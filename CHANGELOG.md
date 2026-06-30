@@ -26,6 +26,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Slash-command autocompletion: typing `/` shows a popup of matching commands
+  above the input — Up/Down to select, Tab to accept, Enter to run.
 - Slash commands (typed in the input): `/clear` (reset the conversation),
   `/model [id]` (show or switch model), `/provider <name>` (switch provider
   preset mid-session), `/copy` (last reply → clipboard), `/retry` (re-run the

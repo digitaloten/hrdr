@@ -5,7 +5,8 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Wrap,
 };
 
 use crate::app::{App, Entry};
@@ -67,6 +68,57 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     draw_input(f, app, chunks[input_idx]);
     draw_statusbar(f, app, chunks[statusbar_idx]);
     draw_help(f, app, chunks[help_idx]);
+
+    // Slash-command completion popup, overlaid above the input.
+    let comp = crate::app::slash_completions(&app.editor.content());
+    if !comp.is_empty() {
+        app.completion_idx = app.completion_idx.min(comp.len() - 1);
+        draw_completion(f, app, chunks[input_idx], &comp);
+    }
+}
+
+fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &[(&str, &str)]) {
+    let theme = &app.theme;
+    let height = comp.len() as u16 + 2;
+    let widest = comp
+        .iter()
+        .map(|(n, d)| n.chars().count() + d.chars().count() + 5)
+        .max()
+        .unwrap_or(24);
+    let width = (widest as u16).clamp(20, input_area.width.max(20));
+    let rect = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(height),
+        width,
+        height,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" commands · Tab ")
+        .border_style(Style::default().fg(theme.dim));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let lines: Vec<Line> = comp
+        .iter()
+        .enumerate()
+        .map(|(i, (name, desc))| {
+            let name_style = if i == app.completion_idx {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.user)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.user)
+            };
+            Line::from(vec![
+                Span::styled(format!(" {name} "), name_style),
+                Span::styled(format!(" {desc}"), Style::default().fg(theme.dim)),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {

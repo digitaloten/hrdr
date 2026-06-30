@@ -80,6 +80,8 @@ pub(crate) struct App {
     cfg: AgentConfig,
     /// OS clipboard for `/copy` (None if unavailable).
     clipboard: Option<Clipboard>,
+    /// Selected row in the slash-command completion popup.
+    pub(crate) completion_idx: usize,
     /// Handle to the in-flight turn task; `abort()` cancels it.
     turn_handle: Option<JoinHandle<()>>,
     /// Transcript scroll offset in raw lines from the natural bottom.
@@ -157,6 +159,7 @@ impl App {
             session_out: 0,
             cfg,
             clipboard: Clipboard::new().ok(),
+            completion_idx: 0,
             turn_handle: None,
             scroll_offset: 0,
             transcript_height: 24,
@@ -219,6 +222,29 @@ impl App {
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         if !is_ctrl_c {
             self.quit_armed = false;
+        }
+
+        // Slash-command completion popup: Tab accepts the selection, Up/Down move it.
+        let comp = slash_completions(&self.editor.content());
+        if !comp.is_empty() && key.modifiers.is_empty() {
+            let last = comp.len() - 1;
+            match key.code {
+                KeyCode::Tab => {
+                    let idx = self.completion_idx.min(last);
+                    self.editor.set_content(&format!("{} ", comp[idx].0));
+                    self.completion_idx = 0;
+                    return Action::None;
+                }
+                KeyCode::Up => {
+                    self.completion_idx = self.completion_idx.min(last).saturating_sub(1);
+                    return Action::None;
+                }
+                KeyCode::Down => {
+                    self.completion_idx = (self.completion_idx.min(last) + 1).min(last);
+                    return Action::None;
+                }
+                _ => {}
+            }
         }
 
         // Ctrl+C / Ctrl+Q / Ctrl+G, plus vim-mode scroll.
@@ -750,6 +776,29 @@ fn parse_head(head: &str) -> Option<String> {
     }
 }
 
+/// Slash commands offered by the completion popup.
+pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/clear", "reset the conversation"),
+    ("/model", "show or switch model"),
+    ("/provider", "switch provider preset"),
+    ("/copy", "copy last reply"),
+    ("/retry", "re-run last turn"),
+    ("/help", "list commands"),
+    ("/exit", "quit"),
+];
+
+/// Commands matching the in-progress `/…` input (empty once a space is typed).
+pub(crate) fn slash_completions(input: &str) -> Vec<(&'static str, &'static str)> {
+    if !input.starts_with('/') || input.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    SLASH_COMMANDS
+        .iter()
+        .filter(|(n, _)| n.starts_with(input))
+        .copied()
+        .collect()
+}
+
 /// Whether a submitted line is a common "quit the session" command, matched
 /// across popular CLIs/REPLs/editors so users feel at home: bare `exit`/`quit`,
 /// the `/exit` `/quit` `/bye` slash family, and vim's `:q` family.
@@ -794,7 +843,22 @@ fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatu
 
 #[cfg(test)]
 mod tests {
-    use super::is_quit_command;
+    use super::{is_quit_command, slash_completions};
+
+    #[test]
+    fn slash_completions_filter() {
+        let names = |i: &str| {
+            slash_completions(i)
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>()
+        };
+        assert!(names("/").len() >= 6); // all commands for a bare slash
+        assert_eq!(names("/c"), vec!["/clear", "/copy"]);
+        assert_eq!(names("/help"), vec!["/help"]);
+        assert!(names("/model gpt").is_empty()); // a space ends completion
+        assert!(names("hello").is_empty()); // not a slash command
+    }
 
     #[test]
     fn recognizes_common_quit_commands() {
