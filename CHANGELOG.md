@@ -31,5 +31,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   auto-follow, and a live TODO panel driven by the `todo_write` tool.
 - ANSI banner shown in `hrdr --help`.
 - Offline unit tests for the tool set and the streaming `Accumulator`.
+- **Temporary** managed backend: hrdr spawns a local `llama-server` (with
+  `--jinja` for tool calling) by default, reuses an already-running endpoint if
+  present, and tears it down on exit. Configurable via `--backend-model`,
+  `--backend-bin`, `--backend-ctx`, `--backend-arg`; disable with
+  `--no-backend`. To be removed once infr's serve path supports agentic tool
+  use.
 
 [Unreleased]: https://github.com/kryptic-sh/hrdr/commits/main

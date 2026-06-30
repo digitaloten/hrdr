@@ -29,14 +29,14 @@ job is done.
 
 ## Workspace
 
-| Crate         | Role                                                              |
-| ------------- | ---------------------------------------------------------------- |
-| `hrdr-llm`    | OpenAI-compatible client: types, streaming, tool-call assembly.  |
-| `hrdr-tools`  | The seven MVP tools + registry.                                  |
-| `hrdr-agent`  | The agent loop + minijinja system prompt.                        |
-| `hrdr-editor` | FSM-agnostic hjkl embedding (`EditorEngine` seam).               |
-| `hrdr-tui`    | Ratatui UI: transcript + vim input pane, live streaming.         |
-| `hrdr`        | Binary: TUI by default, `hrdr run <task>` for headless.          |
+| Crate         | Role                                                            |
+| ------------- | --------------------------------------------------------------- |
+| `hrdr-llm`    | OpenAI-compatible client: types, streaming, tool-call assembly. |
+| `hrdr-tools`  | The seven MVP tools + registry.                                 |
+| `hrdr-agent`  | The agent loop + minijinja system prompt.                       |
+| `hrdr-editor` | FSM-agnostic hjkl embedding (`EditorEngine` seam).              |
+| `hrdr-tui`    | Ratatui UI: transcript + vim input pane, live streaming.        |
+| `hrdr`        | Binary: TUI by default, `hrdr run <task>` for headless.         |
 
 ## Usage
 
@@ -48,13 +48,32 @@ hrdr
 hrdr run "add a --json flag to the status command"
 ```
 
+### Backend (temporary)
+
+By default hrdr **spawns a local `llama-server`** (llama.cpp, started with
+`--jinja` so tool calling works) and shuts it down on exit. This is a
+**stopgap** so the harness can be refined against a real tool-calling model — it
+will be removed once [`infr`](https://github.com/kryptic-sh/infr)'s serve path
+supports agentic tool use (today infr ignores the request's `tools` and only
+forwards the last user message). See `apps/hrdr/src/backend.rs`.
+
+```bash
+hrdr                                   # spawns llama-server with the default model
+hrdr --backend-model unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M   # pick a model
+hrdr --backend-arg=-ngl --backend-arg=99                 # GPU offload passthrough
+hrdr --no-backend                      # use an endpoint you started yourself
+```
+
+If a backend is already answering at `--base-url`, hrdr reuses it instead of
+spawning. Spawn logs go to `~/.cache/hrdr/llama-server.log`.
+
 Configuration (CLI flags override env):
 
-| Env             | Default                       | Meaning                       |
-| --------------- | ----------------------------- | ----------------------------- |
-| `HRDR_BASE_URL` | `http://localhost:8080/v1`    | OpenAI-compatible endpoint.   |
-| `HRDR_MODEL`    | `default`                     | Model id.                     |
-| `HRDR_API_KEY`  | _(falls back to `OPENAI_API_KEY`)_ | Bearer token, if required. |
+| Env             | Default                            | Meaning                     |
+| --------------- | ---------------------------------- | --------------------------- |
+| `HRDR_BASE_URL` | `http://localhost:8080/v1`         | OpenAI-compatible endpoint. |
+| `HRDR_MODEL`    | `default`                          | Model id.                   |
+| `HRDR_API_KEY`  | _(falls back to `OPENAI_API_KEY`)_ | Bearer token, if required.  |
 
 ## Status / roadmap
 

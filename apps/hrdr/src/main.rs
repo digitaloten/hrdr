@@ -3,6 +3,12 @@
 //! No subcommand launches the interactive TUI. `hrdr run <task>` runs a single
 //! turn headlessly, streaming to stdout (scriptable, pipeable).
 //! `hrdr models` lists available models from the configured endpoint.
+//!
+//! By default hrdr spawns a local `llama-server` backend (see [`backend`] —
+//! a TEMPORARY stopgap until infr's tool-calling serve path lands). Pass
+//! `--no-backend` to use an already-running endpoint at `--base-url`.
+
+mod backend;
 
 use std::io::Write;
 
@@ -10,6 +16,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use hrdr_agent::{Agent, AgentConfig, AgentEvent};
 use hrdr_llm::Client;
+
+use backend::{Backend, BackendConfig};
 
 #[derive(Parser)]
 #[command(
@@ -26,6 +34,26 @@ struct Cli {
     /// Model id (default: $HRDR_MODEL).
     #[arg(long, global = true)]
     model: Option<String>,
+
+    /// Don't spawn a local llama-server; use the endpoint at --base-url.
+    #[arg(long, global = true)]
+    no_backend: bool,
+
+    /// [temporary] Model ref (HF org/repo:quant or .gguf path) for the spawned backend.
+    #[arg(long, global = true)]
+    backend_model: Option<String>,
+
+    /// [temporary] llama-server binary to spawn (default: llama-server).
+    #[arg(long, global = true)]
+    backend_bin: Option<String>,
+
+    /// [temporary] Context window size for the spawned backend.
+    #[arg(long, global = true)]
+    backend_ctx: Option<u32>,
+
+    /// [temporary] Extra arg passed verbatim to llama-server (repeatable), e.g. --backend-arg=-ngl --backend-arg=99.
+    #[arg(long = "backend-arg", global = true)]
+    backend_args: Vec<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -61,6 +89,25 @@ async fn main() -> Result<()> {
     if let Some(m) = cli.model {
         config.model = m;
     }
+
+    // TEMPORARY: bring up a local llama-server backend unless told not to.
+    // Held for the duration of the command; dropping it kills the server.
+    let _backend = if cli.no_backend {
+        None
+    } else {
+        let mut bcfg = BackendConfig::default();
+        if let Some(m) = cli.backend_model {
+            bcfg.model = m;
+        }
+        if let Some(b) = cli.backend_bin {
+            bcfg.bin = b;
+        }
+        if let Some(c) = cli.backend_ctx {
+            bcfg.ctx = c;
+        }
+        bcfg.extra_args = cli.backend_args;
+        Some(Backend::ensure(&bcfg, &config.base_url).await?)
+    };
 
     match cli.command {
         Some(Command::Run { prompt }) => run_headless(config, prompt.join(" ")).await,
