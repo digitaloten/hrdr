@@ -144,8 +144,9 @@ pub(crate) struct App {
     pending_edit: Option<std::path::PathBuf>,
     /// A `/goto` target message number, resolved to a scroll offset at draw.
     pub(crate) pending_goto: Option<usize>,
-    /// Last `/find` query and the message number it last landed on (for cycling).
-    find_query: Option<String>,
+    /// Last `/find` query (also drives transcript highlighting) and the message
+    /// number it last landed on (for cycling).
+    pub(crate) find_query: Option<String>,
     find_pos: usize,
     /// Auto-compact trigger as a fraction of the context window; 0 disables.
     pub(crate) auto_compact_ratio: f64,
@@ -181,6 +182,8 @@ pub(crate) struct App {
     // ---- live inference stats (for the loader above the input) ----
     /// When the current turn started (for elapsed time + spinner).
     pub(crate) turn_started: Option<Instant>,
+    /// Wall-clock start of the current turn (for the loader's "started …").
+    pub(crate) turn_started_at: Option<chrono::DateTime<chrono::Local>>,
     /// When the first output token of the turn arrived (for tok/s).
     pub(crate) first_token_at: Option<Instant>,
     /// Streamed output deltas this turn (≈ tokens).
@@ -286,6 +289,7 @@ impl App {
             follow_button: None,
             quit_armed: false,
             turn_started: None,
+            turn_started_at: None,
             first_token_at: None,
             out_tokens: 0,
             last_usage: None,
@@ -686,6 +690,7 @@ impl App {
                 self.last_usage = None;
                 self.session_id = None; // detach; next message starts a new session
                 self.session_label = None;
+                self.find_query = None;
                 self.system("conversation cleared");
             }
             "model" => {
@@ -1524,33 +1529,78 @@ impl App {
         self.editor.paste(&text);
     }
 
-    /// `/export [file]` — write the transcript (as text) to a file. With no
-    /// argument, a timestamped `hrdr-transcript-<date>.md` in the cwd is used.
+    /// `/export [--json] [file]` — write the transcript to a file as text
+    /// (default) or JSON. With no file, a timestamped `hrdr-transcript-<date>`
+    /// in the cwd is used (`.md` or `.json`).
     fn export_cmd(&mut self, arg: &str) {
         let Some(cwd) = self.agent.try_lock().ok().map(|a| a.cwd()) else {
             self.system("busy — try again after the current turn");
             return;
         };
-        let path = if arg.is_empty() {
-            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-            cwd.join(format!("hrdr-transcript-{stamp}.md"))
-        } else {
-            let p = std::path::Path::new(arg);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                cwd.join(p)
+        let mut json = false;
+        let mut file: Option<&str> = None;
+        for tok in arg.split_whitespace() {
+            if tok == "--json" {
+                json = true;
+            } else if file.is_none() {
+                file = Some(tok);
+            }
+        }
+        let path = match file {
+            Some(f) => {
+                let p = std::path::Path::new(f);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    cwd.join(p)
+                }
+            }
+            None => {
+                let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                let ext = if json { "json" } else { "md" };
+                cwd.join(format!("hrdr-transcript-{stamp}.{ext}"))
             }
         };
-        let text = self.transcript_text();
-        match std::fs::write(&path, &text) {
+        let content = if json {
+            self.transcript_json()
+        } else {
+            self.transcript_text()
+        };
+        match std::fs::write(&path, &content) {
             Ok(()) => self.system(format!(
                 "exported transcript to {} ({} lines)",
                 path.display(),
-                text.lines().count()
+                content.lines().count()
             )),
             Err(e) => self.system(format!("export failed: {e}")),
         }
+    }
+
+    /// The conversation as a JSON array of `{n, role, time, content}` objects
+    /// (user/assistant messages only).
+    fn transcript_json(&self) -> String {
+        let mut arr = Vec::new();
+        let mut num = 0;
+        for (i, e) in self.transcript.iter().enumerate() {
+            let (role, content) = match e {
+                Entry::User(s) => ("user", s),
+                Entry::Assistant(s) => ("assistant", s),
+                _ => continue,
+            };
+            num += 1;
+            let time = self
+                .entry_times
+                .get(i)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default();
+            arr.push(serde_json::json!({
+                "n": num,
+                "role": role,
+                "time": time,
+                "content": content,
+            }));
+        }
+        serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string())
     }
 
     /// `/edit <file>` — open a file (relative to the cwd) in `$EDITOR`.
@@ -1656,6 +1706,7 @@ impl App {
         self.running = true;
         self.status = "thinking…".to_string();
         self.turn_started = Some(Instant::now());
+        self.turn_started_at = Some(chrono::Local::now());
         self.first_token_at = None;
         self.out_tokens = 0;
         // Keep last_usage so the status-bar context size persists between turns;
@@ -1740,6 +1791,7 @@ impl App {
         self.compacting = true;
         self.status = "compacting…".to_string();
         self.turn_started = Some(Instant::now());
+        self.turn_started_at = Some(chrono::Local::now());
         self.first_token_at = None;
         self.out_tokens = 0;
         let agent = self.agent.clone();
@@ -2237,7 +2289,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/goto", "jump to message N or time (5m/1h/top/end)"),
     ("/find", "jump to next message containing text"),
     ("/copy", "copy reply (or 'code' / 'all' / 'msg N[-M]')"),
-    ("/export", "write the transcript to a file (default name)"),
+    ("/export", "write transcript to a file ([--json] [file])"),
     ("/paste", "paste clipboard (file path → attach)"),
     ("/edit", "open a file in $EDITOR"),
     ("/retry", "re-run last turn (optional model)"),

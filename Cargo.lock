@@ -1070,6 +1070,7 @@ dependencies = [
  "hrdr-editor",
  "ignore",
  "ratatui",
+ "serde_json",
  "tokio",
 ]
 

@@ -245,9 +245,15 @@ fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
         None => "ctx —".to_string(),
     };
 
+    // "started …" segment, respecting the timestamp style (omitted when off).
+    let started = match (app.timestamp_style, app.turn_started_at) {
+        (TimestampStyle::None, _) | (_, None) => String::new(),
+        (TimestampStyle::Relative, Some(t)) => format!("  ·  started {}", relative_time(t)),
+        (TimestampStyle::Exact, Some(t)) => format!("  ·  started {}", t.format("%H:%M")),
+    };
     let text = if app.compacting {
         format!(
-            " {frame} compacting context — summarizing the conversation…  ·  {:.1}s",
+            " {frame} compacting context — summarizing the conversation…  ·  {:.1}s{started}",
             elapsed.as_secs_f64(),
         )
     } else {
@@ -257,7 +263,7 @@ fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
             "inferring"
         };
         format!(
-            " {frame} {phase}  ·  {ctx}  ·  {speed:.1} tok/s ({} out)  ·  {:.1}s",
+            " {frame} {phase}  ·  {ctx}  ·  {speed:.1} tok/s ({} out)  ·  {:.1}s{started}",
             app.out_tokens,
             elapsed.as_secs_f64(),
         )
@@ -461,6 +467,38 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, area);
 }
 
+/// Restyle every (ASCII case-insensitive) occurrence of `needle` within `line`
+/// with `hl`, preserving each span's original style elsewhere. `needle` must be
+/// lowercase. Operates on byte indices (safe because `to_ascii_lowercase`
+/// preserves length).
+fn highlight_line(line: Line<'static>, needle: &str, hl: Style) -> Line<'static> {
+    if needle.is_empty() {
+        return line;
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for span in line.spans {
+        let content = span.content.into_owned();
+        let lower = content.to_ascii_lowercase();
+        let style = span.style;
+        let mut start = 0;
+        let mut search = 0;
+        while let Some(rel) = lower[search..].find(needle) {
+            let at = search + rel;
+            if at > start {
+                spans.push(Span::styled(content[start..at].to_string(), style));
+            }
+            let end = at + needle.len();
+            spans.push(Span::styled(content[at..end].to_string(), hl));
+            start = end;
+            search = end;
+        }
+        if start < content.len() {
+            spans.push(Span::styled(content[start..].to_string(), style));
+        }
+    }
+    Line::from(spans)
+}
+
 /// Human-friendly elapsed time since `then`, with compound units for the larger
 /// ranges (`now`, `42s ago`, `5m ago`, `1h30m ago`, `2d3h ago`).
 fn relative_time(then: chrono::DateTime<chrono::Local>) -> String {
@@ -595,6 +633,22 @@ fn transcript_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
             }
         }
         out.push(Line::raw(""));
+    }
+
+    // Highlight the active /find query across the committed transcript.
+    if let Some(needle) = app
+        .find_query
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .filter(|q| !q.is_empty())
+    {
+        let hl = Style::default()
+            .fg(Color::Black)
+            .bg(theme.warn)
+            .add_modifier(Modifier::BOLD);
+        for line in out.iter_mut() {
+            *line = highlight_line(std::mem::take(line), &needle, hl);
+        }
     }
 
     // Pending queued messages float at the bottom (following the output) until

@@ -34,16 +34,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/timestamps [none|relative|exact]` (no arg toggles off/relative). Relative
   times use compound units past an hour (`1h30m`, `2d3h`).
 - `/find <text>` jumps the transcript to the next message containing `text`
-  (case-insensitive); repeat `/find` with no argument to cycle through matches.
-  Reports the match position and count.
+  (case-insensitive) and highlights every match across the transcript; repeat
+  `/find` with no argument to cycle through matches. Reports the match position
+  and count; `/clear` clears the highlight.
+- The inference loader shows when the current turn started (`started 2m ago` /
+  `started 14:32`), respecting the timestamp style (hidden when set to `none`).
 - `/goto <N | 5m | 1h | top | end>` scrolls the transcript to a message number,
   to the message nearest a relative time ago (e.g. `5m`, `1h`, `2d`), or to the
   top/latest. The target message is placed at the top of the viewport.
 - `/copy msg N` copies a specific numbered message (the `#N` shown by the
   timestamp headers), and `/copy msg N-M` copies an inclusive range, alongside
   the existing `/copy`, `/copy code`, `/copy all`.
-- `/export [file]` writes the transcript (as text) to a file; with no argument
-  it writes a timestamped `hrdr-transcript-<date>.md` in the working directory.
+- `/export [--json] [file]` writes the transcript to a file as text (default) or
+  JSON (`{n, role, time, content}` per message); with no file argument it writes
+  a timestamped `hrdr-transcript-<date>.md` / `.json` in the working directory.
 - `/reload` re-reads `AGENTS.md` and the config file, applying the bits that can
   change live (theme, icons, effort, toggles, temperature) without a restart.
 - `/paste` inserts the system clipboard into the input — and if the clipboard
