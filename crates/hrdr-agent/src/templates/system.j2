@@ -22,3 +22,10 @@ Available tools:
 {% for t in tools -%}
 - {{ t.name }}: {{ t.description }}
 {% endfor %}
+{%- if instructions %}
+
+Project instructions (from AGENTS.md — follow these for this project; more
+specific files appear later and take precedence):
+
+{{ instructions }}
+{%- endif %}

@@ -26,6 +26,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Project instructions via the open `AGENTS.md` standard (https://agents.md): on
+  startup (and whenever the working directory changes) hrdr gathers `AGENTS.md`
+  files walking from the cwd up to the filesystem root, plus an optional global
+  `~/.config/hrdr/AGENTS.md`, and injects them into the system prompt
+  (less-specific files first, so nearer ones take precedence). The TUI notes
+  when project instructions were loaded.
 - Context compaction (Claude Code / opencode style): `/compact [instructions]`
   asks the model for a structured summary of the conversation (intent, technical
   context, files & code, commands, errors & fixes, current state, pending tasks)

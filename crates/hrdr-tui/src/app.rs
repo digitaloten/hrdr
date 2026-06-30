@@ -151,6 +151,7 @@ impl App {
         let cfg = config.clone();
         let agent = Agent::new(config)?;
         let todos = agent.todos();
+        let project_docs_loaded = agent.project_docs().is_some();
         let (tx, rx) = mpsc::unbounded_channel();
         let editor: Box<dyn EditorEngine> = if vim_mode {
             Box::new(VimEngine::new())
@@ -165,11 +166,17 @@ impl App {
              (Shift+Enter too on supporting terminals), Ctrl+G opens $EDITOR. /help for commands; \
              /exit (or Ctrl+C twice) to quit. Submit while a reply runs to queue follow-ups."
         };
+        let mut transcript = vec![Entry::System(welcome.to_string())];
+        if project_docs_loaded {
+            transcript.push(Entry::System(
+                "loaded project instructions from AGENTS.md".to_string(),
+            ));
+        }
         Ok(Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             editor,
             theme,
-            transcript: vec![Entry::System(welcome.to_string())],
+            transcript,
             running: false,
             status: "ready".to_string(),
             model,

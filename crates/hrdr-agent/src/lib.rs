@@ -21,7 +21,7 @@ use futures_util::StreamExt;
 use hrdr_llm::{Accumulator, ChatMessage, Client, Role};
 use hrdr_tools::{TodoItem, ToolContext, ToolRegistry};
 
-pub use prompt::render_system;
+pub use prompt::{gather_agent_docs, render_system};
 
 /// Events emitted as a turn progresses.
 #[derive(Debug, Clone)]
@@ -345,6 +345,8 @@ pub struct Agent {
     ctx: ToolContext,
     messages: Vec<ChatMessage>,
     max_steps: usize,
+    /// Gathered `AGENTS.md` project instructions for the current cwd, if any.
+    project_docs: Option<String>,
 }
 
 impl Agent {
@@ -352,7 +354,8 @@ impl Agent {
     pub fn new(config: AgentConfig) -> Result<Self> {
         let tools = ToolRegistry::with_defaults();
         let ctx = ToolContext::new(config.cwd.clone());
-        let system = render_system(&tools, &config.cwd)?;
+        let project_docs = gather_agent_docs(&config.cwd);
+        let system = render_system(&tools, &config.cwd, project_docs.as_deref())?;
 
         let mut client = Client::new(config.base_url, config.api_key, config.model);
         if let Some(t) = config.temperature {
@@ -365,7 +368,13 @@ impl Agent {
             ctx,
             messages: vec![ChatMessage::system(system)],
             max_steps: config.max_steps,
+            project_docs,
         })
+    }
+
+    /// The gathered `AGENTS.md` project instructions for the current cwd, if any.
+    pub fn project_docs(&self) -> Option<&str> {
+        self.project_docs.as_deref()
     }
 
     pub fn messages(&self) -> &[ChatMessage] {
@@ -402,9 +411,17 @@ impl Agent {
         self.ctx.cwd.clone()
     }
 
-    /// Change the tools' working directory.
+    /// Change the tools' working directory. Reloads `AGENTS.md` for the new
+    /// directory and refreshes the system prompt in place.
     pub fn set_cwd(&mut self, cwd: std::path::PathBuf) {
         self.ctx.cwd = cwd;
+        self.project_docs = gather_agent_docs(&self.ctx.cwd);
+        if self.messages.first().map(|m| m.role == Role::System) == Some(true)
+            && let Ok(system) =
+                render_system(&self.tools, &self.ctx.cwd, self.project_docs.as_deref())
+        {
+            self.messages[0] = ChatMessage::system(system);
+        }
     }
 
     /// Registered tools as `(name, description)` pairs.
