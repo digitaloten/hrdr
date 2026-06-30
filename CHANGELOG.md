@@ -26,6 +26,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Slash-command aliases for users switching from other agents: `/new` and
+  `/reset` → `/clear`, `/cd` → `/cwd`, `/status` → `/info`, `/continue` →
+  `/resume`, `/summarize` → `/compact`, and `/commands` / `/?` → `/help`
+  (case-insensitive). They resolve to the canonical command and appear in the
+  completion popup. (Quit words `/quit` `/bye` `/q` already exit.)
 - Web tools: `web_fetch` (GET a URL and return its content as text — HTML is
   reduced to readable text, scripts/styles/markup stripped, with an optional
   `max_chars` cap) and `web_search` (top results as title/URL/snippet). Search

@@ -469,7 +469,7 @@ impl App {
             return false;
         };
         let mut parts = rest.splitn(2, char::is_whitespace);
-        let cmd = parts.next().unwrap_or("");
+        let cmd = resolve_alias(parts.next().unwrap_or(""));
         let arg = parts.next().unwrap_or("").trim();
         match cmd {
             "help" => {
@@ -1561,6 +1561,13 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/undo", "undo last turn (edit & resend)"),
     ("/help", "list commands"),
     ("/exit", "quit"),
+    // Aliases for users switching from other agents (resolved by resolve_alias).
+    ("/new", "alias of /clear"),
+    ("/reset", "alias of /clear"),
+    ("/cd", "alias of /cwd"),
+    ("/status", "alias of /info"),
+    ("/continue", "alias of /resume"),
+    ("/summarize", "alias of /compact"),
 ];
 
 /// The active completion popup's contents and kind.
@@ -1741,6 +1748,27 @@ pub(crate) fn slash_completions(input: &str) -> Vec<(&'static str, &'static str)
 /// Whether a submitted line is a common "quit the session" command, matched
 /// across popular CLIs/REPLs/editors so users feel at home: bare `exit`/`quit`,
 /// the `/exit` `/quit` `/bye` slash family, and vim's `:q` family.
+/// Resolve a slash-command alias to its canonical name (case-insensitive), so
+/// users coming from other agents can use familiar names. Unknown names pass
+/// through unchanged.
+fn resolve_alias(cmd: &str) -> &str {
+    match cmd.to_ascii_lowercase().as_str() {
+        // Claude Code / opencode / aider new-session & reset names.
+        "new" | "reset" => "clear",
+        // aider/shell-style directory change.
+        "cd" => "cwd",
+        // Claude Code status line.
+        "status" => "info",
+        // opencode/Claude Code resume.
+        "continue" => "resume",
+        // descriptive name for compaction.
+        "summarize" | "summary" => "compact",
+        // help variants.
+        "commands" | "?" => "help",
+        _ => cmd,
+    }
+}
+
 fn is_quit_command(s: &str) -> bool {
     matches!(
         s.trim().to_ascii_lowercase().as_str(),
@@ -1782,7 +1810,19 @@ fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatu
 
 #[cfg(test)]
 mod tests {
-    use super::{active_file_token, is_quit_command, slash_completions};
+    use super::{active_file_token, is_quit_command, resolve_alias, slash_completions};
+
+    #[test]
+    fn aliases_resolve_to_canonical() {
+        assert_eq!(resolve_alias("new"), "clear");
+        assert_eq!(resolve_alias("RESET"), "clear"); // case-insensitive
+        assert_eq!(resolve_alias("cd"), "cwd");
+        assert_eq!(resolve_alias("status"), "info");
+        assert_eq!(resolve_alias("continue"), "resume");
+        assert_eq!(resolve_alias("summarize"), "compact");
+        assert_eq!(resolve_alias("?"), "help");
+        assert_eq!(resolve_alias("model"), "model"); // unknown passes through
+    }
 
     #[test]
     fn active_file_token_detection() {
