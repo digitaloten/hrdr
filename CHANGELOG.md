@@ -45,4 +45,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (or `vim = true` in config). The submit key and status hint are now decided by
   the `EditorEngine`, keeping the FSM-agnostic seam intact.
 
+- Message queueing: submitting while a turn is running enqueues the message and
+  runs it (FIFO) once the current turn finishes; the queued count shows in the
+  status bar and `Ctrl+C` discards the queue along with the in-flight turn.
+- Newline gestures in plain input now also accept **Alt+Enter** (reported by far
+  more terminals than Shift+Enter); Shift+Enter still works where the terminal
+  reports it, and `\`+Enter works everywhere.
+
 [Unreleased]: https://github.com/kryptic-sh/hrdr/commits/main

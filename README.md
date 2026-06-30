@@ -42,8 +42,9 @@ job is done.
 ## Usage
 
 ```bash
-# interactive TUI — plain input: type, Enter sends, Shift+Enter/\+Enter newline,
-# Ctrl+G opens $EDITOR, Ctrl+C quits
+# interactive TUI — plain input: type, Enter sends, Alt+Enter or \+Enter newline
+# (Shift+Enter on supporting terminals), Ctrl+G opens $EDITOR, Ctrl+C quits.
+# Submit while a reply is running to queue follow-up messages.
 hrdr
 
 # vim keybindings in the input pane instead

@@ -1,5 +1,6 @@
 //! App state, the async event loop, and agent orchestration.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -59,6 +60,8 @@ pub(crate) struct App {
     pub(crate) transcript_height: u16,
     /// Shared TODO list updated live by the `todo_write` tool.
     pub(crate) todos: Arc<Mutex<Vec<Todo>>>,
+    /// Messages submitted while a turn is running, processed FIFO once it ends.
+    pub(crate) queue: VecDeque<String>,
     tx: mpsc::UnboundedSender<TurnMsg>,
     rx: Option<mpsc::UnboundedReceiver<TurnMsg>>,
     should_quit: bool,
@@ -80,8 +83,9 @@ impl App {
             "hrdr ready (vim mode). Insert to type, Esc for Normal, Enter in Normal sends, \
              Ctrl+G opens $EDITOR, Ctrl+C quits."
         } else {
-            "hrdr ready. Type a message; Enter sends, Shift+Enter or \\+Enter for a newline, \
-             Ctrl+G opens $EDITOR, Ctrl+C quits."
+            "hrdr ready. Type a message; Enter sends, Alt+Enter or \\+Enter for a newline \
+             (Shift+Enter too on supporting terminals), Ctrl+G opens $EDITOR, Ctrl+C quits. \
+             Submit while a reply is running to queue follow-ups."
         };
         Ok(Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
@@ -94,6 +98,7 @@ impl App {
             scroll_offset: 0,
             transcript_height: 24,
             todos,
+            queue: VecDeque::new(),
             tx,
             rx: Some(rx),
             should_quit: false,
@@ -189,8 +194,8 @@ impl App {
         }
 
         // The engine decides whether this key submits (vim: Enter in Normal;
-        // plain: Enter without Shift / trailing backslash).
-        if !self.running && self.editor.wants_submit(&key) {
+        // plain: Enter without a newline modifier / trailing backslash).
+        if self.editor.wants_submit(&key) {
             let input = self.editor.content();
             if input.trim().is_empty() {
                 return Action::None;
@@ -198,7 +203,12 @@ impl App {
             self.transcript.push(Entry::User(input.clone()));
             self.editor.set_content("");
             self.scroll_offset = 0; // auto-follow on new submission
-            self.spawn_turn(input);
+            if self.running {
+                // A turn is in flight — queue it, run after the current one.
+                self.queue.push_back(input);
+            } else {
+                self.spawn_turn(input);
+            }
             return Action::None;
         }
 
@@ -227,15 +237,21 @@ impl App {
         Ok(())
     }
 
-    /// Abort the in-flight agent task, update status, push a cancel marker.
+    /// Abort the in-flight agent task and discard any queued messages.
     fn cancel_turn(&mut self) {
         if let Some(handle) = self.turn_handle.take() {
             handle.abort();
         }
         self.running = false;
+        let dropped = self.queue.len();
+        self.queue.clear();
         self.status = "cancelled".to_string();
-        self.transcript
-            .push(Entry::System("[cancelled]".to_string()));
+        let msg = if dropped > 0 {
+            format!("[cancelled · {dropped} queued message(s) discarded]")
+        } else {
+            "[cancelled]".to_string()
+        };
+        self.transcript.push(Entry::System(msg));
     }
 
     fn spawn_turn(&mut self, input: String) {
@@ -277,6 +293,10 @@ impl App {
                         self.transcript.push(Entry::System(format!("[error] {e}")));
                     }
                     None => self.status = "ready".to_string(),
+                }
+                // Start the next queued message, if any (FIFO).
+                if let Some(next) = self.queue.pop_front() {
+                    self.spawn_turn(next);
                 }
             }
         }

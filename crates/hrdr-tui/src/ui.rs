@@ -122,8 +122,13 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     } else {
         String::new()
     };
+    let queue_hint = if app.queue.is_empty() {
+        String::new()
+    } else {
+        format!("  [{} queued]", app.queue.len())
+    };
     let text = format!(
-        "{dot} {}  │  {}  │  {}{scroll_hint}",
+        "{dot} {}{queue_hint}  │  {}  │  {}{scroll_hint}",
         app.status,
         app.model,
         app.editor.keybind_hint(),

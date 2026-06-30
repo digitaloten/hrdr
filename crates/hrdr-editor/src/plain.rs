@@ -203,15 +203,18 @@ impl EditorEngine for PlainEngine {
     }
 
     fn wants_submit(&self, key: &KeyEvent) -> bool {
-        // Enter sends — unless Shift is held or the line ends with a backslash,
-        // in which case it inserts a newline instead.
+        // Enter sends — UNLESS it's a newline gesture: Shift+Enter (only on
+        // terminals that report it), Alt+Enter (reported by far more
+        // terminals), or a trailing backslash (`\`+Enter, works everywhere).
         key.code == KeyCode::Enter
-            && !key.modifiers.contains(KeyModifiers::SHIFT)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
             && !self.pending_backslash()
     }
 
     fn keybind_hint(&self) -> &'static str {
-        "Enter=send · Shift/\\+Enter=newline · Ctrl+G=$EDITOR · Ctrl+C=quit"
+        "Enter=send · Alt/Shift+Enter or \\+Enter=newline · Ctrl+G=$EDITOR · Ctrl+C=quit"
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -256,14 +259,16 @@ mod tests {
     }
 
     #[test]
-    fn shift_enter_inserts_newline_and_does_not_submit() {
-        let mut e = PlainEngine::new();
-        type_str(&mut e, "a");
-        let se = enter(KeyModifiers::SHIFT);
-        assert!(!e.wants_submit(&se));
-        e.feed_key(se);
-        type_str(&mut e, "b");
-        assert_eq!(e.content(), "a\nb");
+    fn shift_or_alt_enter_inserts_newline_and_does_not_submit() {
+        for mods in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            let mut e = PlainEngine::new();
+            type_str(&mut e, "a");
+            let ne = enter(mods);
+            assert!(!e.wants_submit(&ne), "modifier {mods:?} should not submit");
+            e.feed_key(ne);
+            type_str(&mut e, "b");
+            assert_eq!(e.content(), "a\nb", "modifier {mods:?}");
+        }
     }
 
     #[test]
