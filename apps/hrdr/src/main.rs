@@ -56,6 +56,10 @@ struct Cli {
     #[arg(long, global = true)]
     auto_compact: Option<f64>,
 
+    /// Don't auto-resume the most recent session for the working directory.
+    #[arg(long = "no-auto-resume", global = true)]
+    no_auto_resume: bool,
+
     /// Don't spawn a local llama-server; use the endpoint at --base-url.
     #[arg(long, global = true)]
     no_backend: bool,
@@ -159,6 +163,9 @@ async fn main() -> Result<()> {
     }
     if let Some(r) = cli.auto_compact {
         config.auto_compact = r;
+    }
+    if cli.no_auto_resume {
+        config.auto_resume = false;
     }
 
     if remote_provider && config.model == "default" {

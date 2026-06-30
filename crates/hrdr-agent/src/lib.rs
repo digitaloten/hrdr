@@ -79,6 +79,8 @@ pub struct AgentConfig {
     /// `0` (or any value outside that range) disables it. Default
     /// [`DEFAULT_AUTO_COMPACT`].
     pub auto_compact: f64,
+    /// On TUI startup, resume the most recent session for the cwd. Default `true`.
+    pub auto_resume: bool,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
 }
@@ -102,6 +104,7 @@ impl Default for AgentConfig {
             context_window: None,
             effort: None,
             auto_compact: DEFAULT_AUTO_COMPACT,
+            auto_resume: true,
             providers: HashMap::new(),
         }
     }
@@ -203,6 +206,7 @@ struct FileConfig {
     context_window: Option<u32>,
     effort: Option<String>,
     auto_compact: Option<f64>,
+    auto_resume: Option<bool>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
 }
@@ -277,6 +281,9 @@ impl AgentConfig {
             if let Some(v) = fc.auto_compact {
                 cfg.auto_compact = v;
             }
+            if let Some(v) = fc.auto_resume {
+                cfg.auto_resume = v;
+            }
             if !fc.providers.is_empty() {
                 cfg.providers = fc.providers;
             }
@@ -299,6 +306,13 @@ impl AgentConfig {
             && let Ok(f) = v.parse::<f64>()
         {
             cfg.auto_compact = f;
+        }
+        if let Ok(v) = std::env::var("HRDR_AUTO_RESUME") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "0" | "false" | "off" | "no" => cfg.auto_resume = false,
+                "1" | "true" | "on" | "yes" => cfg.auto_resume = true,
+                _ => {}
+            }
         }
         let env_key = std::env::var("HRDR_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))

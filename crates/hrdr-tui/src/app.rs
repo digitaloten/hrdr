@@ -150,6 +150,7 @@ impl App {
         let branch = git_branch(&config.cwd);
         let context_window = config.context_window;
         let auto_compact = config.auto_compact;
+        let auto_resume = config.auto_resume;
         let effort = config.effort.clone();
         let base_url = config.base_url.clone();
         let cfg = config.clone();
@@ -178,7 +179,7 @@ impl App {
                 "loaded project instructions from AGENTS.md".to_string(),
             ));
         }
-        Ok(Self {
+        let mut app = Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             editor,
             theme,
@@ -218,7 +219,44 @@ impl App {
             tx,
             rx: Some(rx),
             should_quit: false,
-        })
+        };
+        if auto_resume {
+            app.auto_resume_latest();
+        }
+        Ok(app)
+    }
+
+    /// On startup, resume the most recent saved session for the current
+    /// directory (if any). No match → leave the fresh session as-is.
+    fn auto_resume_latest(&mut self) {
+        let cwd = self.current_cwd();
+        let cur = hrdr_agent::cwd_slug(&cwd);
+        let Some(meta) = hrdr_agent::list_sessions()
+            .into_iter()
+            .find(|m| hrdr_agent::cwd_slug(&m.cwd) == cur)
+        else {
+            return; // nothing saved here yet — start fresh
+        };
+        let Ok(session) = Session::load_path(&meta.path) else {
+            return;
+        };
+        // Skip empty sessions (system prompt only).
+        if session.messages.len() <= 1 {
+            return;
+        }
+        if let Ok(mut a) = self.agent.try_lock() {
+            a.set_messages(session.messages.clone());
+            a.set_model(session.model.clone());
+        }
+        self.model = session.model.clone();
+        self.rebuild_transcript(&session.messages);
+        self.session_id = Some(meta.id);
+        self.session_label = Some(session.name.clone());
+        self.transcript.push(Entry::System(format!(
+            "resumed most recent session '{}' ({} messages) — /clear to start fresh",
+            session.name,
+            session.messages.len()
+        )));
     }
 
     pub(crate) async fn run(&mut self, terminal: &mut Tui) -> Result<()> {

@@ -26,6 +26,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Auto-resume on startup: the TUI restores the most recent saved session for the
+  current working directory (history + transcript + model), so reopening hrdr in
+  a project picks up where you left off; `/clear` starts fresh. If no session
+  exists for the directory, a new one is started. Disable with
+  `auto_resume = false` in config, `--no-auto-resume`, or `$HRDR_AUTO_RESUME=0`.
 - Slash-command aliases for users switching from other agents: `/new` and
   `/reset` → `/clear`, `/cd` → `/cwd`, `/status` → `/info`, `/continue` →
   `/resume`, `/summarize` → `/compact`, and `/commands` / `/?` → `/help`
