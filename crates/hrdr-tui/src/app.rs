@@ -104,11 +104,11 @@ impl App {
         };
         let welcome = if vim_mode {
             "hrdr ready (vim mode). Insert to type, Esc for Normal, Enter in Normal sends, \
-             Ctrl+G opens $EDITOR, Ctrl+C twice quits."
+             Ctrl+G opens $EDITOR. Send /exit (or Ctrl+C twice) to quit."
         } else {
             "hrdr ready. Type a message; Enter sends, Alt+Enter or \\+Enter for a newline \
-             (Shift+Enter too on supporting terminals), Ctrl+G opens $EDITOR, Ctrl+C twice quits. \
-             Submit while a reply is running to queue follow-ups."
+             (Shift+Enter too on supporting terminals), Ctrl+G opens $EDITOR. Send /exit (or \
+             Ctrl+C twice) to quit. Submit while a reply is running to queue follow-ups."
         };
         Ok(Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
@@ -255,6 +255,11 @@ impl App {
         if self.editor.wants_submit(&key) {
             let input = self.editor.content();
             if input.trim().is_empty() {
+                return Action::None;
+            }
+            // Common quit commands exit the session instead of being sent.
+            if is_quit_command(input.trim()) {
+                self.should_quit = true;
                 return Action::None;
             }
             self.editor.set_content("");
@@ -461,6 +466,34 @@ impl App {
     }
 }
 
+/// Whether a submitted line is a common "quit the session" command, matched
+/// across popular CLIs/REPLs/editors so users feel at home: bare `exit`/`quit`,
+/// the `/exit` `/quit` `/bye` slash family, and vim's `:q` family.
+fn is_quit_command(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "exit"
+            | "quit"
+            | "q"
+            | "bye"
+            | "exit()"
+            | "quit()"
+            | "/exit"
+            | "/quit"
+            | "/q"
+            | "/bye"
+            | "/stop"
+            | ":q"
+            | ":q!"
+            | ":qa"
+            | ":qa!"
+            | ":wq"
+            | ":x"
+            | ":exit"
+            | ":quit"
+    )
+}
+
 /// Run `$VISUAL`/`$EDITOR` (falling back to `vi`) on `path`, inheriting stdio.
 /// The command string may carry args (e.g. `code -w`), split on whitespace.
 fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
@@ -473,4 +506,42 @@ fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatu
         .args(parts)
         .arg(path)
         .status()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_quit_command;
+
+    #[test]
+    fn recognizes_common_quit_commands() {
+        for cmd in [
+            "exit",
+            "quit",
+            "q",
+            "bye",
+            "/exit",
+            "/quit",
+            "/bye",
+            ":q",
+            ":qa",
+            ":wq",
+            ":x",
+            "EXIT",
+            "  /quit  ",
+        ] {
+            assert!(is_quit_command(cmd), "{cmd:?} should quit");
+        }
+    }
+
+    #[test]
+    fn leaves_normal_messages_alone() {
+        for msg in [
+            "exit the loop early",
+            "how do I quit vim?",
+            "q1 results",
+            "fix bye-bug",
+        ] {
+            assert!(!is_quit_command(msg), "{msg:?} should NOT quit");
+        }
+    }
 }

@@ -16,6 +16,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Quit commands: submitting a common quit word exits the session instead of
+  being sent to the model — bare `exit`/`quit`/`q`/`bye`, the `/exit` `/quit`
+  `/bye` slash family, and vim's `:q`/`:qa`/`:wq`/`:x` family
+  (case-insensitive).
 - Provider presets via `--provider` (or `provider` in config /
   `$HRDR_PROVIDER`): `zen`/`opencode` (OpenCode Zen, `OPENCODE_API_KEY`),
   `openai`, and `local`/`infr`. A preset sets the base URL + API-key env, and
