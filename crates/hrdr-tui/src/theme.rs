@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use hjkl_markdown_tui::MdTheme;
 use hjkl_theme::Theme as HjklTheme;
 use hjkl_theme::loader;
 use hjkl_theme_tui::ToRatatui;
@@ -63,6 +64,23 @@ impl Theme {
                 .or_else(|| pal("red"))
                 .unwrap_or(Color::Red),
         }
+    }
+
+    /// Markdown render theme derived from these chat colors, so assistant
+    /// markdown follows the active hjkl theme.
+    pub fn md_theme(&self) -> MdTheme {
+        MdTheme::new(
+            self.assistant, // text
+            self.user,      // heading1
+            self.warn,      // heading 2-6
+            self.success,   // inline code span
+            self.success,   // code block
+            self.user,      // link
+            self.warn,      // list bullet
+            self.assistant, // bold
+            self.assistant, // italic
+            self.dim,       // rule
+        )
     }
 }
 

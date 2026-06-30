@@ -26,6 +26,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Markdown rendering of assistant messages (headings, bold/italic, lists,
+  inline/code spans, links, rules) via `hjkl-markdown` + `hjkl-markdown-tui`,
+  themed from the active hjkl theme. (Per-language syntax highlighting of code
+  blocks is a follow-up.)
 - Custom providers in config: define `[providers.<name>]` (with `base_url`,
   `key_env`/`api_key`, optional `model`, `remote`, `context_window`) and select
   with `--provider <name>` (config entries shadow built-ins of the same name).

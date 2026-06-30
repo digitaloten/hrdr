@@ -77,7 +77,7 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
         ..area
     };
 
-    let para = Paragraph::new(transcript_lines(app)).wrap(Wrap { trim: false });
+    let para = Paragraph::new(transcript_lines(app, text_area.width)).wrap(Wrap { trim: false });
     // Count the *wrapped* rows at this width — not the logical line count — so
     // long messages that wrap don't push the newest content below the fold.
     let total = para.line_count(text_area.width) as u16;
@@ -331,8 +331,9 @@ fn fmt_count(n: usize) -> String {
     }
 }
 
-fn transcript_lines(app: &App) -> Vec<Line<'static>> {
+fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let theme = &app.theme;
+    let md_theme = theme.md_theme();
     let mut out: Vec<Line> = Vec::new();
     for entry in &app.transcript {
         match entry {
@@ -342,12 +343,16 @@ fn transcript_lines(app: &App) -> Vec<Line<'static>> {
                 text,
                 Style::default().fg(theme.user),
             ),
-            Entry::Assistant(text) => push_text(
-                &mut out,
-                Span::raw(""),
-                text,
-                Style::default().fg(theme.assistant),
-            ),
+            // Assistant text is rendered as markdown (headings, lists, emphasis,
+            // inline/code spans), themed from the active hjkl theme.
+            Entry::Assistant(text) => {
+                let events = hjkl_markdown::parse(text);
+                out.extend(hjkl_markdown_tui::to_lines(
+                    &events,
+                    &md_theme,
+                    width.max(1),
+                ));
+            }
             Entry::Reasoning(text) => push_text(
                 &mut out,
                 Span::styled("· ", Style::default().fg(theme.dim)),
