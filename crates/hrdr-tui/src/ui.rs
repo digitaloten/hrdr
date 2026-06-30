@@ -132,11 +132,26 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
         ..area
     };
 
-    let para = Paragraph::new(transcript_lines(app, text_area.width)).wrap(Wrap { trim: false });
+    let (lines, msg_starts) = transcript_lines(app, text_area.width);
+    // Resolve a pending /goto to a from-top wrapped-row offset before `lines`
+    // is consumed by the Paragraph.
+    let goto_top: Option<u16> = app.pending_goto.take().and_then(|num| {
+        let start = (*msg_starts.get(num.checked_sub(1)?)?).min(lines.len());
+        Some(
+            Paragraph::new(lines[..start].to_vec())
+                .wrap(Wrap { trim: false })
+                .line_count(text_area.width) as u16,
+        )
+    });
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     // Count the *wrapped* rows at this width — not the logical line count — so
     // long messages that wrap don't push the newest content below the fold.
     let total = para.line_count(text_area.width) as u16;
     let max_scroll = total.saturating_sub(area.height);
+    // A /goto puts the target message at the top of the viewport.
+    if let Some(wrapped_start) = goto_top {
+        app.scroll_offset = max_scroll.saturating_sub(wrapped_start) as usize;
+    }
     // scroll_offset is rows scrolled UP from the bottom; 0 == follow newest.
     // Clamp and write back so "scrolled up" state (and the follow button) is
     // accurate even after the content shrinks.
@@ -473,10 +488,13 @@ fn fmt_count(n: usize) -> String {
     }
 }
 
-fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+/// Returns the rendered transcript lines plus, for each user/assistant message
+/// (1-based), the logical-line index where it starts (for `/goto`).
+fn transcript_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
     let theme = &app.theme;
     let md_theme = theme.md_theme();
     let mut out: Vec<Line> = Vec::new();
+    let mut msg_starts: Vec<usize> = Vec::new();
     // Number user/assistant messages so `/copy msg N` lines up with the display.
     let mut msg_num = 0usize;
     let meta = |out: &mut Vec<Line<'static>>, i: usize, num: usize, role: &str| {
@@ -503,6 +521,7 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         match entry {
             Entry::User(text) => {
                 msg_num += 1;
+                msg_starts.push(out.len());
                 meta(&mut out, i, msg_num, "you");
                 push_text(
                     &mut out,
@@ -515,6 +534,7 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             // inline/code spans), themed from the active hjkl theme.
             Entry::Assistant(text) => {
                 msg_num += 1;
+                msg_starts.push(out.len());
                 meta(&mut out, i, msg_num, "assistant");
                 let events = hjkl_markdown::parse(text);
                 out.extend(hjkl_markdown_tui::to_lines(
@@ -585,7 +605,7 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         }
     }
 
-    out
+    (out, msg_starts)
 }
 
 fn push_text(out: &mut Vec<Line<'static>>, prefix: Span<'static>, text: &str, style: Style) {

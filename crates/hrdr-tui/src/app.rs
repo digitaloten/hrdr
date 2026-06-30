@@ -142,6 +142,8 @@ pub(crate) struct App {
     pending_init: bool,
     /// A file `/edit` requested to open in `$EDITOR`, consumed by the run loop.
     pending_edit: Option<std::path::PathBuf>,
+    /// A `/goto` target message number, resolved to a scroll offset at draw.
+    pub(crate) pending_goto: Option<usize>,
     /// Auto-compact trigger as a fraction of the context window; 0 disables.
     pub(crate) auto_compact_ratio: f64,
     /// Ring the terminal bell when a turn finishes (after a brief minimum).
@@ -264,6 +266,7 @@ impl App {
             compacting: false,
             pending_init: false,
             pending_edit: None,
+            pending_goto: None,
             auto_compact_ratio: auto_compact,
             bell,
             base_url,
@@ -746,6 +749,7 @@ impl App {
             "compact" => self.compact_cmd(arg),
             "init" => self.init_agents_cmd(),
             "reload" => self.reload_cmd(),
+            "goto" => self.goto_cmd(arg),
             "timestamps" | "ts" => self.timestamps_cmd(arg),
             _ => return false,
         }
@@ -1280,6 +1284,66 @@ impl App {
             format!("messages #{a}-{b}")
         };
         self.copy_to_clipboard(&parts.join("\n\n"), &label);
+    }
+
+    /// `/goto <N | 5m | 1h | top | end>` — scroll the transcript to a message
+    /// number, to the message nearest a relative time ago, or to top/bottom.
+    fn goto_cmd(&mut self, arg: &str) {
+        let count = self.display_message_count();
+        if count == 0 {
+            self.system("no messages to jump to yet");
+            return;
+        }
+        let a = arg.trim().to_ascii_lowercase();
+        let target = match a.as_str() {
+            "" => {
+                self.system("usage: /goto <N | 5m | 1h | top | end>");
+                return;
+            }
+            "top" | "start" | "first" => 1,
+            "end" | "bottom" | "last" => {
+                self.scroll_offset = 0; // follow newest
+                self.system("jumped to the latest output");
+                return;
+            }
+            _ => {
+                if let Ok(n) = a.parse::<usize>() {
+                    n.clamp(1, count)
+                } else if let Some(secs) = parse_duration(&a) {
+                    let cutoff = chrono::Local::now() - chrono::Duration::seconds(secs);
+                    // First message at/after the cutoff; if all are older, the
+                    // newest one is closest to "that long ago".
+                    self.first_message_since(cutoff).unwrap_or(count)
+                } else {
+                    self.system("usage: /goto <N | 5m | 1h | top | end>");
+                    return;
+                }
+            }
+        };
+        self.pending_goto = Some(target);
+        self.system(format!("jumped to message #{target}"));
+    }
+
+    /// Number of user/assistant messages in the transcript.
+    fn display_message_count(&self) -> usize {
+        self.transcript
+            .iter()
+            .filter(|e| matches!(e, Entry::User(_) | Entry::Assistant(_)))
+            .count()
+    }
+
+    /// The number of the first user/assistant message sent at/after `cutoff`.
+    fn first_message_since(&self, cutoff: chrono::DateTime<chrono::Local>) -> Option<usize> {
+        let mut num = 0;
+        for (i, e) in self.transcript.iter().enumerate() {
+            if matches!(e, Entry::User(_) | Entry::Assistant(_)) {
+                num += 1;
+                if self.entry_times.get(i).is_some_and(|t| *t >= cutoff) {
+                    return Some(num);
+                }
+            }
+        }
+        None
     }
 
     /// The text of the Nth (1-based) user/assistant message in the transcript.
@@ -2113,6 +2177,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/temp", "show or set temperature"),
     ("/effort", "show or set effort label"),
     ("/info", "session info"),
+    ("/goto", "jump to message N or time (5m/1h/top/end)"),
     ("/copy", "copy reply (or 'code' / 'all' / 'msg N[-M]')"),
     ("/export", "write the transcript to a file"),
     ("/paste", "paste clipboard (file path → attach)"),
@@ -2141,6 +2206,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/rename",
             "/compact",
             "/info",
+            "/goto",
         ],
     ),
     (
@@ -2274,6 +2340,23 @@ fn last_fenced_block(md: &str) -> Option<String> {
         .next_back()
         .map(|b| b.trim_end().to_string())
         .filter(|b| !b.is_empty())
+}
+
+/// Parse a relative duration like `30s`, `5m`, `1h`, `2d` into seconds.
+fn parse_duration(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (digits, mult) = if let Some(n) = s.strip_suffix('s') {
+        (n, 1)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3600)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86_400)
+    } else {
+        return None;
+    };
+    digits.trim().parse::<i64>().ok().map(|v| v * mult)
 }
 
 /// Parse a message spec: `N` → `(N, N)`, or `N-M` → `(N, M)` (1-based,
@@ -2538,9 +2621,19 @@ fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatu
 #[cfg(test)]
 mod tests {
     use super::{
-        active_file_token, is_quit_command, last_fenced_block, parse_msg_range, resolve_alias,
-        slash_completions,
+        active_file_token, is_quit_command, last_fenced_block, parse_duration, parse_msg_range,
+        resolve_alias, slash_completions,
     };
+
+    #[test]
+    fn parse_duration_specs() {
+        assert_eq!(parse_duration("30s"), Some(30));
+        assert_eq!(parse_duration("5m"), Some(300));
+        assert_eq!(parse_duration("1h"), Some(3600));
+        assert_eq!(parse_duration("2d"), Some(172_800));
+        assert_eq!(parse_duration("5"), None); // no unit
+        assert_eq!(parse_duration("xm"), None);
+    }
 
     #[test]
     fn parse_msg_range_specs() {
