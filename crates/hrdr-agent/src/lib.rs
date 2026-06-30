@@ -65,6 +65,27 @@ impl Default for AgentConfig {
     }
 }
 
+/// Subset of config.toml we parse; all fields are optional.
+#[derive(serde::Deserialize, Default)]
+struct FileConfig {
+    base_url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+    temperature: Option<f32>,
+}
+
+fn config_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".config")
+            .join("hrdr")
+            .join("config.toml"),
+    )
+}
+
 impl AgentConfig {
     /// Build from `HRDR_BASE_URL`, `HRDR_MODEL`, `HRDR_API_KEY` (falling back to
     /// `OPENAI_API_KEY`), defaulting to a local infr endpoint.
@@ -79,6 +100,48 @@ impl AgentConfig {
         cfg.api_key = std::env::var("HRDR_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .ok();
+        cfg
+    }
+
+    /// Load config with precedence: env > `~/.config/hrdr/config.toml` > built-in defaults.
+    /// Does NOT auto-write a config file when one is missing.
+    pub fn load() -> Self {
+        // Start with defaults, layer file, then layer env on top.
+        let mut cfg = Self::default();
+
+        // Layer 1: file config.
+        if let Some(path) = config_path()
+            && let Ok(text) = std::fs::read_to_string(&path)
+            && let Ok(fc) = toml::from_str::<FileConfig>(&text)
+        {
+            if let Some(v) = fc.base_url {
+                cfg.base_url = v;
+            }
+            if let Some(v) = fc.api_key {
+                cfg.api_key = Some(v);
+            }
+            if let Some(v) = fc.model {
+                cfg.model = v;
+            }
+            if let Some(v) = fc.temperature {
+                cfg.temperature = Some(v);
+            }
+        }
+
+        // Layer 2: env vars override file.
+        if let Ok(v) = std::env::var("HRDR_BASE_URL") {
+            cfg.base_url = v;
+        }
+        if let Ok(v) = std::env::var("HRDR_MODEL") {
+            cfg.model = v;
+        }
+        let env_key = std::env::var("HRDR_API_KEY")
+            .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            .ok();
+        if env_key.is_some() {
+            cfg.api_key = env_key;
+        }
+
         cfg
     }
 }
