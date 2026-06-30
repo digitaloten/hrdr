@@ -26,6 +26,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `/init` creates a starter `AGENTS.md` in the working directory, with build and
+  test commands guessed from project markers (Cargo.toml, package.json,
+  pyproject.toml, go.mod, …) and TODO sections to fill in, then loads it into
+  the system prompt. Won't overwrite an existing `AGENTS.md`.
 - Input history: Up/Down in the input recalls previous submissions
   (readline-style), restoring your in-progress draft when you pass the newest.
   Active only for single-line input, so multi-line editing keeps normal cursor

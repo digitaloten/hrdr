@@ -612,6 +612,7 @@ impl App {
             "rename" => self.rename_session(arg),
             "sessions" => self.list_sessions_cmd(arg),
             "compact" => self.compact_cmd(arg),
+            "init" => self.init_agents_cmd(),
             _ => return false,
         }
         true
@@ -866,6 +867,36 @@ impl App {
             }
             None => self.system("busy — try again after the current turn"),
         }
+    }
+
+    /// `/init` — write a starter `AGENTS.md` in the cwd (build/test commands
+    /// guessed from project markers), then load it into the system prompt.
+    fn init_agents_cmd(&mut self) {
+        let cwd = self.agent.try_lock().ok().map(|a| a.cwd());
+        let Some(cwd) = cwd else {
+            self.system("busy — try again after the current turn");
+            return;
+        };
+        let path = cwd.join("AGENTS.md");
+        if path.exists() {
+            self.system(
+                "AGENTS.md already exists — edit it directly (or delete it and /init again)",
+            );
+            return;
+        }
+        let template = agents_template(&cwd);
+        if let Err(e) = std::fs::write(&path, &template) {
+            self.system(format!("can't write {}: {e}", path.display()));
+            return;
+        }
+        // Reload project instructions (re-gathers AGENTS.md, refreshes prompt).
+        if let Ok(mut a) = self.agent.try_lock() {
+            a.set_cwd(cwd.clone());
+        }
+        let lines = template.lines().count();
+        self.system(format!(
+            "wrote AGENTS.md ({lines} lines) and loaded it — fill in the TODOs to guide the agent"
+        ));
     }
 
     fn add_file(&mut self, arg: &str) {
@@ -1656,6 +1687,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/theme", "switch theme (path, or reset)"),
     ("/cwd", "show or change working directory"),
     ("/tools", "list available tools"),
+    ("/init", "create a starter AGENTS.md for this project"),
     ("/add", "attach a file (or type @path inline)"),
     ("/diff", "show git diff of the working tree"),
     ("/reasoning", "toggle showing model reasoning"),
@@ -1737,6 +1769,61 @@ const WALK_SKIP_DIRS: &[&str] = &[
     ".venv",
     "__pycache__",
 ];
+
+/// A starter `AGENTS.md`, with build/test commands guessed from the project's
+/// marker files (Cargo.toml, package.json, …). Sections left as TODO for the
+/// user to fill in.
+fn agents_template(cwd: &std::path::Path) -> String {
+    let has = |f: &str| cwd.join(f).exists();
+    let (stack, build, test) = if has("Cargo.toml") {
+        (
+            "Rust (Cargo)",
+            "cargo build",
+            "cargo test  # also: cargo clippy, cargo fmt",
+        )
+    } else if has("package.json") {
+        (
+            "Node.js",
+            "npm install",
+            "npm test  # or the project's package-manager equivalent",
+        )
+    } else if has("pyproject.toml") || has("setup.py") || has("setup.cfg") {
+        ("Python", "pip install -e .", "pytest")
+    } else if has("go.mod") {
+        ("Go", "go build ./...", "go test ./...")
+    } else if has("composer.json") {
+        ("PHP (Composer)", "composer install", "composer test")
+    } else if has("Gemfile") {
+        ("Ruby (Bundler)", "bundle install", "bundle exec rspec")
+    } else if has("pom.xml") {
+        ("Java (Maven)", "mvn compile", "mvn test")
+    } else if has("build.gradle") || has("build.gradle.kts") {
+        ("Java/Kotlin (Gradle)", "gradle build", "gradle test")
+    } else {
+        (
+            "TODO: describe the stack",
+            "TODO: build command",
+            "TODO: test command",
+        )
+    };
+    format!(
+        "# AGENTS.md\n\n\
+         Guidance for AI coding agents working in this repository \
+         (open standard: https://agents.md).\n\n\
+         ## Project\n\n\
+         TODO: one-paragraph description of what this project is and does.\n\n\
+         Detected stack: {stack}\n\n\
+         ## Setup / Build\n\n\
+         ```sh\n{build}\n```\n\n\
+         ## Test\n\n\
+         ```sh\n{test}\n```\n\n\
+         ## Conventions\n\n\
+         - TODO: formatting, naming, and style rules to follow.\n\
+         - TODO: commit message conventions.\n\n\
+         ## Notes\n\n\
+         - TODO: architecture overview, gotchas, or anything an agent should know.\n"
+    )
+}
 
 /// Collect relative file paths under `root` for `@file` completion. In a git
 /// repo, honors `.gitignore`/`.ignore` (and parents/global) + `.git/info/exclude`
