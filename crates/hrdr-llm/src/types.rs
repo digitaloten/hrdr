@@ -1,0 +1,289 @@
+//! OpenAI chat-completions wire types — the subset hrdr speaks.
+//!
+//! hrdr only ever sends structured `messages[]` + `tools[]`; the server
+//! (e.g. `infr`) owns chat-template application and tool-call parsing. We do
+//! not render model prompt formats here.
+
+use serde::{Deserialize, Serialize};
+
+/// Message author role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+/// A single chat message. Used for both request and response — `content` is
+/// optional because assistant turns that only call tools carry no text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: Role,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Model "thinking" channel (infr/Qwen3 etc). Received-only; never sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Set on `Role::Tool` messages to bind the result to its call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn system(text: impl Into<String>) -> Self {
+        Self::text(Role::System, text)
+    }
+
+    pub fn user(text: impl Into<String>) -> Self {
+        Self::text(Role::User, text)
+    }
+
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self::text(Role::Assistant, text)
+    }
+
+    fn text(role: Role, text: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: Some(text.into()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    /// A `Role::Tool` result message bound to `call_id`.
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: Some(content.into()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: Some(call_id.into()),
+            name: None,
+        }
+    }
+}
+
+/// A native tool call emitted by the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    #[serde(default)]
+    pub id: String,
+    #[serde(rename = "type", default = "function_kind")]
+    pub kind: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    /// Raw JSON string of arguments (OpenAI sends this as a string, not an object).
+    pub arguments: String,
+}
+
+fn function_kind() -> String {
+    "function".to_string()
+}
+
+/// A tool definition advertised to the model in the request `tools[]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDef {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: FunctionDef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDef {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema object describing the call arguments.
+    pub parameters: serde_json::Value,
+}
+
+impl ToolDef {
+    pub fn function(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
+        Self {
+            kind: "function".to_string(),
+            function: FunctionDef {
+                name: name.into(),
+                description: description.into(),
+                parameters,
+            },
+        }
+    }
+}
+
+/// Request body for `POST /v1/chat/completions`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatRequest {
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    pub stream: bool,
+}
+
+/// Non-streaming response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatResponse {
+    pub choices: Vec<Choice>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Choice {
+    pub message: ChatMessage,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u32,
+    #[serde(default)]
+    pub completion_tokens: u32,
+    #[serde(default)]
+    pub total_tokens: u32,
+}
+
+// ---- streaming ----
+
+/// One `chat.completion.chunk` SSE event.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatChunk {
+    #[serde(default)]
+    pub choices: Vec<ChunkChoice>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChunkChoice {
+    #[serde(default)]
+    pub delta: Delta,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Delta {
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ToolCallDelta {
+    #[serde(default)]
+    pub index: usize,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub function: Option<FunctionDelta>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FunctionDelta {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<String>,
+}
+
+/// Folds streaming chunks back into a single assistant [`ChatMessage`].
+///
+/// Tool-call deltas arrive fragmented (name on the first delta, arguments
+/// split across many); this reassembles them by `index`.
+#[derive(Debug, Default)]
+pub struct Accumulator {
+    pub content: String,
+    pub reasoning: String,
+    pub finish_reason: Option<String>,
+    calls: Vec<ToolCall>,
+}
+
+impl Accumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Merge one chunk. Returns the freshly-appended text delta (for live
+    /// rendering), if any.
+    pub fn push(&mut self, chunk: &ChatChunk) -> Option<String> {
+        let choice = chunk.choices.first()?;
+        if let Some(reason) = &choice.finish_reason {
+            self.finish_reason = Some(reason.clone());
+        }
+        if let Some(r) = &choice.delta.reasoning_content {
+            self.reasoning.push_str(r);
+        }
+        for tc in choice.delta.tool_calls.iter().flatten() {
+            if self.calls.len() <= tc.index {
+                self.calls.resize_with(tc.index + 1, || ToolCall {
+                    id: String::new(),
+                    kind: "function".to_string(),
+                    function: FunctionCall {
+                        name: String::new(),
+                        arguments: String::new(),
+                    },
+                });
+            }
+            let slot = &mut self.calls[tc.index];
+            if let Some(id) = &tc.id
+                && !id.is_empty()
+            {
+                slot.id = id.clone();
+            }
+            if let Some(f) = &tc.function {
+                if let Some(name) = &f.name {
+                    slot.function.name.push_str(name);
+                }
+                if let Some(args) = &f.arguments {
+                    slot.function.arguments.push_str(args);
+                }
+            }
+        }
+        let delta = choice.delta.content.clone();
+        if let Some(text) = &delta {
+            self.content.push_str(text);
+        }
+        delta
+    }
+
+    /// Whether the model asked to call at least one tool.
+    pub fn has_tool_calls(&self) -> bool {
+        !self.calls.is_empty()
+    }
+
+    /// Assemble the final assistant message.
+    pub fn into_message(self) -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            content: (!self.content.is_empty()).then_some(self.content),
+            reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
+            tool_calls: (!self.calls.is_empty()).then_some(self.calls),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+}

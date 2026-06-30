@@ -1,0 +1,20 @@
+[package]
+name = "hrdr"
+description = "hrdr — herder: a fast, agentic coding harness for OpenAI-compatible models."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "hrdr"
+path = "src/main.rs"
+
+[dependencies]
+hrdr-agent.workspace = true
+hrdr-tui.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true

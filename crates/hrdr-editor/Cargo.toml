@@ -1,0 +1,18 @@
+[package]
+name = "hrdr-editor"
+description = "FSM-agnostic text-editor seam for hrdr, embedding the hjkl engine behind an EditorEngine trait."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+hjkl-engine.workspace = true
+hjkl-vim.workspace = true
+hjkl-buffer.workspace = true
+hjkl-buffer-tui.workspace = true
+hjkl-engine-tui.workspace = true
+hjkl-clipboard.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true

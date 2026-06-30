@@ -1,0 +1,17 @@
+[package]
+name = "hrdr-tui"
+description = "hrdr terminal UI — agent transcript + vim-keybound input pane (hjkl), live streaming."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+hrdr-agent.workspace = true
+hrdr-editor.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
