@@ -26,6 +26,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `/copy` variants: `/copy` (last reply, as before), `/copy code` (the most
+  recent fenced code block), and `/copy all` (the whole transcript as text).
+- `/edit <file>` opens a file (relative to the cwd, created if missing) in
+  `$EDITOR`/`$VISUAL`, suspending the TUI while you edit.
+- `/retry [model]` re-runs the last turn, optionally switching to `model` first
+  (for that turn and subsequent ones) to compare outputs.
 - Input draft size estimate: while you type, the input box's bottom-right border
   shows a rough token count and character count (`~123 tok · 480 ch`), so you
   can gauge how big a message (or paste) is before sending.

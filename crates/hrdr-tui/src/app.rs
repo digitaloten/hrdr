@@ -28,6 +28,8 @@ use crate::ui;
 enum Action {
     None,
     OpenEditor,
+    /// Open a specific file in `$EDITOR` (from `/edit <file>`).
+    OpenFile(std::path::PathBuf),
 }
 
 /// One rendered item in the transcript.
@@ -108,6 +110,8 @@ pub(crate) struct App {
     pub(crate) compacting: bool,
     /// True while an `/init` turn runs, so its result reloads `AGENTS.md`.
     pending_init: bool,
+    /// A file `/edit` requested to open in `$EDITOR`, consumed by the run loop.
+    pending_edit: Option<std::path::PathBuf>,
     /// Auto-compact trigger as a fraction of the context window; 0 disables.
     pub(crate) auto_compact_ratio: f64,
     /// Ring the terminal bell when a turn finishes (after a brief minimum).
@@ -225,6 +229,7 @@ impl App {
             show_reasoning: true,
             compacting: false,
             pending_init: false,
+            pending_edit: None,
             auto_compact_ratio: auto_compact,
             bell,
             base_url,
@@ -299,11 +304,11 @@ impl App {
 
             tokio::select! {
                 maybe_ev = events.next() => match maybe_ev {
-                    Some(Ok(Event::Key(key))) => {
-                        if let Action::OpenEditor = self.on_key(key) {
-                            self.open_in_editor(terminal)?;
-                        }
-                    }
+                    Some(Ok(Event::Key(key))) => match self.on_key(key) {
+                        Action::OpenEditor => self.open_in_editor(terminal)?,
+                        Action::OpenFile(path) => self.open_file_in_editor(terminal, &path)?,
+                        Action::None => {}
+                    },
                     Some(Ok(Event::Mouse(m))) => self.on_mouse(m),
                     Some(Ok(Event::Paste(text))) => {
                         self.quit_armed = false;
@@ -470,6 +475,9 @@ impl App {
             if self.handle_slash(input.trim()) {
                 self.editor.set_content("");
                 self.scroll_offset = 0;
+                if let Some(path) = self.pending_edit.take() {
+                    return Action::OpenFile(path);
+                }
                 return Action::None;
             }
             self.editor.set_content("");
@@ -529,6 +537,20 @@ impl App {
             self.editor.set_content(text);
         }
         let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    /// Open an arbitrary file in `$EDITOR` (from `/edit <file>`), suspending the
+    /// TUI for the duration. The file may not exist yet — the editor creates it.
+    fn open_file_in_editor(&mut self, terminal: &mut Tui, path: &std::path::Path) -> Result<()> {
+        crate::suspend_terminal(terminal)?;
+        let status = run_editor(path);
+        crate::resume_terminal(terminal)?;
+        terminal.clear()?;
+        match status {
+            Ok(_) => self.system(format!("edited {}", path.display())),
+            Err(e) => self.system(format!("editor failed: {e}")),
+        }
         Ok(())
     }
 
@@ -622,8 +644,9 @@ impl App {
                 }
             }
             "info" => self.show_info(),
-            "copy" => self.copy_last_reply(),
-            "retry" => self.retry_last(),
+            "copy" => self.copy_cmd(arg),
+            "retry" => self.retry_last(arg),
+            "edit" => self.edit_file_cmd(arg),
             "undo" => self.undo_last(),
             "resume" | "load" => self.resume_session(arg),
             "rename" => self.rename_session(arg),
@@ -1098,27 +1121,122 @@ impl App {
         }
     }
 
-    fn copy_last_reply(&mut self) {
-        let last = self.transcript.iter().rev().find_map(|e| match e {
-            Entry::Assistant(s) => Some(s.clone()),
-            _ => None,
-        });
-        match (last, self.clipboard.as_mut()) {
-            (Some(text), Some(cb)) => {
-                match cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()) {
-                    Ok(()) => self.system("copied last reply to clipboard"),
-                    Err(_) => self.system("clipboard write failed"),
+    /// `/copy [code|all]` — copy the last reply (default), the last code block,
+    /// or the whole transcript to the clipboard.
+    fn copy_cmd(&mut self, arg: &str) {
+        match arg.trim().to_ascii_lowercase().as_str() {
+            "" | "reply" | "last" => match self.last_assistant_text() {
+                Some(t) => self.copy_to_clipboard(&t, "last reply"),
+                None => self.system("no assistant reply to copy"),
+            },
+            "code" => match self.last_code_block() {
+                Some(t) => self.copy_to_clipboard(&t, "last code block"),
+                None => self.system("no code block to copy"),
+            },
+            "all" | "transcript" => {
+                let t = self.transcript_text();
+                if t.is_empty() {
+                    self.system("nothing to copy");
+                } else {
+                    self.copy_to_clipboard(&t, "transcript");
                 }
             }
-            (Some(_), None) => self.system("clipboard unavailable"),
-            (None, _) => self.system("no assistant reply to copy"),
+            other => self.system(format!(
+                "usage: /copy [code|all]  (unknown option: {other})"
+            )),
         }
     }
 
-    fn retry_last(&mut self) {
+    /// Write `text` to the system clipboard, reporting success/failure.
+    fn copy_to_clipboard(&mut self, text: &str, label: &str) {
+        let res = self
+            .clipboard
+            .as_mut()
+            .map(|cb| cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()));
+        match res {
+            Some(Ok(())) => self.system(format!("copied {label} to clipboard")),
+            Some(Err(_)) => self.system("clipboard write failed"),
+            None => self.system("clipboard unavailable"),
+        }
+    }
+
+    /// The most recent assistant message text.
+    fn last_assistant_text(&self) -> Option<String> {
+        self.transcript.iter().rev().find_map(|e| match e {
+            Entry::Assistant(s) => Some(s.clone()),
+            _ => None,
+        })
+    }
+
+    /// The most recent fenced code block across assistant messages.
+    fn last_code_block(&self) -> Option<String> {
+        self.transcript.iter().rev().find_map(|e| match e {
+            Entry::Assistant(s) => last_fenced_block(s),
+            _ => None,
+        })
+    }
+
+    /// A plain-text rendering of the conversation for `/copy all`.
+    fn transcript_text(&self) -> String {
+        let mut out = String::new();
+        for e in &self.transcript {
+            match e {
+                Entry::User(s) => out.push_str(&format!("## User\n{s}\n\n")),
+                Entry::Assistant(s) => out.push_str(&format!("## Assistant\n{s}\n\n")),
+                Entry::System(s) => out.push_str(&format!("[{s}]\n\n")),
+                Entry::Diff(s) => out.push_str(&format!("{s}\n\n")),
+                Entry::Tool { name, .. } => out.push_str(&format!("[tool: {name}]\n\n")),
+                Entry::Reasoning(_) | Entry::Stats(_) => {}
+            }
+        }
+        out.trim_end().to_string()
+    }
+
+    /// `/edit <file>` — open a file (relative to the cwd) in `$EDITOR`.
+    fn edit_file_cmd(&mut self, arg: &str) {
+        if arg.is_empty() {
+            self.system("usage: /edit <file>");
+            return;
+        }
+        if self.running {
+            self.system("can't /edit while a turn is running");
+            return;
+        }
+        let Some(cwd) = self.agent.try_lock().ok().map(|a| a.cwd()) else {
+            self.system("busy — try again after the current turn");
+            return;
+        };
+        let p = std::path::Path::new(arg);
+        let path = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        };
+        // Consumed by the run loop (it owns the terminal needed to suspend).
+        self.pending_edit = Some(path);
+    }
+
+    fn retry_last(&mut self, arg: &str) {
         if self.running {
             self.system("can't retry while a turn is running");
             return;
+        }
+        // Optional model switch for this retry (and subsequent turns).
+        if !arg.is_empty() {
+            let ok = match self.agent.try_lock() {
+                Ok(mut a) => {
+                    a.set_model(arg);
+                    true
+                }
+                Err(_) => false,
+            };
+            if ok {
+                self.model = arg.to_string();
+                self.system(format!("model → {arg}"));
+            } else {
+                self.system("busy — try again after the current turn");
+                return;
+            }
         }
         let text = self
             .agent
@@ -1748,8 +1866,9 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/temp", "show or set temperature"),
     ("/effort", "show or set effort label"),
     ("/info", "session info"),
-    ("/copy", "copy last reply"),
-    ("/retry", "re-run last turn"),
+    ("/copy", "copy reply (or 'code' / 'all')"),
+    ("/edit", "open a file in $EDITOR"),
+    ("/retry", "re-run last turn (optional model)"),
     ("/undo", "undo last turn (edit & resend)"),
     ("/help", "list commands"),
     ("/exit", "quit"),
@@ -1823,6 +1942,32 @@ const WALK_SKIP_DIRS: &[&str] = &[
     ".venv",
     "__pycache__",
 ];
+
+/// The last fenced (```…```) code block in markdown `md`, without the fences.
+fn last_fenced_block(md: &str) -> Option<String> {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_block = false;
+    for line in md.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_block {
+                blocks.push(std::mem::take(&mut cur));
+                in_block = false;
+            } else {
+                in_block = true;
+                cur.clear();
+            }
+        } else if in_block {
+            cur.push_str(line);
+            cur.push('\n');
+        }
+    }
+    blocks
+        .into_iter()
+        .next_back()
+        .map(|b| b.trim_end().to_string())
+        .filter(|b| !b.is_empty())
+}
 
 /// Max input-history entries kept (in memory and on disk).
 const MAX_HISTORY: usize = 200;
@@ -2072,7 +2217,17 @@ fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatu
 
 #[cfg(test)]
 mod tests {
-    use super::{active_file_token, is_quit_command, resolve_alias, slash_completions};
+    use super::{
+        active_file_token, is_quit_command, last_fenced_block, resolve_alias, slash_completions,
+    };
+
+    #[test]
+    fn last_fenced_block_extraction() {
+        let md = "intro\n```rust\nfn a() {}\n```\nmid\n```\nlast block\nline2\n```\nend";
+        assert_eq!(last_fenced_block(md).as_deref(), Some("last block\nline2"));
+        assert_eq!(last_fenced_block("no code here"), None);
+        assert_eq!(last_fenced_block("```\n\n```"), None); // empty block
+    }
 
     #[test]
     fn aliases_resolve_to_canonical() {
