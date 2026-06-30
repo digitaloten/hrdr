@@ -56,6 +56,10 @@ impl Client {
             tools,
             temperature: self.temperature,
             stream,
+            // Ask for token usage on streamed turns (for the live loader stats).
+            stream_options: stream.then_some(crate::types::StreamOptions {
+                include_usage: true,
+            }),
         }
     }
 

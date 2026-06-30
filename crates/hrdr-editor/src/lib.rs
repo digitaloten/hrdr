@@ -42,8 +42,27 @@ pub trait EditorEngine {
     fn wants_submit(&self, key: &KeyEvent) -> bool;
     /// One-line key hint for the status bar, specific to this discipline.
     fn keybind_hint(&self) -> &'static str;
+    /// Desired number of text rows for the input box given the inner `width`,
+    /// clamped to `1..=max`. Lets the host auto-grow the input with content.
+    /// Default counts logical lines (suits no-wrap engines like vim).
+    fn desired_rows(&self, _width: u16, max: u16) -> u16 {
+        let lines = self.content().split('\n').count().max(1);
+        (lines as u16).clamp(1, max)
+    }
     /// Draw the editable pane into `area` and place the cursor.
     fn render(&mut self, frame: &mut Frame, area: Rect);
+}
+
+/// Number of display rows `text` occupies when hard-wrapped at `width` columns.
+pub(crate) fn wrapped_row_count(text: &str, width: u16) -> usize {
+    let w = width.max(1) as usize;
+    text.split('\n')
+        .map(|line| {
+            let cells = line.chars().count();
+            if cells == 0 { 1 } else { cells.div_ceil(w) }
+        })
+        .sum::<usize>()
+        .max(1)
 }
 
 /// The default discipline: hjkl's vim FSM.

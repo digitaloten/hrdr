@@ -36,6 +36,11 @@ pub enum AgentEvent {
         result: String,
         ok: bool,
     },
+    /// Token usage reported for the latest model call (when the server sends it).
+    Usage {
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    },
     /// The model produced a final answer with no further tool calls.
     TurnDone,
 }
@@ -218,6 +223,13 @@ impl Agent {
                 if let Some(text) = acc.push(&chunk) {
                     on_event(AgentEvent::Text(text));
                 }
+            }
+
+            if let Some(u) = &acc.usage {
+                on_event(AgentEvent::Usage {
+                    prompt_tokens: u.prompt_tokens,
+                    completion_tokens: u.completion_tokens,
+                });
             }
 
             let assistant = acc.into_message();

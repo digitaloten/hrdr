@@ -11,6 +11,8 @@ use crate::app::{App, Entry};
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
 /// Max lines shown in the TODO panel (plus 2 for borders).
 const TODO_PANEL_MAX_ITEMS: u16 = 6;
+/// Input box grows with content up to this many text rows (plus 2 for borders).
+const INPUT_MAX_ROWS: u16 = 5;
 
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -18,38 +20,44 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // Snapshot TODO count while briefly holding the lock.
     let todo_count = app.todos.lock().map(|t| t.len()).unwrap_or(0);
     let todo_height = if todo_count > 0 {
-        // +2 for borders, cap at TODO_PANEL_MAX_ITEMS visible items.
         (todo_count as u16).min(TODO_PANEL_MAX_ITEMS) + 2
     } else {
         0
     };
 
-    // Build constraints dynamically so the TODO panel appears only when needed.
-    let (transcript_area, todo_area, input_area, status_area) = if todo_height > 0 {
-        let chunks = Layout::vertical([
-            Constraint::Min(3),
-            Constraint::Length(todo_height),
-            Constraint::Length(7),
-            Constraint::Length(1),
-        ])
-        .split(area);
-        (chunks[0], Some(chunks[1]), chunks[2], chunks[3])
-    } else {
-        let chunks = Layout::vertical([
-            Constraint::Min(3),
-            Constraint::Length(7),
-            Constraint::Length(1),
-        ])
-        .split(area);
-        (chunks[0], None, chunks[1], chunks[2])
-    };
+    // The inference loader sits just above the input while a turn runs.
+    let loader_height: u16 = if app.running { 1 } else { 0 };
 
-    draw_transcript(f, app, transcript_area);
-    if let Some(ta) = todo_area {
-        draw_todos(f, app, ta);
+    // Input box auto-grows 1..=INPUT_MAX_ROWS text rows with the content (+2 border).
+    let input_inner_w = area.width.saturating_sub(2);
+    let input_height = app.editor.desired_rows(input_inner_w, INPUT_MAX_ROWS) + 2;
+
+    // Build the row stack dynamically, remembering each section's index.
+    let mut constraints = vec![Constraint::Min(3)];
+    let todo_idx = (todo_height > 0).then(|| {
+        constraints.push(Constraint::Length(todo_height));
+        constraints.len() - 1
+    });
+    let loader_idx = (loader_height > 0).then(|| {
+        constraints.push(Constraint::Length(loader_height));
+        constraints.len() - 1
+    });
+    constraints.push(Constraint::Length(input_height));
+    let input_idx = constraints.len() - 1;
+    constraints.push(Constraint::Length(1));
+    let status_idx = constraints.len() - 1;
+
+    let chunks = Layout::vertical(constraints).split(area);
+
+    draw_transcript(f, app, chunks[0]);
+    if let Some(i) = todo_idx {
+        draw_todos(f, app, chunks[i]);
     }
-    draw_input(f, app, input_area);
-    draw_status(f, app, status_area);
+    if let Some(i) = loader_idx {
+        draw_loader(f, app, chunks[i]);
+    }
+    draw_input(f, app, chunks[input_idx]);
+    draw_status(f, app, chunks[status_idx]);
 }
 
 fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
@@ -103,6 +111,59 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The inference loader: spinner + live stats (context size, in/out ratio,
+/// token throughput) shown above the input while a turn runs.
+fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
+    let elapsed = app.turn_started.map(|t| t.elapsed()).unwrap_or_default();
+    let frame = SPINNER[(elapsed.as_millis() / 120) as usize % SPINNER.len()];
+
+    // Live throughput since the first token arrived.
+    let speed = match app.first_token_at {
+        Some(t0) if app.out_tokens > 0 => {
+            let secs = t0.elapsed().as_secs_f64();
+            if secs > 0.0 {
+                app.out_tokens as f64 / secs
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    };
+
+    let ctx = match app.last_usage {
+        Some((prompt, completion)) => {
+            let ratio = if completion > 0 {
+                prompt as f64 / completion as f64
+            } else {
+                0.0
+            };
+            format!("ctx {prompt} tok · in/out {prompt}/{completion} ({ratio:.1}:1)")
+        }
+        None => "ctx —".to_string(),
+    };
+
+    let phase = if app.first_token_at.is_some() {
+        "generating"
+    } else {
+        "inferring"
+    };
+    let text = format!(
+        " {frame} {phase}  ·  {ctx}  ·  {speed:.1} tok/s ({} out)  ·  {:.1}s",
+        app.out_tokens,
+        elapsed.as_secs_f64(),
+    );
+    f.render_widget(
+        Paragraph::new(text).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        area,
+    );
 }
 
 fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
@@ -225,6 +286,26 @@ fn transcript_lines(app: &App) -> Vec<Line<'static>> {
         }
         out.push(Line::raw(""));
     }
+
+    // Pending queued messages float at the bottom (following the output) until
+    // they're actually sent — rendered dimmed, distinct from committed entries.
+    if !app.queue.is_empty() {
+        out.push(Line::from(Span::styled(
+            "— queued —",
+            Style::default().fg(Color::DarkGray),
+        )));
+        for msg in &app.queue {
+            push_text(
+                &mut out,
+                Span::styled("❯ ", Style::default().fg(Color::DarkGray).bold()),
+                msg,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            );
+        }
+    }
+
     out
 }
 

@@ -144,6 +144,12 @@ async fn run_headless(config: AgentConfig, prompt: String) -> Result<()> {
                 };
                 eprintln!("{mark} {name}");
             }
+            AgentEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                eprintln!("\x1b[90m[usage] ctx {prompt_tokens} · out {completion_tokens}\x1b[0m");
+            }
             AgentEvent::TurnDone => println!(),
         })
         .await?;

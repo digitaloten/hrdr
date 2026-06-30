@@ -136,6 +136,15 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// Streaming options. `include_usage` asks the server to emit a final chunk
+/// carrying token counts (OpenAI / llama-server support this).
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
 }
 
 /// Non-streaming response.
@@ -165,11 +174,14 @@ pub struct Usage {
 
 // ---- streaming ----
 
-/// One `chat.completion.chunk` SSE event.
+/// One `chat.completion.chunk` SSE event. The final chunk (when `include_usage`
+/// is set) carries `usage` with empty `choices`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatChunk {
     #[serde(default)]
     pub choices: Vec<ChunkChoice>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -219,6 +231,8 @@ pub struct Accumulator {
     pub content: String,
     pub reasoning: String,
     pub finish_reason: Option<String>,
+    /// Token usage from the final `include_usage` chunk, if the server sent it.
+    pub usage: Option<Usage>,
     calls: Vec<ToolCall>,
 }
 
@@ -230,6 +244,11 @@ impl Accumulator {
     /// Merge one chunk. Returns the freshly-appended text delta (for live
     /// rendering), if any.
     pub fn push(&mut self, chunk: &ChatChunk) -> Option<String> {
+        // The usage chunk arrives with empty `choices`, so capture it before
+        // the early return below.
+        if chunk.usage.is_some() {
+            self.usage = chunk.usage.clone();
+        }
         let choice = chunk.choices.first()?;
         if let Some(reason) = &choice.finish_reason {
             self.finish_reason = Some(reason.clone());
@@ -304,6 +323,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         }
     }
 

@@ -12,9 +12,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
-use crate::EditorEngine;
+use crate::{EditorEngine, wrapped_row_count};
 
 /// A plain UTF-8 text buffer with a char-index cursor.
 #[derive(Default)]
@@ -133,21 +134,6 @@ impl PlainEngine {
     fn pending_backslash(&self) -> bool {
         self.cursor > 0 && self.chars[self.cursor - 1] == '\\'
     }
-
-    /// Cursor position as `(row, col)` in display lines from the buffer top.
-    fn cursor_rowcol(&self) -> (usize, usize) {
-        let mut row = 0;
-        let mut col = 0;
-        for &c in &self.chars[..self.cursor] {
-            if c == '\n' {
-                row += 1;
-                col = 0;
-            } else {
-                col += 1;
-            }
-        }
-        (row, col)
-    }
 }
 
 impl EditorEngine for PlainEngine {
@@ -217,16 +203,56 @@ impl EditorEngine for PlainEngine {
         "Enter=send · Alt/Shift+Enter or \\+Enter=newline · Ctrl+G=$EDITOR · Ctrl+C×2=quit"
     }
 
-    fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let text: String = self.chars.iter().collect();
-        frame.render_widget(Paragraph::new(text), area);
+    fn desired_rows(&self, width: u16, max: u16) -> u16 {
+        (wrapped_row_count(&self.content(), width) as u16).clamp(1, max)
+    }
 
-        let (row, col) = self.cursor_rowcol();
-        let max_x = area.width.saturating_sub(1);
-        let max_y = area.height.saturating_sub(1);
-        let x = area.x + (col as u16).min(max_x);
-        let y = area.y + (row as u16).min(max_y);
-        frame.set_cursor_position((x, y));
+    fn render(&mut self, frame: &mut Frame, area: Rect) {
+        // Hard-wrap at the inner width, tracking the cursor's wrapped position,
+        // so render and `desired_rows` agree and the cursor stays correct.
+        let width = area.width.max(1) as usize;
+        let mut lines: Vec<String> = vec![String::new()];
+        let mut col = 0usize;
+        let (mut crow, mut ccol) = (0usize, 0usize);
+        for i in 0..=self.chars.len() {
+            if i == self.cursor {
+                crow = lines.len() - 1;
+                ccol = col;
+            }
+            if i == self.chars.len() {
+                break;
+            }
+            match self.chars[i] {
+                '\n' => {
+                    lines.push(String::new());
+                    col = 0;
+                }
+                c => {
+                    if col == width {
+                        lines.push(String::new());
+                        col = 0;
+                    }
+                    lines.last_mut().unwrap().push(c);
+                    col += 1;
+                }
+            }
+        }
+
+        // Vertically scroll so the cursor row stays visible when the content is
+        // taller than the (capped) box.
+        let height = area.height.max(1) as usize;
+        let top = crow.saturating_sub(height - 1);
+        let visible: Vec<Line> = lines
+            .iter()
+            .skip(top)
+            .take(height)
+            .map(|l| Line::from(l.clone()))
+            .collect();
+        frame.render_widget(Paragraph::new(visible), area);
+
+        let sx = (ccol as u16).min(area.width.saturating_sub(1));
+        let sy = (crow - top) as u16;
+        frame.set_cursor_position((area.x + sx, area.y + sy));
     }
 }
 

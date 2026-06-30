@@ -16,6 +16,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Queued messages now float as a dimmed "— queued —" block at the bottom,
+  following the output, and are committed into history only when actually sent
+  (rather than being pinned at their typed position mid-conversation).
+- Auto-growing input box: starts at one row and expands with content up to five
+  rows (then scrolls internally); plain input wraps long lines to match.
+- Inference loader above the input while a turn runs: an animated spinner with
+  live stats — context size, input/output token ratio, and throughput (tok/s) —
+  driven by streamed `usage` (via `stream_options.include_usage`).
 - Chat scrolling: mouse wheel scrolls the transcript, `PageUp`/`PageDown` page
   through it, and `End` resumes following the newest output. While scrolled up,
   a "Press END to follow output" button appears on the input box's top border —

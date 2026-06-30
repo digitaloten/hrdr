@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -75,6 +76,15 @@ pub(crate) struct App {
     /// Set after one idle Ctrl+C; a second consecutive Ctrl+C quits. Any other
     /// key (or a mouse action) disarms it.
     pub(crate) quit_armed: bool,
+    // ---- live inference stats (for the loader above the input) ----
+    /// When the current turn started (for elapsed time + spinner).
+    pub(crate) turn_started: Option<Instant>,
+    /// When the first output token of the turn arrived (for tok/s).
+    pub(crate) first_token_at: Option<Instant>,
+    /// Streamed output deltas this turn (≈ tokens).
+    pub(crate) out_tokens: usize,
+    /// `(prompt_tokens, completion_tokens)` from the latest model call.
+    pub(crate) last_usage: Option<(u32, u32)>,
     tx: mpsc::UnboundedSender<TurnMsg>,
     rx: Option<mpsc::UnboundedReceiver<TurnMsg>>,
     should_quit: bool,
@@ -114,6 +124,10 @@ impl App {
             queue: VecDeque::new(),
             follow_button: None,
             quit_armed: false,
+            turn_started: None,
+            first_token_at: None,
+            out_tokens: 0,
+            last_usage: None,
             tx,
             rx: Some(rx),
             should_quit: false,
@@ -123,6 +137,8 @@ impl App {
     pub(crate) async fn run(&mut self, terminal: &mut Tui) -> Result<()> {
         let mut events = EventStream::new();
         let mut rx = self.rx.take().expect("run called once");
+        // Periodic wake so the inference spinner animates between tokens.
+        let mut ticker = tokio::time::interval(Duration::from_millis(120));
 
         loop {
             terminal.draw(|f| ui::draw(f, self))?;
@@ -142,6 +158,7 @@ impl App {
                     Some(Err(_)) | None => break,
                 },
                 Some(msg) = rx.recv() => self.on_turn_msg(msg),
+                _ = ticker.tick() => {}
             }
         }
         Ok(())
@@ -240,11 +257,12 @@ impl App {
             if input.trim().is_empty() {
                 return Action::None;
             }
-            self.transcript.push(Entry::User(input.clone()));
             self.editor.set_content("");
             self.scroll_offset = 0; // auto-follow on new submission
             if self.running {
-                // A turn is in flight — queue it, run after the current one.
+                // A turn is in flight — queue it. It renders as pending at the
+                // bottom (following the output) and is committed into history
+                // only when it's actually sent (see `spawn_turn`).
                 self.queue.push_back(input);
             } else {
                 self.spawn_turn(input);
@@ -317,8 +335,15 @@ impl App {
     }
 
     fn spawn_turn(&mut self, input: String) {
+        // Commit the message into history at send time (a queued message lives
+        // as a pending bottom item until this point).
+        self.transcript.push(Entry::User(input.clone()));
         self.running = true;
         self.status = "thinking…".to_string();
+        self.turn_started = Some(Instant::now());
+        self.first_token_at = None;
+        self.out_tokens = 0;
+        self.last_usage = None;
         let agent = self.agent.clone();
         let tx = self.tx.clone();
         let tx_events = tx.clone();
@@ -364,16 +389,36 @@ impl App {
         }
     }
 
+    /// Count a streamed delta toward the live tok/s stats.
+    fn count_token(&mut self) {
+        if self.first_token_at.is_none() {
+            self.first_token_at = Some(Instant::now());
+        }
+        self.out_tokens += 1;
+    }
+
     fn apply_event(&mut self, ev: AgentEvent) {
         match ev {
-            AgentEvent::Text(t) => match self.transcript.last_mut() {
-                Some(Entry::Assistant(s)) => s.push_str(&t),
-                _ => self.transcript.push(Entry::Assistant(t)),
-            },
-            AgentEvent::Reasoning(t) => match self.transcript.last_mut() {
-                Some(Entry::Reasoning(s)) => s.push_str(&t),
-                _ => self.transcript.push(Entry::Reasoning(t)),
-            },
+            AgentEvent::Text(t) => {
+                self.count_token();
+                match self.transcript.last_mut() {
+                    Some(Entry::Assistant(s)) => s.push_str(&t),
+                    _ => self.transcript.push(Entry::Assistant(t)),
+                }
+            }
+            AgentEvent::Reasoning(t) => {
+                self.count_token();
+                match self.transcript.last_mut() {
+                    Some(Entry::Reasoning(s)) => s.push_str(&t),
+                    _ => self.transcript.push(Entry::Reasoning(t)),
+                }
+            }
+            AgentEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                self.last_usage = Some((prompt_tokens, completion_tokens));
+            }
             AgentEvent::ToolStart { id, name, args } => {
                 self.status = format!("running {name}…");
                 self.transcript.push(Entry::Tool {
