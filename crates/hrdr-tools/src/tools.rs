@@ -422,3 +422,220 @@ fn render_todos(todos: &[TodoItem]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn ctx(cwd: PathBuf) -> ToolContext {
+        ToolContext::new(cwd)
+    }
+
+    // ---- read_file ----
+
+    #[tokio::test]
+    async fn read_file_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let out = ReadTool
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}), &c)
+            .await
+            .unwrap();
+        assert!(out.contains("     1\talpha"), "line 1 not found: {out}");
+        assert!(out.contains("     2\tbeta"), "line 2 not found: {out}");
+        assert!(out.contains("     3\tgamma"), "line 3 not found: {out}");
+    }
+
+    #[tokio::test]
+    async fn read_file_offset_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "1\n2\n3\n4\n5\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let out = ReadTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "offset": 2, "limit": 2}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(!out.contains("     1\t"), "line 1 should be skipped");
+        assert!(out.contains("     2\t2"), "line 2 missing: {out}");
+        assert!(out.contains("     3\t3"), "line 3 missing: {out}");
+        assert!(!out.contains("     4\t"), "line 4 should be skipped");
+    }
+
+    // ---- write_file ----
+
+    #[tokio::test]
+    async fn write_file_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let c = ctx(dir.path().to_path_buf());
+        WriteTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "content": "hello world"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a").join("b").join("c.txt");
+        let c = ctx(dir.path().to_path_buf());
+        WriteTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "content": "nested"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "nested");
+    }
+
+    // ---- edit ----
+
+    #[tokio::test]
+    async fn edit_unique_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "foo bar baz").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        EditTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "old_string": "bar", "new_string": "qux"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "foo qux baz");
+    }
+
+    #[tokio::test]
+    async fn edit_not_found_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "foo bar baz").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let result = EditTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "old_string": "zzz", "new_string": "x"}),
+                &c,
+            )
+            .await;
+        assert!(result.is_err(), "expected error for not-found old_string");
+    }
+
+    #[tokio::test]
+    async fn edit_non_unique_without_replace_all_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "aa bb aa").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let result = EditTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "old_string": "aa", "new_string": "cc"}),
+                &c,
+            )
+            .await;
+        assert!(result.is_err(), "expected error for non-unique match");
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "aa bb aa").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        EditTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "old_string": "aa", "new_string": "cc", "replace_all": true}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "cc bb cc");
+    }
+
+    // ---- glob ----
+
+    #[tokio::test]
+    async fn glob_finds_matching_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let out = GlobTool
+            .execute(serde_json::json!({"pattern": "*.rs"}), &c)
+            .await
+            .unwrap();
+        assert!(out.contains("a.rs"), "a.rs missing: {out}");
+        assert!(out.contains("b.rs"), "b.rs missing: {out}");
+        assert!(!out.contains("c.txt"), "c.txt should not appear: {out}");
+    }
+
+    #[tokio::test]
+    async fn glob_no_matches_returns_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let out = GlobTool
+            .execute(serde_json::json!({"pattern": "*.nonexistent"}), &c)
+            .await
+            .unwrap();
+        assert_eq!(out, "(no matches)");
+    }
+
+    // ---- todo_write ----
+
+    #[tokio::test]
+    async fn todo_write_render_marks() {
+        let c = ctx(std::path::PathBuf::from("."));
+        let out = TodoTool
+            .execute(
+                serde_json::json!({
+                    "todos": [
+                        {"content": "pending task",  "status": "pending"},
+                        {"content": "active task",   "status": "in_progress"},
+                        {"content": "done task",     "status": "completed"}
+                    ]
+                }),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("[ ] pending task"), "pending: {out}");
+        assert!(out.contains("[~] active task"), "in_progress: {out}");
+        assert!(out.contains("[x] done task"), "completed: {out}");
+    }
+
+    // ---- bash ----
+
+    #[tokio::test]
+    async fn bash_echo_captures_output() {
+        let c = ctx(std::path::PathBuf::from("."));
+        let out = BashTool
+            .execute(serde_json::json!({"command": "echo hello_hrdr"}), &c)
+            .await
+            .unwrap();
+        assert!(out.contains("hello_hrdr"), "echo output missing: {out}");
+    }
+
+    #[tokio::test]
+    async fn bash_exit_nonzero_includes_status() {
+        let c = ctx(std::path::PathBuf::from("."));
+        let out = BashTool
+            .execute(serde_json::json!({"command": "exit 42"}), &c)
+            .await
+            .unwrap();
+        assert!(out.contains("exit status"), "status marker missing: {out}");
+    }
+}

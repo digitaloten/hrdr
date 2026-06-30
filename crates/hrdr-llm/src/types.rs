@@ -287,3 +287,127 @@ impl Accumulator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal ChatChunk with optional text content and tool-call deltas.
+    fn chunk(content: Option<&str>, tool_calls: Option<Vec<ToolCallDelta>>) -> ChatChunk {
+        ChatChunk {
+            choices: vec![ChunkChoice {
+                delta: Delta {
+                    role: None,
+                    content: content.map(|s| s.to_string()),
+                    reasoning_content: None,
+                    tool_calls,
+                },
+                finish_reason: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn accumulator_reassembles_text_across_chunks() {
+        let mut acc = Accumulator::new();
+        assert_eq!(acc.push(&chunk(Some("hel"), None)), Some("hel".to_string()));
+        assert_eq!(acc.push(&chunk(Some("lo"), None)), Some("lo".to_string()));
+        assert_eq!(acc.push(&chunk(None, None)), None);
+        let msg = acc.into_message();
+        assert_eq!(msg.content, Some("hello".to_string()));
+        assert!(msg.tool_calls.is_none());
+    }
+
+    #[test]
+    fn accumulator_reassembles_fragmented_tool_call_arguments() {
+        let mut acc = Accumulator::new();
+
+        // First chunk: id + start of name + start of arguments.
+        acc.push(&chunk(
+            None,
+            Some(vec![ToolCallDelta {
+                index: 0,
+                id: Some("call_abc".to_string()),
+                function: Some(FunctionDelta {
+                    name: Some("read_fi".to_string()),
+                    arguments: Some("{\"pa".to_string()),
+                }),
+            }]),
+        ));
+
+        // Second chunk: rest of name + rest of arguments.
+        acc.push(&chunk(
+            None,
+            Some(vec![ToolCallDelta {
+                index: 0,
+                id: None,
+                function: Some(FunctionDelta {
+                    name: Some("le".to_string()),
+                    arguments: Some("th\": \"x\"}".to_string()),
+                }),
+            }]),
+        ));
+
+        let msg = acc.into_message();
+        assert!(msg.content.is_none());
+        let calls = msg.tool_calls.expect("should have tool calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_abc");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, "{\"path\": \"x\"}");
+    }
+
+    #[test]
+    fn accumulator_handles_multiple_tool_calls_by_index() {
+        let mut acc = Accumulator::new();
+
+        acc.push(&chunk(
+            None,
+            Some(vec![
+                ToolCallDelta {
+                    index: 0,
+                    id: Some("id0".to_string()),
+                    function: Some(FunctionDelta {
+                        name: Some("tool_a".to_string()),
+                        arguments: Some("{}".to_string()),
+                    }),
+                },
+                ToolCallDelta {
+                    index: 1,
+                    id: Some("id1".to_string()),
+                    function: Some(FunctionDelta {
+                        name: Some("tool_b".to_string()),
+                        arguments: Some("{\"k\":".to_string()),
+                    }),
+                },
+            ]),
+        ));
+        acc.push(&chunk(
+            None,
+            Some(vec![ToolCallDelta {
+                index: 1,
+                id: None,
+                function: Some(FunctionDelta {
+                    name: None,
+                    arguments: Some("\"v\"}".to_string()),
+                }),
+            }]),
+        ));
+
+        let msg = acc.into_message();
+        let calls = msg.tool_calls.expect("should have tool calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "tool_a");
+        assert_eq!(calls[0].function.arguments, "{}");
+        assert_eq!(calls[1].function.name, "tool_b");
+        assert_eq!(calls[1].function.arguments, "{\"k\":\"v\"}");
+    }
+
+    #[test]
+    fn accumulator_empty_produces_no_content_no_calls() {
+        let acc = Accumulator::new();
+        let msg = acc.into_message();
+        assert!(msg.content.is_none());
+        assert!(msg.tool_calls.is_none());
+    }
+}
