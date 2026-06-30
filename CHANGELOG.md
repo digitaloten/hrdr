@@ -28,7 +28,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Slash-command autocompletion: typing `/` shows a popup of matching commands
   above the input — Up/Down to select, Tab to accept, and Enter accepts the
-  selected (best) match and runs it.
+  selected (best) match and runs it. Matches the query against both the command
+  name and its description (so `/list` surfaces `/help`).
 - Slash commands (typed in the input): `/clear` (reset the conversation),
   `/model [id]` (show or switch model), `/provider <name>` (switch provider
   preset mid-session), `/copy` (last reply → clipboard), `/retry` (re-run the

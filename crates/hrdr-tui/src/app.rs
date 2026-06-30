@@ -796,15 +796,38 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
 ];
 
 /// Commands matching the in-progress `/…` input (empty once a space is typed).
+///
+/// Matches the query (the text after `/`) against both the command name and its
+/// description (case-insensitive substring), so e.g. `/list` surfaces `/help`
+/// ("list commands"). Ranked: name-prefix, then name-substring, then
+/// description-substring.
 pub(crate) fn slash_completions(input: &str) -> Vec<(&'static str, &'static str)> {
-    if !input.starts_with('/') || input.chars().any(char::is_whitespace) {
+    let Some(query) = input.strip_prefix('/') else {
+        return Vec::new();
+    };
+    if query.chars().any(char::is_whitespace) {
         return Vec::new();
     }
-    SLASH_COMMANDS
-        .iter()
-        .filter(|(n, _)| n.starts_with(input))
-        .copied()
-        .collect()
+    if query.is_empty() {
+        return SLASH_COMMANDS.to_vec();
+    }
+    let q = query.to_ascii_lowercase();
+    let mut scored: Vec<(u8, (&'static str, &'static str))> = Vec::new();
+    for &(name, desc) in SLASH_COMMANDS {
+        let nl = name.trim_start_matches('/').to_ascii_lowercase();
+        let rank = if nl.starts_with(&q) {
+            0
+        } else if nl.contains(&q) {
+            1
+        } else if desc.to_ascii_lowercase().contains(&q) {
+            2
+        } else {
+            continue;
+        };
+        scored.push((rank, (name, desc)));
+    }
+    scored.sort_by_key(|(r, _)| *r); // stable: preserves list order within a rank
+    scored.into_iter().map(|(_, c)| c).collect()
 }
 
 /// Whether a submitted line is a common "quit the session" command, matched
@@ -862,8 +885,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(names("/").len() >= 6); // all commands for a bare slash
-        assert_eq!(names("/c"), vec!["/clear", "/copy"]);
-        assert_eq!(names("/help"), vec!["/help"]);
+        // Name-prefix matches rank first.
+        assert_eq!(&names("/c")[..2], &["/clear", "/copy"]);
+        // Description match: "/list" surfaces "/help" ("list commands").
+        assert!(names("/list").contains(&"/help"));
+        assert!(!names("/list").contains(&"/clear"));
         assert!(names("/model gpt").is_empty()); // a space ends completion
         assert!(names("hello").is_empty()); // not a slash command
     }
