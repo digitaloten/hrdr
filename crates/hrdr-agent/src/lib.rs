@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use hrdr_llm::{Accumulator, ChatMessage, Client, Role};
 use hrdr_tools::{TodoItem, ToolContext, ToolRegistry};
@@ -260,117 +260,188 @@ impl AgentConfig {
         cfg
     }
 
-    /// Load config with precedence: env > `~/.config/hrdr/config.toml` > built-in defaults.
+    /// Load config with precedence: env > `~/.config/hrdr/config.toml` > built-in
+    /// defaults. Lenient: a malformed config file is ignored (treated as absent).
     /// Does NOT auto-write a config file when one is missing.
     pub fn load() -> Self {
-        // Start with defaults, layer file, then layer env on top.
         let mut cfg = Self::default();
-
-        // Layer 1: file config.
         if let Some(path) = config_path()
             && let Ok(text) = std::fs::read_to_string(&path)
             && let Ok(fc) = toml::from_str::<FileConfig>(&text)
         {
-            if let Some(v) = fc.base_url {
-                cfg.base_url = v;
-            }
-            if let Some(v) = fc.api_key {
-                cfg.api_key = Some(v);
-            }
-            if let Some(v) = fc.model {
-                cfg.model = v;
-            }
-            if let Some(v) = fc.temperature {
-                cfg.temperature = Some(v);
-            }
-            if let Some(v) = fc.vim {
-                cfg.vim_mode = v;
-            }
-            if let Some(v) = fc.provider {
-                cfg.provider = Some(v);
-            }
-            if let Some(v) = fc.theme {
-                cfg.theme = Some(v);
-            }
-            if let Some(v) = fc.context_window {
-                cfg.context_window = Some(v);
-            }
-            if let Some(v) = fc.effort {
-                cfg.effort = Some(v);
-            }
-            if let Some(v) = fc.auto_compact {
-                cfg.auto_compact = v;
-            }
-            if let Some(v) = fc.auto_resume {
-                cfg.auto_resume = v;
-            }
-            if let Some(v) = fc.bell {
-                cfg.bell = v;
-            }
-            if let Some(v) = fc.icons {
-                cfg.icons = Some(v);
-            }
-            if let Some(v) = fc.timestamps {
-                cfg.timestamps = Some(v);
-            }
-            if let Some(v) = fc.statusbar {
-                cfg.statusbar = Some(v);
-            }
-            if !fc.providers.is_empty() {
-                cfg.providers = fc.providers;
-            }
+            cfg.apply_file(fc);
         }
+        cfg.apply_env();
+        cfg
+    }
 
-        // Layer 2: env vars override file.
+    /// Like [`load`](Self::load) but returns an error if the config file exists
+    /// and fails to parse (for surfacing a warning + falling back to defaults).
+    pub fn load_checked() -> Result<Self> {
+        let mut cfg = Self::default();
+        if let Some(path) = config_path()
+            && let Ok(text) = std::fs::read_to_string(&path)
+        {
+            let fc: FileConfig =
+                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+            cfg.apply_file(fc);
+        }
+        cfg.apply_env();
+        Ok(cfg)
+    }
+
+    /// Layer file values over the current config.
+    fn apply_file(&mut self, fc: FileConfig) {
+        if let Some(v) = fc.base_url {
+            self.base_url = v;
+        }
+        if let Some(v) = fc.api_key {
+            self.api_key = Some(v);
+        }
+        if let Some(v) = fc.model {
+            self.model = v;
+        }
+        if let Some(v) = fc.temperature {
+            self.temperature = Some(v);
+        }
+        if let Some(v) = fc.vim {
+            self.vim_mode = v;
+        }
+        if let Some(v) = fc.provider {
+            self.provider = Some(v);
+        }
+        if let Some(v) = fc.theme {
+            self.theme = Some(v);
+        }
+        if let Some(v) = fc.context_window {
+            self.context_window = Some(v);
+        }
+        if let Some(v) = fc.effort {
+            self.effort = Some(v);
+        }
+        if let Some(v) = fc.auto_compact {
+            self.auto_compact = v;
+        }
+        if let Some(v) = fc.auto_resume {
+            self.auto_resume = v;
+        }
+        if let Some(v) = fc.bell {
+            self.bell = v;
+        }
+        if let Some(v) = fc.icons {
+            self.icons = Some(v);
+        }
+        if let Some(v) = fc.timestamps {
+            self.timestamps = Some(v);
+        }
+        if let Some(v) = fc.statusbar {
+            self.statusbar = Some(v);
+        }
+        if !fc.providers.is_empty() {
+            self.providers = fc.providers;
+        }
+    }
+
+    /// Layer environment variables over the current config.
+    fn apply_env(&mut self) {
         if let Ok(v) = std::env::var("HRDR_PROVIDER") {
-            cfg.provider = Some(v);
+            self.provider = Some(v);
         }
         if let Ok(v) = std::env::var("HRDR_THEME") {
-            cfg.theme = Some(v);
+            self.theme = Some(v);
         }
         if let Ok(v) = std::env::var("HRDR_BASE_URL") {
-            cfg.base_url = v;
+            self.base_url = v;
         }
         if let Ok(v) = std::env::var("HRDR_MODEL") {
-            cfg.model = v;
+            self.model = v;
         }
         if let Ok(v) = std::env::var("HRDR_AUTO_COMPACT")
             && let Ok(f) = v.parse::<f64>()
         {
-            cfg.auto_compact = f;
+            self.auto_compact = f;
         }
         if let Ok(v) = std::env::var("HRDR_AUTO_RESUME") {
             match v.trim().to_ascii_lowercase().as_str() {
-                "0" | "false" | "off" | "no" => cfg.auto_resume = false,
-                "1" | "true" | "on" | "yes" => cfg.auto_resume = true,
+                "0" | "false" | "off" | "no" => self.auto_resume = false,
+                "1" | "true" | "on" | "yes" => self.auto_resume = true,
                 _ => {}
             }
         }
         if let Ok(v) = std::env::var("HRDR_BELL") {
             match v.trim().to_ascii_lowercase().as_str() {
-                "0" | "false" | "off" | "no" => cfg.bell = false,
-                "1" | "true" | "on" | "yes" => cfg.bell = true,
+                "0" | "false" | "off" | "no" => self.bell = false,
+                "1" | "true" | "on" | "yes" => self.bell = true,
                 _ => {}
             }
         }
         if let Ok(v) = std::env::var("HRDR_ICONS") {
-            cfg.icons = Some(v);
+            self.icons = Some(v);
         }
         if let Ok(v) = std::env::var("HRDR_TIMESTAMPS") {
-            cfg.timestamps = Some(v);
+            self.timestamps = Some(v);
         }
         if let Ok(v) = std::env::var("HRDR_STATUSBAR") {
-            cfg.statusbar = Some(v);
+            self.statusbar = Some(v);
         }
         let env_key = std::env::var("HRDR_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .ok();
         if env_key.is_some() {
-            cfg.api_key = env_key;
+            self.api_key = env_key;
         }
-
-        cfg
     }
+}
+
+/// A value to persist into the user config file.
+pub enum ConfigValue<'a> {
+    Str(&'a str),
+    Bool(bool),
+    Float(f64),
+}
+
+/// Path to the user config file (`~/.config/hrdr/config.toml`), if `HOME` is set.
+pub fn config_file_path() -> Option<std::path::PathBuf> {
+    config_path()
+}
+
+/// Set `key = value` in the user config file (creating it if needed), preserving
+/// existing keys, ordering, and comments. Returns the file path.
+pub fn persist_setting(key: &str, value: ConfigValue) -> Result<std::path::PathBuf> {
+    let path = config_path().ok_or_else(|| anyhow::anyhow!("no HOME to locate the config file"))?;
+    let mut doc = read_config_doc(&path);
+    match value {
+        ConfigValue::Str(s) => doc[key] = toml_edit::value(s),
+        ConfigValue::Bool(b) => doc[key] = toml_edit::value(b),
+        ConfigValue::Float(f) => doc[key] = toml_edit::value(f),
+    }
+    write_config_doc(&path, &doc)?;
+    Ok(path)
+}
+
+/// Remove `key` from the user config file (if present). Returns the file path.
+pub fn remove_setting(key: &str) -> Result<std::path::PathBuf> {
+    let path = config_path().ok_or_else(|| anyhow::anyhow!("no HOME to locate the config file"))?;
+    let mut doc = read_config_doc(&path);
+    doc.remove(key);
+    write_config_doc(&path, &doc)?;
+    Ok(path)
+}
+
+fn read_config_doc(path: &std::path::Path) -> toml_edit::DocumentMut {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
+        .unwrap_or_default()
+}
+
+fn write_config_doc(path: &std::path::Path, doc: &toml_edit::DocumentMut) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 /// System prompt for the one-off compaction (summarization) call.

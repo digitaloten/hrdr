@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -145,6 +145,8 @@ pub(crate) struct App {
     pub(crate) session_out: usize,
     /// Config kept for mid-session provider resolution (`/provider`).
     cfg: AgentConfig,
+    /// Last-seen mtime of the config file, for hot-reload polling.
+    config_mtime: Option<SystemTime>,
     /// OS clipboard for `/copy` (None if unavailable).
     clipboard: Option<Clipboard>,
     /// Selected row in the completion popup (slash command or `@file`).
@@ -263,6 +265,13 @@ impl App {
              reply runs to queue follow-ups."
         };
         let mut transcript = vec![Entry::System(welcome.to_string())];
+        // Warn (but don't fail) if the config file exists but is invalid — the
+        // running config has already fallen back to defaults + env in that case.
+        if let Err(e) = AgentConfig::load_checked() {
+            transcript.push(Entry::System(format!(
+                "config file is invalid — using defaults: {e}"
+            )));
+        }
         if project_docs_loaded {
             transcript.push(Entry::System(
                 "loaded project instructions from AGENTS.md".to_string(),
@@ -288,6 +297,7 @@ impl App {
             session_in: 0,
             session_out: 0,
             cfg,
+            config_mtime: current_config_mtime(),
             clipboard: Clipboard::new().ok(),
             completion_idx: 0,
             input_history: load_history(),
@@ -432,7 +442,7 @@ impl App {
                     Some(Err(_)) | None => break,
                 },
                 Some(msg) = rx.recv() => self.on_turn_msg(msg),
-                _ = ticker.tick() => {}
+                _ = ticker.tick() => self.maybe_reload_config(),
             }
         }
         Ok(())
@@ -745,8 +755,14 @@ impl App {
                 let path = (!arg.is_empty()).then_some(arg);
                 self.theme = Theme::load(path);
                 match path {
-                    Some(p) => self.system(format!("theme → {p}")),
-                    None => self.system("theme reset to default"),
+                    Some(p) => {
+                        self.persist_setting("theme", hrdr_agent::ConfigValue::Str(p));
+                        self.system(format!("theme → {p}"));
+                    }
+                    None => {
+                        self.unpersist_setting("theme");
+                        self.system("theme reset to default");
+                    }
                 }
             }
             "cwd" => self.change_cwd(arg),
@@ -770,6 +786,7 @@ impl App {
                     ));
                 } else {
                     self.effort = Some(arg.to_string());
+                    self.persist_setting("effort", hrdr_agent::ConfigValue::Str(arg));
                     self.system(format!("effort → {arg}"));
                 }
             }
@@ -1048,10 +1065,16 @@ impl App {
         }
     }
 
-    /// `/reload` — re-read `AGENTS.md` and re-load config (applying the runtime
-    /// bits that can change live: theme, icons, effort, toggles, temperature).
+    /// `/reload` — re-read config + `AGENTS.md`, applying the runtime bits that
+    /// can change live; keeps the current settings if the config is invalid.
     fn reload_cmd(&mut self) {
-        let cfg = AgentConfig::load();
+        self.apply_config_reload(true);
+        self.reload_project_docs();
+    }
+
+    /// Apply the live-changeable settings from a config. Does NOT touch the
+    /// model/provider/endpoint (those are session-scoped).
+    fn apply_runtime_config(&mut self, cfg: &AgentConfig) {
         self.theme = Theme::load(cfg.theme.as_deref());
         self.effort = cfg.effort.clone();
         self.auto_compact_ratio = cfg.auto_compact;
@@ -1066,9 +1089,51 @@ impl App {
         if let (Some(t), Ok(mut a)) = (cfg.temperature, self.agent.try_lock()) {
             a.set_temperature(Some(t));
         }
-        self.cfg = cfg;
-        self.reload_project_docs();
-        self.system("reloaded config (theme, icons, effort, toggles) + AGENTS.md");
+    }
+
+    /// Re-load config and apply it. On an invalid file, keep the current
+    /// settings and warn instead of resetting.
+    fn apply_config_reload(&mut self, manual: bool) {
+        match AgentConfig::load_checked() {
+            Ok(cfg) => {
+                self.apply_runtime_config(&cfg);
+                self.cfg = cfg;
+                self.system(if manual {
+                    "reloaded config (theme, icons, effort, toggles)"
+                } else {
+                    "config changed on disk — reloaded"
+                });
+            }
+            Err(e) => self.system(format!("config invalid — keeping current settings: {e}")),
+        }
+        // Either way, stop re-triggering for this version of the file.
+        self.config_mtime = current_config_mtime();
+    }
+
+    /// Hot-reload: poll the config file's mtime and apply changes when it's
+    /// edited (manually or by another session).
+    fn maybe_reload_config(&mut self) {
+        let mtime = current_config_mtime();
+        if mtime != self.config_mtime {
+            self.apply_config_reload(false);
+        }
+    }
+
+    /// Persist a single setting to the user config file, suppressing the
+    /// resulting hot-reload (we already applied it in memory).
+    fn persist_setting(&mut self, key: &str, value: hrdr_agent::ConfigValue) {
+        match hrdr_agent::persist_setting(key, value) {
+            Ok(_) => self.config_mtime = current_config_mtime(),
+            Err(e) => self.system(format!("couldn't save '{key}' to config: {e}")),
+        }
+    }
+
+    /// Remove a setting from the user config file (e.g. resetting the theme).
+    fn unpersist_setting(&mut self, key: &str) {
+        match hrdr_agent::remove_setting(key) {
+            Ok(_) => self.config_mtime = current_config_mtime(),
+            Err(e) => self.system(format!("couldn't update config: {e}")),
+        }
     }
 
     /// Re-gather `AGENTS.md` for the current cwd and refresh the system prompt
@@ -1180,6 +1245,7 @@ impl App {
                 if let Ok(mut a) = self.agent.try_lock() {
                     a.set_temperature(Some(t));
                 }
+                self.persist_setting("temperature", hrdr_agent::ConfigValue::Float(t as f64));
                 self.system(format!("temperature → {t}"));
             }
             Err(_) => self.system("usage: /temp <number>"),
@@ -1503,6 +1569,14 @@ impl App {
             }
         };
         self.statusbar_mode = mode;
+        self.persist_setting(
+            "statusbar",
+            hrdr_agent::ConfigValue::Str(match mode {
+                StatusBarMode::None => "none",
+                StatusBarMode::Truncate => "truncate",
+                StatusBarMode::Wrap => "wrap",
+            }),
+        );
         self.system(match mode {
             StatusBarMode::None => "status bar: hidden",
             StatusBarMode::Truncate => "status bar: truncate",
@@ -1530,6 +1604,14 @@ impl App {
             }
         };
         self.timestamp_style = style;
+        self.persist_setting(
+            "timestamps",
+            hrdr_agent::ConfigValue::Str(match style {
+                TimestampStyle::None => "none",
+                TimestampStyle::Relative => "relative",
+                TimestampStyle::Exact => "exact",
+            }),
+        );
         self.system(match style {
             TimestampStyle::None => "timestamps: off",
             TimestampStyle::Relative => "timestamps: relative",
@@ -2283,6 +2365,13 @@ impl App {
             }
         }
     }
+}
+
+/// Modified-time of the user config file, for hot-reload polling.
+fn current_config_mtime() -> Option<SystemTime> {
+    hrdr_agent::config_file_path()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
 }
 
 /// Current local time, for per-message timestamps.
