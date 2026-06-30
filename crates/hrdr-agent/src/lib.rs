@@ -90,6 +90,9 @@ pub struct AgentConfig {
     /// Per-message timestamp style: `none`, `relative` (e.g. `2m ago`), or
     /// `exact` (`HH:MM`). `None` resolves to `relative` (the default).
     pub timestamps: Option<String>,
+    /// Status-bar mode: `none` (hidden), `truncate` (drop sections to fit), or
+    /// `wrap` (use multiple rows). `None` resolves to `truncate` (the default).
+    pub statusbar: Option<String>,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
 }
@@ -117,6 +120,7 @@ impl Default for AgentConfig {
             bell: true,
             icons: None,
             timestamps: None,
+            statusbar: None,
             providers: HashMap::new(),
         }
     }
@@ -222,6 +226,7 @@ struct FileConfig {
     bell: Option<bool>,
     icons: Option<String>,
     timestamps: Option<String>,
+    statusbar: Option<String>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
 }
@@ -308,6 +313,9 @@ impl AgentConfig {
             if let Some(v) = fc.timestamps {
                 cfg.timestamps = Some(v);
             }
+            if let Some(v) = fc.statusbar {
+                cfg.statusbar = Some(v);
+            }
             if !fc.providers.is_empty() {
                 cfg.providers = fc.providers;
             }
@@ -350,6 +358,9 @@ impl AgentConfig {
         }
         if let Ok(v) = std::env::var("HRDR_TIMESTAMPS") {
             cfg.timestamps = Some(v);
+        }
+        if let Ok(v) = std::env::var("HRDR_STATUSBAR") {
+            cfg.statusbar = Some(v);
         }
         let env_key = std::env::var("HRDR_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))

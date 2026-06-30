@@ -47,6 +47,29 @@ impl TimestampStyle {
     }
 }
 
+/// How the status bar behaves when it doesn't fit the terminal width.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusBarMode {
+    /// Hidden entirely.
+    None,
+    /// Drop the least-important sections until it fits one row.
+    Truncate,
+    /// Wrap onto multiple rows so everything is shown.
+    Wrap,
+}
+
+impl StatusBarMode {
+    /// Resolve from a config string; anything unrecognized (incl. `None`) is
+    /// `Truncate` — the default.
+    fn from_config(s: Option<&str>) -> Self {
+        match s.map(|x| x.trim().to_ascii_lowercase()).as_deref() {
+            Some("none" | "off" | "hidden") => Self::None,
+            Some("wrap") => Self::Wrap,
+            _ => Self::Truncate,
+        }
+    }
+}
+
 /// What a key press asks the run loop to do (for actions needing the terminal).
 enum Action {
     None,
@@ -101,6 +124,8 @@ pub(crate) struct App {
     pub(crate) entry_times: Vec<chrono::DateTime<chrono::Local>>,
     /// Per-message timestamp style: none / relative / exact (`/timestamps`).
     pub(crate) timestamp_style: TimestampStyle,
+    /// Status-bar mode: none / truncate / wrap (`/statusbar`).
+    pub(crate) statusbar_mode: StatusBarMode,
     pub(crate) running: bool,
     pub(crate) status: String,
     pub(crate) model: String,
@@ -207,6 +232,7 @@ impl App {
         let auto_resume = config.auto_resume;
         let bell = config.bell;
         let timestamp_style = TimestampStyle::from_config(config.timestamps.as_deref());
+        let statusbar_mode = StatusBarMode::from_config(config.statusbar.as_deref());
         // No portable terminal-font probe, so an unset/`auto` icons setting
         // resolves to Nerd glyphs.
         let icon_mode = config
@@ -250,6 +276,7 @@ impl App {
             transcript,
             entry_times,
             timestamp_style,
+            statusbar_mode,
             running: false,
             status: "ready".to_string(),
             model,
@@ -764,6 +791,7 @@ impl App {
             "next" => self.find_cycle(true),
             "prev" | "previous" => self.find_cycle(false),
             "timestamps" | "ts" => self.timestamps_cmd(arg),
+            "statusbar" => self.statusbar_cmd(arg),
             _ => return false,
         }
         true
@@ -1029,6 +1057,7 @@ impl App {
         self.auto_compact_ratio = cfg.auto_compact;
         self.bell = cfg.bell;
         self.timestamp_style = TimestampStyle::from_config(cfg.timestamps.as_deref());
+        self.statusbar_mode = StatusBarMode::from_config(cfg.statusbar.as_deref());
         self.icon_mode = cfg
             .icons
             .as_deref()
@@ -1454,6 +1483,31 @@ impl App {
                 _ => None,
             })
             .nth(n - 1)
+    }
+
+    /// `/statusbar [none|truncate|wrap]` — set the status-bar mode (no arg
+    /// cycles truncate → wrap → none).
+    fn statusbar_cmd(&mut self, arg: &str) {
+        let mode = match arg.trim().to_ascii_lowercase().as_str() {
+            "" => match self.statusbar_mode {
+                StatusBarMode::Truncate => StatusBarMode::Wrap,
+                StatusBarMode::Wrap => StatusBarMode::None,
+                StatusBarMode::None => StatusBarMode::Truncate,
+            },
+            "none" | "off" | "hidden" => StatusBarMode::None,
+            "truncate" | "trunc" => StatusBarMode::Truncate,
+            "wrap" => StatusBarMode::Wrap,
+            _ => {
+                self.system("usage: /statusbar [none | truncate | wrap]");
+                return;
+            }
+        };
+        self.statusbar_mode = mode;
+        self.system(match mode {
+            StatusBarMode::None => "status bar: hidden",
+            StatusBarMode::Truncate => "status bar: truncate",
+            StatusBarMode::Wrap => "status bar: wrap",
+        });
     }
 
     /// `/timestamps [none|relative|exact]` — set the timestamp style (no arg
@@ -2318,6 +2372,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/diff", "show git diff of the working tree"),
     ("/reasoning", "toggle showing model reasoning"),
     ("/timestamps", "set timestamps (none|relative|exact)"),
+    ("/statusbar", "set status bar (none|truncate|wrap)"),
     ("/reload", "reload AGENTS.md + config"),
     ("/temp", "show or set temperature"),
     ("/effort", "show or set effort label"),
@@ -2378,7 +2433,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Reply", &["/copy", "/export", "/retry", "/undo"]),
-    ("Appearance", &["/theme", "/timestamps"]),
+    ("Appearance", &["/theme", "/timestamps", "/statusbar"]),
     ("Other", &["/reload", "/help", "/exit"]),
 ];
 

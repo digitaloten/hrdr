@@ -19,7 +19,7 @@ use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
-use crate::app::{App, Entry, TimestampStyle};
+use crate::app::{App, Entry, StatusBarMode, TimestampStyle};
 use crate::theme::Theme;
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
@@ -61,8 +61,17 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     });
     constraints.push(Constraint::Length(input_height));
     let input_idx = constraints.len() - 1;
-    constraints.push(Constraint::Length(1)); // status bar
-    let statusbar_idx = constraints.len() - 1;
+    // Status bar: hidden (0 rows), one row (truncate), or wrapped (≤4 rows).
+    let sb_sections = build_status_sections(app);
+    let sb_height: u16 = match app.statusbar_mode {
+        StatusBarMode::None => 0,
+        StatusBarMode::Truncate => 1,
+        StatusBarMode::Wrap => status_wrap_rows(&sb_sections, area.width as usize).clamp(1, 4),
+    };
+    let statusbar_idx = (sb_height > 0).then(|| {
+        constraints.push(Constraint::Length(sb_height));
+        constraints.len() - 1
+    });
     constraints.push(Constraint::Length(1)); // help / keybind line
     let help_idx = constraints.len() - 1;
 
@@ -76,7 +85,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         draw_loader(f, app, chunks[i]);
     }
     draw_input(f, app, chunks[input_idx]);
-    draw_statusbar(f, app, chunks[statusbar_idx]);
+    if let Some(i) = statusbar_idx {
+        draw_statusbar(f, app, chunks[i], &sb_sections);
+    }
     draw_help(f, app, chunks[help_idx]);
 
     // Completion popup (slash command or `@file`), overlaid above the input.
@@ -356,14 +367,19 @@ fn top_border_button(f: &mut Frame, area: Rect, label: &str, style: Style) -> Re
     rect
 }
 
-/// Rich status bar (above the help line): cwd, git branch, in/out tokens,
-/// context size, model, and effort.
-fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
-    let t = &app.theme;
+/// One status-bar section: `(priority, spans)`. Lower priority is kept longer;
+/// higher is dropped first in truncate mode.
+type StatusSection = (u8, Vec<Span<'static>>);
 
-    // Each section is `(priority, spans)`; lower priority is kept, higher is the
-    // first to be dropped when the bar is too narrow. Built in display order.
-    let mut sections: Vec<(u8, Vec<Span<'static>>)> = Vec::new();
+fn status_section_width(s: &StatusSection) -> usize {
+    s.1.iter().map(Span::width).sum()
+}
+
+/// Build the status-bar sections (cwd, branch, in/out tokens, context, model,
+/// effort) in display order.
+fn build_status_sections(app: &App) -> Vec<StatusSection> {
+    let t = &app.theme;
+    let mut sections: Vec<StatusSection> = Vec::new();
 
     // cwd basename + folder icon (Nerd glyphs only when the icon mode allows).
     let nerd = app.icon_mode == hjkl_icons::IconMode::Nerd;
@@ -465,20 +481,52 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
             vec![Span::styled(effort.clone(), Style::default().fg(t.warn))],
         ));
     }
+    sections
+}
 
-    // Drop the highest-priority (least important) sections until the bar fits.
-    const SEP_W: usize = 3; // " │ "
-    let avail = area.width as usize;
-    let widths: Vec<usize> = sections
-        .iter()
-        .map(|(_, ss)| ss.iter().map(Span::width).sum())
-        .collect();
+/// Separator width: " │ ".
+const STATUS_SEP_W: usize = 3;
+
+/// Rows the status bar needs in wrap mode at `width`.
+fn status_wrap_rows(sections: &[StatusSection], width: usize) -> u16 {
+    let mut rows: u16 = 1;
+    let mut cur_w = 0usize;
+    let mut empty = true;
+    for s in sections {
+        let w = status_section_width(s);
+        let needed = if empty { w } else { STATUS_SEP_W + w };
+        if !empty && cur_w + needed > width {
+            rows += 1;
+            cur_w = w; // section starts the new row
+        } else {
+            cur_w += needed;
+            empty = false;
+        }
+    }
+    rows
+}
+
+/// Render the status bar into `area` according to the active mode (Truncate or
+/// Wrap; None is handled by the caller not allocating a row).
+fn draw_statusbar(f: &mut Frame, app: &App, area: Rect, sections: &[StatusSection]) {
+    let t = &app.theme;
+    let width = area.width as usize;
+    let lines = match app.statusbar_mode {
+        StatusBarMode::Wrap => status_wrap_lines(sections, width, t),
+        _ => vec![status_truncate_line(sections, width, t)],
+    };
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// One-row status bar that drops the least-important sections until it fits.
+fn status_truncate_line(sections: &[StatusSection], width: usize, t: &Theme) -> Line<'static> {
+    let widths: Vec<usize> = sections.iter().map(status_section_width).collect();
     let mut keep = vec![true; sections.len()];
     loop {
         let kept: Vec<usize> = (0..sections.len()).filter(|&i| keep[i]).collect();
-        let total: usize =
-            kept.iter().map(|&i| widths[i]).sum::<usize>() + SEP_W * kept.len().saturating_sub(1);
-        if total <= avail || kept.len() <= 1 {
+        let total: usize = kept.iter().map(|&i| widths[i]).sum::<usize>()
+            + STATUS_SEP_W * kept.len().saturating_sub(1);
+        if total <= width || kept.len() <= 1 {
             break;
         }
         // Drop the kept section with the largest (priority, index): least
@@ -487,30 +535,54 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
             keep[drop] = false;
         }
     }
-
     let truncated = keep.iter().any(|k| !k);
-    let sep = || Span::styled(" │ ", Style::default().fg(t.dim));
     let mut spans: Vec<Span> = Vec::new();
     let mut first = true;
-    for (i, (_, ss)) in sections.into_iter().enumerate() {
+    for (i, (_, ss)) in sections.iter().enumerate() {
         if !keep[i] {
             continue;
         }
         if !first {
-            spans.push(sep());
+            spans.push(Span::styled(" │ ", Style::default().fg(t.dim)));
         }
-        spans.extend(ss);
+        spans.extend(ss.iter().cloned());
         first = false;
     }
-    // A trailing ellipsis signals dropped sections, when there's room for it.
     if truncated {
         let used: usize = spans.iter().map(Span::width).sum();
-        if used + 2 <= avail {
+        if used + 2 <= width {
             spans.push(Span::styled(" …", Style::default().fg(t.dim)));
         }
     }
+    Line::from(spans)
+}
 
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+/// Multi-row status bar that packs sections across rows so nothing is dropped.
+fn status_wrap_lines(sections: &[StatusSection], width: usize, t: &Theme) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+    let mut cur: Vec<Span> = Vec::new();
+    let mut cur_w = 0usize;
+    for s in sections {
+        let w = status_section_width(s);
+        let needed = if cur.is_empty() { w } else { STATUS_SEP_W + w };
+        if !cur.is_empty() && cur_w + needed > width {
+            lines.push(Line::from(std::mem::take(&mut cur)));
+            cur_w = 0;
+        }
+        if !cur.is_empty() {
+            cur.push(Span::styled(" │ ", Style::default().fg(t.dim)));
+            cur_w += STATUS_SEP_W;
+        }
+        cur.extend(s.1.iter().cloned());
+        cur_w += w;
+    }
+    if !cur.is_empty() {
+        lines.push(Line::from(cur));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines
 }
 
 /// Help / keybind line.

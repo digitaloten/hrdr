@@ -18,10 +18,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- The status bar now degrades gracefully on narrow terminals: instead of being
-  clipped mid-section, it drops the least-important sections (effort, then
-  in/out tokens, then git branch, then model) until it fits, keeping the cwd and
-  context bar, and shows a trailing `…` when anything was dropped.
+- The status bar has a configurable mode — `truncate` (default), `wrap`, or
+  `none` — via `statusbar` in config, `--statusbar <mode>`, `$HRDR_STATUSBAR`,
+  or `/statusbar [none|truncate|wrap]` (no arg cycles). `truncate` drops the
+  least-important sections (effort, then in/out tokens, then git branch, then
+  model) until it fits one row, keeping the cwd and context bar and showing a
+  trailing `…`; `wrap` packs every section across up to four rows; `none` hides
+  the bar entirely.
 - Quitting now requires a double Ctrl+C: the first idle Ctrl+C arms a confirm
   (any other key/mouse action disarms it) and shows a "Press Ctrl+C again to
   quit" banner on the input box's top border (taking priority over the follow

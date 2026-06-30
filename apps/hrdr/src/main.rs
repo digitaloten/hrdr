@@ -72,6 +72,10 @@ struct Cli {
     #[arg(long, global = true)]
     timestamps: Option<String>,
 
+    /// Status-bar mode: none, truncate (default), or wrap.
+    #[arg(long, global = true)]
+    statusbar: Option<String>,
+
     /// Don't spawn a local llama-server; use the endpoint at --base-url.
     #[arg(long, global = true)]
     no_backend: bool,
@@ -187,6 +191,9 @@ async fn main() -> Result<()> {
     }
     if let Some(t) = cli.timestamps {
         config.timestamps = Some(t);
+    }
+    if let Some(s) = cli.statusbar {
+        config.statusbar = Some(s);
     }
 
     if remote_provider && config.model == "default" {
