@@ -93,8 +93,9 @@ Configuration (CLI flags override env):
 - [x] Config file (`~/.config/hrdr/config.toml`), `hrdr models`
 - [x] Tool + client unit tests
 - [x] Temporary managed `llama-server` backend
+- [x] Wrap-aware transcript scrolling
+- [x] Message queueing during a running turn
 - [ ] infr serve path with tool calling (replaces the temporary backend)
-- [ ] Wrap-aware transcript scrolling
 - [ ] Switch hjkl path-deps to registry pins for standalone CI
 
 ## License

@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Transcript auto-follow now accounts for line wrapping: it scrolls by the
+  rendered (wrapped) row count, so a newly sent message or streamed reply no
+  longer hides below the fold until the next message bumped it into view.
+
 ### Added
 
 - Initial scaffold: a Cargo workspace for an agentic coding harness driving

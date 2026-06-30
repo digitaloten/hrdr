@@ -56,18 +56,16 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // Publish the height so key handlers can compute half-page offsets.
     app.transcript_height = area.height;
 
-    let lines = transcript_lines(app);
-    let total = lines.len() as u16;
-    let visible = area.height;
-    let max_scroll = total.saturating_sub(visible);
-    // Cap the stored offset so it can't go past the top.
+    let para = Paragraph::new(transcript_lines(app)).wrap(Wrap { trim: false });
+    // Count the *wrapped* rows at this width — not the logical line count — so
+    // long messages that wrap don't push the newest content below the fold.
+    let total = para.line_count(area.width) as u16;
+    let max_scroll = total.saturating_sub(area.height);
+    // scroll_offset is rows scrolled UP from the bottom; 0 == follow newest.
     let offset = (app.scroll_offset as u16).min(max_scroll);
     let scroll = max_scroll.saturating_sub(offset);
 
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    f.render_widget(para, area);
+    f.render_widget(para.scroll((scroll, 0)), area);
 }
 
 fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
