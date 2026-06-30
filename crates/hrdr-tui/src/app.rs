@@ -90,6 +90,12 @@ pub(crate) struct App {
     clipboard: Option<Clipboard>,
     /// Selected row in the completion popup (slash command or `@file`).
     pub(crate) completion_idx: usize,
+    /// Submitted inputs this session, for Up/Down recall (oldest first).
+    input_history: Vec<String>,
+    /// Current position while browsing `input_history` (None = editing a draft).
+    history_pos: Option<usize>,
+    /// The in-progress draft stashed when history browsing began.
+    history_draft: String,
     /// Cached relative file paths under the cwd, for `@file` completion.
     file_index: Vec<String>,
     /// The cwd `file_index` was built for; rebuilt when the cwd changes.
@@ -196,6 +202,9 @@ impl App {
             cfg,
             clipboard: Clipboard::new().ok(),
             completion_idx: 0,
+            input_history: Vec::new(),
+            history_pos: None,
+            history_draft: String::new(),
             file_index: Vec::new(),
             file_index_cwd: None,
             show_reasoning: true,
@@ -413,6 +422,16 @@ impl App {
                     self.scroll_offset = self.max_scroll; // jump to the top of the session
                     return Action::None;
                 }
+                // Up/Down recall previous submissions (readline-style), but only
+                // for single-line input so multi-line editing keeps cursor moves.
+                KeyCode::Up if !self.editor.content().contains('\n') => {
+                    self.history_prev();
+                    return Action::None;
+                }
+                KeyCode::Down if !self.editor.content().contains('\n') => {
+                    self.history_next();
+                    return Action::None;
+                }
                 _ => {}
             }
         }
@@ -424,6 +443,7 @@ impl App {
             if input.trim().is_empty() {
                 return Action::None;
             }
+            self.record_history(&input);
             // Common quit commands exit the session instead of being sent.
             if is_quit_command(input.trim()) {
                 self.should_quit = true;
@@ -1176,6 +1196,54 @@ impl App {
             let _ = tx.send(TurnMsg::Compacted(res.map_err(|e| e.to_string())));
         });
         self.turn_handle = Some(handle);
+    }
+
+    /// Record a submitted input for Up/Down recall (skips consecutive dups,
+    /// bounds the buffer) and resets browsing state.
+    fn record_history(&mut self, input: &str) {
+        if self.input_history.last().map(String::as_str) != Some(input) {
+            self.input_history.push(input.to_string());
+            const MAX_HISTORY: usize = 200;
+            if self.input_history.len() > MAX_HISTORY {
+                self.input_history.remove(0);
+            }
+        }
+        self.history_pos = None;
+        self.history_draft.clear();
+    }
+
+    /// Recall the previous (older) submission into the input.
+    fn history_prev(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let pos = match self.history_pos {
+            None => {
+                self.history_draft = self.editor.content();
+                self.input_history.len() - 1
+            }
+            Some(0) => 0,
+            Some(p) => p - 1,
+        };
+        self.history_pos = Some(pos);
+        let text = self.input_history[pos].clone();
+        self.editor.set_content(&text);
+    }
+
+    /// Move toward newer submissions; past the newest, restore the draft.
+    fn history_next(&mut self) {
+        let Some(pos) = self.history_pos else {
+            return;
+        };
+        if pos + 1 < self.input_history.len() {
+            self.history_pos = Some(pos + 1);
+            let text = self.input_history[pos + 1].clone();
+            self.editor.set_content(&text);
+        } else {
+            self.history_pos = None;
+            let draft = self.history_draft.clone();
+            self.editor.set_content(&draft);
+        }
     }
 
     /// The active completion popup contents: slash commands when the line starts

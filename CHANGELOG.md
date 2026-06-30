@@ -26,6 +26,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Input history: Up/Down in the input recalls previous submissions
+  (readline-style), restoring your in-progress draft when you pass the newest.
+  Active only for single-line input, so multi-line editing keeps normal cursor
+  movement; the completion popup still owns Up/Down while it's open.
 - Auto-resume on startup: the TUI restores the most recent saved session for the
   current working directory (history + transcript + model), so reopening hrdr in
   a project picks up where you left off; `/clear` starts fresh. If no session
