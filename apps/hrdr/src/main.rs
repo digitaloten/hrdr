@@ -60,6 +60,10 @@ struct Cli {
     #[arg(long = "no-auto-resume", global = true)]
     no_auto_resume: bool,
 
+    /// Don't ring the terminal bell when a turn finishes.
+    #[arg(long = "no-bell", global = true)]
+    no_bell: bool,
+
     /// Don't spawn a local llama-server; use the endpoint at --base-url.
     #[arg(long, global = true)]
     no_backend: bool,
@@ -166,6 +170,9 @@ async fn main() -> Result<()> {
     }
     if cli.no_auto_resume {
         config.auto_resume = false;
+    }
+    if cli.no_bell {
+        config.bell = false;
     }
 
     if remote_provider && config.model == "default" {

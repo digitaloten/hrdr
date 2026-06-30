@@ -106,6 +106,8 @@ pub(crate) struct App {
     pub(crate) compacting: bool,
     /// Auto-compact trigger as a fraction of the context window; 0 disables.
     pub(crate) auto_compact_ratio: f64,
+    /// Ring the terminal bell when a turn finishes (after a brief minimum).
+    bell: bool,
     /// Current endpoint base URL (for `/info`; updated by `/provider`).
     base_url: String,
     /// Active session's file id (stem). Assigned on first auto-save; stable.
@@ -157,6 +159,7 @@ impl App {
         let context_window = config.context_window;
         let auto_compact = config.auto_compact;
         let auto_resume = config.auto_resume;
+        let bell = config.bell;
         let effort = config.effort.clone();
         let base_url = config.base_url.clone();
         let cfg = config.clone();
@@ -210,6 +213,7 @@ impl App {
             show_reasoning: true,
             compacting: false,
             auto_compact_ratio: auto_compact,
+            bell,
             base_url,
             session_id: None,
             session_label: None,
@@ -1193,6 +1197,25 @@ impl App {
         self.spawn_compaction(instructions);
     }
 
+    /// Ring the terminal bell when a turn finishes, if enabled and the turn ran
+    /// long enough to be worth a nudge (so quick replies stay silent).
+    fn maybe_bell(&self) {
+        const MIN_SECS: f64 = 5.0;
+        if !self.bell {
+            return;
+        }
+        let long_enough = self
+            .turn_started
+            .map(|t| t.elapsed().as_secs_f64() >= MIN_SECS)
+            .unwrap_or(false);
+        if long_enough {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(b"\x07"); // BEL
+            let _ = out.flush();
+        }
+    }
+
     /// Whether the context has grown enough to auto-compact (with headroom).
     /// A configured ratio of `0` (or outside `0.0..=1.0`) disables it.
     fn should_auto_compact(&self) -> bool {
@@ -1453,6 +1476,8 @@ impl App {
                 if let Some(stats) = self.turn_stats() {
                     self.transcript.push(Entry::Stats(stats));
                 }
+                // Notify on completion of a non-trivial turn (if enabled).
+                self.maybe_bell();
                 // Persist the completed turn into the active session, if any.
                 self.autosave();
                 // Auto-compact near the context limit before doing more work;

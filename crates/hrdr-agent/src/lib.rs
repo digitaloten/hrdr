@@ -81,6 +81,9 @@ pub struct AgentConfig {
     pub auto_compact: f64,
     /// On TUI startup, resume the most recent session for the cwd. Default `true`.
     pub auto_resume: bool,
+    /// Ring the terminal bell when a turn finishes (after a short minimum
+    /// duration, so quick turns stay quiet). Default `true`.
+    pub bell: bool,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
 }
@@ -105,6 +108,7 @@ impl Default for AgentConfig {
             effort: None,
             auto_compact: DEFAULT_AUTO_COMPACT,
             auto_resume: true,
+            bell: true,
             providers: HashMap::new(),
         }
     }
@@ -207,6 +211,7 @@ struct FileConfig {
     effort: Option<String>,
     auto_compact: Option<f64>,
     auto_resume: Option<bool>,
+    bell: Option<bool>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
 }
@@ -284,6 +289,9 @@ impl AgentConfig {
             if let Some(v) = fc.auto_resume {
                 cfg.auto_resume = v;
             }
+            if let Some(v) = fc.bell {
+                cfg.bell = v;
+            }
             if !fc.providers.is_empty() {
                 cfg.providers = fc.providers;
             }
@@ -311,6 +319,13 @@ impl AgentConfig {
             match v.trim().to_ascii_lowercase().as_str() {
                 "0" | "false" | "off" | "no" => cfg.auto_resume = false,
                 "1" | "true" | "on" | "yes" => cfg.auto_resume = true,
+                _ => {}
+            }
+        }
+        if let Ok(v) = std::env::var("HRDR_BELL") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "0" | "false" | "off" | "no" => cfg.bell = false,
+                "1" | "true" | "on" | "yes" => cfg.bell = true,
                 _ => {}
             }
         }

@@ -26,6 +26,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Terminal bell on turn completion: when a turn finishes after running at least
+  a few seconds, hrdr rings the bell so you can tab away during long tasks and
+  be notified when it's done. Disable with `bell = false` in config,
+  `--no-bell`, or `$HRDR_BELL=0`.
 - Status-bar context usage now shows a percentage of the window and colors it by
   fill level — dim under 70%, amber at 70%+, and red once it reaches the
   auto-compact threshold — so you can see compaction coming.
