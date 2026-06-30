@@ -30,6 +30,8 @@ enum Action {
     OpenEditor,
     /// Open a specific file in `$EDITOR` (from `/edit <file>`).
     OpenFile(std::path::PathBuf),
+    /// Force a full clear + repaint (Ctrl+L), to fix terminal corruption.
+    Redraw,
 }
 
 /// One rendered item in the transcript.
@@ -257,6 +259,43 @@ impl App {
         Ok(app)
     }
 
+    /// Probe the endpoint (list its models) on a background task and post a
+    /// warning if it's unreachable or doesn't advertise the configured model.
+    /// Stays silent on success so it doesn't clutter the transcript.
+    fn spawn_health_check(&self) {
+        let Some(client) = self.agent.try_lock().ok().map(|a| a.client()) else {
+            return;
+        };
+        let model = self.model.clone();
+        let base_url = self.base_url.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match client.list_models().await {
+                Err(e) => {
+                    let _ = tx.send(TurnMsg::System(format!(
+                        "⚠ endpoint {base_url} looks unreachable: {e}"
+                    )));
+                }
+                Ok(models) => {
+                    if model != "default"
+                        && !models.is_empty()
+                        && !models.iter().any(|m| m == &model)
+                    {
+                        let sample = models
+                            .iter()
+                            .take(8)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let _ = tx.send(TurnMsg::System(format!(
+                            "⚠ model '{model}' not found at {base_url}; available: {sample}"
+                        )));
+                    }
+                }
+            }
+        });
+    }
+
     /// On startup, resume the most recent saved session for the current
     /// directory (if any). No match → leave the fresh session as-is.
     fn auto_resume_latest(&mut self) {
@@ -291,6 +330,9 @@ impl App {
     }
 
     pub(crate) async fn run(&mut self, terminal: &mut Tui) -> Result<()> {
+        // Probe the endpoint in the background and warn if it's unreachable or
+        // doesn't have the configured model — surfaced before the first turn.
+        self.spawn_health_check();
         let mut events = EventStream::new();
         let mut rx = self.rx.take().expect("run called once");
         // Periodic wake so the inference spinner animates between tokens.
@@ -307,6 +349,7 @@ impl App {
                     Some(Ok(Event::Key(key))) => match self.on_key(key) {
                         Action::OpenEditor => self.open_in_editor(terminal)?,
                         Action::OpenFile(path) => self.open_file_in_editor(terminal, &path)?,
+                        Action::Redraw => terminal.clear()?,
                         Action::None => {}
                     },
                     Some(Ok(Event::Mouse(m))) => self.on_mouse(m),
@@ -393,6 +436,8 @@ impl App {
                     self.should_quit = true;
                     return Action::None;
                 }
+                // Ctrl+L clears + repaints the screen (fix terminal corruption).
+                KeyCode::Char('l') => return Action::Redraw,
                 // Ctrl+G: hand the buffer off to $EDITOR (only when idle).
                 KeyCode::Char('g') if !self.running => return Action::OpenEditor,
                 // Transcript scroll — Ctrl+U/Ctrl+D in vim Normal mode only

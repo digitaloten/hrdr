@@ -26,6 +26,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `Ctrl+L` clears and repaints the screen, to recover from terminal corruption
+  (e.g. after a stray external write or a garbled resize).
+- Startup endpoint health check: on launch hrdr probes the endpoint in the
+  background and warns in the transcript if it's unreachable, or if the
+  configured model isn't among the endpoint's advertised models (listing a few
+  available ones). Silent on success.
 - `/copy` variants: `/copy` (last reply, as before), `/copy code` (the most
   recent fenced code block), and `/copy all` (the whole transcript as text).
 - `/edit <file>` opens a file (relative to the cwd, created if missing) in
