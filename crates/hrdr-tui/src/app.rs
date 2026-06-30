@@ -88,8 +88,12 @@ pub(crate) struct App {
     cfg: AgentConfig,
     /// OS clipboard for `/copy` (None if unavailable).
     clipboard: Option<Clipboard>,
-    /// Selected row in the slash-command completion popup.
+    /// Selected row in the completion popup (slash command or `@file`).
     pub(crate) completion_idx: usize,
+    /// Cached relative file paths under the cwd, for `@file` completion.
+    file_index: Vec<String>,
+    /// The cwd `file_index` was built for; rebuilt when the cwd changes.
+    file_index_cwd: Option<std::path::PathBuf>,
     /// Whether to render the model's reasoning (`<think>`) blocks (`/reasoning`).
     pub(crate) show_reasoning: bool,
     /// True while a compaction (summarization) pass is running.
@@ -160,11 +164,13 @@ impl App {
         };
         let welcome = if vim_mode {
             "hrdr ready (vim mode). Insert to type, Esc for Normal, Enter in Normal sends, \
-             Ctrl+G opens $EDITOR. /help for commands; /exit (or Ctrl+C twice) to quit."
+             Ctrl+G opens $EDITOR. Type @path to attach a file. /help for commands; \
+             /exit (or Ctrl+C twice) to quit."
         } else {
             "hrdr ready. Type a message; Enter sends, Alt+Enter or \\+Enter for a newline \
-             (Shift+Enter too on supporting terminals), Ctrl+G opens $EDITOR. /help for commands; \
-             /exit (or Ctrl+C twice) to quit. Submit while a reply runs to queue follow-ups."
+             (Shift+Enter too on supporting terminals), Ctrl+G opens $EDITOR. Type @path to \
+             attach a file. /help for commands; /exit (or Ctrl+C twice) to quit. Submit while a \
+             reply runs to queue follow-ups."
         };
         let mut transcript = vec![Entry::System(welcome.to_string())];
         if project_docs_loaded {
@@ -189,6 +195,8 @@ impl App {
             cfg,
             clipboard: Clipboard::new().ok(),
             completion_idx: 0,
+            file_index: Vec::new(),
+            file_index_cwd: None,
             show_reasoning: true,
             compacting: false,
             auto_compact_ratio: auto_compact,
@@ -259,15 +267,16 @@ impl App {
             self.quit_armed = false;
         }
 
-        // Slash-command completion popup: Tab accepts the selection, Up/Down move
-        // it, Enter accepts the selection and submits it.
-        let comp = slash_completions(&self.editor.content());
-        if !comp.is_empty() && key.modifiers.is_empty() {
-            let last = comp.len() - 1;
+        // Completion popup (slash command or `@file`): Tab accepts the selection,
+        // Up/Down move it, Enter accepts; a slash Enter then submits, an `@file`
+        // Enter just inserts the path and keeps editing.
+        if key.modifiers.is_empty()
+            && let Some(comp) = self.active_completions()
+        {
+            let last = comp.items.len() - 1;
             match key.code {
                 KeyCode::Tab => {
-                    let idx = self.completion_idx.min(last);
-                    self.editor.set_content(&format!("{} ", comp[idx].0));
+                    self.apply_completion(&comp, self.completion_idx.min(last), true);
                     self.completion_idx = 0;
                     return Action::None;
                 }
@@ -279,12 +288,14 @@ impl App {
                     self.completion_idx = (self.completion_idx.min(last) + 1).min(last);
                     return Action::None;
                 }
-                // Replace the partial input with the selected command, then fall
-                // through to the normal submit path below so it runs.
                 KeyCode::Enter => {
-                    let idx = self.completion_idx.min(last);
-                    self.editor.set_content(comp[idx].0);
+                    self.apply_completion(&comp, self.completion_idx.min(last), false);
                     self.completion_idx = 0;
+                    // A file mention just inserts; a slash command falls through
+                    // to the submit path below so it runs.
+                    if matches!(comp.kind, CompletionKind::File { .. }) {
+                        return Action::None;
+                    }
                 }
                 _ => {}
             }
@@ -783,6 +794,7 @@ impl App {
         }
         self.dir = display_dir(&new);
         self.branch = git_branch(&new);
+        self.file_index_cwd = None; // force a rebuild for the new directory
     }
 
     fn show_tools(&mut self) {
@@ -1043,6 +1055,9 @@ impl App {
         // Commit the message into history at send time (a queued message lives
         // as a pending bottom item until this point).
         self.transcript.push(Entry::User(input.clone()));
+        // Expand `@file` mentions into attached contents for the model only; the
+        // transcript still shows the message as the user typed it.
+        let input = self.expand_mentions(&input);
         self.running = true;
         self.status = "thinking…".to_string();
         self.turn_started = Some(Instant::now());
@@ -1123,6 +1138,147 @@ impl App {
             let _ = tx.send(TurnMsg::Compacted(res.map_err(|e| e.to_string())));
         });
         self.turn_handle = Some(handle);
+    }
+
+    /// The active completion popup contents: slash commands when the line starts
+    /// with `/`, else `@file` paths when an `@…` token is being typed.
+    pub(crate) fn active_completions(&mut self) -> Option<Completions> {
+        let content = self.editor.content();
+        let slash = slash_completions(&content);
+        if !slash.is_empty() {
+            return Some(Completions {
+                kind: CompletionKind::Slash,
+                items: slash
+                    .into_iter()
+                    .map(|(n, d)| (n.to_string(), d.to_string()))
+                    .collect(),
+            });
+        }
+        if let Some((start, query)) = active_file_token(&content) {
+            let items = self.file_completion_items(&query);
+            if !items.is_empty() {
+                return Some(Completions {
+                    kind: CompletionKind::File { token_start: start },
+                    items,
+                });
+            }
+        }
+        None
+    }
+
+    /// Apply the selected completion. `trailing_space` adds a space after the
+    /// inserted text (Tab keeps editing; a slash Enter omits it so the bare
+    /// command submits).
+    fn apply_completion(&mut self, comp: &Completions, idx: usize, trailing_space: bool) {
+        let chosen = &comp.items[idx].0;
+        match comp.kind {
+            CompletionKind::Slash => {
+                if trailing_space {
+                    self.editor.set_content(&format!("{chosen} "));
+                } else {
+                    self.editor.set_content(chosen);
+                }
+            }
+            CompletionKind::File { token_start } => {
+                let content = self.editor.content();
+                // Replace the partial `@…` token with `@<path> ` (always a space
+                // so the next mention/word is separate).
+                let prefix = content.get(..token_start).unwrap_or("");
+                self.editor.set_content(&format!("{prefix}@{chosen} "));
+            }
+        }
+    }
+
+    /// Build (and cache) the list of files under the cwd, then rank by `query`.
+    fn file_completion_items(&mut self, query: &str) -> Vec<(String, String)> {
+        self.ensure_file_index();
+        let q = query.to_ascii_lowercase();
+        let mut scored: Vec<(u8, usize, &String)> = self
+            .file_index
+            .iter()
+            .filter_map(|p| {
+                if q.is_empty() {
+                    return Some((1u8, p.len(), p));
+                }
+                let lp = p.to_ascii_lowercase();
+                let base = lp.rsplit('/').next().unwrap_or(&lp);
+                if base.starts_with(&q) {
+                    Some((0, p.len(), p))
+                } else if lp.contains(&q) {
+                    Some((1, p.len(), p))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(b.2)));
+        scored
+            .into_iter()
+            .take(8)
+            .map(|(_, _, p)| (p.clone(), String::new()))
+            .collect()
+    }
+
+    /// Rebuild `file_index` if it's stale for the current cwd.
+    fn ensure_file_index(&mut self) {
+        let Some(cwd) = self
+            .agent
+            .try_lock()
+            .ok()
+            .map(|a| a.cwd())
+            .or_else(|| std::env::current_dir().ok())
+        else {
+            return;
+        };
+        if self.file_index_cwd.as_deref() == Some(cwd.as_path()) && !self.file_index.is_empty() {
+            return;
+        }
+        self.file_index = walk_files(&cwd);
+        self.file_index_cwd = Some(cwd);
+    }
+
+    /// Expand `@file` mentions in `input` by appending the referenced files'
+    /// contents (for the model only). Unreadable or missing references are left
+    /// as-is. Returns `input` unchanged when there are no resolvable mentions.
+    fn expand_mentions(&self, input: &str) -> String {
+        let Some(cwd) = self
+            .agent
+            .try_lock()
+            .ok()
+            .map(|a| a.cwd())
+            .or_else(|| std::env::current_dir().ok())
+        else {
+            return input.to_string();
+        };
+        const MAX_BYTES: usize = 100 * 1024;
+        let mut attached: Vec<(String, String)> = Vec::new();
+        for raw in input.split_whitespace() {
+            let Some(rel) = raw.strip_prefix('@') else {
+                continue;
+            };
+            let rel = rel.trim_end_matches([',', '.', ';', ':', ')', ']', '}']);
+            if rel.is_empty() || attached.iter().any(|(p, _)| p == rel) {
+                continue;
+            }
+            let path = cwd.join(rel);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let text = if text.len() > MAX_BYTES {
+                    format!("{}\n…[truncated]", &text[..MAX_BYTES])
+                } else {
+                    text
+                };
+                attached.push((rel.to_string(), text));
+            }
+        }
+        if attached.is_empty() {
+            return input.to_string();
+        }
+        let mut out = String::from(input);
+        out.push_str("\n\n--- Referenced files (via @) ---\n");
+        for (rel, text) in attached {
+            out.push_str(&format!("\n=== {rel} ===\n{text}\n"));
+        }
+        out
     }
 
     fn on_turn_msg(&mut self, msg: TurnMsg) {
@@ -1394,7 +1550,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/theme", "switch theme (path, or reset)"),
     ("/cwd", "show or change working directory"),
     ("/tools", "list available tools"),
-    ("/add", "attach a file to the next message"),
+    ("/add", "attach a file (or type @path inline)"),
     ("/diff", "show git diff of the working tree"),
     ("/reasoning", "toggle showing model reasoning"),
     ("/temp", "show or set temperature"),
@@ -1406,6 +1562,102 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
     ("/exit", "quit"),
 ];
+
+/// The active completion popup's contents and kind.
+pub(crate) struct Completions {
+    pub(crate) kind: CompletionKind,
+    /// `(label, description)` rows; the label is the text inserted on accept.
+    pub(crate) items: Vec<(String, String)>,
+}
+
+/// Which completion is active, and how to apply the selection.
+pub(crate) enum CompletionKind {
+    /// Replace the whole input with the chosen command.
+    Slash,
+    /// Replace the `@…` token starting at this byte offset with `@<path> `.
+    File { token_start: usize },
+}
+
+impl Completions {
+    /// Popup title shown on the border.
+    pub(crate) fn title(&self) -> &'static str {
+        match self.kind {
+            CompletionKind::Slash => " commands · Tab ",
+            CompletionKind::File { .. } => " files · Tab ",
+        }
+    }
+}
+
+/// If an `@…` file mention is being typed at the end of `input`, return the byte
+/// offset of the `@` and the partial query after it. Requires the `@` to start a
+/// token (preceded by start-of-input or whitespace) with no whitespace after it.
+fn active_file_token(input: &str) -> Option<(usize, String)> {
+    let at = input.rfind('@')?;
+    // Must start a token.
+    if at > 0 {
+        let prev = input[..at].chars().next_back()?;
+        if !prev.is_whitespace() {
+            return None;
+        }
+    }
+    let query = &input[at + 1..];
+    if query.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some((at, query.to_string()))
+}
+
+/// Directory names skipped when indexing files for `@` completion.
+const WALK_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".cache",
+    "dist",
+    "build",
+    ".next",
+    "vendor",
+    ".venv",
+    "__pycache__",
+];
+
+/// Collect relative file paths under `root` for `@file` completion. Bounded in
+/// depth and count, skipping VCS/build directories and hidden directories.
+fn walk_files(root: &std::path::Path) -> Vec<String> {
+    const MAX_FILES: usize = 20_000;
+    const MAX_DEPTH: usize = 12;
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > MAX_DEPTH || out.len() >= MAX_FILES {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                if name.starts_with('.') || WALK_SKIP_DIRS.contains(&name.as_ref()) {
+                    continue;
+                }
+                stack.push((path, depth + 1));
+            } else if ft.is_file()
+                && let Ok(rel) = path.strip_prefix(root)
+            {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+                if out.len() >= MAX_FILES {
+                    break;
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
 
 /// Commands matching the in-progress `/…` input (empty once a space is typed).
 ///
@@ -1486,7 +1738,23 @@ fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatu
 
 #[cfg(test)]
 mod tests {
-    use super::{is_quit_command, slash_completions};
+    use super::{active_file_token, is_quit_command, slash_completions};
+
+    #[test]
+    fn active_file_token_detection() {
+        // Bare @ at start, or after whitespace, with a partial query.
+        assert_eq!(active_file_token("@"), Some((0, String::new())));
+        assert_eq!(
+            active_file_token("look at @src/ma"),
+            Some((8, "src/ma".into()))
+        );
+        // Not a token boundary (email-ish) — the @ is preceded by a non-space.
+        assert_eq!(active_file_token("me@host"), None);
+        // Already-completed mention followed by a space is not active.
+        assert_eq!(active_file_token("@src/main.rs and"), None);
+        // No @ at all.
+        assert_eq!(active_file_token("hello world"), None);
+    }
 
     #[test]
     fn slash_completions_filter() {

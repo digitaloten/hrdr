@@ -69,18 +69,18 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     draw_statusbar(f, app, chunks[statusbar_idx]);
     draw_help(f, app, chunks[help_idx]);
 
-    // Slash-command completion popup, overlaid above the input.
-    let comp = crate::app::slash_completions(&app.editor.content());
-    if !comp.is_empty() {
-        app.completion_idx = app.completion_idx.min(comp.len() - 1);
+    // Completion popup (slash command or `@file`), overlaid above the input.
+    if let Some(comp) = app.active_completions() {
+        app.completion_idx = app.completion_idx.min(comp.items.len() - 1);
         draw_completion(f, app, chunks[input_idx], &comp);
     }
 }
 
-fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &[(&str, &str)]) {
+fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &crate::app::Completions) {
     let theme = &app.theme;
-    let height = comp.len() as u16 + 2;
+    let height = comp.items.len() as u16 + 2;
     let widest = comp
+        .items
         .iter()
         .map(|(n, d)| n.chars().count() + d.chars().count() + 5)
         .max()
@@ -95,12 +95,13 @@ fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &[(&str, &s
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" commands · Tab ")
+        .title(comp.title())
         .border_style(Style::default().fg(theme.dim));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
     let lines: Vec<Line> = comp
+        .items
         .iter()
         .enumerate()
         .map(|(i, (name, desc))| {
