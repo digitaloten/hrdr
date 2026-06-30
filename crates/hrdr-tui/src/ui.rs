@@ -461,7 +461,8 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, area);
 }
 
-/// Human-friendly elapsed time since `then` (e.g. `now`, `2m ago`, `3h ago`).
+/// Human-friendly elapsed time since `then`, with compound units for the larger
+/// ranges (`now`, `42s ago`, `5m ago`, `1h30m ago`, `2d3h ago`).
 fn relative_time(then: chrono::DateTime<chrono::Local>) -> String {
     let secs = (chrono::Local::now() - then).num_seconds().max(0);
     if secs < 5 {
@@ -471,9 +472,19 @@ fn relative_time(then: chrono::DateTime<chrono::Local>) -> String {
     } else if secs < 3600 {
         format!("{}m ago", secs / 60)
     } else if secs < 86_400 {
-        format!("{}h ago", secs / 3600)
+        let (h, m) = (secs / 3600, (secs % 3600) / 60);
+        if m > 0 {
+            format!("{h}h{m}m ago")
+        } else {
+            format!("{h}h ago")
+        }
     } else {
-        format!("{}d ago", secs / 86_400)
+        let (d, h) = (secs / 86_400, (secs % 86_400) / 3600);
+        if h > 0 {
+            format!("{d}d{h}h ago")
+        } else {
+            format!("{d}d ago")
+        }
     }
 }
 

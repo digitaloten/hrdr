@@ -144,6 +144,9 @@ pub(crate) struct App {
     pending_edit: Option<std::path::PathBuf>,
     /// A `/goto` target message number, resolved to a scroll offset at draw.
     pub(crate) pending_goto: Option<usize>,
+    /// Last `/find` query and the message number it last landed on (for cycling).
+    find_query: Option<String>,
+    find_pos: usize,
     /// Auto-compact trigger as a fraction of the context window; 0 disables.
     pub(crate) auto_compact_ratio: f64,
     /// Ring the terminal bell when a turn finishes (after a brief minimum).
@@ -267,6 +270,8 @@ impl App {
             pending_init: false,
             pending_edit: None,
             pending_goto: None,
+            find_query: None,
+            find_pos: 0,
             auto_compact_ratio: auto_compact,
             bell,
             base_url,
@@ -750,6 +755,7 @@ impl App {
             "init" => self.init_agents_cmd(),
             "reload" => self.reload_cmd(),
             "goto" => self.goto_cmd(arg),
+            "find" | "search" => self.find_cmd(arg),
             "timestamps" | "ts" => self.timestamps_cmd(arg),
             _ => return false,
         }
@@ -1324,6 +1330,55 @@ impl App {
         self.system(format!("jumped to message #{target}"));
     }
 
+    /// `/find <text>` — jump to the next message containing `text`
+    /// (case-insensitive). Repeat `/find` with no argument to cycle to the next
+    /// match of the same query.
+    fn find_cmd(&mut self, arg: &str) {
+        let query = if arg.trim().is_empty() {
+            match &self.find_query {
+                Some(q) => q.clone(),
+                None => {
+                    self.system("usage: /find <text>");
+                    return;
+                }
+            }
+        } else {
+            arg.trim().to_string()
+        };
+        let needle = query.to_ascii_lowercase();
+        // Numbered messages whose text contains the query.
+        let mut num = 0;
+        let mut hits: Vec<usize> = Vec::new();
+        for e in &self.transcript {
+            if let Entry::User(s) | Entry::Assistant(s) = e {
+                num += 1;
+                if s.to_ascii_lowercase().contains(&needle) {
+                    hits.push(num);
+                }
+            }
+        }
+        if hits.is_empty() {
+            self.find_query = Some(query.clone());
+            self.system(format!("no match for {query:?}"));
+            return;
+        }
+        // Continue from the last landing spot when repeating the same query.
+        let after = if self.find_query.as_deref() == Some(query.as_str()) {
+            self.find_pos
+        } else {
+            0
+        };
+        let target = hits.iter().copied().find(|&n| n > after).unwrap_or(hits[0]);
+        let idx = hits.iter().position(|&n| n == target).unwrap_or(0) + 1;
+        self.find_query = Some(query.clone());
+        self.find_pos = target;
+        self.pending_goto = Some(target);
+        self.system(format!(
+            "match {idx}/{} for {query:?} → message #{target}",
+            hits.len()
+        ));
+    }
+
     /// Number of user/assistant messages in the transcript.
     fn display_message_count(&self) -> usize {
         self.transcript
@@ -1469,21 +1524,23 @@ impl App {
         self.editor.paste(&text);
     }
 
-    /// `/export <file>` — write the transcript (as text) to a file.
+    /// `/export [file]` — write the transcript (as text) to a file. With no
+    /// argument, a timestamped `hrdr-transcript-<date>.md` in the cwd is used.
     fn export_cmd(&mut self, arg: &str) {
-        if arg.is_empty() {
-            self.system("usage: /export <file>");
-            return;
-        }
         let Some(cwd) = self.agent.try_lock().ok().map(|a| a.cwd()) else {
             self.system("busy — try again after the current turn");
             return;
         };
-        let p = std::path::Path::new(arg);
-        let path = if p.is_absolute() {
-            p.to_path_buf()
+        let path = if arg.is_empty() {
+            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            cwd.join(format!("hrdr-transcript-{stamp}.md"))
         } else {
-            cwd.join(p)
+            let p = std::path::Path::new(arg);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                cwd.join(p)
+            }
         };
         let text = self.transcript_text();
         match std::fs::write(&path, &text) {
@@ -2178,8 +2235,9 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/effort", "show or set effort label"),
     ("/info", "session info"),
     ("/goto", "jump to message N or time (5m/1h/top/end)"),
+    ("/find", "jump to next message containing text"),
     ("/copy", "copy reply (or 'code' / 'all' / 'msg N[-M]')"),
-    ("/export", "write the transcript to a file"),
+    ("/export", "write the transcript to a file (default name)"),
     ("/paste", "paste clipboard (file path → attach)"),
     ("/edit", "open a file in $EDITOR"),
     ("/retry", "re-run last turn (optional model)"),
@@ -2207,6 +2265,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/compact",
             "/info",
             "/goto",
+            "/find",
         ],
     ),
     (
