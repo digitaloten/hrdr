@@ -21,10 +21,10 @@ jobs:
     steps:
       # hrdr depends on the sibling hjkl crates via `../hjkl/...` path deps, so
       # both repos are checked out side by side under the workspace.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: hrdr
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: kryptic-sh/hjkl
           path: hjkl
@@ -40,10 +40,10 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: hrdr
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: kryptic-sh/hjkl
           path: hjkl
@@ -62,10 +62,10 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: hrdr
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: kryptic-sh/hjkl
           path: hjkl
