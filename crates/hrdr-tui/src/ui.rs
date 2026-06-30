@@ -1,4 +1,4 @@
-//! Rendering: transcript + vim input pane + status line.
+//! Rendering: transcript + TODO panel + vim input pane + status line.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -9,29 +9,99 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::app::{App, Entry};
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
+/// Max lines shown in the TODO panel (plus 2 for borders).
+const TODO_PANEL_MAX_ITEMS: u16 = 6;
 
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let chunks = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(7),
-        Constraint::Length(1),
-    ])
-    .split(area);
 
-    draw_transcript(f, app, chunks[0]);
-    draw_input(f, app, chunks[1]);
-    draw_status(f, app, chunks[2]);
+    // Snapshot TODO count while briefly holding the lock.
+    let todo_count = app.todos.lock().map(|t| t.len()).unwrap_or(0);
+    let todo_height = if todo_count > 0 {
+        // +2 for borders, cap at TODO_PANEL_MAX_ITEMS visible items.
+        (todo_count as u16).min(TODO_PANEL_MAX_ITEMS) + 2
+    } else {
+        0
+    };
+
+    // Build constraints dynamically so the TODO panel appears only when needed.
+    let (transcript_area, todo_area, input_area, status_area) = if todo_height > 0 {
+        let chunks = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(todo_height),
+            Constraint::Length(7),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        (chunks[0], Some(chunks[1]), chunks[2], chunks[3])
+    } else {
+        let chunks = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(7),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        (chunks[0], None, chunks[1], chunks[2])
+    };
+
+    draw_transcript(f, app, transcript_area);
+    if let Some(ta) = todo_area {
+        draw_todos(f, app, ta);
+    }
+    draw_input(f, app, input_area);
+    draw_status(f, app, status_area);
 }
 
-fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
+fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
+    // Publish the height so key handlers can compute half-page offsets.
+    app.transcript_height = area.height;
+
     let lines = transcript_lines(app);
-    let total = lines.len();
-    let scroll = total.saturating_sub(area.height as usize) as u16;
+    let total = lines.len() as u16;
+    let visible = area.height;
+    let max_scroll = total.saturating_sub(visible);
+    // Cap the stored offset so it can't go past the top.
+    let offset = (app.scroll_offset as u16).min(max_scroll);
+    let scroll = max_scroll.saturating_sub(offset);
+
     let para = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(para, area);
+}
+
+fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
+    let todos = match app.todos.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => return,
+    };
+    if todos.is_empty() {
+        return;
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" todos ")
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines: Vec<Line<'static>> = todos
+        .iter()
+        .map(|t| {
+            let (mark, color) = match t.status.as_str() {
+                "completed" => ("x", Color::Green),
+                "in_progress" => ("~", Color::Yellow),
+                _ => (" ", Color::DarkGray),
+            };
+            Line::from(Span::styled(
+                format!("[{mark}] {}", t.content),
+                Style::default().fg(color),
+            ))
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
@@ -47,8 +117,13 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let dot = if app.running { "●" } else { "○" };
+    let scroll_hint = if app.scroll_offset > 0 {
+        format!("  [scroll: {}↑]", app.scroll_offset)
+    } else {
+        String::new()
+    };
     let text = format!(
-        "{dot} {}  │  model: {}  │  Esc=normal  Enter=send  Ctrl+C=quit",
+        "{dot} {}  │  model: {}  │  Esc=normal  Enter=send  Ctrl+C=quit{scroll_hint}",
         app.status, app.model
     );
     let para = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
