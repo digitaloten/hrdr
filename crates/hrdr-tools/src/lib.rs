@@ -14,8 +14,10 @@ use async_trait::async_trait;
 use hrdr_llm::ToolDef;
 
 mod tools;
+mod web;
 
 pub use tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, TodoTool, WriteTool};
+pub use web::{WebFetchTool, WebSearchTool};
 
 /// Default cap on a single tool's textual output, in bytes. Larger results are
 /// truncated with a marker so the model's context is never blown by one call.
@@ -90,7 +92,7 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// The locked MVP set: Core 6 + `todo_write`.
+    /// The default set: Core 6 + `todo_write` + web (`web_fetch`, `web_search`).
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
         r.register(Arc::new(ReadTool));
@@ -100,6 +102,8 @@ impl ToolRegistry {
         r.register(Arc::new(GrepTool));
         r.register(Arc::new(GlobTool));
         r.register(Arc::new(TodoTool));
+        r.register(Arc::new(WebFetchTool));
+        r.register(Arc::new(WebSearchTool));
         r
     }
 

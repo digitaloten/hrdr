@@ -26,6 +26,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Web tools: `web_fetch` (GET a URL and return its content as text — HTML is
+  reduced to readable text, scripts/styles/markup stripped, with an optional
+  `max_chars` cap) and `web_search` (top results as title/URL/snippet). Search
+  uses DuckDuckGo's HTML endpoint with zero configuration, or a SearXNG instance
+  when `SEARXNG_URL` is set (a JSON API — more robust). Both are in the default
+  tool set, so the model can look things up and read pages.
 - `@file` mentions with autocompletion: type `@` in the input to get a popup of
   matching project files (Up/Down to select, Tab or Enter to insert the path);
   the file index is built lazily from the cwd, skipping VCS/build/hidden

@@ -965,6 +965,7 @@ dependencies = [
  "async-trait",
  "glob",
  "hrdr-llm",
+ "reqwest",
  "serde",
  "serde_json",
  "similar",
