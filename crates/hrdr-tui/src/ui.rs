@@ -446,6 +446,22 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, area);
 }
 
+/// Human-friendly elapsed time since `then` (e.g. `now`, `2m ago`, `3h ago`).
+fn relative_time(then: chrono::DateTime<chrono::Local>) -> String {
+    let secs = (chrono::Local::now() - then).num_seconds().max(0);
+    if secs < 5 {
+        "now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
 /// Compact token count: `840`, `12.4k`, `1.8M`.
 fn fmt_count(n: usize) -> String {
     if n >= 1_000_000 {
@@ -467,7 +483,17 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         if !app.show_timestamps {
             return;
         }
-        let time = app.entry_times.get(i).map(String::as_str).unwrap_or("");
+        let time = app
+            .entry_times
+            .get(i)
+            .map(|t| {
+                if app.timestamp_relative {
+                    relative_time(*t)
+                } else {
+                    t.format("%H:%M").to_string()
+                }
+            })
+            .unwrap_or_default();
         out.push(Line::from(Span::styled(
             format!("#{num} {role} · {time}"),
             Style::default().fg(theme.dim),

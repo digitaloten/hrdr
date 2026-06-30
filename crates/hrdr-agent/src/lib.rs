@@ -89,6 +89,9 @@ pub struct AgentConfig {
     pub icons: Option<String>,
     /// Show per-message timestamps + numbers in the transcript. Default `true`.
     pub timestamps: bool,
+    /// Timestamp style: `relative` (e.g. `2m ago`, default) or `absolute`
+    /// (`HH:MM`). `None` resolves to relative.
+    pub timestamp_style: Option<String>,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
 }
@@ -116,6 +119,7 @@ impl Default for AgentConfig {
             bell: true,
             icons: None,
             timestamps: true,
+            timestamp_style: None,
             providers: HashMap::new(),
         }
     }
@@ -221,6 +225,7 @@ struct FileConfig {
     bell: Option<bool>,
     icons: Option<String>,
     timestamps: Option<bool>,
+    timestamp_style: Option<String>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
 }
@@ -307,6 +312,9 @@ impl AgentConfig {
             if let Some(v) = fc.timestamps {
                 cfg.timestamps = v;
             }
+            if let Some(v) = fc.timestamp_style {
+                cfg.timestamp_style = Some(v);
+            }
             if !fc.providers.is_empty() {
                 cfg.providers = fc.providers;
             }
@@ -353,6 +361,9 @@ impl AgentConfig {
                 "1" | "true" | "on" | "yes" => cfg.timestamps = true,
                 _ => {}
             }
+        }
+        if let Ok(v) = std::env::var("HRDR_TIMESTAMP_STYLE") {
+            cfg.timestamp_style = Some(v);
         }
         let env_key = std::env::var("HRDR_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))

@@ -73,10 +73,13 @@ pub(crate) struct App {
     /// Resolved chat-UI colors (from an hjkl theme).
     pub(crate) theme: Theme,
     pub(crate) transcript: Vec<Entry>,
-    /// Local "HH:MM" timestamp per transcript entry (parallel to `transcript`).
-    pub(crate) entry_times: Vec<String>,
+    /// Local timestamp per transcript entry (parallel to `transcript`), rendered
+    /// as relative or absolute time at draw.
+    pub(crate) entry_times: Vec<chrono::DateTime<chrono::Local>>,
     /// Show per-message timestamps + numbers in the transcript (`/timestamps`).
     pub(crate) show_timestamps: bool,
+    /// Render timestamps as relative (`2m ago`) vs absolute (`HH:MM`).
+    pub(crate) timestamp_relative: bool,
     pub(crate) running: bool,
     pub(crate) status: String,
     pub(crate) model: String,
@@ -175,6 +178,12 @@ impl App {
         let auto_resume = config.auto_resume;
         let bell = config.bell;
         let timestamps = config.timestamps;
+        // Relative unless the style is explicitly "absolute".
+        let timestamp_relative = config
+            .timestamp_style
+            .as_deref()
+            .map(|s| !s.eq_ignore_ascii_case("absolute"))
+            .unwrap_or(true);
         // No portable terminal-font probe, so an unset/`auto` icons setting
         // resolves to Nerd glyphs.
         let icon_mode = config
@@ -218,6 +227,7 @@ impl App {
             transcript,
             entry_times,
             show_timestamps: timestamps,
+            timestamp_relative,
             running: false,
             status: "ready".to_string(),
             model,
@@ -721,7 +731,7 @@ impl App {
             "compact" => self.compact_cmd(arg),
             "init" => self.init_agents_cmd(),
             "reload" => self.reload_cmd(),
-            "timestamps" | "ts" => self.toggle_timestamps(),
+            "timestamps" | "ts" => self.timestamps_cmd(arg),
             _ => return false,
         }
         true
@@ -987,6 +997,11 @@ impl App {
         self.auto_compact_ratio = cfg.auto_compact;
         self.bell = cfg.bell;
         self.show_timestamps = cfg.timestamps;
+        self.timestamp_relative = cfg
+            .timestamp_style
+            .as_deref()
+            .map(|s| !s.eq_ignore_ascii_case("absolute"))
+            .unwrap_or(true);
         self.icon_mode = cfg
             .icons
             .as_deref()
@@ -1258,14 +1273,38 @@ impl App {
             .nth(n - 1)
     }
 
-    /// `/timestamps` — toggle the per-message timestamp + number headers.
-    fn toggle_timestamps(&mut self) {
-        self.show_timestamps = !self.show_timestamps;
-        self.system(if self.show_timestamps {
-            "timestamps shown"
-        } else {
-            "timestamps hidden"
-        });
+    /// `/timestamps [on|off|relative|absolute]` — toggle the per-message
+    /// timestamp + number headers, or switch their style.
+    fn timestamps_cmd(&mut self, arg: &str) {
+        match arg.trim().to_ascii_lowercase().as_str() {
+            "" => {
+                self.show_timestamps = !self.show_timestamps;
+                self.system(if self.show_timestamps {
+                    "timestamps shown"
+                } else {
+                    "timestamps hidden"
+                });
+            }
+            "on" => {
+                self.show_timestamps = true;
+                self.system("timestamps shown");
+            }
+            "off" => {
+                self.show_timestamps = false;
+                self.system("timestamps hidden");
+            }
+            "relative" | "rel" => {
+                self.timestamp_relative = true;
+                self.show_timestamps = true;
+                self.system("timestamps: relative");
+            }
+            "absolute" | "abs" => {
+                self.timestamp_relative = false;
+                self.show_timestamps = true;
+                self.system("timestamps: absolute (HH:MM)");
+            }
+            _ => self.system("usage: /timestamps [on | off | relative | absolute]"),
+        }
     }
 
     /// Write `text` to the system clipboard, reporting success/failure.
@@ -1940,9 +1979,9 @@ impl App {
     }
 }
 
-/// Current local time as `HH:MM`, for per-message timestamps.
-fn timestamp_now() -> String {
-    chrono::Local::now().format("%H:%M").to_string()
+/// Current local time, for per-message timestamps.
+fn timestamp_now() -> chrono::DateTime<chrono::Local> {
+    chrono::Local::now()
 }
 
 /// Display form of `cwd`, with the home directory collapsed to `~`.
@@ -2026,7 +2065,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/add", "attach a file (or type @path inline)"),
     ("/diff", "show git diff of the working tree"),
     ("/reasoning", "toggle showing model reasoning"),
-    ("/timestamps", "toggle message timestamps"),
+    ("/timestamps", "toggle/style timestamps (relative|absolute)"),
     ("/reload", "reload AGENTS.md + config"),
     ("/temp", "show or set temperature"),
     ("/effort", "show or set effort label"),
