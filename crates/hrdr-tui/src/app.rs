@@ -224,7 +224,8 @@ impl App {
             self.quit_armed = false;
         }
 
-        // Slash-command completion popup: Tab accepts the selection, Up/Down move it.
+        // Slash-command completion popup: Tab accepts the selection, Up/Down move
+        // it, Enter accepts the selection and submits it.
         let comp = slash_completions(&self.editor.content());
         if !comp.is_empty() && key.modifiers.is_empty() {
             let last = comp.len() - 1;
@@ -242,6 +243,13 @@ impl App {
                 KeyCode::Down => {
                     self.completion_idx = (self.completion_idx.min(last) + 1).min(last);
                     return Action::None;
+                }
+                // Replace the partial input with the selected command, then fall
+                // through to the normal submit path below so it runs.
+                KeyCode::Enter => {
+                    let idx = self.completion_idx.min(last);
+                    self.editor.set_content(comp[idx].0);
+                    self.completion_idx = 0;
                 }
                 _ => {}
             }
