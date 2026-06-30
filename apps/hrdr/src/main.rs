@@ -14,7 +14,7 @@ use std::io::Write;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use hrdr_agent::{Agent, AgentConfig, AgentEvent};
+use hrdr_agent::{Agent, AgentConfig, AgentEvent, resolve_provider};
 use hrdr_llm::Client;
 
 use backend::{Backend, BackendConfig};
@@ -34,6 +34,11 @@ struct Cli {
     /// Model id (default: $HRDR_MODEL).
     #[arg(long, global = true)]
     model: Option<String>,
+
+    /// Provider preset: zen (OpenCode Zen), openai, or local. Sets the endpoint,
+    /// API key env, and (for remote providers) skips the local backend.
+    #[arg(long, global = true)]
+    provider: Option<String>,
 
     /// Use vim keybindings in the input pane (default: plain claude-style input).
     #[arg(long, global = true)]
@@ -87,6 +92,30 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     // Precedence: CLI flag > env var > config file > built-in default.
     let mut config = AgentConfig::load();
+
+    // Apply a provider preset (CLI > config/env) before explicit CLI overrides.
+    let mut remote_provider = false;
+    let provider_name = cli.provider.clone().or_else(|| config.provider.clone());
+    if let Some(name) = &provider_name {
+        let p = resolve_provider(name).ok_or_else(|| {
+            anyhow::anyhow!("unknown provider '{name}' (known: zen, openai, local)")
+        })?;
+        // Provider sets the endpoint unless an explicit --base-url / $HRDR_BASE_URL wins.
+        let base_overridden = cli.base_url.is_some() || std::env::var_os("HRDR_BASE_URL").is_some();
+        if !base_overridden {
+            config.base_url = p.base_url.to_string();
+        }
+        if let Ok(key) = std::env::var(p.key_env) {
+            config.api_key = Some(key);
+        } else if p.remote && config.api_key.is_none() {
+            eprintln!(
+                "hrdr: provider '{name}' needs an API key — set ${}",
+                p.key_env
+            );
+        }
+        remote_provider = p.remote;
+    }
+
     if let Some(u) = cli.base_url {
         config.base_url = u;
     }
@@ -97,9 +126,15 @@ async fn main() -> Result<()> {
         config.vim_mode = true;
     }
 
-    // TEMPORARY: bring up a local llama-server backend unless told not to.
-    // Held for the duration of the command; dropping it kills the server.
-    let _backend = if cli.no_backend {
+    if remote_provider && config.model == "default" {
+        eprintln!(
+            "hrdr: set a model with --model (run `hrdr models` to list this provider's models)"
+        );
+    }
+
+    // TEMPORARY: bring up a local llama-server backend unless told not to. Remote
+    // providers never spawn one. Held for the command; dropping it kills the server.
+    let _backend = if cli.no_backend || remote_provider {
         None
     } else {
         let mut bcfg = BackendConfig::default();

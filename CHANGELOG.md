@@ -16,6 +16,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Provider presets via `--provider` (or `provider` in config /
+  `$HRDR_PROVIDER`): `zen`/`opencode` (OpenCode Zen, `OPENCODE_API_KEY`),
+  `openai`, and `local`/`infr`. A preset sets the base URL + API-key env, and
+  remote providers skip the local llama-server backend.
+  `--base-url`/`$HRDR_BASE_URL` still override the endpoint.
 - Queued messages now float as a dimmed "— queued —" block at the bottom,
   following the output, and are committed into history only when actually sent
   (rather than being pinned at their typed position mid-conversation).

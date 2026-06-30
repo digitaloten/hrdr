@@ -73,6 +73,26 @@ hrdr --no-backend                      # use an endpoint you started yourself
 If a backend is already answering at `--base-url`, hrdr reuses it instead of
 spawning. Spawn logs go to `~/.cache/hrdr/llama-server.log`.
 
+### Providers
+
+`--provider <name>` (or `provider = "..."` in config, or `$HRDR_PROVIDER`)
+selects a preset endpoint + API-key env, and remote providers skip the local
+backend:
+
+| Provider           | Endpoint                     | API key env        | Backend |
+| ------------------ | ---------------------------- | ------------------ | ------- |
+| `zen` / `opencode` | `https://opencode.ai/zen/v1` | `OPENCODE_API_KEY` | remote  |
+| `openai`           | `https://api.openai.com/v1`  | `OPENAI_API_KEY`   | remote  |
+| `local` / `infr`   | `http://localhost:8080/v1`   | `HRDR_API_KEY`     | spawned |
+
+```bash
+export OPENCODE_API_KEY=sk-...
+hrdr models --provider zen                 # list OpenCode Zen models
+hrdr --provider zen --model grok-build-0.1 # chat against a Zen model
+```
+
+`--base-url` / `$HRDR_BASE_URL` still override a provider's endpoint.
+
 Configuration (CLI flags override env):
 
 | Env             | Default                            | Meaning                     |

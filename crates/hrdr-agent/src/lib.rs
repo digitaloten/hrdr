@@ -58,6 +58,9 @@ pub struct AgentConfig {
     /// Input discipline for the TUI: `true` = vim (hjkl), `false` = plain
     /// claude-style input (default).
     pub vim_mode: bool,
+    /// Named provider preset (e.g. `zen`, `openai`, `local`). Resolved by the
+    /// binary into `base_url`/`api_key`/backend behaviour via [`resolve_provider`].
+    pub provider: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -70,7 +73,45 @@ impl Default for AgentConfig {
             temperature: None,
             max_steps: 50,
             vim_mode: false,
+            provider: None,
         }
+    }
+}
+
+/// A named, OpenAI-compatible model provider preset.
+#[derive(Debug, Clone)]
+pub struct Provider {
+    /// OpenAI-compatible base URL (including the `/v1` suffix).
+    pub base_url: &'static str,
+    /// Environment variable holding the API key.
+    pub key_env: &'static str,
+    /// Remote provider — hrdr must NOT spawn a local backend for it.
+    pub remote: bool,
+}
+
+/// Resolve a provider name (case-insensitive) to its preset.
+///
+/// - `zen` / `opencode` — OpenCode Zen gateway (`OPENCODE_API_KEY`).
+/// - `openai` — OpenAI (`OPENAI_API_KEY`).
+/// - `local` / `infr` — a local OpenAI-compatible server (spawned backend).
+pub fn resolve_provider(name: &str) -> Option<Provider> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "zen" | "opencode" | "opencode-zen" => Some(Provider {
+            base_url: "https://opencode.ai/zen/v1",
+            key_env: "OPENCODE_API_KEY",
+            remote: true,
+        }),
+        "openai" => Some(Provider {
+            base_url: "https://api.openai.com/v1",
+            key_env: "OPENAI_API_KEY",
+            remote: true,
+        }),
+        "local" | "infr" => Some(Provider {
+            base_url: "http://localhost:8080/v1",
+            key_env: "HRDR_API_KEY",
+            remote: false,
+        }),
+        _ => None,
     }
 }
 
@@ -82,6 +123,7 @@ struct FileConfig {
     model: Option<String>,
     temperature: Option<f32>,
     vim: Option<bool>,
+    provider: Option<String>,
 }
 
 fn config_path() -> Option<std::path::PathBuf> {
@@ -139,9 +181,15 @@ impl AgentConfig {
             if let Some(v) = fc.vim {
                 cfg.vim_mode = v;
             }
+            if let Some(v) = fc.provider {
+                cfg.provider = Some(v);
+            }
         }
 
         // Layer 2: env vars override file.
+        if let Ok(v) = std::env::var("HRDR_PROVIDER") {
+            cfg.provider = Some(v);
+        }
         if let Ok(v) = std::env::var("HRDR_BASE_URL") {
             cfg.base_url = v;
         }
@@ -290,4 +338,24 @@ pub use hrdr_tools::TodoItem as Todo;
 /// transcript state.
 pub fn is_assistant(m: &ChatMessage) -> bool {
     m.role == Role::Assistant
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_provider;
+
+    #[test]
+    fn zen_provider_is_remote_with_opencode_key() {
+        let p = resolve_provider("ZEN").expect("zen resolves (case-insensitive)");
+        assert_eq!(p.base_url, "https://opencode.ai/zen/v1");
+        assert_eq!(p.key_env, "OPENCODE_API_KEY");
+        assert!(p.remote);
+        assert!(resolve_provider("opencode").is_some());
+    }
+
+    #[test]
+    fn local_provider_is_not_remote_and_unknown_is_none() {
+        assert!(!resolve_provider("local").unwrap().remote);
+        assert!(resolve_provider("nope").is_none());
+    }
 }
