@@ -217,7 +217,7 @@ impl App {
             cfg,
             clipboard: Clipboard::new().ok(),
             completion_idx: 0,
-            input_history: Vec::new(),
+            input_history: load_history(),
             history_pos: None,
             history_draft: String::new(),
             file_index: Vec::new(),
@@ -1276,14 +1276,15 @@ impl App {
     }
 
     /// Record a submitted input for Up/Down recall (skips consecutive dups,
-    /// bounds the buffer) and resets browsing state.
+    /// bounds the buffer, persists to disk) and resets browsing state.
     fn record_history(&mut self, input: &str) {
         if self.input_history.last().map(String::as_str) != Some(input) {
             self.input_history.push(input.to_string());
-            const MAX_HISTORY: usize = 200;
             if self.input_history.len() > MAX_HISTORY {
-                self.input_history.remove(0);
+                let drop = self.input_history.len() - MAX_HISTORY;
+                self.input_history.drain(0..drop);
             }
+            persist_history(&self.input_history);
         }
         self.history_pos = None;
         self.history_draft.clear();
@@ -1822,6 +1823,52 @@ const WALK_SKIP_DIRS: &[&str] = &[
     ".venv",
     "__pycache__",
 ];
+
+/// Max input-history entries kept (in memory and on disk).
+const MAX_HISTORY: usize = 200;
+
+/// Path to the persisted input history (`$XDG_DATA_HOME/hrdr/history`).
+fn history_path() -> Option<std::path::PathBuf> {
+    hjkl_xdg::data_dir("hrdr").ok().map(|d| d.join("history"))
+}
+
+/// Load persisted single-line input history (most recent `MAX_HISTORY`).
+fn load_history() -> Vec<String> {
+    let Some(path) = history_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut v: Vec<String> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    if v.len() > MAX_HISTORY {
+        let drop = v.len() - MAX_HISTORY;
+        v.drain(0..drop);
+    }
+    v
+}
+
+/// Persist input history (one entry per line; multi-line entries are skipped to
+/// keep the line-based file well-formed).
+fn persist_history(history: &[String]) {
+    let Some(path) = history_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body: String = history
+        .iter()
+        .filter(|s| !s.contains('\n'))
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = std::fs::write(path, body);
+}
 
 /// Instruction sent to the model by `/init` to author an `AGENTS.md`.
 const INIT_PROMPT: &str = "\
