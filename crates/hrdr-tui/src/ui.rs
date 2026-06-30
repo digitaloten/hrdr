@@ -1,5 +1,11 @@
 //! Rendering: transcript + TODO panel + vim input pane + status line.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -8,6 +14,10 @@ use ratatui::widgets::{
     Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
     Wrap,
 };
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
+use syntect::util::LinesWithEndings;
 
 use crate::app::{App, Entry, TimestampStyle};
 use crate::theme::Theme;
@@ -557,6 +567,116 @@ fn highlight_line(line: Line<'static>, needle: &str, hl: Style) -> Line<'static>
     Line::from(spans)
 }
 
+// syntect resources are loaded once (deserialized from the bundled dumps).
+fn syntax_set() -> &'static SyntaxSet {
+    static SS: OnceLock<SyntaxSet> = OnceLock::new();
+    SS.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+fn syntect_theme() -> &'static syntect::highlighting::Theme {
+    static TH: OnceLock<syntect::highlighting::Theme> = OnceLock::new();
+    TH.get_or_init(|| {
+        let ts = ThemeSet::load_defaults();
+        ts.themes
+            .get("base16-ocean.dark")
+            .or_else(|| ts.themes.values().next())
+            .cloned()
+            .expect("syntect ships default themes")
+    })
+}
+
+thread_local! {
+    // Cache highlighted code blocks (keyed by lang+content+width) so the ~8/sec
+    // redraw doesn't re-run syntect every frame.
+    static HL_CACHE: RefCell<HashMap<u64, Vec<Line<'static>>>> = RefCell::new(HashMap::new());
+}
+
+/// Render a fenced code block with syntect highlighting on a distinct
+/// background, padded to a solid rectangle. Cached per (lang, content, width).
+fn highlight_code_block(lang: &str, content: &str, width: u16) -> Vec<Line<'static>> {
+    let mut hasher = DefaultHasher::new();
+    lang.hash(&mut hasher);
+    content.hash(&mut hasher);
+    width.hash(&mut hasher);
+    let key = hasher.finish();
+    if let Some(cached) = HL_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    let lines = render_code_block(lang, content, width);
+    HL_CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        if m.len() > 256 {
+            m.clear();
+        }
+        m.insert(key, lines.clone());
+    });
+    lines
+}
+
+fn render_code_block(lang: &str, content: &str, width: u16) -> Vec<Line<'static>> {
+    let ss = syntax_set();
+    let theme = syntect_theme();
+    let bg = theme
+        .settings
+        .background
+        .map(|c| Color::Rgb(c.r, c.g, c.b))
+        .unwrap_or(Color::Rgb(30, 32, 40));
+    let bg_only = Style::default().bg(bg);
+    let syntax = ss
+        .find_syntax_by_token(lang)
+        .or_else(|| ss.find_syntax_by_first_line(content))
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let mut hl = HighlightLines::new(syntax, theme);
+    let w = width as usize;
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    // A small language tag bar atop the block.
+    if !lang.is_empty() {
+        out.push(pad_line(
+            vec![Span::styled(
+                format!(" {lang} "),
+                Style::default()
+                    .fg(Color::Gray)
+                    .bg(bg)
+                    .add_modifier(Modifier::ITALIC),
+            )],
+            w,
+            bg,
+        ));
+    }
+
+    for line in LinesWithEndings::from(content) {
+        let ranges = hl.highlight_line(line, ss).unwrap_or_default();
+        let mut spans: Vec<Span<'static>> = vec![Span::styled(" ", bg_only)]; // left gutter
+        for (style, piece) in ranges {
+            let piece = piece.trim_end_matches(['\n', '\r']);
+            if piece.is_empty() {
+                continue;
+            }
+            let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+            spans.push(Span::styled(
+                piece.to_string(),
+                Style::default().fg(fg).bg(bg),
+            ));
+        }
+        out.push(pad_line(spans, w, bg));
+    }
+    out
+}
+
+/// Pad a line of spans with background-colored spaces out to `width` columns so
+/// the code block renders as a solid block.
+fn pad_line(mut spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> {
+    let used: usize = spans.iter().map(Span::width).sum();
+    if used < width {
+        spans.push(Span::styled(
+            " ".repeat(width - used),
+            Style::default().bg(bg),
+        ));
+    }
+    Line::from(spans)
+}
+
 /// Human-friendly elapsed time since `then`, with compound units for the larger
 /// ranges (`now`, `42s ago`, `5m ago`, `1h30m ago`, `2d3h ago`).
 fn relative_time(then: chrono::DateTime<chrono::Local>) -> String {
@@ -638,17 +758,27 @@ fn transcript_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
                 );
             }
             // Assistant text is rendered as markdown (headings, lists, emphasis,
-            // inline/code spans), themed from the active hjkl theme.
+            // inline/code spans) via hjkl-markdown; fenced code blocks are pulled
+            // out and syntax-highlighted with syntect on a distinct background.
             Entry::Assistant(text) => {
                 msg_num += 1;
                 msg_starts.push(out.len());
                 meta(&mut out, i, msg_num, "assistant");
-                let events = hjkl_markdown::parse(text);
-                out.extend(hjkl_markdown_tui::to_lines(
-                    &events,
-                    &md_theme,
-                    width.max(1),
-                ));
+                let mut buf: Vec<hjkl_markdown::Event> = Vec::new();
+                for ev in hjkl_markdown::parse(text) {
+                    if let hjkl_markdown::Event::CodeBlock { lang, content } = ev {
+                        if !buf.is_empty() {
+                            out.extend(hjkl_markdown_tui::to_lines(&buf, &md_theme, width.max(1)));
+                            buf.clear();
+                        }
+                        out.extend(highlight_code_block(&lang, &content, width.max(1)));
+                    } else {
+                        buf.push(ev);
+                    }
+                }
+                if !buf.is_empty() {
+                    out.extend(hjkl_markdown_tui::to_lines(&buf, &md_theme, width.max(1)));
+                }
             }
             Entry::Reasoning(_) if !app.show_reasoning => continue, // hidden via /reasoning
             Entry::Reasoning(text) => push_text(

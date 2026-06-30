@@ -30,6 +30,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Syntax highlighting for fenced code blocks in assistant messages: code blocks
+  are pulled out of the markdown and highlighted with `syntect` (lightweight,
+  pure-Rust fancy-regex) on a distinct dark background, with a small language
+  tag bar. Highlighted output is cached per (language, content, width) so the
+  live redraw stays cheap. Prose still renders via `hjkl-markdown`.
 - Per-message timestamps + numbers: each user/assistant message gets a dim
   header (`#3 you · 2m ago`) showing its number and send time. A single
   `timestamps` setting picks the style — `none`, `relative` (default; `now`,
