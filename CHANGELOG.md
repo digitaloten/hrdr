@@ -26,6 +26,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Icon set is configurable: `icons = nerd` (default), `unicode`, or `ascii` in
+  config, `--icons <set>`, or `$HRDR_ICONS`. Non-nerd modes drop the status-bar
+  Nerd-Font glyphs (folder, git branch) so they don't render as tofu without a
+  patched font. Uses `hjkl-icons`' `IconMode`.
 - Terminal bell on turn completion: when a turn finishes after running at least
   a few seconds, hrdr rings the bell so you can tab away during long tasks and
   be notified when it's done. Disable with `bell = false` in config,

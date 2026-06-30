@@ -320,20 +320,24 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
     let sep = || Span::styled(" │ ", Style::default().fg(t.dim));
     let mut spans: Vec<Span> = Vec::new();
 
-    // Show just the cwd's basename, not the full path, with a folder icon.
+    // Show just the cwd's basename, not the full path, with a folder icon
+    // (Nerd-font glyphs only when the icon mode allows them).
+    let nerd = app.icon_mode == hjkl_icons::IconMode::Nerd;
+    let folder = if nerd { "\u{f07b} " } else { "" };
+    let branch_icon = if nerd { "\u{e0a0} " } else { "" };
     let dir_label = app
         .dir
         .rsplit('/')
         .find(|s| !s.is_empty())
         .unwrap_or(&app.dir);
     spans.push(Span::styled(
-        format!(" \u{f07b} {dir_label}"),
+        format!(" {folder}{dir_label}"),
         Style::default().fg(t.user),
     ));
     if let Some(branch) = &app.branch {
         spans.push(sep());
         spans.push(Span::styled(
-            format!("\u{e0a0} {branch}"),
+            format!("{branch_icon}{branch}"),
             Style::default().fg(t.success),
         ));
     }

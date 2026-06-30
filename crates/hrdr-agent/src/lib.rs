@@ -84,6 +84,9 @@ pub struct AgentConfig {
     /// Ring the terminal bell when a turn finishes (after a short minimum
     /// duration, so quick turns stay quiet). Default `true`.
     pub bell: bool,
+    /// Icon set for the TUI: `nerd` (default), `unicode`, or `ascii`. `None`
+    /// resolves to nerd (there's no portable way to probe the terminal font).
+    pub icons: Option<String>,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
 }
@@ -109,6 +112,7 @@ impl Default for AgentConfig {
             auto_compact: DEFAULT_AUTO_COMPACT,
             auto_resume: true,
             bell: true,
+            icons: None,
             providers: HashMap::new(),
         }
     }
@@ -212,6 +216,7 @@ struct FileConfig {
     auto_compact: Option<f64>,
     auto_resume: Option<bool>,
     bell: Option<bool>,
+    icons: Option<String>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
 }
@@ -292,6 +297,9 @@ impl AgentConfig {
             if let Some(v) = fc.bell {
                 cfg.bell = v;
             }
+            if let Some(v) = fc.icons {
+                cfg.icons = Some(v);
+            }
             if !fc.providers.is_empty() {
                 cfg.providers = fc.providers;
             }
@@ -328,6 +336,9 @@ impl AgentConfig {
                 "1" | "true" | "on" | "yes" => cfg.bell = true,
                 _ => {}
             }
+        }
+        if let Ok(v) = std::env::var("HRDR_ICONS") {
+            cfg.icons = Some(v);
         }
         let env_key = std::env::var("HRDR_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))

@@ -64,6 +64,10 @@ struct Cli {
     #[arg(long = "no-bell", global = true)]
     no_bell: bool,
 
+    /// Icon set for the TUI: nerd (default), unicode, or ascii.
+    #[arg(long, global = true)]
+    icons: Option<String>,
+
     /// Don't spawn a local llama-server; use the endpoint at --base-url.
     #[arg(long, global = true)]
     no_backend: bool,
@@ -173,6 +177,9 @@ async fn main() -> Result<()> {
     }
     if cli.no_bell {
         config.bell = false;
+    }
+    if let Some(i) = cli.icons {
+        config.icons = Some(i);
     }
 
     if remote_provider && config.model == "default" {

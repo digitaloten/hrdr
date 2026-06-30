@@ -878,6 +878,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hjkl-icons"
+version = "0.33.2"
+
+[[package]]
 name = "hjkl-keymap"
 version = "0.33.2"
 dependencies = [
@@ -1029,6 +1033,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "hjkl-clipboard",
+ "hjkl-icons",
  "hjkl-markdown",
  "hjkl-markdown-tui",
  "hjkl-theme",

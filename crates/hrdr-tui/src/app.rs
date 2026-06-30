@@ -81,6 +81,8 @@ pub(crate) struct App {
     pub(crate) context_window: Option<u32>,
     /// Reasoning-effort label to display.
     pub(crate) effort: Option<String>,
+    /// Icon set for the TUI chrome (status bar glyphs).
+    pub(crate) icon_mode: hjkl_icons::IconMode,
     /// Cumulative input/output tokens across the session.
     pub(crate) session_in: usize,
     pub(crate) session_out: usize,
@@ -162,6 +164,13 @@ impl App {
         let auto_compact = config.auto_compact;
         let auto_resume = config.auto_resume;
         let bell = config.bell;
+        // No portable terminal-font probe, so an unset/`auto` icons setting
+        // resolves to Nerd glyphs.
+        let icon_mode = config
+            .icons
+            .as_deref()
+            .and_then(hjkl_icons::IconMode::from_config)
+            .unwrap_or(hjkl_icons::IconMode::Nerd);
         let effort = config.effort.clone();
         let base_url = config.base_url.clone();
         let cfg = config.clone();
@@ -202,6 +211,7 @@ impl App {
             branch,
             context_window,
             effort,
+            icon_mode,
             session_in: 0,
             session_out: 0,
             cfg,
