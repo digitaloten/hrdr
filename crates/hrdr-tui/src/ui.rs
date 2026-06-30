@@ -407,6 +407,7 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     width.max(1),
                 ));
             }
+            Entry::Reasoning(_) if !app.show_reasoning => continue, // hidden via /reasoning
             Entry::Reasoning(text) => push_text(
                 &mut out,
                 Span::styled("· ", Style::default().fg(theme.dim)),
@@ -437,6 +438,14 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 text,
                 Style::default().fg(theme.dim),
             ),
+            Entry::Diff(text) => {
+                for line in text.lines() {
+                    out.push(Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(diff_line_color(line, theme)),
+                    )));
+                }
+            }
         }
         out.push(Line::raw(""));
     }

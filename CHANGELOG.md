@@ -26,6 +26,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- More slash commands: `/models` (list endpoint models), `/cwd [path]` (show or
+  change the tools' working directory), `/tools` (list tools), `/reasoning`
+  (toggle showing `<think>` blocks), `/theme [path]` (live theme switch),
+  `/info` (session summary), `/temp [n]`, `/effort [level]`, `/add <file>`
+  (attach a file's contents to the next message), `/diff` (git diff of the
+  working tree, colored), and `/undo` (drop the last turn and restore it to the
+  input for editing).
 - Slash-command autocompletion: typing `/` shows a popup of matching commands
   above the input — Up/Down to select, Tab to accept, and Enter accepts the
   selected (best) match and runs it. Matches the query against both the command

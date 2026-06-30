@@ -331,6 +331,40 @@ impl Agent {
         self.client.model = model.into();
     }
 
+    /// A clone of the model client (for out-of-band calls like `/models`).
+    pub fn client(&self) -> Client {
+        self.client.clone()
+    }
+
+    /// Working directory the tools operate in.
+    pub fn cwd(&self) -> std::path::PathBuf {
+        self.ctx.cwd.clone()
+    }
+
+    /// Change the tools' working directory.
+    pub fn set_cwd(&mut self, cwd: std::path::PathBuf) {
+        self.ctx.cwd = cwd;
+    }
+
+    /// Registered tools as `(name, description)` pairs.
+    pub fn tools(&self) -> Vec<(String, String)> {
+        self.tools
+            .defs()
+            .into_iter()
+            .map(|d| (d.function.name, d.function.description))
+            .collect()
+    }
+
+    /// Sampling temperature, if set.
+    pub fn temperature(&self) -> Option<f32> {
+        self.client.temperature
+    }
+
+    /// Set (or clear) the sampling temperature.
+    pub fn set_temperature(&mut self, t: Option<f32>) {
+        self.client.temperature = t;
+    }
+
     /// Repoint at a different OpenAI-compatible endpoint + key (provider switch).
     pub fn set_endpoint(&mut self, base_url: impl Into<String>, api_key: Option<String>) {
         self.client.set_base_url(base_url);

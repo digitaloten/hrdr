@@ -46,6 +46,8 @@ pub(crate) enum Entry {
     System(String),
     /// Final per-turn stats line, appended below the last output.
     Stats(String),
+    /// A unified diff (e.g. `/diff`), rendered with diff coloring.
+    Diff(String),
 }
 
 /// Messages from the background agent task back to the UI loop.
@@ -53,6 +55,10 @@ enum TurnMsg {
     Event(AgentEvent),
     /// Turn finished; `Some` carries an error string.
     Done(Option<String>),
+    /// Out-of-band system line (e.g. async `/models` result).
+    System(String),
+    /// Out-of-band diff block (e.g. async `/diff` result).
+    Diff(String),
 }
 
 pub(crate) struct App {
@@ -82,6 +88,10 @@ pub(crate) struct App {
     clipboard: Option<Clipboard>,
     /// Selected row in the slash-command completion popup.
     pub(crate) completion_idx: usize,
+    /// Whether to render the model's reasoning (`<think>`) blocks (`/reasoning`).
+    pub(crate) show_reasoning: bool,
+    /// Current endpoint base URL (for `/info`; updated by `/provider`).
+    base_url: String,
     /// Handle to the in-flight turn task; `abort()` cancels it.
     turn_handle: Option<JoinHandle<()>>,
     /// Transcript scroll offset in raw lines from the natural bottom.
@@ -126,6 +136,7 @@ impl App {
         let branch = git_branch(&config.cwd);
         let context_window = config.context_window;
         let effort = config.effort.clone();
+        let base_url = config.base_url.clone();
         let cfg = config.clone();
         let agent = Agent::new(config)?;
         let todos = agent.todos();
@@ -160,6 +171,8 @@ impl App {
             cfg,
             clipboard: Clipboard::new().ok(),
             completion_idx: 0,
+            show_reasoning: true,
+            base_url,
             turn_handle: None,
             scroll_offset: 0,
             transcript_height: 24,
@@ -460,12 +473,239 @@ impl App {
                     }
                 }
             }
+            "models" => self.list_models_cmd(),
             "provider" => self.switch_provider(arg),
+            "theme" => {
+                let path = (!arg.is_empty()).then_some(arg);
+                self.theme = Theme::load(path);
+                match path {
+                    Some(p) => self.system(format!("theme → {p}")),
+                    None => self.system("theme reset to default"),
+                }
+            }
+            "cwd" => self.change_cwd(arg),
+            "tools" => self.show_tools(),
+            "add" => self.add_file(arg),
+            "diff" => self.git_diff_cmd(),
+            "reasoning" => {
+                self.show_reasoning = !self.show_reasoning;
+                self.system(if self.show_reasoning {
+                    "reasoning shown"
+                } else {
+                    "reasoning hidden"
+                });
+            }
+            "temp" | "temperature" => self.set_temp_cmd(arg),
+            "effort" => {
+                if arg.is_empty() {
+                    self.system(format!(
+                        "effort: {}",
+                        self.effort.clone().unwrap_or_else(|| "—".into())
+                    ));
+                } else {
+                    self.effort = Some(arg.to_string());
+                    self.system(format!("effort → {arg}"));
+                }
+            }
+            "info" => self.show_info(),
             "copy" => self.copy_last_reply(),
             "retry" => self.retry_last(),
+            "undo" => self.undo_last(),
             _ => return false,
         }
         true
+    }
+
+    fn list_models_cmd(&mut self) {
+        let client = self.agent.try_lock().ok().map(|a| a.client());
+        let Some(client) = client else {
+            self.system("busy — try again after the current turn");
+            return;
+        };
+        let tx = self.tx.clone();
+        self.system("fetching models…");
+        tokio::spawn(async move {
+            let msg = match client.list_models().await {
+                Ok(m) if !m.is_empty() => format!("models:\n  {}", m.join("\n  ")),
+                Ok(_) => "endpoint reported no models".to_string(),
+                Err(e) => format!("models error: {e}"),
+            };
+            let _ = tx.send(TurnMsg::System(msg));
+        });
+    }
+
+    fn change_cwd(&mut self, arg: &str) {
+        let cur = self.agent.try_lock().ok().map(|a| a.cwd());
+        let Some(cur) = cur else {
+            self.system("busy — try again after the current turn");
+            return;
+        };
+        if arg.is_empty() {
+            self.system(format!("cwd: {}", cur.display()));
+            return;
+        }
+        let p = std::path::Path::new(arg);
+        let new = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cur.join(p)
+        };
+        if !new.is_dir() {
+            self.system(format!("not a directory: {}", new.display()));
+            return;
+        }
+        let new = new.canonicalize().unwrap_or(new);
+        if let Ok(mut a) = self.agent.try_lock() {
+            a.set_cwd(new.clone());
+        }
+        self.dir = display_dir(&new);
+        self.branch = git_branch(&new);
+        self.system(format!("cwd → {}", new.display()));
+    }
+
+    fn show_tools(&mut self) {
+        match self.agent.try_lock().ok().map(|a| a.tools()) {
+            Some(tools) => {
+                let mut s = String::from("tools:");
+                for (n, d) in tools {
+                    s.push_str(&format!("\n  {n} — {d}"));
+                }
+                self.system(s);
+            }
+            None => self.system("busy — try again after the current turn"),
+        }
+    }
+
+    fn add_file(&mut self, arg: &str) {
+        if arg.is_empty() {
+            self.system("usage: /add <file>");
+            return;
+        }
+        let cur = self.agent.try_lock().ok().map(|a| a.cwd());
+        let Some(cur) = cur else {
+            self.system("busy — try again after the current turn");
+            return;
+        };
+        let p = std::path::Path::new(arg);
+        let path = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cur.join(p)
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let n = content.lines().count();
+                let block = format!("`{arg}`:\n```\n{content}\n```\n\n");
+                let existing = self.editor.content();
+                self.editor.set_content(&format!("{block}{existing}"));
+                self.system(format!("added {arg} ({n} lines) to the input"));
+            }
+            Err(e) => self.system(format!("can't read {arg}: {e}")),
+        }
+    }
+
+    fn git_diff_cmd(&mut self) {
+        let cwd = self.agent.try_lock().ok().map(|a| a.cwd());
+        let Some(cwd) = cwd else {
+            self.system("busy — try again after the current turn");
+            return;
+        };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let out = tokio::process::Command::new("git")
+                .arg("diff")
+                .current_dir(&cwd)
+                .output()
+                .await;
+            match out {
+                Ok(o) if o.status.success() => {
+                    let s = String::from_utf8_lossy(&o.stdout).to_string();
+                    if s.trim().is_empty() {
+                        let _ = tx.send(TurnMsg::System("git diff: no changes".to_string()));
+                    } else {
+                        let _ = tx.send(TurnMsg::Diff(s));
+                    }
+                }
+                Ok(o) => {
+                    let _ = tx.send(TurnMsg::System(format!(
+                        "git diff failed: {}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    )));
+                }
+                Err(e) => {
+                    let _ = tx.send(TurnMsg::System(format!("git error: {e}")));
+                }
+            }
+        });
+    }
+
+    fn set_temp_cmd(&mut self, arg: &str) {
+        if arg.is_empty() {
+            let t = self.agent.try_lock().ok().and_then(|a| a.temperature());
+            self.system(format!(
+                "temperature: {}",
+                t.map(|t| t.to_string()).unwrap_or_else(|| "default".into())
+            ));
+            return;
+        }
+        match arg.parse::<f32>() {
+            Ok(t) => {
+                if let Ok(mut a) = self.agent.try_lock() {
+                    a.set_temperature(Some(t));
+                }
+                self.system(format!("temperature → {t}"));
+            }
+            Err(_) => self.system("usage: /temp <number>"),
+        }
+    }
+
+    fn show_info(&mut self) {
+        let temp = self.agent.try_lock().ok().and_then(|a| a.temperature());
+        let branch = self.branch.clone().unwrap_or_else(|| "—".into());
+        let ctx = match (self.last_usage, self.context_window) {
+            (Some((p, _)), Some(w)) => format!("{p} / {w}"),
+            (Some((p, _)), None) => p.to_string(),
+            _ => "—".into(),
+        };
+        let info = format!(
+            "model: {}\nendpoint: {}\ncwd: {} ({branch})\ncontext: {ctx}\ntokens: ↑{} ↓{}\ntemperature: {}\neffort: {}",
+            self.model,
+            self.base_url,
+            self.dir,
+            self.session_in,
+            self.session_out,
+            temp.map(|t| t.to_string())
+                .unwrap_or_else(|| "default".into()),
+            self.effort.clone().unwrap_or_else(|| "—".into()),
+        );
+        self.system(info);
+    }
+
+    fn undo_last(&mut self) {
+        if self.running {
+            self.system("can't undo while a turn is running");
+            return;
+        }
+        let text = self
+            .agent
+            .try_lock()
+            .ok()
+            .and_then(|mut a| a.rewind_last_user());
+        match text {
+            Some(t) => {
+                if let Some(idx) = self
+                    .transcript
+                    .iter()
+                    .rposition(|e| matches!(e, Entry::User(_)))
+                {
+                    self.transcript.truncate(idx);
+                }
+                self.editor.set_content(&t); // restore for editing
+                self.scroll_offset = 0;
+                self.system("undid last turn — edit and resend");
+            }
+            None => self.system("nothing to undo"),
+        }
     }
 
     fn switch_provider(&mut self, name: &str) {
@@ -501,6 +741,7 @@ impl App {
         if let Some(w) = p.context_window {
             self.context_window = Some(w);
         }
+        self.base_url = p.base_url.clone();
         self.system(format!("provider → {name} ({})", p.base_url));
         if !p.remote {
             self.system(
@@ -603,6 +844,14 @@ impl App {
                 if self.running {
                     self.apply_event(ev);
                 }
+            }
+            TurnMsg::System(text) => {
+                self.transcript.push(Entry::System(text));
+                self.scroll_offset = 0;
+            }
+            TurnMsg::Diff(text) => {
+                self.transcript.push(Entry::Diff(text));
+                self.scroll_offset = 0;
             }
             TurnMsg::Done(err) => {
                 if !self.running {
@@ -788,9 +1037,20 @@ fn parse_head(head: &str) -> Option<String> {
 pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "reset the conversation"),
     ("/model", "show or switch model"),
+    ("/models", "list models from the endpoint"),
     ("/provider", "switch provider preset"),
+    ("/theme", "switch theme (path, or reset)"),
+    ("/cwd", "show or change working directory"),
+    ("/tools", "list available tools"),
+    ("/add", "attach a file to the next message"),
+    ("/diff", "show git diff of the working tree"),
+    ("/reasoning", "toggle showing model reasoning"),
+    ("/temp", "show or set temperature"),
+    ("/effort", "show or set effort label"),
+    ("/info", "session info"),
     ("/copy", "copy last reply"),
     ("/retry", "re-run last turn"),
+    ("/undo", "undo last turn (edit & resend)"),
     ("/help", "list commands"),
     ("/exit", "quit"),
 ];
@@ -885,8 +1145,9 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(names("/").len() >= 6); // all commands for a bare slash
-        // Name-prefix matches rank first.
-        assert_eq!(&names("/c")[..2], &["/clear", "/copy"]);
+        // Name-prefix matches rank first (/clear, /cwd, /copy all start with c).
+        assert_eq!(names("/c")[0], "/clear");
+        assert!(names("/c").contains(&"/copy") && names("/c").contains(&"/cwd"));
         // Description match: "/list" surfaces "/help" ("list commands").
         assert!(names("/list").contains(&"/help"));
         assert!(!names("/list").contains(&"/clear"));
