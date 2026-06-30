@@ -52,6 +52,10 @@ struct Cli {
     #[arg(long, global = true)]
     effort: Option<String>,
 
+    /// Auto-compact trigger as a fraction of the context window (0.0–1.0; 0 disables).
+    #[arg(long, global = true)]
+    auto_compact: Option<f64>,
+
     /// Don't spawn a local llama-server; use the endpoint at --base-url.
     #[arg(long, global = true)]
     no_backend: bool,
@@ -152,6 +156,9 @@ async fn main() -> Result<()> {
     }
     if let Some(e) = cli.effort {
         config.effort = Some(e);
+    }
+    if let Some(r) = cli.auto_compact {
+        config.auto_compact = r;
     }
 
     if remote_provider && config.model == "default" {

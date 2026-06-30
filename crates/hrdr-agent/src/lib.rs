@@ -75,9 +75,17 @@ pub struct AgentConfig {
     pub context_window: Option<u32>,
     /// Reasoning-effort label shown in the status bar (e.g. `low`/`medium`/`high`).
     pub effort: Option<String>,
+    /// Auto-compaction trigger as a fraction of the context window (`0.0`–`1.0`);
+    /// `0` (or any value outside that range) disables it. Default
+    /// [`DEFAULT_AUTO_COMPACT`].
+    pub auto_compact: f64,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
 }
+
+/// Default auto-compaction trigger: 85% of the context window (leaves headroom
+/// so the next turn doesn't overflow).
+pub const DEFAULT_AUTO_COMPACT: f64 = 0.85;
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -93,6 +101,7 @@ impl Default for AgentConfig {
             theme: None,
             context_window: None,
             effort: None,
+            auto_compact: DEFAULT_AUTO_COMPACT,
             providers: HashMap::new(),
         }
     }
@@ -193,6 +202,7 @@ struct FileConfig {
     theme: Option<String>,
     context_window: Option<u32>,
     effort: Option<String>,
+    auto_compact: Option<f64>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
 }
@@ -264,6 +274,9 @@ impl AgentConfig {
             if let Some(v) = fc.effort {
                 cfg.effort = Some(v);
             }
+            if let Some(v) = fc.auto_compact {
+                cfg.auto_compact = v;
+            }
             if !fc.providers.is_empty() {
                 cfg.providers = fc.providers;
             }
@@ -281,6 +294,11 @@ impl AgentConfig {
         }
         if let Ok(v) = std::env::var("HRDR_MODEL") {
             cfg.model = v;
+        }
+        if let Ok(v) = std::env::var("HRDR_AUTO_COMPACT")
+            && let Ok(f) = v.parse::<f64>()
+        {
+            cfg.auto_compact = f;
         }
         let env_key = std::env::var("HRDR_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))

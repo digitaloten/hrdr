@@ -63,10 +63,6 @@ enum TurnMsg {
     Compacted(Result<(usize, usize), String>),
 }
 
-/// Auto-compact once the prompt size reaches this fraction of the context
-/// window — with headroom so the next turn doesn't overflow (Claude Code style).
-const AUTO_COMPACT_RATIO: f64 = 0.85;
-
 pub(crate) struct App {
     agent: Arc<tokio::sync::Mutex<Agent>>,
     pub(crate) editor: Box<dyn EditorEngine>,
@@ -98,6 +94,8 @@ pub(crate) struct App {
     pub(crate) show_reasoning: bool,
     /// True while a compaction (summarization) pass is running.
     pub(crate) compacting: bool,
+    /// Auto-compact trigger as a fraction of the context window; 0 disables.
+    auto_compact_ratio: f64,
     /// Current endpoint base URL (for `/info`; updated by `/provider`).
     base_url: String,
     /// Active session's file id (stem). Assigned on first auto-save; stable.
@@ -147,6 +145,7 @@ impl App {
         let dir = display_dir(&config.cwd);
         let branch = git_branch(&config.cwd);
         let context_window = config.context_window;
+        let auto_compact = config.auto_compact;
         let effort = config.effort.clone();
         let base_url = config.base_url.clone();
         let cfg = config.clone();
@@ -185,6 +184,7 @@ impl App {
             completion_idx: 0,
             show_reasoning: true,
             compacting: false,
+            auto_compact_ratio: auto_compact,
             base_url,
             session_id: None,
             session_label: None,
@@ -1083,14 +1083,19 @@ impl App {
     }
 
     /// Whether the context has grown enough to auto-compact (with headroom).
+    /// A configured ratio of `0` (or outside `0.0..=1.0`) disables it.
     fn should_auto_compact(&self) -> bool {
         if self.compacting {
+            return false;
+        }
+        let ratio = self.auto_compact_ratio;
+        if ratio <= 0.0 || ratio > 1.0 {
             return false;
         }
         let (Some((prompt, _)), Some(window)) = (self.last_usage, self.context_window) else {
             return false;
         };
-        window > 0 && f64::from(prompt) >= f64::from(window) * AUTO_COMPACT_RATIO
+        window > 0 && f64::from(prompt) >= f64::from(window) * ratio
     }
 
     /// Run a compaction pass on the background task, reporting via `TurnMsg`.
