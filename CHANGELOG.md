@@ -26,6 +26,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Status-bar context usage now shows a percentage of the window and colors it by
+  fill level — dim under 70%, amber at 70%+, and red once it reaches the
+  auto-compact threshold — so you can see compaction coming.
 - `/init` creates a starter `AGENTS.md` in the working directory, with build and
   test commands guessed from project markers (Cargo.toml, package.json,
   pyproject.toml, go.mod, …) and TODO sections to fill in, then loads it into

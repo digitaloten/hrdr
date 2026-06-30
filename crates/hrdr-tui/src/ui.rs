@@ -342,11 +342,31 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
     ));
     spans.push(sep());
     let ctx = app.last_usage.map(|(p, _)| p as usize).unwrap_or(0);
-    let ctx_str = match app.context_window {
-        Some(w) => format!("{} of {} ctx", fmt_count(ctx), fmt_count(w as usize)),
-        None => format!("{} ctx", fmt_count(ctx)),
+    let (ctx_str, ctx_color) = match app.context_window {
+        Some(w) if w > 0 => {
+            let frac = ctx as f64 / w as f64;
+            let pct = (frac * 100.0).round() as u32;
+            // Escalate color as the context fills: dim → amber → red at the
+            // auto-compact threshold (where compaction kicks in next turn).
+            let color = if app.auto_compact_ratio > 0.0 && frac >= app.auto_compact_ratio {
+                t.error
+            } else if frac >= 0.70 {
+                t.warn
+            } else {
+                t.dim
+            };
+            (
+                format!(
+                    "{} of {} ctx ({pct}%)",
+                    fmt_count(ctx),
+                    fmt_count(w as usize)
+                ),
+                color,
+            )
+        }
+        _ => (format!("{} ctx", fmt_count(ctx)), t.warn),
     };
-    spans.push(Span::styled(ctx_str, Style::default().fg(t.warn)));
+    spans.push(Span::styled(ctx_str, Style::default().fg(ctx_color)));
     spans.push(sep());
     spans.push(Span::styled(
         app.model.clone(),

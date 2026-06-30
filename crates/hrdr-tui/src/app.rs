@@ -105,7 +105,7 @@ pub(crate) struct App {
     /// True while a compaction (summarization) pass is running.
     pub(crate) compacting: bool,
     /// Auto-compact trigger as a fraction of the context window; 0 disables.
-    auto_compact_ratio: f64,
+    pub(crate) auto_compact_ratio: f64,
     /// Current endpoint base URL (for `/info`; updated by `/provider`).
     base_url: String,
     /// Active session's file id (stem). Assigned on first auto-save; stable.
