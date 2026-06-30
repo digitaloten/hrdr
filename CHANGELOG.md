@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Scrollbar thumb position: it now reaches the bottom when following the output
+  (was stuck midway) — `content_length` is the number of scroll positions, not
+  the raw line total, matching ratatui's `position` mapping.
+
 ### Changed
 
 - Quitting now requires a double Ctrl+C: the first idle Ctrl+C arms a confirm
@@ -18,6 +24,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Transcript scrollbar on the right edge showing total session length and the
   current scroll position within it.
+- `Home` jumps the transcript to the top of the session (and `End` back to
+  following the newest output); both fall through to the editor at the extremes.
 - The input box has one column of left/right padding for breathing room.
 - Paste support: bracketed-paste text is inserted into the input at the cursor
   (newlines kept literal, so a multi-line paste no longer submits early).

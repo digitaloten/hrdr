@@ -68,6 +68,9 @@ pub(crate) struct App {
     /// Height of the transcript area as measured during the last draw; used
     /// by key handlers to compute half-page scroll amounts.
     pub(crate) transcript_height: u16,
+    /// Max scroll offset (rows from bottom to the very top) from the last draw;
+    /// lets `Home` jump to the top and bound scrolling.
+    pub(crate) max_scroll: usize,
     /// Shared TODO list updated live by the `todo_write` tool.
     pub(crate) todos: Arc<Mutex<Vec<Todo>>>,
     /// Messages submitted while a turn is running, processed FIFO once it ends.
@@ -122,6 +125,7 @@ impl App {
             turn_handle: None,
             scroll_offset: 0,
             transcript_height: 24,
+            max_scroll: 0,
             todos,
             queue: VecDeque::new(),
             follow_button: None,
@@ -250,6 +254,10 @@ impl App {
                 }
                 KeyCode::End if self.scroll_offset > 0 => {
                     self.scroll_offset = 0; // resume following the newest output
+                    return Action::None;
+                }
+                KeyCode::Home if self.scroll_offset < self.max_scroll => {
+                    self.scroll_offset = self.max_scroll; // jump to the top of the session
                     return Action::None;
                 }
                 _ => {}

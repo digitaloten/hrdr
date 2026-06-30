@@ -83,12 +83,16 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // accurate even after the content shrinks.
     let offset = (app.scroll_offset as u16).min(max_scroll);
     app.scroll_offset = offset as usize;
+    app.max_scroll = max_scroll as usize;
     let scroll = max_scroll.saturating_sub(offset);
 
     f.render_widget(para.scroll((scroll, 0)), text_area);
 
-    // Scrollbar shows total session length + where we are within it.
-    let mut sb_state = ScrollbarState::new(total as usize)
+    // Scrollbar shows total session length + where we are within it. ratatui maps
+    // `position` over `0..=content_length-1`, so content_length is the number of
+    // scroll positions (max_scroll + 1) — not the raw line total, or the thumb
+    // never reaches the bottom when following.
+    let mut sb_state = ScrollbarState::new(max_scroll as usize + 1)
         .viewport_content_length(area.height as usize)
         .position(scroll as usize);
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
