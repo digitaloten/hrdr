@@ -8,7 +8,8 @@ mod prompt;
 mod session;
 
 pub use session::{
-    Session, SessionMeta, list_sessions, resolve_session, sessions_dir, unique_session_id,
+    Session, SessionMeta, cwd_slug, list_sessions, resolve_session, session_dir, sessions_dir,
+    unique_session_id,
 };
 
 use std::collections::HashMap;

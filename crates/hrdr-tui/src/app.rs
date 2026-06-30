@@ -525,7 +525,7 @@ impl App {
             "undo" => self.undo_last(),
             "resume" | "load" => self.resume_session(arg),
             "rename" => self.rename_session(arg),
-            "sessions" => self.list_sessions_cmd(),
+            "sessions" => self.list_sessions_cmd(arg),
             _ => return false,
         }
         true
@@ -554,7 +554,7 @@ impl App {
             .unwrap_or_else(|| session_name_from(&msgs));
         // Notify once, when the session is first created.
         if self.session_id.is_none() {
-            let id = hrdr_agent::unique_session_id(&name);
+            let id = hrdr_agent::unique_session_id(&cwd.display().to_string(), &name);
             self.transcript.push(Entry::System(format!(
                 "session saved as '{id}' — /resume {id}"
             )));
@@ -591,7 +591,8 @@ impl App {
             return;
         }
         // Match by file id first, then by display name (e.g. after /rename).
-        let Some((id, session)) = hrdr_agent::resolve_session(arg) else {
+        let cwd = self.current_cwd();
+        let Some((id, session)) = hrdr_agent::resolve_session(&cwd, arg) else {
             self.system(format!("no session matching '{arg}' (see /sessions)"));
             return;
         };
@@ -614,18 +615,46 @@ impl App {
         }
     }
 
-    fn list_sessions_cmd(&mut self) {
-        let sessions = hrdr_agent::list_sessions();
+    /// The tools' current working directory (agent's, or the process cwd while
+    /// a turn holds the agent lock).
+    fn current_cwd(&self) -> String {
+        if let Ok(a) = self.agent.try_lock() {
+            return a.cwd().display().to_string();
+        }
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    }
+
+    fn list_sessions_cmd(&mut self, arg: &str) {
+        let all = matches!(arg.trim(), "--all" | "-a" | "all");
+        let cur = hrdr_agent::cwd_slug(&self.current_cwd());
+        let sessions: Vec<_> = hrdr_agent::list_sessions()
+            .into_iter()
+            .filter(|m| all || hrdr_agent::cwd_slug(&m.cwd) == cur)
+            .collect();
         if sessions.is_empty() {
-            self.system(format!(
-                "no saved sessions in {}",
-                hrdr_agent::sessions_dir().display()
-            ));
+            self.system(if all {
+                format!(
+                    "no saved sessions in {}",
+                    hrdr_agent::sessions_dir().display()
+                )
+            } else {
+                "no saved sessions for this directory (try /sessions --all)".to_string()
+            });
             return;
         }
-        let mut s = String::from("sessions (resume by id):");
+        let mut s = if all {
+            String::from("all sessions (resume by id or name):")
+        } else {
+            String::from("sessions here (resume by id or name; /sessions --all for every dir):")
+        };
         for m in sessions {
-            s.push_str(&format!("\n  {} — {}", m.id, m.name));
+            if all {
+                s.push_str(&format!("\n  {} — {}  [{}]", m.id, m.name, m.cwd));
+            } else {
+                s.push_str(&format!("\n  {} — {}", m.id, m.name));
+            }
         }
         self.system(s);
     }
@@ -1222,8 +1251,11 @@ fn session_name_from(msgs: &[Message]) -> String {
 /// Slash commands offered by the completion popup.
 pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "reset the conversation"),
-    ("/sessions", "list saved sessions"),
-    ("/resume", "resume a saved session by id"),
+    (
+        "/sessions",
+        "list this dir's saved sessions (--all for every dir)",
+    ),
+    ("/resume", "resume a saved session by id or name"),
     ("/rename", "rename the current session"),
     ("/model", "show or switch model"),
     ("/models", "list models from the endpoint"),

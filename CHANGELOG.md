@@ -28,14 +28,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Session persistence with continuous auto-save: every non-empty conversation is
   saved as JSON under `$XDG_DATA_HOME/hrdr/sessions` (default
-  `~/.local/share/hrdr/sessions`, via `hjkl-xdg`), with the session `name`
-  derived from the first user message and a stable file id assigned on first
-  save. Auto-saves after each completed turn and after `/undo`/`/retry`.
-  Commands `/sessions` (list), `/resume <id-or-name>` (restore history +
-  transcript; matches the file id or the display name, e.g. after `/rename`),
-  `/rename <name>` (rename the session; persisted). `/clear` starts a fresh
-  session. (No `/save` — saving is automatic.) `/info` shows the current session
-  id + name, and a notice prints the id when a session is first saved.
+  `~/.local/share/hrdr/sessions`, via `hjkl-xdg`), partitioned by working
+  directory as `sessions/<cwd-slug>/<name-slug>.json` for easy manual
+  management. The session `name` derives from the first user message and a
+  stable file id is assigned on first save. Auto-saves after each completed turn
+  and after `/undo`/`/retry`. Commands `/sessions` (list this directory's
+  sessions; `--all` for every directory, grouped with their cwd),
+  `/resume <id-or-name>` (restore history + transcript; prefers the current
+  directory, then matches any session's file id or display name, e.g. after
+  `/rename`), `/rename <name>` (rename the session; persisted). `/clear` starts
+  a fresh session. (No `/save` — saving is automatic.) `/info` shows the current
+  session id + name, and a notice prints the id when a session is first saved.
 - More slash commands: `/models` (list endpoint models), `/cwd [path]` (show or
   change the tools' working directory), `/tools` (list tools), `/reasoning`
   (toggle showing `<think>` blocks), `/theme [path]` (live theme switch),
