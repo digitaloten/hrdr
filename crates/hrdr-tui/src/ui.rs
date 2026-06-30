@@ -259,11 +259,23 @@ fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let mode = app.editor.mode_label();
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" input [{mode}] "))
         .border_style(Style::default().fg(app.theme.dim))
         .padding(Padding::horizontal(1));
+    // Rough size of the draft on the bottom-right border (~4 chars/token).
+    let chars = app.editor.content().chars().count();
+    if chars > 0 {
+        let toks = chars.div_ceil(4);
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                format!(" ~{toks} tok · {chars} ch "),
+                Style::default().fg(app.theme.dim),
+            ))
+            .right_aligned(),
+        );
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.editor.render(f, inner);

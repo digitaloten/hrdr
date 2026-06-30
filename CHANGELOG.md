@@ -26,6 +26,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Input draft size estimate: while you type, the input box's bottom-right border
+  shows a rough token count and character count (`~123 tok · 480 ch`), so you
+  can gauge how big a message (or paste) is before sending.
 - Icon set is configurable: `icons = nerd` (default), `unicode`, or `ascii` in
   config, `--icons <set>`, or `$HRDR_ICONS`. Non-nerd modes drop the status-bar
   Nerd-Font glyphs (folder, git branch) so they don't render as tofu without a
