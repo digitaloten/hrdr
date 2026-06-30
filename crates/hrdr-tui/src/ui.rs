@@ -62,7 +62,10 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     let total = para.line_count(area.width) as u16;
     let max_scroll = total.saturating_sub(area.height);
     // scroll_offset is rows scrolled UP from the bottom; 0 == follow newest.
+    // Clamp and write back so "scrolled up" state (and the follow button) is
+    // accurate even after the content shrinks.
     let offset = (app.scroll_offset as u16).min(max_scroll);
+    app.scroll_offset = offset as usize;
     let scroll = max_scroll.saturating_sub(offset);
 
     f.render_widget(para.scroll((scroll, 0)), area);
@@ -111,6 +114,30 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.editor.render(f, inner);
+
+    // While scrolled up, overlay a "follow output" button on the top border.
+    if app.scroll_offset > 0 {
+        let label = " Press END to follow output ↓ ";
+        let w = (label.chars().count() as u16).min(area.width);
+        let x = area.x + area.width.saturating_sub(w) / 2;
+        let rect = Rect {
+            x,
+            y: area.y,
+            width: w,
+            height: 1,
+        };
+        let button = Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        f.render_widget(button, rect);
+        app.follow_button = Some(rect);
+    } else {
+        app.follow_button = None;
+    }
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {

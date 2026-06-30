@@ -14,8 +14,8 @@ use std::io::{Stdout, stdout};
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -38,6 +38,7 @@ impl TerminalGuard {
             out,
             EnterAlternateScreen,
             EnableBracketedPaste,
+            EnableMouseCapture,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
         )?;
         Ok(Self)
@@ -50,6 +51,7 @@ impl Drop for TerminalGuard {
         let _ = execute!(
             out,
             PopKeyboardEnhancementFlags,
+            DisableMouseCapture,
             LeaveAlternateScreen,
             DisableBracketedPaste,
         );
@@ -66,6 +68,7 @@ pub(crate) fn suspend_terminal(terminal: &mut Tui) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
+        DisableMouseCapture,
         LeaveAlternateScreen,
         DisableBracketedPaste,
     )?;
@@ -80,6 +83,7 @@ pub(crate) fn resume_terminal(terminal: &mut Tui) -> Result<()> {
         terminal.backend_mut(),
         EnterAlternateScreen,
         EnableBracketedPaste,
+        EnableMouseCapture,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     )?;
     Ok(())

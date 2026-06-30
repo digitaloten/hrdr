@@ -4,12 +4,19 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use futures_util::StreamExt;
 use hrdr_agent::{Agent, AgentConfig, AgentEvent, Todo};
 use hrdr_editor::{EditorEngine, PlainEngine, VimEngine};
+use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+/// Rows scrolled per mouse-wheel notch.
+const MOUSE_SCROLL_LINES: usize = 3;
 
 use crate::Tui;
 use crate::ui;
@@ -62,6 +69,9 @@ pub(crate) struct App {
     pub(crate) todos: Arc<Mutex<Vec<Todo>>>,
     /// Messages submitted while a turn is running, processed FIFO once it ends.
     pub(crate) queue: VecDeque<String>,
+    /// Screen rect of the "follow output" button, set during draw while scrolled
+    /// up so mouse clicks can hit-test against it. `None` when following.
+    pub(crate) follow_button: Option<Rect>,
     tx: mpsc::UnboundedSender<TurnMsg>,
     rx: Option<mpsc::UnboundedReceiver<TurnMsg>>,
     should_quit: bool,
@@ -99,6 +109,7 @@ impl App {
             transcript_height: 24,
             todos,
             queue: VecDeque::new(),
+            follow_button: None,
             tx,
             rx: Some(rx),
             should_quit: false,
@@ -122,6 +133,7 @@ impl App {
                             self.open_in_editor(terminal)?;
                         }
                     }
+                    Some(Ok(Event::Mouse(m))) => self.on_mouse(m),
                     Some(Ok(_)) => {}
                     Some(Err(_)) | None => break,
                 },
@@ -176,7 +188,8 @@ impl App {
             return Action::None;
         }
 
-        // PageUp / PageDown scroll the transcript (any mode).
+        // Transcript scroll: PageUp/PageDown (any mode); End follows the output
+        // when scrolled up (otherwise End falls through to the editor's line-end).
         if key.modifiers.is_empty() {
             match key.code {
                 KeyCode::PageUp => {
@@ -187,6 +200,10 @@ impl App {
                 KeyCode::PageDown => {
                     let page = self.transcript_height.max(1) as usize;
                     self.scroll_offset = self.scroll_offset.saturating_sub(page);
+                    return Action::None;
+                }
+                KeyCode::End if self.scroll_offset > 0 => {
+                    self.scroll_offset = 0; // resume following the newest output
                     return Action::None;
                 }
                 _ => {}
@@ -214,6 +231,27 @@ impl App {
 
         self.editor.feed_key(key);
         Action::None
+    }
+
+    /// Mouse: wheel scrolls the transcript; a left click on the follow button
+    /// resumes following the newest output.
+    fn on_mouse(&mut self, m: MouseEvent) {
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_offset = self.scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(rect) = self.follow_button
+                    && rect.contains((m.column, m.row).into())
+                {
+                    self.scroll_offset = 0;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Hand the input buffer to `$EDITOR`/`$VISUAL`, then read it back.

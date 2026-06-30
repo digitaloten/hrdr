@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Chat scrolling: mouse wheel scrolls the transcript, `PageUp`/`PageDown` page
+  through it, and `End` resumes following the newest output. While scrolled up,
+  a "Press END to follow output" button appears on the input box's top border —
+  clicking it (or pressing `End`) re-pins to the bottom. (Mouse capture is
+  enabled, which takes over the terminal's native text selection.)
+
 ### Fixed
 
 - Transcript auto-follow now accounts for line wrapping: it scrolls by the
