@@ -81,8 +81,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Slash commands now have a **shared implementation** in `hrdr-app` behind a
   `CommandHost` trait, so the TUI and GUI drive one dispatcher
-  (`hrdr_app:: dispatch`) instead of each reimplementing commands — a new
-  command benefits both frontends for free. The shared set is `/help`, `/clear`,
+  (`hrdr_app::dispatch`) instead of each reimplementing commands — a new command
+  benefits both frontends for free. The shared set is `/help`, `/clear`,
   `/model`, `/models`, `/tools`, `/info`, `/copy`, `/export`, `/rename`,
   `/diff`, `/thinking`, `/sessions`, `/resume`; async work (network, subprocess,
   filesystem, agent lock) is expressed as a future the host spawns and reports.
