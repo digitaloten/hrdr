@@ -1,27 +1,64 @@
 //! `hrdr-gui` — a floem desktop frontend for the agentic coding harness.
 //!
-//! This is a **scaffold / proof-of-concept**. It drives the same UI-agnostic
-//! core the TUI uses — `hrdr_agent::Agent` — rendering its streamed
-//! [`AgentEvent`]s in a floem window. As GUI features grow, the parts shared
-//! with the TUI (transcript model, slash commands, sessions, …) get lifted out
-//! of `hrdr-tui` into a shared crate that both frontends consume.
+//! A **proof-of-concept** that drives the same UI-agnostic core the TUI uses —
+//! `hrdr_agent::Agent` — rendering its streamed [`AgentEvent`]s in a floem
+//! window: assistant text + `<think>` reasoning, tool calls with live output
+//! and pass/fail results, and Enter-to-send. As GUI features grow, the parts
+//! shared with the TUI (transcript model, slash commands, sessions, …) get
+//! lifted out of `hrdr-tui` into a shared crate both frontends consume.
 
 use std::sync::Arc;
 
+use floem::AnyView;
 use floem::ext_event::create_signal_from_tokio_channel;
+use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
-use floem::reactive::create_effect;
+use floem::reactive::{Scope, create_effect};
 use floem::views::Decorators;
 use hrdr_agent::{Agent, AgentConfig, AgentEvent};
 use tokio::sync::Mutex as TokioMutex;
 
-/// A rendered transcript message. `text` is a signal so streamed tokens update
-/// the view in place without rebuilding the list.
+// ---- colors -------------------------------------------------------------
+const DIM: Color = Color::rgb8(0x8a, 0x8a, 0x8a);
+const USER: Color = Color::rgb8(0x6c, 0xb6, 0xff);
+const OK: Color = Color::rgb8(0x5f, 0xd0, 0x7a);
+const ERR: Color = Color::rgb8(0xe0, 0x6c, 0x6c);
+const TOOL: Color = Color::rgb8(0xc9, 0xa2, 0x66);
+
+// ---- transcript model ---------------------------------------------------
+// Streamed fields are signals so tokens update the view in place; the item
+// list only changes when a new item is pushed (keyed by a stable id).
+
 #[derive(Clone)]
-struct Msg {
-    id: u64,
-    role: String,
+struct Assistant {
+    reasoning: RwSignal<String>,
     text: RwSignal<String>,
+}
+
+#[derive(Clone)]
+struct Tool {
+    call_id: String,
+    name: String,
+    args: String,
+    output: RwSignal<String>,
+    result: RwSignal<String>,
+    ok: RwSignal<bool>,
+    done: RwSignal<bool>,
+}
+
+#[derive(Clone)]
+enum Body {
+    User(String),
+    Assistant(Assistant),
+    Tool(Tool),
+    System(String),
+    Error(String),
+}
+
+#[derive(Clone)]
+struct Item {
+    id: u64,
+    body: Body,
 }
 
 /// UI-thread message from a running turn (mirrors the TUI's `TurnMsg`).
@@ -33,9 +70,8 @@ enum UiMsg {
 }
 
 fn main() -> anyhow::Result<()> {
-    // A tokio runtime, entered on this (UI) thread so floem's tokio-channel
-    // bridge and our per-turn agent tasks can `tokio::spawn`. Held for the
-    // program's lifetime.
+    // A tokio runtime entered on this (UI) thread so floem's tokio-channel
+    // bridge + per-turn agent tasks can `tokio::spawn`. Held for program life.
     let rt = tokio::runtime::Runtime::new()?;
     let _guard = rt.enter();
 
@@ -47,27 +83,25 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn app_view(agent: Arc<TokioMutex<Agent>>) -> impl IntoView {
-    let messages: RwSignal<Vec<Msg>> = create_rw_signal(Vec::new());
+    // Persistent scope for dynamically-created per-message signals, so they
+    // outlive the effect that creates them.
+    let cx = Scope::current();
+    let transcript: RwSignal<Vec<Item>> = create_rw_signal(Vec::new());
     let input = create_rw_signal(String::new());
     let running = create_rw_signal(false);
     let next_id = create_rw_signal(0u64);
 
-    // One long-lived channel bridges background turns → the UI thread.
+    // Bridge background turns → the UI thread over one long-lived channel.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiMsg>();
     let events = create_signal_from_tokio_channel(rx);
     create_effect(move |_| {
         let Some(msg) = events.get() else { return };
         match msg {
-            UiMsg::Event(AgentEvent::Text(t)) => {
-                if let Some(sig) = messages.with_untracked(|m| m.last().map(|msg| msg.text)) {
-                    sig.update(|s| s.push_str(&t));
-                }
-            }
-            UiMsg::Event(_) => {}
+            UiMsg::Event(ev) => handle_event(cx, transcript, next_id, ev),
             UiMsg::Done(err) => {
                 running.set(false);
                 if let Some(e) = err {
-                    push_msg(messages, next_id, "error", e);
+                    push_item(transcript, next_id, Body::Error(e));
                 }
             }
         }
@@ -79,9 +113,7 @@ fn app_view(agent: Arc<TokioMutex<Agent>>) -> impl IntoView {
             return;
         }
         input.set(String::new());
-        push_msg(messages, next_id, "you", text.clone());
-        // Empty assistant message to stream tokens into.
-        push_msg(messages, next_id, "assistant", String::new());
+        push_item(transcript, next_id, Body::User(text.clone()));
         running.set(true);
 
         let agent = agent.clone();
@@ -98,47 +130,158 @@ fn app_view(agent: Arc<TokioMutex<Agent>>) -> impl IntoView {
             let _ = tx.send(UiMsg::Done(result.err().map(|e| e.to_string())));
         });
     };
+    let send_enter = send.clone();
 
-    let transcript = scroll(
-        dyn_stack(
-            move || messages.get(),
-            |m: &Msg| m.id,
-            |m: Msg| {
-                let role = m.role.clone();
-                let text_sig = m.text;
-                v_stack((
-                    text(role).style(|s| s.font_bold().margin_bottom(2.0)),
-                    label(move || text_sig.get()),
-                ))
-                .style(|s| s.margin_bottom(10.0))
-            },
-        )
-        .style(|s| s.flex_col().width_full()),
+    let transcript_view = scroll(
+        dyn_stack(move || transcript.get(), |item: &Item| item.id, render_item)
+            .style(|s| s.flex_col().width_full().gap(10.0)),
     )
-    .style(|s| s.flex_grow(1.0).width_full().padding(8.0));
+    .style(|s| s.flex_grow(1.0).width_full().padding(10.0));
 
-    let input_row = h_stack((
-        text_input(input).style(|s| s.flex_grow(1.0).padding(6.0)),
-        button("Send").on_click_stop(move |_| send()),
-    ))
-    .style(|s| s.width_full().gap(6.0).padding(8.0));
+    let input_box = text_input(input)
+        .placeholder("Message hrdr…  (Enter to send)")
+        .on_key_down(
+            Key::Named(NamedKey::Enter),
+            |m| m.is_empty(),
+            move |_| send_enter(),
+        )
+        .style(|s| s.flex_grow(1.0).padding(8.0));
 
-    v_stack((transcript, input_row)).style(|s| s.width_full().height_full())
+    let input_row = h_stack((input_box, button("Send").on_click_stop(move |_| send())))
+        .style(|s| s.width_full().gap(8.0).padding(10.0).items_center());
+
+    v_stack((transcript_view, input_row)).style(|s| s.width_full().height_full())
 }
 
-/// Append a message with a fresh id.
-fn push_msg(
-    messages: RwSignal<Vec<Msg>>,
-    next_id: RwSignal<u64>,
-    role: &str,
-    text: impl Into<String>,
-) {
-    let id = next_id.get();
+// ---- event handling -----------------------------------------------------
+
+fn push_item(transcript: RwSignal<Vec<Item>>, next_id: RwSignal<u64>, body: Body) {
+    let id = next_id.get_untracked();
     next_id.set(id + 1);
-    let msg = Msg {
-        id,
-        role: role.to_string(),
-        text: create_rw_signal(text.into()),
+    transcript.update(|t| t.push(Item { id, body }));
+}
+
+/// The assistant item currently being streamed into — the last item if it's an
+/// assistant turn, otherwise a fresh one (a tool call ends the prior segment).
+fn current_assistant(
+    cx: Scope,
+    transcript: RwSignal<Vec<Item>>,
+    next_id: RwSignal<u64>,
+) -> Assistant {
+    let existing = transcript.with_untracked(|t| match t.last().map(|i| &i.body) {
+        Some(Body::Assistant(a)) => Some(a.clone()),
+        _ => None,
+    });
+    if let Some(a) = existing {
+        return a;
+    }
+    let a = Assistant {
+        reasoning: cx.create_rw_signal(String::new()),
+        text: cx.create_rw_signal(String::new()),
     };
-    messages.update(|m| m.push(msg));
+    push_item(transcript, next_id, Body::Assistant(a.clone()));
+    a
+}
+
+fn find_tool(transcript: RwSignal<Vec<Item>>, call_id: &str) -> Option<Tool> {
+    transcript.with_untracked(|t| {
+        t.iter().find_map(|i| match &i.body {
+            Body::Tool(tool) if tool.call_id == call_id => Some(tool.clone()),
+            _ => None,
+        })
+    })
+}
+
+fn handle_event(
+    cx: Scope,
+    transcript: RwSignal<Vec<Item>>,
+    next_id: RwSignal<u64>,
+    ev: AgentEvent,
+) {
+    match ev {
+        AgentEvent::Reasoning(r) => {
+            current_assistant(cx, transcript, next_id)
+                .reasoning
+                .update(|s| s.push_str(&r));
+        }
+        AgentEvent::Text(t) => {
+            current_assistant(cx, transcript, next_id)
+                .text
+                .update(|s| s.push_str(&t));
+        }
+        AgentEvent::ToolStart { id, name, args } => {
+            let tool = Tool {
+                call_id: id,
+                name,
+                args,
+                output: cx.create_rw_signal(String::new()),
+                result: cx.create_rw_signal(String::new()),
+                ok: cx.create_rw_signal(true),
+                done: cx.create_rw_signal(false),
+            };
+            push_item(transcript, next_id, Body::Tool(tool));
+        }
+        AgentEvent::ToolOutput { id, chunk } => {
+            if let Some(tool) = find_tool(transcript, &id) {
+                tool.output.update(|s| s.push_str(&chunk));
+            }
+        }
+        AgentEvent::ToolEnd { id, result, ok, .. } => {
+            if let Some(tool) = find_tool(transcript, &id) {
+                tool.result.set(result);
+                tool.ok.set(ok);
+                tool.done.set(true);
+            }
+        }
+        AgentEvent::Notice(s) => push_item(transcript, next_id, Body::System(s)),
+        AgentEvent::Usage { .. } | AgentEvent::TurnDone => {}
+    }
+}
+
+// ---- rendering ----------------------------------------------------------
+
+fn render_item(item: Item) -> AnyView {
+    match item.body {
+        Body::User(text) => v_stack((
+            label(|| "you").style(|s| s.color(USER).font_bold().margin_bottom(2.0)),
+            text_label(text),
+        ))
+        .into_any(),
+        Body::Assistant(a) => v_stack((
+            label(|| "assistant").style(|s| s.color(DIM).font_bold().margin_bottom(2.0)),
+            // Reasoning (dim); empty until the model streams any.
+            label(move || a.reasoning.get()).style(|s| s.color(DIM).margin_bottom(2.0)),
+            label(move || a.text.get()),
+        ))
+        .into_any(),
+        Body::Tool(t) => {
+            let header = format!("⚙ {} {}", t.name, one_line(&t.args, 80));
+            v_stack((
+                label(move || header.clone()).style(|s| s.color(TOOL).font_bold()),
+                label(move || t.output.get()).style(|s| s.color(DIM)),
+                label(move || t.result.get())
+                    .style(move |s| s.color(if t.ok.get() { OK } else { ERR })),
+            ))
+            .style(|s| s.padding(6.0).gap(2.0))
+            .into_any()
+        }
+        Body::System(s) => text_label(s).style(|st| st.color(DIM)).into_any(),
+        Body::Error(s) => text_label(s).style(|st| st.color(ERR)).into_any(),
+    }
+}
+
+/// A plain (non-reactive) text label.
+fn text_label(s: String) -> impl IntoView {
+    label(move || s.clone())
+}
+
+/// Collapse to a single line and truncate to `max` chars (char-safe).
+fn one_line(s: &str, max: usize) -> String {
+    let one = s.replace('\n', " ");
+    if one.chars().count() <= max {
+        one
+    } else {
+        let head: String = one.chars().take(max).collect();
+        format!("{head}…")
+    }
 }
