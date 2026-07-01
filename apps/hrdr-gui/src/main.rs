@@ -156,6 +156,12 @@ enum UiMsg {
     Done(Option<String>),
     /// Out-of-band system line (e.g. an async `/models` result).
     System(String),
+    /// A completed turn was auto-saved; carries the session id and whether this
+    /// was the first save (so the UI thread can adopt the id and notify once).
+    Saved {
+        id: String,
+        first_save: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -168,9 +174,10 @@ fn main() -> anyhow::Result<()> {
     let model = config.model.clone();
     let ctx_window = config.context_window;
     let theme_path = config.theme.clone();
+    let base_url = config.base_url.clone();
     let agent = Arc::new(TokioMutex::new(Agent::new(config)?));
 
-    floem::launch(move || app_view(agent, model, ctx_window, theme_path));
+    floem::launch(move || app_view(agent, model, ctx_window, theme_path, base_url));
     Ok(())
 }
 
@@ -179,6 +186,7 @@ fn app_view(
     model: String,
     ctx_window: Option<u32>,
     theme_path: Option<String>,
+    base_url: String,
 ) -> impl IntoView {
     let theme = GuiTheme::load(theme_path.as_deref());
     // Persistent scope for dynamically-created per-message signals, so they
@@ -209,6 +217,9 @@ fn app_view(
     // turn, shown in the status bar.
     let turn_start: RwSignal<Option<Instant>> = create_rw_signal(None);
     let ttft: RwSignal<Option<f64>> = create_rw_signal(None);
+    // Active session's file id (stem), once assigned by the first auto-save (or
+    // adopted on `/resume`). Subsequent saves reuse it; `/clear` resets it.
+    let session_id: RwSignal<Option<String>> = create_rw_signal(None);
     // Whether to show the model's `<think>` reasoning (`/reasoning` toggles).
     let show_reasoning = create_rw_signal(true);
     // OS clipboard for `/copy`, held for the app's life so the selection stays
@@ -249,6 +260,16 @@ fn app_view(
                 }
             }
             UiMsg::System(s) => push_item(transcript, next_id, Body::System(s)),
+            UiMsg::Saved { id, first_save } => {
+                if first_save {
+                    system(
+                        transcript,
+                        next_id,
+                        format!("session saved as '{id}' — /resume {id}"),
+                    );
+                }
+                session_id.set(Some(id));
+            }
         }
     });
 
@@ -276,6 +297,7 @@ fn app_view(
                 next_id,
                 usage,
                 model,
+                session_id,
                 show_reasoning,
                 &clipboard,
                 &agent,
@@ -301,6 +323,11 @@ fn app_view(
 
         let agent = agent.clone();
         let tx = tx.clone();
+        // Snapshot session state for the post-turn auto-save (signals can't be
+        // read from the spawned task).
+        let existing_id = session_id.get_untracked();
+        let cur_model = model.get_untracked();
+        let base_url = base_url.clone();
         let handle = tokio::spawn(async move {
             let tx_ev = tx.clone();
             let result = agent
@@ -311,6 +338,24 @@ fn app_view(
                 })
                 .await;
             let _ = tx.send(UiMsg::Done(result.err().map(|e| e.to_string())));
+            // Auto-save the (now-updated) conversation, best-effort.
+            let (msgs, cwd) = {
+                let a = agent.lock().await;
+                (a.messages_owned(), a.cwd().display().to_string())
+            };
+            if let Some(o) = hrdr_app::save_session(
+                existing_id.as_deref(),
+                None,
+                &cur_model,
+                &base_url,
+                &cwd,
+                msgs,
+            ) {
+                let _ = tx.send(UiMsg::Saved {
+                    id: o.id,
+                    first_save: o.first_save,
+                });
+            }
         });
         *th_for_send.borrow_mut() = Some(handle);
     };
@@ -692,6 +737,7 @@ fn dispatch_slash(
     next_id: RwSignal<u64>,
     usage: RwSignal<Option<(u32, u32)>>,
     model: RwSignal<String>,
+    session_id: RwSignal<Option<String>>,
     show_reasoning: RwSignal<bool>,
     clipboard: &Rc<RefCell<Option<hjkl_clipboard::Clipboard>>>,
     agent: &Arc<TokioMutex<Agent>>,
@@ -741,6 +787,7 @@ fn dispatch_slash(
             transcript.update(|t| t.clear());
             next_id.set(0);
             usage.set(None);
+            session_id.set(None); // detach; the next turn starts a new session
             let agent = agent.clone();
             tokio::spawn(async move { agent.lock().await.clear() });
             system(transcript, next_id, "conversation cleared");
@@ -761,9 +808,11 @@ fn dispatch_slash(
             }
             let cwd = cwd_string();
             match hrdr_agent::resolve_session(&cwd, &arg) {
-                Some((_id, session)) => {
+                Some((id, session)) => {
                     let count = session.messages.len();
                     model.set(session.model.clone());
+                    // Adopt the id so later auto-saves update this session.
+                    session_id.set(Some(id));
                     // Rebuild the display transcript, then push agent state on the
                     // async side (set_messages/set_model need the lock).
                     rebuild_transcript(cx, transcript, next_id, &session.messages);

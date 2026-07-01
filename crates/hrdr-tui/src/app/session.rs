@@ -52,31 +52,24 @@ impl super::App {
         let Some((msgs, cwd)) = snap else {
             return;
         };
-        // Non-empty == has at least one user message.
-        if !msgs.iter().any(|m| m.role == MessageRole::User) {
-            return;
-        }
-        let name = self
-            .session_label
-            .clone()
-            .unwrap_or_else(|| hrdr_app::session_name_from(&msgs));
-        // Notify once, when the session is first created.
-        if self.session_id.is_none() {
-            let id = hrdr_agent::unique_session_id(&cwd.display().to_string(), &name);
-            self.push_entry(Entry::System(format!(
-                "session saved as '{id}' — /resume {id}"
-            )));
-            self.session_id = Some(id);
-        }
-        let id = self.session_id.clone().unwrap_or_else(|| name.clone());
-        let s = Session::new(
-            name,
-            self.model.clone(),
-            self.base_url.clone(),
-            cwd.display().to_string(),
+        let outcome = hrdr_app::save_session(
+            self.session_id.as_deref(),
+            self.session_label.as_deref(),
+            &self.model,
+            &self.base_url,
+            &cwd.display().to_string(),
             msgs,
         );
-        let _ = s.save(&id); // best-effort; silent
+        if let Some(o) = outcome {
+            // Notify once, when the session is first created.
+            if o.first_save {
+                self.push_entry(Entry::System(format!(
+                    "session saved as '{}' — /resume {}",
+                    o.id, o.id
+                )));
+            }
+            self.session_id = Some(o.id);
+        }
     }
     pub(super) fn rename_session(&mut self, arg: &str) {
         if arg.is_empty() {
