@@ -44,6 +44,9 @@ struct Tool {
     result: RwSignal<String>,
     ok: RwSignal<bool>,
     done: RwSignal<bool>,
+    /// Collapse the (potentially long) streamed output; toggled by clicking the
+    /// tool header. Starts collapsed.
+    collapsed: RwSignal<bool>,
 }
 
 #[derive(Clone)]
@@ -76,13 +79,19 @@ fn main() -> anyhow::Result<()> {
     let _guard = rt.enter();
 
     let config = AgentConfig::load();
+    let model = config.model.clone();
+    let ctx_window = config.context_window;
     let agent = Arc::new(TokioMutex::new(Agent::new(config)?));
 
-    floem::launch(move || app_view(agent));
+    floem::launch(move || app_view(agent, model, ctx_window));
     Ok(())
 }
 
-fn app_view(agent: Arc<TokioMutex<Agent>>) -> impl IntoView {
+fn app_view(
+    agent: Arc<TokioMutex<Agent>>,
+    model: String,
+    ctx_window: Option<u32>,
+) -> impl IntoView {
     // Persistent scope for dynamically-created per-message signals, so they
     // outlive the effect that creates them.
     let cx = Scope::current();
@@ -90,6 +99,8 @@ fn app_view(agent: Arc<TokioMutex<Agent>>) -> impl IntoView {
     let input = create_rw_signal(String::new());
     let running = create_rw_signal(false);
     let next_id = create_rw_signal(0u64);
+    // Last turn's reported (prompt, completion) token usage, for the status bar.
+    let usage: RwSignal<Option<(u32, u32)>> = create_rw_signal(None);
 
     // Bridge background turns → the UI thread over one long-lived channel.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiMsg>();
@@ -97,7 +108,7 @@ fn app_view(agent: Arc<TokioMutex<Agent>>) -> impl IntoView {
     create_effect(move |_| {
         let Some(msg) = events.get() else { return };
         match msg {
-            UiMsg::Event(ev) => handle_event(cx, transcript, next_id, ev),
+            UiMsg::Event(ev) => handle_event(cx, transcript, next_id, usage, ev),
             UiMsg::Done(err) => {
                 running.set(false);
                 if let Some(e) = err {
@@ -150,7 +161,36 @@ fn app_view(agent: Arc<TokioMutex<Agent>>) -> impl IntoView {
     let input_row = h_stack((input_box, button("Send").on_click_stop(move |_| send())))
         .style(|s| s.width_full().gap(8.0).padding(10.0).items_center());
 
-    v_stack((transcript_view, input_row)).style(|s| s.width_full().height_full())
+    // Status bar: model · context · last-turn output tokens, + a live "thinking"
+    // indicator while a turn runs.
+    let status_bar = h_stack((
+        label(move || {
+            let (used, out) = usage.get().unwrap_or((0, 0));
+            let ctx = match ctx_window {
+                Some(w) => format!("{used} of {w}"),
+                None if used > 0 => format!("{used} tok"),
+                None => "—".to_string(),
+            };
+            format!("{model}   ·   ctx {ctx}   ·   ↓{out}")
+        })
+        .style(|s| s.color(DIM)),
+        label(|| "● thinking…").style(move |s| {
+            if running.get() {
+                s.color(TOOL)
+            } else {
+                s.hide()
+            }
+        }),
+    ))
+    .style(|s| {
+        s.width_full()
+            .padding_horiz(10.0)
+            .padding_vert(4.0)
+            .justify_between()
+            .items_center()
+    });
+
+    v_stack((transcript_view, status_bar, input_row)).style(|s| s.width_full().height_full())
 }
 
 // ---- event handling -----------------------------------------------------
@@ -196,6 +236,7 @@ fn handle_event(
     cx: Scope,
     transcript: RwSignal<Vec<Item>>,
     next_id: RwSignal<u64>,
+    usage: RwSignal<Option<(u32, u32)>>,
     ev: AgentEvent,
 ) {
     match ev {
@@ -218,6 +259,7 @@ fn handle_event(
                 result: cx.create_rw_signal(String::new()),
                 ok: cx.create_rw_signal(true),
                 done: cx.create_rw_signal(false),
+                collapsed: cx.create_rw_signal(true),
             };
             push_item(transcript, next_id, Body::Tool(tool));
         }
@@ -234,7 +276,11 @@ fn handle_event(
             }
         }
         AgentEvent::Notice(s) => push_item(transcript, next_id, Body::System(s)),
-        AgentEvent::Usage { .. } | AgentEvent::TurnDone => {}
+        AgentEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+        } => usage.set(Some((prompt_tokens, completion_tokens))),
+        AgentEvent::TurnDone => {}
     }
 }
 
@@ -255,12 +301,28 @@ fn render_item(item: Item) -> AnyView {
         ))
         .into_any(),
         Body::Tool(t) => {
-            let header = format!("⚙ {} {}", t.name, one_line(&t.args, 80));
+            let name = t.name.clone();
+            let args = one_line(&t.args, 80);
+            let (output, result, ok, collapsed) = (t.output, t.result, t.ok, t.collapsed);
             v_stack((
-                label(move || header.clone()).style(|s| s.color(TOOL).font_bold()),
-                label(move || t.output.get()).style(|s| s.color(DIM)),
-                label(move || t.result.get())
-                    .style(move |s| s.color(if t.ok.get() { OK } else { ERR })),
+                // Clickable header — caret reflects/toggles the output collapse.
+                label(move || {
+                    let caret = if collapsed.get() { "▸" } else { "▾" };
+                    format!("{caret} ⚙ {name} {args}")
+                })
+                .style(|s| s.color(TOOL).font_bold())
+                .on_click_stop(move |_| collapsed.update(|c| *c = !*c)),
+                // Streamed output — hidden while collapsed.
+                label(move || output.get()).style(move |s| {
+                    if collapsed.get() {
+                        s.hide()
+                    } else {
+                        s.color(DIM)
+                    }
+                }),
+                // Result is always shown, colored by pass/fail.
+                label(move || result.get())
+                    .style(move |s| s.color(if ok.get() { OK } else { ERR })),
             ))
             .style(|s| s.padding(6.0).gap(2.0))
             .into_any()

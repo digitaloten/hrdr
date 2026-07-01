@@ -135,13 +135,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `apps/hrdr-gui` binary drives the same UI-agnostic core as the TUI
   (`hrdr_agent::Agent`): a chat window that streams a turn's `AgentEvent`s into
   a scrolling transcript via floem's `create_signal_from_tokio_channel` bridge.
-  Renders assistant text + dim `<think>` reasoning, tool calls (name + args
-  header, live streamed output, and a pass/fail-colored result), and
-  system/error lines; Enter or a Send button submits. Per-message reactive
-  signals stream tokens in place without rebuilding the list. TUI-shared logic
-  (transcript model, slash commands, sessions, …) will move into a shared crate
-  as GUI features land. Excluded from CI for now (floem's large X11/Wayland dep
-  tree + Linux system libs — wiring it in is a follow-up).
+  Renders assistant text + dim `<think>` reasoning, tool calls (a clickable
+  header that collapses/expands the live streamed output, plus a
+  pass/fail-colored result), and system/error lines; a status bar shows the
+  model / context usage / output tokens and a "thinking" indicator; Enter or a
+  Send button submits. Per-message reactive signals stream tokens in place
+  without rebuilding the list. TUI-shared logic (transcript model, slash
+  commands, sessions, …) will move into a shared crate as GUI features land.
+  Excluded from CI for now (floem's large X11/Wayland dep tree + Linux system
+  libs — wiring it in is a follow-up).
 - Weekly `cargo-deny` scan (advisories / licenses / bans / sources) via a
   scheduled `cron.yml` workflow (Monday 06:00 UTC, matching hjkl), plus a
   `deny.toml` config. Two syntect-transitive unmaintained advisories are ignored
