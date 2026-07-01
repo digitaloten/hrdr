@@ -608,11 +608,6 @@ impl Tool for GlobTool {
 
 pub struct TodoTool;
 
-#[derive(Deserialize)]
-struct TodoArgs {
-    todos: Vec<TodoItem>,
-}
-
 #[async_trait]
 impl Tool for TodoTool {
     fn name(&self) -> &'static str {
@@ -642,13 +637,90 @@ impl Tool for TodoTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: TodoArgs = serde_json::from_value(args).context("invalid todo_write args")?;
-        let rendered = render_todos(&a.todos);
+        let items = parse_todos(args).context("invalid todo_write args")?;
+        let rendered = render_todos(&items);
         if let Ok(mut todos) = ctx.todos.lock() {
-            *todos = a.todos;
+            *todos = items;
         }
         Ok(rendered)
     }
+}
+
+/// Forgivingly extract the todo list from `todo_write` arguments. The schema is
+/// the standard `{"todos": [{content, status}, …]}`, but smaller models often
+/// echo the JSON-Schema shape into the value or drop/rename the wrapper, so we
+/// also accept `{"todos": {"items": […]}}` (the schema-echo mistake), a bare
+/// `{"items": […]}` / `{"tasks": […]}`, and a top-level array.
+fn parse_todos(args: serde_json::Value) -> Result<Vec<TodoItem>> {
+    use serde_json::Value;
+    let arr = match args {
+        Value::Array(a) => a,
+        Value::Object(mut m) => {
+            let v = m
+                .remove("todos")
+                .or_else(|| m.remove("items"))
+                .or_else(|| m.remove("tasks"))
+                .ok_or_else(|| anyhow!("expected a `todos` array of {{content, status}} items"))?;
+            match v {
+                Value::Array(a) => a,
+                // `{"todos": {"items": […]}}` — the model copied the schema's
+                // `items` keyword instead of emitting a bare array.
+                Value::Object(mut inner) => {
+                    match inner.remove("items").or_else(|| inner.remove("todos")) {
+                        Some(Value::Array(a)) => a,
+                        _ => bail!("`todos` must be an array of {{content, status}} items"),
+                    }
+                }
+                // A single item object instead of a one-element array.
+                other => vec![other],
+            }
+        }
+        _ => bail!("expected an object with a `todos` array"),
+    };
+    arr.into_iter().map(parse_item).collect()
+}
+
+/// Parse one todo item, tolerating `task`/`text`/`title` aliases for the content
+/// and a range of status spellings (see [`normalize_status`]).
+fn parse_item(v: serde_json::Value) -> Result<TodoItem> {
+    use serde_json::Value;
+    let Value::Object(mut m) = v else {
+        bail!("each todo must be an object with a `content` string");
+    };
+    let content = m
+        .remove("content")
+        .or_else(|| m.remove("task"))
+        .or_else(|| m.remove("text"))
+        .or_else(|| m.remove("title"))
+        .and_then(|c| match c {
+            Value::String(s) => Some(s),
+            _ => None,
+        })
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("each todo needs a non-empty `content` string"))?;
+    let status = m
+        .remove("status")
+        .or_else(|| m.remove("state"))
+        .and_then(|s| s.as_str().map(normalize_status))
+        .unwrap_or_else(|| "pending".to_string());
+    Ok(TodoItem { content, status })
+}
+
+/// Map a free-form status string onto one of `pending | in_progress | completed`.
+/// Unknown values fall back to `pending`, so a bad status never fails the call.
+fn normalize_status(s: &str) -> String {
+    match s
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_")
+        .as_str()
+    {
+        "completed" | "complete" | "done" | "finished" | "x" | "[x]" => "completed",
+        "in_progress" | "inprogress" | "doing" | "active" | "current" | "wip" | "started"
+        | "ongoing" => "in_progress",
+        _ => "pending",
+    }
+    .to_string()
 }
 
 fn render_todos(todos: &[TodoItem]) -> String {
@@ -926,6 +998,65 @@ mod tests {
         assert!(out.contains("[ ] pending task"), "pending: {out}");
         assert!(out.contains("[~] active task"), "in_progress: {out}");
         assert!(out.contains("[x] done task"), "completed: {out}");
+    }
+
+    #[test]
+    fn parse_todos_accepts_schema_echo_and_variants() {
+        let want = |items: &[TodoItem]| {
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].content, "a");
+            assert_eq!(items[0].status, "in_progress");
+            assert_eq!(items[1].content, "b");
+            assert_eq!(items[1].status, "completed");
+        };
+        let items = [
+            json!({"content": "a", "status": "in_progress"}),
+            json!({"content": "b", "status": "completed"}),
+        ];
+        // Correct shape.
+        want(&parse_todos(json!({ "todos": items })).unwrap());
+        // The schema-echo mistake: `{"todos": {"items": [...]}}`.
+        want(&parse_todos(json!({ "todos": { "items": items } })).unwrap());
+        // Dropped/renamed wrapper key, and a bare top-level array.
+        want(&parse_todos(json!({ "items": items })).unwrap());
+        want(&parse_todos(json!({ "tasks": items })).unwrap());
+        want(&parse_todos(json!(items)).unwrap());
+    }
+
+    #[test]
+    fn parse_todos_tolerates_status_synonyms_and_content_aliases() {
+        let items = parse_todos(json!({
+            "todos": [
+                {"content": "x", "status": "DONE"},
+                {"task": "y", "state": "doing"},   // `task` alias, `state` alias
+                {"text": "z"},                       // no status → pending
+                {"title": "w", "status": "wat"},    // unknown status → pending
+            ]
+        }))
+        .unwrap();
+        assert_eq!(items.len(), 4);
+        assert_eq!(
+            (items[0].content.as_str(), items[0].status.as_str()),
+            ("x", "completed")
+        );
+        assert_eq!(
+            (items[1].content.as_str(), items[1].status.as_str()),
+            ("y", "in_progress")
+        );
+        assert_eq!(
+            (items[2].content.as_str(), items[2].status.as_str()),
+            ("z", "pending")
+        );
+        assert_eq!(
+            (items[3].content.as_str(), items[3].status.as_str()),
+            ("w", "pending")
+        );
+    }
+
+    #[test]
+    fn parse_todos_rejects_itemless_content() {
+        // An item with no usable content string is an error (not silently kept).
+        assert!(parse_todos(json!({ "todos": [{"status": "pending"}] })).is_err());
     }
 
     // ---- bash ---- (unix-only: these spawn a real `bash` shell)

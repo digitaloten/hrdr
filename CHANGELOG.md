@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `todo_write` now tolerates the malformed argument shapes smaller models emit
+  instead of failing with `invalid todo_write args`. The schema is unchanged
+  (`{"todos": [{content, status}, …]}`), but the parser now also accepts the
+  common schema-echo mistake `{"todos": {"items": […]}}` (the model copies the
+  JSON-Schema `items` keyword into the value), a dropped/renamed wrapper
+  (`{"items": …}` / `{"tasks": …}`), a bare top-level array, and a single item
+  object. Per-item it accepts `task`/`text`/`title` aliases for `content` and
+  normalizes a range of status spellings (`done`/`complete` → `completed`,
+  `doing`/`wip`/`active` → `in_progress`, case/space/hyphen-insensitive) with
+  unknown statuses falling back to `pending` rather than erroring.
+
 - Pasting from the OS clipboard in `--vim` mode now works. The editor Host's
   `read_clipboard` returned a cache that was only filled by a
   `refresh_clipboard_cache` call that existed nowhere, so vim clipboard-register
