@@ -129,7 +129,6 @@ pub(crate) struct App {
     /// Status-bar mode: none / truncate / wrap (`/statusbar`).
     pub(crate) statusbar_mode: StatusBarMode,
     pub(crate) running: bool,
-    pub(crate) status: String,
     pub(crate) model: String,
     // ---- status bar info ----
     /// Working directory, home-shortened for display.
@@ -292,7 +291,6 @@ impl App {
             timestamp_style,
             statusbar_mode,
             running: false,
-            status: "ready".to_string(),
             model,
             dir,
             branch,
@@ -1919,7 +1917,6 @@ impl App {
         self.compacting = false;
         let dropped = self.queue.len();
         self.queue.clear();
-        self.status = "cancelled".to_string();
         let msg = if dropped > 0 {
             format!("[cancelled · {dropped} queued message(s) discarded]")
         } else {
@@ -1942,7 +1939,6 @@ impl App {
     /// message. The caller is responsible for any transcript display.
     fn launch_turn(&mut self, input: String) {
         self.running = true;
-        self.status = "thinking…".to_string();
         self.turn_started = Some(Instant::now());
         self.turn_started_at = Some(chrono::Local::now());
         self.first_token_at = None;
@@ -2027,7 +2023,6 @@ impl App {
     fn spawn_compaction(&mut self, instructions: Option<String>) {
         self.running = true;
         self.compacting = true;
-        self.status = "compacting…".to_string();
         self.turn_started = Some(Instant::now());
         self.turn_started_at = Some(chrono::Local::now());
         self.first_token_at = None;
@@ -2257,12 +2252,8 @@ impl App {
                 }
                 self.turn_handle = None;
                 self.running = false;
-                match err {
-                    Some(e) => {
-                        self.status = format!("error: {e}");
-                        self.push_entry(Entry::System(format!("[error] {e}")));
-                    }
-                    None => self.status = "ready".to_string(),
+                if let Some(e) = err {
+                    self.push_entry(Entry::System(format!("[error] {e}")));
                 }
                 // Append the final stats for the turn (before stats are reset by
                 // any queued turn that spawns next).
@@ -2301,7 +2292,6 @@ impl App {
                 self.last_usage = None;
                 match res {
                     Ok((before, after)) => {
-                        self.status = "ready".to_string();
                         self.push_entry(Entry::System(format!(
                             "compacted: {before} → {after} messages (summary kept; scrollback \
                              above is preserved for you)"
@@ -2309,7 +2299,6 @@ impl App {
                         self.autosave();
                     }
                     Err(e) => {
-                        self.status = format!("compact failed: {e}");
                         self.transcript
                             .push(Entry::System(format!("[compact failed] {e}")));
                     }
@@ -2392,7 +2381,6 @@ impl App {
                 self.session_out += completion_tokens as usize;
             }
             AgentEvent::ToolStart { id, name, args } => {
-                self.status = format!("running {name}…");
                 self.push_entry(Entry::Tool {
                     id,
                     name,
@@ -2448,9 +2436,7 @@ impl App {
                 self.push_entry(Entry::System(text));
                 self.scroll_offset = 0;
             }
-            AgentEvent::TurnDone => {
-                self.status = "ready".to_string();
-            }
+            AgentEvent::TurnDone => {}
         }
     }
 }

@@ -585,9 +585,9 @@ fn status_wrap_lines(sections: &[StatusSection], width: usize, t: &Theme) -> Vec
     lines
 }
 
-/// Help / keybind line.
+/// Help / keybind line. (Turn state is shown by the loader above the input, so
+/// no ready/thinking status is repeated here.)
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
-    let dot = if app.running { "●" } else { "○" };
     let scroll_hint = if app.scroll_offset > 0 {
         format!("  [scroll: {}↑]", app.scroll_offset)
     } else {
@@ -598,11 +598,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     } else {
         format!("  [{} queued]", app.queue.len())
     };
-    let text = format!(
-        "{dot} {}{queue_hint}  │  {}{scroll_hint}",
-        app.status,
-        app.editor.keybind_hint(),
-    );
+    let text = format!("{}{queue_hint}{scroll_hint}", app.editor.keybind_hint());
     let para = Paragraph::new(text).style(Style::default().fg(app.theme.dim));
     f.render_widget(para, area);
 }
