@@ -73,6 +73,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- End-to-end TUI tests + a mock provider. A tiny in-process OpenAI-compatible
+  server (`GET /v1/models` + streamed SSE `POST /v1/chat/completions`, with
+  scriptable text / tool-call replies) lets tests drive a real `App` through its
+  `on_key`/`on_turn_msg` seams and assert on the rendered ratatui `TestBackend`
+  buffer — no network, no live model. Covers a streamed text reply, a full
+  tool-call round-trip (`todo_write` → follow-up reply), and a locally-handled
+  slash command. Lives in `crates/hrdr-tui/src/app/e2e.rs`.
 - Presence-aware shell tools: the `bash` tool is now only offered to the model
   when `bash` is actually on `PATH`, and a new `powershell` tool is offered when
   `pwsh`/`powershell` is available (PowerShell 7 runs on Linux/macOS too). So

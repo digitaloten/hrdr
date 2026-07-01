@@ -3204,6 +3204,9 @@ fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatu
 }
 
 #[cfg(test)]
+mod e2e;
+
+#[cfg(test)]
 mod tests {
     use super::{
         Todo, active_file_token, age_completed_todos, is_quit_command, last_fenced_block,
