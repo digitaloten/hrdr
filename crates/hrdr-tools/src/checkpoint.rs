@@ -270,4 +270,72 @@ mod tests {
         cp.revert_last().unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "v0");
     }
+
+    #[test]
+    fn store_and_load_blob_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = Checkpoints::open(dir.path().join("cp")).unwrap();
+        let data = b"hello checkpoint world";
+        let hash = cp.store_blob(data).unwrap();
+        let loaded = cp.load_blob(&hash).unwrap();
+        assert_eq!(loaded, data);
+    }
+
+    #[test]
+    fn identical_blobs_are_deduped_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = Checkpoints::open(dir.path().join("cp")).unwrap();
+        let data = b"same content";
+        let h1 = cp.store_blob(data).unwrap();
+        let h2 = cp.store_blob(data).unwrap();
+        // Same content → same hash, written only once.
+        assert_eq!(h1, h2);
+        let blob_count = std::fs::read_dir(&cp.blobs_dir).unwrap().count();
+        assert_eq!(
+            blob_count, 1,
+            "identical content should produce exactly one blob file"
+        );
+    }
+
+    #[test]
+    fn record_pre_only_first_touch_recorded_per_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f.txt");
+        std::fs::write(&f, "original").unwrap();
+        let mut cp = Checkpoints::open(dir.path().join("cp")).unwrap();
+
+        cp.begin_turn();
+        cp.record_pre(&f);
+        cp.record_pre(&f); // second call for the same file in the same turn is a no-op
+        // Only one journal record — the first touch.
+        assert_eq!(cp.records.len(), 1);
+    }
+
+    #[test]
+    fn revert_to_specific_turn_only_undoes_that_turn_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f.txt");
+        std::fs::write(&f, "v0").unwrap();
+        let mut cp = Checkpoints::open(dir.path().join("cp")).unwrap();
+
+        cp.begin_turn(); // turn 1: v0 → v1
+        cp.record_pre(&f);
+        std::fs::write(&f, "v1").unwrap();
+
+        cp.begin_turn(); // turn 2: v1 → v2
+        cp.record_pre(&f);
+        std::fs::write(&f, "v2").unwrap();
+
+        cp.begin_turn(); // turn 3: v2 → v3
+        cp.record_pre(&f);
+        std::fs::write(&f, "v3").unwrap();
+
+        // revert_to(2) undoes turns 2 and 3; pre-turn-2 content is v1.
+        cp.revert_to(2).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "v1");
+        // Turn 1 must still be listed — it was not reverted.
+        let remaining = cp.list();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].turn, 1);
+    }
 }

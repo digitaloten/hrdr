@@ -1045,10 +1045,14 @@ fn estimate_tokens_in_messages(messages: &[ChatMessage]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
-        Agent, AgentConfig, ProviderConfig, builtin_provider, is_context_overflow, is_transient,
-        repair_dangling_tool_calls,
+        Agent, AgentConfig, ENV_SETTERS, FileConfig, ProviderConfig, builtin_provider,
+        estimate_tokens, estimate_tokens_in_messages, in_git_repo, is_context_overflow,
+        is_transient, parse_env_bool, repair_dangling_tool_calls,
     };
+    use crate::cwd_slug;
     use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
 
     fn system_prompt(agent: &Agent) -> String {
@@ -1210,5 +1214,269 @@ mod tests {
         // Built-ins still resolve when not shadowed.
         assert!(cfg.resolve_provider("openai").is_some());
         assert!(cfg.resolve_provider("nope").is_none());
+    }
+
+    // ---- parse_env_bool ----
+
+    #[test]
+    fn parse_env_bool_recognizes_all_spellings() {
+        // falsy
+        for s in ["0", "false", "off", "no", "FALSE", "OFF"] {
+            assert_eq!(parse_env_bool(s), Some(false), "expected false for {s:?}");
+        }
+        // truthy
+        for s in ["1", "true", "on", "yes", "TRUE", "YES"] {
+            assert_eq!(parse_env_bool(s), Some(true), "expected true for {s:?}");
+        }
+        // unrecognized → None (leave current value unchanged)
+        assert_eq!(parse_env_bool("maybe"), None);
+        assert_eq!(parse_env_bool(""), None);
+        assert_eq!(parse_env_bool("2"), None);
+    }
+
+    // ---- ENV_SETTERS ----
+
+    fn find_setter(key: &str) -> fn(&mut AgentConfig, String) {
+        ENV_SETTERS
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, s)| *s)
+            .unwrap_or_else(|| panic!("setter not found for {key}"))
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn env_setters_string_fields_directly() {
+        // Exercise each string-typed setter in ENV_SETTERS by calling the fn
+        // pointer directly, without touching process environment.
+        let cases: &[(&str, fn(&AgentConfig) -> &str)] = &[
+            ("HRDR_PROVIDER", |c| c.provider.as_deref().unwrap_or("")),
+            ("HRDR_THEME", |c| c.theme.as_deref().unwrap_or("")),
+            ("HRDR_BASE_URL", |c| &c.base_url),
+            ("HRDR_MODEL", |c| &c.model),
+            ("HRDR_ICONS", |c| c.icons.as_deref().unwrap_or("")),
+            ("HRDR_TIMESTAMPS", |c| c.timestamps.as_deref().unwrap_or("")),
+            ("HRDR_STATUSBAR", |c| c.statusbar.as_deref().unwrap_or("")),
+            ("HRDR_CHECKPOINTS", |c| {
+                c.checkpoints.as_deref().unwrap_or("")
+            }),
+        ];
+        for (key, getter) in cases {
+            let setter = find_setter(key);
+            let mut cfg = AgentConfig::default();
+            setter(&mut cfg, "test_value".to_string());
+            assert_eq!(getter(&cfg), "test_value", "setter for {key} did not apply");
+        }
+    }
+
+    #[test]
+    fn env_setter_bool_ignores_bad_value() {
+        // HRDR_BELL with an unrecognized value must leave `bell` unchanged.
+        let setter = find_setter("HRDR_BELL");
+        let mut cfg = AgentConfig::default();
+        let original = cfg.bell;
+        setter(&mut cfg, "maybe".to_string());
+        assert_eq!(cfg.bell, original, "bad bool value should be ignored");
+    }
+
+    #[test]
+    fn env_setter_numeric_ignores_bad_value() {
+        // HRDR_TODO_TTL with a non-numeric string must leave `todo_ttl` unchanged.
+        let setter = find_setter("HRDR_TODO_TTL");
+        let mut cfg = AgentConfig::default();
+        let original = cfg.todo_ttl;
+        setter(&mut cfg, "notanumber".to_string());
+        assert_eq!(
+            cfg.todo_ttl, original,
+            "bad numeric value should be ignored"
+        );
+    }
+
+    #[test]
+    fn env_setter_auto_compact_numeric() {
+        let setter = find_setter("HRDR_AUTO_COMPACT");
+        let mut cfg = AgentConfig::default();
+        setter(&mut cfg, "0.5".to_string());
+        assert!((cfg.auto_compact - 0.5).abs() < f64::EPSILON);
+    }
+
+    // ---- apply_file ----
+
+    #[test]
+    fn apply_file_sets_all_fields() {
+        let mut cfg = AgentConfig::default();
+        cfg.apply_file(FileConfig {
+            base_url: Some("http://custom/v1".to_string()),
+            api_key: Some("key123".to_string()),
+            model: Some("gpt-4".to_string()),
+            temperature: Some(0.5),
+            vim: Some(true),
+            provider: Some("zen".to_string()),
+            theme: Some("dark".to_string()),
+            context_window: Some(8192),
+            effort: Some("high".to_string()),
+            auto_compact: Some(0.7),
+            auto_resume: Some(false),
+            bell: Some(false),
+            icons: Some("ascii".to_string()),
+            timestamps: Some("exact".to_string()),
+            statusbar: Some("wrap".to_string()),
+            checkpoints: Some("on".to_string()),
+            todo_ttl: Some(10),
+            providers: HashMap::new(),
+        });
+        assert_eq!(cfg.base_url, "http://custom/v1");
+        assert_eq!(cfg.api_key.as_deref(), Some("key123"));
+        assert_eq!(cfg.model, "gpt-4");
+        assert_eq!(cfg.temperature, Some(0.5));
+        assert!(cfg.vim_mode);
+        assert_eq!(cfg.provider.as_deref(), Some("zen"));
+        assert_eq!(cfg.theme.as_deref(), Some("dark"));
+        assert_eq!(cfg.context_window, Some(8192));
+        assert_eq!(cfg.effort.as_deref(), Some("high"));
+        assert!((cfg.auto_compact - 0.7).abs() < f64::EPSILON);
+        assert!(!cfg.auto_resume);
+        assert!(!cfg.bell);
+        assert_eq!(cfg.icons.as_deref(), Some("ascii"));
+        assert_eq!(cfg.timestamps.as_deref(), Some("exact"));
+        assert_eq!(cfg.statusbar.as_deref(), Some("wrap"));
+        assert_eq!(cfg.checkpoints.as_deref(), Some("on"));
+        assert_eq!(cfg.todo_ttl, 10);
+    }
+
+    // ---- is_transient / is_context_overflow (additional variants) ----
+
+    #[test]
+    fn is_transient_more_variants() {
+        for msg in [
+            "chat stream request failed: connection timed out",
+            "broken pipe",
+            "chat endpoint returned 502 Bad Gateway: upstream down",
+            "chat endpoint returned 503 Service Unavailable",
+            "chat endpoint returned 504 Gateway Timeout",
+            "connection reset by peer",
+        ] {
+            assert!(
+                is_transient(&anyhow::anyhow!("{msg}")),
+                "expected transient for: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_context_overflow_more_variants() {
+        for msg in [
+            "context window exceeded",
+            "too many tokens in the prompt",
+            "please reduce the length of the messages",
+            "context size limit reached",
+            "context_length exceeded",
+        ] {
+            assert!(
+                is_context_overflow(&anyhow::anyhow!("{msg}")),
+                "expected context overflow for: {msg}"
+            );
+        }
+    }
+
+    // ---- repair_dangling_tool_calls (additional cases) ----
+
+    #[test]
+    fn repair_no_op_when_all_answered_then_user_turn() {
+        // A complete turn followed by a subsequent user message should not get
+        // stubs appended — the tool results are all present.
+        let mut msgs = vec![
+            ChatMessage::user("first"),
+            assistant_with_calls(&["a", "b"]),
+            ChatMessage::tool_result("a", "done_a"),
+            ChatMessage::tool_result("b", "done_b"),
+            ChatMessage::user("second"),
+        ];
+        let before = msgs.len();
+        repair_dangling_tool_calls(&mut msgs);
+        assert_eq!(
+            msgs.len(),
+            before,
+            "no stubs expected when all calls answered"
+        );
+    }
+
+    #[test]
+    fn repair_partially_answered_three_calls() {
+        // Three tool calls; only first two answered → stub for third only.
+        let mut msgs = vec![
+            ChatMessage::user("go"),
+            assistant_with_calls(&["x", "y", "z"]),
+            ChatMessage::tool_result("x", "rx"),
+            ChatMessage::tool_result("y", "ry"),
+        ];
+        repair_dangling_tool_calls(&mut msgs);
+        assert_eq!(msgs.len(), 5, "exactly one stub expected");
+        let stub = msgs.last().unwrap();
+        assert_eq!(stub.role, Role::Tool);
+        assert_eq!(stub.tool_call_id.as_deref(), Some("z"));
+        assert_eq!(stub.content.as_deref(), Some("[interrupted]"));
+    }
+
+    // ---- estimate_tokens ----
+
+    #[test]
+    fn estimate_tokens_in_messages_per_message_overhead() {
+        // Even a message with no content should contribute at least 4 tokens
+        // (the per-message overhead the implementation adds).
+        use hrdr_llm::Role;
+        let msg = ChatMessage {
+            role: Role::User,
+            content: None,
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let estimate = estimate_tokens_in_messages(&[msg]);
+        assert!(
+            estimate >= 4,
+            "per-message overhead must be at least 4, got {estimate}"
+        );
+    }
+
+    #[test]
+    fn estimate_tokens_monotonic_with_content_length() {
+        let short = estimate_tokens("hi");
+        let long = estimate_tokens(&"word ".repeat(1000));
+        assert!(long > short, "longer text must produce more tokens");
+    }
+
+    // ---- in_git_repo ----
+
+    #[test]
+    fn in_git_repo_detects_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // Without .git: not a git repo.
+        assert!(!in_git_repo(dir.path()));
+        // With .git directory: detected.
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert!(in_git_repo(dir.path()));
+    }
+
+    #[test]
+    fn in_git_repo_detected_via_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("a").join("b");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        // A nested subdirectory should also be considered inside the repo.
+        assert!(in_git_repo(&subdir));
+    }
+
+    // ---- cwd_slug ----
+
+    #[test]
+    fn cwd_slug_sanitizes_path() {
+        assert_eq!(cwd_slug("/home/me/projects/foo"), "home-me-projects-foo");
+        assert_eq!(cwd_slug("/"), "root");
+        assert_eq!(cwd_slug("  "), "root");
+        // Consecutive separators collapse to a single dash.
+        assert_eq!(cwd_slug("a//b"), "a-b");
     }
 }

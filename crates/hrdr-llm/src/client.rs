@@ -287,4 +287,34 @@ mod tests {
         // non-positive is ignored
         assert_eq!(context_field(&json!({"n_ctx": 0})), None);
     }
+
+    #[test]
+    fn json_u32_parses_numeric_string() {
+        assert_eq!(json_u32(&json!("1234")), Some(1234u32));
+        assert_eq!(json_u32(&json!("0")), Some(0u32));
+    }
+
+    #[test]
+    fn json_u32_negative_string_is_none() {
+        // A negative numeric string must not parse to a valid u32.
+        assert_eq!(json_u32(&json!("-1")), None);
+    }
+
+    #[test]
+    fn json_u32_u64_overflow_is_none() {
+        // A JSON number > u32::MAX cannot be represented; must return None.
+        let big = serde_json::Value::Number(serde_json::Number::from(u64::from(u32::MAX) + 1));
+        assert_eq!(json_u32(&big), None);
+    }
+
+    #[test]
+    fn context_field_string_zero_is_filtered() {
+        // "0" parses as u32 0 but is filtered out by the `> 0` guard.
+        assert_eq!(context_field(&json!({"n_ctx": "0"})), None);
+    }
+
+    #[test]
+    fn context_field_empty_object_is_none() {
+        assert_eq!(context_field(&json!({})), None);
+    }
 }

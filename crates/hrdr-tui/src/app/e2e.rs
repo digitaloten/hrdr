@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use super::{App, TurnMsg};
+use super::{App, Entry, StatusBarMode, TimestampStyle, TurnMsg};
 use crate::ui;
 use hrdr_agent::AgentConfig;
 
@@ -37,6 +37,12 @@ enum MockReply {
     /// Several tool calls in one turn — `(name, json_args)` each — so a turn
     /// with parallel calls can be exercised.
     ToolCalls(Vec<(String, String)>),
+    /// Content split across many SSE frames; tests the streaming accumulator path
+    /// end-to-end (each string becomes a separate `data:` frame).
+    MultiChunk(Vec<String>),
+    /// A reasoning delta arrives first, then a content delta. Exercises the
+    /// `AgentEvent::Reasoning` → `Entry::Reasoning` path.
+    TextWithReasoning { reasoning: String, text: String },
 }
 
 /// A tiny in-process HTTP server speaking just enough of the OpenAI API for the
@@ -174,6 +180,36 @@ fn sse_body(reply: &MockReply) -> String {
             tool_calls_frame(calls),
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
         ),
+        MockReply::MultiChunk(chunks) => {
+            // Each string becomes its own `data:` SSE frame; proves the streaming
+            // accumulator appends them into one `Entry::Assistant`.
+            let payload: String = chunks
+                .iter()
+                .map(|c| {
+                    format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+                        esc(c)
+                    )
+                })
+                .collect();
+            (
+                payload,
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )
+        }
+        MockReply::TextWithReasoning { reasoning, text } => {
+            // First frame carries `reasoning_content`; second carries `content`.
+            let payload = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{}\"}}}}]}}\n\n\
+                 data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+                esc(reasoning),
+                esc(text),
+            );
+            (
+                payload,
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )
+        }
     };
     format!("{role}{payload}{finish}{usage}{done}")
 }
@@ -439,6 +475,157 @@ async fn slash_help_renders_locally_without_a_turn() {
     assert!(
         screen.contains("/exit") && screen.contains("reload AGENTS.md"),
         "help output missing:\n{screen}"
+    );
+    assert!(!h.app.running);
+}
+
+#[tokio::test]
+async fn usage_captured_after_turn() {
+    // The mock always sends prompt_tokens:10 completion_tokens:5 in its usage chunk.
+    let mut h = Harness::new(vec![MockReply::Text("pong".to_string())]).await;
+    assert!(
+        h.app.last_usage.is_none(),
+        "last_usage must be None before any turn"
+    );
+    h.submit("ping").await;
+    assert!(!h.app.running);
+    assert_eq!(
+        h.app.last_usage,
+        Some((10, 5)),
+        "last_usage should be populated from the mock's usage SSE chunk"
+    );
+}
+
+#[tokio::test]
+async fn multi_chunk_text_assembles_correctly() {
+    // Three separate SSE content frames should be concatenated into one Assistant entry.
+    let mut h = Harness::new(vec![MockReply::MultiChunk(vec![
+        "Hel".to_string(),
+        "lo, ".to_string(),
+        "world!".to_string(),
+    ])])
+    .await;
+    h.submit("say hello").await;
+    assert!(!h.app.running);
+    // The accumulator must stitch the deltas into a single entry.
+    let assembled = h.app.transcript.iter().find_map(|e| match e {
+        Entry::Assistant(s) => Some(s.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        assembled.as_deref(),
+        Some("Hello, world!"),
+        "streamed chunks not assembled correctly: {assembled:?}"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_entry_appended_to_transcript() {
+    // show_reasoning is true by default; a reasoning_content SSE delta should
+    // land as Entry::Reasoning alongside the normal Entry::Assistant.
+    let mut h = Harness::new(vec![MockReply::TextWithReasoning {
+        reasoning: "I am thinking.".to_string(),
+        text: "Done.".to_string(),
+    }])
+    .await;
+    assert!(h.app.show_reasoning, "show_reasoning must default to true");
+    h.submit("think").await;
+    assert!(!h.app.running);
+    let has_reasoning = h
+        .app
+        .transcript
+        .iter()
+        .any(|e| matches!(e, Entry::Reasoning(t) if t.as_str() == "I am thinking."));
+    assert!(has_reasoning, "Entry::Reasoning missing from transcript");
+    let has_text = h
+        .app
+        .transcript
+        .iter()
+        .any(|e| matches!(e, Entry::Assistant(t) if t.as_str() == "Done."));
+    assert!(has_text, "Entry::Assistant missing from transcript");
+}
+
+#[tokio::test]
+async fn reasoning_hidden_in_render_after_toggle() {
+    // After /reasoning, reasoning text must not appear in the rendered buffer even
+    // though Entry::Reasoning is still stored (the entry is skipped at draw time).
+    let mut h = Harness::new(vec![MockReply::TextWithReasoning {
+        reasoning: "secret thought".to_string(),
+        text: "visible reply".to_string(),
+    }])
+    .await;
+    h.submit("/reasoning").await;
+    assert!(
+        !h.app.show_reasoning,
+        "show_reasoning should be false after first /reasoning"
+    );
+    h.submit("think aloud").await;
+    assert!(!h.app.running);
+    let screen = h.render();
+    assert!(
+        !screen.contains("secret thought"),
+        "reasoning leaked into render when disabled:\n{screen}"
+    );
+    assert!(
+        screen.contains("visible reply"),
+        "text reply missing from render:\n{screen}"
+    );
+    // Toggling again re-enables display.
+    h.submit("/reasoning").await;
+    assert!(
+        h.app.show_reasoning,
+        "show_reasoning should be true after second /reasoning"
+    );
+}
+
+#[tokio::test]
+async fn statusbar_slash_command_updates_state() {
+    // /statusbar is a local slash command — no model turn consumed.
+    let mut h = Harness::new(vec![]).await;
+    assert!(
+        h.app.statusbar_mode == StatusBarMode::Truncate,
+        "statusbar_mode should default to Truncate"
+    );
+    h.submit("/statusbar none").await;
+    assert!(
+        h.app.statusbar_mode == StatusBarMode::None,
+        "/statusbar none did not set None mode"
+    );
+    h.submit("/statusbar wrap").await;
+    assert!(
+        h.app.statusbar_mode == StatusBarMode::Wrap,
+        "/statusbar wrap did not set Wrap mode"
+    );
+    h.submit("/statusbar truncate").await;
+    assert!(
+        h.app.statusbar_mode == StatusBarMode::Truncate,
+        "/statusbar truncate did not set Truncate mode"
+    );
+    assert!(!h.app.running);
+}
+
+#[tokio::test]
+async fn timestamps_slash_command_updates_state() {
+    // /timestamps is a local slash command — no model turn consumed.
+    let mut h = Harness::new(vec![]).await;
+    assert!(
+        h.app.timestamp_style == TimestampStyle::Relative,
+        "timestamp_style should default to Relative"
+    );
+    h.submit("/timestamps exact").await;
+    assert!(
+        h.app.timestamp_style == TimestampStyle::Exact,
+        "/timestamps exact did not set Exact style"
+    );
+    h.submit("/timestamps none").await;
+    assert!(
+        h.app.timestamp_style == TimestampStyle::None,
+        "/timestamps none did not set None style"
+    );
+    h.submit("/timestamps relative").await;
+    assert!(
+        h.app.timestamp_style == TimestampStyle::Relative,
+        "/timestamps relative did not set Relative style"
     );
     assert!(!h.app.running);
 }

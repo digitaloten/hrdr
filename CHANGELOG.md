@@ -116,12 +116,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Client::context_window()`.
 - End-to-end TUI tests + a mock provider. A tiny in-process OpenAI-compatible
   server (`GET /v1/models` + streamed SSE `POST /v1/chat/completions`, with
-  scriptable text / tool-call replies) lets tests drive a real `App` through its
-  `on_key`/`on_turn_msg` seams and assert on the rendered ratatui `TestBackend`
-  buffer — no network, no live model. Covers a streamed text reply, a single-
-  and multi-call tool round-trip, a failing/unknown tool call (surfaced but
-  non-fatal, turn recovers), `/clear` wiping the transcript, and a
-  locally-handled slash command. Lives in `crates/hrdr-tui/src/app/e2e.rs`.
+  scriptable text / tool-call / multi-chunk / reasoning replies) lets tests
+  drive a real `App` through its `on_key`/`on_turn_msg` seams and assert on
+  transcript state + the rendered ratatui `TestBackend` buffer — no network, no
+  live model. Covers a streamed text reply, single- and multi-call tool
+  round-trips, a failing/unknown tool call (surfaced but non-fatal, turn
+  recovers), multi-chunk stream assembly, usage capture, `<think>` reasoning
+  display + `/reasoning` toggle, `/statusbar` and `/timestamps` state changes,
+  `/clear` wiping the transcript, and a locally-handled slash command. Lives in
+  `crates/hrdr-tui/src/app/e2e.rs`.
+- Broad unit-test hardening across the loop internals: `Accumulator` edge cases
+  (usage-only chunk, reasoning accumulation, content+tool-calls in one turn),
+  `ChatRequest` serialization (empty `tools` / `None` temperature omitted),
+  context-window field parsing, `truncate` boundaries (exact size, UTF-8
+  multibyte safety), the file-checkpoint store (blob round-trip, dedup, per-turn
+  record, `revert_to`), config resolution (the `ENV_SETTERS` table,
+  `apply_file`, provider precedence), transient/overflow error classification,
+  `repair_dangling_tool_calls`, token estimation, and `in_git_repo`/`cwd_slug`.
+  The suite is ~106 tests.
 - Presence-aware shell tools: the `bash` tool is now only offered to the model
   when `bash` is actually on `PATH`, and a new `powershell` tool is offered when
   `pwsh`/`powershell` is available (PowerShell 7 runs on Linux/macOS too). So

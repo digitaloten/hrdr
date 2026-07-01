@@ -502,4 +502,139 @@ mod tests {
         assert_eq!(calls[1].id, "call_1");
         assert_ne!(calls[0].id, calls[1].id);
     }
+
+    fn usage_chunk(prompt_tokens: u32, completion_tokens: u32) -> ChatChunk {
+        ChatChunk {
+            choices: vec![],
+            usage: Some(Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+            }),
+        }
+    }
+
+    fn reasoning_chunk(text: &str) -> ChatChunk {
+        ChatChunk {
+            choices: vec![ChunkChoice {
+                delta: Delta {
+                    role: None,
+                    content: None,
+                    reasoning_content: Some(text.to_string()),
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        }
+    }
+
+    fn chunk_with_finish(content: Option<&str>, reason: &str) -> ChatChunk {
+        ChatChunk {
+            choices: vec![ChunkChoice {
+                delta: Delta {
+                    role: None,
+                    content: content.map(|s| s.to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some(reason.to_string()),
+            }],
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn accumulator_usage_only_chunk_captured() {
+        // A usage-only chunk (empty choices) must store the usage but return None
+        // from push (no text delta).
+        let mut acc = Accumulator::new();
+        let result = acc.push(&usage_chunk(100, 20));
+        assert!(result.is_none(), "usage-only chunk should return None");
+        let u = acc.usage.as_ref().expect("usage should be stored");
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 20);
+        assert_eq!(u.total_tokens, 120);
+    }
+
+    #[test]
+    fn accumulator_reasoning_accumulated_across_chunks() {
+        // Multi-chunk reasoning_content deltas must concatenate, and no text
+        // content should leak into the `content` field.
+        let mut acc = Accumulator::new();
+        acc.push(&reasoning_chunk("think "));
+        acc.push(&reasoning_chunk("harder"));
+        let msg = acc.into_message();
+        assert_eq!(msg.reasoning_content.as_deref(), Some("think harder"));
+        assert!(
+            msg.content.is_none(),
+            "no content expected when only reasoning came in"
+        );
+    }
+
+    #[test]
+    fn accumulator_finish_reason_captured() {
+        let mut acc = Accumulator::new();
+        // Verify finish_reason is stored on the accumulator before into_message.
+        acc.push(&chunk_with_finish(Some("answer"), "stop"));
+        assert_eq!(acc.finish_reason.as_deref(), Some("stop"));
+        let msg = acc.into_message();
+        assert_eq!(msg.content.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn accumulator_content_and_tool_calls_same_turn() {
+        // A model turn that emits text AND requests a tool call in the same chunk.
+        let mut acc = Accumulator::new();
+        acc.push(&chunk(
+            Some("searching..."),
+            Some(vec![ToolCallDelta {
+                index: 0,
+                id: Some("call_x".to_string()),
+                function: Some(FunctionDelta {
+                    name: Some("grep".to_string()),
+                    arguments: Some("{\"pattern\":\"foo\"}".to_string()),
+                }),
+            }]),
+        ));
+        let msg = acc.into_message();
+        assert_eq!(msg.content.as_deref(), Some("searching..."));
+        let calls = msg.tool_calls.expect("should have tool calls");
+        assert_eq!(calls[0].id, "call_x");
+        assert_eq!(calls[0].function.name, "grep");
+    }
+
+    #[test]
+    fn chat_request_tools_omitted_when_empty() {
+        let req = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            tools: vec![],
+            temperature: Some(0.5),
+            stream: false,
+            stream_options: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("\"tools\""),
+            "tools should be omitted when empty: {json}"
+        );
+    }
+
+    #[test]
+    fn chat_request_temperature_omitted_when_none() {
+        let req = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            tools: vec![],
+            temperature: None,
+            stream: false,
+            stream_options: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("\"temperature\""),
+            "temperature should be omitted when None: {json}"
+        );
+    }
 }

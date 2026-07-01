@@ -195,3 +195,70 @@ pub fn truncate(text: &str, max: usize) -> String {
         &text[..end]
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // ---- truncate ----
+
+    #[test]
+    fn truncate_under_max_returns_unchanged() {
+        let text = "hello world";
+        assert_eq!(truncate(text, 100), text);
+    }
+
+    #[test]
+    fn truncate_exact_max_returns_unchanged() {
+        // text.len() == max is the boundary; no marker should be added.
+        let text = "abcde";
+        assert_eq!(truncate(text, 5), text);
+    }
+
+    #[test]
+    fn truncate_over_max_adds_marker() {
+        let text = "abcdefghij"; // 10 bytes
+        let out = truncate(text, 5);
+        assert!(out.starts_with("abcde"), "prefix wrong: {out}");
+        assert!(out.contains("[output truncated"), "marker missing: {out}");
+        assert!(out.contains("5 bytes omitted"), "byte count missing: {out}");
+    }
+
+    #[test]
+    fn truncate_does_not_split_multibyte_char() {
+        // '£' is U+00A3, encoded as 0xC2 0xA3 (2 bytes in UTF-8).
+        // "££££" = 8 bytes. Setting max = 3 would land mid-codepoint at byte 3;
+        // the implementation must back up to byte 2 (the only char boundary ≤ 3).
+        let text = "££££";
+        assert_eq!(text.len(), 8);
+        let out = truncate(text, 3);
+        // Output must be valid UTF-8 (no panic or replacement bytes).
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        // The prefix must start with exactly one '£' (2 bytes kept).
+        assert!(
+            out.starts_with('£'),
+            "expected at least one '£' in output: {out}"
+        );
+        // Must contain the truncation marker.
+        assert!(out.contains("[output truncated"), "marker missing: {out}");
+    }
+
+    // ---- ToolContext::resolve ----
+
+    #[test]
+    fn tool_context_resolve_absolute_path() {
+        let ctx = ToolContext::new("/some/cwd");
+        let abs = "/absolute/path/file.txt";
+        assert_eq!(ctx.resolve(abs), PathBuf::from(abs));
+    }
+
+    #[test]
+    fn tool_context_resolve_relative_path() {
+        let ctx = ToolContext::new("/my/cwd");
+        assert_eq!(
+            ctx.resolve("sub/file.txt"),
+            PathBuf::from("/my/cwd/sub/file.txt")
+        );
+    }
+}
