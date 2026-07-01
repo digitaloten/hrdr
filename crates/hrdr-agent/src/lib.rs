@@ -265,22 +265,6 @@ fn config_path() -> Option<std::path::PathBuf> {
 }
 
 impl AgentConfig {
-    /// Build from `HRDR_BASE_URL`, `HRDR_MODEL`, `HRDR_API_KEY` (falling back to
-    /// `OPENAI_API_KEY`), defaulting to a local infr endpoint.
-    pub fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(v) = std::env::var("HRDR_BASE_URL") {
-            cfg.base_url = v;
-        }
-        if let Ok(v) = std::env::var("HRDR_MODEL") {
-            cfg.model = v;
-        }
-        cfg.api_key = std::env::var("HRDR_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .ok();
-        cfg
-    }
-
     /// Load config with precedence: env > `~/.config/hrdr/config.toml` > built-in
     /// defaults. Lenient: a malformed config file is ignored (treated as absent).
     /// Does NOT auto-write a config file when one is missing.
@@ -974,12 +958,6 @@ fn is_context_overflow(e: &anyhow::Error) -> bool {
 fn retry_backoff(attempt: usize) -> std::time::Duration {
     let secs = 0.5 * 2f64.powi((attempt as i32 - 1).max(0));
     std::time::Duration::from_secs_f64(secs.min(8.0))
-}
-
-/// Convenience: the role of the last assistant message, for callers inspecting
-/// transcript state.
-pub fn is_assistant(m: &ChatMessage) -> bool {
-    m.role == Role::Assistant
 }
 
 /// Repair a history left dangling by an interrupted turn. An assistant message

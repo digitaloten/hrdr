@@ -159,10 +159,6 @@ impl ToolRegistry {
             .collect()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
-    }
-
     /// Execute a named tool. Errors from a missing tool are hard; errors from
     /// the tool body are returned to the caller to relay to the model.
     pub async fn execute(
@@ -185,10 +181,7 @@ pub fn truncate(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = floor_char_boundary(text, max);
     let omitted = text.len() - end;
     format!(
         "{}\n\n… [output truncated, {omitted} bytes omitted]",
@@ -196,10 +189,58 @@ pub fn truncate(text: &str, max: usize) -> String {
     )
 }
 
+/// Collapse `s` to a single line (newlines → spaces) and truncate to `max`
+/// **characters**, appending `…` if it was cut. For compact one-line previews
+/// (tool-arg previews, status lines) — width-based, unlike the byte-based
+/// [`truncate`].
+pub fn truncate_inline(s: &str, max: usize) -> String {
+    let one_line = s.replace('\n', " ");
+    if one_line.chars().count() <= max {
+        one_line
+    } else {
+        let head: String = one_line.chars().take(max).collect();
+        format!("{head}…")
+    }
+}
+
+/// Largest byte index `≤ max` that lies on a UTF-8 char boundary of `s`, so
+/// `&s[..floor_char_boundary(s, max)]` never panics on multibyte text. Returns
+/// `s.len()` when `max >= s.len()`. (std's `str::floor_char_boundary` is still
+/// unstable, hence this helper.)
+pub fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ---- floor_char_boundary ----
+
+    #[test]
+    fn floor_char_boundary_never_splits_multibyte() {
+        // "£" is 2 bytes (0xC2 0xA3). Byte index 1 is mid-codepoint.
+        let s = "a£b"; // bytes: a(1) £(2) b(1) = 4 bytes
+        assert_eq!(floor_char_boundary(s, 100), 4); // max ≥ len → len
+        assert_eq!(floor_char_boundary(s, 4), 4);
+        assert_eq!(floor_char_boundary(s, 2), 1); // byte 2 is mid-'£' → back to 1
+        assert_eq!(floor_char_boundary(s, 1), 1);
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        // The returned index is always safe to slice at.
+        for max in 0..=s.len() + 2 {
+            let end = floor_char_boundary(s, max);
+            assert!(s.is_char_boundary(end));
+            let _ = &s[..end]; // must not panic
+        }
+    }
 
     // ---- truncate ----
 

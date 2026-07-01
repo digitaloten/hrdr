@@ -258,7 +258,7 @@ fn clean_ddg_url(href: &str) -> String {
 // ---- small HTML helpers (no extra dependencies) ----
 
 fn looks_like_html(s: &str) -> bool {
-    let head = &s[..s.len().min(512)].to_ascii_lowercase();
+    let head = s[..crate::floor_char_boundary(s, 512)].to_ascii_lowercase();
     head.contains("<html") || head.contains("<!doctype html") || head.contains("<body")
 }
 

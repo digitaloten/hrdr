@@ -98,12 +98,6 @@ impl VimEngine {
         );
         Self { editor }
     }
-
-    pub fn with_content(text: &str) -> Self {
-        let mut e = Self::new();
-        e.set_content(text);
-        e
-    }
 }
 
 impl Default for VimEngine {

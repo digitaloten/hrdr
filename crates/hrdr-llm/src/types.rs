@@ -151,21 +151,6 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
-/// Non-streaming response.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ChatResponse {
-    pub choices: Vec<Choice>,
-    #[serde(default)]
-    pub usage: Option<Usage>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Choice {
-    pub message: ChatMessage,
-    #[serde(default)]
-    pub finish_reason: Option<String>,
-}
-
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Usage {
     #[serde(default)]
@@ -291,11 +276,6 @@ impl Accumulator {
             self.content.push_str(text);
         }
         delta
-    }
-
-    /// Whether the model asked to call at least one tool.
-    pub fn has_tool_calls(&self) -> bool {
-        !self.calls.is_empty()
     }
 
     /// Assemble the final assistant message.

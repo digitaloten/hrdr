@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- No more panics on multibyte (non-ASCII) text. Three sites sliced a `&str` at a
+  fixed byte offset without landing on a char boundary — `read_file` (long
+  lines), the web-fetch HTML sniff, and `@file` mention expansion — so a UTF-8
+  codepoint straddling the cut would panic. All now use a shared
+  `hrdr_tools::floor_char_boundary` helper (reused by `truncate` too).
+
 - Interrupting a turn mid tool-call no longer corrupts the conversation. A turn
   pushes the assistant `tool_calls` message before running the tools, so
   cancelling (Esc) during tool execution left the history ending with an

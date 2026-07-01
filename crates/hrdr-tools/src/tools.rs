@@ -60,11 +60,7 @@ impl Tool for ReadTool {
         let mut out = String::new();
         for (i, line) in text.lines().enumerate().skip(start - 1).take(limit) {
             let n = i + 1;
-            let line = if line.len() > MAX_LINE {
-                &line[..MAX_LINE]
-            } else {
-                line
-            };
+            let line = &line[..crate::floor_char_boundary(line, MAX_LINE)];
             out.push_str(&format!("{n:>6}\t{line}\n"));
         }
         if out.is_empty() {

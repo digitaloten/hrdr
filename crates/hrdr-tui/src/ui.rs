@@ -976,7 +976,7 @@ fn push_tool(
     } else {
         ("✗", theme.error)
     };
-    let args_preview = truncate_inline(args, 80);
+    let args_preview = hrdr_tools::truncate_inline(args, 80);
     out.push(Line::from(vec![
         Span::styled(format!("{} ", mark.0), Style::default().fg(mark.1)),
         Span::styled(name.to_string(), Style::default().fg(theme.warn).bold()),
@@ -1045,15 +1045,5 @@ fn diff_line_color(line: &str, theme: &Theme) -> Color {
         theme.error
     } else {
         theme.dim
-    }
-}
-
-fn truncate_inline(s: &str, max: usize) -> String {
-    let one_line = s.replace('\n', " ");
-    if one_line.chars().count() <= max {
-        one_line
-    } else {
-        let truncated: String = one_line.chars().take(max).collect();
-        format!("{truncated}…")
     }
 }

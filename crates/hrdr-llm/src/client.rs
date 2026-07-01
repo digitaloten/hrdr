@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 
-use crate::types::{ChatChunk, ChatMessage, ChatRequest, ChatResponse, ToolDef};
+use crate::types::{ChatChunk, ChatMessage, ChatRequest, ToolDef};
 
 /// Boxed stream of decoded streaming chunks.
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
@@ -17,7 +17,7 @@ pub struct Client {
     http: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
-    /// Default model id; overridable per request via [`Client::with_model`].
+    /// Model id sent with each request (a public field; set it directly).
     pub model: String,
     pub temperature: Option<f32>,
 }
@@ -82,26 +82,6 @@ impl Client {
             req = req.bearer_auth(key);
         }
         req
-    }
-
-    /// Non-streaming completion. Returns the full response.
-    pub async fn chat(
-        &self,
-        messages: Vec<ChatMessage>,
-        tools: Vec<ToolDef>,
-    ) -> Result<ChatResponse> {
-        let body = self.request(messages, tools, false);
-        let resp = self
-            .post(&body)
-            .send()
-            .await
-            .context("chat request failed")?;
-        let status = resp.status();
-        let text = resp.text().await.context("reading chat response body")?;
-        if !status.is_success() {
-            bail!("chat endpoint returned {status}: {text}");
-        }
-        serde_json::from_str(&text).with_context(|| format!("decoding chat response: {text}"))
     }
 
     /// Streaming completion. Yields decoded chunks as they arrive.

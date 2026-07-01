@@ -270,7 +270,10 @@ async fn run_headless(config: AgentConfig, prompt: String) -> Result<()> {
             }
             AgentEvent::Reasoning(_) => {}
             AgentEvent::ToolStart { name, args, .. } => {
-                eprintln!("\x1b[33m⚙ {name}\x1b[0m {}", truncate_inline(&args, 120));
+                eprintln!(
+                    "\x1b[33m⚙ {name}\x1b[0m {}",
+                    hrdr_tools::truncate_inline(&args, 120)
+                );
             }
             AgentEvent::ToolOutput { chunk, .. } => {
                 eprint!("\x1b[90m{chunk}\x1b[0m");
@@ -305,14 +308,4 @@ async fn list_models(config: AgentConfig) -> Result<()> {
         println!("{m}");
     }
     Ok(())
-}
-
-fn truncate_inline(s: &str, max: usize) -> String {
-    let one_line = s.replace('\n', " ");
-    if one_line.chars().count() <= max {
-        one_line
-    } else {
-        let head: String = one_line.chars().take(max).collect();
-        format!("{head}…")
-    }
 }

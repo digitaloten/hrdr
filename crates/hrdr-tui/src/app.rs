@@ -2357,7 +2357,8 @@ impl App {
             let path = cwd.join(rel);
             if let Ok(text) = std::fs::read_to_string(&path) {
                 let text = if text.len() > MAX_BYTES {
-                    format!("{}\n…[truncated]", &text[..MAX_BYTES])
+                    let end = hrdr_tools::floor_char_boundary(&text, MAX_BYTES);
+                    format!("{}\n…[truncated]", &text[..end])
                 } else {
                     text
                 };
