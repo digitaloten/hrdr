@@ -274,11 +274,7 @@ fn code_layout(lang: &str, content: &str) -> TextLayout {
             if end == start {
                 continue;
             }
-            let fg = Color::rgb8(
-                style.foreground.r,
-                style.foreground.g,
-                style.foreground.b,
-            );
+            let fg = Color::rgb8(style.foreground.r, style.foreground.g, style.foreground.b);
             attrs.add_span(
                 start..end,
                 Attrs::new().color(fg).family(&mono).font_size(CODE_SIZE),

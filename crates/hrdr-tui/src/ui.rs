@@ -1024,7 +1024,10 @@ fn push_tool(
     out.push(pad_line(
         vec![
             Span::styled(format!(" {} ", mark.0), Style::default().fg(mark.1).bg(bg)),
-            Span::styled(name.to_string(), Style::default().fg(theme.warn).bg(bg).bold()),
+            Span::styled(
+                name.to_string(),
+                Style::default().fg(theme.warn).bg(bg).bold(),
+            ),
             Span::styled(format!(" {args_preview}"), dim_bg),
         ],
         width,
