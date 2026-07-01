@@ -308,30 +308,6 @@ pub(super) fn age_completed_todos(
             .any(|t| t.status == "completed" && &t.content == content)
     });
 }
-pub(super) fn is_quit_command(s: &str) -> bool {
-    matches!(
-        s.trim().to_ascii_lowercase().as_str(),
-        "exit"
-            | "quit"
-            | "q"
-            | "bye"
-            | "exit()"
-            | "quit()"
-            | "/exit"
-            | "/quit"
-            | "/q"
-            | "/bye"
-            | "/stop"
-            | ":q"
-            | ":q!"
-            | ":qa"
-            | ":qa!"
-            | ":wq"
-            | ":x"
-            | ":exit"
-            | ":quit"
-    )
-}
 /// Run `$VISUAL`/`$EDITOR` (falling back to `vi`) on `path`, inheriting stdio.
 /// The command string may carry args (e.g. `code -w`), split on whitespace.
 pub(crate) fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {

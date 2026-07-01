@@ -1,7 +1,7 @@
 //! Slash-command and @file completion.
 
-use super::commands::SLASH_COMMANDS;
 use super::util::walk_files;
+use hrdr_app::SLASH_COMMANDS;
 
 impl super::App {
     /// The active completion popup contents: slash commands when the line starts

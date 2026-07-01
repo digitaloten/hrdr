@@ -5,6 +5,7 @@ members = [
     "crates/hrdr-tools",
     "crates/hrdr-agent",
     "crates/hrdr-editor",
+    "crates/hrdr-app",
     "crates/hrdr-tui",
     "apps/hrdr",
     "apps/hrdr-gui",
@@ -23,6 +24,7 @@ hrdr-llm = { path = "crates/hrdr-llm", version = "0.0.1" }
 hrdr-tools = { path = "crates/hrdr-tools", version = "0.0.1" }
 hrdr-agent = { path = "crates/hrdr-agent", version = "0.0.1" }
 hrdr-editor = { path = "crates/hrdr-editor", version = "0.0.1" }
+hrdr-app = { path = "crates/hrdr-app", version = "0.0.1" }
 hrdr-tui = { path = "crates/hrdr-tui", version = "0.0.1" }
 
 # hjkl — crates.io pins (caret-minor; lockfile holds the exact patch).

@@ -2147,6 +2147,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hrdr-app"
+version = "0.0.1"
+
+[[package]]
 name = "hrdr-editor"
 version = "0.0.1"
 dependencies = [
@@ -2168,6 +2172,7 @@ dependencies = [
  "floem",
  "hjkl-theme",
  "hrdr-agent",
+ "hrdr-app",
  "tokio",
 ]
 
@@ -2220,6 +2225,7 @@ dependencies = [
  "hjkl-theme-tui",
  "hjkl-xdg",
  "hrdr-agent",
+ "hrdr-app",
  "hrdr-editor",
  "hrdr-tools",
  "ignore",

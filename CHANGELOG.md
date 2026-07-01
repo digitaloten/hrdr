@@ -131,6 +131,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`hrdr-app` — a shared application-core crate.** The first slice of logic
+  that the TUI and GUI both use now lives in one place instead of being
+  duplicated: the slash-command registry (`SLASH_COMMANDS`), help groupings,
+  alias resolution (`resolve_alias`), and quit-command detection
+  (`is_quit_command`). The TUI's `/help`, completion, dispatch, and quit-on-type
+  use it; the GUI uses `is_quit_command` so typing `exit`/`quit`/`:q` closes the
+  window. More representation-independent logic will move in as the frontends
+  converge (the transcript reducer stays per-frontend for now — the TUI is
+  immediate-mode with plain strings, the GUI retained-mode with per-field
+  reactive signals).
 - **`hrdr-gui` — a floem desktop frontend (proof-of-concept).** A new
   `apps/hrdr-gui` binary drives the same UI-agnostic core as the TUI
   (`hrdr_agent::Agent`): a chat window that streams a turn's `AgentEvent`s into

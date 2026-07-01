@@ -26,12 +26,13 @@ mod util;
 
 use completion::CompletionKind;
 pub(crate) use completion::Completions;
+use hrdr_app::is_quit_command;
+use util::{
+    MAX_HISTORY, age_completed_todos, current_config_mtime, display_dir, git_branch, load_history,
+    persist_history, timestamp_now,
+};
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
-use util::{
-    MAX_HISTORY, age_completed_todos, current_config_mtime, display_dir, git_branch,
-    is_quit_command, load_history, persist_history, timestamp_now,
-};
 pub(crate) use util::{run_editor, setup_config_watcher};
 
 /// Per-message timestamp display style.
@@ -1201,10 +1202,9 @@ mod e2e;
 #[cfg(test)]
 mod tests {
     use super::Todo;
-    use super::commands::resolve_alias;
     use super::completion::{active_file_token, slash_completions};
     use super::util::{
-        age_completed_todos, is_quit_command, last_fenced_block, parse_duration, parse_msg_range,
+        age_completed_todos, last_fenced_block, parse_duration, parse_msg_range,
         walk_files_gitignore,
     };
     use std::collections::HashMap;
@@ -1332,18 +1332,6 @@ mod tests {
     }
 
     #[test]
-    fn aliases_resolve_to_canonical() {
-        assert_eq!(resolve_alias("new"), "clear");
-        assert_eq!(resolve_alias("RESET"), "clear"); // case-insensitive
-        assert_eq!(resolve_alias("cd"), "cwd");
-        assert_eq!(resolve_alias("status"), "info");
-        assert_eq!(resolve_alias("continue"), "resume");
-        assert_eq!(resolve_alias("summarize"), "compact");
-        assert_eq!(resolve_alias("?"), "help");
-        assert_eq!(resolve_alias("model"), "model"); // unknown passes through
-    }
-
-    #[test]
     fn active_file_token_detection() {
         // Bare @ at start, or after whitespace, with a partial query.
         assert_eq!(active_file_token("@"), Some((0, String::new())));
@@ -1376,38 +1364,5 @@ mod tests {
         assert!(!names("/list").contains(&"/clear"));
         assert!(names("/model gpt").is_empty()); // a space ends completion
         assert!(names("hello").is_empty()); // not a slash command
-    }
-
-    #[test]
-    fn recognizes_common_quit_commands() {
-        for cmd in [
-            "exit",
-            "quit",
-            "q",
-            "bye",
-            "/exit",
-            "/quit",
-            "/bye",
-            ":q",
-            ":qa",
-            ":wq",
-            ":x",
-            "EXIT",
-            "  /quit  ",
-        ] {
-            assert!(is_quit_command(cmd), "{cmd:?} should quit");
-        }
-    }
-
-    #[test]
-    fn leaves_normal_messages_alone() {
-        for msg in [
-            "exit the loop early",
-            "how do I quit vim?",
-            "q1 results",
-            "fix bye-bug",
-        ] {
-            assert!(!is_quit_command(msg), "{msg:?} should NOT quit");
-        }
     }
 }

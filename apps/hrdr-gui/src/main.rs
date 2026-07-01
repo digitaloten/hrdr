@@ -186,6 +186,11 @@ fn app_view(
         if text.trim().is_empty() || running.get() {
             return;
         }
+        // Common quit words (shared with the TUI) close the window.
+        if hrdr_app::is_quit_command(&text) {
+            floem::quit_app();
+            return;
+        }
         input.set(String::new());
         push_item(transcript, next_id, Body::User(text.clone()));
         running.set(true);

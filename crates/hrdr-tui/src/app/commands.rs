@@ -4,6 +4,7 @@ use super::util::{last_fenced_block, parse_duration, parse_msg_range, resolve_un
 use super::*;
 use crate::theme::Theme;
 use hjkl_clipboard::{MimeType, Selection};
+use hrdr_app::{HELP_GROUPS, SLASH_COMMANDS, resolve_alias};
 
 impl super::App {
     /// Dispatch a known slash command. Returns `true` if it was a recognized
@@ -956,106 +957,6 @@ impl super::App {
     }
 }
 
-/// Slash commands offered by the completion popup.
-pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/clear", "reset the conversation"),
-    ("/compact", "summarize the conversation to reclaim context"),
-    (
-        "/sessions",
-        "list this dir's saved sessions (--all for every dir)",
-    ),
-    ("/resume", "resume a saved session by id or name"),
-    ("/rename", "rename the current session"),
-    ("/model", "show or switch model"),
-    ("/models", "list models from the endpoint"),
-    ("/provider", "switch provider preset"),
-    ("/theme", "switch theme (path, or reset)"),
-    ("/cwd", "show or change working directory"),
-    ("/tools", "list available tools"),
-    ("/expand", "expand tool output (last, or 'all'/'off')"),
-    ("/init", "analyze the project and write an AGENTS.md"),
-    ("/add", "attach a file (or type @path inline)"),
-    ("/diff", "show git diff of the working tree"),
-    ("/revert", "undo the last turn's file edits"),
-    ("/checkpoints", "list revertible file checkpoints"),
-    ("/reasoning", "toggle showing model reasoning"),
-    ("/timestamps", "set timestamps (none|relative|exact)"),
-    ("/statusbar", "set status bar (none|truncate|wrap)"),
-    ("/todo-ttl", "turns a finished todo stays shown"),
-    ("/reload", "reload AGENTS.md + config"),
-    ("/temp", "show or set temperature"),
-    ("/effort", "show or set effort label"),
-    ("/info", "session info"),
-    ("/goto", "jump to message N or time (5m/1h/top/end)"),
-    ("/find", "jump to text (or 'clear' to drop search)"),
-    ("/next", "jump to next /find match"),
-    ("/prev", "jump to previous /find match"),
-    ("/copy", "copy reply (or 'code' / 'all' / 'msg N[-M]')"),
-    ("/export", "write transcript to a file ([--json] [file])"),
-    ("/paste", "paste clipboard (file path → attach)"),
-    ("/edit", "open a file in $EDITOR"),
-    ("/retry", "re-run last turn (optional model)"),
-    ("/undo", "undo last turn (edit & resend)"),
-    ("/help", "list commands"),
-    ("/exit", "quit"),
-    // Aliases for users switching from other agents (resolved by resolve_alias).
-    ("/new", "alias of /clear"),
-    ("/reset", "alias of /clear"),
-    ("/cd", "alias of /cwd"),
-    ("/status", "alias of /info"),
-    ("/continue", "alias of /resume"),
-    ("/summarize", "alias of /compact"),
-];
-/// Commands grouped by theme for a readable `/help`.
-const HELP_GROUPS: &[(&str, &[&str])] = &[
-    (
-        "Session",
-        &[
-            "/clear",
-            "/sessions",
-            "/resume",
-            "/rename",
-            "/compact",
-            "/info",
-            "/goto",
-            "/find",
-            "/next",
-            "/prev",
-        ],
-    ),
-    (
-        "Model & sampling",
-        &[
-            "/model",
-            "/models",
-            "/provider",
-            "/temp",
-            "/effort",
-            "/reasoning",
-        ],
-    ),
-    (
-        "Files & context",
-        &[
-            "/init",
-            "/add",
-            "/edit",
-            "/diff",
-            "/revert",
-            "/checkpoints",
-            "/cwd",
-            "/tools",
-            "/expand",
-            "/paste",
-        ],
-    ),
-    ("Reply", &["/copy", "/export", "/retry", "/undo"]),
-    (
-        "Appearance",
-        &["/theme", "/timestamps", "/statusbar", "/todo-ttl"],
-    ),
-    ("Other", &["/reload", "/help", "/exit"]),
-];
 /// Render the grouped, aligned `/help` text.
 fn help_text() -> String {
     let desc = |name: &str| {
@@ -1101,23 +1002,3 @@ Do this:
 
 Prefer real commands, paths, and specifics over generic advice. Keep it tight. \
 When finished, give a one-line summary of what you wrote.";
-/// Resolve a slash-command alias to its canonical name (case-insensitive), so
-/// users coming from other agents can use familiar names. Unknown names pass
-/// through unchanged.
-pub(super) fn resolve_alias(cmd: &str) -> &str {
-    match cmd.to_ascii_lowercase().as_str() {
-        // Claude Code / opencode / aider new-session & reset names.
-        "new" | "reset" => "clear",
-        // aider/shell-style directory change.
-        "cd" => "cwd",
-        // Claude Code status line.
-        "status" => "info",
-        // opencode/Claude Code resume.
-        "continue" => "resume",
-        // descriptive name for compaction.
-        "summarize" | "summary" => "compact",
-        // help variants.
-        "commands" | "?" => "help",
-        _ => cmd,
-    }
-}
