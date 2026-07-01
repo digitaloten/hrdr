@@ -1,10 +1,22 @@
 //! Free helper functions with no `App` receiver.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use hrdr_agent::Todo;
 use tokio::sync::mpsc;
+
+/// Resolve `path` against `base`: absolute paths pass through unchanged,
+/// relative ones are joined onto `base`.
+pub(super) fn resolve_under(base: &Path, path: &str) -> PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    }
+}
 
 /// Set up an OS-level watch on the config file, pinging `()` on the returned
 /// channel whenever it changes. Returns `None` if a watcher can't be created

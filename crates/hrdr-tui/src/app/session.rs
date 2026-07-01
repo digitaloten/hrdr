@@ -25,10 +25,10 @@ impl super::App {
         if session.messages.len() <= 1 {
             return;
         }
-        if let Ok(mut a) = self.agent.try_lock() {
+        self.with_agent(|a| {
             a.set_messages(session.messages.clone());
             a.set_model(session.model.clone());
-        }
+        });
         self.model = session.model.clone();
         self.rebuild_transcript(&session.messages);
         self.session_id = Some(meta.id);
@@ -103,10 +103,10 @@ impl super::App {
             return;
         };
         let count = session.messages.len();
-        if let Ok(mut a) = self.agent.try_lock() {
+        self.with_agent(|a| {
             a.set_messages(session.messages.clone());
             a.set_model(session.model.clone());
-        }
+        });
         self.model = session.model.clone();
         self.rebuild_transcript(&session.messages);
         self.session_id = Some(id.clone());

@@ -1,6 +1,6 @@
 //! Slash-command dispatch and the individual command handlers.
 
-use super::util::{last_fenced_block, parse_duration, parse_msg_range};
+use super::util::{last_fenced_block, parse_duration, parse_msg_range, resolve_under};
 use super::*;
 use crate::theme::Theme;
 use hjkl_clipboard::{MimeType, Selection};
@@ -22,9 +22,7 @@ impl super::App {
                 // Full reset — as if a fresh session just opened. `Agent::clear`
                 // drops history and re-reads `AGENTS.md` (so an updated/removed
                 // file is reflected); here we reset the view + interaction state.
-                if let Ok(mut a) = self.agent.try_lock() {
-                    a.clear();
-                }
+                self.with_agent(|a| a.clear());
                 self.clear_transcript();
                 self.queue.clear();
                 if let Ok(mut todos) = self.todos.lock() {
@@ -50,14 +48,7 @@ impl super::App {
                 if arg.is_empty() {
                     self.system(format!("model: {}", self.model));
                 } else {
-                    let ok = match self.agent.try_lock() {
-                        Ok(mut a) => {
-                            a.set_model(arg);
-                            true
-                        }
-                        Err(_) => false,
-                    };
-                    if ok {
+                    if self.with_agent(|a| a.set_model(arg)).is_some() {
                         self.model = arg.to_string();
                         self.system(format!("model → {arg}"));
                     } else {
@@ -134,9 +125,7 @@ impl super::App {
         true
     }
     fn list_models_cmd(&mut self) {
-        let client = self.agent.try_lock().ok().map(|a| a.client());
-        let Some(client) = client else {
-            self.system("busy — try again after the current turn");
+        let Some(client) = self.with_agent_or_busy(|a| a.client()) else {
             return;
         };
         let tx = self.tx.clone();
@@ -151,21 +140,14 @@ impl super::App {
         });
     }
     fn change_cwd(&mut self, arg: &str) {
-        let cur = self.agent.try_lock().ok().map(|a| a.cwd());
-        let Some(cur) = cur else {
-            self.system("busy — try again after the current turn");
+        let Some(cur) = self.with_agent_or_busy(|a| a.cwd()) else {
             return;
         };
         if arg.is_empty() {
             self.system(format!("cwd: {}", cur.display()));
             return;
         }
-        let p = std::path::Path::new(arg);
-        let new = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            cur.join(p)
-        };
+        let new = resolve_under(&cur, arg);
         if !new.is_dir() {
             self.system(format!("not a directory: {}", new.display()));
             return;
@@ -213,7 +195,7 @@ impl super::App {
         }
     }
     fn show_tools(&mut self) {
-        match self.agent.try_lock().ok().map(|a| a.tools()) {
+        match self.with_agent(|a| a.tools()) {
             Some(tools) => {
                 let mut s = String::from("tools:");
                 for (n, d) in tools {
@@ -250,17 +232,10 @@ impl super::App {
             self.system("usage: /add <file>");
             return;
         }
-        let cur = self.agent.try_lock().ok().map(|a| a.cwd());
-        let Some(cur) = cur else {
-            self.system("busy — try again after the current turn");
+        let Some(cur) = self.with_agent_or_busy(|a| a.cwd()) else {
             return;
         };
-        let p = std::path::Path::new(arg);
-        let path = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            cur.join(p)
-        };
+        let path = resolve_under(&cur, arg);
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 let n = content.lines().count();
@@ -273,9 +248,7 @@ impl super::App {
         }
     }
     fn git_diff_cmd(&mut self) {
-        let cwd = self.agent.try_lock().ok().map(|a| a.cwd());
-        let Some(cwd) = cwd else {
-            self.system("busy — try again after the current turn");
+        let Some(cwd) = self.with_agent_or_busy(|a| a.cwd()) else {
             return;
         };
         let tx = self.tx.clone();
@@ -308,7 +281,7 @@ impl super::App {
     }
     fn set_temp_cmd(&mut self, arg: &str) {
         if arg.is_empty() {
-            let t = self.agent.try_lock().ok().and_then(|a| a.temperature());
+            let t = self.with_agent(|a| a.temperature()).flatten();
             self.system(format!(
                 "temperature: {}",
                 t.map(|t| t.to_string()).unwrap_or_else(|| "default".into())
@@ -317,9 +290,7 @@ impl super::App {
         }
         match arg.parse::<f32>() {
             Ok(t) => {
-                if let Ok(mut a) = self.agent.try_lock() {
-                    a.set_temperature(Some(t));
-                }
+                self.with_agent(|a| a.set_temperature(Some(t)));
                 self.persist_setting("temperature", hrdr_agent::ConfigValue::Float(t as f64));
                 self.system(format!("temperature → {t}"));
             }
@@ -327,7 +298,7 @@ impl super::App {
         }
     }
     fn show_info(&mut self) {
-        let temp = self.agent.try_lock().ok().and_then(|a| a.temperature());
+        let temp = self.with_agent(|a| a.temperature()).flatten();
         let branch = self.branch.clone().unwrap_or_else(|| "—".into());
         let ctx = match (self.last_usage, self.context_window) {
             (Some((p, _)), Some(w)) => format!("{p} / {w}"),
@@ -392,16 +363,14 @@ impl super::App {
             .api_key
             .clone()
             .or_else(|| p.key_env.as_ref().and_then(|e| std::env::var(e).ok()));
-        let switched = match self.agent.try_lock() {
-            Ok(mut a) => {
+        let switched = self
+            .with_agent(|a| {
                 a.set_endpoint(p.base_url.clone(), key);
                 if let Some(m) = &p.model {
                     a.set_model(m.clone());
                 }
-                true
-            }
-            Err(_) => false,
-        };
+            })
+            .is_some();
         if !switched {
             self.system("busy — try again after the current turn");
             return;
@@ -764,14 +733,9 @@ impl super::App {
         let trimmed = text.trim();
         if !trimmed.is_empty()
             && !trimmed.contains('\n')
-            && let Some(cwd) = self.agent.try_lock().ok().map(|a| a.cwd())
+            && let Some(cwd) = self.with_agent(|a| a.cwd())
         {
-            let p = std::path::Path::new(trimmed);
-            let full = if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                cwd.join(p)
-            };
+            let full = resolve_under(&cwd, trimmed);
             if full.is_file() {
                 self.editor.paste(&format!("@{trimmed} "));
                 self.system(format!("attached @{trimmed} from clipboard"));
@@ -784,8 +748,7 @@ impl super::App {
     /// (default) or JSON. With no file, a timestamped `hrdr-transcript-<date>`
     /// in the cwd is used (`.md` or `.json`).
     fn export_cmd(&mut self, arg: &str) {
-        let Some(cwd) = self.agent.try_lock().ok().map(|a| a.cwd()) else {
-            self.system("busy — try again after the current turn");
+        let Some(cwd) = self.with_agent_or_busy(|a| a.cwd()) else {
             return;
         };
         let mut json = false;
@@ -798,14 +761,7 @@ impl super::App {
             }
         }
         let path = match file {
-            Some(f) => {
-                let p = std::path::Path::new(f);
-                if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    cwd.join(p)
-                }
-            }
+            Some(f) => resolve_under(&cwd, f),
             None => {
                 let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
                 let ext = if json { "json" } else { "md" };
@@ -858,7 +814,7 @@ impl super::App {
             self.system("can't revert while a turn is running");
             return;
         }
-        let Some(cp) = self.agent.try_lock().ok().and_then(|a| a.checkpoints()) else {
+        let Some(cp) = self.with_agent(|a| a.checkpoints()).flatten() else {
             self.system("checkpoints are off (auto-disabled in git repos — use git, or set checkpoints = on)");
             return;
         };
@@ -889,7 +845,7 @@ impl super::App {
     }
     /// `/checkpoints` — list the revertible per-turn file checkpoints.
     fn checkpoints_cmd(&mut self) {
-        let Some(cp) = self.agent.try_lock().ok().and_then(|a| a.checkpoints()) else {
+        let Some(cp) = self.with_agent(|a| a.checkpoints()).flatten() else {
             self.system("checkpoints are off (auto-disabled in git repos — use git, or set checkpoints = on)");
             return;
         };
@@ -935,16 +891,10 @@ impl super::App {
             self.system("can't /edit while a turn is running");
             return;
         }
-        let Some(cwd) = self.agent.try_lock().ok().map(|a| a.cwd()) else {
-            self.system("busy — try again after the current turn");
+        let Some(cwd) = self.with_agent_or_busy(|a| a.cwd()) else {
             return;
         };
-        let p = std::path::Path::new(arg);
-        let path = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            cwd.join(p)
-        };
+        let path = resolve_under(&cwd, arg);
         // Consumed by the run loop (it owns the terminal needed to suspend).
         self.pending_edit = Some(path);
     }
@@ -955,14 +905,7 @@ impl super::App {
         }
         // Optional model switch for this retry (and subsequent turns).
         if !arg.is_empty() {
-            let ok = match self.agent.try_lock() {
-                Ok(mut a) => {
-                    a.set_model(arg);
-                    true
-                }
-                Err(_) => false,
-            };
-            if ok {
+            if self.with_agent(|a| a.set_model(arg)).is_some() {
                 self.model = arg.to_string();
                 self.system(format!("model → {arg}"));
             } else {

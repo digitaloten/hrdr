@@ -207,11 +207,13 @@ fn now() -> u64 {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
     let mut s = String::with_capacity(64);
     for b in digest {
-        s.push_str(&format!("{b:02x}"));
+        let _ = write!(s, "{b:02x}");
     }
     s
 }

@@ -373,7 +373,7 @@ impl App {
     /// warning if it's unreachable or doesn't advertise the configured model.
     /// Stays silent on success so it doesn't clutter the transcript.
     fn spawn_health_check(&self) {
-        let Some(client) = self.agent.try_lock().ok().map(|a| a.client()) else {
+        let Some(client) = self.with_agent(|a| a.client()) else {
             return;
         };
         let model = self.model.clone();
@@ -704,6 +704,24 @@ impl App {
         self.push_entry(Entry::System(msg.into()));
     }
 
+    /// Run `f` with the locked agent, returning its result — or `None` if a turn
+    /// currently holds the lock. For fire-and-forget mutations (ignore the
+    /// `None`) or optional reads.
+    fn with_agent<T>(&self, f: impl FnOnce(&mut Agent) -> T) -> Option<T> {
+        self.agent.try_lock().ok().map(|mut a| f(&mut a))
+    }
+
+    /// Like [`Self::with_agent`], but emits the standard "busy" system line when
+    /// the agent is locked, so callers can `let Some(x) = …_or_busy(…) else {
+    /// return; }`.
+    fn with_agent_or_busy<T>(&mut self, f: impl FnOnce(&mut Agent) -> T) -> Option<T> {
+        let result = self.with_agent(f);
+        if result.is_none() {
+            self.system("busy — try again after the current turn");
+        }
+        result
+    }
+
     /// Append a transcript entry, stamping it with the current local time so the
     /// `entry_times` vector stays parallel to `transcript`.
     fn push_entry(&mut self, e: Entry) {
@@ -738,8 +756,8 @@ impl App {
     /// The tools' current working directory (agent's, or the process cwd while
     /// a turn holds the agent lock).
     fn current_cwd(&self) -> String {
-        if let Ok(a) = self.agent.try_lock() {
-            return a.cwd().display().to_string();
+        if let Some(cwd) = self.with_agent(|a| a.cwd()) {
+            return cwd.display().to_string();
         }
         std::env::current_dir()
             .map(|p| p.display().to_string())
@@ -748,9 +766,7 @@ impl App {
 
     /// Switch the tools' working directory: update the agent and the status bar.
     fn apply_cwd(&mut self, new: std::path::PathBuf) {
-        if let Ok(mut a) = self.agent.try_lock() {
-            a.set_cwd(new.clone());
-        }
+        self.with_agent(|a| a.set_cwd(new.clone()));
         self.dir = display_dir(&new);
         self.branch = git_branch(&new);
         self.file_index_cwd = None; // force a rebuild for the new directory
@@ -771,8 +787,8 @@ impl App {
             .as_deref()
             .and_then(hjkl_icons::IconMode::from_config)
             .unwrap_or(hjkl_icons::IconMode::Nerd);
-        if let (Some(t), Ok(mut a)) = (cfg.temperature, self.agent.try_lock()) {
-            a.set_temperature(Some(t));
+        if let Some(t) = cfg.temperature {
+            self.with_agent(|a| a.set_temperature(Some(t)));
         }
     }
 
@@ -824,13 +840,12 @@ impl App {
     /// Re-gather `AGENTS.md` for the current cwd and refresh the system prompt
     /// in place (e.g. after `/init` writes one).
     fn reload_project_docs(&mut self) {
-        let loaded = match self.agent.try_lock() {
-            Ok(mut a) => {
-                let cwd = a.cwd();
-                a.set_cwd(cwd);
-                a.project_docs().is_some()
-            }
-            Err(_) => return,
+        let Some(loaded) = self.with_agent(|a| {
+            let cwd = a.cwd();
+            a.set_cwd(cwd);
+            a.project_docs().is_some()
+        }) else {
+            return;
         };
         if loaded {
             self.system("loaded AGENTS.md into the system prompt");
