@@ -68,6 +68,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- CI now mirrors the kryptic-sh canonical layout (referenced from hjkl): `fmt`,
+  `clippy` (3 OSes), `cargo-machete` (unused-deps lint), `test` (nextest +
+  doctests on 3 OSes), and a cross-platform release `build` job. No release/
+  packaging jobs yet.
+
 - The context bar and auto-compaction keep working when the server reports no
   token usage. hrdr asks for usage (`stream_options.include_usage`), but servers
   that ignore it left the "used" count stale at 0. Turns now fall back to a
