@@ -10,17 +10,22 @@ tasks in a terminal. It is provider-agnostic: point it at any
 OpenAI, llama.cpp, OpenRouter — and it streams tokens and runs tools until the
 job is done.
 
-> Early WIP. The agent loop, tool set, OpenAI client, and a vim-keybound TUI are
-> in place; see the roadmap below.
+> Active development. The agent loop, adaptive tool set, sessions, file
+> checkpoints, config hot-reload, and a rich TUI are in place; the main open
+> item is `infr`'s serve path (see the roadmap).
 
 ## Design
 
 - **Provider-agnostic client.** Speaks clean OpenAI chat-completions with native
   `tools`/`tool_calls` and SSE streaming. The server owns chat-template
   application; hrdr only ever sends structured `messages[]` + `tools[]`.
-- **Efficient, locked tool set.** Fewer, more powerful tools beat a big menu:
-  `read_file`, `write_file`, `edit`, `bash`, `grep`, `glob`, `todo_write`.
-  Token-bounded outputs, line-numbered reads for precise edits, ripgrep search.
+- **Efficient, adaptive tool set.** Fewer, more powerful tools beat a big menu:
+  `read_file`, `write_file`, `edit`, `grep`, `glob`, `todo_write`, `web_fetch`,
+  `web_search`, plus a shell. Token-bounded outputs and line-numbered reads for
+  precise edits. Tools that shell out are **presence-aware**: the shell tool is
+  `bash` and/or `powershell` depending on what's installed, and `grep` uses
+  ripgrep → POSIX grep → a built-in walker — so the model is only ever offered
+  tools it can actually run.
 - **Pluggable input discipline.** Default is a plain, claude-style input (always
   typing; `Enter` sends, `Shift+Enter` / `\`+`Enter` insert a newline, `Ctrl+G`
   opens `$EDITOR`, readline-ish `Ctrl+A`/`Ctrl+E`/`Ctrl+W`). `--vim` swaps in a
@@ -35,7 +40,7 @@ job is done.
 | Crate         | Role                                                            |
 | ------------- | --------------------------------------------------------------- |
 | `hrdr-llm`    | OpenAI-compatible client: types, streaming, tool-call assembly. |
-| `hrdr-tools`  | The seven MVP tools + registry.                                 |
+| `hrdr-tools`  | The tool set + registry + file checkpoints.                     |
 | `hrdr-agent`  | The agent loop + minijinja system prompt.                       |
 | `hrdr-editor` | FSM-agnostic hjkl embedding (`EditorEngine` seam).              |
 | `hrdr-tui`    | Ratatui UI: transcript + vim input pane, live streaming.        |
@@ -44,9 +49,7 @@ job is done.
 ## Usage
 
 ```bash
-# interactive TUI — plain input: type, Enter sends, Alt+Enter or \+Enter newline
-# (Shift+Enter on supporting terminals), Ctrl+G opens $EDITOR, Ctrl+C quits.
-# Submit while a reply is running to queue follow-up messages.
+# interactive TUI (see keybindings + slash commands below)
 hrdr
 
 # vim keybindings in the input pane instead
@@ -55,6 +58,45 @@ hrdr --vim
 # one-shot headless run, streamed to stdout
 hrdr run "add a --json flag to the status command"
 ```
+
+In the TUI, type a message and press `Enter` to send. `@path` attaches a file
+(with completion), and typing `/` opens a slash-command menu.
+
+### Keybindings
+
+| Key                       | Action                                                    |
+| ------------------------- | --------------------------------------------------------- |
+| `Enter`                   | Send (queues a follow-up if a reply is already running)   |
+| `Alt+Enter` / `\`+`Enter` | Insert a newline (`Shift+Enter` too, where supported)     |
+| `Up` / `Down`             | Recall previous inputs (single-line); drive the `/` menu  |
+| `@path`                   | Attach a file to the message                              |
+| `Ctrl+G`                  | Edit the input in `$EDITOR` / `$VISUAL`                   |
+| `PageUp/Down`, mouse      | Scroll the transcript; `End` follows the newest output    |
+| `Ctrl+L`                  | Clear + repaint the screen                                |
+| `Esc` / `Ctrl+C`          | Interrupt the running turn                                |
+| `Ctrl+C` twice / `Ctrl+D` | Quit (`Ctrl+D` on an empty input); `Ctrl+Q` quits at once |
+
+Pass `--vim` for a full [hjkl](https://github.com/kryptic-sh/hjkl) vim editor in
+the input pane instead of the default plain input.
+
+### Slash commands
+
+Type `/` to see the menu (fuzzy-matched, `Tab` to accept). Highlights:
+
+- **Session** — `/clear`, `/sessions`, `/resume <id|name>`, `/rename`,
+  `/compact`, `/info`, `/goto <N|5m|top|end>`, `/find <text>` (`/next` `/prev`)
+- **Model** — `/model`, `/models`, `/provider`, `/temp`, `/effort`, `/reasoning`
+- **Files** — `/init` (write `AGENTS.md`), `/add`, `/edit <file>`, `/diff`,
+  `/revert` + `/checkpoints` (file undo), `/tools`, `/expand`, `/paste`
+- **Reply** — `/copy [code|all|msg N]`, `/export [--json]`, `/retry [model]`,
+  `/undo`
+- **Appearance** — `/theme`, `/timestamps [none|relative|exact]`,
+  `/statusbar [none|truncate|wrap]`
+- **Other** — `/reload`, `/help`, `/exit`
+
+Sessions auto-save per working directory and auto-resume on reopen. Project
+instructions are read from `AGENTS.md` (the open [agents.md](https://agents.md)
+standard) walking up from the cwd.
 
 ### Backend (temporary)
 
@@ -145,21 +187,53 @@ Configuration (CLI flags override env):
 | `HRDR_MODEL`    | `default`                          | Model id.                   |
 | `HRDR_API_KEY`  | _(falls back to `OPENAI_API_KEY`)_ | Bearer token, if required.  |
 
+## Recommended companion tools
+
+hrdr works with zero extra tools installed, but the agent is more capable when
+these are on `PATH`. It detects what's available and adapts.
+
+| Tool                           | Why                                                                                                          |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| **bash** and/or **PowerShell** | The shell tool. At least one lets the model run builds/tests/commands. `bash` on unix; `pwsh` runs anywhere. |
+| **ripgrep** (`rg`)             | Fastest `grep` backend. Falls back to POSIX `grep`, then a built-in walker — but `rg` is best.               |
+| **git**                        | Repo awareness (branch in the status bar). In a git repo, file checkpoints auto-disable since git covers it. |
+| **`$EDITOR` / `$VISUAL`**      | Used by `Ctrl+G` and `/edit` (falls back to `vi`).                                                           |
+| A **Nerd Font**                | Status-bar icons. Otherwise set `icons = unicode` or `ascii` (config / `--icons` / `$HRDR_ICONS`).           |
+| **llama.cpp** (`llama-server`) | Only for the built-in local backend; not needed with a remote provider.                                      |
+
+`SEARXNG_URL` (optional) points `web_search` at a SearXNG instance for more
+reliable results than the zero-config DuckDuckGo default.
+
+## Platform support
+
+Built and tested in CI on **Linux, macOS, and Windows** (fmt + clippy + tests on
+all three). The TUI, model streaming, web tools, theming, clipboard, config
+hot-reload, sessions, and file checkpoints are cross-platform.
+
+The shell and search tools adapt to the host:
+
+- **Linux / macOS** — `bash` + ripgrep is the typical setup; everything works
+  out of the box.
+- **Windows** — PowerShell is always present, so the shell tool works, and the
+  built-in `grep` fallback means search works with nothing extra installed. For
+  parity with unix, optionally add **Git for Windows** (`bash`) and **ripgrep**
+  to `PATH`.
+
 ## Status / roadmap
 
-- [x] OpenAI client (streaming + tool calls)
-- [x] Tool set (read/write/edit/bash/grep/glob/todo)
-- [x] Agent loop with tool execution
-- [x] hjkl vim input pane (FSM-agnostic seam)
-- [x] Interactive TUI + headless `run`
-- [x] In-flight turn cancellation
-- [x] TODO panel + transcript scrolling _(wrap-aware scroll still TODO)_
-- [x] Config file (`~/.config/hrdr/config.toml`), `hrdr models`
-- [x] Tool + client unit tests
+- [x] OpenAI client (streaming + tool calls) + agent loop
+- [x] Adaptive tool set (files, `web_fetch`/`web_search`, presence-aware shell +
+      grep) with live output streaming
+- [x] TUI: markdown + syntax-highlighted code, diffs, `@file`, slash commands,
+      search/goto, timestamps, configurable status bar, themes
+- [x] Sessions (auto-save + auto-resume per cwd), `AGENTS.md` project
+      instructions
+- [x] File checkpoints + `/revert`; network retry + auto-compact on overflow
+- [x] Config file with persistence + OS-level hot-reload
+- [x] Cross-platform CI (Linux/macOS/Windows)
 - [x] Temporary managed `llama-server` backend
-- [x] Wrap-aware transcript scrolling
-- [x] Message queueing during a running turn
 - [ ] infr serve path with tool calling (replaces the temporary backend)
+- [ ] MCP client + LSP diagnostics feedback
 - [ ] Switch hjkl path-deps to registry pins for standalone CI
 
 ## License
