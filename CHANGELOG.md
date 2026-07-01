@@ -6,14 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed
-
-- hjkl dependencies now come from crates.io (registry pins `hjkl-* = "0.33"`)
-  instead of `../hjkl/...` path deps against the sibling repo. hjkl was
-  published to crates.io at 0.33.3. CI is now standalone — the second checkout
-  of `kryptic-sh/hjkl` alongside hrdr is gone; each job checks out hrdr only.
-
 ### Fixed
+
+- Scrolling up in the transcript now stays pinned to the content you scrolled to
+  while output streams in. `scroll_offset` is measured from the bottom, so as
+  new rows were appended the view drifted downward; the draw now bumps the
+  offset by however much the content grew since the last frame, keeping the
+  from-top position fixed. Following the newest output (offset 0) is unaffected.
 
 - Status-bar context size no longer drops to 0 between turns: `last_usage` is
   kept across turns (only the live per-turn counters reset), so the displayed
@@ -25,6 +24,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- hjkl dependencies now come from crates.io (registry pins `hjkl-* = "0.33"`)
+  instead of `../hjkl/...` path deps against the sibling repo. hjkl was
+  published to crates.io at 0.33.3. CI is now standalone — the second checkout
+  of `kryptic-sh/hjkl` alongside hrdr is gone; each job checks out hrdr only.
 - The status bar has a configurable mode — `truncate` (default), `wrap`, or
   `none` — via `statusbar` in config, `--statusbar <mode>`, `$HRDR_STATUSBAR`,
   or `/statusbar [none|truncate|wrap]` (no arg cycles). `truncate` drops the

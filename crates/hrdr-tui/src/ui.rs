@@ -169,6 +169,17 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // long messages that wrap don't push the newest content below the fold.
     let total = para.line_count(text_area.width) as u16;
     let max_scroll = total.saturating_sub(area.height);
+    // Pin the view to the same content while scrolled up. `scroll_offset` is
+    // measured from the bottom, so as streaming appends rows `max_scroll` grows
+    // and the rendered `scroll = max_scroll - offset` would drift downward. Bump
+    // the offset by however much `max_scroll` grew since the last draw (held in
+    // `app.max_scroll`) so the from-top position stays put. `offset == 0`
+    // (following the newest output) is left untouched — it stays pinned to the
+    // bottom by design.
+    if app.scroll_offset > 0 {
+        let grown = max_scroll.saturating_sub(app.max_scroll as u16);
+        app.scroll_offset = app.scroll_offset.saturating_add(grown as usize);
+    }
     // A /goto puts the target message at the top of the viewport.
     if let Some(wrapped_start) = goto_top {
         app.scroll_offset = max_scroll.saturating_sub(wrapped_start) as usize;
