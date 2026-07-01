@@ -39,6 +39,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the model always gets a shell it can actually use — bash on unix, PowerShell
   on Windows (or both), and no phantom shell where neither exists. Both stream
   output like before.
+- Presence-aware `grep`: the search tool now picks the best available backend —
+  ripgrep (`rg`) if installed, else POSIX `grep`, else a built-in pure-Rust
+  walker (honors `.gitignore`, filters by glob, matches with the `regex` crate).
+  So content search works even on a machine with neither `rg` nor `grep`.
 - File checkpoints + `/revert`: the agent's file edits (`edit`/`write_file`) are
   now snapshotted per turn, so `/revert` undoes the last turn's file changes
   (restoring modified files and deleting ones the agent created), and

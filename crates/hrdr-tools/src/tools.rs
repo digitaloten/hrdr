@@ -392,7 +392,32 @@ impl Tool for PowerShellTool {
 
 // ---- grep ----
 
-pub struct GrepTool;
+/// Search backend, chosen once by availability.
+#[derive(Clone, Copy)]
+enum GrepBackend {
+    Rg,
+    Grep,
+    Builtin,
+}
+
+pub struct GrepTool {
+    backend: GrepBackend,
+}
+
+impl GrepTool {
+    /// Pick a search backend: ripgrep, then POSIX `grep`, then a built-in walker
+    /// (so search works even on a machine with neither installed).
+    pub fn detect() -> Self {
+        let backend = if which::which("rg").is_ok() {
+            GrepBackend::Rg
+        } else if which::which("grep").is_ok() {
+            GrepBackend::Grep
+        } else {
+            GrepBackend::Builtin
+        };
+        Self { backend }
+    }
+}
 
 #[derive(Deserialize)]
 struct GrepArgs {
@@ -409,8 +434,9 @@ impl Tool for GrepTool {
         "grep"
     }
     fn description(&self) -> &'static str {
-        "Search file contents with ripgrep. Returns `path:line:match`. Optionally scope to a \
-         `path` and/or filter files with a `glob` (e.g. '*.rs')."
+        "Search file contents (via ripgrep, grep, or a built-in walker — whichever is available). \
+         Returns `path:line:match`. Optionally scope to a `path` and/or filter files with a \
+         `glob` (e.g. '*.rs')."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -425,32 +451,112 @@ impl Tool for GrepTool {
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: GrepArgs = serde_json::from_value(args).context("invalid grep args")?;
-        let mut cmd = tokio::process::Command::new("rg");
-        cmd.arg("--line-number")
-            .arg("--no-heading")
-            .arg("--color=never")
-            .current_dir(&ctx.cwd);
-        if let Some(g) = &a.glob {
-            cmd.arg("--glob").arg(g);
+        match self.backend {
+            GrepBackend::Rg => grep_ripgrep(&a, ctx).await,
+            GrepBackend::Grep => grep_posix(&a, ctx).await,
+            GrepBackend::Builtin => grep_builtin(&a, ctx),
         }
-        cmd.arg("--").arg(&a.pattern);
-        if let Some(p) = &a.path {
-            cmd.arg(p);
+    }
+}
+
+async fn grep_ripgrep(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
+    let mut cmd = tokio::process::Command::new("rg");
+    cmd.arg("--line-number")
+        .arg("--no-heading")
+        .arg("--color=never")
+        .current_dir(&ctx.cwd);
+    if let Some(g) = &a.glob {
+        cmd.arg("--glob").arg(g);
+    }
+    cmd.arg("--").arg(&a.pattern);
+    if let Some(p) = &a.path {
+        cmd.arg(p);
+    }
+    let output = cmd.output().await.context("running ripgrep")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            bail!("ripgrep: {}", stderr.trim());
         }
-        let output = cmd
-            .output()
-            .await
-            .context("running ripgrep (is `rg` installed?)")?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.is_empty() {
-            // rg exits 1 with no output when there are no matches.
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.is_empty() {
-                bail!("ripgrep: {}", stderr.trim());
+        return Ok("(no matches)".to_string());
+    }
+    Ok(truncate(&stdout, ctx.max_output))
+}
+
+async fn grep_posix(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
+    let mut cmd = tokio::process::Command::new("grep");
+    cmd.arg("-rnE").arg("--color=never").current_dir(&ctx.cwd);
+    if let Some(g) = &a.glob {
+        cmd.arg(format!("--include={g}"));
+    }
+    cmd.arg("--").arg(&a.pattern);
+    cmd.arg(a.path.as_deref().unwrap_or("."));
+    let output = cmd.output().await.context("running grep")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.is_empty() {
+        // grep exits 1 with no matches; a real error writes to stderr.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            bail!("grep: {}", stderr.trim());
+        }
+        return Ok("(no matches)".to_string());
+    }
+    Ok(truncate(&stdout, ctx.max_output))
+}
+
+/// Pure-Rust search fallback: walk the tree (honoring `.gitignore`) and match
+/// each line with a regex. Used when neither ripgrep nor grep is installed.
+fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
+    let re =
+        regex::Regex::new(&a.pattern).with_context(|| format!("invalid regex: {}", a.pattern))?;
+    let root = a
+        .path
+        .as_ref()
+        .map(|p| ctx.resolve(p))
+        .unwrap_or_else(|| ctx.cwd.clone());
+    let glob_pat = a
+        .glob
+        .as_ref()
+        .map(|g| glob::Pattern::new(g))
+        .transpose()
+        .context("invalid glob")?;
+
+    let mut out = String::new();
+    let walker = ignore::WalkBuilder::new(&root)
+        .max_depth(Some(20))
+        .hidden(true)
+        .build();
+    'walk: for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if let Some(gp) = &glob_pat {
+            let name = path.file_name().map(|n| n.to_string_lossy());
+            let rel = path.strip_prefix(&root).unwrap_or(path);
+            let hit = name.as_deref().is_some_and(|n| gp.matches(n)) || gp.matches_path(rel);
+            if !hit {
+                continue;
             }
-            return Ok("(no matches)".to_string());
         }
-        Ok(truncate(&stdout, ctx.max_output))
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue; // skip binary / non-UTF-8 files
+        };
+        let disp = path.strip_prefix(&ctx.cwd).unwrap_or(path);
+        for (i, line) in text.lines().enumerate() {
+            if re.is_match(line) {
+                out.push_str(&format!("{}:{}:{}\n", disp.display(), i + 1, line));
+                if out.len() > ctx.max_output {
+                    break 'walk;
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        Ok("(no matches)".to_string())
+    } else {
+        Ok(truncate(&out, ctx.max_output))
     }
 }
 
@@ -573,6 +679,54 @@ mod tests {
 
     fn ctx(cwd: PathBuf) -> ToolContext {
         ToolContext::new(cwd)
+    }
+
+    // ---- grep (built-in fallback) ----
+
+    #[test]
+    fn grep_builtin_matches_and_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn foo() {}\nlet x = 1;\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "foo in text\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+
+        // Matches across files.
+        let out = super::grep_builtin(
+            &GrepArgs {
+                pattern: "foo".into(),
+                path: None,
+                glob: None,
+            },
+            &c,
+        )
+        .unwrap();
+        assert!(out.contains("a.rs:1:fn foo() {}"), "{out}");
+        assert!(out.contains("b.txt:1:foo in text"), "{out}");
+
+        // Glob restricts to *.rs.
+        let out = super::grep_builtin(
+            &GrepArgs {
+                pattern: "foo".into(),
+                path: None,
+                glob: Some("*.rs".into()),
+            },
+            &c,
+        )
+        .unwrap();
+        assert!(out.contains("a.rs"), "{out}");
+        assert!(!out.contains("b.txt"), "glob should exclude b.txt: {out}");
+
+        // No matches.
+        let out = super::grep_builtin(
+            &GrepArgs {
+                pattern: "zzz_nope".into(),
+                path: None,
+                glob: None,
+            },
+            &c,
+        )
+        .unwrap();
+        assert_eq!(out, "(no matches)");
     }
 
     // ---- read_file ----

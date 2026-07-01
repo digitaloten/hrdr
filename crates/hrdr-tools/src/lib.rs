@@ -135,7 +135,7 @@ impl ToolRegistry {
         for shell in available_shell_tools() {
             r.register(shell);
         }
-        r.register(Arc::new(GrepTool));
+        r.register(Arc::new(GrepTool::detect()));
         r.register(Arc::new(GlobTool));
         r.register(Arc::new(TodoTool));
         r.register(Arc::new(WebFetchTool));
