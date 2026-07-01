@@ -23,8 +23,9 @@ use tokio::process::{Child, Command};
 /// How a managed backend was provisioned.
 pub enum Backend {
     /// We launched `llama-server`; it is killed when this value drops (the
-    /// held `Child` is a kill-on-drop RAII guard, never read directly).
-    Spawned(#[allow(dead_code)] Child),
+    /// held `Child` is a kill-on-drop RAII guard, never read directly). Boxed so
+    /// the enum stays small (the `Child` is larger on Windows).
+    Spawned(#[allow(dead_code)] Box<Child>),
     /// A backend was already reachable; we reuse it and own nothing.
     External,
 }
@@ -108,7 +109,7 @@ impl Backend {
             );
         }
         eprintln!("hrdr: backend ready.");
-        Ok(Backend::Spawned(child))
+        Ok(Backend::Spawned(Box::new(child)))
     }
 }
 
