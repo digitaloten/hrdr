@@ -91,7 +91,7 @@ Type `/` to see the menu (fuzzy-matched, `Tab` to accept). Highlights:
 - **Reply** — `/copy [code|all|msg N]`, `/export [--json]`, `/retry [model]`,
   `/undo`
 - **Appearance** — `/theme`, `/timestamps [none|relative|exact]`,
-  `/statusbar [none|truncate|wrap]`
+  `/statusbar [none|truncate|wrap]`, `/todo-ttl [turns]`
 - **Other** — `/reload`, `/help`, `/exit`
 
 Sessions auto-save per working directory and auto-resume on reopen. Project

@@ -36,8 +36,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so the list keeps showing recent progress without accreting stale checkmarks.
   Pending / in-progress items are never pruned, and an item re-completed after
   being reopened ages from scratch. The lifetime is configurable via `todo_ttl`
-  in config, `--todo-ttl <turns>`, or `$HRDR_TODO_TTL` (default 5); it's
-  hot-reloadable like the other display settings.
+  in config, `--todo-ttl <turns>`, `$HRDR_TODO_TTL`, or the `/todo-ttl [turns]`
+  slash command (which persists to config); no arg reports the current value.
+  Default 5; hot-reloadable like the other display settings.
 - The status-bar context readout is simpler — just `{used} of {max}` (no
   percentage or `ctx` label). The used/free fill bar and its green→amber→red
   escalation are unchanged (they already convey the fraction visually).

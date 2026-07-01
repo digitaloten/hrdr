@@ -877,6 +877,7 @@ impl App {
             "prev" | "previous" => self.find_cycle(false),
             "timestamps" | "ts" => self.timestamps_cmd(arg),
             "statusbar" => self.statusbar_cmd(arg),
+            "todo-ttl" | "todottl" | "todos" => self.todo_ttl_cmd(arg),
             _ => return false,
         }
         true
@@ -1691,6 +1692,31 @@ impl App {
             StatusBarMode::Truncate => "status bar: truncate",
             StatusBarMode::Wrap => "status bar: wrap",
         });
+    }
+
+    /// `/todo-ttl [turns]` — how many turns a completed TODO stays visible
+    /// before it's pruned from the panel. No arg reports the current value.
+    fn todo_ttl_cmd(&mut self, arg: &str) {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            self.system(format!(
+                "todo-ttl: {} turn{}",
+                self.todo_ttl,
+                if self.todo_ttl == 1 { "" } else { "s" }
+            ));
+            return;
+        }
+        match arg.parse::<u64>() {
+            Ok(n) => {
+                self.todo_ttl = n;
+                self.persist_setting("todo_ttl", hrdr_agent::ConfigValue::Int(n as i64));
+                self.system(format!(
+                    "todo-ttl → {n} turn{}",
+                    if n == 1 { "" } else { "s" }
+                ));
+            }
+            Err(_) => self.system("usage: /todo-ttl <turns> (a whole number, e.g. 5)"),
+        }
     }
 
     /// `/timestamps [none|relative|exact]` — set the timestamp style (no arg
@@ -2690,6 +2716,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/reasoning", "toggle showing model reasoning"),
     ("/timestamps", "set timestamps (none|relative|exact)"),
     ("/statusbar", "set status bar (none|truncate|wrap)"),
+    ("/todo-ttl", "turns a finished todo stays shown"),
     ("/reload", "reload AGENTS.md + config"),
     ("/temp", "show or set temperature"),
     ("/effort", "show or set effort label"),
@@ -2759,7 +2786,10 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Reply", &["/copy", "/export", "/retry", "/undo"]),
-    ("Appearance", &["/theme", "/timestamps", "/statusbar"]),
+    (
+        "Appearance",
+        &["/theme", "/timestamps", "/statusbar", "/todo-ttl"],
+    ),
     ("Other", &["/reload", "/help", "/exit"]),
 ];
 

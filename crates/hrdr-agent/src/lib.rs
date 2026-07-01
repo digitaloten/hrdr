@@ -440,6 +440,7 @@ pub enum ConfigValue<'a> {
     Str(&'a str),
     Bool(bool),
     Float(f64),
+    Int(i64),
 }
 
 /// Path to the user config file (`~/.config/hrdr/config.toml`), if `HOME` is set.
@@ -456,6 +457,7 @@ pub fn persist_setting(key: &str, value: ConfigValue) -> Result<std::path::PathB
         ConfigValue::Str(s) => doc[key] = toml_edit::value(s),
         ConfigValue::Bool(b) => doc[key] = toml_edit::value(b),
         ConfigValue::Float(f) => doc[key] = toml_edit::value(f),
+        ConfigValue::Int(i) => doc[key] = toml_edit::value(i),
     }
     write_config_doc(&path, &doc)?;
     Ok(path)
