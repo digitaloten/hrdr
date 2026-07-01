@@ -207,9 +207,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `/resume <id or name>` restores a saved conversation — rebuilding the GUI
   transcript from the message history (user/assistant text + each tool call
   paired with its result) and pushing the messages + model back into the agent.
-  TUI-shared logic continues to move into the shared `hrdr-app` crate as GUI
-  features land. Excluded from CI for now (floem's large X11/Wayland dep tree +
-  Linux system libs — wiring it in is a follow-up).
+  **Turn interruption**: the Send button becomes **Stop** while a turn runs, and
+  Esc (or Stop) aborts the in-flight task — dropping its future releases the
+  agent lock, late buffered events are discarded, and the next turn repairs any
+  dangling tool calls. TUI-shared logic continues to move into the shared
+  `hrdr-app` crate as GUI features land. Excluded from CI for now (floem's large
+  X11/Wayland dep tree + Linux system libs — wiring it in is a follow-up).
 - Weekly `cargo-deny` scan (advisories / licenses / bans / sources) via a
   scheduled `cron.yml` workflow (Monday 06:00 UTC, matching hjkl), plus a
   `deny.toml` config. Two syntect-transitive unmaintained advisories are ignored

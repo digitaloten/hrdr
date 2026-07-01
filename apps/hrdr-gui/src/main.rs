@@ -215,6 +215,9 @@ fn app_view(
     // served (X11 requires the owning process to stay alive). `None` if
     // unavailable. `Rc<RefCell<…>>` since the UI thread is single-threaded.
     let clipboard = Rc::new(RefCell::new(hjkl_clipboard::Clipboard::new().ok()));
+    // Handle to the in-flight turn task; `abort()` cancels it (Esc / Stop).
+    let turn_handle: Rc<RefCell<Option<tokio::task::JoinHandle<()>>>> =
+        Rc::new(RefCell::new(None));
     // Submitted-input history (shared load/persist), for Up/Down recall.
     let history: RwSignal<Vec<String>> = create_rw_signal(hrdr_app::load_history());
     // Position while browsing history (None = editing a fresh draft); the draft
@@ -228,6 +231,8 @@ fn app_view(
     create_effect(move |_| {
         let Some(msg) = events.get() else { return };
         match msg {
+            // Ignore events buffered before a cancel (the task was aborted).
+            UiMsg::Event(_) if !running.get_untracked() => {}
             UiMsg::Event(ev) => {
                 // First streamed token → record time-to-first-token.
                 if ttft.get_untracked().is_none()
@@ -248,6 +253,7 @@ fn app_view(
         }
     });
 
+    let th_for_send = turn_handle.clone();
     let send = move || {
         let text = input.get();
         if text.trim().is_empty() || running.get() {
@@ -296,7 +302,7 @@ fn app_view(
 
         let agent = agent.clone();
         let tx = tx.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let tx_ev = tx.clone();
             let result = agent
                 .lock()
@@ -307,8 +313,27 @@ fn app_view(
                 .await;
             let _ = tx.send(UiMsg::Done(result.err().map(|e| e.to_string())));
         });
+        *th_for_send.borrow_mut() = Some(handle);
     };
+
+    // Cancel the in-flight turn: abort the task (dropping its future releases
+    // the agent lock; the next turn repairs any dangling tool calls) and mark
+    // the turn done. Late buffered events are dropped via the `running` guard.
+    let cancel = move || {
+        if !running.get_untracked() {
+            return;
+        }
+        if let Some(h) = turn_handle.borrow_mut().take() {
+            h.abort();
+        }
+        running.set(false);
+        system(transcript, next_id, "[cancelled]");
+    };
+
     let send_enter = send.clone();
+    let send_btn = send.clone();
+    let cancel_esc = cancel.clone();
+    let cancel_btn = cancel.clone();
 
     let transcript_view = scroll(
         dyn_stack(
@@ -338,9 +363,26 @@ fn app_view(
             |m| m.is_empty(),
             move |_| history_next(history, input, hist_pos, hist_draft),
         )
+        // Esc cancels the in-flight turn (otherwise unused in the single-line input).
+        .on_key_down(
+            Key::Named(NamedKey::Escape),
+            |_| true,
+            move |_| cancel_esc(),
+        )
         .style(|s| s.flex_grow(1.0).padding(8.0));
 
-    let input_row = h_stack((input_box, button("Send").on_click_stop(move |_| send())))
+    // One button: "Stop" (cancel) while a turn runs, "Send" otherwise.
+    let action_button = button(label(move || {
+        if running.get() { "Stop" } else { "Send" }
+    }))
+    .on_click_stop(move |_| {
+        if running.get_untracked() {
+            cancel_btn();
+        } else {
+            send_btn();
+        }
+    });
+    let input_row = h_stack((input_box, action_button))
         .style(|s| s.width_full().gap(8.0).padding(10.0).items_center());
 
     // Completion list shown above the input: slash commands while a `/…` is being
