@@ -68,6 +68,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Internal: the TUI `App` is now render- and terminal-I/O-agnostic — a first
+  step toward a GUI frontend sharing the same core. The ratatui event loop +
+  terminal ownership moved out of `impl App` into a new `tui` driver module;
+  `App`'s only ratatui type (`Rect` for the follow-button hit-box) became a
+  plain `HitRect`. `App` is now a drivable state machine (input in, view-state
+  out); its sole remaining UI-lib dependency is `crossterm`'s
+  `KeyEvent`/`MouseEvent` as input DTOs. No behavior change.
+
 - CI now mirrors the kryptic-sh canonical layout (referenced from hjkl): `fmt`,
   `clippy` (3 OSes), `cargo-machete` (unused-deps lint), `test` (nextest +
   doctests on 3 OSes), and a cross-platform release `build` job. No release/

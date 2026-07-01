@@ -357,7 +357,12 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
                 .bg(app.theme.warn)
                 .add_modifier(Modifier::BOLD),
         );
-        app.follow_button = Some(rect);
+        app.follow_button = Some(crate::app::HitRect {
+            x: rect.x,
+            y: rect.y,
+            w: rect.width,
+            h: rect.height,
+        });
     } else {
         app.follow_button = None;
     }

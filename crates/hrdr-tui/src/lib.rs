@@ -9,6 +9,7 @@
 
 mod app;
 mod theme;
+mod tui;
 mod ui;
 
 use std::io::{Stdout, stdout};
@@ -97,6 +98,6 @@ pub async fn run(config: AgentConfig) -> Result<()> {
     let mut terminal: Tui = Terminal::new(backend)?;
 
     let mut app = App::new(config)?;
-    app.run(&mut terminal).await?;
+    tui::run_loop(&mut app, &mut terminal).await?;
     Ok(())
 }

@@ -22,7 +22,7 @@ pub(super) fn resolve_under(base: &Path, path: &str) -> PathBuf {
 /// channel whenever it changes. Returns `None` if a watcher can't be created
 /// (the caller falls back to mtime polling). The watcher must be kept alive for
 /// the watch to stay active.
-pub(super) fn setup_config_watcher()
+pub(crate) fn setup_config_watcher()
 -> Option<(notify::RecommendedWatcher, mpsc::UnboundedReceiver<()>)> {
     use notify::{RecursiveMode, Watcher};
     let path = hrdr_agent::config_file_path()?;
@@ -334,7 +334,7 @@ pub(super) fn is_quit_command(s: &str) -> bool {
 }
 /// Run `$VISUAL`/`$EDITOR` (falling back to `vi`) on `path`, inheriting stdio.
 /// The command string may carry args (e.g. `code -w`), split on whitespace.
-pub(super) fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
+pub(crate) fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".to_string());

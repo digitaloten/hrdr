@@ -2,27 +2,22 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use anyhow::Result;
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use futures_util::StreamExt;
 use hjkl_clipboard::Clipboard;
 use hrdr_agent::{Agent, AgentConfig, AgentEvent, Todo};
 use hrdr_editor::{EditorEngine, PlainEngine, VimEngine};
-use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 /// Rows scrolled per mouse-wheel notch.
 const MOUSE_SCROLL_LINES: usize = 3;
 
-use crate::Tui;
 use crate::theme::Theme;
-use crate::ui;
 
 mod commands;
 mod completion;
@@ -31,11 +26,13 @@ mod util;
 
 use completion::CompletionKind;
 pub(crate) use completion::Completions;
+// Re-exported so the `tui` driver module (which owns the event loop + terminal)
+// can reach these terminal-facing helpers.
 use util::{
     MAX_HISTORY, age_completed_todos, current_config_mtime, display_dir, git_branch,
-    is_quit_command, load_history, persist_history, run_editor, setup_config_watcher,
-    timestamp_now,
+    is_quit_command, load_history, persist_history, timestamp_now,
 };
+pub(crate) use util::{run_editor, setup_config_watcher};
 
 /// Per-message timestamp display style.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -83,14 +80,32 @@ impl StatusBarMode {
     }
 }
 
-/// What a key press asks the run loop to do (for actions needing the terminal).
-enum Action {
+/// What a key press asks the driver to do (for actions needing the terminal).
+/// Returned by [`App::on_key`] so the render/terminal layer stays outside `App`.
+pub(crate) enum Action {
     None,
     OpenEditor,
     /// Open a specific file in `$EDITOR` (from `/edit <file>`).
     OpenFile(std::path::PathBuf),
     /// Force a full clear + repaint (Ctrl+L), to fix terminal corruption.
     Redraw,
+}
+
+/// A render-agnostic clickable rectangle (screen cells), for mouse hit-testing
+/// without depending on the renderer's geometry types.
+#[derive(Clone, Copy)]
+pub(crate) struct HitRect {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+impl HitRect {
+    /// Whether the cell at `(col, row)` is inside this rectangle.
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        col >= self.x && col < self.x + self.w && row >= self.y && row < self.y + self.h
+    }
 }
 
 /// One rendered item in the transcript.
@@ -116,7 +131,7 @@ pub(crate) enum Entry {
 }
 
 /// Messages from the background agent task back to the UI loop.
-enum TurnMsg {
+pub(crate) enum TurnMsg {
     Event(AgentEvent),
     /// Turn finished; `Some` carries an error string.
     Done(Option<String>),
@@ -227,7 +242,7 @@ pub(crate) struct App {
     pub(crate) queue: VecDeque<String>,
     /// Screen rect of the "follow output" button, set during draw while scrolled
     /// up so mouse clicks can hit-test against it. `None` when following.
-    pub(crate) follow_button: Option<Rect>,
+    pub(crate) follow_button: Option<HitRect>,
     /// Set after one idle Ctrl+C; a second consecutive Ctrl+C quits. Any other
     /// key (or a mouse action) disarms it.
     pub(crate) quit_armed: bool,
@@ -243,8 +258,8 @@ pub(crate) struct App {
     /// `(prompt_tokens, completion_tokens)` from the latest model call.
     pub(crate) last_usage: Option<(u32, u32)>,
     tx: mpsc::UnboundedSender<TurnMsg>,
-    rx: Option<mpsc::UnboundedReceiver<TurnMsg>>,
-    should_quit: bool,
+    pub(crate) rx: Option<mpsc::UnboundedReceiver<TurnMsg>>,
+    pub(crate) should_quit: bool,
 }
 
 impl App {
@@ -372,7 +387,7 @@ impl App {
     /// Probe the endpoint (list its models) on a background task and post a
     /// warning if it's unreachable or doesn't advertise the configured model.
     /// Stays silent on success so it doesn't clutter the transcript.
-    fn spawn_health_check(&self) {
+    pub(crate) fn spawn_health_check(&self) {
         let Some(client) = self.with_agent(|a| a.client()) else {
             return;
         };
@@ -406,64 +421,7 @@ impl App {
         });
     }
 
-    pub(crate) async fn run(&mut self, terminal: &mut Tui) -> Result<()> {
-        // Probe the endpoint in the background and warn if it's unreachable or
-        // doesn't have the configured model — surfaced before the first turn.
-        self.spawn_health_check();
-        let mut events = EventStream::new();
-        let mut rx = self.rx.take().expect("run called once");
-        // Periodic wake so the inference spinner animates between tokens.
-        let mut ticker = tokio::time::interval(Duration::from_millis(120));
-        // OS-level config watch (inotify/FSEvents/…); kept alive for the loop.
-        // Falls back to mtime polling on the ticker if a watcher can't be made.
-        let (_config_watcher, mut config_rx) = match setup_config_watcher() {
-            Some((w, rx)) => (Some(w), Some(rx)),
-            None => (None, None),
-        };
-        let watch_active = config_rx.is_some();
-
-        loop {
-            terminal.draw(|f| ui::draw(f, self))?;
-            if self.should_quit {
-                break;
-            }
-
-            tokio::select! {
-                maybe_ev = events.next() => match maybe_ev {
-                    Some(Ok(Event::Key(key))) => match self.on_key(key) {
-                        Action::OpenEditor => self.open_in_editor(terminal)?,
-                        Action::OpenFile(path) => self.open_file_in_editor(terminal, &path)?,
-                        Action::Redraw => terminal.clear()?,
-                        Action::None => {}
-                    },
-                    Some(Ok(Event::Mouse(m))) => self.on_mouse(m),
-                    Some(Ok(Event::Paste(text))) => {
-                        self.quit_armed = false;
-                        self.editor.paste(&text);
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) | None => break,
-                },
-                Some(msg) = rx.recv() => self.on_turn_msg(msg),
-                // OS notified the config file changed → reload (mtime-guarded).
-                _ = async {
-                    match config_rx.as_mut() {
-                        Some(rx) => { rx.recv().await; }
-                        None => std::future::pending::<()>().await,
-                    }
-                } => self.maybe_reload_config(),
-                _ = ticker.tick() => {
-                    // Fallback polling only when no OS watcher is active.
-                    if !watch_active {
-                        self.maybe_reload_config();
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn on_key(&mut self, key: KeyEvent) -> Action {
+    pub(crate) fn on_key(&mut self, key: KeyEvent) -> Action {
         if key.kind == KeyEventKind::Release {
             return Action::None;
         }
@@ -645,7 +603,7 @@ impl App {
 
     /// Mouse: wheel scrolls the transcript; a left click on the follow button
     /// resumes following the newest output.
-    fn on_mouse(&mut self, m: MouseEvent) {
+    pub(crate) fn on_mouse(&mut self, m: MouseEvent) {
         self.quit_armed = false;
         match m.kind {
             MouseEventKind::ScrollUp => {
@@ -656,7 +614,7 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(rect) = self.follow_button
-                    && rect.contains((m.column, m.row).into())
+                    && rect.contains(m.column, m.row)
                 {
                     self.scroll_offset = 0;
                 }
@@ -665,42 +623,7 @@ impl App {
         }
     }
 
-    /// Hand the input buffer to `$EDITOR`/`$VISUAL`, then read it back.
-    fn open_in_editor(&mut self, terminal: &mut Tui) -> Result<()> {
-        let path = std::env::temp_dir().join(format!("hrdr-input-{}.md", std::process::id()));
-        std::fs::write(&path, self.editor.content())?;
-
-        crate::suspend_terminal(terminal)?;
-        let status = run_editor(&path);
-        crate::resume_terminal(terminal)?;
-        terminal.clear()?;
-
-        if status.is_ok()
-            && let Ok(text) = std::fs::read_to_string(&path)
-        {
-            // Editors append a trailing newline; drop one so it doesn't submit blank.
-            let text = text.strip_suffix('\n').unwrap_or(&text);
-            self.editor.set_content(text);
-        }
-        let _ = std::fs::remove_file(&path);
-        Ok(())
-    }
-
-    /// Open an arbitrary file in `$EDITOR` (from `/edit <file>`), suspending the
-    /// TUI for the duration. The file may not exist yet — the editor creates it.
-    fn open_file_in_editor(&mut self, terminal: &mut Tui, path: &std::path::Path) -> Result<()> {
-        crate::suspend_terminal(terminal)?;
-        let status = run_editor(path);
-        crate::resume_terminal(terminal)?;
-        terminal.clear()?;
-        match status {
-            Ok(_) => self.system(format!("edited {}", path.display())),
-            Err(e) => self.system(format!("editor failed: {e}")),
-        }
-        Ok(())
-    }
-
-    fn system(&mut self, msg: impl Into<String>) {
+    pub(crate) fn system(&mut self, msg: impl Into<String>) {
         self.push_entry(Entry::System(msg.into()));
     }
 
@@ -813,7 +736,7 @@ impl App {
 
     /// Hot-reload: poll the config file's mtime and apply changes when it's
     /// edited (manually or by another session).
-    fn maybe_reload_config(&mut self) {
+    pub(crate) fn maybe_reload_config(&mut self) {
         let mtime = current_config_mtime();
         if mtime != self.config_mtime {
             self.apply_config_reload(false);
@@ -1057,7 +980,7 @@ impl App {
         out
     }
 
-    fn on_turn_msg(&mut self, msg: TurnMsg) {
+    pub(crate) fn on_turn_msg(&mut self, msg: TurnMsg) {
         match msg {
             TurnMsg::Event(ev) => {
                 // Ignore buffered events after cancellation.
