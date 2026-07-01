@@ -1,0 +1,18 @@
+[package]
+name = "hrdr-gui"
+description = "hrdr GUI — a floem desktop frontend for the agentic coding harness."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "hrdr-gui"
+path = "src/main.rs"
+
+[dependencies]
+hrdr-agent.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+floem = { version = "0.2.0", features = ["tokio"] }

@@ -46,8 +46,12 @@ jobs:
           cache: false
       - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
+      # hrdr-gui (floem) is excluded for now — its large X11/Wayland/font
+      # dependency tree slows CI and needs Linux system libs. Wiring the GUI
+      # into CI (with those deps, like pikr/buffr) is a follow-up.
       - run:
-          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo clippy --workspace --exclude hrdr-gui --all-targets
+          --all-features -- -D warnings
 
   machete:
     name: cargo-machete (unused deps)
@@ -75,8 +79,10 @@ jobs:
       - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --workspace --all-features --no-fail-fast
-      - run: cargo test --workspace --doc --all-features
+      - run:
+          cargo nextest run --workspace --exclude hrdr-gui --all-features
+          --no-fail-fast
+      - run: cargo test --workspace --exclude hrdr-gui --doc --all-features
 
   build:
     name: build ${{ matrix.os }}
@@ -95,5 +101,6 @@ jobs:
       - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
       # Release build catches release-only compile issues the debug test build
-      # can miss (e.g. a platform-specific cfg leak in the binary).
-      - run: cargo build --workspace --all-features --release
+      # can miss (e.g. a platform-specific cfg leak in the binary). hrdr-gui
+      # (floem) excluded for now — see the clippy job note.
+      - run: cargo build --workspace --exclude hrdr-gui --all-features --release

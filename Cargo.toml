@@ -7,6 +7,7 @@ members = [
     "crates/hrdr-editor",
     "crates/hrdr-tui",
     "apps/hrdr",
+    "apps/hrdr-gui",
 ]
 
 [workspace.package]
