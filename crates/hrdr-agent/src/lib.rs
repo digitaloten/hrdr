@@ -788,12 +788,23 @@ impl Agent {
                 }
             }
 
-            if let Some(u) = &acc.usage {
-                on_event(AgentEvent::Usage {
-                    prompt_tokens: u.prompt_tokens,
-                    completion_tokens: u.completion_tokens,
-                });
-            }
+            // Emit usage for the status bar + auto-compaction. Prefer the
+            // server's reported counts; when it doesn't send any (e.g. a server
+            // that ignores `stream_options.include_usage`), fall back to a rough
+            // estimate so the context bar and compaction still work — an estimate
+            // beats a stale/zero reading, and the overflow-retry path covers any
+            // under-estimate.
+            let (prompt_tokens, completion_tokens) = match &acc.usage {
+                Some(u) => (u.prompt_tokens, u.completion_tokens),
+                None => (
+                    estimate_tokens_in_messages(&self.messages),
+                    estimate_tokens(&acc.content),
+                ),
+            };
+            on_event(AgentEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+            });
 
             let assistant = acc.into_message();
             let tool_calls = assistant.tool_calls.clone().unwrap_or_default();
@@ -1003,6 +1014,35 @@ fn repair_dangling_tool_calls(messages: &mut Vec<ChatMessage>) {
     }
 }
 
+/// Very rough token estimate (~4 characters per token) for `text`. Used only as
+/// a fallback when the server reports no usage — good enough for the context bar
+/// + auto-compaction, not for billing.
+fn estimate_tokens(text: &str) -> u32 {
+    (text.len() / 4) as u32
+}
+
+/// Estimate the prompt tokens of a whole request: each message's content and any
+/// tool-call names/arguments, plus a small per-message overhead for the role and
+/// structural tokens the chat template adds.
+fn estimate_tokens_in_messages(messages: &[ChatMessage]) -> u32 {
+    messages
+        .iter()
+        .map(|m| {
+            let content = m.content.as_deref().map(str::len).unwrap_or(0);
+            let calls = m
+                .tool_calls
+                .as_ref()
+                .map(|tcs| {
+                    tcs.iter()
+                        .map(|c| c.function.name.len() + c.function.arguments.len())
+                        .sum::<usize>()
+                })
+                .unwrap_or(0);
+            (content + calls) as u32 / 4 + 4
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1070,6 +1110,19 @@ mod tests {
         let mut msgs = vec![ChatMessage::user("hi"), ChatMessage::assistant("hello")];
         repair_dangling_tool_calls(&mut msgs);
         assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn token_estimate_scales_with_content() {
+        use super::{estimate_tokens, estimate_tokens_in_messages};
+        // ~4 chars/token.
+        assert_eq!(estimate_tokens(&"x".repeat(40)), 10);
+        assert_eq!(estimate_tokens(""), 0);
+        // Per-message overhead + content; more content ⇒ strictly more tokens.
+        let small = estimate_tokens_in_messages(&[ChatMessage::user("hi")]);
+        let big = estimate_tokens_in_messages(&[ChatMessage::user("word ".repeat(100))]);
+        assert!(big > small);
+        assert!(small >= 4, "per-message overhead applies");
     }
 
     #[test]

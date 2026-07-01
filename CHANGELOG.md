@@ -54,6 +54,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The context bar and auto-compaction keep working when the server reports no
+  token usage. hrdr asks for usage (`stream_options.include_usage`), but servers
+  that ignore it left the "used" count stale at 0. Turns now fall back to a
+  rough `~4 chars/token` estimate of the prompt + completion when the server
+  sends no usage chunk, so the status bar and the auto-compact threshold still
+  track context growth (the overflow-retry path still covers any
+  under-estimate).
+
 - The managed local backend is now **infr-first**. If
   [`infr`](https://github.com/kryptic-sh/infr) is on `PATH`, hrdr spawns
   `infr serve <model> --addr <ip:port>` (native `tools`/`tool_calls`, SSE, GGUF
