@@ -2151,6 +2151,7 @@ name = "hrdr-app"
 version = "0.0.1"
 dependencies = [
  "chrono",
+ "hjkl-xdg",
  "hrdr-agent",
  "ignore",
  "serde_json",
@@ -2230,7 +2231,6 @@ dependencies = [
  "hjkl-markdown-tui",
  "hjkl-theme",
  "hjkl-theme-tui",
- "hjkl-xdg",
  "hrdr-agent",
  "hrdr-app",
  "hrdr-editor",

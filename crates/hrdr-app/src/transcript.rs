@@ -61,7 +61,10 @@ pub fn find_hits(entries: &[Entry], query: &str) -> Vec<usize> {
 
 /// Number of user/assistant messages in the transcript.
 pub fn message_count(entries: &[Entry]) -> usize {
-    entries.iter().filter(|e| e.message_text().is_some()).count()
+    entries
+        .iter()
+        .filter(|e| e.message_text().is_some())
+        .count()
 }
 
 /// The text of the Nth (1-based) user/assistant message, if any.
@@ -153,7 +156,10 @@ mod tests {
     fn message_count_and_nth_skip_non_messages() {
         let e = sample();
         assert_eq!(message_count(&e), 3); // 2 user + 1 assistant
-        assert_eq!(nth_message_text(&e, 1).as_deref(), Some("Fix the parser bug"));
+        assert_eq!(
+            nth_message_text(&e, 1).as_deref(),
+            Some("Fix the parser bug")
+        );
         assert_eq!(
             nth_message_text(&e, 2).as_deref(),
             Some("Done — it was an off-by-one.")
@@ -190,7 +196,9 @@ mod tests {
         let e = sample();
         let base = Local::now();
         // Parallel timestamps; only the message entries' times surface.
-        let times: Vec<_> = (0..e.len() as i64).map(|i| base + Duration::seconds(i)).collect();
+        let times: Vec<_> = (0..e.len() as i64)
+            .map(|i| base + Duration::seconds(i))
+            .collect();
         let json = transcript_to_json(&e, &times);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let arr = v.as_array().unwrap();

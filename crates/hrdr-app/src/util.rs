@@ -3,8 +3,38 @@
 //! and small argument parsers (`/goto` durations, `/copy` message ranges,
 //! fenced-code extraction). No UI, no rendering — pure logic + filesystem.
 
-use hrdr_agent::{Message, MessageRole};
+use hrdr_agent::{Message, MessageRole, Todo};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// Age out finished TODO items in place. Stamps each completed item with the
+/// `turn` it was first seen finished (in `stamps`, keyed by content), then drops
+/// any completed item that has been finished for `ttl` turns. Stamps for items
+/// no longer present as completed are forgotten, so a re-completed item ages
+/// from scratch. Pending / in-progress items are kept.
+pub fn age_completed_todos(
+    todos: &mut Vec<Todo>,
+    stamps: &mut HashMap<String, u64>,
+    turn: u64,
+    ttl: u64,
+) {
+    for t in todos.iter() {
+        if t.status == "completed" {
+            stamps.entry(t.content.clone()).or_insert(turn);
+        }
+    }
+    todos.retain(|t| {
+        t.status != "completed"
+            || stamps
+                .get(&t.content)
+                .is_none_or(|&done| turn.saturating_sub(done) < ttl)
+    });
+    stamps.retain(|content, _| {
+        todos
+            .iter()
+            .any(|t| t.status == "completed" && &t.content == content)
+    });
+}
 
 /// A short session name derived from the first user message (first line, trimmed,
 /// capped at 60 chars). Falls back to `"untitled"` when there's no usable text.
@@ -280,6 +310,65 @@ fn walk_files_fallback(root: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn todo(content: &str, status: &str) -> Todo {
+        Todo {
+            content: content.to_string(),
+            status: status.to_string(),
+        }
+    }
+
+    #[test]
+    fn completed_todos_age_out_after_ttl() {
+        const TTL: u64 = 5;
+        let mut stamps = HashMap::new();
+        let mut todos = vec![todo("a", "completed"), todo("b", "in_progress")];
+        // Turn it completes and the next TTL-1 turns: still shown.
+        for turn in 0..TTL {
+            age_completed_todos(&mut todos, &mut stamps, turn, TTL);
+            assert!(
+                todos.iter().any(|t| t.content == "a"),
+                "completed item should survive turn {turn}"
+            );
+        }
+        // TTL turns after completion: pruned. The in-progress item stays.
+        age_completed_todos(&mut todos, &mut stamps, TTL, TTL);
+        assert!(!todos.iter().any(|t| t.content == "a"));
+        assert!(todos.iter().any(|t| t.content == "b"));
+        assert!(stamps.is_empty(), "stamp forgotten once the item is gone");
+    }
+
+    #[test]
+    fn pending_todos_are_never_pruned() {
+        const TTL: u64 = 5;
+        let mut stamps = HashMap::new();
+        let mut todos = vec![todo("keep", "pending")];
+        for turn in 0..(TTL * 3) {
+            age_completed_todos(&mut todos, &mut stamps, turn, TTL);
+        }
+        assert_eq!(todos.len(), 1);
+        assert!(stamps.is_empty());
+    }
+
+    #[test]
+    fn recompleted_item_ages_from_scratch() {
+        const TTL: u64 = 5;
+        let mut stamps = HashMap::new();
+        // Completed at turn 0.
+        let mut todos = vec![todo("x", "completed")];
+        age_completed_todos(&mut todos, &mut stamps, 0, TTL);
+        // Model flips it back to in_progress at turn 2 → stamp forgotten.
+        todos[0].status = "in_progress".to_string();
+        age_completed_todos(&mut todos, &mut stamps, 2, TTL);
+        assert!(stamps.is_empty());
+        // Re-completed at turn 3 → stamped at 3, so it survives through turn 7.
+        todos[0].status = "completed".to_string();
+        age_completed_todos(&mut todos, &mut stamps, 3, TTL);
+        age_completed_todos(&mut todos, &mut stamps, 3 + TTL - 1, TTL);
+        assert!(todos.iter().any(|t| t.content == "x"));
+        age_completed_todos(&mut todos, &mut stamps, 3 + TTL, TTL);
+        assert!(!todos.iter().any(|t| t.content == "x"));
+    }
 
     #[test]
     fn expand_mentions_attaches_readable_files_once() {

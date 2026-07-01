@@ -26,11 +26,11 @@ mod util;
 
 use completion::CompletionKind;
 pub(crate) use completion::Completions;
-use hrdr_app::{display_dir, git_branch, is_quit_command};
-use util::{
-    MAX_HISTORY, age_completed_todos, current_config_mtime, load_history, persist_history,
-    timestamp_now,
+use hrdr_app::{
+    MAX_HISTORY, age_completed_todos, display_dir, git_branch, is_quit_command, load_history,
+    persist_history,
 };
+use util::{current_config_mtime, timestamp_now};
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
 pub(crate) use util::{run_editor, setup_config_watcher};
@@ -1105,71 +1105,10 @@ mod e2e;
 
 #[cfg(test)]
 mod tests {
-    use super::Todo;
-    use super::util::age_completed_todos;
-    use std::collections::HashMap;
-
-    const TTL: u64 = 5;
-
-    fn todo(content: &str, status: &str) -> Todo {
-        Todo {
-            content: content.to_string(),
-            status: status.to_string(),
-        }
-    }
-
-    #[test]
-    fn completed_todos_age_out_after_ttl() {
-        let mut stamps = HashMap::new();
-        let mut todos = vec![todo("a", "completed"), todo("b", "in_progress")];
-
-        // Turn it completes and the next TTL-1 turns: still shown.
-        for turn in 0..TTL {
-            age_completed_todos(&mut todos, &mut stamps, turn, TTL);
-            assert!(
-                todos.iter().any(|t| t.content == "a"),
-                "completed item should survive turn {turn}"
-            );
-        }
-        // TTL turns after completion: pruned. The in-progress item stays.
-        age_completed_todos(&mut todos, &mut stamps, TTL, TTL);
-        assert!(!todos.iter().any(|t| t.content == "a"));
-        assert!(todos.iter().any(|t| t.content == "b"));
-        assert!(stamps.is_empty(), "stamp forgotten once the item is gone");
-    }
-
-    #[test]
-    fn pending_todos_are_never_pruned() {
-        let mut stamps = HashMap::new();
-        let mut todos = vec![todo("keep", "pending")];
-        for turn in 0..(TTL * 3) {
-            age_completed_todos(&mut todos, &mut stamps, turn, TTL);
-        }
-        assert_eq!(todos.len(), 1);
-        assert!(stamps.is_empty());
-    }
-
-    #[test]
-    fn recompleted_item_ages_from_scratch() {
-        let mut stamps = HashMap::new();
-        // Completed at turn 0.
-        let mut todos = vec![todo("x", "completed")];
-        age_completed_todos(&mut todos, &mut stamps, 0, TTL);
-        // Model flips it back to in_progress at turn 2 → stamp forgotten.
-        todos[0].status = "in_progress".to_string();
-        age_completed_todos(&mut todos, &mut stamps, 2, TTL);
-        assert!(stamps.is_empty());
-        // Re-completed at turn 3 → stamped at 3, so it survives through turn 7.
-        todos[0].status = "completed".to_string();
-        age_completed_todos(&mut todos, &mut stamps, 3, TTL);
-        age_completed_todos(&mut todos, &mut stamps, 3 + TTL - 1, TTL);
-        assert!(todos.iter().any(|t| t.content == "x"));
-        age_completed_todos(&mut todos, &mut stamps, 3 + TTL, TTL);
-        assert!(!todos.iter().any(|t| t.content == "x"));
-    }
-
+    /// The TUI's TODO-panel default lifetime must track the agent's config
+    /// default (the aging logic itself is tested in `hrdr-app`).
     #[test]
     fn ttl_matches_config_default() {
-        assert_eq!(TTL, hrdr_agent::DEFAULT_TODO_TTL);
+        assert_eq!(5, hrdr_agent::DEFAULT_TODO_TTL);
     }
 }

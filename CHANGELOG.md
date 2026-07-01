@@ -158,9 +158,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`/copy all`, `/export`) — now live in `hrdr-app` (which grew `serde_json` for
   the JSON export; the TUI dropped it). The TUI re-exports `Entry` and delegates
   those methods, so a GUI transcript can reuse the exact same search/export
-  semantics. The streaming reducer stays per-frontend for now — the TUI is
-  immediate-mode with plain strings, the GUI retained-mode with per-field
-  reactive signals.
+  semantics. Also lifted: `@file` mention expansion (`expand_mentions`, so both
+  frontends attach file contents identically), the input-history persistence
+  (`load_history`/`persist_history`/`MAX_HISTORY` over
+  `$XDG_DATA_HOME/hrdr/history`, which moved `hjkl-xdg` to `hrdr-app`), and the
+  TODO-panel aging (`age_completed_todos`, with its tests). The streaming
+  reducer stays per-frontend for now — the TUI is immediate-mode with plain
+  strings, the GUI retained-mode with per-field reactive signals.
 - **`hrdr-gui` — a floem desktop frontend (proof-of-concept).** A new
   `apps/hrdr-gui` binary drives the same UI-agnostic core as the TUI
   (`hrdr_agent::Agent`): a chat window that streams a turn's `AgentEvent`s into
