@@ -9,10 +9,12 @@
 mod completion;
 mod config;
 mod format;
+mod transcript;
 mod util;
 pub use completion::*;
 pub use config::*;
 pub use format::*;
+pub use transcript::*;
 pub use util::*;
 
 /// The slash commands, as `(name, one-line description)`. Frontends render this

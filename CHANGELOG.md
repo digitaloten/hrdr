@@ -150,10 +150,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (first-user-line session titles), and the config-value enums
   `TimestampStyle`/`StatusBarMode` (now with an `as_config_str` for round-trip
   persistence). All the TUI-only copies are gone; `hrdr-app` grew `chrono` for
-  the relative-time formatter. More representation-independent logic will move
-  in as the frontends converge (the transcript reducer stays per-frontend for
-  now — the TUI is immediate-mode with plain strings, the GUI retained-mode with
-  per-field reactive signals).
+  the relative-time formatter. Then the transcript model itself was lifted: the
+  `Entry` enum (one rendered conversation item) and the
+  representation-independent queries over `&[Entry]` — `find_hits` (`/find`),
+  `message_count`, `nth_message_text`, `first_message_since` (`/goto <time>`),
+  and the export builders `transcript_to_text`/`transcript_to_json`
+  (`/copy all`, `/export`) — now live in `hrdr-app` (which grew `serde_json` for
+  the JSON export; the TUI dropped it). The TUI re-exports `Entry` and delegates
+  those methods, so a GUI transcript can reuse the exact same search/export
+  semantics. The streaming reducer stays per-frontend for now — the TUI is
+  immediate-mode with plain strings, the GUI retained-mode with per-field
+  reactive signals.
 - **`hrdr-gui` — a floem desktop frontend (proof-of-concept).** A new
   `apps/hrdr-gui` binary drives the same UI-agnostic core as the TUI
   (`hrdr_agent::Agent`): a chat window that streams a turn's `AgentEvent`s into

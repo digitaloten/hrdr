@@ -25,7 +25,6 @@ ratatui.workspace = true
 hjkl-icons.workspace = true
 hjkl-xdg.workspace = true
 chrono.workspace = true
-serde_json.workspace = true
 syntect.workspace = true
 notify.workspace = true
 

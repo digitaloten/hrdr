@@ -504,18 +504,7 @@ impl super::App {
     }
     /// Message numbers (1-based) whose text contains `query` (case-insensitive).
     fn find_hits(&self, query: &str) -> Vec<usize> {
-        let needle = query.to_ascii_lowercase();
-        let mut num = 0;
-        let mut hits = Vec::new();
-        for e in &self.transcript {
-            if let Entry::User(s) | Entry::Assistant(s) = e {
-                num += 1;
-                if s.to_ascii_lowercase().contains(&needle) {
-                    hits.push(num);
-                }
-            }
-        }
-        hits
+        hrdr_app::find_hits(&self.transcript, query)
     }
     /// Cycle to the next (`forward`) or previous match of the active query,
     /// wrapping around; used by `/find`, `/next`, and `/prev`.
@@ -551,36 +540,15 @@ impl super::App {
     }
     /// Number of user/assistant messages in the transcript.
     fn display_message_count(&self) -> usize {
-        self.transcript
-            .iter()
-            .filter(|e| matches!(e, Entry::User(_) | Entry::Assistant(_)))
-            .count()
+        hrdr_app::message_count(&self.transcript)
     }
     /// The number of the first user/assistant message sent at/after `cutoff`.
     fn first_message_since(&self, cutoff: chrono::DateTime<chrono::Local>) -> Option<usize> {
-        let mut num = 0;
-        for (i, e) in self.transcript.iter().enumerate() {
-            if matches!(e, Entry::User(_) | Entry::Assistant(_)) {
-                num += 1;
-                if self.entry_times.get(i).is_some_and(|t| *t >= cutoff) {
-                    return Some(num);
-                }
-            }
-        }
-        None
+        hrdr_app::first_message_since(&self.transcript, &self.entry_times, cutoff)
     }
     /// The text of the Nth (1-based) user/assistant message in the transcript.
     fn nth_message_text(&self, n: usize) -> Option<String> {
-        if n == 0 {
-            return None;
-        }
-        self.transcript
-            .iter()
-            .filter_map(|e| match e {
-                Entry::User(s) | Entry::Assistant(s) => Some(s.clone()),
-                _ => None,
-            })
-            .nth(n - 1)
+        hrdr_app::nth_message_text(&self.transcript, n)
     }
     /// `/statusbar [none|truncate|wrap]` — set the status-bar mode (no arg
     /// cycles truncate → wrap → none).
@@ -692,18 +660,7 @@ impl super::App {
     }
     /// A plain-text rendering of the conversation for `/copy all`.
     fn transcript_text(&self) -> String {
-        let mut out = String::new();
-        for e in &self.transcript {
-            match e {
-                Entry::User(s) => out.push_str(&format!("## User\n{s}\n\n")),
-                Entry::Assistant(s) => out.push_str(&format!("## Assistant\n{s}\n\n")),
-                Entry::System(s) => out.push_str(&format!("[{s}]\n\n")),
-                Entry::Diff(s) => out.push_str(&format!("{s}\n\n")),
-                Entry::Tool { name, .. } => out.push_str(&format!("[tool: {name}]\n\n")),
-                Entry::Reasoning(_) | Entry::Stats(_) => {}
-            }
-        }
-        out.trim_end().to_string()
+        hrdr_app::transcript_to_text(&self.transcript)
     }
     /// `/paste` — insert the system clipboard into the input. If the clipboard
     /// holds a path to an existing file, attach it as an `@mention` instead.
@@ -777,28 +734,7 @@ impl super::App {
     /// The conversation as a JSON array of `{n, role, time, content}` objects
     /// (user/assistant messages only).
     fn transcript_json(&self) -> String {
-        let mut arr = Vec::new();
-        let mut num = 0;
-        for (i, e) in self.transcript.iter().enumerate() {
-            let (role, content) = match e {
-                Entry::User(s) => ("user", s),
-                Entry::Assistant(s) => ("assistant", s),
-                _ => continue,
-            };
-            num += 1;
-            let time = self
-                .entry_times
-                .get(i)
-                .map(|t| t.to_rfc3339())
-                .unwrap_or_default();
-            arr.push(serde_json::json!({
-                "n": num,
-                "role": role,
-                "time": time,
-                "content": content,
-            }));
-        }
-        serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string())
+        hrdr_app::transcript_to_json(&self.transcript, &self.entry_times)
     }
     /// `/revert` — undo the most recent turn's file edits (restore pre-images).
     fn revert_cmd(&mut self) {

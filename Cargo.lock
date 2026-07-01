@@ -2153,6 +2153,7 @@ dependencies = [
  "chrono",
  "hrdr-agent",
  "ignore",
+ "serde_json",
  "tempfile",
 ]
 
@@ -2236,7 +2237,6 @@ dependencies = [
  "hrdr-tools",
  "notify",
  "ratatui",
- "serde_json",
  "syntect",
  "tempfile",
  "tokio",

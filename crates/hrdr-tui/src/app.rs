@@ -67,27 +67,9 @@ impl HitRect {
     }
 }
 
-/// One rendered item in the transcript.
-pub(crate) enum Entry {
-    User(String),
-    Assistant(String),
-    Reasoning(String),
-    Tool {
-        id: String,
-        name: String,
-        args: String,
-        result: String,
-        ok: bool,
-        done: bool,
-        /// Show the full result instead of a truncated preview (`/expand`).
-        expanded: bool,
-    },
-    System(String),
-    /// Final per-turn stats line, appended below the last output.
-    Stats(String),
-    /// A unified diff (e.g. `/diff`), rendered with diff coloring.
-    Diff(String),
-}
+// The transcript item model + its representation-independent queries
+// (search/count/export) live in the shared `hrdr-app` core.
+pub(crate) use hrdr_app::Entry;
 
 /// Messages from the background agent task back to the UI loop.
 pub(crate) enum TurnMsg {
