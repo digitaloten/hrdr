@@ -34,6 +34,9 @@ enum MockReply {
     /// A single tool call (`finish_reason: "tool_calls"`). The agent runs the
     /// tool then requests again, consuming the next queued reply.
     ToolCall { name: String, args: String },
+    /// Several tool calls in one turn — `(name, json_args)` each — so a turn
+    /// with parallel calls can be exercised.
+    ToolCalls(Vec<(String, String)>),
 }
 
 /// A tiny in-process HTTP server speaking just enough of the OpenAI API for the
@@ -164,16 +167,35 @@ fn sse_body(reply: &MockReply) -> String {
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
         ),
         MockReply::ToolCall { name, args } => (
-            format!(
-                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\
-                 \"id\":\"call_1\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}]}}}}]}}\n\n",
-                esc(name),
-                esc(args)
-            ),
+            tool_calls_frame(&[(name.clone(), args.clone())]),
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        ),
+        MockReply::ToolCalls(calls) => (
+            tool_calls_frame(calls),
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
         ),
     };
     format!("{role}{payload}{finish}{usage}{done}")
+}
+
+/// One SSE delta carrying a `tool_calls` array with `(name, args)` per call.
+fn tool_calls_frame(calls: &[(String, String)]) -> String {
+    let items: Vec<String> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, (name, args))| {
+            format!(
+                "{{\"index\":{i},\"id\":\"call_{i}\",\"function\":{{\"name\":\"{}\",\
+                 \"arguments\":\"{}\"}}}}",
+                esc(name),
+                esc(args)
+            )
+        })
+        .collect();
+    format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{}]}}}}]}}\n\n",
+        items.join(",")
+    )
 }
 
 /// Minimal JSON string escaping for values embedded in the canned SSE frames.
@@ -328,6 +350,80 @@ async fn tool_call_runs_the_tool_then_finishes() {
     assert!(
         screen.contains("Added the todo."),
         "final reply missing:\n{screen}"
+    );
+    assert!(!h.app.running);
+}
+
+#[tokio::test]
+async fn parallel_tool_calls_in_one_turn_all_run() {
+    // One turn requests two tools; the follow-up request ends with text.
+    let mut h = Harness::new(vec![
+        MockReply::ToolCalls(vec![
+            (
+                "todo_write".to_string(),
+                r#"{"todos":[{"content":"first task","status":"in_progress"}]}"#.to_string(),
+            ),
+            ("glob".to_string(), r#"{"pattern":"*"}"#.to_string()),
+        ]),
+        MockReply::Text("Both ran.".to_string()),
+    ])
+    .await;
+    h.submit("do two things").await;
+    let screen = h.render();
+    assert!(
+        screen.contains("todo_write"),
+        "first tool missing:\n{screen}"
+    );
+    assert!(screen.contains("glob"), "second tool missing:\n{screen}");
+    assert!(
+        screen.contains("Both ran."),
+        "final reply missing:\n{screen}"
+    );
+    assert!(!h.app.running);
+}
+
+#[tokio::test]
+async fn a_failing_tool_call_is_surfaced_but_not_fatal() {
+    // The model hallucinates a tool that doesn't exist; the turn must recover.
+    let mut h = Harness::new(vec![
+        MockReply::ToolCall {
+            name: "nonexistent_tool".to_string(),
+            args: "{}".to_string(),
+        },
+        MockReply::Text("Recovered fine.".to_string()),
+    ])
+    .await;
+    h.submit("use a bad tool").await;
+    let screen = h.render();
+    // The error is shown to the user (and was fed back to the model)…
+    assert!(
+        screen.contains("unknown tool") || screen.contains("Error"),
+        "tool error not surfaced:\n{screen}"
+    );
+    // …and the turn continued to a normal reply instead of dying.
+    assert!(
+        screen.contains("Recovered fine."),
+        "did not recover after tool error:\n{screen}"
+    );
+    assert!(!h.app.running);
+}
+
+#[tokio::test]
+async fn clear_wipes_the_transcript() {
+    let mut h = Harness::new(vec![MockReply::Text("first answer".to_string())]).await;
+    h.submit("remember this").await;
+    assert!(h.render().contains("first answer"));
+
+    // `/clear` resets to a fresh session — prior turns must be gone.
+    h.submit("/clear").await;
+    let screen = h.render();
+    assert!(
+        screen.contains("conversation cleared"),
+        "clear notice missing:\n{screen}"
+    );
+    assert!(
+        !screen.contains("first answer") && !screen.contains("remember this"),
+        "old transcript survived /clear:\n{screen}"
     );
     assert!(!h.app.running);
 }

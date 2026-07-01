@@ -299,7 +299,15 @@ impl Accumulator {
     }
 
     /// Assemble the final assistant message.
-    pub fn into_message(self) -> ChatMessage {
+    pub fn into_message(mut self) -> ChatMessage {
+        // Some servers omit tool-call ids. Synthesize a stable one per call so
+        // the assistant message and its `role:"tool"` results correlate — and so
+        // multiple calls in one turn don't collide on an empty id.
+        for (i, call) in self.calls.iter_mut().enumerate() {
+            if call.id.is_empty() {
+                call.id = format!("call_{i}");
+            }
+        }
         ChatMessage {
             role: Role::Assistant,
             content: (!self.content.is_empty()).then_some(self.content),
@@ -461,5 +469,37 @@ mod tests {
         let msg = acc.into_message();
         assert!(msg.content.is_none());
         assert!(msg.tool_calls.is_none());
+    }
+
+    #[test]
+    fn tool_calls_without_ids_get_synthesized_distinct_ids() {
+        // A server that omits `id` on its tool-call deltas.
+        let mut acc = Accumulator::new();
+        acc.push(&chunk(
+            None,
+            Some(vec![
+                ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    function: Some(FunctionDelta {
+                        name: Some("tool_a".to_string()),
+                        arguments: Some("{}".to_string()),
+                    }),
+                },
+                ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    function: Some(FunctionDelta {
+                        name: Some("tool_b".to_string()),
+                        arguments: Some("{}".to_string()),
+                    }),
+                },
+            ]),
+        ));
+        let calls = acc.into_message().tool_calls.expect("has tool calls");
+        // Synthesized, non-empty, and distinct so results can be correlated.
+        assert_eq!(calls[0].id, "call_0");
+        assert_eq!(calls[1].id, "call_1");
+        assert_ne!(calls[0].id, calls[1].id);
     }
 }

@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Tool calls whose server omits the `id` field now get stable synthesized ids
+  (`call_0`, `call_1`, …) in `Accumulator::into_message`, so the assistant
+  message and its `role:"tool"` results correlate and multiple calls in one turn
+  don't collide on an empty id (which breaks the follow-up request on stricter
+  servers).
+
 - Multi-turn conversations with reasoning models (Qwen3 via `infr`, etc.) no
   longer degenerate into repetition/gibberish on the second turn. The assistant
   history message was serializing its `reasoning_content` (the `<think>` block)
@@ -96,9 +102,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   server (`GET /v1/models` + streamed SSE `POST /v1/chat/completions`, with
   scriptable text / tool-call replies) lets tests drive a real `App` through its
   `on_key`/`on_turn_msg` seams and assert on the rendered ratatui `TestBackend`
-  buffer — no network, no live model. Covers a streamed text reply, a full
-  tool-call round-trip (`todo_write` → follow-up reply), and a locally-handled
-  slash command. Lives in `crates/hrdr-tui/src/app/e2e.rs`.
+  buffer — no network, no live model. Covers a streamed text reply, a single-
+  and multi-call tool round-trip, a failing/unknown tool call (surfaced but
+  non-fatal, turn recovers), `/clear` wiping the transcript, and a
+  locally-handled slash command. Lives in `crates/hrdr-tui/src/app/e2e.rs`.
 - Presence-aware shell tools: the `bash` tool is now only offered to the model
   when `bash` is actually on `PATH`, and a new `powershell` tool is offered when
   `pwsh`/`powershell` is available (PowerShell 7 runs on Linux/macOS too). So
