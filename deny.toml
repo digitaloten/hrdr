@@ -1,0 +1,45 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/checks/cfg.html
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "warn"
+ignore = [
+  # Both are "unmaintained" advisories (not vulnerabilities) with no safe
+  # upgrade, pulled transitively by `syntect` (code-block syntax highlighting).
+  { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained; transitive via syntect" },
+  { id = "RUSTSEC-2024-0320", reason = "yaml-rust unmaintained; transitive via syntect" },
+]
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "CC0-1.0",
+]
+exceptions = [
+  # webpki-roots bundles the Mozilla CA certificate set under the Community
+  # Data License Agreement (a permissive data license). Pulled by reqwest's
+  # rustls TLS backend.
+  { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

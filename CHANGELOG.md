@@ -123,6 +123,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Daily `cargo-deny` scan (advisories / licenses / bans / sources) via a
+  scheduled `cron.yml` workflow, plus a `deny.toml` config. Two
+  syntect-transitive unmaintained advisories are ignored (`yaml-rust`, `bincode`
+  1.x — no safe upgrade) and `webpki-roots`' CDLA data license is allowed as a
+  scoped exception.
+
 - Auto-detect the server's context window. On startup, when `context_window`
   isn't set explicitly (config/provider), hrdr probes the endpoint and uses what
   it advertises — a non-standard field on the `/v1/models` entry (vLLM's
