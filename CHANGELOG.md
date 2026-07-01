@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Pasting from the OS clipboard in `--vim` mode now works. The editor Host's
+  `read_clipboard` returned a cache that was only filled by a
+  `refresh_clipboard_cache` call that existed nowhere, so vim clipboard-register
+  paste (`"+p`) always got nothing (yank-out already worked). It now reads the
+  OS clipboard directly via `hjkl_clipboard::get` — exactly like the TUI's
+  `/paste` — and the dead cache/`refresh`/`cursor_shape`/`set_cancel` machinery
+  is gone.
+
 - No more panics on multibyte (non-ASCII) text. Three sites sliced a `&str` at a
   fixed byte offset without landing on a char boundary — `read_file` (long
   lines), the web-fetch HTML sniff, and `@file` mention expansion — so a UTF-8
