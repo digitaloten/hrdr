@@ -41,7 +41,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--backend-arg`/`--backend-ctx` apply to the llama.cpp fallback (infr is tuned
   via `INFR_*` env vars). Spawn logs go to `~/.cache/hrdr/infr-serve.log` or
   `llama-server.log`. Dropped the "temporary" framing — infr's serve path now
-  has full tool support.
+  has full tool support. The default spawned model is now `Qwen3-8B` (Q4_K_M),
+  down from the 30B-A3B MoE, for a smaller download and faster startup.
 - Finished TODO items now age out of the panel. A completed item stays visible
   for the turn it finishes plus four more (five turns total), then it's pruned —
   so the list keeps showing recent progress without accreting stale checkmarks.

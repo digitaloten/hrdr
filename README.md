@@ -110,8 +110,8 @@ with `--jinja` so tool calling works). If neither is installed, hrdr errors and
 points you at `--no-backend`. See `apps/hrdr/src/backend.rs`.
 
 ```bash
-hrdr                                   # spawns infr (or llama-server) with the default model
-hrdr --backend-model unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M   # pick a model (HF ref or .gguf path)
+hrdr                                   # spawns infr (or llama-server); default model Qwen3-8B
+hrdr --backend-model unsloth/Qwen3-14B-GGUF:Q4_K_M       # pick a bigger model (HF ref or .gguf path)
 hrdr --backend-arg=-ngl --backend-arg=99                 # GPU offload passthrough (llama.cpp fallback)
 hrdr --no-backend                      # use an endpoint you started yourself
 ```

@@ -59,7 +59,7 @@ pub struct BackendConfig {
 impl Default for BackendConfig {
     fn default() -> Self {
         Self {
-            model: "unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M".to_string(),
+            model: "unsloth/Qwen3-8B-GGUF:Q4_K_M".to_string(),
             bin: "llama-server".to_string(),
             ctx: 16384,
             extra_args: Vec::new(),
