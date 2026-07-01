@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
-use hrdr_llm::{Accumulator, ChatMessage, Client, Role};
+use hrdr_llm::{Accumulator, ChatMessage, ChatStream, Client, Role, ToolDef};
 use hrdr_tools::{TodoItem, ToolContext, ToolRegistry};
 
 pub use prompt::{gather_agent_docs, render_system};
@@ -50,6 +50,9 @@ pub enum AgentEvent {
         prompt_tokens: u32,
         completion_tokens: u32,
     },
+    /// An out-of-band notice from the agent (e.g. a retry or auto-compaction),
+    /// surfaced to the user as a system line.
+    Notice(String),
     /// The model produced a final answer with no further tool calls.
     TurnDone,
 }
@@ -658,12 +661,15 @@ impl Agent {
     {
         self.messages.push(ChatMessage::user(user_input.into()));
         let defs = self.tools.defs();
+        // Allow one automatic compaction per turn when the context overflows.
+        let mut overflow_compacted = false;
 
         for _ in 0..self.max_steps {
-            // Stream one assistant turn, accumulating text + tool calls.
+            // Stream one assistant turn, accumulating text + tool calls. The
+            // connect is retried on transient errors and auto-compacted once on
+            // a context-length overflow.
             let mut stream = self
-                .client
-                .chat_stream(self.messages.clone(), defs.clone())
+                .connect_stream(&defs, &mut overflow_compacted, &mut on_event)
                 .await?;
             let mut acc = Accumulator::new();
             while let Some(chunk) = stream.next().await {
@@ -728,6 +734,51 @@ impl Agent {
         bail!("agent exceeded max_steps ({})", self.max_steps);
     }
 
+    /// Open a chat stream, retrying transient network/server errors with
+    /// exponential backoff and auto-compacting once on a context-length
+    /// overflow. Emits `Notice` events for each recovery attempt.
+    async fn connect_stream<F: FnMut(AgentEvent)>(
+        &mut self,
+        defs: &[ToolDef],
+        overflow_compacted: &mut bool,
+        on_event: &mut F,
+    ) -> Result<ChatStream> {
+        const MAX_RETRIES: usize = 4;
+        let mut attempt = 0usize;
+        loop {
+            match self
+                .client
+                .chat_stream(self.messages.clone(), defs.to_vec())
+                .await
+            {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    // Context overflow → compact once, then retry.
+                    if is_context_overflow(&e) && !*overflow_compacted && self.messages.len() > 2 {
+                        on_event(AgentEvent::Notice(
+                            "context window exceeded — compacting and retrying".to_string(),
+                        ));
+                        self.compact(None).await?;
+                        *overflow_compacted = true;
+                        continue;
+                    }
+                    // Transient network/server error → backoff and retry.
+                    if is_transient(&e) && attempt < MAX_RETRIES {
+                        attempt += 1;
+                        let delay = retry_backoff(attempt);
+                        on_event(AgentEvent::Notice(format!(
+                            "network error — retrying in {:.0}s (attempt {attempt}/{MAX_RETRIES})",
+                            delay.as_secs_f64()
+                        )));
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     /// Execute a tool, forwarding any live output it streams as `ToolOutput`
     /// events while it runs.
     async fn run_tool_streaming<F: FnMut(AgentEvent)>(
@@ -775,6 +826,41 @@ pub use hrdr_llm::ChatMessage as Message;
 pub use hrdr_llm::Role as MessageRole;
 pub use hrdr_tools::TodoItem as Todo;
 
+/// Whether an error looks like a transient network/server failure worth
+/// retrying (connection issues, 429, or 5xx).
+fn is_transient(e: &anyhow::Error) -> bool {
+    let msg = e.to_string().to_ascii_lowercase();
+    msg.contains("request failed")           // reqwest send() failure (network)
+        || msg.contains("timed out")
+        || msg.contains("connection")
+        || msg.contains("reset")
+        || msg.contains("broken pipe")
+        || msg.contains("returned 429")       // rate limited
+        || msg.contains("returned 500")
+        || msg.contains("returned 502")
+        || msg.contains("returned 503")
+        || msg.contains("returned 504")
+}
+
+/// Whether an error is the server rejecting the request for exceeding the
+/// model's context window.
+fn is_context_overflow(e: &anyhow::Error) -> bool {
+    let msg = e.to_string().to_ascii_lowercase();
+    msg.contains("context length")
+        || msg.contains("context_length")
+        || msg.contains("maximum context")
+        || msg.contains("context window")
+        || msg.contains("context size")
+        || msg.contains("too many tokens")
+        || msg.contains("reduce the length")
+}
+
+/// Exponential backoff for retry `attempt` (1-based), capped at 8s.
+fn retry_backoff(attempt: usize) -> std::time::Duration {
+    let secs = 0.5 * 2f64.powi((attempt as i32 - 1).max(0));
+    std::time::Duration::from_secs_f64(secs.min(8.0))
+}
+
 /// Convenience: the role of the last assistant message, for callers inspecting
 /// transcript state.
 pub fn is_assistant(m: &ChatMessage) -> bool {
@@ -783,7 +869,27 @@ pub fn is_assistant(m: &ChatMessage) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentConfig, ProviderConfig, builtin_provider};
+    use super::{AgentConfig, ProviderConfig, builtin_provider, is_context_overflow, is_transient};
+
+    #[test]
+    fn classifies_transient_and_overflow_errors() {
+        let overflow = anyhow::anyhow!(
+            "chat endpoint returned 400 Bad Request: This model's maximum context length is 8192 tokens"
+        );
+        assert!(is_context_overflow(&overflow));
+        assert!(!is_transient(&overflow));
+
+        let rate = anyhow::anyhow!("chat endpoint returned 429 Too Many Requests: slow down");
+        assert!(is_transient(&rate));
+        assert!(!is_context_overflow(&rate));
+
+        let net = anyhow::anyhow!("chat stream request failed: connection refused");
+        assert!(is_transient(&net));
+
+        let plain = anyhow::anyhow!("chat endpoint returned 400 Bad Request: invalid tool schema");
+        assert!(!is_transient(&plain));
+        assert!(!is_context_overflow(&plain));
+    }
 
     #[test]
     fn zen_builtin_is_remote_with_opencode_key() {

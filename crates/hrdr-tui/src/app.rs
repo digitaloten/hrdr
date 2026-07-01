@@ -2377,6 +2377,10 @@ impl App {
                     }
                 }
             }
+            AgentEvent::Notice(text) => {
+                self.push_entry(Entry::System(text));
+                self.scroll_offset = 0;
+            }
             AgentEvent::TurnDone => {
                 self.status = "ready".to_string();
             }

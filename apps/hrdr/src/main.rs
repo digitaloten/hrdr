@@ -249,6 +249,7 @@ async fn run_headless(config: AgentConfig, prompt: String) -> Result<()> {
                 eprint!("\x1b[90m{chunk}\x1b[0m");
                 let _ = std::io::stderr().flush();
             }
+            AgentEvent::Notice(text) => eprintln!("\x1b[90m[{text}]\x1b[0m"),
             AgentEvent::ToolEnd { name, ok, .. } => {
                 let mark = if ok {
                     "\x1b[32m✓\x1b[0m"

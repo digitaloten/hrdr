@@ -33,6 +33,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Network resilience: the model connection is now retried with exponential
+  backoff (up to 4 attempts) on transient failures — connection errors, 429, and
+  5xx — instead of failing the turn. Each retry posts a system notice.
+- Auto-compact on context overflow: if the server rejects a request because the
+  context window is exceeded, hrdr automatically compacts the conversation once
+  and retries the turn (with a notice) rather than erroring out.
 - Live tool output streaming: long-running tools (notably `bash`) now stream
   their stdout/stderr into the transcript line-by-line as it's produced, instead
   of showing nothing until the tool finishes — the running tool entry shows the
