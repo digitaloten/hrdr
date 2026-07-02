@@ -346,33 +346,51 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          set -euo pipefail
           VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          # Dependency order; hrdr-gui (floem app) is not published.
-          # NB: crates.io rejects UA-less requests with 403, so the
-          # idempotency probe must send a User-Agent or it never detects an
-          # already-published version.
-          for CRATE in hrdr-llm hrdr-tools hrdr-agent hrdr-editor hrdr-app hrdr-tui hrdr; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              -A "hrdr-ci (https://github.com/kryptic-sh/hrdr)" \
-              "https://crates.io/api/v1/crates/$CRATE/$VERSION")
-            if [ "$STATUS" = "200" ]; then
-              echo "$CRATE $VERSION already on crates.io — skipping"
-              continue
+          # hjkl-style publish helper: idempotency probe (crates.io 403s
+          # UA-less requests, so it must send a User-Agent), 429 retries
+          # parsing the "try again after" timestamp (11-min fallback), and
+          # pacing between crates to stay under the publish rate limits.
+          publish_if_missing() {
+            local crate="$1"
+            local url="https://crates.io/api/v1/crates/${crate}/${VERSION}"
+            if curl -fsS -A "${crate}-release-ci" -o /dev/null "$url"; then
+              echo "::notice::${crate}@${VERSION} already on crates.io, skipping"
+              return 0
             fi
-            # crates.io rate-limits bursts of NEW crates (~5, then a wait);
-            # a 7-crate workspace trips it on the first release. Retry with
-            # a wait instead of failing the job.
-            for ATTEMPT in 1 2 3; do
-              if cargo publish -p "$CRATE" --locked; then
-                break
+            local attempt=0
+            while [ $attempt -lt 3 ]; do
+              if cargo publish -p "${crate}" --locked 2>&1 | tee /tmp/publish_"${crate}".log; then
+                # Pacing across the workspace (cargo itself waits for index
+                # propagation before returning).
+                sleep 25
+                return 0
               fi
-              if [ "$ATTEMPT" = "3" ]; then
-                echo "publishing $CRATE failed after $ATTEMPT attempts"
-                exit 1
+              if grep -qiE "429|Too Many Requests" /tmp/publish_"${crate}".log; then
+                local wait_until wait_secs
+                wait_until=$(grep -oE 'try again after [^.]+' /tmp/publish_"${crate}".log | sed 's/try again after //' || true)
+                if [ -n "$wait_until" ]; then
+                  wait_secs=$(( $(date -d "$wait_until" +%s) - $(date +%s) + 30 ))
+                  [ "$wait_secs" -lt 30 ] && wait_secs=30
+                  echo "::warning::rate limited publishing ${crate}, sleeping ${wait_secs}s until $wait_until"
+                else
+                  wait_secs=660
+                  echo "::warning::rate limited publishing ${crate}, sleeping ${wait_secs}s (11 min fallback)"
+                fi
+                sleep "$wait_secs"
+                attempt=$(( attempt + 1 ))
+              else
+                echo "::error::publish failed for ${crate} (non-rate-limit error)"
+                return 1
               fi
-              echo "publish of $CRATE failed (likely the new-crate rate limit) — retrying in 10m"
-              sleep 600
             done
+            echo "::error::publish failed for ${crate} after 3 rate-limit retries"
+            return 1
+          }
+          # Dependency order; hrdr-gui (floem app) is not published.
+          for CRATE in hrdr-llm hrdr-tools hrdr-agent hrdr-editor hrdr-app hrdr-tui hrdr; do
+            publish_if_missing "$CRATE"
           done
 
   aur-bin:
