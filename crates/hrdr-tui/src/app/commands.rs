@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::theme::Theme;
-use hrdr_app::{last_fenced_block, parse_duration, resolve_alias, resolve_under};
+use hrdr_app::{last_fenced_block, resolve_alias, resolve_under};
 
 impl super::App {
     /// Dispatch a known slash command. Returns `true` if it was a recognized
@@ -71,8 +71,7 @@ impl super::App {
         self.last_usage = None;
         self.session_id = None; // detach; next message starts a new session
         self.session_label = None;
-        self.find_query = None;
-        self.find_pos = 0;
+        self.find = hrdr_app::FindState::default();
         self.pending_goto = None;
         self.pending_edit = None;
         self.expand_tools = false;
@@ -139,110 +138,44 @@ impl super::App {
         Some(text)
     }
     /// `/goto <N | 5m | 1h | top | end>` — scroll the transcript to a message
-    /// number, to the message nearest a relative time ago, or to top/bottom.
+    /// number, to the message nearest a relative time ago, or to top/bottom
+    /// (shared [`hrdr_app::goto_action`] core; only the scrolling is local).
     fn goto_cmd(&mut self, arg: &str) {
-        let count = self.display_message_count();
-        if count == 0 {
-            self.system("no messages to jump to yet");
-            return;
-        }
-        let a = arg.trim().to_ascii_lowercase();
-        let target = match a.as_str() {
-            "" => {
-                self.system("usage: /goto <N | 5m | 1h | top | end>");
-                return;
-            }
-            "top" | "start" | "first" => 1,
-            "end" | "bottom" | "last" => {
-                self.scroll_offset = 0; // follow newest
-                self.system("jumped to the latest output");
-                return;
-            }
-            _ => {
-                if let Ok(n) = a.parse::<usize>() {
-                    n.clamp(1, count)
-                } else if let Some(secs) = parse_duration(&a) {
-                    let cutoff = chrono::Local::now() - chrono::Duration::seconds(secs);
-                    // First message at/after the cutoff; if all are older, the
-                    // newest one is closest to "that long ago".
-                    self.first_message_since(cutoff).unwrap_or(count)
-                } else {
-                    self.system("usage: /goto <N | 5m | 1h | top | end>");
-                    return;
-                }
-            }
-        };
-        self.pending_goto = Some(target);
-        self.system(format!("jumped to message #{target}"));
+        let act = hrdr_app::goto_action(arg, self.display_message_count(), |cutoff| {
+            self.first_message_since(cutoff)
+        });
+        self.apply_find_action(act);
     }
     /// `/find <text>` — search the transcript and jump to the next match
     /// (case-insensitive). No arg cycles to the next match of the current query;
     /// `/find clear` (or `off`/`discard`) drops the search + highlight.
     fn find_cmd(&mut self, arg: &str) {
-        // Clear the active search + highlight.
-        if matches!(
-            arg.trim().to_ascii_lowercase().as_str(),
-            "clear" | "off" | "discard"
-        ) {
-            if self.find_query.is_some() {
-                self.find_query = None;
-                self.find_pos = 0;
-                self.system("search cleared");
-            } else {
-                self.system("no active search");
-            }
-            return;
-        }
-        let arg = arg.trim();
-        if arg.is_empty() {
-            if self.find_query.is_none() {
-                self.system("usage: /find <text>");
-                return;
-            }
-        } else {
-            // A new query restarts cycling from the top.
-            if self.find_query.as_deref() != Some(arg) {
-                self.find_pos = 0;
-            }
-            self.find_query = Some(arg.to_string());
-        }
-        self.find_cycle(true);
-    }
-    /// Message numbers (1-based) whose text contains `query` (case-insensitive).
-    fn find_hits(&self, query: &str) -> Vec<usize> {
-        hrdr_app::find_hits(&self.transcript, query)
+        let mut st = std::mem::take(&mut self.find);
+        let act = st.find(arg, |q| hrdr_app::find_hits(&self.transcript, q));
+        self.find = st;
+        self.apply_find_action(act);
     }
     /// Cycle to the next (`forward`) or previous match of the active query,
-    /// wrapping around; used by `/find`, `/next`, and `/prev`.
+    /// wrapping around; used by `/next` and `/prev`.
     fn find_cycle(&mut self, forward: bool) {
-        let Some(query) = self.find_query.clone() else {
-            self.system("no active search — /find <text>");
-            return;
-        };
-        let hits = self.find_hits(&query);
-        if hits.is_empty() {
-            self.system(format!("no match for {query:?}"));
-            return;
+        let mut st = std::mem::take(&mut self.find);
+        let act = st.cycle(forward, |q| hrdr_app::find_hits(&self.transcript, q));
+        self.find = st;
+        self.apply_find_action(act);
+    }
+    /// Route a resolved find/goto action to the TUI's scroll primitives.
+    fn apply_find_action(&mut self, act: hrdr_app::FindAction) {
+        match act {
+            hrdr_app::FindAction::Info(line) => self.system(line),
+            hrdr_app::FindAction::Jump { msg, line } => {
+                self.pending_goto = Some(msg);
+                self.system(line);
+            }
+            hrdr_app::FindAction::Bottom { line } => {
+                self.scroll_offset = 0; // follow newest
+                self.system(line);
+            }
         }
-        let target = if forward {
-            hits.iter()
-                .copied()
-                .find(|&n| n > self.find_pos)
-                .unwrap_or(hits[0])
-        } else {
-            hits.iter()
-                .rev()
-                .copied()
-                .find(|&n| n < self.find_pos)
-                .unwrap_or(*hits.last().unwrap())
-        };
-        let idx = hits.iter().position(|&n| n == target).unwrap_or(0) + 1;
-        self.find_pos = target;
-        self.pending_goto = Some(target);
-        self.system(format!(
-            "match {idx}/{} for {query:?} → message #{target}",
-            hits.len()
-        ));
     }
     /// Number of user/assistant messages in the transcript.
     fn display_message_count(&self) -> usize {

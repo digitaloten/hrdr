@@ -28,6 +28,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     like the TUI — keeps current settings and warns on an invalid file instead
     of resetting to defaults.
 
+- **Shared `/resume` core (`hrdr_app::resume_plan` + `RESUME_BUSY_MSG`).** One
+  place decides the cwd to adopt and the notices to show (resumed line, `cwd →`,
+  missing-cwd note, endpoint note); the shared dispatcher now guards `/resume`
+  against a running turn in both frontends (the GUI previously let a mid-turn
+  resume race the in-flight autosave). Resuming in the GUI also refreshes the
+  dir/branch status chrome and invalidates the `@file` index when it follows the
+  session's directory, like `/cwd`.
+
+- **Shared `/find`/`/next`/`/prev`/`/goto` state machine
+  (`hrdr_app::FindState` + `goto_action` + `FindAction`, unit-tested).** All
+  parsing, match cycling, wrap-around, and status lines live in `hrdr-app`; each
+  frontend only maps the resulting action to its scroll primitive
+  (`pending_goto`/offset in the TUI, the ViewId registry in the GUI).
+  `/goto end` now means the same thing in both: follow the very bottom of the
+  transcript (the GUI used to stop at the last user/assistant message).
+
 ### Fixed
 
 - **GUI:** a stale `Done` message from a just-cancelled turn no longer clobbers

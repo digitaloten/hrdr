@@ -65,11 +65,16 @@ impl super::App {
         // the in-flight turn's autosave would then overwrite the resumed
         // session's file with the old conversation.
         if self.running {
-            self.system("a turn is running — interrupt it (Ctrl+C) before /resume");
+            // Defense in depth: the shared dispatcher already guards /resume,
+            // but auto-resume/other callers reach this directly.
+            self.system(hrdr_app::RESUME_BUSY_MSG);
             return;
         }
-        let cwd = self.current_cwd();
-        let count = session.messages.len();
+        let plan = hrdr_app::resume_plan(
+            &session,
+            std::path::Path::new(&self.current_cwd()),
+            &self.base_url,
+        );
         self.with_agent(|a| {
             a.set_messages(session.messages.clone());
             a.set_model(session.model.clone());
@@ -79,26 +84,13 @@ impl super::App {
         self.session_id = Some(id.clone());
         self.session_label = Some(session.name.clone());
         self.scroll_offset = 0;
-        self.system(format!("resumed '{}' ({count} messages)", session.name));
         // Switch hrdr's tools to the session's working directory (in-process
         // only — the parent shell is untouched).
-        if !session.cwd.is_empty() && session.cwd != cwd {
-            let target = std::path::PathBuf::from(&session.cwd);
-            if target.is_dir() {
-                self.apply_cwd(target.clone());
-                self.system(format!("cwd → {}", target.display()));
-            } else {
-                self.system(format!(
-                    "note: session cwd {} no longer exists; staying in {cwd}",
-                    session.cwd
-                ));
-            }
+        if let Some(target) = plan.new_cwd {
+            self.apply_cwd(target);
         }
-        if session.base_url != self.base_url {
-            self.system(format!(
-                "note: session endpoint was {} (current: {})",
-                session.base_url, self.base_url
-            ));
+        for line in plan.lines {
+            self.system(line);
         }
     }
     /// Rebuild the display transcript from a restored message history (the

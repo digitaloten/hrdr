@@ -146,8 +146,7 @@ pub(crate) struct App {
     pub(crate) pending_goto: Option<usize>,
     /// Last `/find` query (also drives transcript highlighting) and the message
     /// number it last landed on (for cycling).
-    pub(crate) find_query: Option<String>,
-    find_pos: usize,
+    pub(crate) find: hrdr_app::FindState,
     /// Auto-compact trigger as a fraction of the context window; 0 disables.
     pub(crate) auto_compact_ratio: f64,
     /// Ring the terminal bell when a turn finishes (after a brief minimum).
@@ -292,8 +291,7 @@ impl App {
             pending_init: false,
             pending_edit: None,
             pending_goto: None,
-            find_query: None,
-            find_pos: 0,
+            find: hrdr_app::FindState::default(),
             auto_compact_ratio: auto_compact,
             bell,
             base_url,

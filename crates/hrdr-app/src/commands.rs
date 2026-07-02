@@ -867,6 +867,10 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 host.info("usage: /resume <id or name> (see /sessions)".to_string());
                 return true;
             }
+            if host.is_busy() {
+                host.info(RESUME_BUSY_MSG.to_string());
+                return true;
+            }
             match hrdr_agent::resolve_session(&host.cwd().display().to_string(), &arg) {
                 Some((id, session)) => host.resume(id, session),
                 None => host.info(format!("no session matching '{arg}' (see /sessions)")),
@@ -956,6 +960,56 @@ pub fn startup_config_warning() -> Option<String> {
     hrdr_agent::AgentConfig::load_checked()
         .err()
         .map(|e| format!("config file is invalid — using defaults: {e}"))
+}
+
+/// Guard shown when `/resume` is attempted mid-turn (the running turn holds
+/// the agent mutex: the message swap would silently no-op while the transcript
+/// and session id switched, and the turn's autosave would then overwrite the
+/// resumed session's file with the old conversation).
+pub const RESUME_BUSY_MSG: &str = "a turn is running — interrupt it before /resume";
+
+/// What restoring a session changes beyond the host's own state swap: the
+/// working directory to adopt (if any) and the system lines to show, in order.
+pub struct ResumePlan {
+    /// The session's cwd when it exists and differs from the current one.
+    pub new_cwd: Option<PathBuf>,
+    /// Notices: the "resumed …" line, then cwd / missing-cwd / endpoint notes.
+    pub lines: Vec<String>,
+}
+
+/// The shared `/resume` semantics both frontends apply: follow the session's
+/// working directory (in-process only) and surface the same notices.
+pub fn resume_plan(
+    session: &hrdr_agent::Session,
+    prev_cwd: &Path,
+    current_base_url: &str,
+) -> ResumePlan {
+    let mut lines = vec![format!(
+        "resumed '{}' ({} messages)",
+        session.name,
+        session.messages.len()
+    )];
+    let mut new_cwd = None;
+    if !session.cwd.is_empty() && Path::new(&session.cwd) != prev_cwd {
+        let target = PathBuf::from(&session.cwd);
+        if target.is_dir() {
+            lines.push(format!("cwd → {}", target.display()));
+            new_cwd = Some(target);
+        } else {
+            lines.push(format!(
+                "note: session cwd {} no longer exists; staying in {}",
+                session.cwd,
+                prev_cwd.display()
+            ));
+        }
+    }
+    if session.base_url != current_base_url {
+        lines.push(format!(
+            "note: session endpoint was {} (current: {current_base_url})",
+            session.base_url
+        ));
+    }
+    ResumePlan { new_cwd, lines }
 }
 
 /// The cancel notice both frontends show (with the discarded-queue count).

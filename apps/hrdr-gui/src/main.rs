@@ -329,6 +329,10 @@ fn app_view(
     // render time, and the view the transcript scroll should bring into view.
     let msg_view_ids: Rc<RefCell<std::collections::HashMap<usize, floem::ViewId>>> =
         Rc::new(RefCell::new(std::collections::HashMap::new()));
+    // Every rendered item keyed by its transcript id — the max key is the
+    // bottom of the transcript (`/goto end`).
+    let item_view_ids: Rc<RefCell<std::collections::HashMap<u64, floem::ViewId>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
     let goto_view: RwSignal<Option<floem::ViewId>> = create_rw_signal(None);
     // Messages submitted while a turn runs, sent FIFO as turns finish (like
     // the TUI's queue).
@@ -667,6 +671,7 @@ fn app_view(
 
     let history_for_send = history.clone();
     let msg_ids_for_send = msg_view_ids.clone();
+    let item_ids_for_send = item_view_ids.clone();
     let spawn_for_send = spawn_turn.clone();
     let compact_for_send = start_compaction.clone();
     let mtime_for_send = config_mtime_seen.clone();
@@ -711,6 +716,7 @@ fn app_view(
                     find_query,
                     find_pos,
                     ids: msg_ids_for_send.clone(),
+                    all_ids: item_ids_for_send.clone(),
                     goto_view,
                 };
                 let handled = match lcmd {
@@ -850,6 +856,7 @@ fn app_view(
     let cancel_btn = cancel.clone();
 
     let ids_for_render = msg_view_ids.clone();
+    let all_ids_for_render = item_view_ids.clone();
     let transcript_view = scroll(
         dyn_stack(
             move || {
@@ -873,6 +880,7 @@ fn app_view(
                 if let Some(n) = item.msg_no {
                     ids_for_render.borrow_mut().insert(n, view.id());
                 }
+                all_ids_for_render.borrow_mut().insert(item.id, view.id());
                 view
             },
         )
@@ -1380,6 +1388,7 @@ struct FindCtx {
     find_query: RwSignal<Option<String>>,
     find_pos: RwSignal<usize>,
     ids: Rc<RefCell<std::collections::HashMap<usize, floem::ViewId>>>,
+    all_ids: Rc<RefCell<std::collections::HashMap<u64, floem::ViewId>>>,
     goto_view: RwSignal<Option<floem::ViewId>>,
 }
 
@@ -1416,101 +1425,69 @@ impl FindCtx {
             self.goto_view.set(Some(v));
         }
     }
-    /// `/goto <N | 5m | 1h | top | end>`.
-    fn goto_cmd(&self, arg: &str) {
-        let count = self.message_count();
-        if count == 0 {
-            self.info("no messages to jump to yet");
-            return;
+    /// Scroll to the very bottom of the transcript (`/goto end`) — the
+    /// highest-id rendered item.
+    fn scroll_bottom(&self) {
+        let vid = self
+            .all_ids
+            .borrow()
+            .iter()
+            .max_by_key(|(id, _)| **id)
+            .map(|(_, v)| *v);
+        if let Some(v) = vid {
+            self.goto_view.set(Some(v));
         }
-        let a = arg.trim().to_ascii_lowercase();
-        let target = match a.as_str() {
-            "" => {
-                self.info("usage: /goto <N | 5m | 1h | top | end>");
-                return;
+    }
+    /// Route a resolved find/goto action to the GUI's scroll primitives (the
+    /// parsing/cycling/status lines live in the shared core).
+    fn apply(&self, act: hrdr_app::FindAction) {
+        match act {
+            hrdr_app::FindAction::Info(line) => self.info(line),
+            hrdr_app::FindAction::Jump { msg, line } => {
+                self.scroll_to_msg(msg);
+                self.info(line);
             }
-            "top" | "start" | "first" => 1,
-            "end" | "bottom" | "last" => count,
-            _ => {
-                if let Ok(n) = a.parse::<usize>() {
-                    n.clamp(1, count)
-                } else if let Some(secs) = hrdr_app::parse_duration(&a) {
-                    let cutoff = chrono::Local::now() - chrono::Duration::seconds(secs);
-                    // First message at/after the cutoff; all older → the newest.
-                    self.transcript
-                        .with_untracked(|t| {
-                            t.iter()
-                                .find(|i| i.msg_no.is_some() && i.time >= cutoff)
-                                .and_then(|i| i.msg_no)
-                        })
-                        .unwrap_or(count)
-                } else {
-                    self.info("usage: /goto <N | 5m | 1h | top | end>");
-                    return;
-                }
+            hrdr_app::FindAction::Bottom { line } => {
+                self.scroll_bottom();
+                self.info(line);
             }
-        };
-        self.scroll_to_msg(target);
-        self.info(format!("jumped to message #{target}"));
+        }
+    }
+    /// The shared find state, mirrored out of the signals for one operation.
+    fn state(&self) -> hrdr_app::FindState {
+        hrdr_app::FindState {
+            query: self.find_query.get_untracked(),
+            pos: self.find_pos.get_untracked(),
+        }
+    }
+    fn store(&self, st: hrdr_app::FindState) {
+        self.find_query.set(st.query);
+        self.find_pos.set(st.pos);
+    }
+    /// `/goto <N | 5m | 1h | top | end>` (shared [`hrdr_app::goto_action`]).
+    fn goto_cmd(&self, arg: &str) {
+        let act = hrdr_app::goto_action(arg, self.message_count(), |cutoff| {
+            self.transcript.with_untracked(|t| {
+                t.iter()
+                    .find(|i| i.msg_no.is_some() && i.time >= cutoff)
+                    .and_then(|i| i.msg_no)
+            })
+        });
+        self.apply(act);
     }
     /// `/find <text>` — search + jump; no arg cycles; `clear` drops the search.
     fn find_cmd(&self, arg: &str) {
-        if matches!(
-            arg.trim().to_ascii_lowercase().as_str(),
-            "clear" | "off" | "discard"
-        ) {
-            if self.find_query.get_untracked().is_some() {
-                self.find_query.set(None);
-                self.find_pos.set(0);
-                self.info("search cleared");
-            } else {
-                self.info("no active search");
-            }
-            return;
-        }
-        let arg = arg.trim();
-        if arg.is_empty() {
-            if self.find_query.get_untracked().is_none() {
-                self.info("usage: /find <text>");
-                return;
-            }
-        } else {
-            // A new query restarts cycling from the top.
-            if self.find_query.get_untracked().as_deref() != Some(arg) {
-                self.find_pos.set(0);
-            }
-            self.find_query.set(Some(arg.to_string()));
-        }
-        self.cycle(true);
+        let mut st = self.state();
+        let act = st.find(arg, |q| self.hits(q));
+        self.store(st);
+        self.apply(act);
     }
-    /// Cycle to the next/previous match of the active query, wrapping.
+    /// `/next` / `/prev` — cycle matches of the active query, wrapping.
     fn cycle(&self, forward: bool) {
-        let Some(query) = self.find_query.get_untracked() else {
-            self.info("no active search — /find <text>");
-            return;
-        };
-        let hits = self.hits(&query);
-        if hits.is_empty() {
-            self.info(format!("no match for {query:?}"));
-            return;
-        }
-        let pos = self.find_pos.get_untracked();
-        let target = if forward {
-            hits.iter().copied().find(|&n| n > pos).unwrap_or(hits[0])
-        } else {
-            hits.iter()
-                .rev()
-                .copied()
-                .find(|&n| n < pos)
-                .unwrap_or(*hits.last().unwrap())
-        };
-        let idx = hits.iter().position(|&n| n == target).unwrap_or(0) + 1;
-        self.find_pos.set(target);
-        self.scroll_to_msg(target);
-        self.info(format!(
-            "match {idx}/{} for {query:?} → message #{target}",
-            hits.len()
-        ));
+        let mut st = self.state();
+        let act = st.cycle(forward, |q| self.hits(q));
+        self.store(st);
+        self.apply(act);
     }
 }
 
@@ -1670,24 +1647,18 @@ impl hrdr_app::CommandHost for GuiHost {
         });
     }
     fn resume(&mut self, id: String, session: Session) {
-        let count = session.messages.len();
-        let prev_cwd = self.cwd();
+        let plan = hrdr_app::resume_plan(&session, &self.cwd(), &self.base_url.get_untracked());
         self.model.set(session.model.clone());
         self.session_id.set(Some(id));
         self.session_label.set(Some(session.name.clone()));
         // Pending saves from before the resume belong to the old conversation.
         self.save_gen.update(|g| *g += 1);
         rebuild_transcript(self.cx, self.transcript, self.next_id, &session.messages);
-        // Follow the session's working directory (in-process only), matching
-        // the TUI — the tools must operate where the session's work lives.
-        let target = std::path::PathBuf::from(&session.cwd);
-        let new_cwd = (!session.cwd.is_empty() && target != prev_cwd && target.is_dir())
-            .then_some(target.clone());
         // Synchronous when the lock is free (see clear_conversation) so a
         // send right after /resume can't race the message swap.
-        let msgs = session.messages.clone();
-        let m = session.model.clone();
-        let cwd_for_agent = new_cwd.clone();
+        let msgs = session.messages;
+        let m = session.model;
+        let cwd_for_agent = plan.new_cwd.clone();
         let apply = move |a: &mut Agent| {
             a.set_messages(msgs);
             a.set_model(m);
@@ -1701,41 +1672,14 @@ impl hrdr_app::CommandHost for GuiHost {
             let agent = self.agent.clone();
             tokio::spawn(async move { apply(&mut *agent.lock().await) });
         }
-        system(
-            self.transcript,
-            self.next_id,
-            format!("resumed '{}' ({count} messages)", session.name),
-        );
-        if let Some(c) = new_cwd {
-            system(
-                self.transcript,
-                self.next_id,
-                format!("cwd → {}", c.display()),
-            );
-        } else if !session.cwd.is_empty()
-            && std::path::Path::new(&session.cwd) != prev_cwd
-            && !std::path::Path::new(&session.cwd).is_dir()
-        {
-            system(
-                self.transcript,
-                self.next_id,
-                format!(
-                    "note: session cwd {} no longer exists; staying in {}",
-                    session.cwd,
-                    prev_cwd.display()
-                ),
-            );
+        if let Some(c) = &plan.new_cwd {
+            // Refresh dir/branch chrome + invalidate the @file index, exactly
+            // like /cwd (the TUI's apply_cwd does the same).
+            let c = c.clone();
+            hrdr_app::CommandHost::cwd_changed(self, &c);
         }
-        let cur_url = self.base_url.get_untracked();
-        if session.base_url != cur_url {
-            system(
-                self.transcript,
-                self.next_id,
-                format!(
-                    "note: session endpoint was {} (current: {cur_url})",
-                    session.base_url
-                ),
-            );
+        for line in plan.lines {
+            system(self.transcript, self.next_id, line);
         }
     }
     fn copy_to_clipboard(&mut self, text: &str, label: &str) -> String {

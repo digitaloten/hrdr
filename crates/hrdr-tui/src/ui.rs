@@ -878,7 +878,8 @@ fn transcript_lines(
 
     // Highlight the active /find query across the committed transcript.
     if let Some(needle) = app
-        .find_query
+        .find
+        .query
         .as_deref()
         .map(str::to_ascii_lowercase)
         .filter(|q| !q.is_empty())
