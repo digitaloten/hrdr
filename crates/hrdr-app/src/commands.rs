@@ -158,6 +158,45 @@ pub trait CommandHost {
         }));
     }
 
+    /// Current per-message timestamp style (frontends with timestamp rendering
+    /// override the pair).
+    fn timestamp_style(&self) -> crate::TimestampStyle {
+        crate::TimestampStyle::Relative
+    }
+    /// Apply a timestamp style (persistence is dispatch's job).
+    fn set_timestamp_style(&mut self, style: crate::TimestampStyle) {
+        let _ = style;
+    }
+    /// Turns a completed TODO stays visible before pruning.
+    fn todo_ttl(&self) -> u64 {
+        crate::DEFAULT_TODO_TTL
+    }
+    /// Apply a TODO lifetime (persistence is dispatch's job).
+    fn set_todo_ttl(&mut self, turns: u64) {
+        let _ = turns;
+    }
+
+    /// Re-read config and apply the live-changeable settings (frontends decide
+    /// what that covers and emit their own status lines).
+    fn reload_config(&mut self) {
+        self.info("reload isn't supported here".to_string());
+    }
+
+    /// Resolve a provider preset by name (built-ins + `[providers.<name>]`
+    /// from config). `None` = unknown / no provider support.
+    fn resolve_provider(&self, name: &str) -> Option<hrdr_agent::ResolvedProvider> {
+        let _ = name;
+        None
+    }
+    /// Update the displayed endpoint after a `/provider` switch.
+    fn set_base_url(&mut self, url: String) {
+        let _ = url;
+    }
+    /// Update the displayed context window after a `/provider` switch.
+    fn set_context_window(&mut self, tokens: Option<u32>) {
+        let _ = tokens;
+    }
+
     /// Whether this frontend supports `cmd` (used to filter `/help`). Default
     /// matches the GUI: everything not in [`crate::TUI_ONLY_COMMANDS`].
     fn supports_command(&self, cmd: &str) -> bool {
@@ -561,6 +600,105 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             }
             host.info("/init — exploring the project to write AGENTS.md…".to_string());
             host.send_prompt(INIT_PROMPT.to_string(), false);
+        }
+        "timestamps" | "ts" => {
+            use crate::TimestampStyle;
+            let style = match arg.to_ascii_lowercase().as_str() {
+                // No arg toggles between off and relative.
+                "" => {
+                    if host.timestamp_style() == TimestampStyle::None {
+                        TimestampStyle::Relative
+                    } else {
+                        TimestampStyle::None
+                    }
+                }
+                "none" | "off" | "hidden" => TimestampStyle::None,
+                "relative" | "rel" | "on" => TimestampStyle::Relative,
+                "exact" | "absolute" | "abs" => TimestampStyle::Exact,
+                _ => {
+                    host.info("usage: /timestamps [none | relative | exact]".to_string());
+                    return true;
+                }
+            };
+            host.set_timestamp_style(style);
+            host.persist_setting(
+                "timestamps",
+                hrdr_agent::ConfigValue::Str(style.as_config_str()),
+            );
+            host.info(
+                match style {
+                    TimestampStyle::None => "timestamps: off",
+                    TimestampStyle::Relative => "timestamps: relative",
+                    TimestampStyle::Exact => "timestamps: exact (HH:MM)",
+                }
+                .to_string(),
+            );
+        }
+        "todo-ttl" | "todottl" | "todos" => {
+            if arg.is_empty() {
+                let ttl = host.todo_ttl();
+                host.info(format!(
+                    "todo-ttl: {ttl} turn{}",
+                    if ttl == 1 { "" } else { "s" }
+                ));
+                return true;
+            }
+            match arg.parse::<u64>() {
+                Ok(n) => {
+                    host.set_todo_ttl(n);
+                    host.persist_setting("todo_ttl", hrdr_agent::ConfigValue::Int(n as i64));
+                    host.info(format!(
+                        "todo-ttl → {n} turn{}",
+                        if n == 1 { "" } else { "s" }
+                    ));
+                }
+                Err(_) => {
+                    host.info("usage: /todo-ttl <turns> (a whole number, e.g. 5)".to_string())
+                }
+            }
+        }
+        "reload" => host.reload_config(),
+        "provider" => {
+            if arg.is_empty() {
+                host.info("usage: /provider <name>".to_string());
+                return true;
+            }
+            let Some(p) = host.resolve_provider(&arg) else {
+                host.info(format!("unknown provider '{arg}'"));
+                return true;
+            };
+            if host.is_busy() {
+                host.info("busy — try again after the current turn".to_string());
+                return true;
+            }
+            let key = p
+                .api_key
+                .clone()
+                .or_else(|| p.key_env.as_ref().and_then(|e| std::env::var(e).ok()));
+            let agent = host.agent();
+            let (url, m) = (p.base_url.clone(), p.model.clone());
+            host.spawn_line(Box::pin(async move {
+                let mut a = agent.lock().await;
+                a.set_endpoint(url, key);
+                if let Some(m) = m {
+                    a.set_model(m);
+                }
+                String::new()
+            }));
+            if let Some(m) = &p.model {
+                host.set_model(m.clone());
+            }
+            if p.context_window.is_some() {
+                host.set_context_window(p.context_window);
+            }
+            host.set_base_url(p.base_url.clone());
+            host.info(format!("provider → {arg} ({})", p.base_url));
+            if !p.remote {
+                host.info(
+                    "note: a running backend isn't restarted; relaunch hrdr for a local backend"
+                        .to_string(),
+                );
+            }
         }
         "sessions" => {
             let all = crate::sessions_all_flag(&arg);

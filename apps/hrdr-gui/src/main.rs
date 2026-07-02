@@ -107,6 +107,11 @@ struct Item {
     /// with no signals), disposed when the item is cleared — see
     /// [`clear_items`].
     scope: Option<Scope>,
+    /// When the item was pushed (per-message timestamps, `/goto 5m`).
+    time: chrono::DateTime<chrono::Local>,
+    /// 1-based message number (user/assistant items only) — the `#N` shown in
+    /// the meta line and targeted by `/goto`, `/find`, `/copy msg N`.
+    msg_no: Option<usize>,
 }
 
 /// One row in the completion dropdown: a slash command or an `@file` match.
@@ -161,17 +166,25 @@ fn main() -> anyhow::Result<()> {
     let model = config.model.clone();
     let ctx_window = config.context_window;
     let base_url = config.base_url.clone();
-    let agent = Arc::new(TokioMutex::new(Agent::new(config)?));
+    // Keep the config around for `/provider` preset resolution.
+    let cfg = Rc::new(config.clone());
+    let agent_raw = Agent::new(config)?;
+    // Shared TODO list, mutated by the todo_write tool during turns.
+    let todos = agent_raw.todos();
+    let agent = Arc::new(TokioMutex::new(agent_raw));
 
-    floem::launch(move || app_view(agent, model, ctx_window, base_url, ui));
+    floem::launch(move || app_view(agent, todos, model, ctx_window, base_url, cfg, ui));
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn app_view(
     agent: Arc<TokioMutex<Agent>>,
+    todos: Arc<std::sync::Mutex<Vec<hrdr_tools::TodoItem>>>,
     model: String,
     ctx_window: Option<u32>,
     base_url: String,
+    cfg: Rc<AgentConfig>,
     ui: hrdr_app::UiConfig,
 ) -> impl IntoView {
     let theme = GuiTheme::load(ui.theme.as_deref());
@@ -263,6 +276,28 @@ fn app_view(
 
     // Reasoning-effort label (status bar; `/effort` sets it).
     let effort: RwSignal<Option<String>> = create_rw_signal(None);
+    // Endpoint + context window as signals so `/provider` updates them live.
+    let base_url: RwSignal<String> = create_rw_signal(base_url);
+    let ctx_window: RwSignal<Option<u32>> = create_rw_signal(ctx_window);
+    // Per-message timestamp style (`/timestamps`; from config).
+    let timestamp_style: RwSignal<hrdr_app::TimestampStyle> = create_rw_signal(
+        hrdr_app::TimestampStyle::from_config(ui.timestamps.as_deref()),
+    );
+    // TODO panel state: a reactive mirror of the shared list (refreshed on tool
+    // events), the turn counter + completion stamps for aging, and the TTL.
+    let todos_sig: RwSignal<Vec<hrdr_tools::TodoItem>> = create_rw_signal(Vec::new());
+    let todo_turn: RwSignal<u64> = create_rw_signal(0);
+    let todo_completed_at: Rc<RefCell<std::collections::HashMap<String, u64>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
+    let todo_ttl: RwSignal<u64> = create_rw_signal(ui.todo_ttl);
+    // `/find` state: the active query + the message number cycling last landed on.
+    let find_query: RwSignal<Option<String>> = create_rw_signal(None);
+    let find_pos: RwSignal<usize> = create_rw_signal(0);
+    // Scroll target for /goto //find: message-number → ViewId registry filled at
+    // render time, and the view the transcript scroll should bring into view.
+    let msg_view_ids: Rc<RefCell<std::collections::HashMap<usize, floem::ViewId>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
+    let goto_view: RwSignal<Option<floem::ViewId>> = create_rw_signal(None);
     // Messages submitted while a turn runs, sent FIFO as turns finish (like
     // the TUI's queue).
     let queue: Rc<RefCell<VecDeque<String>>> = Rc::new(RefCell::new(VecDeque::new()));
@@ -277,7 +312,6 @@ fn app_view(
     let spawn_turn: Rc<dyn Fn(String, bool)> = {
         let agent = agent.clone();
         let tx = tx.clone();
-        let base_url = base_url.clone();
         let th = turn_handle.clone();
         Rc::new(move |text: String, show_as_user: bool| {
             if show_as_user {
@@ -306,7 +340,7 @@ fn app_view(
             let existing_id = session_id.get_untracked();
             let session_label = session_label.get_untracked();
             let cur_model = model.get_untracked();
-            let base_url = base_url.clone();
+            let base_url = base_url.get_untracked();
             let generation = save_gen.get_untracked();
             let handle = tokio::spawn(async move {
                 let tx_ev = tx.clone();
@@ -341,6 +375,8 @@ fn app_view(
 
     let spawn_for_done = spawn_turn.clone();
     let queue_for_done = queue.clone();
+    let todos_for_events = todos.clone();
+    let todo_stamps_for_done = todo_completed_at.clone();
     create_effect(move |_| {
         let Some(msg) = events.get() else { return };
         match msg {
@@ -354,12 +390,29 @@ fn app_view(
                 {
                     ttft.set(Some(start.elapsed().as_secs_f64()));
                 }
+                // Tool completions may have rewritten the shared TODO list.
+                let refresh_todos = matches!(ev, AgentEvent::ToolEnd { .. });
                 handle_event(cx, transcript, next_id, usage, ev);
+                if refresh_todos && let Ok(t) = todos_for_events.lock() {
+                    todos_sig.set(t.clone());
+                }
             }
             UiMsg::Done(err) => {
                 running.set(false);
                 if let Some(e) = err {
                     push_item(transcript, next_id, Body::Error(e));
+                }
+                // Age out completed TODOs (a completed item stays visible for
+                // todo_ttl turns, like the TUI panel).
+                todo_turn.set(todo_turn.get_untracked() + 1);
+                if let Ok(mut t) = todos_for_events.lock() {
+                    hrdr_app::age_completed_todos(
+                        &mut t,
+                        &mut todo_stamps_for_done.borrow_mut(),
+                        todo_turn.get_untracked(),
+                        todo_ttl.get_untracked(),
+                    );
+                    todos_sig.set(t.clone());
                 }
                 // Start the next queued message, if any (FIFO, like the TUI).
                 let next = queue_for_done.borrow_mut().pop_front();
@@ -392,13 +445,16 @@ fn app_view(
     });
 
     let history_for_send = history.clone();
+    let msg_ids_for_send = msg_view_ids.clone();
     let spawn_for_send = spawn_turn.clone();
     let queue_for_send = queue.clone();
     let th_for_host = turn_handle.clone();
     let clipboard_for_send = clipboard.clone();
     let agent_for_send = agent.clone();
     let tx_for_send = tx.clone();
-    let base_url_for_send = base_url.clone();
+    let todos_for_send = todos.clone();
+    let todo_stamps_for_send = todo_completed_at.clone();
+    let cfg_for_send = cfg.clone();
     let send = move || {
         // Trim like the TUI does, so " /help" is still a command.
         let text = input.get().trim().to_string();
@@ -419,6 +475,45 @@ fn app_view(
         // it's a registered command the GUI just doesn't implement, which gets
         // a notice instead of confusing the model.
         if let Some(rest) = text.strip_prefix('/') {
+            // Frontend-coupled scroll/search commands are handled locally
+            // (they drive the GUI's scroll container), like the TUI's local
+            // arms; everything else goes to the shared dispatcher.
+            {
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                let lcmd = hrdr_app::resolve_alias(parts.next().unwrap_or(""));
+                let larg = parts.next().unwrap_or("").trim().to_string();
+                let f = FindCtx {
+                    transcript,
+                    next_id,
+                    find_query,
+                    find_pos,
+                    ids: msg_ids_for_send.clone(),
+                    goto_view,
+                };
+                let handled = match lcmd {
+                    "goto" => {
+                        f.goto_cmd(&larg);
+                        true
+                    }
+                    "find" | "search" => {
+                        f.find_cmd(&larg);
+                        true
+                    }
+                    "next" => {
+                        f.cycle(true);
+                        true
+                    }
+                    "prev" | "previous" => {
+                        f.cycle(false);
+                        true
+                    }
+                    _ => false,
+                };
+                if handled {
+                    input.set(String::new());
+                    return;
+                }
+            }
             let mut host = GuiHost {
                 cx,
                 transcript,
@@ -435,13 +530,23 @@ fn app_view(
                 turn_start,
                 ttft,
                 show_reasoning,
+                timestamp_style,
+                todo_ttl,
+                todos: todos_for_send.clone(),
+                todos_sig,
+                todo_turn,
+                todo_completed_at: todo_stamps_for_send.clone(),
+                find_query,
+                find_pos,
+                ctx_window,
+                cfg: cfg_for_send.clone(),
                 queue: queue_for_send.clone(),
                 turn_handle: th_for_host.clone(),
                 spawn_turn: spawn_for_send.clone(),
                 clipboard: clipboard_for_send.clone(),
                 agent: agent_for_send.clone(),
                 tx: tx_for_send.clone(),
-                base_url: base_url_for_send.clone(),
+                base_url,
             };
             if hrdr_app::dispatch(&mut host, &text) {
                 input.set(String::new());
@@ -509,15 +614,56 @@ fn app_view(
     let cancel_esc = cancel.clone();
     let cancel_btn = cancel.clone();
 
+    let ids_for_render = msg_view_ids.clone();
     let transcript_view = scroll(
         dyn_stack(
             move || transcript.get(),
             |item: &Item| item.id,
-            move |item| render_item(item, theme, show_reasoning),
+            move |item| {
+                let view = render_item(item.clone(), theme, show_reasoning, timestamp_style);
+                // Register user/assistant views so /goto //find can scroll to
+                // them (re-registered whenever the item re-renders).
+                if let Some(n) = item.msg_no {
+                    ids_for_render.borrow_mut().insert(n, view.id());
+                }
+                view
+            },
         )
         .style(|s| s.flex_col().width_full().gap(10.0)),
     )
+    // Bring the /goto //find target into view when one is set.
+    .scroll_to_view(move || goto_view.get())
     .style(|s| s.flex_grow(1.0).width_full().padding(10.0));
+
+    // TODO panel (mirrors the TUI's): the model's task list, shown while
+    // non-empty; completed items age out via todo_ttl.
+    let todo_panel = dyn_stack(
+        move || todos_sig.get(),
+        |t: &hrdr_tools::TodoItem| format!("{}:{}", t.status, t.content),
+        move |t| {
+            let (glyph, color) = match t.status.as_str() {
+                "completed" => ("✓", theme.ok),
+                "in_progress" => ("▸", theme.tool),
+                _ => ("·", theme.dim),
+            };
+            let content = t.content.clone();
+            label(move || format!("{glyph} {content}"))
+                .style(move |s| s.color(color))
+                .into_any()
+        },
+    )
+    .style(move |s| {
+        let s = s
+            .flex_col()
+            .width_full()
+            .padding_horiz(10.0)
+            .padding_vert(4.0);
+        if todos_sig.with(Vec::is_empty) {
+            s.hide()
+        } else {
+            s
+        }
+    });
 
     let hist_up = history.clone();
     let hist_down = history.clone();
@@ -633,7 +779,7 @@ fn app_view(
     let status_bar = h_stack((
         label(move || {
             let (used, out) = usage.get().unwrap_or((0, 0));
-            let ctx = match ctx_window {
+            let ctx = match ctx_window.get() {
                 Some(w) => format!("{used} of {w}"),
                 None if used > 0 => format!("{used} tok"),
                 None => "—".to_string(),
@@ -666,7 +812,14 @@ fn app_view(
             .items_center()
     });
 
-    v_stack((transcript_view, completions, status_bar, input_row)).style(move |s| {
+    v_stack((
+        transcript_view,
+        todo_panel,
+        completions,
+        status_bar,
+        input_row,
+    ))
+    .style(move |s| {
         s.width_full()
             .height_full()
             .background(theme.bg)
@@ -690,7 +843,20 @@ fn push_item_scoped(
 ) {
     let id = next_id.get_untracked();
     next_id.set(id + 1);
-    transcript.update(|t| t.push(Item { id, body, scope }));
+    // User/assistant items get the next message number (matching the shared
+    // transcript numbering used by /copy msg, /find, /goto).
+    let msg_no = matches!(body, Body::User(_) | Body::Assistant(_)).then(|| {
+        transcript.with_untracked(|t| t.iter().filter(|i| i.msg_no.is_some()).count()) + 1
+    });
+    transcript.update(|t| {
+        t.push(Item {
+            id,
+            body,
+            scope,
+            time: chrono::Local::now(),
+            msg_no,
+        })
+    });
 }
 
 /// Clear the transcript and dispose each item's signal scope. Per-item signals
@@ -834,6 +1000,150 @@ fn copy_to_clipboard(
     }
 }
 
+/// Transcript search/jump state + helpers for the GUI-local `/find`, `/next`,
+/// `/prev`, and `/goto` (frontend-coupled: they drive the scroll container via
+/// the render-time message-number → ViewId registry). Mirrors the TUI's logic.
+#[derive(Clone)]
+struct FindCtx {
+    transcript: RwSignal<Vec<Item>>,
+    next_id: RwSignal<u64>,
+    find_query: RwSignal<Option<String>>,
+    find_pos: RwSignal<usize>,
+    ids: Rc<RefCell<std::collections::HashMap<usize, floem::ViewId>>>,
+    goto_view: RwSignal<Option<floem::ViewId>>,
+}
+
+impl FindCtx {
+    fn info(&self, msg: impl Into<String>) {
+        system(self.transcript, self.next_id, msg);
+    }
+    /// Number of user/assistant messages.
+    fn message_count(&self) -> usize {
+        self.transcript
+            .with_untracked(|t| t.iter().filter(|i| i.msg_no.is_some()).count())
+    }
+    /// Message numbers whose user/assistant text contains `query`.
+    fn hits(&self, query: &str) -> Vec<usize> {
+        let q = query.to_ascii_lowercase();
+        self.transcript.with_untracked(|t| {
+            t.iter()
+                .filter_map(|i| {
+                    let n = i.msg_no?;
+                    let text = match &i.body {
+                        Body::User(s) => s.clone(),
+                        Body::Assistant(a) => a.text.get_untracked(),
+                        _ => return None,
+                    };
+                    text.to_ascii_lowercase().contains(&q).then_some(n)
+                })
+                .collect()
+        })
+    }
+    /// Scroll to message number `n` via the render-time ViewId registry.
+    fn scroll_to_msg(&self, n: usize) {
+        let vid = self.ids.borrow().get(&n).copied();
+        if let Some(v) = vid {
+            self.goto_view.set(Some(v));
+        }
+    }
+    /// `/goto <N | 5m | 1h | top | end>`.
+    fn goto_cmd(&self, arg: &str) {
+        let count = self.message_count();
+        if count == 0 {
+            self.info("no messages to jump to yet");
+            return;
+        }
+        let a = arg.trim().to_ascii_lowercase();
+        let target = match a.as_str() {
+            "" => {
+                self.info("usage: /goto <N | 5m | 1h | top | end>");
+                return;
+            }
+            "top" | "start" | "first" => 1,
+            "end" | "bottom" | "last" => count,
+            _ => {
+                if let Ok(n) = a.parse::<usize>() {
+                    n.clamp(1, count)
+                } else if let Some(secs) = hrdr_app::parse_duration(&a) {
+                    let cutoff = chrono::Local::now() - chrono::Duration::seconds(secs);
+                    // First message at/after the cutoff; all older → the newest.
+                    self.transcript
+                        .with_untracked(|t| {
+                            t.iter()
+                                .find(|i| i.msg_no.is_some() && i.time >= cutoff)
+                                .and_then(|i| i.msg_no)
+                        })
+                        .unwrap_or(count)
+                } else {
+                    self.info("usage: /goto <N | 5m | 1h | top | end>");
+                    return;
+                }
+            }
+        };
+        self.scroll_to_msg(target);
+        self.info(format!("jumped to message #{target}"));
+    }
+    /// `/find <text>` — search + jump; no arg cycles; `clear` drops the search.
+    fn find_cmd(&self, arg: &str) {
+        if matches!(
+            arg.trim().to_ascii_lowercase().as_str(),
+            "clear" | "off" | "discard"
+        ) {
+            if self.find_query.get_untracked().is_some() {
+                self.find_query.set(None);
+                self.find_pos.set(0);
+                self.info("search cleared");
+            } else {
+                self.info("no active search");
+            }
+            return;
+        }
+        let arg = arg.trim();
+        if arg.is_empty() {
+            if self.find_query.get_untracked().is_none() {
+                self.info("usage: /find <text>");
+                return;
+            }
+        } else {
+            // A new query restarts cycling from the top.
+            if self.find_query.get_untracked().as_deref() != Some(arg) {
+                self.find_pos.set(0);
+            }
+            self.find_query.set(Some(arg.to_string()));
+        }
+        self.cycle(true);
+    }
+    /// Cycle to the next/previous match of the active query, wrapping.
+    fn cycle(&self, forward: bool) {
+        let Some(query) = self.find_query.get_untracked() else {
+            self.info("no active search — /find <text>");
+            return;
+        };
+        let hits = self.hits(&query);
+        if hits.is_empty() {
+            self.info(format!("no match for {query:?}"));
+            return;
+        }
+        let pos = self.find_pos.get_untracked();
+        let target = if forward {
+            hits.iter().copied().find(|&n| n > pos).unwrap_or(hits[0])
+        } else {
+            hits.iter()
+                .rev()
+                .copied()
+                .find(|&n| n < pos)
+                .unwrap_or(*hits.last().unwrap())
+        };
+        let idx = hits.iter().position(|&n| n == target).unwrap_or(0) + 1;
+        self.find_pos.set(target);
+        self.scroll_to_msg(target);
+        self.info(format!(
+            "match {idx}/{} for {query:?} → message #{target}",
+            hits.len()
+        ));
+    }
+}
+
 /// The GUI's [`hrdr_app::CommandHost`] — the capability surface the shared
 /// slash-command dispatcher drives. Holds clones of the reactive signals +
 /// agent handle + clipboard so the shared commands can mutate GUI state.
@@ -853,13 +1163,23 @@ struct GuiHost {
     turn_start: RwSignal<Option<Instant>>,
     ttft: RwSignal<Option<f64>>,
     show_reasoning: RwSignal<bool>,
+    timestamp_style: RwSignal<hrdr_app::TimestampStyle>,
+    todo_ttl: RwSignal<u64>,
+    todos: Arc<std::sync::Mutex<Vec<hrdr_tools::TodoItem>>>,
+    todos_sig: RwSignal<Vec<hrdr_tools::TodoItem>>,
+    todo_turn: RwSignal<u64>,
+    todo_completed_at: Rc<RefCell<std::collections::HashMap<String, u64>>>,
+    find_query: RwSignal<Option<String>>,
+    find_pos: RwSignal<usize>,
+    ctx_window: RwSignal<Option<u32>>,
+    cfg: Rc<AgentConfig>,
     queue: Rc<RefCell<VecDeque<String>>>,
     turn_handle: Rc<RefCell<Option<tokio::task::JoinHandle<()>>>>,
     spawn_turn: Rc<dyn Fn(String, bool)>,
     clipboard: Rc<RefCell<Option<hjkl_clipboard::Clipboard>>>,
     agent: Arc<TokioMutex<Agent>>,
     tx: tokio::sync::mpsc::UnboundedSender<UiMsg>,
-    base_url: String,
+    base_url: RwSignal<String>,
 }
 
 impl hrdr_app::CommandHost for GuiHost {
@@ -889,7 +1209,7 @@ impl hrdr_app::CommandHost for GuiHost {
             .unwrap_or_default()
     }
     fn base_url(&self) -> String {
-        self.base_url.clone()
+        self.base_url.get_untracked()
     }
     fn model(&self) -> String {
         self.model.get_untracked()
@@ -915,6 +1235,14 @@ impl hrdr_app::CommandHost for GuiHost {
             self.running.set(false);
         }
         self.queue.borrow_mut().clear();
+        if let Ok(mut t) = self.todos.lock() {
+            t.clear();
+        }
+        self.todos_sig.set(Vec::new());
+        self.todo_turn.set(0);
+        self.todo_completed_at.borrow_mut().clear();
+        self.find_query.set(None);
+        self.find_pos.set(0);
         clear_items(self.transcript);
         self.next_id.set(0);
         self.usage.set(None);
@@ -946,7 +1274,7 @@ impl hrdr_app::CommandHost for GuiHost {
         let existing = self.session_id.get_untracked();
         let label = self.session_label.get_untracked();
         let model = self.model.get_untracked();
-        let base_url = self.base_url.clone();
+        let base_url = self.base_url.get_untracked();
         let generation = self.save_gen.get_untracked();
         tokio::spawn(async move {
             if let Some(o) =
@@ -1017,13 +1345,14 @@ impl hrdr_app::CommandHost for GuiHost {
                 ),
             );
         }
-        if session.base_url != self.base_url {
+        let cur_url = self.base_url.get_untracked();
+        if session.base_url != cur_url {
             system(
                 self.transcript,
                 self.next_id,
                 format!(
-                    "note: session endpoint was {} (current: {})",
-                    session.base_url, self.base_url
+                    "note: session endpoint was {} (current: {cur_url})",
+                    session.base_url
                 ),
             );
         }
@@ -1135,6 +1464,44 @@ impl hrdr_app::CommandHost for GuiHost {
     fn files_changed(&mut self) {
         self.file_index.set(Vec::new());
     }
+    fn timestamp_style(&self) -> hrdr_app::TimestampStyle {
+        self.timestamp_style.get_untracked()
+    }
+    fn set_timestamp_style(&mut self, style: hrdr_app::TimestampStyle) {
+        self.timestamp_style.set(style);
+    }
+    fn todo_ttl(&self) -> u64 {
+        self.todo_ttl.get_untracked()
+    }
+    fn set_todo_ttl(&mut self, turns: u64) {
+        self.todo_ttl.set(turns);
+    }
+    fn reload_config(&mut self) {
+        // Re-read the display config and apply what the GUI can change live.
+        let ui = hrdr_app::UiConfig::load();
+        self.show_reasoning.set(ui.show_thinking);
+        self.timestamp_style
+            .set(hrdr_app::TimestampStyle::from_config(
+                ui.timestamps.as_deref(),
+            ));
+        self.todo_ttl.set(ui.todo_ttl);
+        system(
+            self.transcript,
+            self.next_id,
+            "reloaded config (thinking, timestamps, todo-ttl; theme needs a restart)",
+        );
+    }
+    fn resolve_provider(&self, name: &str) -> Option<hrdr_agent::ResolvedProvider> {
+        self.cfg.resolve_provider(name)
+    }
+    fn set_base_url(&mut self, url: String) {
+        self.base_url.set(url);
+    }
+    fn set_context_window(&mut self, tokens: Option<u32>) {
+        if tokens.is_some() {
+            self.ctx_window.set(tokens);
+        }
+    }
 }
 
 /// The assistant item currently being streamed into — the last item if it's an
@@ -1234,15 +1601,31 @@ fn handle_event(
 
 // ---- rendering ----------------------------------------------------------
 
-fn render_item(item: Item, th: GuiTheme, show_reasoning: RwSignal<bool>) -> AnyView {
-    match item.body {
-        Body::User(text) => v_stack((
-            label(|| "you").style(move |s| s.color(th.user).font_bold().margin_bottom(2.0)),
-            text_label(text),
-        ))
-        .into_any(),
+fn render_item(
+    item: Item,
+    th: GuiTheme,
+    show_reasoning: RwSignal<bool>,
+    timestamp_style: RwSignal<hrdr_app::TimestampStyle>,
+) -> AnyView {
+    // "#N role · time" header for user/assistant items, per /timestamps style.
+    let meta = |role: &'static str, accent: Color| {
+        let (n, time) = (item.msg_no.unwrap_or(0), item.time);
+        label(move || {
+            use hrdr_app::TimestampStyle;
+            match timestamp_style.get() {
+                TimestampStyle::None => format!("#{n} {role}"),
+                TimestampStyle::Relative => {
+                    format!("#{n} {role} · {}", hrdr_app::relative_time(time))
+                }
+                TimestampStyle::Exact => format!("#{n} {role} · {}", time.format("%H:%M")),
+            }
+        })
+        .style(move |s| s.color(accent).font_bold().margin_bottom(2.0))
+    };
+    match item.body.clone() {
+        Body::User(text) => v_stack((meta("you", th.user), text_label(text))).into_any(),
         Body::Assistant(a) => v_stack((
-            label(|| "assistant").style(move |s| s.color(th.dim).font_bold().margin_bottom(2.0)),
+            meta("assistant", th.dim),
             // Reasoning (dim); hidden when `/reasoning` is off or none streamed.
             label(move || a.reasoning.get()).style(move |s| {
                 if show_reasoning.get() && !a.reasoning.get().is_empty() {

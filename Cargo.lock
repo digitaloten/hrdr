@@ -2173,6 +2173,7 @@ name = "hrdr-gui"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "floem",
  "hjkl-clipboard",
  "hjkl-markdown",

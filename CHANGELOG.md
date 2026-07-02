@@ -8,6 +8,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **GUI feature parity, round two.** The GUI now covers everything but the
+  genuinely terminal-bound commands:
+  - **TODO panel** — the model's task list renders above the status bar (✓/▸/·
+    glyphs), refreshed as `todo_write` runs and aged out after `todo_ttl` turns
+    like the TUI's panel; `/todo-ttl` (shared implementation) adjusts and
+    persists the lifetime, and `/clear` resets the list.
+  - **Per-message timestamps** — user/assistant items get a `#N role · time`
+    header (relative or `HH:MM`), controlled by the now-shared `/timestamps`
+    command (persisted; `HRDR_TIMESTAMPS`/config honored at startup).
+  - **`/find`, `/next`, `/prev`, `/goto`** — transcript search and jump with
+    real scrolling: message numbers map to view ids at render time and the
+    transcript scroll brings the target into view (`/goto` accepts
+    `N | 5m | 1h | top | end`, using per-item timestamps for durations).
+  - **`/provider`** — switch provider presets (built-ins + `[providers.<name>]`
+    from config) with endpoint/model/context-window updates; the shared
+    implementation now also drives the TUI.
+  - **`/reload`** — re-reads the display config and applies what the GUI can
+    change live (thinking, timestamps, todo-ttl; theme needs a restart).
+  - `/timestamps`, `/todo-ttl`, and `/provider` moved into the shared dispatcher
+    (TUI local copies deleted); `TUI_ONLY_COMMANDS` is down to `/theme`,
+    `/statusbar`, and `/edit`.
+
 - **GUI feature parity, round one.** Twelve more commands moved into the shared
   `hrdr-app` dispatcher behind new `CommandHost` capabilities (busy-guard,
   send-prompt, input editing, clipboard read, tool-expansion, rewind-last-turn,
@@ -17,9 +39,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same shared implementations through its host adapter (its bespoke copies are
   deleted); only `/init`, `/compact`, and `/reload` keep richer TUI-local
   versions (pending-docs reload, compaction progress/queue machinery,
-  hot-reload). `TUI_ONLY_COMMANDS` shrinks to the genuinely terminal-coupled
-  set: `/provider`, `/theme`, `/timestamps`, `/statusbar`, `/todo-ttl`,
-  `/reload`, `/goto`, `/find`, `/next`, `/prev`, `/edit`.
+  hot-reload).
 
 - GUI behavior parity with the TUI:
   - **Input queueing** — messages submitted while a turn runs are queued and
@@ -38,11 +58,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     agent's cwd (after `/cwd` or a resumed session) and is invalidated by
     `/revert`.
   - `/init`'s instruction prompt (`hrdr_app::INIT_PROMPT`) is shared.
-
-  Still TUI-only, pending GUI rendering features: transcript search/jump
-  (`/find`/`/goto`), live theme swap, timestamps/status-bar modes, the TODO
-  panel (`/todo-ttl`), `$EDITOR` integration (`/edit`), `/provider`, and
-  `/reload`.
 
 ### Changed
 

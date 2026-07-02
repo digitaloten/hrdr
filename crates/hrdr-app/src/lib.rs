@@ -135,19 +135,7 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
 /// to the GUI). Canonical names; aliases resolve before matching. The GUI
 /// filters these out of completion and `/help`, and answers with a notice
 /// instead of sending the text to the model.
-pub const TUI_ONLY_COMMANDS: &[&str] = &[
-    "/provider",
-    "/theme",
-    "/timestamps",
-    "/statusbar",
-    "/todo-ttl",
-    "/reload",
-    "/goto",
-    "/find",
-    "/next",
-    "/prev",
-    "/edit",
-];
+pub const TUI_ONLY_COMMANDS: &[&str] = &["/theme", "/statusbar", "/edit"];
 
 /// Whether `cmd` (with or without the leading `/`; aliases welcome) is a
 /// TUI-only command per [`TUI_ONLY_COMMANDS`].

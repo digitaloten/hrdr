@@ -19,5 +19,6 @@ hjkl-clipboard.workspace = true
 hjkl-markdown.workspace = true
 syntect.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 tokio.workspace = true
 floem = { version = "0.2.0", features = ["tokio"] }

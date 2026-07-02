@@ -20,7 +20,6 @@ impl super::App {
         // are handled here; everything else falls through to the shared
         // `hrdr_app` dispatcher (so the TUI and GUI run one implementation).
         match cmd {
-            "provider" => self.switch_provider(arg),
             "theme" => {
                 let path = (!arg.is_empty()).then_some(arg);
                 self.theme = Theme::load(path);
@@ -44,9 +43,7 @@ impl super::App {
             "find" | "search" => self.find_cmd(arg),
             "next" => self.find_cycle(true),
             "prev" | "previous" => self.find_cycle(false),
-            "timestamps" | "ts" => self.timestamps_cmd(arg),
             "statusbar" => self.statusbar_cmd(arg),
-            "todo-ttl" | "todottl" | "todos" => self.todo_ttl_cmd(arg),
             // help, clear, model, models, tools, copy, diff, rename, thinking,
             // sessions, resume, export → shared dispatcher (TuiHost overrides
             // route /diff to the colored Entry::Diff rendering).
@@ -195,45 +192,6 @@ impl super::App {
         self.scroll_offset = 0;
         Some(text)
     }
-    fn switch_provider(&mut self, name: &str) {
-        if name.is_empty() {
-            self.system("usage: /provider <name>");
-            return;
-        }
-        let Some(p) = self.cfg.resolve_provider(name) else {
-            self.system(format!("unknown provider '{name}'"));
-            return;
-        };
-        let key = p
-            .api_key
-            .clone()
-            .or_else(|| p.key_env.as_ref().and_then(|e| std::env::var(e).ok()));
-        let switched = self
-            .with_agent(|a| {
-                a.set_endpoint(p.base_url.clone(), key);
-                if let Some(m) = &p.model {
-                    a.set_model(m.clone());
-                }
-            })
-            .is_some();
-        if !switched {
-            self.system("busy — try again after the current turn");
-            return;
-        }
-        if let Some(m) = &p.model {
-            self.model = m.clone();
-        }
-        if let Some(w) = p.context_window {
-            self.context_window = Some(w);
-        }
-        self.base_url = p.base_url.clone();
-        self.system(format!("provider → {name} ({})", p.base_url));
-        if !p.remote {
-            self.system(
-                "note: a running backend isn't restarted; relaunch hrdr for a local backend",
-            );
-        }
-    }
     /// `/goto <N | 5m | 1h | top | end>` — scroll the transcript to a message
     /// number, to the message nearest a relative time ago, or to top/bottom.
     fn goto_cmd(&mut self, arg: &str) {
@@ -378,60 +336,6 @@ impl super::App {
             StatusBarMode::None => "status bar: hidden",
             StatusBarMode::Truncate => "status bar: truncate",
             StatusBarMode::Wrap => "status bar: wrap",
-        });
-    }
-    /// `/todo-ttl [turns]` — how many turns a completed TODO stays visible
-    /// before it's pruned from the panel. No arg reports the current value.
-    fn todo_ttl_cmd(&mut self, arg: &str) {
-        let arg = arg.trim();
-        if arg.is_empty() {
-            self.system(format!(
-                "todo-ttl: {} turn{}",
-                self.todo_ttl,
-                if self.todo_ttl == 1 { "" } else { "s" }
-            ));
-            return;
-        }
-        match arg.parse::<u64>() {
-            Ok(n) => {
-                self.todo_ttl = n;
-                self.persist_setting("todo_ttl", hrdr_agent::ConfigValue::Int(n as i64));
-                self.system(format!(
-                    "todo-ttl → {n} turn{}",
-                    if n == 1 { "" } else { "s" }
-                ));
-            }
-            Err(_) => self.system("usage: /todo-ttl <turns> (a whole number, e.g. 5)"),
-        }
-    }
-    /// `/timestamps [none|relative|exact]` — set the timestamp style (no arg
-    /// toggles between off and relative).
-    fn timestamps_cmd(&mut self, arg: &str) {
-        let style = match arg.trim().to_ascii_lowercase().as_str() {
-            "" => {
-                if self.timestamp_style == TimestampStyle::None {
-                    TimestampStyle::Relative
-                } else {
-                    TimestampStyle::None
-                }
-            }
-            "none" | "off" | "hidden" => TimestampStyle::None,
-            "relative" | "rel" | "on" => TimestampStyle::Relative,
-            "exact" | "absolute" | "abs" => TimestampStyle::Exact,
-            _ => {
-                self.system("usage: /timestamps [none | relative | exact]");
-                return;
-            }
-        };
-        self.timestamp_style = style;
-        self.persist_setting(
-            "timestamps",
-            hrdr_agent::ConfigValue::Str(style.as_config_str()),
-        );
-        self.system(match style {
-            TimestampStyle::None => "timestamps: off",
-            TimestampStyle::Relative => "timestamps: relative",
-            TimestampStyle::Exact => "timestamps: exact (HH:MM)",
         });
     }
     /// Write `text` to the system clipboard, returning a status line (used by the
@@ -657,6 +561,29 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     }
     fn files_changed(&mut self) {
         self.app.file_index_cwd = None;
+    }
+    fn timestamp_style(&self) -> hrdr_app::TimestampStyle {
+        self.app.timestamp_style
+    }
+    fn set_timestamp_style(&mut self, style: hrdr_app::TimestampStyle) {
+        self.app.timestamp_style = style;
+    }
+    fn todo_ttl(&self) -> u64 {
+        self.app.todo_ttl
+    }
+    fn set_todo_ttl(&mut self, turns: u64) {
+        self.app.todo_ttl = turns;
+    }
+    fn resolve_provider(&self, name: &str) -> Option<hrdr_agent::ResolvedProvider> {
+        self.app.cfg.resolve_provider(name)
+    }
+    fn set_base_url(&mut self, url: String) {
+        self.app.base_url = url;
+    }
+    fn set_context_window(&mut self, tokens: Option<u32>) {
+        if tokens.is_some() {
+            self.app.context_window = tokens;
+        }
     }
     fn help_tips(&self) -> Option<String> {
         Some(HELP_TIPS.to_string())
