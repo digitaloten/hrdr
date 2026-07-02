@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-02
+
 ### Added
 
 - **Release pipeline**, mirroring gpur's: pushing a `v*` tag now builds the
@@ -873,4 +875,5 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/commits/main
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/kryptic-sh/hrdr/releases/tag/v0.1.0
