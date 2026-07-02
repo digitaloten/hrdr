@@ -2180,7 +2180,6 @@ dependencies = [
  "hrdr-agent",
  "hrdr-app",
  "hrdr-tools",
- "syntect",
  "tokio",
 ]
 

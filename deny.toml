@@ -15,6 +15,12 @@ ignore = [
   # bumps its stack.
   { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive via floem → wgpu → metal" },
   { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; transitive via floem → cosmic-text" },
+  # Quadratic runtime parsing attacker-controlled XML attributes; patched only
+  # in quick-xml >= 0.41, which neither dependent allows yet (plist/syntect,
+  # wayland-scanner). Our quick-xml inputs are trusted, bundled data (syntect
+  # theme/syntax dumps; Wayland protocol codegen at build time), not
+  # attacker-controlled. Re-check when plist/wayland-scanner bump.
+  { id = "RUSTSEC-2026-0194", reason = "quick-xml DoS needs untrusted XML; ours parses trusted bundled data; no upgrade path yet" },
 ]
 
 [licenses]

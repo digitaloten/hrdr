@@ -17,7 +17,6 @@ hrdr-app.workspace = true
 hrdr-tools.workspace = true
 hjkl-clipboard.workspace = true
 hjkl-markdown.workspace = true
-syntect.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 tokio.workspace = true
