@@ -52,6 +52,104 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **Auto-save** — `hrdr_app::save_agent_session` (lock, snapshot, persist)
     replaces the GUI's two hand-rolled copies.
 
+- Slash commands now have a **shared implementation** in `hrdr-app` behind a
+  `CommandHost` trait, so the TUI and GUI drive one dispatcher
+  (`hrdr_app::dispatch`) instead of each reimplementing commands — a new command
+  benefits both frontends for free. The shared set is `/help`, `/clear`,
+  `/model`, `/models`, `/tools`, `/info`, `/copy`, `/export`, `/rename`,
+  `/diff`, `/thinking`, `/sessions`, `/resume`; async work (network, subprocess,
+  filesystem, agent lock) is expressed as a future the host spawns and reports.
+  As a result the **GUI gains `/export`** (write the conversation as Markdown or
+  `--json`), **`/rename`** (name the session; later auto-saves reuse it), and
+  **`/diff`** (the working-tree `git diff`). Frontend-coupled or richer commands
+  stay local (the TUI keeps its `msg N[-M]` `/copy`, detailed `/info`, and
+  colored `/diff`, plus scrolling/find/goto/expand/theme/editor). New shared
+  cores: `git_working_diff` and `export_conversation`
+  (`conversation_to_markdown`/`_json`).
+
+- Showing the model's `<think>` reasoning is now a first-class setting:
+  `show_thinking` in config, `--show-thinking on|off|1|0`, and
+  `$HRDR_SHOW_THINKING` (default on). A new `/thinking [on|off|1|0]` slash
+  command toggles it at runtime and persists to config (no arg flips it);
+  `/reasoning` is now an alias of it. Both frontends honor the config value at
+  startup; the TUI also re-reads it on config hot-reload. The bool parser
+  (`1`/`0`, `on`/`off`, `true`/`false`, `yes`/`no`) is exposed as
+  `hrdr_agent::parse_env_bool`.
+
+- Tool output in the TUI now renders on a distinct panel background (the same
+  shade as fenced code blocks) so each tool call reads as a self-contained
+  block, and **clicking a tool block toggles its full output** — a per-entry
+  `/expand` by mouse. The truncation hint reflects it
+  (`… (+N more lines · click or /expand)` /
+  `⌃ (click or /expand off to collapse)`); the click is hit-tested against the
+  tool's on-screen rows (accounting for wrapping + scroll).
+
+- Internal: the TUI `App` is now render- and terminal-I/O-agnostic — a first
+  step toward a GUI frontend sharing the same core. The ratatui event loop +
+  terminal ownership moved out of `impl App` into a new `tui` driver module;
+  `App`'s only ratatui type (`Rect` for the follow-button hit-box) became a
+  plain `HitRect`. `App` is now a drivable state machine (input in, view-state
+  out); its sole remaining UI-lib dependency is `crossterm`'s
+  `KeyEvent`/`MouseEvent` as input DTOs. No behavior change.
+
+- CI now mirrors the kryptic-sh canonical layout (referenced from hjkl): `fmt`,
+  `clippy` (3 OSes), `cargo-machete` (unused-deps lint), `test` (nextest +
+  doctests on 3 OSes), and a cross-platform release `build` job. No release/
+  packaging jobs yet.
+
+- The context bar and auto-compaction keep working when the server reports no
+  token usage. hrdr asks for usage (`stream_options.include_usage`), but servers
+  that ignore it left the "used" count stale at 0. Turns now fall back to a
+  rough `~4 chars/token` estimate of the prompt + completion when the server
+  sends no usage chunk, so the status bar and the auto-compact threshold still
+  track context growth (the overflow-retry path still covers any
+  under-estimate).
+
+- The managed local backend is now **infr-first**. If
+  [`infr`](https://github.com/kryptic-sh/infr) is on `PATH`, hrdr spawns
+  `infr serve <model> --addr <ip:port>` (native `tools`/`tool_calls`, SSE, GGUF
+  Jinja chat template) as the default backend; it falls back to `llama-server`
+  (llama.cpp, `--jinja`) when infr isn't installed, and errors clearly if
+  neither is present. A backend already answering at `--base-url` is still
+  reused. The `--backend-model` ref works for both;
+  `--backend-arg`/`--backend-ctx` apply to the llama.cpp fallback (infr is tuned
+  via `INFR_*` env vars). Spawn logs go to `~/.cache/hrdr/infr-serve.log` or
+  `llama-server.log`. Dropped the "temporary" framing — infr's serve path now
+  has full tool support. The default spawned model is now `Qwen3-8B` (Q4_K_M),
+  down from the 30B-A3B MoE, for a smaller download and faster startup.
+- Finished TODO items now age out of the panel. A completed item stays visible
+  for the turn it finishes plus four more (five turns total), then it's pruned —
+  so the list keeps showing recent progress without accreting stale checkmarks.
+  Pending / in-progress items are never pruned, and an item re-completed after
+  being reopened ages from scratch. The lifetime is configurable via `todo_ttl`
+  in config, `--todo-ttl <turns>`, `$HRDR_TODO_TTL`, or the `/todo-ttl [turns]`
+  slash command (which persists to config); no arg reports the current value.
+  Default 5; hot-reloadable like the other display settings.
+- The status-bar context readout is simpler — just `{used} of {max}` (no
+  percentage or `ctx` label). The used/free fill bar and its green→amber→red
+  escalation are unchanged (they already convey the fraction visually).
+- Time-to-first-token (TTFT) is now reported — how long the provider took to
+  send the first streamed token. The TUI shows `ttft {n.nn}s` on the generating
+  loader (live) and on the persistent per-turn `✓` stats line; the GUI shows it
+  in the status bar (measured from send to the first `Text`/`Reasoning` event,
+  kept until the next turn).
+- hjkl dependencies now come from crates.io (registry pins `hjkl-* = "0.33"`)
+  instead of `../hjkl/...` path deps against the sibling repo. hjkl was
+  published to crates.io at 0.33.3. CI is now standalone — the second checkout
+  of `kryptic-sh/hjkl` alongside hrdr is gone; each job checks out hrdr only.
+- The status bar has a configurable mode — `truncate` (default), `wrap`, or
+  `none` — via `statusbar` in config, `--statusbar <mode>`, `$HRDR_STATUSBAR`,
+  or `/statusbar [none|truncate|wrap]` (no arg cycles). `truncate` drops the
+  least-important sections (effort, then in/out tokens, then git branch, then
+  model) until it fits one row, keeping the cwd and context bar and showing a
+  trailing `…`; `wrap` packs every section across up to four rows; `none` hides
+  the bar entirely.
+- Quitting now requires a double Ctrl+C: the first idle Ctrl+C arms a confirm
+  (any other key/mouse action disarms it) and shows a "Press Ctrl+C again to
+  quit" banner on the input box's top border (taking priority over the follow
+  button); a second consecutive Ctrl+C quits. While a turn is running the first
+  Ctrl+C still interrupts it. Ctrl+Q remains an immediate quit.
+
 ### Fixed
 
 - GUI: per-message signals no longer leak. Every assistant/tool item created its
@@ -227,106 +325,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Scrollbar thumb position: it now reaches the bottom when following the output
   (was stuck midway) — `content_length` is the number of scroll positions, not
   the raw line total, matching ratatui's `position` mapping.
-
-### Changed
-
-- Slash commands now have a **shared implementation** in `hrdr-app` behind a
-  `CommandHost` trait, so the TUI and GUI drive one dispatcher
-  (`hrdr_app::dispatch`) instead of each reimplementing commands — a new command
-  benefits both frontends for free. The shared set is `/help`, `/clear`,
-  `/model`, `/models`, `/tools`, `/info`, `/copy`, `/export`, `/rename`,
-  `/diff`, `/thinking`, `/sessions`, `/resume`; async work (network, subprocess,
-  filesystem, agent lock) is expressed as a future the host spawns and reports.
-  As a result the **GUI gains `/export`** (write the conversation as Markdown or
-  `--json`), **`/rename`** (name the session; later auto-saves reuse it), and
-  **`/diff`** (the working-tree `git diff`). Frontend-coupled or richer commands
-  stay local (the TUI keeps its `msg N[-M]` `/copy`, detailed `/info`, and
-  colored `/diff`, plus scrolling/find/goto/expand/theme/editor). New shared
-  cores: `git_working_diff` and `export_conversation`
-  (`conversation_to_markdown`/`_json`).
-
-- Showing the model's `<think>` reasoning is now a first-class setting:
-  `show_thinking` in config, `--show-thinking on|off|1|0`, and
-  `$HRDR_SHOW_THINKING` (default on). A new `/thinking [on|off|1|0]` slash
-  command toggles it at runtime and persists to config (no arg flips it);
-  `/reasoning` is now an alias of it. Both frontends honor the config value at
-  startup; the TUI also re-reads it on config hot-reload. The bool parser
-  (`1`/`0`, `on`/`off`, `true`/`false`, `yes`/`no`) is exposed as
-  `hrdr_agent::parse_env_bool`.
-
-- Tool output in the TUI now renders on a distinct panel background (the same
-  shade as fenced code blocks) so each tool call reads as a self-contained
-  block, and **clicking a tool block toggles its full output** — a per-entry
-  `/expand` by mouse. The truncation hint reflects it
-  (`… (+N more lines · click or /expand)` /
-  `⌃ (click or /expand off to collapse)`); the click is hit-tested against the
-  tool's on-screen rows (accounting for wrapping + scroll).
-
-- Internal: the TUI `App` is now render- and terminal-I/O-agnostic — a first
-  step toward a GUI frontend sharing the same core. The ratatui event loop +
-  terminal ownership moved out of `impl App` into a new `tui` driver module;
-  `App`'s only ratatui type (`Rect` for the follow-button hit-box) became a
-  plain `HitRect`. `App` is now a drivable state machine (input in, view-state
-  out); its sole remaining UI-lib dependency is `crossterm`'s
-  `KeyEvent`/`MouseEvent` as input DTOs. No behavior change.
-
-- CI now mirrors the kryptic-sh canonical layout (referenced from hjkl): `fmt`,
-  `clippy` (3 OSes), `cargo-machete` (unused-deps lint), `test` (nextest +
-  doctests on 3 OSes), and a cross-platform release `build` job. No release/
-  packaging jobs yet.
-
-- The context bar and auto-compaction keep working when the server reports no
-  token usage. hrdr asks for usage (`stream_options.include_usage`), but servers
-  that ignore it left the "used" count stale at 0. Turns now fall back to a
-  rough `~4 chars/token` estimate of the prompt + completion when the server
-  sends no usage chunk, so the status bar and the auto-compact threshold still
-  track context growth (the overflow-retry path still covers any
-  under-estimate).
-
-- The managed local backend is now **infr-first**. If
-  [`infr`](https://github.com/kryptic-sh/infr) is on `PATH`, hrdr spawns
-  `infr serve <model> --addr <ip:port>` (native `tools`/`tool_calls`, SSE, GGUF
-  Jinja chat template) as the default backend; it falls back to `llama-server`
-  (llama.cpp, `--jinja`) when infr isn't installed, and errors clearly if
-  neither is present. A backend already answering at `--base-url` is still
-  reused. The `--backend-model` ref works for both;
-  `--backend-arg`/`--backend-ctx` apply to the llama.cpp fallback (infr is tuned
-  via `INFR_*` env vars). Spawn logs go to `~/.cache/hrdr/infr-serve.log` or
-  `llama-server.log`. Dropped the "temporary" framing — infr's serve path now
-  has full tool support. The default spawned model is now `Qwen3-8B` (Q4_K_M),
-  down from the 30B-A3B MoE, for a smaller download and faster startup.
-- Finished TODO items now age out of the panel. A completed item stays visible
-  for the turn it finishes plus four more (five turns total), then it's pruned —
-  so the list keeps showing recent progress without accreting stale checkmarks.
-  Pending / in-progress items are never pruned, and an item re-completed after
-  being reopened ages from scratch. The lifetime is configurable via `todo_ttl`
-  in config, `--todo-ttl <turns>`, `$HRDR_TODO_TTL`, or the `/todo-ttl [turns]`
-  slash command (which persists to config); no arg reports the current value.
-  Default 5; hot-reloadable like the other display settings.
-- The status-bar context readout is simpler — just `{used} of {max}` (no
-  percentage or `ctx` label). The used/free fill bar and its green→amber→red
-  escalation are unchanged (they already convey the fraction visually).
-- Time-to-first-token (TTFT) is now reported — how long the provider took to
-  send the first streamed token. The TUI shows `ttft {n.nn}s` on the generating
-  loader (live) and on the persistent per-turn `✓` stats line; the GUI shows it
-  in the status bar (measured from send to the first `Text`/`Reasoning` event,
-  kept until the next turn).
-- hjkl dependencies now come from crates.io (registry pins `hjkl-* = "0.33"`)
-  instead of `../hjkl/...` path deps against the sibling repo. hjkl was
-  published to crates.io at 0.33.3. CI is now standalone — the second checkout
-  of `kryptic-sh/hjkl` alongside hrdr is gone; each job checks out hrdr only.
-- The status bar has a configurable mode — `truncate` (default), `wrap`, or
-  `none` — via `statusbar` in config, `--statusbar <mode>`, `$HRDR_STATUSBAR`,
-  or `/statusbar [none|truncate|wrap]` (no arg cycles). `truncate` drops the
-  least-important sections (effort, then in/out tokens, then git branch, then
-  model) until it fits one row, keeping the cwd and context bar and showing a
-  trailing `…`; `wrap` packs every section across up to four rows; `none` hides
-  the bar entirely.
-- Quitting now requires a double Ctrl+C: the first idle Ctrl+C arms a confirm
-  (any other key/mouse action disarms it) and shows a "Press Ctrl+C again to
-  quit" banner on the input box's top border (taking priority over the follow
-  button); a second consecutive Ctrl+C quits. While a turn is running the first
-  Ctrl+C still interrupts it. Ctrl+Q remains an immediate quit.
 
 ### Added
 
