@@ -160,9 +160,13 @@ enum UiMsg {
     System(String),
     /// A completed turn was auto-saved; carries the session id and whether this
     /// was the first save (so the UI thread can adopt the id and notify once).
+    /// `generation` is the save-generation at spawn time: `/clear` bumps it, so
+    /// a save that raced a clear is ignored instead of resurrecting the old
+    /// session id (which would make the next conversation overwrite its file).
     Saved {
         id: String,
         first_save: bool,
+        generation: u64,
     },
 }
 
@@ -236,6 +240,9 @@ fn app_view(
     // Display-name override for the session (`/rename`); `None` derives it from
     // the first user message.
     let session_label: RwSignal<Option<String>> = create_rw_signal(None);
+    // Save generation: bumped by `/clear` so an in-flight save's late `Saved`
+    // message can be told apart from one belonging to the current conversation.
+    let save_gen: RwSignal<u64> = create_rw_signal(0);
     // Whether to show the model's `<think>` reasoning (`/thinking` toggles);
     // initial value from config (`show_thinking`).
     let show_reasoning = create_rw_signal(show_thinking);
@@ -277,7 +284,17 @@ fn app_view(
                 }
             }
             UiMsg::System(s) => push_item(transcript, next_id, Body::System(s)),
-            UiMsg::Saved { id, first_save } => {
+            UiMsg::Saved {
+                id,
+                first_save,
+                generation,
+            } => {
+                // Stale save (a /clear happened after the turn spawned) —
+                // adopting its id would attach the next conversation to the
+                // old session's file.
+                if generation != save_gen.get_untracked() {
+                    return;
+                }
                 if first_save {
                     system(
                         transcript,
@@ -316,6 +333,9 @@ fn app_view(
                 model,
                 session_id,
                 session_label,
+                save_gen,
+                turn_start,
+                ttft,
                 show_reasoning,
                 clipboard: clipboard.clone(),
                 agent: agent.clone(),
@@ -349,6 +369,7 @@ fn app_view(
         let session_label = session_label.get_untracked();
         let cur_model = model.get_untracked();
         let base_url = base_url.clone();
+        let generation = save_gen.get_untracked();
         let handle = tokio::spawn(async move {
             let tx_ev = tx.clone();
             let result = agent
@@ -375,6 +396,7 @@ fn app_view(
                 let _ = tx.send(UiMsg::Saved {
                     id: o.id,
                     first_save: o.first_save,
+                    generation,
                 });
             }
         });
@@ -755,6 +777,9 @@ struct GuiHost {
     model: RwSignal<String>,
     session_id: RwSignal<Option<String>>,
     session_label: RwSignal<Option<String>>,
+    save_gen: RwSignal<u64>,
+    turn_start: RwSignal<Option<Instant>>,
+    ttft: RwSignal<Option<f64>>,
     show_reasoning: RwSignal<bool>,
     clipboard: Rc<RefCell<Option<hjkl_clipboard::Clipboard>>>,
     agent: Arc<TokioMutex<Agent>>,
@@ -800,10 +825,21 @@ impl hrdr_app::CommandHost for GuiHost {
         self.transcript.update(|t| t.clear());
         self.next_id.set(0);
         self.usage.set(None);
+        self.turn_start.set(None);
+        self.ttft.set(None); // don't show the previous session's ttft
         self.session_id.set(None); // detach; the next turn starts a new session
         self.session_label.set(None);
-        let agent = self.agent.clone();
-        tokio::spawn(async move { agent.lock().await.clear() });
+        // Invalidate any in-flight turn's pending auto-save (see UiMsg::Saved).
+        self.save_gen.update(|g| *g += 1);
+        // Clear synchronously when the lock is free (always, when no turn is
+        // running) so an immediately-following send can't win the agent lock
+        // before the clear; fall back to a task otherwise.
+        if let Ok(mut a) = self.agent.try_lock() {
+            a.clear();
+        } else {
+            let agent = self.agent.clone();
+            tokio::spawn(async move { agent.lock().await.clear() });
+        }
     }
     fn session_id(&self) -> Option<String> {
         self.session_id.get_untracked()
@@ -818,6 +854,7 @@ impl hrdr_app::CommandHost for GuiHost {
         let label = self.session_label.get_untracked();
         let model = self.model.get_untracked();
         let base_url = self.base_url.clone();
+        let generation = self.save_gen.get_untracked();
         tokio::spawn(async move {
             let (msgs, cwd) = {
                 let a = agent.lock().await;
@@ -834,6 +871,7 @@ impl hrdr_app::CommandHost for GuiHost {
                 let _ = tx.send(UiMsg::Saved {
                     id: o.id,
                     first_save: o.first_save,
+                    generation,
                 });
             }
         });
@@ -843,15 +881,24 @@ impl hrdr_app::CommandHost for GuiHost {
         self.model.set(session.model.clone());
         self.session_id.set(Some(id));
         self.session_label.set(Some(session.name.clone()));
+        // Pending saves from before the resume belong to the old conversation.
+        self.save_gen.update(|g| *g += 1);
         rebuild_transcript(self.cx, self.transcript, self.next_id, &session.messages);
-        let agent = self.agent.clone();
+        // Synchronous when the lock is free (see clear_conversation) so a
+        // send right after /resume can't race the message swap.
         let msgs = session.messages.clone();
         let m = session.model.clone();
-        tokio::spawn(async move {
-            let mut a = agent.lock().await;
+        if let Ok(mut a) = self.agent.try_lock() {
             a.set_messages(msgs);
             a.set_model(m);
-        });
+        } else {
+            let agent = self.agent.clone();
+            tokio::spawn(async move {
+                let mut a = agent.lock().await;
+                a.set_messages(msgs);
+                a.set_model(m);
+            });
+        }
         system(
             self.transcript,
             self.next_id,
@@ -892,9 +939,14 @@ fn current_assistant(
 }
 
 fn find_tool(transcript: RwSignal<Vec<Item>>, call_id: &str) -> Option<Tool> {
+    // Newest-first and live-only: backends that restart ids each turn
+    // (`call_0`, `call_1`, …) must not update a finished tool from an earlier
+    // turn (which would also leave the new tool spinning forever).
     transcript.with_untracked(|t| {
-        t.iter().find_map(|i| match &i.body {
-            Body::Tool(tool) if tool.call_id == call_id => Some(tool.clone()),
+        t.iter().rev().find_map(|i| match &i.body {
+            Body::Tool(tool) if tool.call_id == call_id && !tool.done.get_untracked() => {
+                Some(tool.clone())
+            }
             _ => None,
         })
     })

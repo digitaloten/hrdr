@@ -258,16 +258,16 @@ struct FileConfig {
     providers: HashMap<String, ProviderConfig>,
 }
 
+/// `hrdr`'s config directory — `$XDG_CONFIG_HOME/hrdr`, default
+/// `~/.config/hrdr` (cross-platform via home-dir detection). Shared by
+/// `config.toml` loading and the global `AGENTS.md` lookup so the two can't
+/// diverge.
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    hjkl_xdg::config_dir("hrdr").ok()
+}
+
 fn config_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    Some(
-        std::path::PathBuf::from(home)
-            .join(".config")
-            .join("hrdr")
-            .join("config.toml"),
-    )
+    Some(config_dir()?.join("config.toml"))
 }
 
 impl AgentConfig {
@@ -372,11 +372,16 @@ impl AgentConfig {
                 set(self, v);
             }
         }
-        let env_key = std::env::var("HRDR_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .ok();
-        if env_key.is_some() {
-            self.api_key = env_key;
+        // HRDR_API_KEY always wins. OPENAI_API_KEY — commonly exported for
+        // unrelated tools — is only a last-resort fallback when nothing else
+        // set a key; it must not override a config-file key destined for a
+        // non-OpenAI endpoint.
+        if let Ok(k) = std::env::var("HRDR_API_KEY") {
+            self.api_key = Some(k);
+        } else if self.api_key.is_none()
+            && let Ok(k) = std::env::var("OPENAI_API_KEY")
+        {
+            self.api_key = Some(k);
         }
     }
 }
@@ -723,17 +728,29 @@ impl Agent {
             trigger.push_str("\n\nAdditional instructions for the summary, follow them closely:\n");
             trigger.push_str(extra);
         }
-        let mut req = Vec::with_capacity(before + 1);
-        req.push(ChatMessage::system(COMPACT_SYSTEM.to_string()));
-        req.extend(self.messages.iter().skip(1).cloned());
-        req.push(ChatMessage::user(trigger));
-
-        let mut stream = self.client.chat_stream(req, vec![]).await?;
-        let mut acc = Accumulator::new();
-        while let Some(chunk) = stream.next().await {
-            acc.push(&chunk?);
-        }
-        let summary = acc.into_message().content.unwrap_or_default();
+        // When compaction is overflow-triggered, the summarization request is
+        // itself near the limit (versus the failed request it only drops the
+        // `tools[]` block). If it overflows too, shrink what the summarizer
+        // sees and retry: first elide bulky tool results, then keep only the
+        // most recent half/quarter/eighth of the conversation.
+        let full: Vec<ChatMessage> = self.messages.iter().skip(1).cloned().collect();
+        let mut stage = 0usize;
+        let summary = loop {
+            let history = match stage {
+                0 => full.clone(),
+                1 => elide_tool_results(&full),
+                n => tail_window(&elide_tool_results(&full), 1 << (n - 1)),
+            };
+            let mut req = Vec::with_capacity(history.len() + 2);
+            req.push(ChatMessage::system(COMPACT_SYSTEM.to_string()));
+            req.extend(history);
+            req.push(ChatMessage::user(trigger.clone()));
+            match self.plain_completion(req).await {
+                Ok(s) => break s,
+                Err(e) if is_context_overflow(&e) && stage < 4 => stage += 1,
+                Err(e) => return Err(e),
+            }
+        };
         if summary.trim().is_empty() {
             bail!("compaction produced an empty summary");
         }
@@ -748,6 +765,16 @@ impl Agent {
         );
         self.messages = vec![system, ChatMessage::user(continuation)];
         Ok((before, self.messages.len()))
+    }
+
+    /// Run one no-tools request to completion, returning the streamed text.
+    async fn plain_completion(&self, req: Vec<ChatMessage>) -> Result<String> {
+        let mut stream = self.client.chat_stream(req, vec![]).await?;
+        let mut acc = Accumulator::new();
+        while let Some(chunk) = stream.next().await {
+            acc.push(&chunk?);
+        }
+        Ok(acc.into_message().content.unwrap_or_default())
     }
 
     /// Run one user turn to completion, emitting events as it goes.
@@ -972,6 +999,43 @@ fn is_context_overflow(e: &anyhow::Error) -> bool {
         || msg.contains("reduce the length")
 }
 
+/// Max bytes of a tool-result body kept when shrinking a compaction request.
+const ELIDE_TOOL_RESULT_BYTES: usize = 400;
+
+/// Copy of `msgs` with bulky tool-result bodies truncated — tool output is the
+/// usual context hog, and the summarizer mostly needs the surrounding turns.
+fn elide_tool_results(msgs: &[ChatMessage]) -> Vec<ChatMessage> {
+    msgs.iter()
+        .map(|m| {
+            let Some(c) = &m.content else {
+                return m.clone();
+            };
+            if m.role != Role::Tool || c.len() <= ELIDE_TOOL_RESULT_BYTES {
+                return m.clone();
+            }
+            let cut = hrdr_tools::floor_char_boundary(c, ELIDE_TOOL_RESULT_BYTES);
+            let mut m = m.clone();
+            m.content = Some(format!(
+                "{}\n…[tool output elided for compaction]",
+                &c[..cut]
+            ));
+            m
+        })
+        .collect()
+}
+
+/// The most recent `1/div` of `msgs` (at least two messages), aligned forward
+/// past any leading `role:"tool"` results so no result is orphaned from its
+/// assistant `tool_calls` message (strict servers reject that).
+fn tail_window(msgs: &[ChatMessage], div: usize) -> Vec<ChatMessage> {
+    let keep = (msgs.len() / div.max(1)).clamp(2, msgs.len());
+    let mut start = msgs.len() - keep;
+    while start < msgs.len() && msgs[start].role == Role::Tool {
+        start += 1;
+    }
+    msgs[start..].to_vec()
+}
+
 /// Exponential backoff for retry `attempt` (1-based), capped at 8s.
 fn retry_backoff(attempt: usize) -> std::time::Duration {
     let secs = 0.5 * 2f64.powi((attempt as i32 - 1).max(0));
@@ -1044,9 +1108,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        Agent, AgentConfig, ENV_SETTERS, FileConfig, ProviderConfig, builtin_provider,
-        estimate_tokens, estimate_tokens_in_messages, in_git_repo, is_context_overflow,
-        is_transient, parse_env_bool, repair_dangling_tool_calls,
+        Agent, AgentConfig, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig, ProviderConfig,
+        builtin_provider, elide_tool_results, estimate_tokens, estimate_tokens_in_messages,
+        in_git_repo, is_context_overflow, is_transient, parse_env_bool, repair_dangling_tool_calls,
+        tail_window,
     };
     use crate::cwd_slug;
     use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
@@ -1375,6 +1440,41 @@ mod tests {
                 "expected context overflow for: {msg}"
             );
         }
+    }
+
+    // ---- compaction shrink helpers ----
+
+    #[test]
+    fn elide_tool_results_truncates_only_bulky_tool_bodies() {
+        let big = "x".repeat(ELIDE_TOOL_RESULT_BYTES + 100);
+        let msgs = vec![
+            ChatMessage::user(big.clone()),
+            ChatMessage::tool_result("a", big),
+            ChatMessage::tool_result("b", "small"),
+        ];
+        let out = elide_tool_results(&msgs);
+        // User content untouched, small tool result untouched, big one cut.
+        assert_eq!(out[0].content, msgs[0].content);
+        assert!(out[1].content.as_ref().unwrap().contains("elided"));
+        assert!(out[1].content.as_ref().unwrap().len() < msgs[1].content.as_ref().unwrap().len());
+        assert_eq!(out[2].content.as_deref(), Some("small"));
+    }
+
+    #[test]
+    fn tail_window_never_starts_on_a_tool_result() {
+        // Halving this history would start the window on a tool result,
+        // orphaning it from its assistant tool_calls message.
+        let msgs = vec![
+            ChatMessage::user("1"),
+            ChatMessage::user("2"),
+            assistant_with_calls(&["a"]),
+            ChatMessage::tool_result("a", "r"),
+            ChatMessage::assistant("done"),
+            ChatMessage::user("3"),
+        ];
+        let out = tail_window(&msgs, 2);
+        assert!(out[0].role != Role::Tool, "window starts on a tool result");
+        assert!(!out.is_empty() && out.len() < msgs.len());
     }
 
     // ---- repair_dangling_tool_calls (additional cases) ----

@@ -223,8 +223,14 @@ fn parse_ddg(html: &str, n: usize) -> Vec<Hit> {
         let title = collapse_ws(&decode_entities(&strip_tags(&html[after..after + close])));
         let url = clean_ddg_url(&href);
 
-        // Snippet: the next result__snippet anchor's text.
-        let snippet = html[after..]
+        // Snippet: the next result__snippet anchor's text — but only within
+        // this result's block (bounded by the next result link), else a
+        // snippet-less result would steal the following result's snippet.
+        let block_end = html[after..]
+            .find("result__a")
+            .map(|r| after + r)
+            .unwrap_or(html.len());
+        let snippet = html[after..block_end]
             .find("result__snippet")
             .and_then(|srel| {
                 let s = after + srel;

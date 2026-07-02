@@ -598,8 +598,13 @@ impl Tool for GlobTool {
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: GlobArgs = serde_json::from_value(args).context("invalid glob args")?;
-        let joined = ctx.cwd.join(&a.pattern);
-        let pat = joined.to_string_lossy().to_string();
+        // Escape the cwd prefix: only the user's pattern is glob syntax. A cwd
+        // containing `[`, `*`, or `?` must match literally.
+        let cwd_escaped = glob::Pattern::escape(&ctx.cwd.to_string_lossy());
+        let pat = std::path::Path::new(&cwd_escaped)
+            .join(&a.pattern)
+            .to_string_lossy()
+            .to_string();
         let mut paths: Vec<String> = glob::glob(&pat)
             .with_context(|| format!("invalid glob pattern: {pat}"))?
             .filter_map(|r| r.ok())
@@ -653,9 +658,10 @@ impl Tool for TodoTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let items = parse_todos(args).context("invalid todo_write args")?;
         let rendered = render_todos(&items);
-        if let Ok(mut todos) = ctx.todos.lock() {
-            *todos = items;
-        }
+        // A poisoned lock must not silently report success with a stale list.
+        *ctx.todos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = items;
         Ok(rendered)
     }
 }

@@ -143,7 +143,9 @@ pub fn git_branch(cwd: &Path) -> Option<String> {
         if git.is_file()
             && let Ok(content) = std::fs::read_to_string(&git)
             && let Some(p) = content.strip_prefix("gitdir:")
-            && let Ok(head) = std::fs::read_to_string(Path::new(p.trim()).join("HEAD"))
+            // A relative gitdir (submodules, worktrees) is relative to the
+            // directory containing the `.git` file, not the process cwd.
+            && let Ok(head) = std::fs::read_to_string(d.join(p.trim()).join("HEAD"))
         {
             return parse_head(&head);
         }

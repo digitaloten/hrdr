@@ -8,6 +8,64 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Overflow-triggered auto-compaction can no longer overflow itself. The
+  summarization request re-sent the entire history (saving only the `tools[]`
+  block versus the request that failed), so against the same model it usually
+  hit the context limit too and killed the turn. On overflow the summarizer
+  input now shrinks and retries: bulky tool-result bodies are elided first, then
+  only the most recent half/quarter/eighth of the conversation is kept (windows
+  aligned so no `role:"tool"` result is orphaned from its `tool_calls` message).
+
+- A stray `OPENAI_API_KEY` in the environment no longer overrides a config-file
+  `api_key` (it silently hijacked auth for local/OpenRouter/zen endpoints).
+  `HRDR_API_KEY` still always wins; `OPENAI_API_KEY` is now only a last-resort
+  fallback when no other key is set.
+
+- GUI: live tool output/results now update the right entry. `find_tool` scanned
+  oldest-first without checking `done`, so backends that restart tool-call ids
+  each turn (`call_0`, `call_1`, …) updated a finished tool from an earlier turn
+  while the new one spun forever. It now scans newest-first and matches only
+  unfinished tools.
+
+- GUI: a `/clear` racing an in-flight turn's auto-save can no longer resurrect
+  the old session id (which made the next conversation overwrite the old
+  session's file). Saves carry a generation stamp; `/clear` and `/resume` bump
+  it and stale `Saved` notifications are dropped. `/clear` and `/resume` also
+  apply agent changes synchronously when the lock is free, so an immediately
+  following send can't win the agent lock first, and `/clear` now resets the
+  status bar's leftover ttft.
+
+- The session file's `created` timestamp is preserved across auto-saves (every
+  save rebuilt the session, so `created` always equaled the last save time).
+
+- Config directory resolution is now XDG-aware and shared: `config.toml` and the
+  global `AGENTS.md` both live in `hjkl_xdg::config_dir("hrdr")`
+  (`$XDG_CONFIG_HOME/hrdr`, default `~/.config/hrdr`). Previously the two built
+  the path differently (`HOME`-only vs `HOME`/`USERPROFILE`), so on Windows the
+  global `AGENTS.md` silently never loaded, and `$XDG_CONFIG_HOME` was ignored
+  everywhere.
+
+- `glob` works when the working directory itself contains glob metacharacters
+  (`[`, `*`, `?`) — the cwd prefix is now escaped so only the pattern argument
+  is interpreted as glob syntax.
+
+- `web_search` (DuckDuckGo) snippet extraction is bounded to each result's own
+  block; a snippet-less result no longer steals the next result's snippet.
+
+- `/help` derives its column width from the longest command name — `/timestamps`
+  and `/checkpoints` no longer run into their descriptions.
+
+- Status-bar git branch detection follows relative `gitdir:` pointers
+  (submodules, worktrees) relative to the repo, not the process cwd.
+
+- TUI: a failed compaction's error line went around the timestamp bookkeeping,
+  shifting every later entry's displayed time (and `/goto 5m` targets) by one.
+
+- Sessions-dir fallback when no home directory can be resolved is an absolute
+  path under the system temp dir; the old relative fallback scattered
+  `.local/share/hrdr` into whatever directory hrdr ran in. A poisoned todo lock
+  now recovers instead of silently reporting success with a stale list.
+
 - Streamed responses no longer corrupt multibyte UTF-8 split across network
   chunks. The SSE decoder ran `from_utf8_lossy` per raw chunk, so an emoji/CJK
   codepoint straddling a chunk boundary became U+FFFD replacement characters

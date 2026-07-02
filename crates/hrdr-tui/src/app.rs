@@ -974,8 +974,9 @@ impl App {
                         self.autosave();
                     }
                     Err(e) => {
-                        self.transcript
-                            .push(Entry::System(format!("[compact failed] {e}")));
+                        // Must go through push_entry: a bare transcript.push
+                        // desyncs the parallel entry_times vec.
+                        self.push_entry(Entry::System(format!("[compact failed] {e}")));
                     }
                 }
                 self.scroll_offset = 0;

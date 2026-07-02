@@ -53,8 +53,10 @@ fn now() -> u64 {
 
 /// `$XDG_DATA_HOME/hrdr/sessions`, or `~/.local/share/hrdr/sessions`.
 pub fn sessions_dir() -> PathBuf {
+    // The fallback must be absolute: a relative path would scatter session
+    // JSON into whatever directory the agent happens to run in.
     hjkl_xdg::data_dir("hrdr")
-        .unwrap_or_else(|_| PathBuf::from(".local/share/hrdr"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("hrdr"))
         .join("sessions")
 }
 
@@ -129,7 +131,13 @@ impl Session {
         let dir = session_dir(&self.cwd);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join(format!("{}.json", sanitize_name(id)));
-        let json = serde_json::to_string_pretty(self).context("serializing session")?;
+        // Autosave rebuilds a fresh `Session` per write; keep the original
+        // creation time from the file being overwritten.
+        let mut snap = self.clone();
+        if let Ok(prev) = Self::load_path(&path) {
+            snap.created = prev.created;
+        }
+        let json = serde_json::to_string_pretty(&snap).context("serializing session")?;
         std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
         Ok(path)
     }

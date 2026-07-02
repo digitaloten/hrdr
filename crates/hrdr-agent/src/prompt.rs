@@ -72,17 +72,14 @@ pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
     // Reverse to outer-first (root ancestor … cwd).
     docs.reverse();
 
-    // Global personal instructions, least specific of all.
-    if let Some(home) = std::env::var_os("HOME") {
-        let global = Path::new(&home)
-            .join(".config")
-            .join("hrdr")
-            .join(AGENTS_FILE);
-        if let Ok(text) = std::fs::read_to_string(global) {
-            let text = text.trim();
-            if !text.is_empty() {
-                docs.insert(0, text.to_string());
-            }
+    // Global personal instructions, least specific of all. Same directory as
+    // config.toml (XDG-aware, cross-platform) — see [`crate::config_dir`].
+    if let Some(dir) = crate::config_dir()
+        && let Ok(text) = std::fs::read_to_string(dir.join(AGENTS_FILE))
+    {
+        let text = text.trim();
+        if !text.is_empty() {
+            docs.insert(0, text.to_string());
         }
     }
 

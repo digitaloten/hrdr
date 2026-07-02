@@ -159,11 +159,20 @@ pub fn help_body() -> String {
             .map(|(_, d)| *d)
             .unwrap_or("")
     };
+    // Column width from the longest command so long names (`/checkpoints`)
+    // never run into their descriptions.
+    let width = HELP_GROUPS
+        .iter()
+        .flat_map(|(_, names)| names.iter())
+        .map(|n| n.len())
+        .max()
+        .unwrap_or(0)
+        + 2;
     let mut s = String::from("Commands");
     for (group, names) in HELP_GROUPS {
         s.push_str(&format!("\n\n{group}"));
         for name in *names {
-            s.push_str(&format!("\n  {name:<11}{}", desc(name)));
+            s.push_str(&format!("\n  {name:<width$}{}", desc(name)));
         }
     }
     s
