@@ -15,7 +15,6 @@ use std::time::Instant;
 
 use floem::AnyView;
 use floem::ext_event::create_signal_from_tokio_channel;
-use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::{Scope, create_effect};
 use floem::views::Decorators;
@@ -745,40 +744,91 @@ fn app_view(
 
     let hist_up = history.clone();
     let hist_down = history.clone();
-    let input_box = text_input(input)
-        .placeholder("Message hrdr…  (Enter to send)")
-        .on_key_down(
-            Key::Named(NamedKey::Enter),
-            |m| m.is_empty(),
-            move |_| send_enter(),
-        )
-        // Up/Down recall previous submissions (like the TUI's history).
-        .on_key_down(
-            Key::Named(NamedKey::ArrowUp),
-            |m| m.is_empty(),
-            move |_| {
-                let current = input.get_untracked();
-                if let Some(text) = hist_up.borrow_mut().recall_prev(&current) {
-                    input.set(text);
+    // Multi-line input (parity with the TUI's plain engine): Enter sends;
+    // Shift+Enter / Alt+Enter — and Enter after a trailing `\` — insert a
+    // newline; Up/Down recall history for single-line input only (multi-line
+    // editing keeps them as cursor moves); Esc cancels the in-flight turn.
+    let input_box = {
+        use floem::keyboard::Modifiers;
+        use floem::views::editor::command::CommandExecuted;
+        use floem::views::editor::keypress::default_key_handler;
+        use floem::views::editor::keypress::key::KeyInput;
+        use floem::views::editor::keypress::press::KeyPress;
+        use std::str::FromStr;
+
+        let key_enter = KeyInput::from_str("enter").expect("enter key parses");
+        let key_up = KeyInput::from_str("up").expect("up key parses");
+        let key_down = KeyInput::from_str("down").expect("down key parses");
+        let key_esc = KeyInput::from_str("escape").expect("escape key parses");
+        let plain_enter = KeyPress::new(key_enter.clone(), Modifiers::empty());
+
+        let ed = floem::views::text_editor::text_editor_keys(
+            input.get_untracked(),
+            move |editor_sig, kp, mods| {
+                if kp.key == key_enter {
+                    let text = input.get_untracked();
+                    if mods.shift() || mods.alt() || text.trim_end().ends_with('\\') {
+                        // Insert a newline (synthesized plain Enter → the
+                        // default keymap's InsertNewLine).
+                        return default_key_handler(editor_sig)(&plain_enter, Modifiers::empty());
+                    }
+                    send_enter();
+                    return CommandExecuted::Yes;
                 }
-            },
-        )
-        .on_key_down(
-            Key::Named(NamedKey::ArrowDown),
-            |m| m.is_empty(),
-            move |_| {
-                if let Some(text) = hist_down.borrow_mut().recall_next() {
-                    input.set(text);
+                if kp.key == key_esc && mods.is_empty() {
+                    cancel_esc();
+                    return CommandExecuted::Yes;
                 }
+                // Up/Down recall previous submissions (readline-style), but
+                // only for single-line input, like the TUI.
+                if mods.is_empty() && kp.key == key_up && !input.get_untracked().contains('\n') {
+                    let current = input.get_untracked();
+                    if let Some(text) = hist_up.borrow_mut().recall_prev(&current) {
+                        input.set(text);
+                    }
+                    return CommandExecuted::Yes;
+                }
+                if mods.is_empty() && kp.key == key_down && !input.get_untracked().contains('\n') {
+                    if let Some(text) = hist_down.borrow_mut().recall_next() {
+                        input.set(text);
+                    }
+                    return CommandExecuted::Yes;
+                }
+                default_key_handler(editor_sig)(kp, mods)
             },
-        )
-        // Esc cancels the in-flight turn (otherwise unused in the single-line input).
-        .on_key_down(
-            Key::Named(NamedKey::Escape),
-            |_| true,
-            move |_| cancel_esc(),
-        )
-        .style(|s| s.flex_grow(1.0).padding(8.0));
+        );
+        let doc = ed.doc();
+
+        // Editor → `input` signal (the source of truth everything else reads).
+        let doc_for_update = doc.clone();
+        let ed = ed
+            .update(move |_| input.set(doc_for_update.text().to_string()))
+            .placeholder("Message hrdr…  (Enter to send · Shift/Alt+Enter for a newline)")
+            .editor_style(|s| s.hide_gutter(true));
+
+        // `input` signal → editor (history recall, /undo, /add, clearing after
+        // send): replace the whole document when they disagree. The guard
+        // breaks the update↔effect cycle.
+        create_effect(move |_| {
+            let want = input.get();
+            let have = doc.text().to_string();
+            if want != have {
+                use floem::views::editor::core::editor::EditType;
+                use floem::views::editor::core::selection::Selection;
+                doc.edit_single(
+                    Selection::region(0, have.len()),
+                    &want,
+                    EditType::InsertChars,
+                );
+            }
+        });
+
+        // Auto-grow with content like the TUI's input (1..=6 text rows).
+        ed.style(move |s| {
+            let rows = input.get().lines().count().clamp(1, 6) as f32;
+            s.flex_grow(1.0).height(rows * 22.0 + 14.0).padding(4.0)
+        })
+    };
 
     // One button: "Stop" (cancel) while a turn runs, "Send" otherwise.
     let action_button = button(label(move || if running.get() { "Stop" } else { "Send" }))

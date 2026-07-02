@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **GUI multi-line input.** The single-line `text_input` is replaced by floem's
+  text editor (gutter hidden, auto-growing 1–6 rows like the TUI's input):
+  **Enter sends; Shift+Enter / Alt+Enter — and Enter after a trailing `\` —
+  insert a newline**, matching the TUI's plain-input conventions. Up/Down still
+  recall history, but only while the input is single-line (multi-line editing
+  keeps them as cursor moves — same rule as the TUI); Esc still cancels the
+  running turn. The editor document syncs two-way with the `input` signal, so
+  history recall, `/undo`, `/add`, `/paste`, and completion clicks keep working
+  unchanged.
+
 ### Changed
 
 - **Incremental code-block highlighting.** A streaming code block used to be
