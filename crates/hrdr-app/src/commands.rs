@@ -176,6 +176,15 @@ pub trait CommandHost {
         let _ = turns;
     }
 
+    /// Current status-bar mode (frontends with a status bar override the pair).
+    fn statusbar_mode(&self) -> crate::StatusBarMode {
+        crate::StatusBarMode::Truncate
+    }
+    /// Apply a status-bar mode (persistence is dispatch's job).
+    fn set_statusbar_mode(&mut self, mode: crate::StatusBarMode) {
+        let _ = mode;
+    }
+
     /// Re-read config and apply the live-changeable settings (frontends decide
     /// what that covers and emit their own status lines).
     fn reload_config(&mut self) {
@@ -656,6 +665,37 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                     host.info("usage: /todo-ttl <turns> (a whole number, e.g. 5)".to_string())
                 }
             }
+        }
+        "statusbar" => {
+            use crate::StatusBarMode;
+            let mode = match arg.to_ascii_lowercase().as_str() {
+                // No arg cycles truncate → wrap → none.
+                "" => match host.statusbar_mode() {
+                    StatusBarMode::Truncate => StatusBarMode::Wrap,
+                    StatusBarMode::Wrap => StatusBarMode::None,
+                    StatusBarMode::None => StatusBarMode::Truncate,
+                },
+                "none" | "off" | "hidden" => StatusBarMode::None,
+                "truncate" | "trunc" => StatusBarMode::Truncate,
+                "wrap" => StatusBarMode::Wrap,
+                _ => {
+                    host.info("usage: /statusbar [none | truncate | wrap]".to_string());
+                    return true;
+                }
+            };
+            host.set_statusbar_mode(mode);
+            host.persist_setting(
+                "statusbar",
+                hrdr_agent::ConfigValue::Str(mode.as_config_str()),
+            );
+            host.info(
+                match mode {
+                    StatusBarMode::None => "status bar: hidden",
+                    StatusBarMode::Truncate => "status bar: truncate",
+                    StatusBarMode::Wrap => "status bar: wrap",
+                }
+                .to_string(),
+            );
         }
         "reload" => host.reload_config(),
         "provider" => {

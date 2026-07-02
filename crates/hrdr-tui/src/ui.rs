@@ -17,7 +17,7 @@ use syntect::util::LinesWithEndings;
 
 use crate::app::{App, Entry, StatusBarMode, TimestampStyle};
 use crate::theme::Theme;
-use hrdr_app::{fmt_count, relative_time, syntax_set, syntect_theme};
+use hrdr_app::{relative_time, syntax_set, syntect_theme};
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
 /// Diff results (edit/write_file) get a larger preview since the diff is the point.
@@ -442,108 +442,66 @@ fn status_section_width(s: &StatusSection) -> usize {
     s.1.iter().map(Span::width).sum()
 }
 
-/// Build the status-bar sections (cwd, branch, in/out tokens, context, model,
-/// effort) in display order.
+/// Build the status-bar sections from the shared content model
+/// ([`hrdr_app::status_sections`] — same sections/priorities as the GUI),
+/// mapping each color role onto the terminal theme.
 fn build_status_sections(app: &App) -> Vec<StatusSection> {
     let t = &app.theme;
-    let mut sections: Vec<StatusSection> = Vec::new();
-
-    // cwd basename + folder icon (Nerd glyphs only when the icon mode allows).
-    let nerd = app.icon_mode == hjkl_icons::IconMode::Nerd;
-    let folder = if nerd { "\u{f07b} " } else { "" };
-    let branch_icon = if nerd { "\u{e0a0} " } else { "" };
-    let dir_label = app
-        .dir
-        .rsplit('/')
-        .find(|s| !s.is_empty())
-        .unwrap_or(&app.dir);
-    sections.push((
-        0,
-        vec![Span::styled(
-            format!(" {folder}{dir_label}"),
-            Style::default().fg(t.user),
-        )],
-    ));
-    if let Some(branch) = &app.branch {
-        sections.push((
-            3,
-            vec![Span::styled(
-                format!("{branch_icon}{branch}"),
-                Style::default().fg(t.success),
-            )],
-        ));
-    }
-    sections.push((
-        4,
-        vec![Span::styled(
-            format!("↑{}", fmt_count(app.session_in)),
-            Style::default().fg(t.accent),
-        )],
-    ));
-    sections.push((
-        4,
-        vec![Span::styled(
-            format!("↓{}", fmt_count(app.session_out)),
-            Style::default().fg(t.accent2),
-        )],
-    ));
-    // Context: a used/free bar when the window is known, else a plain count.
-    let ctx = app.last_usage.map(|(p, _)| p as usize).unwrap_or(0);
-    let ctx_spans = match app.context_window {
-        Some(w) if w > 0 => {
-            let frac = (ctx as f64 / w as f64).clamp(0.0, 1.0);
-            // Fill color escalates with usage: green → amber → red at the
-            // auto-compact threshold (where compaction kicks in next turn).
-            let fill_color = if app.auto_compact_ratio > 0.0 && frac >= app.auto_compact_ratio {
-                t.error
-            } else if frac >= 0.70 {
-                t.warn
-            } else {
-                t.success
-            };
-            let label = format!(" {} of {} ", fmt_count(ctx), fmt_count(w as usize));
-            let chars: Vec<char> = label.chars().collect();
-            let fill = ((frac * chars.len() as f64).round() as usize).min(chars.len());
-            let used: String = chars[..fill].iter().collect();
-            let free: String = chars[fill..].iter().collect();
-            let mut s = Vec::new();
-            if !used.is_empty() {
-                s.push(Span::styled(
-                    used,
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(fill_color)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            if !free.is_empty() {
-                s.push(Span::styled(
-                    free,
-                    Style::default().fg(t.assistant).bg(t.dim),
-                ));
-            }
-            s
-        }
-        _ => vec![Span::styled(
-            format!(" {} ctx ", fmt_count(ctx)),
-            Style::default().fg(t.warn),
-        )],
+    let ttft = match (app.turn_started, app.first_token_at) {
+        (Some(start), Some(first)) => Some(first.duration_since(start).as_secs_f64()),
+        _ => None,
     };
-    sections.push((1, ctx_spans));
-    sections.push((
-        2,
-        vec![Span::styled(
-            app.model.clone(),
-            Style::default().fg(t.assistant),
-        )],
-    ));
-    if let Some(effort) = &app.effort {
-        sections.push((
-            5,
-            vec![Span::styled(effort.clone(), Style::default().fg(t.warn))],
-        ));
+    let inputs = hrdr_app::StatusInputs {
+        dir: &app.dir,
+        branch: app.branch.as_deref(),
+        tokens_in: app.session_in,
+        tokens_out: app.session_out,
+        ctx_used: app.last_usage.map(|(p, _)| p as usize).unwrap_or(0),
+        context_window: app.context_window,
+        auto_compact_ratio: app.auto_compact_ratio,
+        model: &app.model,
+        effort: app.effort.as_deref(),
+        ttft,
+        nerd_icons: app.icon_mode == hjkl_icons::IconMode::Nerd,
+    };
+    hrdr_app::status_sections(&inputs)
+        .into_iter()
+        .map(|seg| {
+            let spans = seg
+                .runs
+                .into_iter()
+                .map(|run| Span::styled(run.text, status_role_style(run.role, t)))
+                .collect();
+            (seg.priority, spans)
+        })
+        .collect()
+}
+
+/// Terminal style for a shared status color role.
+fn status_role_style(role: hrdr_app::StatusRole, t: &Theme) -> Style {
+    use hrdr_app::{CtxLevel, StatusRole};
+    match role {
+        StatusRole::Dir => Style::default().fg(t.user),
+        StatusRole::Branch => Style::default().fg(t.success),
+        StatusRole::TokensIn => Style::default().fg(t.accent),
+        StatusRole::TokensOut => Style::default().fg(t.accent2),
+        StatusRole::CtxFill(level) => {
+            let bg = match level {
+                CtxLevel::Ok => t.success,
+                CtxLevel::Warn => t.warn,
+                CtxLevel::Critical => t.error,
+            };
+            Style::default()
+                .fg(Color::Black)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD)
+        }
+        StatusRole::CtxRest => Style::default().fg(t.assistant).bg(t.dim),
+        StatusRole::CtxPlain => Style::default().fg(t.warn),
+        StatusRole::Model => Style::default().fg(t.assistant),
+        StatusRole::Effort => Style::default().fg(t.warn),
+        StatusRole::Ttft => Style::default().fg(t.dim),
     }
-    sections
 }
 
 /// Separator width: " │ ".

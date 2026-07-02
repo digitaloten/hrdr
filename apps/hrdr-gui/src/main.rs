@@ -31,6 +31,8 @@ const USER: Color = Color::rgb8(0x6c, 0xb6, 0xff);
 const OK: Color = Color::rgb8(0x5f, 0xd0, 0x7a);
 const ERR: Color = Color::rgb8(0xe0, 0x6c, 0x6c);
 const TOOL: Color = Color::rgb8(0xc9, 0xa2, 0x66);
+const ACCENT: Color = Color::rgb8(0x6c, 0x9e, 0xff);
+const ACCENT2: Color = Color::rgb8(0xc7, 0x8f, 0xe3);
 
 /// Chat-role colors resolved from an hjkl theme — the same theme system the TUI
 /// uses (see `hrdr-tui`'s `Theme`), mapped here to floem colors.
@@ -43,6 +45,8 @@ struct GuiTheme {
     tool: Color,
     ok: Color,
     err: Color,
+    accent: Color,
+    accent2: Color,
 }
 
 impl GuiTheme {
@@ -62,6 +66,8 @@ impl GuiTheme {
             tool: c(p.warn, TOOL),
             ok: c(p.success, OK),
             err: c(p.error, ERR),
+            accent: c(p.accent, ACCENT),
+            accent2: c(p.accent2, ACCENT2),
         }
     }
 }
@@ -279,6 +285,23 @@ fn app_view(
     // Endpoint + context window as signals so `/provider` updates them live.
     let base_url: RwSignal<String> = create_rw_signal(base_url);
     let ctx_window: RwSignal<Option<u32>> = create_rw_signal(ctx_window);
+    // Status-bar mode (`/statusbar`; from config).
+    let statusbar_mode: RwSignal<hrdr_app::StatusBarMode> = create_rw_signal(
+        hrdr_app::StatusBarMode::from_config(ui.statusbar.as_deref()),
+    );
+    // Working-directory + git-branch display for the status bar (follow /cwd
+    // and resumed sessions).
+    let start_cwd = agent
+        .try_lock()
+        .map(|a| a.cwd())
+        .ok()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let dir_sig: RwSignal<String> = create_rw_signal(hrdr_app::display_dir(&start_cwd));
+    let branch_sig: RwSignal<Option<String>> = create_rw_signal(hrdr_app::git_branch(&start_cwd));
+    // Session-cumulative token counters (the status bar's ↑/↓).
+    let session_in: RwSignal<usize> = create_rw_signal(0);
+    let session_out: RwSignal<usize> = create_rw_signal(0);
     // Per-message timestamp style (`/timestamps`; from config).
     let timestamp_style: RwSignal<hrdr_app::TimestampStyle> = create_rw_signal(
         hrdr_app::TimestampStyle::from_config(ui.timestamps.as_deref()),
@@ -389,6 +412,15 @@ fn app_view(
                     && let Some(start) = turn_start.get_untracked()
                 {
                     ttft.set(Some(start.elapsed().as_secs_f64()));
+                }
+                // Session-cumulative token counters for the status bar.
+                if let AgentEvent::Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                } = &ev
+                {
+                    session_in.set(session_in.get_untracked() + *prompt_tokens as usize);
+                    session_out.set(session_out.get_untracked() + *completion_tokens as usize);
                 }
                 // Tool completions may have rewritten the shared TODO list.
                 let refresh_todos = matches!(ev, AgentEvent::ToolEnd { .. });
@@ -531,6 +563,11 @@ fn app_view(
                 ttft,
                 show_reasoning,
                 timestamp_style,
+                statusbar_mode,
+                dir: dir_sig,
+                branch: branch_sig,
+                session_in,
+                session_out,
                 todo_ttl,
                 todos: todos_for_send.clone(),
                 todos_sig,
@@ -776,26 +813,70 @@ fn app_view(
 
     // Status bar: model · context · last-turn output tokens, + a live "thinking"
     // indicator while a turn runs.
-    let status_bar = h_stack((
-        label(move || {
-            let (used, out) = usage.get().unwrap_or((0, 0));
-            let ctx = match ctx_window.get() {
-                Some(w) => format!("{used} of {w}"),
-                None if used > 0 => format!("{used} tok"),
-                None => "—".to_string(),
-            };
-            // Time-to-first-token for the last turn, once measured.
-            let ttft = match ttft.get() {
-                Some(secs) => format!("   ·   ttft {secs:.2}s"),
-                None => String::new(),
-            };
-            let effort = match effort.get() {
-                Some(e) => format!("   ·   effort {e}"),
-                None => String::new(),
-            };
-            format!("{}   ·   ctx {ctx}   ·   ↓{out}{ttft}{effort}", model.get())
+    // Status bar from the shared content model (same sections/colors as the
+    // TUI); /statusbar picks hidden / one row / wrapping rows.
+    let auto_compact_ratio = cfg.auto_compact;
+    let status_segs = move || -> Vec<(usize, hrdr_app::StatusSeg)> {
+        let dir = dir_sig.get();
+        let branch = branch_sig.get();
+        let model_name = model.get();
+        let effort_label = effort.get();
+        hrdr_app::status_sections(&hrdr_app::StatusInputs {
+            dir: &dir,
+            branch: branch.as_deref(),
+            tokens_in: session_in.get(),
+            tokens_out: session_out.get(),
+            ctx_used: usage.get().map(|(p, _)| p as usize).unwrap_or(0),
+            context_window: ctx_window.get(),
+            auto_compact_ratio,
+            model: &model_name,
+            effort: effort_label.as_deref(),
+            ttft: ttft.get(),
+            nerd_icons: false,
         })
-        .style(move |s| s.color(theme.dim)),
+        .into_iter()
+        .enumerate()
+        .collect()
+    };
+    let status_row = dyn_stack(
+        status_segs,
+        |(i, seg): &(usize, hrdr_app::StatusSeg)| {
+            let text: String = seg.runs.iter().map(|r| r.text.as_str()).collect();
+            format!("{i}:{text}")
+        },
+        move |(i, seg)| {
+            let mut children: Vec<AnyView> = Vec::new();
+            if i > 0 {
+                children.push(
+                    label(|| "│")
+                        .style(move |s| s.color(theme.dim).margin_horiz(6.0))
+                        .into_any(),
+                );
+            }
+            for run in seg.runs {
+                let text = run.text.clone();
+                let role = run.role;
+                children.push(
+                    label(move || text.clone())
+                        .style(move |s| status_run_style(s, role, theme))
+                        .into_any(),
+                );
+            }
+            h_stack_from_iter(children)
+                .style(|s| s.items_center())
+                .into_any()
+        },
+    )
+    .style(move |s| {
+        let s = s.flex_row().items_center();
+        if statusbar_mode.get() == hrdr_app::StatusBarMode::Wrap {
+            s.flex_wrap(floem::style::FlexWrap::Wrap)
+        } else {
+            s
+        }
+    });
+    let status_bar = h_stack((
+        status_row,
         label(|| "● thinking…").style(move |s| {
             if running.get() {
                 s.color(theme.tool)
@@ -804,12 +885,18 @@ fn app_view(
             }
         }),
     ))
-    .style(|s| {
-        s.width_full()
+    .style(move |s| {
+        let s = s
+            .width_full()
             .padding_horiz(10.0)
             .padding_vert(4.0)
             .justify_between()
-            .items_center()
+            .items_center();
+        if statusbar_mode.get() == hrdr_app::StatusBarMode::None {
+            s.hide()
+        } else {
+            s
+        }
     });
 
     v_stack((
@@ -1164,6 +1251,11 @@ struct GuiHost {
     ttft: RwSignal<Option<f64>>,
     show_reasoning: RwSignal<bool>,
     timestamp_style: RwSignal<hrdr_app::TimestampStyle>,
+    statusbar_mode: RwSignal<hrdr_app::StatusBarMode>,
+    dir: RwSignal<String>,
+    branch: RwSignal<Option<String>>,
+    session_in: RwSignal<usize>,
+    session_out: RwSignal<usize>,
     todo_ttl: RwSignal<u64>,
     todos: Arc<std::sync::Mutex<Vec<hrdr_tools::TodoItem>>>,
     todos_sig: RwSignal<Vec<hrdr_tools::TodoItem>>,
@@ -1241,6 +1333,8 @@ impl hrdr_app::CommandHost for GuiHost {
         self.todos_sig.set(Vec::new());
         self.todo_turn.set(0);
         self.todo_completed_at.borrow_mut().clear();
+        self.session_in.set(0);
+        self.session_out.set(0);
         self.find_query.set(None);
         self.find_pos.set(0);
         clear_items(self.transcript);
@@ -1457,7 +1551,9 @@ impl hrdr_app::CommandHost for GuiHost {
     fn set_effort(&mut self, label: String) {
         self.effort.set(Some(label));
     }
-    fn cwd_changed(&mut self, _new: &std::path::Path) {
+    fn cwd_changed(&mut self, new: &std::path::Path) {
+        self.dir.set(hrdr_app::display_dir(new));
+        self.branch.set(hrdr_app::git_branch(new));
         // Rebuilt lazily on the next `@` mention, for the new directory.
         self.file_index.set(Vec::new());
     }
@@ -1466,6 +1562,12 @@ impl hrdr_app::CommandHost for GuiHost {
     }
     fn timestamp_style(&self) -> hrdr_app::TimestampStyle {
         self.timestamp_style.get_untracked()
+    }
+    fn statusbar_mode(&self) -> hrdr_app::StatusBarMode {
+        self.statusbar_mode.get_untracked()
+    }
+    fn set_statusbar_mode(&mut self, mode: hrdr_app::StatusBarMode) {
+        self.statusbar_mode.set(mode);
     }
     fn set_timestamp_style(&mut self, style: hrdr_app::TimestampStyle) {
         self.timestamp_style.set(style);
@@ -1675,4 +1777,33 @@ fn render_item(
 /// A plain (non-reactive) text label.
 fn text_label(s: String) -> impl IntoView {
     label(move || s.clone())
+}
+
+/// Map a shared status color role onto the GUI theme (mirrors the TUI's
+/// `status_role_style`).
+fn status_run_style(
+    s: floem::style::Style,
+    role: hrdr_app::StatusRole,
+    th: GuiTheme,
+) -> floem::style::Style {
+    use hrdr_app::{CtxLevel, StatusRole};
+    match role {
+        StatusRole::Dir => s.color(th.user),
+        StatusRole::Branch => s.color(th.ok),
+        StatusRole::TokensIn => s.color(th.accent),
+        StatusRole::TokensOut => s.color(th.accent2),
+        StatusRole::CtxFill(level) => {
+            let bg = match level {
+                CtxLevel::Ok => th.ok,
+                CtxLevel::Warn => th.tool,
+                CtxLevel::Critical => th.err,
+            };
+            s.color(Color::BLACK).background(bg).font_bold()
+        }
+        StatusRole::CtxRest => s.color(th.assistant).background(th.dim),
+        StatusRole::CtxPlain => s.color(th.tool),
+        StatusRole::Model => s.color(th.assistant),
+        StatusRole::Effort => s.color(th.tool),
+        StatusRole::Ttft => s.color(th.dim),
+    }
 }

@@ -43,7 +43,6 @@ impl super::App {
             "find" | "search" => self.find_cmd(arg),
             "next" => self.find_cycle(true),
             "prev" | "previous" => self.find_cycle(false),
-            "statusbar" => self.statusbar_cmd(arg),
             // help, clear, model, models, tools, copy, diff, rename, thinking,
             // sessions, resume, export → shared dispatcher (TuiHost overrides
             // route /diff to the colored Entry::Diff rendering).
@@ -310,34 +309,6 @@ impl super::App {
     fn nth_message_text(&self, n: usize) -> Option<String> {
         hrdr_app::nth_message_text(&self.transcript, n)
     }
-    /// `/statusbar [none|truncate|wrap]` — set the status-bar mode (no arg
-    /// cycles truncate → wrap → none).
-    fn statusbar_cmd(&mut self, arg: &str) {
-        let mode = match arg.trim().to_ascii_lowercase().as_str() {
-            "" => match self.statusbar_mode {
-                StatusBarMode::Truncate => StatusBarMode::Wrap,
-                StatusBarMode::Wrap => StatusBarMode::None,
-                StatusBarMode::None => StatusBarMode::Truncate,
-            },
-            "none" | "off" | "hidden" => StatusBarMode::None,
-            "truncate" | "trunc" => StatusBarMode::Truncate,
-            "wrap" => StatusBarMode::Wrap,
-            _ => {
-                self.system("usage: /statusbar [none | truncate | wrap]");
-                return;
-            }
-        };
-        self.statusbar_mode = mode;
-        self.persist_setting(
-            "statusbar",
-            hrdr_agent::ConfigValue::Str(mode.as_config_str()),
-        );
-        self.system(match mode {
-            StatusBarMode::None => "status bar: hidden",
-            StatusBarMode::Truncate => "status bar: truncate",
-            StatusBarMode::Wrap => "status bar: wrap",
-        });
-    }
     /// Write `text` to the system clipboard, returning a status line (used by the
     /// shared `/copy` via [`hrdr_app::CommandHost`]).
     pub(super) fn clipboard_status(&mut self, text: &str, label: &str) -> String {
@@ -570,6 +541,12 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     }
     fn todo_ttl(&self) -> u64 {
         self.app.todo_ttl
+    }
+    fn statusbar_mode(&self) -> hrdr_app::StatusBarMode {
+        self.app.statusbar_mode
+    }
+    fn set_statusbar_mode(&mut self, mode: hrdr_app::StatusBarMode) {
+        self.app.statusbar_mode = mode;
     }
     fn set_todo_ttl(&mut self, turns: u64) {
         self.app.todo_ttl = turns;

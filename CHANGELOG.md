@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Agnostic status bar.** The status-bar _content_ — which sections exist (cwd,
+  branch, ↑/↓ session tokens, the context gauge with its green/amber/red fill,
+  model, effort, ttft), their text, drop priorities, and color roles — now lives
+  once in `hrdr-app` (`status_sections`/`StatusSeg`/`StatusRole`); each frontend
+  only does layout and maps roles onto its theme. The GUI's status bar goes from
+  a single dim text line to the TUI's full section set (including the context
+  gauge and git branch, with new accent colors resolved from the theme), and
+  `/statusbar` is now a **shared command** working in both frontends: `none`
+  hides the bar, `truncate` keeps one row, `wrap` lets sections flow onto
+  multiple rows (terminal width-fitting in the TUI, flex-wrap in the GUI). The
+  TUI's bar additionally gains the ttft section the GUI already showed.
+  `TUI_ONLY_COMMANDS` is down to `/theme` and `/edit`.
+
 - **GUI feature parity, round two.** The GUI now covers everything but the
   genuinely terminal-bound commands:
   - **TODO panel** — the model's task list renders above the status bar (✓/▸/·
