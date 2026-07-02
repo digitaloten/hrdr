@@ -152,6 +152,8 @@ enum UiMsg {
     FileIndex(Vec<String>),
     /// Compaction finished: `Ok((before, after))` message counts, or an error.
     Compacted(Result<(usize, usize), String>),
+    /// The config file changed on disk (from the shared watcher).
+    ConfigChanged,
     /// A completed turn was auto-saved; carries the session id and whether this
     /// was the first save (so the UI thread can adopt the id and notify once).
     /// `generation` is the save-generation at spawn time: `/clear` bumps it, so
@@ -321,6 +323,14 @@ fn app_view(
     // triggers at this fraction of the context window (0 disables).
     let compacting: RwSignal<bool> = create_rw_signal(false);
     let auto_compact_ratio = cfg.auto_compact;
+    // Streamed tokens this turn (the per-turn stats line's token count/rate).
+    let out_tokens: RwSignal<usize> = create_rw_signal(0);
+    // The in-flight turn is an /init run → reload AGENTS.md when it completes.
+    let pending_init: RwSignal<bool> = create_rw_signal(false);
+    // Last config mtime we applied/wrote, so persisting a setting doesn't
+    // bounce back as a hot-reload (same dedup the TUI uses).
+    let config_mtime_seen: Rc<std::cell::Cell<Option<std::time::SystemTime>>> =
+        Rc::new(std::cell::Cell::new(hrdr_app::config_mtime()));
 
     // Bridge background turns → the UI thread over one long-lived channel.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiMsg>();
@@ -341,6 +351,7 @@ fn app_view(
             // Start the TTFT clock; cleared until the first token of this turn.
             turn_start.set(Some(Instant::now()));
             ttft.set(None);
+            out_tokens.set(0);
             // Expand `@file` mentions for the model only; the transcript keeps
             // the bare `@path` the user typed (same split as the TUI). Paths
             // resolve against the agent's cwd (it follows /cwd and /resume).
@@ -415,6 +426,29 @@ fn app_view(
         }
     });
 
+    // Probe the endpoint in the background and warn if it's unreachable or
+    // doesn't have the configured model (shared core with the TUI).
+    {
+        let agent = agent.clone();
+        let tx_health = tx.clone();
+        let m = model.get_untracked();
+        let url = base_url.get_untracked();
+        tokio::spawn(async move {
+            if let Some(warning) = hrdr_app::endpoint_health_warning(agent, m, url).await {
+                let _ = tx_health.send(UiMsg::System(warning));
+            }
+        });
+    }
+    // Shared config-file watch → hot-reload (the guard must outlive the app;
+    // the window lives for the process, so leaking it is fine).
+    {
+        let tx_watch = tx.clone();
+        let guard = hrdr_app::watch_config(move || {
+            let _ = tx_watch.send(UiMsg::ConfigChanged);
+        });
+        std::mem::forget(guard);
+    }
+
     // Start a compaction pass (shared by /compact and the auto-compaction
     // trigger below): runs like a turn — input queues behind it, Esc/Stop
     // cancels it — and lands as UiMsg::Compacted.
@@ -442,6 +476,7 @@ fn app_view(
     let compact_for_done = start_compaction.clone();
     let agent_for_events = agent.clone();
     let tx_for_events = tx.clone();
+    let mtime_for_events = config_mtime_seen.clone();
     let base_url_for_events = base_url;
     let todos_for_events = todos.clone();
     let todo_stamps_for_done = todo_completed_at.clone();
@@ -457,6 +492,9 @@ fn app_view(
                     && let Some(start) = turn_start.get_untracked()
                 {
                     ttft.set(Some(start.elapsed().as_secs_f64()));
+                }
+                if matches!(ev, AgentEvent::Text(_)) {
+                    out_tokens.set(out_tokens.get_untracked() + 1);
                 }
                 // Session-cumulative token counters for the status bar.
                 if let AgentEvent::Usage {
@@ -478,6 +516,29 @@ fn app_view(
                 running.set(false);
                 if let Some(e) = err {
                     push_item(transcript, next_id, Body::Error(e));
+                }
+                // Per-turn stats line (shared formatting with the TUI).
+                if let Some(started) = turn_start.get_untracked()
+                    && let Some(line) = hrdr_app::turn_stats_line(
+                        started.elapsed().as_secs_f64(),
+                        ttft.get_untracked(),
+                        out_tokens.get_untracked(),
+                        usage.get_untracked(),
+                    )
+                {
+                    system(transcript, next_id, line);
+                }
+                // An /init turn just wrote AGENTS.md — load it into the
+                // system prompt (shared core with the TUI's /reload).
+                if pending_init.get_untracked() {
+                    pending_init.set(false);
+                    let agent = agent_for_events.clone();
+                    let tx = tx_for_events.clone();
+                    tokio::spawn(async move {
+                        if let Some(line) = hrdr_app::reload_project_docs(agent).await {
+                            let _ = tx.send(UiMsg::System(line));
+                        }
+                    });
                 }
                 // Age out completed TODOs (a completed item stays visible for
                 // todo_ttl turns, like the TUI panel).
@@ -518,6 +579,25 @@ fn app_view(
             UiMsg::FileIndex(files) => {
                 file_index.set(files);
                 file_index_state.set(2);
+            }
+            UiMsg::ConfigChanged => {
+                // Ignore self-inflicted writes (persisting a setting) via the
+                // mtime guard, like the TUI.
+                let now = hrdr_app::config_mtime();
+                if now == mtime_for_events.get() {
+                    return;
+                }
+                mtime_for_events.set(now);
+                apply_ui_config(
+                    &hrdr_app::UiConfig::load(),
+                    show_reasoning,
+                    theme_sig,
+                    theme_rev,
+                    timestamp_style,
+                    statusbar_mode,
+                    todo_ttl,
+                );
+                system(transcript, next_id, "config changed on disk — reloaded");
             }
             UiMsg::Compacted(res) => {
                 running.set(false);
@@ -581,6 +661,7 @@ fn app_view(
     let msg_ids_for_send = msg_view_ids.clone();
     let spawn_for_send = spawn_turn.clone();
     let compact_for_send = start_compaction.clone();
+    let mtime_for_send = config_mtime_seen.clone();
     let queue_for_send = queue.clone();
     let th_for_host = turn_handle.clone();
     let clipboard_for_send = clipboard.clone();
@@ -687,6 +768,8 @@ fn app_view(
                 spawn_turn: spawn_for_send.clone(),
                 start_compaction: compact_for_send.clone(),
                 compacting,
+                pending_init,
+                config_mtime_seen: mtime_for_send.clone(),
                 clipboard: clipboard_for_send.clone(),
                 agent: agent_for_send.clone(),
                 tx: tx_for_send.clone(),
@@ -1470,6 +1553,8 @@ struct GuiHost {
     spawn_turn: Rc<dyn Fn(String, bool)>,
     start_compaction: Rc<dyn Fn(Option<String>)>,
     compacting: RwSignal<bool>,
+    pending_init: RwSignal<bool>,
+    config_mtime_seen: Rc<std::cell::Cell<Option<std::time::SystemTime>>>,
     clipboard: Rc<RefCell<Option<hjkl_clipboard::Clipboard>>>,
     agent: Arc<TokioMutex<Agent>>,
     tx: tokio::sync::mpsc::UnboundedSender<UiMsg>,
@@ -1729,6 +1814,18 @@ impl hrdr_app::CommandHost for GuiHost {
     fn compact(&mut self, instructions: Option<String>) {
         system(self.transcript, self.next_id, "compacting conversation…");
         (self.start_compaction)(instructions);
+    }
+    fn mark_init_turn(&mut self) {
+        self.pending_init.set(true);
+    }
+    fn persist_setting(&mut self, key: &str, value: hrdr_agent::ConfigValue) {
+        // Suppress the hot-reload bounce from our own write (mtime guard).
+        let _ = hrdr_agent::persist_setting(key, value);
+        self.config_mtime_seen.set(hrdr_app::config_mtime());
+    }
+    fn unpersist_setting(&mut self, key: &str) {
+        let _ = hrdr_agent::remove_setting(key);
+        self.config_mtime_seen.set(hrdr_app::config_mtime());
     }
     fn rewind_last_turn(&mut self) -> Option<String> {
         let text = self
@@ -1992,6 +2089,30 @@ fn render_item(
 /// A plain (non-reactive) text label.
 fn text_label(s: String) -> impl IntoView {
     label(move || s.clone())
+}
+
+/// Apply the live-changeable display settings from a (re)loaded [`UiConfig`]
+/// — the one code path behind both `/reload` and the config hot-reload.
+#[allow(clippy::too_many_arguments)]
+fn apply_ui_config(
+    ui: &hrdr_app::UiConfig,
+    show_reasoning: RwSignal<bool>,
+    theme_sig: RwSignal<GuiTheme>,
+    theme_rev: RwSignal<u64>,
+    timestamp_style: RwSignal<hrdr_app::TimestampStyle>,
+    statusbar_mode: RwSignal<hrdr_app::StatusBarMode>,
+    todo_ttl: RwSignal<u64>,
+) {
+    show_reasoning.set(ui.show_thinking);
+    theme_sig.set(GuiTheme::load(ui.theme.as_deref()));
+    theme_rev.update(|r| *r += 1);
+    timestamp_style.set(hrdr_app::TimestampStyle::from_config(
+        ui.timestamps.as_deref(),
+    ));
+    statusbar_mode.set(hrdr_app::StatusBarMode::from_config(
+        ui.statusbar.as_deref(),
+    ));
+    todo_ttl.set(ui.todo_ttl);
 }
 
 /// The context gauge as a real progress bar: a rounded track with a fill

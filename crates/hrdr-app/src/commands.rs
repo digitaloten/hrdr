@@ -140,6 +140,11 @@ pub trait CommandHost {
     /// `@file` completion index can be invalidated.
     fn files_changed(&mut self) {}
 
+    /// Mark the in-flight turn as an `/init` run, so the frontend reloads
+    /// `AGENTS.md` into the system prompt when it completes (via
+    /// [`reload_project_docs`]).
+    fn mark_init_turn(&mut self) {}
+
     /// Start conversation compaction on a background task. Frontends run
     /// [`run_compaction`] and, when it lands, show [`compaction_message`],
     /// reset their stale context usage, autosave on success, and resume any
@@ -618,6 +623,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 return true;
             }
             host.info("/init — exploring the project to write AGENTS.md…".to_string());
+            host.mark_init_turn();
             host.send_prompt(INIT_PROMPT.to_string(), false);
         }
         "timestamps" | "ts" => {
@@ -850,6 +856,48 @@ Prefer real commands, paths, and specifics over generic advice. Keep it tight. \
 When finished, give a one-line summary of what you wrote.";
 
 // ---- representation-independent command cores ----
+
+/// Probe the endpoint (list its models) and return a warning line when it
+/// looks unreachable or doesn't advertise `model`; `None` when healthy. The
+/// startup health-check core — both frontends spawn it and surface the
+/// warning as a system line before the first turn.
+pub async fn endpoint_health_warning(
+    agent: Arc<Mutex<Agent>>,
+    model: String,
+    base_url: String,
+) -> Option<String> {
+    let client = agent.lock().await.client();
+    match client.list_models().await {
+        Err(e) => Some(format!("⚠ endpoint {base_url} looks unreachable: {e}")),
+        Ok(models) => {
+            if model != "default" && !models.is_empty() && !models.iter().any(|m| m == &model) {
+                let sample = models
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(format!(
+                    "⚠ model '{model}' not found at {base_url}; available: {sample}"
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Re-read `AGENTS.md` into the system prompt (used by `/reload` and after an
+/// `/init` turn writes the file). Returns the standard system line when
+/// project docs were loaded, `None` when there are none.
+pub async fn reload_project_docs(agent: Arc<Mutex<Agent>>) -> Option<String> {
+    let mut a = agent.lock().await;
+    let cwd = a.cwd();
+    a.set_cwd(cwd); // re-runs the AGENTS.md gather for the (unchanged) cwd
+    a.project_docs()
+        .is_some()
+        .then(|| "loaded AGENTS.md into the system prompt".to_string())
+}
 
 /// The shared compaction core (`/compact` and threshold auto-compaction):
 /// lock the agent and summarize. `Ok((before, after))` with `before == after`

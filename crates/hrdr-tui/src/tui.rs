@@ -10,7 +10,7 @@ use anyhow::Result;
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
 
-use crate::app::{Action, App, run_editor, setup_config_watcher};
+use crate::app::{Action, App, run_editor};
 use crate::{Tui, resume_terminal, suspend_terminal, ui};
 
 /// Drive `app` against the terminal until it quits: draw, then await terminal
@@ -23,13 +23,9 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
     let mut rx = app.rx.take().expect("run_loop called once");
     // Periodic wake so the inference spinner animates between tokens.
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
-    // OS-level config watch (inotify/FSEvents/…); kept alive for the loop.
-    // Falls back to mtime polling on the ticker if a watcher can't be made.
-    let (_config_watcher, mut config_rx) = match setup_config_watcher() {
-        Some((w, rx)) => (Some(w), Some(rx)),
-        None => (None, None),
-    };
-    let watch_active = config_rx.is_some();
+    // Shared config watch (OS watcher with polling fallback); pings arrive as
+    // TurnMsg::ConfigChanged. Kept alive for the loop.
+    let _config_watch = app.start_config_watch();
 
     loop {
         terminal.draw(|f| ui::draw(f, app))?;
@@ -54,19 +50,7 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
                 Some(Err(_)) | None => break,
             },
             Some(msg) = rx.recv() => app.on_turn_msg(msg),
-            // OS notified the config file changed → reload (mtime-guarded).
-            _ = async {
-                match config_rx.as_mut() {
-                    Some(rx) => { rx.recv().await; }
-                    None => std::future::pending::<()>().await,
-                }
-            } => app.maybe_reload_config(),
-            _ = ticker.tick() => {
-                // Fallback polling only when no OS watcher is active.
-                if !watch_active {
-                    app.maybe_reload_config();
-                }
-            }
+            _ = ticker.tick() => {}
         }
     }
     Ok(())

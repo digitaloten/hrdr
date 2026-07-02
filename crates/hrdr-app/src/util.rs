@@ -129,6 +129,80 @@ pub fn display_dir(cwd: &Path) -> String {
     s
 }
 
+/// Modified-time of the user config file, for hot-reload dedup guards.
+pub fn config_mtime() -> Option<std::time::SystemTime> {
+    hrdr_agent::config_file_path()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+}
+
+/// Keeps a config watch alive; drop it to stop watching.
+pub struct ConfigWatcherGuard {
+    _watcher: Option<notify::RecommendedWatcher>,
+    poller: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ConfigWatcherGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.poller.take() {
+            p.abort();
+        }
+    }
+}
+
+/// Watch the user config file, invoking `on_change` (from a background
+/// thread/task) on every modification — the unified hot-reload source for
+/// both frontends. Uses an OS-level watcher (inotify/FSEvents/…) on the
+/// config's parent directory (so atomic saves via rename are caught) and
+/// falls back to 2s mtime polling when a watcher can't be created. The
+/// callback should just ping the frontend's channel; dedup (e.g. ignoring
+/// self-inflicted writes from persisting a setting) is the receiver's job.
+pub fn watch_config(on_change: impl Fn() + Send + Sync + 'static) -> ConfigWatcherGuard {
+    use notify::{RecursiveMode, Watcher};
+    let on_change = std::sync::Arc::new(on_change);
+    let watcher = hrdr_agent::config_file_path().and_then(|path| {
+        let dir = path.parent()?.to_path_buf();
+        let _ = std::fs::create_dir_all(&dir);
+        let file_name = path.file_name()?.to_os_string();
+        let cb = on_change.clone();
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res
+                && event
+                    .paths
+                    .iter()
+                    .any(|p| p.file_name() == Some(file_name.as_os_str()))
+            {
+                cb();
+            }
+        })
+        .ok()?;
+        watcher.watch(&dir, RecursiveMode::NonRecursive).ok()?;
+        Some(watcher)
+    });
+    // Fallback: poll the mtime when no OS watcher could be established.
+    let poller = if watcher.is_none() {
+        let cb = on_change;
+        Some(tokio::spawn(async move {
+            let mut last = config_mtime();
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                let now = config_mtime();
+                if now != last {
+                    last = now;
+                    cb();
+                }
+            }
+        }))
+    } else {
+        None
+    };
+    ConfigWatcherGuard {
+        _watcher: watcher,
+        poller,
+    }
+}
+
 /// Build the `@file` completion index off the UI thread — [`walk_files`] can
 /// touch tens of thousands of directory entries, which would stall a frame if
 /// run inline. Runs on a blocking task; `on_done` receives the file list there

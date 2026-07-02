@@ -76,3 +76,58 @@ mod tests {
         assert_eq!(relative_time(now + Duration::hours(1)), "now");
     }
 }
+
+/// The per-turn stats line both frontends append after a completed turn
+/// (`✓ N tok · tok/s · elapsed · ttft · ctx`). `None` when the turn produced
+/// nothing measurable. `ttft_secs` is time-to-first-token; the token rate is
+/// measured from the first token, not the request start.
+pub fn turn_stats_line(
+    elapsed_secs: f64,
+    ttft_secs: Option<f64>,
+    out_tokens: usize,
+    usage: Option<(u32, u32)>,
+) -> Option<String> {
+    if out_tokens == 0 && usage.is_none() {
+        return None;
+    }
+    let speed = match ttft_secs {
+        Some(t0) if out_tokens > 0 && elapsed_secs > t0 => out_tokens as f64 / (elapsed_secs - t0),
+        _ => 0.0,
+    };
+    let mut s = format!("✓ {out_tokens} tok · {speed:.1} tok/s · {elapsed_secs:.1}s");
+    // Time to first token (provider latency before streaming began).
+    if let Some(t0) = ttft_secs {
+        s.push_str(&format!(" · ttft {t0:.2}s"));
+    }
+    if let Some((prompt, completion)) = usage {
+        let ratio = if completion > 0 {
+            prompt as f64 / completion as f64
+        } else {
+            0.0
+        };
+        s.push_str(&format!(
+            " · ctx {prompt} (in/out {prompt}/{completion}, {ratio:.1}:1)"
+        ));
+    }
+    Some(s)
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn turn_stats_line_shapes() {
+        // Nothing measurable → no line.
+        assert_eq!(turn_stats_line(1.0, None, 0, None), None);
+        // Full line: rate measured from the first token.
+        let s = turn_stats_line(3.0, Some(1.0), 100, Some((600, 100))).unwrap();
+        assert!(s.contains("✓ 100 tok"), "{s}");
+        assert!(s.contains("50.0 tok/s"), "{s}");
+        assert!(s.contains("ttft 1.00s"), "{s}");
+        assert!(s.contains("ctx 600 (in/out 600/100, 6.0:1)"), "{s}");
+        // Usage-only turn (no streamed tokens) still reports context.
+        let s = turn_stats_line(2.0, None, 0, Some((10, 0))).unwrap();
+        assert!(s.contains("0.0 tok/s") && s.contains("ctx 10"), "{s}");
+    }
+}

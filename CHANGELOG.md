@@ -8,6 +8,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Four more TUI behaviors unified into shared code paths — the GUI gains all
+  of them:**
+  - **Per-turn stats line** (`hrdr_app::turn_stats_line`, unit-tested): both
+    frontends append `✓ N tok · tok/s · elapsed · ttft · ctx (in/out, ratio)`
+    after every turn; the GUI counts streamed tokens per turn like the TUI.
+  - **Config hot-reload** (`hrdr_app::watch_config` + `config_mtime`): one
+    watcher — OS-level (inotify/FSEvents, catching atomic renames) with a 2s
+    mtime-polling fallback — pings each frontend's channel; both dedup
+    self-inflicted writes (persisting a setting) via the same mtime guard. The
+    TUI's bespoke watcher + event-loop polling are deleted; the GUI now
+    hot-reloads theme/thinking/timestamps/statusbar/todo-ttl on external edits,
+    and its `/reload` shares the exact application path (`apply_ui_config`) and
+    also refreshes `AGENTS.md`.
+  - **Startup endpoint health check** (`hrdr_app::endpoint_health_warning`): the
+    GUI now warns at launch when the endpoint is unreachable or doesn't
+    advertise the configured model, with the TUI's exact messages.
+  - **`/init` doc reload** (`hrdr_app::reload_project_docs` + a `mark_init_turn`
+    host hook): the TUI's local `/init` arm is deleted — the shared command
+    marks the turn in both frontends, and when it completes, both load the fresh
+    `AGENTS.md` into the system prompt.
+
 - **Unified compaction, and the GUI auto-compacts.** The compaction core is
   shared (`hrdr_app::run_compaction` + `compaction_message` +
   `should_auto_compact`): `/compact` now behaves identically in both frontends

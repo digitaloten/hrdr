@@ -22,7 +22,6 @@ impl super::App {
         match cmd {
             "info" => self.show_info(), // richer than the shared /info
             "edit" => self.edit_file_cmd(arg),
-            "init" => self.init_agents_cmd(), // reloads AGENTS.md after (pending_init)
             "reload" => self.reload_cmd(),
             "goto" => self.goto_cmd(arg),
             "find" | "search" => self.find_cmd(arg),
@@ -116,21 +115,6 @@ impl super::App {
     fn reload_cmd(&mut self) {
         self.apply_config_reload(true);
         self.reload_project_docs();
-    }
-    /// `/init` — have the model explore the project and write an `AGENTS.md`
-    /// (Claude Code / opencode style): we send it an instruction prompt and it
-    /// uses its tools to analyze the repo and create the file.
-    fn init_agents_cmd(&mut self) {
-        if self.running {
-            self.system("can't /init while a turn is running");
-            return;
-        }
-        self.push_entry(Entry::System(
-            "/init — exploring the project to write AGENTS.md…".to_string(),
-        ));
-        self.scroll_offset = 0;
-        self.pending_init = true;
-        self.launch_turn(hrdr_app::INIT_PROMPT.to_string());
     }
     fn show_info(&mut self) {
         let temp = self.with_agent(|a| a.temperature()).flatten();
@@ -483,6 +467,9 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     fn compact(&mut self, instructions: Option<String>) {
         self.app.system("compacting conversation…");
         self.app.spawn_compaction(instructions);
+    }
+    fn mark_init_turn(&mut self) {
+        self.app.pending_init = true;
     }
     fn persist_setting(&mut self, key: &str, value: hrdr_agent::ConfigValue) {
         // The TUI version also suppresses the config hot-reload it would cause.

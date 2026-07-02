@@ -26,11 +26,12 @@ mod util;
 
 use completion::CompletionKind;
 pub(crate) use completion::Completions;
+use hrdr_app::config_mtime as current_config_mtime;
 use hrdr_app::{age_completed_todos, display_dir, git_branch, is_quit_command};
-use util::{current_config_mtime, timestamp_now};
+use util::timestamp_now;
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
-pub(crate) use util::{run_editor, setup_config_watcher};
+pub(crate) use util::run_editor;
 
 // The display-mode enums live in the shared `hrdr-app` core so the TUI and GUI
 // resolve/persist these settings identically.
@@ -81,6 +82,8 @@ pub(crate) enum TurnMsg {
     Compacted(Result<(usize, usize), String>),
     /// `@file` completion index built off-thread for `cwd`.
     FileIndex(std::path::PathBuf, Vec<String>),
+    /// The config file changed on disk (from the shared watcher).
+    ConfigChanged,
 }
 
 pub(crate) struct App {
@@ -331,37 +334,25 @@ impl App {
     /// warning if it's unreachable or doesn't advertise the configured model.
     /// Stays silent on success so it doesn't clutter the transcript.
     pub(crate) fn spawn_health_check(&self) {
-        let Some(client) = self.with_agent(|a| a.client()) else {
-            return;
-        };
+        let agent = self.agent.clone();
         let model = self.model.clone();
         let base_url = self.base_url.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            match client.list_models().await {
-                Err(e) => {
-                    let _ = tx.send(TurnMsg::System(format!(
-                        "⚠ endpoint {base_url} looks unreachable: {e}"
-                    )));
-                }
-                Ok(models) => {
-                    if model != "default"
-                        && !models.is_empty()
-                        && !models.iter().any(|m| m == &model)
-                    {
-                        let sample = models
-                            .iter()
-                            .take(8)
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let _ = tx.send(TurnMsg::System(format!(
-                            "⚠ model '{model}' not found at {base_url}; available: {sample}"
-                        )));
-                    }
-                }
+            if let Some(warning) = hrdr_app::endpoint_health_warning(agent, model, base_url).await {
+                let _ = tx.send(TurnMsg::System(warning));
             }
         });
+    }
+
+    /// Start the shared config-file watch, piping change pings into the UI
+    /// loop (dedup happens in [`Self::maybe_reload_config`]'s mtime guard).
+    /// The returned guard must be kept alive for the watch to stay active.
+    pub(crate) fn start_config_watch(&self) -> hrdr_app::ConfigWatcherGuard {
+        let tx = self.tx.clone();
+        hrdr_app::watch_config(move || {
+            let _ = tx.send(TurnMsg::ConfigChanged);
+        })
     }
 
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> Action {
@@ -724,16 +715,13 @@ impl App {
     /// Re-gather `AGENTS.md` for the current cwd and refresh the system prompt
     /// in place (e.g. after `/init` writes one).
     fn reload_project_docs(&mut self) {
-        let Some(loaded) = self.with_agent(|a| {
-            let cwd = a.cwd();
-            a.set_cwd(cwd);
-            a.project_docs().is_some()
-        }) else {
-            return;
-        };
-        if loaded {
-            self.system("loaded AGENTS.md into the system prompt");
-        }
+        let agent = self.agent.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            if let Some(line) = hrdr_app::reload_project_docs(agent).await {
+                let _ = tx.send(TurnMsg::System(line));
+            }
+        });
     }
 
     /// Abort the in-flight agent task and discard any queued messages.
@@ -932,6 +920,7 @@ impl App {
                 self.file_index_cwd = Some(cwd);
                 self.file_index_building = false;
             }
+            TurnMsg::ConfigChanged => self.maybe_reload_config(),
             TurnMsg::Compacted(res) => {
                 self.turn_handle = None;
                 self.running = false;
@@ -956,43 +945,13 @@ impl App {
     /// any output.
     fn turn_stats(&self) -> Option<String> {
         let started = self.turn_started?;
-        if self.out_tokens == 0 && self.last_usage.is_none() {
-            return None;
-        }
-        let elapsed = started.elapsed().as_secs_f64();
-        let speed = match self.first_token_at {
-            Some(t0) if self.out_tokens > 0 => {
-                let secs = t0.elapsed().as_secs_f64();
-                if secs > 0.0 {
-                    self.out_tokens as f64 / secs
-                } else {
-                    0.0
-                }
-            }
-            _ => 0.0,
-        };
-        let mut s = format!(
-            "✓ {} tok · {speed:.1} tok/s · {elapsed:.1}s",
-            self.out_tokens
-        );
-        // Time to first token (provider latency before streaming began).
-        if let Some(t0) = self.first_token_at {
-            s.push_str(&format!(
-                " · ttft {:.2}s",
-                t0.duration_since(started).as_secs_f64()
-            ));
-        }
-        if let Some((prompt, completion)) = self.last_usage {
-            let ratio = if completion > 0 {
-                prompt as f64 / completion as f64
-            } else {
-                0.0
-            };
-            s.push_str(&format!(
-                " · ctx {prompt} (in/out {prompt}/{completion}, {ratio:.1}:1)"
-            ));
-        }
-        Some(s)
+        hrdr_app::turn_stats_line(
+            started.elapsed().as_secs_f64(),
+            self.first_token_at
+                .map(|t0| t0.duration_since(started).as_secs_f64()),
+            self.out_tokens,
+            self.last_usage,
+        )
     }
 
     /// Count a streamed delta toward the live tok/s stats.
