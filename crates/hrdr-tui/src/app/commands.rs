@@ -83,7 +83,18 @@ impl super::App {
     /// history and re-reads `AGENTS.md`; this resets the view + interaction
     /// state. The shared `/clear` command emits the confirmation line.
     pub(super) fn clear_all(&mut self) {
-        self.with_agent(|a| a.clear());
+        // A running turn holds the agent mutex for its whole duration, so a
+        // try_lock clear would silently no-op — and the turn's autosave would
+        // then write the old history into a brand-new session. Cancel the turn
+        // first, then clear through an awaited lock (the abort releases it at
+        // the task's next yield).
+        if self.running {
+            self.cancel_turn();
+        }
+        let agent = self.agent.clone();
+        tokio::spawn(async move {
+            agent.lock().await.clear();
+        });
         self.clear_transcript();
         self.queue.clear();
         if let Ok(mut todos) = self.todos.lock() {

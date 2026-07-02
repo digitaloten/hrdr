@@ -8,6 +8,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Streamed responses no longer corrupt multibyte UTF-8 split across network
+  chunks. The SSE decoder ran `from_utf8_lossy` per raw chunk, so an emoji/CJK
+  codepoint straddling a chunk boundary became U+FFFD replacement characters
+  inside the streamed text (and was baked into the saved history). The decoder
+  now buffers raw bytes and only decodes complete `data:` lines.
+
+- A timed-out `bash`/`powershell` command no longer leaks a running process. The
+  tool reported "command timed out" but never killed the child, so a hung
+  `cargo test` or dev server kept running orphaned. The child is now killed on
+  timeout (and `kill_on_drop` covers turn interruption), and the output the
+  command produced before the timeout is returned to the model instead of being
+  discarded.
+
+- Pasting in `--vim` mode while in Normal mode no longer executes the pasted
+  text as vim commands (`d`, `x`, `:`, … mutated or clobbered the input buffer).
+  `VimEngine` now inserts pastes directly into the buffer outside Insert mode;
+  the key-feed path is kept in Insert mode.
+
+- `/clear` during a running turn now cancels the turn first. Previously the
+  agent-history clear was a silent `try_lock` no-op while the transcript and
+  session id were reset anyway — the still-running turn then streamed into the
+  emptied view and its autosave wrote the _uncleared_ history into a brand-new
+  session file.
+
+- `/resume` is now rejected while a turn is running. The message swap was a
+  silent `try_lock` no-op but the session id was adopted anyway, so the
+  in-flight turn's autosave overwrote the resumed session's file on disk with
+  the previous, unrelated conversation.
+
 - `todo_write` now tolerates the malformed argument shapes smaller models emit
   instead of failing with `invalid todo_write args`. The schema is unchanged
   (`{"todos": [{content, status}, …]}`), but the parser now also accepts the

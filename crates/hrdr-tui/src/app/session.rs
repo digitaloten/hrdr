@@ -75,6 +75,14 @@ impl super::App {
     /// [`hrdr_app::CommandHost::resume`]): swap in its messages/model, rebuild the
     /// transcript, adopt its id/name, and follow its working directory.
     pub(super) fn apply_session(&mut self, id: String, session: hrdr_agent::Session) {
+        // A running turn holds the agent mutex: the message swap below would
+        // silently no-op while the transcript + session id still switched, and
+        // the in-flight turn's autosave would then overwrite the resumed
+        // session's file with the old conversation.
+        if self.running {
+            self.system("a turn is running — interrupt it (Ctrl+C) before /resume");
+            return;
+        }
         let cwd = self.current_cwd();
         let count = session.messages.len();
         self.with_agent(|a| {

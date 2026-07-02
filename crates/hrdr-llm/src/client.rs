@@ -104,14 +104,19 @@ impl Client {
 
         let mut bytes = resp.bytes_stream();
         let stream = async_stream::try_stream! {
-            let mut buf = String::new();
+            // Buffer raw bytes and only decode complete lines: a multibyte
+            // codepoint split across network chunks must not be decoded lossily
+            // mid-sequence (0x0A never occurs inside a UTF-8 sequence, so
+            // splitting on it is safe).
+            let mut buf: Vec<u8> = Vec::new();
             while let Some(chunk) = bytes.next().await {
                 let chunk = chunk.context("reading stream chunk")?;
-                buf.push_str(&String::from_utf8_lossy(&chunk));
+                buf.extend_from_slice(&chunk);
                 // SSE frames are separated by a blank line; events are `data: ...`.
-                while let Some(nl) = buf.find('\n') {
-                    let line = buf[..nl].trim_end_matches('\r').to_string();
-                    buf.drain(..=nl);
+                while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=nl).collect();
+                    let line = String::from_utf8_lossy(&line[..nl]);
+                    let line = line.trim_end_matches('\r');
                     let Some(data) = line.strip_prefix("data:") else {
                         continue;
                     };

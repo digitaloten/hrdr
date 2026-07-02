@@ -154,6 +154,25 @@ impl EditorEngine for VimEngine {
             && matches!(self.editor.coarse_mode(), CoarseMode::Normal)
     }
 
+    fn paste(&mut self, text: &str) {
+        // The trait default feeds chars as key events, which outside Insert
+        // mode would *execute* the pasted text as vim commands (`d`, `x`, `:`…).
+        // Insert directly into the buffer instead; in Insert mode the default
+        // is fine (and keeps the cursor trailing the paste).
+        if self.is_insert() {
+            for c in text.chars().filter(|&c| c != '\r') {
+                let code = match c {
+                    '\n' => KeyCode::Enter,
+                    '\t' => KeyCode::Tab,
+                    other => KeyCode::Char(other),
+                };
+                self.feed_key(KeyEvent::new(code, KeyModifiers::NONE));
+            }
+        } else {
+            self.editor.insert_str(&text.replace('\r', ""));
+        }
+    }
+
     fn keybind_hint(&self) -> &'static str {
         "Esc=normal · Enter(normal)=send · Ctrl+G=$EDITOR · Ctrl+C×2=quit"
     }

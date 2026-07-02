@@ -278,6 +278,8 @@ async fn run_streamed_command(
     ctx: &ToolContext,
 ) -> Result<String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // If this future is cancelled (turn interrupt) the process must not linger.
+    cmd.kill_on_drop(true);
     let mut child = cmd.spawn().context("spawning command")?;
     let stdout = child.stdout.take().context("capturing stdout")?;
     let stderr = child.stderr.take().context("capturing stderr")?;
@@ -307,11 +309,23 @@ async fn run_streamed_command(
         let status = child.wait().await.context("waiting on command")?;
         anyhow::Ok(status)
     };
-    let status = tokio::time::timeout(timeout, collect)
-        .await
-        .map_err(|_| anyhow!("command timed out after {}ms", timeout.as_millis()))??;
-
-    if !status.success() {
+    let timed = tokio::time::timeout(timeout, collect).await;
+    let status = match timed {
+        Ok(status) => Some(status?),
+        Err(_) => {
+            // Timed out: kill the process (it would otherwise keep running
+            // orphaned) and hand the model whatever it printed so far.
+            let _ = child.kill().await;
+            out.push_str(&format!(
+                "[command timed out after {}ms; process killed]\n",
+                timeout.as_millis()
+            ));
+            None
+        }
+    };
+    if let Some(status) = status
+        && !status.success()
+    {
         out.push_str(&format!("[exit status: {status}]\n"));
     }
     let out = out.trim_end();
@@ -1081,5 +1095,20 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("exit status"), "status marker missing: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_timeout_kills_process_and_keeps_partial_output() {
+        let c = ctx(std::path::PathBuf::from("."));
+        let out = BashTool
+            .execute(
+                serde_json::json!({"command": "echo early; sleep 30", "timeout_ms": 300}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("early"), "partial output missing: {out}");
+        assert!(out.contains("timed out"), "timeout marker missing: {out}");
     }
 }
