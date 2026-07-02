@@ -359,7 +359,20 @@ jobs:
               echo "$CRATE $VERSION already on crates.io — skipping"
               continue
             fi
-            cargo publish -p "$CRATE" --locked
+            # crates.io rate-limits bursts of NEW crates (~5, then a wait);
+            # a 7-crate workspace trips it on the first release. Retry with
+            # a wait instead of failing the job.
+            for ATTEMPT in 1 2 3; do
+              if cargo publish -p "$CRATE" --locked; then
+                break
+              fi
+              if [ "$ATTEMPT" = "3" ]; then
+                echo "publishing $CRATE failed after $ATTEMPT attempts"
+                exit 1
+              fi
+              echo "publish of $CRATE failed (likely the new-crate rate limit) — retrying in 10m"
+              sleep 600
+            done
           done
 
   aur-bin:
