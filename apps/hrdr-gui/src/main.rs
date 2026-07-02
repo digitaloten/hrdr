@@ -45,49 +45,24 @@ struct GuiTheme {
 }
 
 impl GuiTheme {
-    /// Load an hjkl theme TOML (or hjkl's bundled default), mapping its palette
-    /// + UI styles onto hrdr's chat roles with fallbacks.
+    /// Load an hjkl theme TOML (or hjkl's bundled default). The role mapping is
+    /// shared with the TUI ([`hrdr_app::ChatPalette`]); this only converts the
+    /// resolved RGB roles to floem colors with GUI fallbacks.
     fn load(path: Option<&str>) -> Self {
-        use hjkl_theme::{Theme as HjklTheme, loader};
-        let t = match path {
-            Some(p) => HjklTheme::from_path(std::path::Path::new(p))
-                .unwrap_or_else(|_| loader::default_theme()),
-            None => loader::default_theme(),
+        let p = hrdr_app::ChatPalette::load(path);
+        let c = |rgb: Option<(u8, u8, u8)>, fb: Color| {
+            rgb.map(|(r, g, b)| Color::rgb8(r, g, b)).unwrap_or(fb)
         };
-        let pal = |name: &str| t.palette.get(name).copied().map(to_floem);
         Self {
-            bg: t
-                .ui
-                .background
-                .map(to_floem)
-                .unwrap_or(Color::rgb8(0x1e, 0x1e, 0x24)),
-            user: pal("teal").or_else(|| pal("blue")).unwrap_or(USER),
-            assistant: t
-                .ui
-                .foreground
-                .map(to_floem)
-                .or_else(|| pal("fg"))
-                .unwrap_or(Color::rgb8(0xe0, 0xe0, 0xe0)),
-            dim: t
-                .ui
-                .gutter
-                .map(to_floem)
-                .or_else(|| pal("comment"))
-                .unwrap_or(DIM),
-            tool: pal("yellow").unwrap_or(TOOL),
-            ok: pal("green").unwrap_or(OK),
-            err: t
-                .ui
-                .diagnostic_error
-                .map(to_floem)
-                .or_else(|| pal("red"))
-                .unwrap_or(ERR),
+            bg: c(p.background, Color::rgb8(0x1e, 0x1e, 0x24)),
+            user: c(p.user, USER),
+            assistant: c(p.assistant, Color::rgb8(0xe0, 0xe0, 0xe0)),
+            dim: c(p.dim, DIM),
+            tool: c(p.warn, TOOL),
+            ok: c(p.success, OK),
+            err: c(p.error, ERR),
         }
     }
-}
-
-fn to_floem(c: hjkl_theme::Color) -> Color {
-    Color::rgb8(c.r, c.g, c.b)
 }
 
 // ---- transcript model ---------------------------------------------------
@@ -127,6 +102,10 @@ enum Body {
 struct Item {
     id: u64,
     body: Body,
+    /// The child scope this item's signals were created on (`None` for bodies
+    /// with no signals), disposed when the item is cleared — see
+    /// [`clear_items`].
+    scope: Option<Scope>,
 }
 
 /// One row in the completion dropdown: a slash command or an `@file` match.
@@ -252,12 +231,8 @@ fn app_view(
     let clipboard = Rc::new(RefCell::new(hjkl_clipboard::Clipboard::new().ok()));
     // Handle to the in-flight turn task; `abort()` cancels it (Esc / Stop).
     let turn_handle: Rc<RefCell<Option<tokio::task::JoinHandle<()>>>> = Rc::new(RefCell::new(None));
-    // Submitted-input history (shared load/persist), for Up/Down recall.
-    let history: RwSignal<Vec<String>> = create_rw_signal(hrdr_app::load_history());
-    // Position while browsing history (None = editing a fresh draft); the draft
-    // is stashed when browsing begins so Down past the newest restores it.
-    let hist_pos: RwSignal<Option<usize>> = create_rw_signal(None);
-    let hist_draft = create_rw_signal(String::new());
+    // Submitted-input history + Up/Down browsing (shared with the TUI).
+    let history = Rc::new(RefCell::new(hrdr_app::HistoryBrowser::load()));
 
     // Bridge background turns → the UI thread over one long-lived channel.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiMsg>();
@@ -308,6 +283,7 @@ fn app_view(
     });
 
     let th_for_send = turn_handle.clone();
+    let history_for_send = history.clone();
     let send = move || {
         // Trim like the TUI does, so " /help" is still a command.
         let text = input.get().trim().to_string();
@@ -315,8 +291,7 @@ fn app_view(
             return;
         }
         // Record every submitted line for Up/Down recall, and reset browsing.
-        record_history(history, &text);
-        hist_pos.set(None);
+        history_for_send.borrow_mut().record(&text);
         // Common quit words (shared with the TUI) close the window.
         if hrdr_app::is_quit_command(&text) {
             floem::quit_app();
@@ -443,6 +418,8 @@ fn app_view(
     )
     .style(|s| s.flex_grow(1.0).width_full().padding(10.0));
 
+    let hist_up = history.clone();
+    let hist_down = history.clone();
     let input_box = text_input(input)
         .placeholder("Message hrdr…  (Enter to send)")
         .on_key_down(
@@ -454,12 +431,21 @@ fn app_view(
         .on_key_down(
             Key::Named(NamedKey::ArrowUp),
             |m| m.is_empty(),
-            move |_| history_prev(history, input, hist_pos, hist_draft),
+            move |_| {
+                let current = input.get_untracked();
+                if let Some(text) = hist_up.borrow_mut().recall_prev(&current) {
+                    input.set(text);
+                }
+            },
         )
         .on_key_down(
             Key::Named(NamedKey::ArrowDown),
             |m| m.is_empty(),
-            move |_| history_next(history, input, hist_pos, hist_draft),
+            move |_| {
+                if let Some(text) = hist_down.borrow_mut().recall_next() {
+                    input.set(text);
+                }
+            },
         )
         // Esc cancels the in-flight turn (otherwise unused in the single-line input).
         .on_key_down(
@@ -586,9 +572,34 @@ fn app_view(
 // ---- event handling -----------------------------------------------------
 
 fn push_item(transcript: RwSignal<Vec<Item>>, next_id: RwSignal<u64>, body: Body) {
+    push_item_scoped(transcript, next_id, body, None);
+}
+
+/// Push an item whose signals live on `scope` (a per-item child scope, so the
+/// signals can be disposed when the item is cleared).
+fn push_item_scoped(
+    transcript: RwSignal<Vec<Item>>,
+    next_id: RwSignal<u64>,
+    body: Body,
+    scope: Option<Scope>,
+) {
     let id = next_id.get_untracked();
     next_id.set(id + 1);
-    transcript.update(|t| t.push(Item { id, body }));
+    transcript.update(|t| t.push(Item { id, body, scope }));
+}
+
+/// Clear the transcript and dispose each item's signal scope. Per-item signals
+/// are created on child scopes so a long-lived window doesn't leak a few
+/// signals per message across every `/clear` and `/resume`. Disposal happens
+/// after the update: the views referencing the signals are torn down
+/// synchronously by the clear, so they stay valid during teardown.
+fn clear_items(transcript: RwSignal<Vec<Item>>) {
+    let scopes: Vec<Scope> =
+        transcript.with_untracked(|t| t.iter().filter_map(|i| i.scope).collect());
+    transcript.update(|t| t.clear());
+    for s in scopes {
+        s.dispose();
+    }
 }
 
 /// Push a system line into the transcript.
@@ -606,19 +617,23 @@ fn rebuild_transcript(
     next_id: RwSignal<u64>,
     msgs: &[Message],
 ) {
-    transcript.update(|t| t.clear());
+    clear_items(transcript);
     next_id.set(0);
     for e in hrdr_app::messages_to_entries(msgs) {
         match e {
             hrdr_app::Entry::User(c) => push_item(transcript, next_id, Body::User(c)),
-            hrdr_app::Entry::Assistant(c) => push_item(
-                transcript,
-                next_id,
-                Body::Assistant(Assistant {
-                    reasoning: cx.create_rw_signal(String::new()),
-                    text: cx.create_rw_signal(c),
-                }),
-            ),
+            hrdr_app::Entry::Assistant(c) => {
+                let item_cx = cx.create_child();
+                push_item_scoped(
+                    transcript,
+                    next_id,
+                    Body::Assistant(Assistant {
+                        reasoning: item_cx.create_rw_signal(String::new()),
+                        text: item_cx.create_rw_signal(c),
+                    }),
+                    Some(item_cx),
+                )
+            }
             hrdr_app::Entry::Tool {
                 id,
                 name,
@@ -626,20 +641,24 @@ fn rebuild_transcript(
                 result,
                 ok,
                 ..
-            } => push_item(
-                transcript,
-                next_id,
-                Body::Tool(Tool {
-                    call_id: id,
-                    name,
-                    args,
-                    output: cx.create_rw_signal(String::new()),
-                    result: cx.create_rw_signal(result),
-                    ok: cx.create_rw_signal(ok),
-                    done: cx.create_rw_signal(true),
-                    collapsed: cx.create_rw_signal(true),
-                }),
-            ),
+            } => {
+                let item_cx = cx.create_child();
+                push_item_scoped(
+                    transcript,
+                    next_id,
+                    Body::Tool(Tool {
+                        call_id: id,
+                        name,
+                        args,
+                        output: item_cx.create_rw_signal(String::new()),
+                        result: item_cx.create_rw_signal(result),
+                        ok: item_cx.create_rw_signal(ok),
+                        done: item_cx.create_rw_signal(true),
+                        collapsed: item_cx.create_rw_signal(true),
+                    }),
+                    Some(item_cx),
+                )
+            }
             _ => {}
         }
     }
@@ -710,73 +729,6 @@ fn copy_to_clipboard(
     }
 }
 
-/// Append a submitted line to the in-memory history (dropping an immediate
-/// duplicate of the last entry) and persist it (capped at `MAX_HISTORY`).
-fn record_history(history: RwSignal<Vec<String>>, text: &str) {
-    history.update(|h| {
-        if h.last().map(String::as_str) != Some(text) {
-            h.push(text.to_string());
-            if h.len() > hrdr_app::MAX_HISTORY {
-                let drop = h.len() - hrdr_app::MAX_HISTORY;
-                h.drain(0..drop);
-            }
-        }
-    });
-    hrdr_app::persist_history(&history.get_untracked());
-}
-
-/// Up-arrow: step to an older history entry, stashing the live draft on the
-/// first step so Down can restore it.
-fn history_prev(
-    history: RwSignal<Vec<String>>,
-    input: RwSignal<String>,
-    hist_pos: RwSignal<Option<usize>>,
-    hist_draft: RwSignal<String>,
-) {
-    let h = history.get();
-    if h.is_empty() {
-        return;
-    }
-    let pos = match hist_pos.get() {
-        None => {
-            hist_draft.set(input.get_untracked());
-            h.len() - 1
-        }
-        Some(0) => 0,
-        Some(p) => p - 1,
-    };
-    hist_pos.set(Some(pos));
-    input.set(h[pos].clone());
-}
-
-/// Down-arrow: step to a newer history entry, or past the newest back to the
-/// stashed draft.
-fn history_next(
-    history: RwSignal<Vec<String>>,
-    input: RwSignal<String>,
-    hist_pos: RwSignal<Option<usize>>,
-    hist_draft: RwSignal<String>,
-) {
-    let h = history.get();
-    match hist_pos.get() {
-        None => {}
-        Some(p) if p + 1 < h.len() => {
-            hist_pos.set(Some(p + 1));
-            input.set(h[p + 1].clone());
-        }
-        Some(_) => {
-            hist_pos.set(None);
-            input.set(hist_draft.get_untracked());
-        }
-    }
-}
-
-/// Handle a `/…` slash command locally. Returns `true` if it was recognized (and
-/// thus shouldn't be sent to the model). Mirrors the representation-independent
-/// subset of the TUI's `handle_slash`; commands needing the agent lock spawn a
-/// task and report back over the `UiMsg::System` channel. Aliases resolve via the
-/// shared `hrdr_app::resolve_alias`.
-#[allow(clippy::too_many_arguments)]
 /// The GUI's [`hrdr_app::CommandHost`] — the capability surface the shared
 /// slash-command dispatcher drives. Holds clones of the reactive signals +
 /// agent handle + clipboard so the shared commands can mutate GUI state.
@@ -838,9 +790,11 @@ impl hrdr_app::CommandHost for GuiHost {
     }
     fn set_show_thinking(&mut self, on: bool) {
         self.show_reasoning.set(on);
+        // Persist like the TUI does, so the setting survives a restart.
+        let _ = hrdr_agent::persist_setting("show_thinking", hrdr_agent::ConfigValue::Bool(on));
     }
     fn clear_conversation(&mut self) {
-        self.transcript.update(|t| t.clear());
+        clear_items(self.transcript);
         self.next_id.set(0);
         self.usage.set(None);
         self.turn_start.set(None);
@@ -981,11 +935,17 @@ fn current_assistant(
     if let Some(a) = existing {
         return a;
     }
+    let item_cx = cx.create_child();
     let a = Assistant {
-        reasoning: cx.create_rw_signal(String::new()),
-        text: cx.create_rw_signal(String::new()),
+        reasoning: item_cx.create_rw_signal(String::new()),
+        text: item_cx.create_rw_signal(String::new()),
     };
-    push_item(transcript, next_id, Body::Assistant(a.clone()));
+    push_item_scoped(
+        transcript,
+        next_id,
+        Body::Assistant(a.clone()),
+        Some(item_cx),
+    );
     a
 }
 
@@ -1022,17 +982,18 @@ fn handle_event(
                 .update(|s| s.push_str(&t));
         }
         AgentEvent::ToolStart { id, name, args } => {
+            let item_cx = cx.create_child();
             let tool = Tool {
                 call_id: id,
                 name,
                 args,
-                output: cx.create_rw_signal(String::new()),
-                result: cx.create_rw_signal(String::new()),
-                ok: cx.create_rw_signal(true),
-                done: cx.create_rw_signal(false),
-                collapsed: cx.create_rw_signal(true),
+                output: item_cx.create_rw_signal(String::new()),
+                result: item_cx.create_rw_signal(String::new()),
+                ok: item_cx.create_rw_signal(true),
+                done: item_cx.create_rw_signal(false),
+                collapsed: item_cx.create_rw_signal(true),
             };
-            push_item(transcript, next_id, Body::Tool(tool));
+            push_item_scoped(transcript, next_id, Body::Tool(tool), Some(item_cx));
         }
         AgentEvent::ToolOutput { id, chunk } => {
             if let Some(tool) = find_tool(transcript, &id) {
@@ -1082,7 +1043,7 @@ fn render_item(item: Item, th: GuiTheme, show_reasoning: RwSignal<bool>) -> AnyV
         .into_any(),
         Body::Tool(t) => {
             let name = t.name.clone();
-            let args = one_line(&t.args, 80);
+            let args = hrdr_tools::truncate_inline(&t.args, 80);
             let (output, result, ok, collapsed) = (t.output, t.result, t.ok, t.collapsed);
             v_stack((
                 // Clickable header — caret reflects/toggles the output collapse.
@@ -1115,15 +1076,4 @@ fn render_item(item: Item, th: GuiTheme, show_reasoning: RwSignal<bool>) -> AnyV
 /// A plain (non-reactive) text label.
 fn text_label(s: String) -> impl IntoView {
     label(move || s.clone())
-}
-
-/// Collapse to a single line and truncate to `max` chars (char-safe).
-fn one_line(s: &str, max: usize) -> String {
-    let one = s.replace('\n', " ");
-    if one.chars().count() <= max {
-        one
-    } else {
-        let head: String = one.chars().take(max).collect();
-        format!("{head}…")
-    }
 }

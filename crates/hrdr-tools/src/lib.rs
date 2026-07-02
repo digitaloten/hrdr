@@ -203,6 +203,15 @@ pub fn truncate_inline(s: &str, max: usize) -> String {
     }
 }
 
+/// Current Unix time in whole seconds (0 if the clock is before the epoch).
+/// Shared by checkpoint journaling and session metadata.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Largest byte index `≤ max` that lies on a UTF-8 char boundary of `s`, so
 /// `&s[..floor_char_boundary(s, max)]` never panics on multibyte text. Returns
 /// `s.len()` when `max >= s.len()`. (std's `str::floor_char_boundary` is still

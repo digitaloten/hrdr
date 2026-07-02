@@ -559,16 +559,19 @@ impl Agent {
         // File checkpoint store, keyed by working directory (like sessions).
         // `auto` (default) enables it only outside a git repo — git already
         // provides revert, so checkpointing there is redundant.
-        let enable_checkpoints = match config
+        // The bool spellings come from `parse_env_bool` (plus `always`/`never`)
+        // so they can't drift from the other on/off knobs; anything else (incl.
+        // `auto`) falls through to the git-repo heuristic.
+        let enable_checkpoints = config
             .checkpoints
             .as_deref()
             .map(|s| s.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("on" | "true" | "yes" | "1" | "always") => true,
-            Some("off" | "false" | "no" | "0" | "never") => false,
-            _ => !in_git_repo(&config.cwd),
-        };
+            .and_then(|v| match v.as_str() {
+                "always" => Some(true),
+                "never" => Some(false),
+                other => parse_env_bool(other),
+            })
+            .unwrap_or_else(|| !in_git_repo(&config.cwd));
         let checkpoints = enable_checkpoints
             .then(|| checkpoint_dir(&config.cwd))
             .flatten()

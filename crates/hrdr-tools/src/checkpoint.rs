@@ -9,7 +9,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -88,7 +87,7 @@ impl Checkpoints {
         };
         let rec = ChangeRecord {
             turn: self.turn,
-            ts: now(),
+            ts: crate::unix_now(),
             path: key,
             pre,
         };
@@ -197,13 +196,6 @@ impl Checkpoints {
         std::fs::write(&self.journal_path, out).context("rewriting checkpoint journal")?;
         Ok(())
     }
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

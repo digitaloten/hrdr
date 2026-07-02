@@ -8,6 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- More frontend plumbing deduplicated into `hrdr-app`:
+  - **Highlighting** — the syntect syntax set, theme (base16-ocean.dark), and
+    panel background were set up byte-identically in the TUI and GUI; both now
+    use shared `hrdr_app::{syntax_set, syntect_theme, panel_bg_rgb}` (the
+    span→color rendering stays per-frontend).
+  - **Theme role mapping** — which hjkl palette entries feed which chat role
+    (teal→user, gutter→dim, diagnostic_error→error, …) now lives once in
+    `hrdr_app::ChatPalette`; the TUI applies ANSI fallbacks, the GUI RGB
+    fallbacks. `hrdr-tui` drops its `hjkl-theme`/`hjkl-theme-tui` deps.
+  - **Input history browsing** — `hrdr_app::HistoryBrowser` (dup-skip, cap,
+    persist, Up/Down recall with draft stash/restore) replaces the two
+    hand-rolled implementations.
+  - Small: one `hrdr_tools::unix_now()` (was duplicated in sessions +
+    checkpoints), one `run_search_cmd` postlude for the rg/grep backends, one
+    `ShellArgs`/`shell_parameters` for the bash/powershell tools, the GUI's
+    `one_line` replaced by `hrdr_tools::truncate_inline`, and the checkpoints
+    `on/off/auto` spellings now derive from `parse_env_bool` (+
+    `always`/`never`).
+
 - The slash-command registry is now **capability-tagged**
   (`hrdr_app::TUI_ONLY_COMMANDS` + `is_tui_only`/`is_known_command`), fixing the
   GUI's biggest UX hole: ~23 advertised-but-unimplemented commands (`/compact`,
@@ -34,6 +53,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     replaces the GUI's two hand-rolled copies.
 
 ### Fixed
+
+- GUI: per-message signals no longer leak. Every assistant/tool item created its
+  reactive signals on the app-root scope, so a long-lived window accumulated a
+  few orphaned signals per message across every `/clear`, `/resume`, and turn.
+  Items now get a child scope that is disposed when the transcript is cleared or
+  rebuilt.
+
+- GUI: `/thinking` now persists to config like the TUI (it only flipped the
+  in-memory signal, so the setting was lost on restart).
 
 - GUI `/resume` now follows the resumed session's working directory (matching
   the TUI): the agent's cwd switches when the directory still exists (with a

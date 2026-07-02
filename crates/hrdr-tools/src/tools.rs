@@ -227,11 +227,25 @@ impl Tool for EditTool {
 
 pub struct BashTool;
 
+/// Arguments shared by the shell tools (`bash`, `powershell`).
 #[derive(Deserialize)]
-struct BashArgs {
+struct ShellArgs {
     command: String,
     #[serde(default)]
     timeout_ms: Option<u64>,
+}
+
+/// The JSON-Schema shared by the shell tools; only the command description
+/// differs.
+fn shell_parameters(command_desc: &str) -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": command_desc},
+            "timeout_ms": {"type": "integer", "description": "Timeout in ms (default 120000)."}
+        },
+        "required": ["command"]
+    })
 }
 
 #[async_trait]
@@ -244,17 +258,10 @@ impl Tool for BashTool {
          git, and anything without a dedicated tool. Output is captured and length-bounded."
     }
     fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "Shell command to run."},
-                "timeout_ms": {"type": "integer", "description": "Timeout in ms (default 120000)."}
-            },
-            "required": ["command"]
-        })
+        shell_parameters("Shell command to run.")
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: BashArgs = serde_json::from_value(args).context("invalid bash args")?;
+        let a: ShellArgs = serde_json::from_value(args).context("invalid bash args")?;
         let mut cmd = tokio::process::Command::new("bash");
         cmd.arg("-c").arg(&a.command).current_dir(&ctx.cwd);
         let timeout = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_BASH_TIMEOUT_MS));
@@ -363,13 +370,6 @@ pub struct PowerShellTool {
     program: String,
 }
 
-#[derive(Deserialize)]
-struct PowerShellArgs {
-    command: String,
-    #[serde(default)]
-    timeout_ms: Option<u64>,
-}
-
 #[async_trait]
 impl Tool for PowerShellTool {
     fn name(&self) -> &'static str {
@@ -381,17 +381,10 @@ impl Tool for PowerShellTool {
          especially on Windows. Output is captured and length-bounded."
     }
     fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "PowerShell command to run."},
-                "timeout_ms": {"type": "integer", "description": "Timeout in ms (default 120000)."}
-            },
-            "required": ["command"]
-        })
+        shell_parameters("PowerShell command to run.")
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: PowerShellArgs = serde_json::from_value(args).context("invalid powershell args")?;
+        let a: ShellArgs = serde_json::from_value(args).context("invalid powershell args")?;
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(["-NoProfile", "-NonInteractive", "-Command", &a.command])
             .current_dir(&ctx.cwd);
@@ -482,16 +475,7 @@ async fn grep_ripgrep(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     if let Some(p) = &a.path {
         cmd.arg(p);
     }
-    let output = cmd.output().await.context("running ripgrep")?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.is_empty() {
-            bail!("ripgrep: {}", stderr.trim());
-        }
-        return Ok("(no matches)".to_string());
-    }
-    Ok(truncate(&stdout, ctx.max_output))
+    run_search_cmd(cmd, "ripgrep", ctx).await
 }
 
 async fn grep_posix(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
@@ -502,13 +486,26 @@ async fn grep_posix(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     }
     cmd.arg("--").arg(&a.pattern);
     cmd.arg(a.path.as_deref().unwrap_or("."));
-    let output = cmd.output().await.context("running grep")?;
+    run_search_cmd(cmd, "grep", ctx).await
+}
+
+/// Run a configured search command: empty stdout means "(no matches)" (search
+/// tools exit non-zero on no match) unless stderr reports a real error;
+/// otherwise the truncated stdout. Shared postlude of the rg/grep backends.
+async fn run_search_cmd(
+    mut cmd: tokio::process::Command,
+    tool: &str,
+    ctx: &ToolContext,
+) -> Result<String> {
+    let output = cmd
+        .output()
+        .await
+        .with_context(|| format!("running {tool}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     if stdout.is_empty() {
-        // grep exits 1 with no matches; a real error writes to stderr.
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.is_empty() {
-            bail!("grep: {}", stderr.trim());
+            bail!("{tool}: {}", stderr.trim());
         }
         return Ok("(no matches)".to_string());
     }

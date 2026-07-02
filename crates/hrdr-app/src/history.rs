@@ -35,6 +35,73 @@ pub fn load_history() -> Vec<String> {
     v
 }
 
+/// Input-history browsing shared by the frontends: record with
+/// consecutive-duplicate skip + [`MAX_HISTORY`] cap + persistence, and Up/Down
+/// recall that stashes the live draft on the first step back and restores it
+/// past the newest entry. The frontends only differ in where the returned text
+/// goes (the TUI's editor buffer vs the GUI's input signal).
+#[derive(Default)]
+pub struct HistoryBrowser {
+    entries: Vec<String>,
+    pos: Option<usize>,
+    draft: String,
+}
+
+impl HistoryBrowser {
+    /// Start from the persisted history file.
+    pub fn load() -> Self {
+        Self {
+            entries: load_history(),
+            ..Self::default()
+        }
+    }
+
+    /// Record a submitted input (skips a consecutive duplicate, bounds the
+    /// buffer, persists on change) and reset browsing state.
+    pub fn record(&mut self, input: &str) {
+        if self.entries.last().map(String::as_str) != Some(input) {
+            self.entries.push(input.to_string());
+            if self.entries.len() > MAX_HISTORY {
+                let drop = self.entries.len() - MAX_HISTORY;
+                self.entries.drain(0..drop);
+            }
+            persist_history(&self.entries);
+        }
+        self.pos = None;
+        self.draft.clear();
+    }
+
+    /// Step to the previous (older) entry, stashing `current` as the draft on
+    /// the first step. `None` when there's no history to recall.
+    pub fn recall_prev(&mut self, current: &str) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let pos = match self.pos {
+            None => {
+                self.draft = current.to_string();
+                self.entries.len() - 1
+            }
+            Some(p) => p.saturating_sub(1),
+        };
+        self.pos = Some(pos);
+        Some(self.entries[pos].clone())
+    }
+
+    /// Step toward newer entries; past the newest, restore the stashed draft.
+    /// `None` when not currently browsing.
+    pub fn recall_next(&mut self) -> Option<String> {
+        let pos = self.pos?;
+        if pos + 1 < self.entries.len() {
+            self.pos = Some(pos + 1);
+            Some(self.entries[pos + 1].clone())
+        } else {
+            self.pos = None;
+            Some(std::mem::take(&mut self.draft))
+        }
+    }
+}
+
 /// Persist input history (one entry per line; multi-line entries are skipped to
 /// keep the line-based file well-formed). Best-effort — filesystem errors are
 /// silently ignored.
@@ -52,4 +119,29 @@ pub fn persist_history(history: &[String]) {
         .collect::<Vec<_>>()
         .join("\n");
     let _ = std::fs::write(path, body);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browse_prev_next_restores_draft() {
+        let mut b = HistoryBrowser {
+            entries: vec!["one".into(), "two".into()],
+            ..Default::default()
+        };
+        assert_eq!(b.recall_prev("draft").as_deref(), Some("two"));
+        assert_eq!(b.recall_prev("ignored").as_deref(), Some("one"));
+        // Clamped at the oldest entry.
+        assert_eq!(b.recall_prev("ignored").as_deref(), Some("one"));
+        assert_eq!(b.recall_next().as_deref(), Some("two"));
+        // Past the newest, the stashed draft comes back.
+        assert_eq!(b.recall_next().as_deref(), Some("draft"));
+        // Not browsing anymore.
+        assert_eq!(b.recall_next(), None);
+        // Empty history: Up does nothing.
+        let mut empty = HistoryBrowser::default();
+        assert_eq!(empty.recall_prev("draft"), None);
+    }
 }

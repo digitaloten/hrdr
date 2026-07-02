@@ -7,7 +7,6 @@
 //! files are easy to manage by hand and `/sessions` can scope to one project.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use hrdr_llm::ChatMessage;
@@ -42,13 +41,6 @@ pub struct SessionMeta {
     pub updated: u64,
     /// Absolute path to the session file.
     pub path: PathBuf,
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// `$XDG_DATA_HOME/hrdr/sessions`, or `~/.local/share/hrdr/sessions`.
@@ -112,7 +104,7 @@ impl Session {
         cwd: impl Into<String>,
         messages: Vec<ChatMessage>,
     ) -> Self {
-        let t = now();
+        let t = hrdr_tools::unix_now();
         Self {
             version: SESSION_VERSION,
             name: name.into(),

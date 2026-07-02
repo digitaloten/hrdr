@@ -6,7 +6,6 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::OnceLock;
 
 use floem::peniko::Color;
 use floem::prelude::SignalGet;
@@ -15,9 +14,8 @@ use floem::text::{Attrs, AttrsList, FamilyOwned, Style as FontStyle, TextLayout,
 use floem::views::{Decorators, RichText, container, dyn_stack, empty, rich_text};
 use floem::{AnyView, IntoView};
 use hjkl_markdown::{Event, parse};
+use hrdr_app::{syntax_set, syntect_theme};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
 use crate::GuiTheme;
@@ -342,28 +340,8 @@ fn code_layout(lang: &str, content: &str) -> TextLayout {
     layout
 }
 
-fn syntax_set() -> &'static SyntaxSet {
-    static SS: OnceLock<SyntaxSet> = OnceLock::new();
-    SS.get_or_init(SyntaxSet::load_defaults_newlines)
-}
-
-fn syntect_theme() -> &'static syntect::highlighting::Theme {
-    static TH: OnceLock<syntect::highlighting::Theme> = OnceLock::new();
-    TH.get_or_init(|| {
-        let ts = ThemeSet::load_defaults();
-        ts.themes
-            .get("base16-ocean.dark")
-            .or_else(|| ts.themes.values().next())
-            .cloned()
-            .expect("syntect ships default themes")
-    })
-}
-
-/// Background for code blocks: the syntect theme's background, dark fallback.
+/// Background for code blocks: the shared panel background as a floem color.
 fn panel_bg() -> Color {
-    syntect_theme()
-        .settings
-        .background
-        .map(|c| Color::rgb8(c.r, c.g, c.b))
-        .unwrap_or(Color::rgb8(30, 32, 40))
+    let (r, g, b) = hrdr_app::panel_bg_rgb();
+    Color::rgb8(r, g, b)
 }

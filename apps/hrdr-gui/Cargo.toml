@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 hrdr-agent.workspace = true
 hrdr-app.workspace = true
-hjkl-theme.workspace = true
+hrdr-tools.workspace = true
 hjkl-clipboard.workspace = true
 hjkl-markdown.workspace = true
 syntect.workspace = true

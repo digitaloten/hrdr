@@ -1,11 +1,5 @@
 //! Rendering: transcript + TODO panel + vim input pane + status line.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::sync::OnceLock;
-
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -14,14 +8,16 @@ use ratatui::widgets::{
     Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
     Wrap,
 };
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
 use crate::app::{App, Entry, StatusBarMode, TimestampStyle};
 use crate::theme::Theme;
-use hrdr_app::{fmt_count, relative_time};
+use hrdr_app::{fmt_count, relative_time, syntax_set, syntect_theme};
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
 /// Diff results (edit/write_file) get a larger preview since the diff is the point.
@@ -701,24 +697,6 @@ fn highlight_line(line: Line<'static>, needle: &str, hl: Style) -> Line<'static>
     Line::from(spans)
 }
 
-// syntect resources are loaded once (deserialized from the bundled dumps).
-fn syntax_set() -> &'static SyntaxSet {
-    static SS: OnceLock<SyntaxSet> = OnceLock::new();
-    SS.get_or_init(SyntaxSet::load_defaults_newlines)
-}
-
-fn syntect_theme() -> &'static syntect::highlighting::Theme {
-    static TH: OnceLock<syntect::highlighting::Theme> = OnceLock::new();
-    TH.get_or_init(|| {
-        let ts = ThemeSet::load_defaults();
-        ts.themes
-            .get("base16-ocean.dark")
-            .or_else(|| ts.themes.values().next())
-            .cloned()
-            .expect("syntect ships default themes")
-    })
-}
-
 thread_local! {
     // Cache highlighted code blocks (keyed by lang+content+width) so the ~8/sec
     // redraw doesn't re-run syntect every frame.
@@ -750,11 +728,8 @@ fn highlight_code_block(lang: &str, content: &str, width: u16) -> Vec<Line<'stat
 /// The shared panel background for code blocks and tool output (the syntect
 /// theme's background, with a dark fallback), so both render as solid blocks.
 fn panel_bg() -> Color {
-    syntect_theme()
-        .settings
-        .background
-        .map(|c| Color::Rgb(c.r, c.g, c.b))
-        .unwrap_or(Color::Rgb(30, 32, 40))
+    let (r, g, b) = hrdr_app::panel_bg_rgb();
+    Color::Rgb(r, g, b)
 }
 
 fn render_code_block(lang: &str, content: &str, width: u16) -> Vec<Line<'static>> {

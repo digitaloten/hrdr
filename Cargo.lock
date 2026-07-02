@@ -2074,16 +2074,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hjkl-theme-tui"
-version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37d654b699f722735f2db0f3e568cf544283ffc4d4e771c64010f9db0dffc950"
-dependencies = [
- "hjkl-theme",
- "ratatui",
-]
-
-[[package]]
 name = "hjkl-vim"
 version = "0.33.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2151,10 +2141,12 @@ name = "hrdr-app"
 version = "0.0.1"
 dependencies = [
  "chrono",
+ "hjkl-theme",
  "hjkl-xdg",
  "hrdr-agent",
  "ignore",
  "serde_json",
+ "syntect",
  "tempfile",
  "tokio",
 ]
@@ -2181,9 +2173,9 @@ dependencies = [
  "floem",
  "hjkl-clipboard",
  "hjkl-markdown",
- "hjkl-theme",
  "hrdr-agent",
  "hrdr-app",
+ "hrdr-tools",
  "syntect",
  "tokio",
 ]
@@ -2233,8 +2225,6 @@ dependencies = [
  "hjkl-icons",
  "hjkl-markdown",
  "hjkl-markdown-tui",
- "hjkl-theme",
- "hjkl-theme-tui",
  "hrdr-agent",
  "hrdr-app",
  "hrdr-editor",
