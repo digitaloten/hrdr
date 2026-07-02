@@ -9,7 +9,6 @@
 //! This is a second [`EditorEngine`] discipline alongside [`crate::VimEngine`],
 //! proving the FSM-agnostic seam: the TUI swaps engines without changing.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -137,21 +136,18 @@ impl PlainEngine {
 }
 
 impl EditorEngine for PlainEngine {
-    fn feed_key(&mut self, key: KeyEvent) {
-        if key.kind == KeyEventKind::Release {
-            return;
-        }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Char(c) if ctrl => match c {
+    fn feed_key(&mut self, key: crate::EditorKey) {
+        use crate::EditorKeyCode as K;
+        match key.key {
+            K::Char(c) if key.ctrl => match c {
                 'a' => self.home(),
                 'e' => self.end(),
                 'w' => self.delete_word(),
                 'u' => self.kill_to_line_start(),
                 _ => {}
             },
-            KeyCode::Char(c) => self.insert(c),
-            KeyCode::Enter => {
+            K::Char(c) => self.insert(c),
+            K::Enter => {
                 // Reached only when this Enter is NOT a submit (Shift+Enter, or
                 // `\`+Enter). Strip the escape backslash if present.
                 if self.pending_backslash() {
@@ -159,14 +155,14 @@ impl EditorEngine for PlainEngine {
                 }
                 self.insert('\n');
             }
-            KeyCode::Backspace => self.backspace(),
-            KeyCode::Delete => self.delete(),
-            KeyCode::Left => self.left(),
-            KeyCode::Right => self.right(),
-            KeyCode::Up => self.up(),
-            KeyCode::Down => self.down(),
-            KeyCode::Home => self.home(),
-            KeyCode::End => self.end(),
+            K::Backspace => self.backspace(),
+            K::Delete => self.delete(),
+            K::Left => self.left(),
+            K::Right => self.right(),
+            K::Up => self.up(),
+            K::Down => self.down(),
+            K::Home => self.home(),
+            K::End => self.end(),
             _ => {}
         }
     }
@@ -188,14 +184,13 @@ impl EditorEngine for PlainEngine {
         true
     }
 
-    fn wants_submit(&self, key: &KeyEvent) -> bool {
+    fn wants_submit(&self, key: &crate::EditorKey) -> bool {
         // Enter sends — UNLESS it's a newline gesture: Shift+Enter (only on
         // terminals that report it), Alt+Enter (reported by far more
         // terminals), or a trailing backslash (`\`+Enter, works everywhere).
-        key.code == KeyCode::Enter
-            && !key
-                .modifiers
-                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+        key.key == crate::EditorKeyCode::Enter
+            && !key.shift
+            && !key.alt
             && !self.pending_backslash()
     }
 
@@ -214,7 +209,9 @@ impl EditorEngine for PlainEngine {
             }
         }
     }
+}
 
+impl crate::TuiRender for PlainEngine {
     fn render(&mut self, frame: &mut Frame, area: Rect) {
         // Hard-wrap at the inner width, tracking the cursor's wrapped position,
         // so render and `desired_rows` agree and the cursor stays correct.
@@ -267,16 +264,29 @@ impl EditorEngine for PlainEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crate::{EditorKey, EditorKeyCode};
 
-    fn k(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    fn key(code: EditorKeyCode) -> EditorKey {
+        EditorKey {
+            key: code,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        }
     }
-    fn ctrl(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    fn k(c: char) -> EditorKey {
+        key(EditorKeyCode::Char(c))
     }
-    fn enter(mods: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(KeyCode::Enter, mods)
+    fn ctrl(c: char) -> EditorKey {
+        EditorKey { ctrl: true, ..k(c) }
+    }
+    /// Enter with the given (shift, alt) modifier pair.
+    fn enter(shift: bool, alt: bool) -> EditorKey {
+        EditorKey {
+            shift,
+            alt,
+            ..key(EditorKeyCode::Enter)
+        }
     }
     fn type_str(e: &mut PlainEngine, s: &str) {
         for c in s.chars() {
@@ -289,19 +299,22 @@ mod tests {
         let mut e = PlainEngine::new();
         type_str(&mut e, "hello");
         assert_eq!(e.content(), "hello");
-        assert!(e.wants_submit(&enter(KeyModifiers::NONE)));
+        assert!(e.wants_submit(&enter(false, false)));
     }
 
     #[test]
     fn shift_or_alt_enter_inserts_newline_and_does_not_submit() {
-        for mods in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+        for (shift, alt) in [(true, false), (false, true)] {
             let mut e = PlainEngine::new();
             type_str(&mut e, "a");
-            let ne = enter(mods);
-            assert!(!e.wants_submit(&ne), "modifier {mods:?} should not submit");
+            let ne = enter(shift, alt);
+            assert!(
+                !e.wants_submit(&ne),
+                "shift={shift} alt={alt} should not submit"
+            );
             e.feed_key(ne);
             type_str(&mut e, "b");
-            assert_eq!(e.content(), "a\nb", "modifier {mods:?}");
+            assert_eq!(e.content(), "a\nb", "shift={shift} alt={alt}");
         }
     }
 
@@ -309,7 +322,7 @@ mod tests {
     fn backslash_enter_is_newline_and_strips_the_backslash() {
         let mut e = PlainEngine::new();
         type_str(&mut e, "a\\");
-        let ret = enter(KeyModifiers::NONE);
+        let ret = enter(false, false);
         assert!(!e.wants_submit(&ret)); // trailing backslash → newline, not submit
         e.feed_key(ret);
         type_str(&mut e, "b");

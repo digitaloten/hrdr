@@ -11,7 +11,6 @@
 mod host;
 mod plain;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use hjkl_buffer_tui::{BufferView, Gutter};
 use hjkl_engine::{CoarseMode, Editor, Host, Options};
 use ratatui::Frame;
@@ -21,13 +20,30 @@ use ratatui::style::{Color, Style};
 pub use host::HrdrHost;
 pub use plain::PlainEngine;
 
-/// A pluggable editing discipline embedded in the TUI.
+/// The seam's renderer-agnostic key DTO — hjkl's own toolkit-neutral
+/// `Input { key, ctrl, alt, shift }`, re-exported so consumers never touch
+/// hjkl types directly.
+pub use hjkl_engine::{Input as EditorKey, Key as EditorKeyCode};
+
+/// Convert a crossterm key event to the seam's [`EditorKey`] (the terminal
+/// frontend's adapter). `None` for key-release events, which must not reach
+/// the engines (terminals reporting them would double keystrokes).
+pub fn key_from_crossterm(key: &crossterm::event::KeyEvent) -> Option<EditorKey> {
+    if key.kind == crossterm::event::KeyEventKind::Release {
+        return None;
+    }
+    Some(hjkl_engine_tui::crossterm_to_input(*key))
+}
+
+/// A pluggable editing discipline — the renderer-agnostic core of the seam.
 ///
-/// Implementors hide their concrete editor/FSM entirely. The TUI only needs
-/// these operations to host an editable text pane.
+/// Implementors hide their concrete editor/FSM entirely, and nothing here
+/// names a UI toolkit: keys arrive as [`EditorKey`]s (each frontend converts
+/// its native events) and painting lives behind the separate [`TuiRender`]
+/// half (or a future GUI adapter).
 pub trait EditorEngine {
-    /// Feed a terminal key event into the engine.
-    fn feed_key(&mut self, key: KeyEvent);
+    /// Feed a key into the engine.
+    fn feed_key(&mut self, key: EditorKey);
     /// Current buffer text.
     fn content(&self) -> String;
     /// Replace the buffer text.
@@ -39,7 +55,7 @@ pub trait EditorEngine {
     /// Whether `key`, in the engine's current state, should submit the buffer
     /// as a message rather than be fed to the editor. (e.g. vim: Enter in
     /// Normal mode; plain: Enter without Shift / trailing backslash.)
-    fn wants_submit(&self, key: &KeyEvent) -> bool;
+    fn wants_submit(&self, key: &EditorKey) -> bool;
     /// One-line key hint for the status bar, specific to this discipline.
     fn keybind_hint(&self) -> &'static str;
     /// Desired number of text rows for the input box given the inner `width`,
@@ -57,17 +73,32 @@ pub trait EditorEngine {
             if c == '\r' {
                 continue;
             }
-            let code = match c {
-                '\n' => KeyCode::Enter,
-                '\t' => KeyCode::Tab,
-                other => KeyCode::Char(other),
+            let key = match c {
+                '\n' => EditorKeyCode::Enter,
+                '\t' => EditorKeyCode::Tab,
+                other => EditorKeyCode::Char(other),
             };
-            self.feed_key(KeyEvent::new(code, KeyModifiers::NONE));
+            self.feed_key(EditorKey {
+                key,
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
         }
     }
+}
+
+/// The terminal renderer half of the seam (ratatui). Kept out of
+/// [`EditorEngine`] so the core stays renderer-agnostic — a GUI frontend can
+/// host the same engines behind its own render adapter.
+pub trait TuiRender {
     /// Draw the editable pane into `area` and place the cursor.
     fn render(&mut self, frame: &mut Frame, area: Rect);
 }
+
+/// What the TUI hosts: both halves of the seam.
+pub trait TuiEditorEngine: EditorEngine + TuiRender {}
+impl<T: EditorEngine + TuiRender> TuiEditorEngine for T {}
 
 /// Number of display rows `text` occupies when hard-wrapped at `width` columns.
 pub(crate) fn wrapped_row_count(text: &str, width: u16) -> usize {
@@ -119,15 +150,10 @@ fn coarse_label(mode: CoarseMode) -> &'static str {
 }
 
 impl EditorEngine for VimEngine {
-    fn feed_key(&mut self, key: KeyEvent) {
-        // We only push DISAMBIGUATE_ESCAPE_CODES (not REPORT_EVENT_TYPES), but
-        // guard against release events doubling keystrokes on terminals that
-        // report them anyway.
-        if key.kind == KeyEventKind::Release {
-            return;
-        }
-        let input = hjkl_engine_tui::crossterm_to_input(key);
-        hjkl_vim::dispatch_input(&mut self.editor, input);
+    fn feed_key(&mut self, key: EditorKey) {
+        // Release filtering happens in the frontend's key conversion
+        // ([`key_from_crossterm`]) — engines only ever see presses.
+        hjkl_vim::dispatch_input(&mut self.editor, key);
         self.editor.host_mut().flush_clipboard();
     }
 
@@ -147,10 +173,12 @@ impl EditorEngine for VimEngine {
         matches!(self.editor.coarse_mode(), CoarseMode::Insert)
     }
 
-    fn wants_submit(&self, key: &KeyEvent) -> bool {
+    fn wants_submit(&self, key: &EditorKey) -> bool {
         // Vim convention: Enter in Normal mode sends; in Insert it's a newline.
-        key.code == KeyCode::Enter
-            && key.modifiers.is_empty()
+        key.key == EditorKeyCode::Enter
+            && !key.ctrl
+            && !key.alt
+            && !key.shift
             && matches!(self.editor.coarse_mode(), CoarseMode::Normal)
     }
 
@@ -161,12 +189,17 @@ impl EditorEngine for VimEngine {
         // is fine (and keeps the cursor trailing the paste).
         if self.is_insert() {
             for c in text.chars().filter(|&c| c != '\r') {
-                let code = match c {
-                    '\n' => KeyCode::Enter,
-                    '\t' => KeyCode::Tab,
-                    other => KeyCode::Char(other),
+                let key = match c {
+                    '\n' => EditorKeyCode::Enter,
+                    '\t' => EditorKeyCode::Tab,
+                    other => EditorKeyCode::Char(other),
                 };
-                self.feed_key(KeyEvent::new(code, KeyModifiers::NONE));
+                self.feed_key(EditorKey {
+                    key,
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                });
             }
         } else {
             self.editor.insert_str(&text.replace('\r', ""));
@@ -176,7 +209,9 @@ impl EditorEngine for VimEngine {
     fn keybind_hint(&self) -> &'static str {
         "Esc=normal · Enter(normal)=send · Ctrl+G=$EDITOR · Ctrl+C×2=quit"
     }
+}
 
+impl TuiRender for VimEngine {
     fn render(&mut self, frame: &mut Frame, area: Rect) {
         let editor = &mut self.editor;
 

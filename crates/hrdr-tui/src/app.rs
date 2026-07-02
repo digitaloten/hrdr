@@ -10,7 +10,7 @@ use crossterm::event::{
 };
 use hjkl_clipboard::Clipboard;
 use hrdr_agent::{Agent, AgentConfig, AgentEvent, Todo};
-use hrdr_editor::{EditorEngine, PlainEngine, VimEngine};
+use hrdr_editor::{PlainEngine, TuiEditorEngine, VimEngine};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -85,7 +85,7 @@ pub(crate) enum TurnMsg {
 
 pub(crate) struct App {
     agent: Arc<tokio::sync::Mutex<Agent>>,
-    pub(crate) editor: Box<dyn EditorEngine>,
+    pub(crate) editor: Box<dyn TuiEditorEngine>,
     /// Resolved chat-UI colors (from an hjkl theme).
     pub(crate) theme: Theme,
     pub(crate) transcript: Vec<Entry>,
@@ -233,7 +233,7 @@ impl App {
         let todos = agent.todos();
         let project_docs_loaded = agent.project_docs().is_some();
         let (tx, rx) = mpsc::unbounded_channel();
-        let editor: Box<dyn EditorEngine> = if vim_mode {
+        let editor: Box<dyn TuiEditorEngine> = if vim_mode {
             Box::new(VimEngine::new())
         } else {
             Box::new(PlainEngine::new())
@@ -505,9 +505,14 @@ impl App {
             }
         }
 
+        // Convert to the seam's renderer-agnostic key (None = release event,
+        // which must not reach the engines).
+        let Some(ekey) = hrdr_editor::key_from_crossterm(&key) else {
+            return Action::None;
+        };
         // The engine decides whether this key submits (vim: Enter in Normal;
         // plain: Enter without a newline modifier / trailing backslash).
-        if self.editor.wants_submit(&key) {
+        if self.editor.wants_submit(&ekey) {
             let input = self.editor.content();
             if input.trim().is_empty() {
                 return Action::None;
@@ -540,7 +545,7 @@ impl App {
             return Action::None;
         }
 
-        self.editor.feed_key(key);
+        self.editor.feed_key(ekey);
         Action::None
     }
 

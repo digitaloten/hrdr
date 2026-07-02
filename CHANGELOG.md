@@ -8,6 +8,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Renderer-agnostic `EditorEngine` seam.** The editing-discipline trait no
+  longer names a UI toolkit: keys arrive as `hrdr_editor::EditorKey` (hjkl's own
+  toolkit-neutral `Input {key, ctrl, alt, shift}` DTO, re-exported), and the
+  ratatui painting moved to a separate `TuiRender` half (the TUI hosts
+  `dyn TuiEditorEngine = EditorEngine + TuiRender`). The terminal adapter is one
+  function (`key_from_crossterm`, which also owns key-release filtering);
+  `VimEngine` and `PlainEngine` no longer touch crossterm. This unblocks hosting
+  the vim discipline in the GUI — a floem key adapter + render adapter is now
+  all that's missing.
+
+- CI lints `hrdr-gui` on Linux (own cache key + floem's system deps) — the GUI
+  was excluded from every workspace job, so a TUI-side refactor could silently
+  break it.
+
+- README refresh: install section (cargo/Homebrew/AUR/Scoop/deb/rpm/apk +
+  release binaries), `hrdr-app`/`hrdr-gui` in the workspace table, roadmap
+  brought up to date (shared core, GUI parity, release pipeline).
+
 - **GUI multi-line input.** The single-line `text_input` is replaced by floem's
   text editor (gutter hidden, auto-growing 1–6 rows like the TUI's input):
   **Enter sends; Shift+Enter / Alt+Enter — and Enter after a trailing `\` —
