@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Colored `/diff` in the GUI — and one shared diff classifier.** The GUI
+  renders `/diff` output as a monospace block on the code-panel background with
+  +/− line coloring (adds green, removes red, `@@` hunks in the user accent,
+  headers dim), routed through its `spawn_diff` override exactly like the TUI
+  (status/error lines stay plain). The line classification is shared
+  (`hrdr_app::classify_diff_line`/`DiffLineKind`, unit-tested); the TUI's color
+  mapping now uses it too. GUI `/copy all` includes diff blocks, matching the
+  shared transcript export.
+
 - **`/info` unified at the TUI's richer level.** One shared implementation shows
   session id/name, model, endpoint, cwd + git branch, context used/window,
   session ↑/↓ tokens, temperature, and effort in both frontends (new read hooks:

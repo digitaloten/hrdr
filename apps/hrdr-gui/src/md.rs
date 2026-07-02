@@ -343,3 +343,34 @@ fn panel_bg() -> Color {
     let (r, g, b) = hrdr_app::panel_bg_rgb();
     Color::rgb8(r, g, b)
 }
+
+/// A unified diff as a single monospace layout with per-line +/− coloring
+/// (shared classification with the TUI via `hrdr_app::classify_diff_line`).
+pub fn diff_view(diff: &str, th: GuiTheme) -> AnyView {
+    let mono = [FamilyOwned::Monospace];
+    let base = Attrs::new().family(&mono).font_size(CODE_SIZE);
+    let mut s = String::new();
+    let mut attrs = AttrsList::new(base);
+    for line in diff.lines() {
+        let color = match hrdr_app::classify_diff_line(line) {
+            hrdr_app::DiffLineKind::Hunk => th.user,
+            hrdr_app::DiffLineKind::Add => th.ok,
+            hrdr_app::DiffLineKind::Remove => th.err,
+            hrdr_app::DiffLineKind::Meta => th.dim,
+        };
+        let start = s.len();
+        s.push_str(line);
+        s.push('\n');
+        attrs.add_span(
+            start..s.len(),
+            Attrs::new().color(color).family(&mono).font_size(CODE_SIZE),
+        );
+    }
+    let mut layout = TextLayout::new();
+    layout.set_text(&s, attrs);
+    layout.set_wrap(Wrap::Word);
+    let layout = std::rc::Rc::new(layout);
+    rich_text(move || (*layout).clone())
+        .style(move |st| st.width_full().padding(6.0).background(panel_bg()))
+        .into_any()
+}

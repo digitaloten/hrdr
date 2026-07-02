@@ -102,6 +102,8 @@ enum Body {
     Tool(Tool),
     System(String),
     Error(String),
+    /// A unified diff (`/diff`), rendered with +/− coloring.
+    Diff(String),
 }
 
 #[derive(Clone)]
@@ -154,6 +156,8 @@ enum UiMsg {
     Compacted(Result<(usize, usize), String>),
     /// The config file changed on disk (from the shared watcher).
     ConfigChanged,
+    /// Out-of-band diff block (the async `/diff` result).
+    Diff(String),
     /// A completed turn was auto-saved; carries the session id and whether this
     /// was the first save (so the UI thread can adopt the id and notify once).
     /// `generation` is the save-generation at spawn time: `/clear` bumps it, so
@@ -576,6 +580,7 @@ fn app_view(
                 }
             }
             UiMsg::System(s) => push_item(transcript, next_id, Body::System(s)),
+            UiMsg::Diff(d) => push_item(transcript, next_id, Body::Diff(d)),
             UiMsg::FileIndex(files) => {
                 file_index.set(files);
                 file_index_state.set(2);
@@ -1342,6 +1347,7 @@ fn transcript_text(transcript: RwSignal<Vec<Item>>) -> String {
                     out.push_str(&format!("## Assistant\n{}\n\n", a.text.get_untracked()))
                 }
                 Body::System(s) | Body::Error(s) => out.push_str(&format!("[{s}]\n\n")),
+                Body::Diff(d) => out.push_str(&format!("{d}\n\n")),
                 Body::Tool(t) => out.push_str(&format!("[tool: {}]\n\n", t.name)),
             }
         }
@@ -1751,6 +1757,23 @@ impl hrdr_app::CommandHost for GuiHost {
     fn nth_message_text(&self, n: usize) -> Option<String> {
         nth_message_text(self.transcript, n)
     }
+    fn spawn_diff(&self, fut: hrdr_app::LineFuture) {
+        // Route a real diff to the colored Body::Diff rendering; status and
+        // error lines stay plain system lines (same rule as the TUI).
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let line = fut.await;
+            if line.is_empty() {
+                return;
+            }
+            let msg = if line.starts_with("diff ") {
+                UiMsg::Diff(line)
+            } else {
+                UiMsg::System(line)
+            };
+            let _ = tx.send(msg);
+        });
+    }
     fn is_busy(&self) -> bool {
         self.running.get_untracked()
     }
@@ -2098,6 +2121,7 @@ fn render_item(
         }
         Body::System(s) => text_label(s).style(move |st| st.color(th.dim)).into_any(),
         Body::Error(s) => text_label(s).style(move |st| st.color(th.err)).into_any(),
+        Body::Diff(d) => md::diff_view(&d, th),
     }
 }
 

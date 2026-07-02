@@ -1026,15 +1026,11 @@ fn push_tool(
 /// Color for one unified-diff line: additions green, deletions red, hunk
 /// headers in the accent color, file headers and context dim.
 fn diff_line_color(line: &str, theme: &Theme) -> Color {
-    if line.starts_with("+++") || line.starts_with("---") {
-        theme.dim
-    } else if line.starts_with('@') {
-        theme.user
-    } else if line.starts_with('+') {
-        theme.success
-    } else if line.starts_with('-') {
-        theme.error
-    } else {
-        theme.dim
+    // Shared classification (same mapping in the GUI).
+    match hrdr_app::classify_diff_line(line) {
+        hrdr_app::DiffLineKind::Hunk => theme.user,
+        hrdr_app::DiffLineKind::Add => theme.success,
+        hrdr_app::DiffLineKind::Remove => theme.error,
+        hrdr_app::DiffLineKind::Meta => theme.dim,
     }
 }

@@ -112,9 +112,50 @@ pub fn turn_stats_line(
     Some(s)
 }
 
+/// Semantic role of one unified-diff line, for `/diff` coloring — the
+/// classification both frontends map onto their theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffLineKind {
+    /// `+++`/`---` file headers and unclassified context: dim.
+    Meta,
+    /// `@@` hunk headers: user accent.
+    Hunk,
+    /// Added line: success green.
+    Add,
+    /// Removed line: error red.
+    Remove,
+}
+
+/// Classify one line of a unified diff (see [`DiffLineKind`]).
+pub fn classify_diff_line(line: &str) -> DiffLineKind {
+    if line.starts_with("+++") || line.starts_with("---") {
+        DiffLineKind::Meta
+    } else if line.starts_with('@') {
+        DiffLineKind::Hunk
+    } else if line.starts_with('+') {
+        DiffLineKind::Add
+    } else if line.starts_with('-') {
+        DiffLineKind::Remove
+    } else {
+        DiffLineKind::Meta
+    }
+}
+
 #[cfg(test)]
 mod stats_tests {
     use super::*;
+
+    #[test]
+    fn diff_line_classification() {
+        use DiffLineKind::*;
+        assert_eq!(classify_diff_line("+++ b/x.rs"), Meta);
+        assert_eq!(classify_diff_line("--- a/x.rs"), Meta);
+        assert_eq!(classify_diff_line("@@ -1,2 +1,3 @@"), Hunk);
+        assert_eq!(classify_diff_line("+added"), Add);
+        assert_eq!(classify_diff_line("-removed"), Remove);
+        assert_eq!(classify_diff_line(" context"), Meta);
+        assert_eq!(classify_diff_line("diff --git a/x b/x"), Meta);
+    }
 
     #[test]
     fn turn_stats_line_shapes() {
