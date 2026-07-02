@@ -2235,7 +2235,6 @@ dependencies = [
  "hrdr-tools",
  "notify",
  "ratatui",
- "syntect",
  "tempfile",
  "tokio",
 ]
