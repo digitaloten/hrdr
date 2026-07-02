@@ -10,10 +10,40 @@ tasks in a terminal. It is provider-agnostic: point it at any
 OpenAI, llama.cpp, OpenRouter — and it streams tokens and runs tools until the
 job is done.
 
-> Active development. The agent loop, adaptive tool set, sessions, file
-> checkpoints, config hot-reload, and a rich TUI are in place. The default local
-> backend is now [`infr`](https://github.com/kryptic-sh/infr) (with a
-> `llama-server` fallback); see the roadmap for what's next.
+> Active development, released as **v0.1.x**. The agent loop, adaptive tool set,
+> sessions, file checkpoints, config hot-reload, a rich TUI, **and a floem-based
+> GUI with full command parity** are in place. The default local backend is
+> [`infr`](https://github.com/kryptic-sh/infr) (with a `llama-server` fallback);
+> see the roadmap for what's next.
+
+## Install
+
+Prebuilt binaries for Linux (gnu + musl, x86_64/aarch64), macOS (Apple Silicon +
+Intel), and Windows ship with every
+[GitHub Release](https://github.com/kryptic-sh/hrdr/releases), alongside `.deb`,
+`.rpm`, and Alpine `.apk` packages.
+
+```bash
+# cargo (any platform with Rust)
+cargo install hrdr
+
+# Homebrew (macOS)
+brew install kryptic-sh/tap/hrdr
+
+# AUR (Arch Linux)
+yay -S hrdr-bin
+
+# Scoop (Windows)
+scoop bucket add kryptic-sh https://github.com/kryptic-sh/scoop-bucket
+scoop install hrdr
+
+# Debian/Ubuntu · Fedora — grab the .deb / .rpm from the latest release
+sudo dpkg -i hrdr_*.deb
+sudo rpm -i hrdr-*.rpm
+```
+
+The desktop GUI (`hrdr-gui`, [floem](https://github.com/lapce/floem)-based)
+builds from source: `cargo run -p hrdr-gui --release`.
 
 ## Design
 
@@ -44,8 +74,10 @@ job is done.
 | `hrdr-tools`  | The tool set + registry + file checkpoints.                     |
 | `hrdr-agent`  | The agent loop + minijinja system prompt.                       |
 | `hrdr-editor` | FSM-agnostic hjkl embedding (`EditorEngine` seam).              |
+| `hrdr-app`    | UI-agnostic app core: shared slash commands, sessions, status.  |
 | `hrdr-tui`    | Ratatui UI: transcript + vim input pane, live streaming.        |
 | `hrdr`        | Binary: TUI by default, `hrdr run <task>` for headless.         |
+| `hrdr-gui`    | floem desktop GUI (full command parity with the TUI).           |
 
 ## Usage
 
@@ -246,7 +278,15 @@ The shell and search tools adapt to the host:
 - [x] Managed local backend — infr-first (native tool calls), `llama-server`
       fallback
 - [x] hjkl deps via crates.io registry pins (standalone CI)
+- [x] Shared UI-agnostic core (`hrdr-app`): one implementation of every slash
+      command, sessions, status bar, and transcript model for both frontends
+- [x] floem desktop GUI with **full command parity** (TODO panel, timestamps,
+      search/goto scrolling, live theme swap, multi-line input, queueing)
+- [x] Release pipeline: 7-target binaries, GitHub Releases, crates.io, AUR,
+      Homebrew, Scoop, Alpine
 - [ ] MCP client + LSP diagnostics feedback
+- [ ] Vim input discipline in the GUI (needs a render-agnostic `EditorEngine`
+      seam)
 
 ## License
 
