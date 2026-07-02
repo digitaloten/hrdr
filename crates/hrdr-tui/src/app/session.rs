@@ -1,8 +1,6 @@
 //! Session persistence, restore, and transcript rebuild.
 
-use std::collections::HashMap;
-
-use hrdr_agent::{Message, MessageRole, Session};
+use hrdr_agent::{Message, Session};
 
 use super::*;
 
@@ -116,47 +114,13 @@ impl super::App {
             ));
         }
     }
-    /// Rebuild the display transcript from a restored message history.
+    /// Rebuild the display transcript from a restored message history (the
+    /// entry construction is shared with the GUI via
+    /// [`hrdr_app::messages_to_entries`]).
     fn rebuild_transcript(&mut self, msgs: &[Message]) {
         self.clear_transcript();
-        // Map tool_call_id → (result, ok) from the tool-result messages.
-        let mut results: HashMap<String, (String, bool)> = HashMap::new();
-        for m in msgs {
-            if m.role == MessageRole::Tool
-                && let (Some(id), Some(content)) = (&m.tool_call_id, &m.content)
-            {
-                let ok = !content.starts_with("Error:");
-                results.insert(id.clone(), (content.clone(), ok));
-            }
-        }
-        for m in msgs {
-            match m.role {
-                MessageRole::User => {
-                    if let Some(c) = &m.content {
-                        self.push_entry(Entry::User(c.clone()));
-                    }
-                }
-                MessageRole::Assistant => {
-                    if let Some(c) = &m.content
-                        && !c.is_empty()
-                    {
-                        self.push_entry(Entry::Assistant(c.clone()));
-                    }
-                    for call in m.tool_calls.iter().flatten() {
-                        let (result, ok) = results.get(&call.id).cloned().unwrap_or_default();
-                        self.push_entry(Entry::Tool {
-                            id: call.id.clone(),
-                            name: call.function.name.clone(),
-                            args: call.function.arguments.clone(),
-                            result,
-                            ok,
-                            done: true,
-                            expanded: false,
-                        });
-                    }
-                }
-                _ => {}
-            }
+        for e in hrdr_app::messages_to_entries(msgs) {
+            self.push_entry(e);
         }
     }
 }

@@ -45,6 +45,32 @@ pub fn save_session(
     Some(SaveOutcome { id, first_save })
 }
 
+/// Async wrapper over [`save_session`]: snapshot the agent's conversation (and
+/// its cwd) under the lock, then persist. The shared core for every auto-save
+/// that runs off the UI thread (the GUI's turn-end save and its
+/// `CommandHost::autosave`); the TUI's synchronous `try_lock` autosave keeps
+/// its own snapshot but funnels into the same [`save_session`].
+pub async fn save_agent_session(
+    agent: std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>>,
+    existing_id: Option<String>,
+    label: Option<String>,
+    model: String,
+    base_url: String,
+) -> Option<SaveOutcome> {
+    let (msgs, cwd) = {
+        let a = agent.lock().await;
+        (a.messages_owned(), a.cwd().display().to_string())
+    };
+    save_session(
+        existing_id.as_deref(),
+        label.as_deref(),
+        &model,
+        &base_url,
+        &cwd,
+        msgs,
+    )
+}
+
 /// The `/sessions` listing as a display string. With `all`, every directory's
 /// sessions are shown (each row tagged with its cwd); otherwise only those whose
 /// cwd matches `cwd`. Returns a friendly empty-state message when there are none.

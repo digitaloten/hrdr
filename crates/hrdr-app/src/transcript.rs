@@ -6,6 +6,7 @@
 //! TUI and GUI stay consistent.
 
 use chrono::{DateTime, Local};
+use hrdr_agent::{Message, MessageRole};
 
 /// One rendered item in the transcript.
 pub enum Entry {
@@ -39,6 +40,60 @@ impl Entry {
             _ => None,
         }
     }
+}
+
+/// Rebuild display entries from a restored message history (`/resume`, startup
+/// auto-resume) — shared so the TUI and GUI reconstruct identically. User and
+/// non-empty assistant texts become entries; each assistant `tool_calls` entry
+/// is paired with its `role:"tool"` result by call id (the `Error:` prefix
+/// convention marks a failed call). Other roles are skipped. Frontends map the
+/// returned entries into their own representation (the TUI stores them as-is,
+/// the GUI wraps each in its reactive signals).
+pub fn messages_to_entries(msgs: &[Message]) -> Vec<Entry> {
+    use std::collections::HashMap;
+    // Map tool_call_id → (result, ok) from the tool-result messages.
+    let mut results: HashMap<&str, (&str, bool)> = HashMap::new();
+    for m in msgs {
+        if m.role == MessageRole::Tool
+            && let (Some(id), Some(content)) = (&m.tool_call_id, &m.content)
+        {
+            results.insert(id, (content, !content.starts_with("Error:")));
+        }
+    }
+    let mut out = Vec::new();
+    for m in msgs {
+        match m.role {
+            MessageRole::User => {
+                if let Some(c) = &m.content {
+                    out.push(Entry::User(c.clone()));
+                }
+            }
+            MessageRole::Assistant => {
+                if let Some(c) = &m.content
+                    && !c.is_empty()
+                {
+                    out.push(Entry::Assistant(c.clone()));
+                }
+                for call in m.tool_calls.iter().flatten() {
+                    let (result, ok) = results
+                        .get(call.id.as_str())
+                        .map(|(r, ok)| (r.to_string(), *ok))
+                        .unwrap_or_default();
+                    out.push(Entry::Tool {
+                        id: call.id.clone(),
+                        name: call.function.name.clone(),
+                        args: call.function.arguments.clone(),
+                        result,
+                        ok,
+                        done: true,
+                        expanded: false,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// 1-based message numbers whose user/assistant text contains `query`

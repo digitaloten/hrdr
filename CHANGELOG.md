@@ -6,7 +6,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The slash-command registry is now **capability-tagged**
+  (`hrdr_app::TUI_ONLY_COMMANDS` + `is_tui_only`/`is_known_command`), fixing the
+  GUI's biggest UX hole: ~23 advertised-but-unimplemented commands (`/compact`,
+  `/retry`, `/undo`, `/goto`, `/theme`, `/cwd`, …) were offered by the GUI's
+  completion dropdown and `/help` but fell through to the model as chat text.
+  The GUI's completion and `/help` now list only what it implements, and typing
+  a known-but-unported command gets a "isn't available in the GUI yet" notice
+  instead of confusing the model. The TUI is unchanged (it implements the full
+  registry).
+
+- More command logic moved into the shared `hrdr-app` layer:
+  - **`/copy`** — one shared implementation including `msg N[-M]` (previously
+    TUI-only despite being advertised to both); the GUI gains message-range
+    copy. A `last_code_block` host hook lets the TUI keep its
+    search-back-through-history behavior for `/copy code`.
+  - **`/diff`** — the TUI's local reimplementation is deleted; a `spawn_diff`
+    host capability routes a real diff to the TUI's colored `Entry::Diff`
+    rendering (status/error lines stay plain), defaulting to a system line in
+    the GUI.
+  - **Transcript rebuild** — `hrdr_app::messages_to_entries` is the single
+    source for reconstructing a display transcript from a restored session; the
+    TUI and GUI each had a near-identical copy (a divergence-drift magnet).
+  - **Auto-save** — `hrdr_app::save_agent_session` (lock, snapshot, persist)
+    replaces the GUI's two hand-rolled copies.
+
 ### Fixed
+
+- GUI `/resume` now follows the resumed session's working directory (matching
+  the TUI): the agent's cwd switches when the directory still exists (with a
+  note when it doesn't), `@file` mentions and tools resolve against it, and an
+  endpoint mismatch is called out. Previously the GUI ignored `session.cwd`
+  entirely, so tools operated in whatever directory the GUI was launched from.
+
+- GUI input is trimmed before command detection, so `" /help"` runs the command
+  instead of being sent to the model (matching the TUI).
 
 - Overflow-triggered auto-compaction can no longer overflow itself. The
   summarization request re-sent the entire history (saving only the `tools[]`

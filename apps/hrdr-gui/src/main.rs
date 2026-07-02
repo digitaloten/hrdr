@@ -20,7 +20,7 @@ use floem::reactive::{Scope, create_effect};
 use floem::views::Decorators;
 
 mod md;
-use hrdr_agent::{Agent, AgentConfig, AgentEvent, Message, MessageRole, Session};
+use hrdr_agent::{Agent, AgentConfig, AgentEvent, Message, Session};
 use tokio::sync::Mutex as TokioMutex;
 
 // ---- colors -------------------------------------------------------------
@@ -309,8 +309,9 @@ fn app_view(
 
     let th_for_send = turn_handle.clone();
     let send = move || {
-        let text = input.get();
-        if text.trim().is_empty() || running.get() {
+        // Trim like the TUI does, so " /help" is still a command.
+        let text = input.get().trim().to_string();
+        if text.is_empty() || running.get() {
             return;
         }
         // Record every submitted line for Up/Down recall, and reset browsing.
@@ -323,8 +324,10 @@ fn app_view(
         }
         // Slash commands run through the shared `hrdr_app` dispatcher (so the TUI
         // and GUI share one implementation). An unrecognized `/…` falls through to
-        // the model (a literal path still works, matching the TUI).
-        if text.starts_with('/') {
+        // the model (a literal path still works, matching the TUI) — unless it's a
+        // registered command the GUI just doesn't implement, which gets a notice
+        // instead of confusing the model.
+        if let Some(rest) = text.strip_prefix('/') {
             let mut host = GuiHost {
                 cx,
                 transcript,
@@ -346,6 +349,16 @@ fn app_view(
                 input.set(String::new());
                 return;
             }
+            let cmd = rest.split_whitespace().next().unwrap_or("");
+            if hrdr_app::is_known_command(cmd) {
+                system(
+                    transcript,
+                    next_id,
+                    format!("/{} isn't available in the GUI yet (see /help)", cmd),
+                );
+                input.set(String::new());
+                return;
+            }
         }
         input.set(String::new());
         push_item(transcript, next_id, Body::User(text.clone()));
@@ -355,10 +368,16 @@ fn app_view(
         ttft.set(None);
 
         // Expand `@file` mentions for the model only; the transcript keeps the
-        // bare `@path` the user typed (same split as the TUI).
-        let sent = match std::env::current_dir() {
-            Ok(cwd) => hrdr_app::expand_mentions(&text, &cwd),
-            Err(_) => text,
+        // bare `@path` the user typed (same split as the TUI). Paths resolve
+        // against the agent's cwd (it follows resumed sessions).
+        let mention_cwd = agent
+            .try_lock()
+            .map(|a| a.cwd())
+            .ok()
+            .or_else(|| std::env::current_dir().ok());
+        let sent = match mention_cwd {
+            Some(cwd) => hrdr_app::expand_mentions(&text, &cwd),
+            None => text,
         };
 
         let agent = agent.clone();
@@ -381,18 +400,10 @@ fn app_view(
                 .await;
             let _ = tx.send(UiMsg::Done(result.err().map(|e| e.to_string())));
             // Auto-save the (now-updated) conversation, best-effort.
-            let (msgs, cwd) = {
-                let a = agent.lock().await;
-                (a.messages_owned(), a.cwd().display().to_string())
-            };
-            if let Some(o) = hrdr_app::save_session(
-                existing_id.as_deref(),
-                session_label.as_deref(),
-                &cur_model,
-                &base_url,
-                &cwd,
-                msgs,
-            ) {
+            if let Some(o) =
+                hrdr_app::save_agent_session(agent, existing_id, session_label, cur_model, base_url)
+                    .await
+            {
                 let _ = tx.send(UiMsg::Saved {
                     id: o.id,
                     first_save: o.first_save,
@@ -478,6 +489,8 @@ fn app_view(
         if inp.starts_with('/') {
             return hrdr_app::slash_completions(&inp)
                 .into_iter()
+                // Only offer what the GUI implements (see TUI_ONLY_COMMANDS).
+                .filter(|(name, _)| !hrdr_app::is_tui_only(name))
                 .map(|(name, desc)| CompRow::Slash { name, desc })
                 .collect();
         }
@@ -584,9 +597,9 @@ fn system(transcript: RwSignal<Vec<Item>>, next_id: RwSignal<u64>, msg: impl Int
 }
 
 /// Rebuild the display transcript from a restored message history (for
-/// `/resume`). Mirrors the TUI's rebuild: user/assistant text plus each
-/// assistant tool call paired with its result message. Non-message roles and
-/// empty assistant turns are skipped.
+/// `/resume`). The entry construction is shared with the TUI
+/// ([`hrdr_app::messages_to_entries`]); this only wraps each entry in the
+/// GUI's reactive signals.
 fn rebuild_transcript(
     cx: Scope,
     transcript: RwSignal<Vec<Item>>,
@@ -595,60 +608,58 @@ fn rebuild_transcript(
 ) {
     transcript.update(|t| t.clear());
     next_id.set(0);
-    // Map tool_call_id → (result, ok) from the tool-result messages.
-    let mut results: std::collections::HashMap<String, (String, bool)> =
-        std::collections::HashMap::new();
-    for m in msgs {
-        if m.role == MessageRole::Tool
-            && let (Some(id), Some(content)) = (&m.tool_call_id, &m.content)
-        {
-            results.insert(
-                id.clone(),
-                (content.clone(), !content.starts_with("Error:")),
-            );
-        }
-    }
-    for m in msgs {
-        match m.role {
-            MessageRole::User => {
-                if let Some(c) = &m.content {
-                    push_item(transcript, next_id, Body::User(c.clone()));
-                }
-            }
-            MessageRole::Assistant => {
-                if let Some(c) = &m.content
-                    && !c.is_empty()
-                {
-                    push_item(
-                        transcript,
-                        next_id,
-                        Body::Assistant(Assistant {
-                            reasoning: cx.create_rw_signal(String::new()),
-                            text: cx.create_rw_signal(c.clone()),
-                        }),
-                    );
-                }
-                for call in m.tool_calls.iter().flatten() {
-                    let (result, ok) = results.get(&call.id).cloned().unwrap_or_default();
-                    push_item(
-                        transcript,
-                        next_id,
-                        Body::Tool(Tool {
-                            call_id: call.id.clone(),
-                            name: call.function.name.clone(),
-                            args: call.function.arguments.clone(),
-                            output: cx.create_rw_signal(String::new()),
-                            result: cx.create_rw_signal(result),
-                            ok: cx.create_rw_signal(ok),
-                            done: cx.create_rw_signal(true),
-                            collapsed: cx.create_rw_signal(true),
-                        }),
-                    );
-                }
-            }
+    for e in hrdr_app::messages_to_entries(msgs) {
+        match e {
+            hrdr_app::Entry::User(c) => push_item(transcript, next_id, Body::User(c)),
+            hrdr_app::Entry::Assistant(c) => push_item(
+                transcript,
+                next_id,
+                Body::Assistant(Assistant {
+                    reasoning: cx.create_rw_signal(String::new()),
+                    text: cx.create_rw_signal(c),
+                }),
+            ),
+            hrdr_app::Entry::Tool {
+                id,
+                name,
+                args,
+                result,
+                ok,
+                ..
+            } => push_item(
+                transcript,
+                next_id,
+                Body::Tool(Tool {
+                    call_id: id,
+                    name,
+                    args,
+                    output: cx.create_rw_signal(String::new()),
+                    result: cx.create_rw_signal(result),
+                    ok: cx.create_rw_signal(ok),
+                    done: cx.create_rw_signal(true),
+                    collapsed: cx.create_rw_signal(true),
+                }),
+            ),
             _ => {}
         }
     }
+}
+
+/// The Nth (1-based) user/assistant message's text — numbering matches the
+/// shared transcript queries (only user/assistant items count).
+fn nth_message_text(transcript: RwSignal<Vec<Item>>, n: usize) -> Option<String> {
+    if n == 0 {
+        return None;
+    }
+    transcript.with_untracked(|t| {
+        t.iter()
+            .filter_map(|i| match &i.body {
+                Body::User(s) => Some(s.clone()),
+                Body::Assistant(a) => Some(a.text.get_untracked()),
+                _ => None,
+            })
+            .nth(n - 1)
+    })
 }
 
 /// Text of the most recent assistant reply, if any (non-empty).
@@ -804,7 +815,14 @@ impl hrdr_app::CommandHost for GuiHost {
         self.agent.clone()
     }
     fn cwd(&self) -> std::path::PathBuf {
-        std::env::current_dir().unwrap_or_default()
+        // The agent's cwd is authoritative (it follows a resumed session);
+        // fall back to the process cwd if a turn holds the lock.
+        self.agent
+            .try_lock()
+            .map(|a| a.cwd())
+            .ok()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default()
     }
     fn base_url(&self) -> String {
         self.base_url.clone()
@@ -856,18 +874,9 @@ impl hrdr_app::CommandHost for GuiHost {
         let base_url = self.base_url.clone();
         let generation = self.save_gen.get_untracked();
         tokio::spawn(async move {
-            let (msgs, cwd) = {
-                let a = agent.lock().await;
-                (a.messages_owned(), a.cwd().display().to_string())
-            };
-            if let Some(o) = hrdr_app::save_session(
-                existing.as_deref(),
-                label.as_deref(),
-                &model,
-                &base_url,
-                &cwd,
-                msgs,
-            ) {
+            if let Some(o) =
+                hrdr_app::save_agent_session(agent, existing, label, model, base_url).await
+            {
                 let _ = tx.send(UiMsg::Saved {
                     id: o.id,
                     first_save: o.first_save,
@@ -878,32 +887,71 @@ impl hrdr_app::CommandHost for GuiHost {
     }
     fn resume(&mut self, id: String, session: Session) {
         let count = session.messages.len();
+        let prev_cwd = self.cwd();
         self.model.set(session.model.clone());
         self.session_id.set(Some(id));
         self.session_label.set(Some(session.name.clone()));
         // Pending saves from before the resume belong to the old conversation.
         self.save_gen.update(|g| *g += 1);
         rebuild_transcript(self.cx, self.transcript, self.next_id, &session.messages);
+        // Follow the session's working directory (in-process only), matching
+        // the TUI — the tools must operate where the session's work lives.
+        let target = std::path::PathBuf::from(&session.cwd);
+        let new_cwd = (!session.cwd.is_empty() && target != prev_cwd && target.is_dir())
+            .then_some(target.clone());
         // Synchronous when the lock is free (see clear_conversation) so a
         // send right after /resume can't race the message swap.
         let msgs = session.messages.clone();
         let m = session.model.clone();
-        if let Ok(mut a) = self.agent.try_lock() {
+        let cwd_for_agent = new_cwd.clone();
+        let apply = move |a: &mut Agent| {
             a.set_messages(msgs);
             a.set_model(m);
+            if let Some(c) = cwd_for_agent {
+                a.set_cwd(c);
+            }
+        };
+        if let Ok(mut a) = self.agent.try_lock() {
+            apply(&mut a);
         } else {
             let agent = self.agent.clone();
-            tokio::spawn(async move {
-                let mut a = agent.lock().await;
-                a.set_messages(msgs);
-                a.set_model(m);
-            });
+            tokio::spawn(async move { apply(&mut *agent.lock().await) });
         }
         system(
             self.transcript,
             self.next_id,
             format!("resumed '{}' ({count} messages)", session.name),
         );
+        if let Some(c) = new_cwd {
+            system(
+                self.transcript,
+                self.next_id,
+                format!("cwd → {}", c.display()),
+            );
+        } else if !session.cwd.is_empty()
+            && std::path::Path::new(&session.cwd) != prev_cwd
+            && !std::path::Path::new(&session.cwd).is_dir()
+        {
+            system(
+                self.transcript,
+                self.next_id,
+                format!(
+                    "note: session cwd {} no longer exists; staying in {}",
+                    session.cwd,
+                    prev_cwd.display()
+                ),
+            );
+        }
+        if session.base_url != self.base_url {
+            system(
+                self.transcript,
+                self.next_id,
+                format!(
+                    "note: session endpoint was {} (current: {})",
+                    session.base_url, self.base_url
+                ),
+            );
+        }
     }
     fn copy_to_clipboard(&mut self, text: &str, label: &str) -> String {
         copy_to_clipboard(&self.clipboard, text, label)
@@ -913,6 +961,9 @@ impl hrdr_app::CommandHost for GuiHost {
     }
     fn transcript_text(&self) -> String {
         transcript_text(self.transcript)
+    }
+    fn nth_message_text(&self, n: usize) -> Option<String> {
+        nth_message_text(self.transcript, n)
     }
 }
 

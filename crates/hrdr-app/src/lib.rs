@@ -127,6 +127,55 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
     ("Other", &["/reload", "/help", "/exit"]),
 ];
 
+/// Commands only the TUI implements today (terminal-coupled, or not yet ported
+/// to the GUI). Canonical names; aliases resolve before matching. The GUI
+/// filters these out of completion and `/help`, and answers with a notice
+/// instead of sending the text to the model.
+pub const TUI_ONLY_COMMANDS: &[&str] = &[
+    "/compact",
+    "/provider",
+    "/theme",
+    "/cwd",
+    "/expand",
+    "/init",
+    "/add",
+    "/revert",
+    "/checkpoints",
+    "/timestamps",
+    "/statusbar",
+    "/todo-ttl",
+    "/reload",
+    "/temp",
+    "/effort",
+    "/goto",
+    "/find",
+    "/next",
+    "/prev",
+    "/paste",
+    "/edit",
+    "/retry",
+    "/undo",
+];
+
+/// Whether `cmd` (with or without the leading `/`; aliases welcome) is a
+/// TUI-only command per [`TUI_ONLY_COMMANDS`].
+pub fn is_tui_only(cmd: &str) -> bool {
+    let c = resolve_alias(cmd.trim().trim_start_matches('/'));
+    TUI_ONLY_COMMANDS
+        .iter()
+        .any(|n| n.trim_start_matches('/') == c)
+}
+
+/// Whether `cmd` (with or without the leading `/`; aliases welcome) is a
+/// registered slash command at all — used by frontends to tell "command I
+/// don't support" apart from "not a command, send it to the model".
+pub fn is_known_command(cmd: &str) -> bool {
+    let c = resolve_alias(cmd.trim().trim_start_matches('/'));
+    SLASH_COMMANDS
+        .iter()
+        .any(|(n, _)| resolve_alias(n.trim_start_matches('/')) == c)
+}
+
 /// Resolve a slash-command alias to its canonical name (case-insensitive), so
 /// users coming from other agents can use familiar names. Unknown names pass
 /// through unchanged.
@@ -152,6 +201,13 @@ pub fn resolve_alias(cmd: &str) -> &str {
 /// `HELP_GROUPS` section with its commands and descriptions. Frontends append
 /// their own keybinding "Tips:" tail (those keys differ per frontend).
 pub fn help_body() -> String {
+    help_body_for(|_| true)
+}
+
+/// Like [`help_body`], but only listing commands `show` accepts — so a
+/// frontend's `/help` advertises exactly what it supports (the GUI passes its
+/// [`CommandHost::supports_command`]). Groups left empty are omitted.
+pub fn help_body_for(show: impl Fn(&str) -> bool) -> String {
     let desc = |name: &str| {
         SLASH_COMMANDS
             .iter()
@@ -170,8 +226,12 @@ pub fn help_body() -> String {
         + 2;
     let mut s = String::from("Commands");
     for (group, names) in HELP_GROUPS {
+        let shown: Vec<&&str> = names.iter().filter(|n| show(n)).collect();
+        if shown.is_empty() {
+            continue;
+        }
         s.push_str(&format!("\n\n{group}"));
-        for name in *names {
+        for name in shown {
             s.push_str(&format!("\n  {name:<width$}{}", desc(name)));
         }
     }
@@ -253,6 +313,29 @@ mod tests {
         ] {
             assert!(!is_quit_command(msg), "{msg:?} should NOT quit");
         }
+    }
+
+    #[test]
+    fn tui_only_and_known_command_classification() {
+        // Every TUI-only entry must exist in the registry.
+        for name in TUI_ONLY_COMMANDS {
+            assert!(
+                SLASH_COMMANDS.iter().any(|(n, _)| n == name),
+                "TUI-only references unknown command {name}"
+            );
+        }
+        assert!(is_tui_only("/theme"));
+        assert!(is_tui_only("cd")); // alias of /cwd
+        assert!(is_tui_only("/summarize")); // alias of /compact
+        assert!(!is_tui_only("/help"));
+        assert!(!is_tui_only("/export"));
+        assert!(is_known_command("/new")); // alias entries count
+        assert!(is_known_command("model"));
+        assert!(!is_known_command("/frobnicate"));
+        // A filtered help body drops TUI-only commands but keeps shared ones.
+        let gui_help = help_body_for(|n| !is_tui_only(n));
+        assert!(gui_help.contains("/export"));
+        assert!(!gui_help.contains("/theme"));
     }
 
     #[test]

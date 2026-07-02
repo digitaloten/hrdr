@@ -3,7 +3,7 @@
 use super::*;
 use crate::theme::Theme;
 use hjkl_clipboard::{MimeType, Selection};
-use hrdr_app::{last_fenced_block, parse_duration, parse_msg_range, resolve_alias, resolve_under};
+use hrdr_app::{last_fenced_block, parse_duration, resolve_alias, resolve_under};
 
 impl super::App {
     /// Dispatch a known slash command. Returns `true` if it was a recognized
@@ -40,7 +40,6 @@ impl super::App {
             "revert" => self.revert_cmd(),
             "checkpoints" => self.checkpoints_cmd(),
             "add" => self.add_file(arg),
-            "diff" => self.git_diff_cmd(), // colored Entry::Diff rendering
             "temp" | "temperature" => self.set_temp_cmd(arg),
             "effort" => {
                 if arg.is_empty() {
@@ -54,8 +53,7 @@ impl super::App {
                     self.system(format!("effort → {arg}"));
                 }
             }
-            "info" => self.show_info(),   // richer than the shared /info
-            "copy" => self.copy_cmd(arg), // supports `msg N[-M]`
+            "info" => self.show_info(), // richer than the shared /info
             "paste" => self.paste_cmd(),
             "retry" => self.retry_last(arg),
             "edit" => self.edit_file_cmd(arg),
@@ -70,8 +68,9 @@ impl super::App {
             "timestamps" | "ts" => self.timestamps_cmd(arg),
             "statusbar" => self.statusbar_cmd(arg),
             "todo-ttl" | "todottl" | "todos" => self.todo_ttl_cmd(arg),
-            // help, clear, model, models, tools, info?, rename, thinking,
-            // sessions, resume, export → shared dispatcher.
+            // help, clear, model, models, tools, copy, diff, rename, thinking,
+            // sessions, resume, export → shared dispatcher (TuiHost overrides
+            // route /diff to the colored Entry::Diff rendering).
             _ => {
                 let mut host = TuiHost { app: self };
                 return hrdr_app::dispatch(&mut host, input);
@@ -211,38 +210,6 @@ impl super::App {
             Err(e) => self.system(format!("can't read {arg}: {e}")),
         }
     }
-    fn git_diff_cmd(&mut self) {
-        let Some(cwd) = self.with_agent_or_busy(|a| a.cwd()) else {
-            return;
-        };
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let out = tokio::process::Command::new("git")
-                .arg("diff")
-                .current_dir(&cwd)
-                .output()
-                .await;
-            match out {
-                Ok(o) if o.status.success() => {
-                    let s = String::from_utf8_lossy(&o.stdout).to_string();
-                    if s.trim().is_empty() {
-                        let _ = tx.send(TurnMsg::System("git diff: no changes".to_string()));
-                    } else {
-                        let _ = tx.send(TurnMsg::Diff(s));
-                    }
-                }
-                Ok(o) => {
-                    let _ = tx.send(TurnMsg::System(format!(
-                        "git diff failed: {}",
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    )));
-                }
-                Err(e) => {
-                    let _ = tx.send(TurnMsg::System(format!("git error: {e}")));
-                }
-            }
-        });
-    }
     fn set_temp_cmd(&mut self, arg: &str) {
         if arg.is_empty() {
             let t = self.with_agent(|a| a.temperature()).flatten();
@@ -352,49 +319,6 @@ impl super::App {
                 "note: a running backend isn't restarted; relaunch hrdr for a local backend",
             );
         }
-    }
-    /// `/copy [code|all|msg N]` — copy the last reply (default), the last code
-    /// block, the whole transcript, or a specific numbered message.
-    fn copy_cmd(&mut self, arg: &str) {
-        let lower = arg.trim().to_ascii_lowercase();
-        match lower.split_whitespace().collect::<Vec<_>>().as_slice() {
-            [] | ["reply"] | ["last"] => match self.last_assistant_text() {
-                Some(t) => self.copy_to_clipboard(&t, "last reply"),
-                None => self.system("no assistant reply to copy"),
-            },
-            ["code"] => match self.last_code_block() {
-                Some(t) => self.copy_to_clipboard(&t, "last code block"),
-                None => self.system("no code block to copy"),
-            },
-            ["all"] | ["transcript"] => {
-                let t = self.transcript_text();
-                if t.is_empty() {
-                    self.system("nothing to copy");
-                } else {
-                    self.copy_to_clipboard(&t, "transcript");
-                }
-            }
-            ["msg", spec] | ["message", spec] | ["m", spec] => self.copy_message_spec(spec),
-            _ => self.system("usage: /copy [code | all | msg N | msg N-M]"),
-        }
-    }
-    /// Copy a single message (`N`) or an inclusive range (`N-M`) by number.
-    fn copy_message_spec(&mut self, spec: &str) {
-        let Some((a, b)) = parse_msg_range(spec) else {
-            self.system("usage: /copy msg <N> or <N-M>");
-            return;
-        };
-        let parts: Vec<String> = (a..=b).filter_map(|n| self.nth_message_text(n)).collect();
-        if parts.is_empty() {
-            self.system(format!("no messages in {a}..{b} (see the #N tags)"));
-            return;
-        }
-        let label = if a == b {
-            format!("message #{a}")
-        } else {
-            format!("messages #{a}-{b}")
-        };
-        self.copy_to_clipboard(&parts.join("\n\n"), &label);
     }
     /// `/goto <N | 5m | 1h | top | end>` — scroll the transcript to a message
     /// number, to the message nearest a relative time ago, or to top/bottom.
@@ -595,11 +519,6 @@ impl super::App {
             TimestampStyle::Relative => "timestamps: relative",
             TimestampStyle::Exact => "timestamps: exact (HH:MM)",
         });
-    }
-    /// Write `text` to the system clipboard, emitting the status as a system line.
-    fn copy_to_clipboard(&mut self, text: &str, label: &str) {
-        let status = self.clipboard_status(text, label);
-        self.system(status);
     }
     /// Write `text` to the system clipboard, returning a status line (used by the
     /// shared `/copy` via [`hrdr_app::CommandHost`]).
@@ -884,6 +803,33 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     }
     fn transcript_text(&self) -> String {
         self.app.transcript_text()
+    }
+    fn nth_message_text(&self, n: usize) -> Option<String> {
+        self.app.nth_message_text(n)
+    }
+    fn last_code_block(&self) -> Option<String> {
+        // Richer than the default: searches back across assistant messages.
+        self.app.last_code_block()
+    }
+    fn spawn_diff(&self, fut: hrdr_app::LineFuture) {
+        // Route a real diff to the colored Entry::Diff rendering; status and
+        // error lines stay plain system lines.
+        let tx = self.app.tx.clone();
+        tokio::spawn(async move {
+            let line = fut.await;
+            if line.is_empty() {
+                return;
+            }
+            let msg = if line.starts_with("diff ") {
+                TurnMsg::Diff(line)
+            } else {
+                TurnMsg::System(line)
+            };
+            let _ = tx.send(msg);
+        });
+    }
+    fn supports_command(&self, _cmd: &str) -> bool {
+        true // the TUI implements the full registry
     }
     fn help_tips(&self) -> Option<String> {
         Some(HELP_TIPS.to_string())

@@ -64,6 +64,28 @@ pub trait CommandHost {
     fn last_reply(&self) -> Option<String>;
     /// The whole transcript as plain text (for `/copy all`).
     fn transcript_text(&self) -> String;
+    /// The Nth (1-based) user/assistant message's text (for `/copy msg N[-M]`).
+    fn nth_message_text(&self, n: usize) -> Option<String>;
+    /// The most recent fenced code block (for `/copy code`). Default: from the
+    /// last reply only; frontends may search further back.
+    fn last_code_block(&self) -> Option<String> {
+        self.last_reply()
+            .as_deref()
+            .and_then(crate::last_fenced_block)
+    }
+
+    /// Like [`spawn_line`](Self::spawn_line), but the resolved string is a
+    /// unified diff (or a status/error line) — frontends with diff-aware
+    /// rendering override to route real diffs accordingly.
+    fn spawn_diff(&self, fut: LineFuture) {
+        self.spawn_line(fut);
+    }
+
+    /// Whether this frontend supports `cmd` (used to filter `/help`). Default
+    /// matches the GUI: everything not in [`crate::TUI_ONLY_COMMANDS`].
+    fn supports_command(&self, cmd: &str) -> bool {
+        !crate::is_tui_only(cmd)
+    }
 
     /// Frontend-specific keybinding tips appended to `/help`.
     fn help_tips(&self) -> Option<String> {
@@ -83,7 +105,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
     let arg = parts.next().unwrap_or("").trim().to_string();
     match cmd {
         "help" => {
-            let mut s = crate::help_body();
+            let mut s = crate::help_body_for(|name| host.supports_command(name));
             if let Some(tips) = host.help_tips() {
                 s.push_str("\n\n");
                 s.push_str(&tips);
@@ -145,22 +167,35 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             }));
         }
         "copy" => {
-            let (text, label) = match arg.to_ascii_lowercase().as_str() {
-                "" | "reply" | "last" => (host.last_reply(), "last reply"),
-                "code" => (
-                    host.last_reply()
-                        .as_deref()
-                        .and_then(crate::last_fenced_block),
-                    "last code block",
-                ),
-                "all" | "transcript" => (Some(host.transcript_text()), "transcript"),
+            let lower = arg.to_ascii_lowercase();
+            let toks: Vec<&str> = lower.split_whitespace().collect();
+            let (text, label) = match toks.as_slice() {
+                [] | ["reply"] | ["last"] => (host.last_reply(), "last reply".to_string()),
+                ["code"] => (host.last_code_block(), "last code block".to_string()),
+                ["all"] | ["transcript"] => {
+                    (Some(host.transcript_text()), "transcript".to_string())
+                }
+                ["msg", spec] | ["message", spec] | ["m", spec] => {
+                    let Some((a, b)) = crate::parse_msg_range(spec) else {
+                        host.info("usage: /copy msg <N> or <N-M>".to_string());
+                        return true;
+                    };
+                    let parts: Vec<String> =
+                        (a..=b).filter_map(|n| host.nth_message_text(n)).collect();
+                    let label = if a == b {
+                        format!("message #{a}")
+                    } else {
+                        format!("messages #{a}-{b}")
+                    };
+                    ((!parts.is_empty()).then(|| parts.join("\n\n")), label)
+                }
                 _ => {
-                    host.info("usage: /copy [code | all]".to_string());
+                    host.info("usage: /copy [code | all | msg N[-M]]".to_string());
                     return true;
                 }
             };
             let line = match text {
-                Some(t) if !t.is_empty() => host.copy_to_clipboard(&t, label),
+                Some(t) if !t.is_empty() => host.copy_to_clipboard(&t, &label),
                 _ => format!("nothing to copy ({label})"),
             };
             host.info(line);
@@ -190,7 +225,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         }
         "diff" => {
             let cwd = host.cwd();
-            host.spawn_line(Box::pin(async move {
+            host.spawn_diff(Box::pin(async move {
                 match git_working_diff(&cwd).await {
                     Ok(d) if d.trim().is_empty() => "git diff: no changes".to_string(),
                     Ok(d) => d,
