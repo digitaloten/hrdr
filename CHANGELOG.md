@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **GUI finish nudge — desktop notification as the bell.** The GUI now honors
+  the `bell` config knob: when a turn finishes (or fails) after running at least
+  5 seconds, it posts a desktop notification (`notify-rust`: D-Bus/XDG on Linux,
+  Notification Center on macOS, toasts on Windows) — the GUI's equivalent of the
+  TUI's terminal `BEL`. The enabled-plus-minimum-duration gate is shared
+  (`hrdr_app::should_bell` / `BELL_MIN_SECS`), the knob hot-reloads with the
+  rest of the config, and quick replies stay silent in both frontends.
+
 - **DRY audit follow-up — one code path for a dozen more TUI/GUI behaviors.**
   - `CommandHost` gained a `line_poster` channel primitive; `spawn_line` /
     `spawn_diff` (including the diff-vs-status routing rule) are now trait

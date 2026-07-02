@@ -770,18 +770,11 @@ impl App {
         self.turn_handle = Some(handle);
     }
 
-    /// Ring the terminal bell when a turn finishes, if enabled and the turn ran
-    /// long enough to be worth a nudge (so quick replies stay silent).
+    /// Ring the terminal bell when a turn finishes (shared gate: enabled +
+    /// ran at least [`hrdr_app::BELL_MIN_SECS`], so quick replies stay silent).
     fn maybe_bell(&self) {
-        const MIN_SECS: f64 = 5.0;
-        if !self.bell {
-            return;
-        }
-        let long_enough = self
-            .turn_started
-            .map(|t| t.elapsed().as_secs_f64() >= MIN_SECS)
-            .unwrap_or(false);
-        if long_enough {
+        let elapsed = self.turn_started.map(|t| t.elapsed().as_secs_f64());
+        if hrdr_app::should_bell(self.bell, elapsed) {
             use std::io::Write;
             let mut out = std::io::stdout();
             let _ = out.write_all(b"\x07"); // BEL

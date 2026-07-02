@@ -216,6 +216,8 @@ fn app_view(
     let running = create_rw_signal(false);
     // Sticky `/expand all`: new tools spawn expanded while set (TUI parity).
     let expand_all = create_rw_signal(false);
+    // Finish nudge (the TUI's bell → a desktop notification here); reloadable.
+    let bell = create_rw_signal(ui.bell);
     let next_id = create_rw_signal(0u64);
     // Model is a signal so `/model <name>` can switch it and the status bar
     // reflects the change live.
@@ -526,8 +528,19 @@ fn app_view(
                     return;
                 }
                 running.set(false);
+                let failed = err.is_some();
                 if let Some(e) = err {
                     push_item(transcript, next_id, Body::Error(e));
+                }
+                // Finish nudge — the GUI's bell (shared gate with the TUI:
+                // enabled + the turn ran long enough to be worth it).
+                if hrdr_app::should_bell(
+                    bell.get_untracked(),
+                    turn_start
+                        .get_untracked()
+                        .map(|t| t.elapsed().as_secs_f64()),
+                ) {
+                    notify_turn_done(failed);
                 }
                 // Per-turn stats line (shared formatting with the TUI).
                 if let Some(started) = turn_start.get_untracked()
@@ -610,6 +623,7 @@ fn app_view(
                     timestamp_style,
                     statusbar_mode,
                     todo_ttl,
+                    bell,
                     effort,
                     auto_compact_ratio,
                 );
@@ -774,6 +788,7 @@ fn app_view(
                 todo_turn,
                 todo_completed_at: todo_stamps_for_send.clone(),
                 expand_all,
+                bell,
                 auto_compact_ratio,
                 find_query,
                 find_pos,
@@ -1369,6 +1384,23 @@ fn transcript_text(transcript: RwSignal<Vec<Item>>) -> String {
     })
 }
 
+/// Desktop notification when a long turn finishes — the GUI's answer to the
+/// TUI's terminal bell (`bell` config knob). Best-effort, off the UI thread.
+fn notify_turn_done(failed: bool) {
+    let body = if failed {
+        "turn failed"
+    } else {
+        "turn finished"
+    };
+    std::thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .appname("hrdr")
+            .summary("hrdr")
+            .body(body)
+            .show();
+    });
+}
+
 /// Write `text` to the OS clipboard, returning a status line for the transcript.
 fn copy_to_clipboard(
     clipboard: &Rc<RefCell<Option<hjkl_clipboard::Clipboard>>>,
@@ -1525,6 +1557,7 @@ struct GuiHost {
     todo_turn: RwSignal<u64>,
     todo_completed_at: Rc<RefCell<std::collections::HashMap<String, u64>>>,
     expand_all: RwSignal<bool>,
+    bell: RwSignal<bool>,
     auto_compact_ratio: RwSignal<f64>,
     find_query: RwSignal<Option<String>>,
     find_pos: RwSignal<usize>,
@@ -1857,6 +1890,7 @@ impl hrdr_app::CommandHost for GuiHost {
             self.timestamp_style,
             self.statusbar_mode,
             self.todo_ttl,
+            self.bell,
             self.effort,
             self.auto_compact_ratio,
         );
@@ -2073,6 +2107,7 @@ fn apply_config_reload(
     timestamp_style: RwSignal<hrdr_app::TimestampStyle>,
     statusbar_mode: RwSignal<hrdr_app::StatusBarMode>,
     todo_ttl: RwSignal<u64>,
+    bell: RwSignal<bool>,
     effort: RwSignal<Option<String>>,
     auto_compact_ratio: RwSignal<f64>,
 ) -> String {
@@ -2086,6 +2121,7 @@ fn apply_config_reload(
                 timestamp_style,
                 statusbar_mode,
                 todo_ttl,
+                bell,
             );
             effort.set(cfg.effort.clone());
             auto_compact_ratio.set(cfg.auto_compact);
@@ -2113,8 +2149,10 @@ fn apply_ui_config(
     timestamp_style: RwSignal<hrdr_app::TimestampStyle>,
     statusbar_mode: RwSignal<hrdr_app::StatusBarMode>,
     todo_ttl: RwSignal<u64>,
+    bell: RwSignal<bool>,
 ) {
     show_reasoning.set(ui.show_thinking);
+    bell.set(ui.bell);
     theme_sig.set(GuiTheme::load(ui.theme.as_deref()));
     theme_rev.update(|r| *r += 1);
     timestamp_style.set(hrdr_app::TimestampStyle::from_config(

@@ -1012,6 +1012,16 @@ pub fn resume_plan(
     ResumePlan { new_cwd, lines }
 }
 
+/// Minimum turn duration before the finish nudge fires (terminal bell in the
+/// TUI, desktop notification in the GUI) — quick replies stay silent.
+pub const BELL_MIN_SECS: f64 = 5.0;
+
+/// Whether a finished turn warrants the nudge: the knob is on and the turn ran
+/// at least [`BELL_MIN_SECS`].
+pub fn should_bell(enabled: bool, elapsed_secs: Option<f64>) -> bool {
+    enabled && elapsed_secs.is_some_and(|e| e >= BELL_MIN_SECS)
+}
+
 /// The cancel notice both frontends show (with the discarded-queue count).
 pub fn cancel_message(dropped: usize) -> String {
     if dropped > 0 {
