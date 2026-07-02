@@ -254,15 +254,11 @@ impl App {
         let mut transcript = vec![Entry::System(welcome.to_string())];
         // Warn (but don't fail) if the config file exists but is invalid — the
         // running config has already fallen back to defaults + env in that case.
-        if let Err(e) = AgentConfig::load_checked() {
-            transcript.push(Entry::System(format!(
-                "config file is invalid — using defaults: {e}"
-            )));
+        if let Some(warning) = hrdr_app::startup_config_warning() {
+            transcript.push(Entry::System(warning));
         }
         if project_docs_loaded {
-            transcript.push(Entry::System(
-                "loaded project instructions from AGENTS.md".to_string(),
-            ));
+            transcript.push(Entry::System(hrdr_app::PROJECT_DOCS_LOADED_MSG.to_string()));
         }
         let entry_times = vec![timestamp_now(); transcript.len()];
         let mut app = Self {
@@ -615,7 +611,8 @@ impl App {
         self.entry_times.truncate(len);
     }
 
-    /// Age out finished TODO items. Called once per turn (on `TurnDone`).
+    /// Age out finished TODO items. Called once per turn (on `Done`, so it also
+    /// runs when a turn errors — same trigger as the GUI).
     fn prune_completed_todos(&mut self) {
         if let Ok(mut todos) = self.todos.lock() {
             age_completed_todos(
@@ -675,12 +672,12 @@ impl App {
                 self.apply_runtime_config(&cfg, &hrdr_app::UiConfig::load());
                 self.cfg = cfg;
                 self.system(if manual {
-                    "reloaded config (theme, icons, effort, toggles)"
+                    hrdr_app::RELOAD_MANUAL_MSG
                 } else {
-                    "config changed on disk — reloaded"
+                    hrdr_app::RELOAD_HOT_MSG
                 });
             }
-            Err(e) => self.system(format!("config invalid — keeping current settings: {e}")),
+            Err(e) => self.system(hrdr_app::reload_invalid_message(&e)),
         }
         // Either way, stop re-triggering for this version of the file.
         self.config_mtime = current_config_mtime();
@@ -734,12 +731,7 @@ impl App {
         self.compacting = false;
         let dropped = self.queue.len();
         self.queue.clear();
-        let msg = if dropped > 0 {
-            format!("[cancelled · {dropped} queued message(s) discarded]")
-        } else {
-            "[cancelled]".to_string()
-        };
-        self.push_entry(Entry::System(msg));
+        self.push_entry(Entry::System(hrdr_app::cancel_message(dropped)));
     }
 
     fn spawn_turn(&mut self, input: String) {
@@ -748,16 +740,7 @@ impl App {
         self.push_entry(Entry::User(input.clone()));
         // Expand `@file` mentions into attached contents for the model only; the
         // transcript still shows the message as the user typed it.
-        let cwd = self
-            .agent
-            .try_lock()
-            .ok()
-            .map(|a| a.cwd())
-            .or_else(|| std::env::current_dir().ok());
-        let sent = match cwd {
-            Some(cwd) => hrdr_app::expand_mentions(&input, &cwd),
-            None => input.clone(),
-        };
+        let sent = hrdr_app::expand_mentions(&input, &hrdr_app::agent_cwd(&self.agent));
         self.launch_turn(sent);
     }
 
@@ -811,17 +794,12 @@ impl App {
     /// Whether the context has grown enough to auto-compact (with headroom).
     /// A configured ratio of `0` (or outside `0.0..=1.0`) disables it.
     fn should_auto_compact(&self) -> bool {
-        if self.compacting {
-            return false;
-        }
-        let ratio = self.auto_compact_ratio;
-        if ratio <= 0.0 || ratio > 1.0 {
-            return false;
-        }
-        let (Some((prompt, _)), Some(window)) = (self.last_usage, self.context_window) else {
-            return false;
-        };
-        window > 0 && f64::from(prompt) >= f64::from(window) * ratio
+        !self.compacting
+            && hrdr_app::should_auto_compact(
+                self.last_usage.map(|(p, _)| p),
+                self.context_window,
+                self.auto_compact_ratio,
+            )
     }
 
     /// Run a compaction pass on the background task, reporting via `TurnMsg`.
@@ -892,6 +870,9 @@ impl App {
                 if let Some(stats) = self.turn_stats() {
                     self.push_entry(Entry::Stats(stats));
                 }
+                // Age out completed TODOs once per turn.
+                self.todo_turn += 1;
+                self.prune_completed_todos();
                 // Notify on completion of a non-trivial turn (if enabled).
                 self.maybe_bell();
                 // Persist the completed turn into the active session, if any.
@@ -1042,10 +1023,7 @@ impl App {
                 self.push_entry(Entry::System(text));
                 self.scroll_offset = 0;
             }
-            AgentEvent::TurnDone => {
-                self.todo_turn += 1;
-                self.prune_completed_todos();
-            }
+            AgentEvent::TurnDone => {}
         }
     }
 }

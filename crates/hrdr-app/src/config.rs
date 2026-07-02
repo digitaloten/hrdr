@@ -10,6 +10,12 @@ use hrdr_agent::parse_env_bool;
 /// pruned: the turn it finishes plus four more.
 pub const DEFAULT_TODO_TTL: u64 = 5;
 
+/// Max text rows the input box auto-grows to (both frontends).
+pub const INPUT_MAX_ROWS: u16 = 5;
+
+/// Character width of the one-line tool-args preview (both frontends).
+pub const TOOL_ARGS_PREVIEW: usize = 80;
+
 /// Frontend/display configuration. Loaded from the same
 /// `~/.config/hrdr/config.toml` + `HRDR_*` env vars as
 /// [`hrdr_agent::AgentConfig`] (precedence: env > file > default) — the file

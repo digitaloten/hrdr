@@ -214,6 +214,8 @@ fn app_view(
     let transcript: RwSignal<Vec<Item>> = create_rw_signal(Vec::new());
     let input = create_rw_signal(String::new());
     let running = create_rw_signal(false);
+    // Sticky `/expand all`: new tools spawn expanded while set (TUI parity).
+    let expand_all = create_rw_signal(false);
     let next_id = create_rw_signal(0u64);
     // Model is a signal so `/model <name>` can switch it and the status bar
     // reflects the change live.
@@ -249,6 +251,19 @@ fn app_view(
     let turn_handle: Rc<RefCell<Option<tokio::task::JoinHandle<()>>>> = Rc::new(RefCell::new(None));
     // Submitted-input history + Up/Down browsing (shared with the TUI).
     let history = Rc::new(RefCell::new(hrdr_app::HistoryBrowser::load()));
+
+    // Startup notices (parity with the TUI): warn if the config file is
+    // invalid, note the AGENTS.md pickup.
+    if let Some(warning) = hrdr_app::startup_config_warning() {
+        system(transcript, next_id, warning);
+    }
+    if agent
+        .try_lock()
+        .map(|a| a.project_docs().is_some())
+        .unwrap_or(false)
+    {
+        system(transcript, next_id, hrdr_app::PROJECT_DOCS_LOADED_MSG);
+    }
 
     // Startup auto-resume: pick up the most recent saved session for this
     // directory (like the TUI; `auto_resume = false` / --no-auto-resume in the
@@ -290,12 +305,7 @@ fn app_view(
     );
     // Working-directory + git-branch display for the status bar (follow /cwd
     // and resumed sessions).
-    let start_cwd = agent
-        .try_lock()
-        .map(|a| a.cwd())
-        .ok()
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_default();
+    let start_cwd = hrdr_app::agent_cwd(&agent);
     let dir_sig: RwSignal<String> = create_rw_signal(hrdr_app::display_dir(&start_cwd));
     let branch_sig: RwSignal<Option<String>> = create_rw_signal(hrdr_app::git_branch(&start_cwd));
     // Session-cumulative token counters (the status bar's ↑/↓).
@@ -326,7 +336,8 @@ fn app_view(
     // True while a compaction (summarization) pass runs; auto-compaction
     // triggers at this fraction of the context window (0 disables).
     let compacting: RwSignal<bool> = create_rw_signal(false);
-    let auto_compact_ratio = cfg.auto_compact;
+    // Signal so `/reload` + hot-reload pick up config edits (the TUI does).
+    let auto_compact_ratio = create_rw_signal(cfg.auto_compact);
     // Streamed tokens this turn (the per-turn stats line's token count/rate).
     let out_tokens: RwSignal<usize> = create_rw_signal(0);
     // The in-flight turn is an /init run → reload AGENTS.md when it completes.
@@ -359,15 +370,7 @@ fn app_view(
             // Expand `@file` mentions for the model only; the transcript keeps
             // the bare `@path` the user typed (same split as the TUI). Paths
             // resolve against the agent's cwd (it follows /cwd and /resume).
-            let mention_cwd = agent
-                .try_lock()
-                .map(|a| a.cwd())
-                .ok()
-                .or_else(|| std::env::current_dir().ok());
-            let sent = match mention_cwd {
-                Some(cwd) => hrdr_app::expand_mentions(&text, &cwd),
-                None => text,
-            };
+            let sent = hrdr_app::expand_mentions(&text, &hrdr_app::agent_cwd(&agent));
             let agent = agent.clone();
             let tx = tx.clone();
             // Snapshot session state for the post-turn auto-save (signals
@@ -415,12 +418,8 @@ fn app_view(
     let tx_for_index = tx.clone();
     create_effect(move |_| {
         if input.get().contains('@') && file_index_state.get_untracked() == 0 {
-            let cwd = agent_for_index
-                .try_lock()
-                .map(|a| a.cwd())
-                .ok()
-                .or_else(|| std::env::current_dir().ok());
-            if let Some(cwd) = cwd {
+            {
+                let cwd = hrdr_app::agent_cwd(&agent_for_index);
                 file_index_state.set(1);
                 let tx = tx_for_index.clone();
                 hrdr_app::spawn_file_index(cwd, move |files| {
@@ -497,7 +496,7 @@ fn app_view(
                 {
                     ttft.set(Some(start.elapsed().as_secs_f64()));
                 }
-                if matches!(ev, AgentEvent::Text(_)) {
+                if matches!(ev, AgentEvent::Text(_) | AgentEvent::Reasoning(_)) {
                     out_tokens.set(out_tokens.get_untracked() + 1);
                 }
                 // Session-cumulative token counters for the status bar.
@@ -511,12 +510,17 @@ fn app_view(
                 }
                 // Tool completions may have rewritten the shared TODO list.
                 let refresh_todos = matches!(ev, AgentEvent::ToolEnd { .. });
-                handle_event(cx, transcript, next_id, usage, ev);
+                handle_event(cx, transcript, next_id, usage, expand_all, ev);
                 if refresh_todos && let Ok(t) = todos_for_events.lock() {
                     todos_sig.set(t.clone());
                 }
             }
             UiMsg::Done(err) => {
+                // Stale Done from an aborted task (cancel raced the channel);
+                // discard, like the TUI.
+                if !running.get_untracked() {
+                    return;
+                }
                 running.set(false);
                 if let Some(e) = err {
                     push_item(transcript, next_id, Body::Error(e));
@@ -562,7 +566,7 @@ fn app_view(
                     && hrdr_app::should_auto_compact(
                         usage.get_untracked().map(|(p, _)| p),
                         ctx_window.get_untracked(),
-                        auto_compact_ratio,
+                        auto_compact_ratio.get_untracked(),
                     )
                 {
                     system(
@@ -593,16 +597,19 @@ fn app_view(
                     return;
                 }
                 mtime_for_events.set(now);
-                apply_ui_config(
-                    &hrdr_app::UiConfig::load(),
+                let line = apply_config_reload(
+                    false,
+                    &agent_for_events,
                     show_reasoning,
                     theme_sig,
                     theme_rev,
                     timestamp_style,
                     statusbar_mode,
                     todo_ttl,
+                    effort,
+                    auto_compact_ratio,
                 );
-                system(transcript, next_id, "config changed on disk — reloaded");
+                system(transcript, next_id, line);
             }
             UiMsg::Compacted(res) => {
                 running.set(false);
@@ -651,11 +658,7 @@ fn app_view(
                     return;
                 }
                 if first_save {
-                    system(
-                        transcript,
-                        next_id,
-                        format!("session saved as '{id}' — /resume {id}"),
-                    );
+                    system(transcript, next_id, hrdr_app::session_saved_notice(&id));
                 }
                 session_id.set(Some(id));
             }
@@ -764,6 +767,8 @@ fn app_view(
                 todos_sig,
                 todo_turn,
                 todo_completed_at: todo_stamps_for_send.clone(),
+                expand_all,
+                auto_compact_ratio,
                 find_query,
                 find_pos,
                 ctx_window,
@@ -828,17 +833,14 @@ fn app_view(
         }
         running.set(false);
         compacting.set(false);
+        pending_init.set(false); // a cancelled /init must not reload docs later
         let dropped = {
             let mut q = queue_for_cancel.borrow_mut();
             let n = q.len();
             q.clear();
             n
         };
-        let msg = if dropped > 0 {
-            format!("[cancelled · {dropped} queued message(s) discarded]")
-        } else {
-            "[cancelled]".to_string()
-        };
+        let msg = hrdr_app::cancel_message(dropped);
         system(transcript, next_id, msg);
     };
 
@@ -1001,7 +1003,11 @@ fn app_view(
 
         // Auto-grow with content like the TUI's input (1..=6 text rows).
         ed.style(move |s| {
-            let rows = input.get().lines().count().clamp(1, 6) as f32;
+            let rows = input
+                .get()
+                .lines()
+                .count()
+                .clamp(1, hrdr_app::INPUT_MAX_ROWS as usize) as f32;
             s.flex_grow(1.0).height(rows * 22.0 + 14.0).padding(4.0)
         })
     };
@@ -1099,7 +1105,7 @@ fn app_view(
             tokens_out: session_out.get(),
             ctx_used: usage.get().map(|(p, _)| p as usize).unwrap_or(0),
             context_window: ctx_window.get(),
-            auto_compact_ratio,
+            auto_compact_ratio: auto_compact_ratio.get(),
             model: &model_name,
             effort: effort_label.as_deref(),
             ttft: ttft.get(),
@@ -1361,16 +1367,7 @@ fn copy_to_clipboard(
     text: &str,
     label: &str,
 ) -> String {
-    use hjkl_clipboard::{MimeType, Selection};
-    let res = clipboard
-        .borrow_mut()
-        .as_mut()
-        .map(|cb| cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()));
-    match res {
-        Some(Ok(())) => format!("copied {label} to clipboard"),
-        Some(Err(_)) => "clipboard write failed".to_string(),
-        None => "clipboard unavailable".to_string(),
-    }
+    hrdr_app::clipboard_copy_status(&mut clipboard.borrow_mut(), text, label)
 }
 
 /// Transcript search/jump state + helpers for the GUI-local `/find`, `/next`,
@@ -1550,6 +1547,8 @@ struct GuiHost {
     todos_sig: RwSignal<Vec<hrdr_tools::TodoItem>>,
     todo_turn: RwSignal<u64>,
     todo_completed_at: Rc<RefCell<std::collections::HashMap<String, u64>>>,
+    expand_all: RwSignal<bool>,
+    auto_compact_ratio: RwSignal<f64>,
     find_query: RwSignal<Option<String>>,
     find_pos: RwSignal<usize>,
     ctx_window: RwSignal<Option<u32>>,
@@ -1571,27 +1570,21 @@ impl hrdr_app::CommandHost for GuiHost {
     fn info(&mut self, line: String) {
         system(self.transcript, self.next_id, line);
     }
-    fn spawn_line(&self, fut: hrdr_app::LineFuture) {
+    fn line_poster(&self) -> Box<dyn Fn(hrdr_app::LineKind, String) + Send> {
         let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let line = fut.await;
-            if !line.is_empty() {
-                let _ = tx.send(UiMsg::System(line));
-            }
-        });
+        Box::new(move |kind, line| {
+            let msg = match kind {
+                hrdr_app::LineKind::Diff => UiMsg::Diff(line),
+                hrdr_app::LineKind::System => UiMsg::System(line),
+            };
+            let _ = tx.send(msg);
+        })
     }
     fn agent(&self) -> Arc<TokioMutex<Agent>> {
         self.agent.clone()
     }
     fn cwd(&self) -> std::path::PathBuf {
-        // The agent's cwd is authoritative (it follows a resumed session);
-        // fall back to the process cwd if a turn holds the lock.
-        self.agent
-            .try_lock()
-            .map(|a| a.cwd())
-            .ok()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_default()
+        hrdr_app::agent_cwd(&self.agent)
     }
     fn base_url(&self) -> String {
         self.base_url.get_untracked()
@@ -1757,23 +1750,6 @@ impl hrdr_app::CommandHost for GuiHost {
     fn nth_message_text(&self, n: usize) -> Option<String> {
         nth_message_text(self.transcript, n)
     }
-    fn spawn_diff(&self, fut: hrdr_app::LineFuture) {
-        // Route a real diff to the colored Body::Diff rendering; status and
-        // error lines stay plain system lines (same rule as the TUI).
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let line = fut.await;
-            if line.is_empty() {
-                return;
-            }
-            let msg = if line.starts_with("diff ") {
-                UiMsg::Diff(line)
-            } else {
-                UiMsg::System(line)
-            };
-            let _ = tx.send(msg);
-        });
-    }
     fn is_busy(&self) -> bool {
         self.running.get_untracked()
     }
@@ -1790,13 +1766,7 @@ impl hrdr_app::CommandHost for GuiHost {
         self.input.update(|s| s.push_str(&text));
     }
     fn read_clipboard(&self) -> Option<String> {
-        use hjkl_clipboard::{MimeType, Selection};
-        let bytes = self
-            .clipboard
-            .borrow_mut()
-            .as_mut()
-            .and_then(|cb| cb.get(Selection::Clipboard, MimeType::Text).ok())?;
-        Some(String::from_utf8_lossy(&bytes).to_string())
+        hrdr_app::clipboard_read_text(&self.clipboard.borrow())
     }
     fn set_tool_expansion(&mut self, mode: hrdr_app::ExpandMode) -> String {
         let tools: Vec<Tool> = self.transcript.with_untracked(|t| {
@@ -1809,33 +1779,36 @@ impl hrdr_app::CommandHost for GuiHost {
         });
         match mode {
             hrdr_app::ExpandMode::All => {
+                // Sticky (as in the TUI): existing tools expand now, new
+                // tools spawn expanded until `/expand off`.
+                self.expand_all.set(true);
                 for t in &tools {
                     t.collapsed.set(false);
                 }
-                "tool output expanded (all)".to_string()
+                hrdr_app::expand_msg::ALL.to_string()
             }
             hrdr_app::ExpandMode::Off => {
+                self.expand_all.set(false);
                 for t in &tools {
                     t.collapsed.set(true);
                 }
-                "tool output collapsed".to_string()
+                hrdr_app::expand_msg::OFF.to_string()
             }
             hrdr_app::ExpandMode::ToggleLast => match tools.last() {
                 Some(t) => {
                     let now = !t.collapsed.get_untracked();
                     t.collapsed.set(now);
                     if now {
-                        "collapsed last tool output".to_string()
+                        hrdr_app::expand_msg::LAST_COLLAPSED.to_string()
                     } else {
-                        "expanded last tool output".to_string()
+                        hrdr_app::expand_msg::LAST_EXPANDED.to_string()
                     }
                 }
-                None => "no tool output to expand".to_string(),
+                None => hrdr_app::expand_msg::NONE.to_string(),
             },
         }
     }
-    fn compact(&mut self, instructions: Option<String>) {
-        system(self.transcript, self.next_id, "compacting conversation…");
+    fn start_compaction(&mut self, instructions: Option<String>) {
         (self.start_compaction)(instructions);
     }
     fn mark_init_turn(&mut self) {
@@ -1929,19 +1902,29 @@ impl hrdr_app::CommandHost for GuiHost {
         self.todo_ttl.set(turns);
     }
     fn reload_config(&mut self) {
-        // Re-read the display config and apply what the GUI can change live.
-        let ui = hrdr_app::UiConfig::load();
-        self.show_reasoning.set(ui.show_thinking);
-        self.timestamp_style
-            .set(hrdr_app::TimestampStyle::from_config(
-                ui.timestamps.as_deref(),
-            ));
-        self.todo_ttl.set(ui.todo_ttl);
-        system(
-            self.transcript,
-            self.next_id,
-            "reloaded config (thinking, timestamps, todo-ttl; theme needs a restart)",
+        // Same application path as the hot-reload; the manual command also
+        // refreshes AGENTS.md like the TUI's /reload.
+        let line = apply_config_reload(
+            true,
+            &self.agent,
+            self.show_reasoning,
+            self.theme,
+            self.theme_rev,
+            self.timestamp_style,
+            self.statusbar_mode,
+            self.todo_ttl,
+            self.effort,
+            self.auto_compact_ratio,
         );
+        self.config_mtime_seen.set(hrdr_app::config_mtime());
+        let agent = self.agent.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            if let Some(line) = hrdr_app::reload_project_docs(agent).await {
+                let _ = tx.send(UiMsg::System(line));
+            }
+        });
+        system(self.transcript, self.next_id, line);
     }
     fn resolve_provider(&self, name: &str) -> Option<hrdr_agent::ResolvedProvider> {
         self.cfg.resolve_provider(name)
@@ -2003,6 +1986,7 @@ fn handle_event(
     transcript: RwSignal<Vec<Item>>,
     next_id: RwSignal<u64>,
     usage: RwSignal<Option<(u32, u32)>>,
+    expand_all: RwSignal<bool>,
     ev: AgentEvent,
 ) {
     match ev {
@@ -2026,7 +2010,8 @@ fn handle_event(
                 result: item_cx.create_rw_signal(String::new()),
                 ok: item_cx.create_rw_signal(true),
                 done: item_cx.create_rw_signal(false),
-                collapsed: item_cx.create_rw_signal(true),
+                // Sticky `/expand all` applies to new tools too (as in the TUI).
+                collapsed: item_cx.create_rw_signal(!expand_all.get_untracked()),
             };
             push_item_scoped(transcript, next_id, Body::Tool(tool), Some(item_cx));
         }
@@ -2094,7 +2079,7 @@ fn render_item(
         .into_any(),
         Body::Tool(t) => {
             let name = t.name.clone();
-            let args = hrdr_tools::truncate_inline(&t.args, 80);
+            let args = hrdr_tools::truncate_inline(&t.args, hrdr_app::TOOL_ARGS_PREVIEW);
             let (output, result, ok, collapsed) = (t.output, t.result, t.ok, t.collapsed);
             v_stack((
                 // Clickable header — caret reflects/toggles the output collapse.
@@ -2130,8 +2115,51 @@ fn text_label(s: String) -> impl IntoView {
     label(move || s.clone())
 }
 
+/// Re-load config and apply the live-changeable settings — the one code path
+/// behind both `/reload` and the hot-reload (mirrors the TUI's
+/// `apply_config_reload`). On an invalid file, keeps the current settings.
+/// Returns the status line to show.
+#[allow(clippy::too_many_arguments)]
+fn apply_config_reload(
+    manual: bool,
+    agent: &Arc<TokioMutex<Agent>>,
+    show_reasoning: RwSignal<bool>,
+    theme_sig: RwSignal<GuiTheme>,
+    theme_rev: RwSignal<u64>,
+    timestamp_style: RwSignal<hrdr_app::TimestampStyle>,
+    statusbar_mode: RwSignal<hrdr_app::StatusBarMode>,
+    todo_ttl: RwSignal<u64>,
+    effort: RwSignal<Option<String>>,
+    auto_compact_ratio: RwSignal<f64>,
+) -> String {
+    match AgentConfig::load_checked() {
+        Ok(cfg) => {
+            apply_ui_config(
+                &hrdr_app::UiConfig::load(),
+                show_reasoning,
+                theme_sig,
+                theme_rev,
+                timestamp_style,
+                statusbar_mode,
+                todo_ttl,
+            );
+            effort.set(cfg.effort.clone());
+            auto_compact_ratio.set(cfg.auto_compact);
+            if let (Some(t), Ok(mut a)) = (cfg.temperature, agent.try_lock()) {
+                a.set_temperature(Some(t));
+            }
+            if manual {
+                hrdr_app::RELOAD_MANUAL_MSG.to_string()
+            } else {
+                hrdr_app::RELOAD_HOT_MSG.to_string()
+            }
+        }
+        Err(e) => hrdr_app::reload_invalid_message(&e),
+    }
+}
+
 /// Apply the live-changeable display settings from a (re)loaded [`UiConfig`]
-/// — the one code path behind both `/reload` and the config hot-reload.
+/// — the display half of [`apply_config_reload`].
 #[allow(clippy::too_many_arguments)]
 fn apply_ui_config(
     ui: &hrdr_app::UiConfig,

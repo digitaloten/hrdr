@@ -51,10 +51,7 @@ impl super::App {
         if let Some(o) = outcome {
             // Notify once, when the session is first created.
             if o.first_save {
-                self.push_entry(Entry::System(format!(
-                    "session saved as '{}' — /resume {}",
-                    o.id, o.id
-                )));
+                self.push_entry(Entry::System(hrdr_app::session_saved_notice(&o.id)));
             }
             self.session_id = Some(o.id);
         }

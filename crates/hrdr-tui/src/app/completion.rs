@@ -70,15 +70,7 @@ impl super::App {
         if self.file_index_building {
             return;
         }
-        let Some(cwd) = self
-            .agent
-            .try_lock()
-            .ok()
-            .map(|a| a.cwd())
-            .or_else(|| std::env::current_dir().ok())
-        else {
-            return;
-        };
+        let cwd = hrdr_app::agent_cwd(&self.agent);
         if self.file_index_cwd.as_deref() == Some(cwd.as_path()) {
             return;
         }

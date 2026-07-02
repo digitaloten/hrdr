@@ -2142,6 +2142,7 @@ name = "hrdr-app"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hjkl-clipboard",
  "hjkl-theme",
  "hjkl-xdg",
  "hrdr-agent",

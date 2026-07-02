@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::theme::Theme;
-use hjkl_clipboard::{MimeType, Selection};
 use hrdr_app::{last_fenced_block, parse_duration, resolve_alias, resolve_under};
 
 impl super::App {
@@ -48,10 +47,16 @@ impl super::App {
         if self.running {
             self.cancel_turn();
         }
-        let agent = self.agent.clone();
-        tokio::spawn(async move {
-            agent.lock().await.clear();
-        });
+        if let Ok(mut a) = self.agent.try_lock() {
+            a.clear();
+        } else {
+            // The just-aborted turn still holds the lock until its task drops;
+            // clear through an awaited lock (the GUI does the same).
+            let agent = self.agent.clone();
+            tokio::spawn(async move {
+                agent.lock().await.clear();
+            });
+        }
         self.clear_transcript();
         self.queue.clear();
         if let Ok(mut todos) = self.todos.lock() {
@@ -79,7 +84,7 @@ impl super::App {
         match mode {
             hrdr_app::ExpandMode::All => {
                 self.expand_tools = true;
-                "tool output expanded (all)".to_string()
+                hrdr_app::expand_msg::ALL.to_string()
             }
             hrdr_app::ExpandMode::Off => {
                 self.expand_tools = false;
@@ -88,7 +93,7 @@ impl super::App {
                         *expanded = false;
                     }
                 }
-                "tool output collapsed".to_string()
+                hrdr_app::expand_msg::OFF.to_string()
             }
             hrdr_app::ExpandMode::ToggleLast => {
                 let last = self.transcript.iter_mut().rev().find_map(|e| match e {
@@ -99,12 +104,12 @@ impl super::App {
                     Some(expanded) => {
                         *expanded = !*expanded;
                         if *expanded {
-                            "expanded last tool output".to_string()
+                            hrdr_app::expand_msg::LAST_EXPANDED.to_string()
                         } else {
-                            "collapsed last tool output".to_string()
+                            hrdr_app::expand_msg::LAST_COLLAPSED.to_string()
                         }
                     }
-                    None => "no tool output to expand".to_string(),
+                    None => hrdr_app::expand_msg::NONE.to_string(),
                 }
             }
         }
@@ -254,15 +259,7 @@ impl super::App {
     /// Write `text` to the system clipboard, returning a status line (used by the
     /// shared `/copy` via [`hrdr_app::CommandHost`]).
     pub(super) fn clipboard_status(&mut self, text: &str, label: &str) -> String {
-        let res = self
-            .clipboard
-            .as_mut()
-            .map(|cb| cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()));
-        match res {
-            Some(Ok(())) => format!("copied {label} to clipboard"),
-            Some(Err(_)) => "clipboard write failed".to_string(),
-            None => "clipboard unavailable".to_string(),
-        }
+        hrdr_app::clipboard_copy_status(&mut self.clipboard, text, label)
     }
     /// The most recent assistant message text.
     fn last_assistant_text(&self) -> Option<String> {
@@ -316,23 +313,21 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     fn info(&mut self, line: String) {
         self.app.system(line);
     }
-    fn spawn_line(&self, fut: hrdr_app::LineFuture) {
+    fn line_poster(&self) -> Box<dyn Fn(hrdr_app::LineKind, String) + Send> {
         let tx = self.app.tx.clone();
-        tokio::spawn(async move {
-            let line = fut.await;
-            if !line.is_empty() {
-                let _ = tx.send(TurnMsg::System(line));
-            }
-        });
+        Box::new(move |kind, line| {
+            let msg = match kind {
+                hrdr_app::LineKind::Diff => TurnMsg::Diff(line),
+                hrdr_app::LineKind::System => TurnMsg::System(line),
+            };
+            let _ = tx.send(msg);
+        })
     }
     fn agent(&self) -> std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>> {
         self.app.agent.clone()
     }
     fn cwd(&self) -> std::path::PathBuf {
-        self.app
-            .with_agent(|a| a.cwd())
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_default()
+        hrdr_app::agent_cwd(&self.app.agent)
     }
     fn base_url(&self) -> String {
         self.app.base_url.clone()
@@ -382,23 +377,6 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         // Richer than the default: searches back across assistant messages.
         self.app.last_code_block()
     }
-    fn spawn_diff(&self, fut: hrdr_app::LineFuture) {
-        // Route a real diff to the colored Entry::Diff rendering; status and
-        // error lines stay plain system lines.
-        let tx = self.app.tx.clone();
-        tokio::spawn(async move {
-            let line = fut.await;
-            if line.is_empty() {
-                return;
-            }
-            let msg = if line.starts_with("diff ") {
-                TurnMsg::Diff(line)
-            } else {
-                TurnMsg::System(line)
-            };
-            let _ = tx.send(msg);
-        });
-    }
     fn supports_command(&self, _cmd: &str) -> bool {
         true // the TUI implements the full registry
     }
@@ -424,12 +402,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.editor.paste(&text);
     }
     fn read_clipboard(&self) -> Option<String> {
-        let bytes = self
-            .app
-            .clipboard
-            .as_ref()
-            .and_then(|cb| cb.get(Selection::Clipboard, MimeType::Text).ok())?;
-        Some(String::from_utf8_lossy(&bytes).to_string())
+        hrdr_app::clipboard_read_text(&self.app.clipboard)
     }
     fn set_tool_expansion(&mut self, mode: hrdr_app::ExpandMode) -> String {
         self.app.apply_tool_expansion(mode)
@@ -437,8 +410,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     fn rewind_last_turn(&mut self) -> Option<String> {
         self.app.rewind_last_turn()
     }
-    fn compact(&mut self, instructions: Option<String>) {
-        self.app.system("compacting conversation…");
+    fn start_compaction(&mut self, instructions: Option<String>) {
         self.app.spawn_compaction(instructions);
     }
     fn mark_init_turn(&mut self) {

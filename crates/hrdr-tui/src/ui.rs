@@ -22,8 +22,6 @@ const TOOL_RESULT_PREVIEW_LINES: usize = 8;
 const DIFF_PREVIEW_LINES: usize = 40;
 /// Max lines shown in the TODO panel (plus 2 for borders).
 const TODO_PANEL_MAX_ITEMS: u16 = 6;
-/// Input box grows with content up to this many text rows (plus 2 for borders).
-const INPUT_MAX_ROWS: u16 = 5;
 
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -42,7 +40,10 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // Input box auto-grows 1..=INPUT_MAX_ROWS text rows with the content.
     // Inner width = full width minus 2 border + 2 horizontal padding columns.
     let input_inner_w = area.width.saturating_sub(4);
-    let input_height = app.editor.desired_rows(input_inner_w, INPUT_MAX_ROWS) + 2;
+    let input_height = app
+        .editor
+        .desired_rows(input_inner_w, hrdr_app::INPUT_MAX_ROWS)
+        + 2;
 
     // Build the row stack dynamically, remembering each section's index.
     let mut constraints = vec![Constraint::Min(3)];
@@ -949,7 +950,7 @@ fn push_tool(
     } else {
         ("✗", theme.error)
     };
-    let args_preview = hrdr_tools::truncate_inline(args, 80);
+    let args_preview = hrdr_tools::truncate_inline(args, hrdr_app::TOOL_ARGS_PREVIEW);
     out.push(pad_line(
         vec![
             Span::styled(format!(" {} ", mark.0), Style::default().fg(mark.1).bg(bg)),

@@ -8,6 +8,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **DRY audit follow-up — one code path for a dozen more TUI/GUI behaviors.**
+  - `CommandHost` gained a `line_poster` channel primitive; `spawn_line` /
+    `spawn_diff` (including the diff-vs-status routing rule) are now trait
+    defaults, and `/compact` is a default over a new `start_compaction` hook —
+    both frontends dropped their duplicated spawn/compact plumbing.
+  - Shared helpers/strings: `cancel_message`, `session_saved_notice`,
+    `clipboard_copy_status` / `clipboard_read_text`, `agent_cwd`,
+    `expand_msg::*`, `startup_config_warning` + `PROJECT_DOCS_LOADED_MSG`,
+    `RELOAD_MANUAL_MSG` / `RELOAD_HOT_MSG` / `reload_invalid_message`, and the
+    `INPUT_MAX_ROWS` / `TOOL_ARGS_PREVIEW` layout constants (the GUI input now
+    caps at 5 rows like the TUI).
+  - The GUI shows the TUI's startup notices (invalid-config warning, "loaded
+    project instructions from AGENTS.md").
+  - GUI `/expand all` is sticky like the TUI: new tool calls spawn expanded
+    until `/expand off`.
+  - GUI `/reload` + hot-reload now re-apply the agent-side knobs too (effort,
+    `auto_compact`, temperature) through one `apply_config_reload` path that —
+    like the TUI — keeps current settings and warns on an invalid file instead
+    of resetting to defaults.
+
+### Fixed
+
+- **GUI:** a stale `Done` message from a just-cancelled turn no longer clobbers
+  the next turn's state; cancelling an `/init` turn clears the pending
+  doc-reload; per-turn token counts include reasoning tokens; `/reload` actually
+  re-applies settings (a refactor had left it a no-op).
+- **TUI:** completed-TODO aging is driven by finished turns again (it had
+  stopped advancing after an event-loop refactor), and auto-compaction uses the
+  shared threshold check.
+- **TUI:** `/clear` clears the agent synchronously when it's idle (no more
+  racing a spawned clear against the next autosave).
+
 - **Colored `/diff` in the GUI — and one shared diff classifier.** The GUI
   renders `/diff` output as a monospace block on the code-panel background with
   +/− line coloring (adds green, removes red, `@@` hunks in the user accent,

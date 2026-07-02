@@ -23,6 +23,15 @@ use tokio::sync::Mutex;
 /// spawns it on its runtime and pipes the result to its transcript.
 pub type LineFuture = Pin<Box<dyn Future<Output = String> + Send>>;
 
+/// How an async result line should be displayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    /// A plain system line.
+    System,
+    /// A unified diff (frontends with diff-aware rendering color it).
+    Diff,
+}
+
 /// What `/expand` should do to tool output (parsed by the shared dispatcher;
 /// applied by the frontend, which owns the expansion state).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +49,15 @@ pub trait CommandHost {
     /// Emit a system line immediately (on the UI thread).
     fn info(&mut self, line: String);
     /// Spawn `fut`; when it resolves, show its non-empty string as a system line.
-    fn spawn_line(&self, fut: LineFuture);
+    fn spawn_line(&self, fut: LineFuture) {
+        let poster = self.line_poster();
+        tokio::spawn(async move {
+            let line = fut.await;
+            if !line.is_empty() {
+                poster(LineKind::System, line);
+            }
+        });
+    }
     /// The shared agent handle (for async reads/mutations).
     fn agent(&self) -> Arc<Mutex<Agent>>;
     /// Working directory the tools operate in.
@@ -86,11 +103,29 @@ pub trait CommandHost {
             .and_then(crate::last_fenced_block)
     }
 
-    /// Like [`spawn_line`](Self::spawn_line), but the resolved string is a
-    /// unified diff (or a status/error line) — frontends with diff-aware
-    /// rendering override to route real diffs accordingly.
+    /// A `Send`able closure that delivers an async result line onto the UI
+    /// thread through the frontend's channel — the one primitive behind the
+    /// [`spawn_line`](Self::spawn_line)/[`spawn_diff`](Self::spawn_diff)
+    /// defaults (the host itself isn't `Send`, so they capture this).
+    fn line_poster(&self) -> Box<dyn Fn(LineKind, String) + Send>;
+
+    /// Like [`spawn_line`](Self::spawn_line), but the resolved string may be a
+    /// unified diff: a real diff routes to the frontend's diff rendering,
+    /// status/error lines stay plain (one classification rule for both).
     fn spawn_diff(&self, fut: LineFuture) {
-        self.spawn_line(fut);
+        let poster = self.line_poster();
+        tokio::spawn(async move {
+            let line = fut.await;
+            if line.is_empty() {
+                return;
+            }
+            let kind = if line.starts_with("diff ") {
+                LineKind::Diff
+            } else {
+                LineKind::System
+            };
+            poster(kind, line);
+        });
     }
 
     /// Whether a turn is currently running — the busy-guard for commands that
@@ -161,11 +196,16 @@ pub trait CommandHost {
     /// [`reload_project_docs`]).
     fn mark_init_turn(&mut self) {}
 
-    /// Start conversation compaction on a background task. Frontends run
-    /// [`run_compaction`] and, when it lands, show [`compaction_message`],
-    /// reset their stale context usage, autosave on success, and resume any
-    /// queued sends — same semantics in both.
-    fn compact(&mut self, instructions: Option<String>);
+    /// Kick off a compaction pass on a background task (runs like a turn:
+    /// input queues behind it, cancel aborts it). When it lands the frontend
+    /// shows [`compaction_message`], resets stale context usage, autosaves on
+    /// success, and resumes queued sends — same semantics in both.
+    fn start_compaction(&mut self, instructions: Option<String>);
+    /// `/compact`: announce and start (shared line + [`run_compaction`] core).
+    fn compact(&mut self, instructions: Option<String>) {
+        self.info("compacting conversation…".to_string());
+        self.start_compaction(instructions);
+    }
 
     /// Current per-message timestamp style (frontends with timestamp rendering
     /// override the pair).
@@ -889,6 +929,87 @@ Prefer real commands, paths, and specifics over generic advice. Keep it tight. \
 When finished, give a one-line summary of what you wrote.";
 
 // ---- representation-independent command cores ----
+
+/// `/expand` status lines (both frontends show the same wording).
+pub mod expand_msg {
+    pub const ALL: &str = "tool output expanded (all)";
+    pub const OFF: &str = "tool output collapsed";
+    pub const LAST_COLLAPSED: &str = "collapsed last tool output";
+    pub const LAST_EXPANDED: &str = "expanded last tool output";
+    pub const NONE: &str = "no tool output to expand";
+}
+
+/// `/reload` + hot-reload status lines (both frontends).
+pub const RELOAD_MANUAL_MSG: &str = "reloaded config (theme, effort, toggles)";
+pub const RELOAD_HOT_MSG: &str = "config changed on disk — reloaded";
+/// Invalid config file on reload: keep the current settings and warn.
+pub fn reload_invalid_message(e: &dyn std::fmt::Display) -> String {
+    format!("config invalid — keeping current settings: {e}")
+}
+
+/// Startup notice when `AGENTS.md` was gathered into the system prompt.
+pub const PROJECT_DOCS_LOADED_MSG: &str = "loaded project instructions from AGENTS.md";
+
+/// Startup warning when the config file exists but is invalid (the running
+/// config already fell back to defaults + env).
+pub fn startup_config_warning() -> Option<String> {
+    hrdr_agent::AgentConfig::load_checked()
+        .err()
+        .map(|e| format!("config file is invalid — using defaults: {e}"))
+}
+
+/// The cancel notice both frontends show (with the discarded-queue count).
+pub fn cancel_message(dropped: usize) -> String {
+    if dropped > 0 {
+        format!("[cancelled · {dropped} queued message(s) discarded]")
+    } else {
+        "[cancelled]".to_string()
+    }
+}
+
+/// The one-time notice when a session file is first created.
+pub fn session_saved_notice(id: &str) -> String {
+    format!("session saved as '{id}' — /resume {id}")
+}
+
+/// Copy `text` to the OS clipboard, returning the status line both frontends
+/// show. `cb` is the frontend's long-lived clipboard handle (`None` when the
+/// platform has none).
+pub fn clipboard_copy_status(
+    cb: &mut Option<hjkl_clipboard::Clipboard>,
+    text: &str,
+    label: &str,
+) -> String {
+    use hjkl_clipboard::{MimeType, Selection};
+    match cb
+        .as_mut()
+        .map(|cb| cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()))
+    {
+        Some(Ok(())) => format!("copied {label} to clipboard"),
+        Some(Err(_)) => "clipboard write failed".to_string(),
+        None => "clipboard unavailable".to_string(),
+    }
+}
+
+/// Read the OS clipboard as text (`/paste`).
+pub fn clipboard_read_text(cb: &Option<hjkl_clipboard::Clipboard>) -> Option<String> {
+    use hjkl_clipboard::{MimeType, Selection};
+    let bytes = cb
+        .as_ref()
+        .and_then(|cb| cb.get(Selection::Clipboard, MimeType::Text).ok())?;
+    Some(String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// The tools' working directory: the agent's cwd when the lock is free
+/// (a turn may hold it), else the process cwd.
+pub fn agent_cwd(agent: &Arc<Mutex<Agent>>) -> PathBuf {
+    agent
+        .try_lock()
+        .map(|a| a.cwd())
+        .ok()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default()
+}
 
 /// Probe the endpoint (list its models) and return a warning line when it
 /// looks unreachable or doesn't advertise `model`; `None` when healthy. The
