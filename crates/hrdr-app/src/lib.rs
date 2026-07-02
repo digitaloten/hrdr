@@ -136,29 +136,17 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
 /// filters these out of completion and `/help`, and answers with a notice
 /// instead of sending the text to the model.
 pub const TUI_ONLY_COMMANDS: &[&str] = &[
-    "/compact",
     "/provider",
     "/theme",
-    "/cwd",
-    "/expand",
-    "/init",
-    "/add",
-    "/revert",
-    "/checkpoints",
     "/timestamps",
     "/statusbar",
     "/todo-ttl",
     "/reload",
-    "/temp",
-    "/effort",
     "/goto",
     "/find",
     "/next",
     "/prev",
-    "/paste",
     "/edit",
-    "/retry",
-    "/undo",
 ];
 
 /// Whether `cmd` (with or without the leading `/`; aliases welcome) is a
@@ -329,10 +317,11 @@ mod tests {
             );
         }
         assert!(is_tui_only("/theme"));
-        assert!(is_tui_only("cd")); // alias of /cwd
-        assert!(is_tui_only("/summarize")); // alias of /compact
+        assert!(!is_tui_only("cd")); // alias of /cwd — shared now
+        assert!(!is_tui_only("/summarize")); // alias of /compact — shared now
         assert!(!is_tui_only("/help"));
         assert!(!is_tui_only("/export"));
+        assert!(!is_tui_only("/retry"));
         assert!(is_known_command("/new")); // alias entries count
         assert!(is_known_command("model"));
         assert!(!is_known_command("/frobnicate"));

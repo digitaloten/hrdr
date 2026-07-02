@@ -71,6 +71,18 @@ pub async fn save_agent_session(
     )
 }
 
+/// The most recent saved session for `cwd` that has actual conversation
+/// content (more than just the system prompt) — the startup auto-resume
+/// lookup shared by both frontends. `None` = nothing to resume, start fresh.
+pub fn latest_session_for_cwd(cwd: &str) -> Option<(String, hrdr_agent::Session)> {
+    let cur = hrdr_agent::cwd_slug(cwd);
+    let meta = hrdr_agent::list_sessions()
+        .into_iter()
+        .find(|m| hrdr_agent::cwd_slug(&m.cwd) == cur)?;
+    let session = hrdr_agent::Session::load_path(&meta.path).ok()?;
+    (session.messages.len() > 1).then_some((meta.id, session))
+}
+
 /// The `/sessions` listing as a display string. With `all`, every directory's
 /// sessions are shown (each row tagged with its cwd); otherwise only those whose
 /// cwd matches `cwd`. Returns a friendly empty-state message when there are none.

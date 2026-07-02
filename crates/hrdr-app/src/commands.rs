@@ -23,6 +23,18 @@ use tokio::sync::Mutex;
 /// spawns it on its runtime and pipes the result to its transcript.
 pub type LineFuture = Pin<Box<dyn Future<Output = String> + Send>>;
 
+/// What `/expand` should do to tool output (parsed by the shared dispatcher;
+/// applied by the frontend, which owns the expansion state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpandMode {
+    /// Show every tool result in full.
+    All,
+    /// Collapse everything.
+    Off,
+    /// Toggle the most recent tool result.
+    ToggleLast,
+}
+
 /// The capabilities a frontend exposes so the shared commands can drive it.
 pub trait CommandHost {
     /// Emit a system line immediately (on the UI thread).
@@ -79,6 +91,71 @@ pub trait CommandHost {
     /// rendering override to route real diffs accordingly.
     fn spawn_diff(&self, fut: LineFuture) {
         self.spawn_line(fut);
+    }
+
+    /// Whether a turn is currently running — the busy-guard for commands that
+    /// mutate turn-coupled state (`/retry`, `/undo`, `/compact`, `/cwd`, …).
+    fn is_busy(&self) -> bool;
+    /// Launch a model turn with `prompt`. `show_as_user` displays it as a user
+    /// message (`/retry`); `false` keeps it out of the transcript (`/init`).
+    fn send_prompt(&mut self, prompt: String, show_as_user: bool);
+    /// Replace the input buffer (`/undo` puts the rewound message back).
+    fn set_input(&mut self, text: String);
+    /// Prepend text to the input buffer (`/add` attaches a file block).
+    fn prepend_input(&mut self, text: String);
+    /// Insert text at the input cursor (`/paste`).
+    fn insert_input(&mut self, text: String);
+    /// Read the OS clipboard as text (`/paste`). `None` = unavailable.
+    fn read_clipboard(&self) -> Option<String> {
+        None
+    }
+    /// Apply an `/expand` mode to the tool-output display, returning the
+    /// status line to show (the expansion state lives in the frontend).
+    fn set_tool_expansion(&mut self, mode: ExpandMode) -> String;
+    /// Rewind the last user turn: pop it (and the reply) from the agent
+    /// history *and* the display transcript, returning the user's text.
+    /// `None` when there's nothing to rewind (or the agent is locked).
+    fn rewind_last_turn(&mut self) -> Option<String>;
+
+    /// Persist one setting to the user config file. Default writes directly;
+    /// the TUI overrides to also suppress its config hot-reload.
+    fn persist_setting(&mut self, key: &str, value: hrdr_agent::ConfigValue) {
+        let _ = hrdr_agent::persist_setting(key, value);
+    }
+    /// The reasoning-effort label shown in status chrome.
+    fn effort(&self) -> Option<String> {
+        None
+    }
+    /// Update the effort label (persistence is dispatch's job).
+    fn set_effort(&mut self, label: String) {
+        let _ = label;
+    }
+
+    /// Called after `/cwd` switched the working directory (update dir/branch
+    /// displays and invalidate any `@file` index).
+    fn cwd_changed(&mut self, new: &Path) {
+        let _ = new;
+    }
+    /// Called when files changed on disk outside a turn (`/revert`), so the
+    /// `@file` completion index can be invalidated.
+    fn files_changed(&mut self) {}
+
+    /// Run conversation compaction. The default locks the agent, compacts, and
+    /// reports a summary line; the TUI overrides to route through its richer
+    /// progress/queue machinery.
+    fn compact(&mut self, instructions: Option<String>) {
+        let agent = self.agent();
+        self.info("compacting conversation…".to_string());
+        self.spawn_line(Box::pin(async move {
+            let mut a = agent.lock().await;
+            if a.message_count() <= 2 {
+                return "nothing to compact yet".to_string();
+            }
+            match a.compact(instructions.as_deref()).await {
+                Ok((before, after)) => format!("compacted: {before} → {after} messages"),
+                Err(e) => format!("compact failed: {e}"),
+            }
+        }));
     }
 
     /// Whether this frontend supports `cmd` (used to filter `/help`). Default
@@ -252,6 +329,239 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 .to_string(),
             );
         }
+        "temp" | "temperature" => {
+            if arg.is_empty() {
+                let agent = host.agent();
+                host.spawn_line(Box::pin(async move {
+                    let t = agent.lock().await.temperature();
+                    format!(
+                        "temperature: {}",
+                        t.map(|t| t.to_string()).unwrap_or_else(|| "default".into())
+                    )
+                }));
+            } else {
+                match arg.parse::<f32>() {
+                    Ok(t) => {
+                        let agent = host.agent();
+                        host.spawn_line(Box::pin(async move {
+                            agent.lock().await.set_temperature(Some(t));
+                            String::new()
+                        }));
+                        host.persist_setting(
+                            "temperature",
+                            hrdr_agent::ConfigValue::Float(t as f64),
+                        );
+                        host.info(format!("temperature → {t}"));
+                    }
+                    Err(_) => host.info("usage: /temp <number>".to_string()),
+                }
+            }
+        }
+        "effort" => {
+            if arg.is_empty() {
+                host.info(format!(
+                    "effort: {}",
+                    host.effort().unwrap_or_else(|| "—".into())
+                ));
+            } else {
+                host.set_effort(arg.clone());
+                host.persist_setting("effort", hrdr_agent::ConfigValue::Str(&arg));
+                host.info(format!("effort → {arg}"));
+            }
+        }
+        "cwd" => {
+            let cur = host.cwd();
+            if arg.is_empty() {
+                host.info(format!("cwd: {}", cur.display()));
+                return true;
+            }
+            if host.is_busy() {
+                host.info("busy — try again after the current turn".to_string());
+                return true;
+            }
+            let new = crate::resolve_under(&cur, &arg);
+            if !new.is_dir() {
+                host.info(format!("not a directory: {}", new.display()));
+                return true;
+            }
+            let new = new.canonicalize().unwrap_or(new);
+            let agent = host.agent();
+            let target = new.clone();
+            host.spawn_line(Box::pin(async move {
+                agent.lock().await.set_cwd(target);
+                String::new()
+            }));
+            host.cwd_changed(&new);
+            host.info(format!("cwd → {}", new.display()));
+        }
+        "expand" => {
+            let mode = match arg.to_ascii_lowercase().as_str() {
+                "all" | "on" => ExpandMode::All,
+                "off" | "none" | "collapse" => ExpandMode::Off,
+                "" => ExpandMode::ToggleLast,
+                _ => {
+                    host.info("usage: /expand [all | off]".to_string());
+                    return true;
+                }
+            };
+            let status = host.set_tool_expansion(mode);
+            host.info(status);
+        }
+        "add" => {
+            if arg.is_empty() {
+                host.info("usage: /add <file>".to_string());
+                return true;
+            }
+            let path = crate::resolve_under(&host.cwd(), &arg);
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    let n = content.lines().count();
+                    host.prepend_input(format!("`{arg}`:\n```\n{content}\n```\n\n"));
+                    host.info(format!("added {arg} ({n} lines) to the input"));
+                }
+                Err(e) => host.info(format!("can't read {arg}: {e}")),
+            }
+        }
+        "paste" => {
+            let Some(text) = host.read_clipboard().filter(|t| !t.is_empty()) else {
+                host.info("clipboard unavailable or empty".to_string());
+                return true;
+            };
+            // A single-line path to an existing file → attach as `@path`.
+            let trimmed = text.trim();
+            if !trimmed.is_empty()
+                && !trimmed.contains('\n')
+                && crate::resolve_under(&host.cwd(), trimmed).is_file()
+            {
+                host.insert_input(format!("@{trimmed} "));
+                host.info(format!("attached @{trimmed} from clipboard"));
+            } else {
+                host.insert_input(text);
+            }
+        }
+        "revert" => {
+            if host.is_busy() {
+                host.info("can't revert while a turn is running".to_string());
+                return true;
+            }
+            host.files_changed(); // files may change; invalidate @-completion
+            let agent = host.agent();
+            host.spawn_line(Box::pin(async move {
+                let Some(cp) = agent.lock().await.checkpoints() else {
+                    return "checkpoints are off (auto-disabled in git repos — use git, or set \
+                            checkpoints = on)"
+                        .to_string();
+                };
+                let result = match cp.lock() {
+                    Ok(mut c) => c.revert_last(),
+                    Err(_) => return "checkpoint store busy".to_string(),
+                };
+                match result {
+                    Ok(files) if files.is_empty() => "nothing to revert".to_string(),
+                    Ok(files) => {
+                        let names = files
+                            .iter()
+                            .map(|p| {
+                                p.file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| p.display().to_string())
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("reverted {} file(s): {names}", files.len())
+                    }
+                    Err(e) => format!("revert failed: {e}"),
+                }
+            }));
+        }
+        "checkpoints" => {
+            let agent = host.agent();
+            host.spawn_line(Box::pin(async move {
+                let Some(cp) = agent.lock().await.checkpoints() else {
+                    return "checkpoints are off (auto-disabled in git repos — use git, or set \
+                            checkpoints = on)"
+                        .to_string();
+                };
+                let infos = match cp.lock() {
+                    Ok(c) => c.list(),
+                    Err(_) => return "checkpoint store busy".to_string(),
+                };
+                if infos.is_empty() {
+                    return "no file checkpoints yet".to_string();
+                }
+                let mut s =
+                    String::from("file checkpoints (newest first; /revert undoes the latest):");
+                for info in infos.iter().take(20) {
+                    let names = info
+                        .files
+                        .iter()
+                        .map(|f| {
+                            std::path::Path::new(f)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| f.clone())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    s.push_str(&format!(
+                        "\n  turn {} · {} file(s): {names}",
+                        info.turn,
+                        info.files.len()
+                    ));
+                }
+                s
+            }));
+        }
+        "retry" => {
+            if host.is_busy() {
+                host.info("can't retry while a turn is running".to_string());
+                return true;
+            }
+            // Optional model switch for this retry (and subsequent turns).
+            if !arg.is_empty() {
+                host.set_model(arg.clone());
+                let agent = host.agent();
+                let name = arg.clone();
+                host.spawn_line(Box::pin(async move {
+                    agent.lock().await.set_model(name);
+                    String::new()
+                }));
+                host.info(format!("model → {arg}"));
+            }
+            match host.rewind_last_turn() {
+                Some(text) => host.send_prompt(text, true),
+                None => host.info("nothing to retry".to_string()),
+            }
+        }
+        "undo" => {
+            if host.is_busy() {
+                host.info("can't undo while a turn is running".to_string());
+                return true;
+            }
+            match host.rewind_last_turn() {
+                Some(text) => {
+                    host.set_input(text);
+                    host.autosave();
+                    host.info("undid last turn — edit and resend".to_string());
+                }
+                None => host.info("nothing to undo".to_string()),
+            }
+        }
+        "compact" => {
+            if host.is_busy() {
+                host.info("can't compact while a turn is running".to_string());
+                return true;
+            }
+            host.compact((!arg.is_empty()).then(|| arg.clone()));
+        }
+        "init" => {
+            if host.is_busy() {
+                host.info("can't /init while a turn is running".to_string());
+                return true;
+            }
+            host.info("/init — exploring the project to write AGENTS.md…".to_string());
+            host.send_prompt(INIT_PROMPT.to_string(), false);
+        }
         "sessions" => {
             let all = crate::sessions_all_flag(&arg);
             host.info(crate::session_list_text(
@@ -273,6 +583,30 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
     }
     true
 }
+
+/// Instruction sent to the model by `/init` to author an `AGENTS.md`.
+pub const INIT_PROMPT: &str = "\
+Analyze this codebase and create an AGENTS.md file at the repository root to guide \
+AI coding agents working here (the open standard at https://agents.md).
+
+Do this:
+1. Explore the project with your tools — read the README(s), the build/manifest \
+   files (Cargo.toml, package.json, pyproject.toml, go.mod, Makefile, etc.), CI \
+   config, and skim the source layout with glob/grep/read_file to understand how \
+   it's organized.
+2. If an AGENTS.md (or CLAUDE.md / .cursorrules / similar) already exists, read it \
+   and improve it instead of discarding useful content.
+3. Write AGENTS.md (use the write_file tool) with concise, repo-specific sections:
+   - Project overview: what it is and does.
+   - Setup / build / run: the actual commands for THIS repo.
+   - Testing: how to run the test suite and a single test.
+   - Code style & conventions: formatting, linting, naming — inferred from config \
+     and existing code.
+   - Architecture / layout: key directories and how they fit together.
+   - Gotchas or rules an agent must follow.
+
+Prefer real commands, paths, and specifics over generic advice. Keep it tight. \
+When finished, give a one-line summary of what you wrote.";
 
 // ---- representation-independent command cores ----
 

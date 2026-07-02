@@ -35,31 +35,10 @@ impl super::App {
                     }
                 }
             }
-            "cwd" => self.change_cwd(arg),
-            "expand" => self.expand_cmd(arg),
-            "revert" => self.revert_cmd(),
-            "checkpoints" => self.checkpoints_cmd(),
-            "add" => self.add_file(arg),
-            "temp" | "temperature" => self.set_temp_cmd(arg),
-            "effort" => {
-                if arg.is_empty() {
-                    self.system(format!(
-                        "effort: {}",
-                        self.effort.clone().unwrap_or_else(|| "—".into())
-                    ));
-                } else {
-                    self.effort = Some(arg.to_string());
-                    self.persist_setting("effort", hrdr_agent::ConfigValue::Str(arg));
-                    self.system(format!("effort → {arg}"));
-                }
-            }
             "info" => self.show_info(), // richer than the shared /info
-            "paste" => self.paste_cmd(),
-            "retry" => self.retry_last(arg),
             "edit" => self.edit_file_cmd(arg),
-            "undo" => self.undo_last(),
-            "compact" => self.compact_cmd(arg),
-            "init" => self.init_agents_cmd(),
+            "init" => self.init_agents_cmd(), // reloads AGENTS.md after (pending_init)
+            "compact" => self.compact_cmd(arg), // richer: TurnMsg::Compacted + queue resume
             "reload" => self.reload_cmd(),
             "goto" => self.goto_cmd(arg),
             "find" | "search" => self.find_cmd(arg),
@@ -114,41 +93,25 @@ impl super::App {
         self.pending_edit = None;
         self.expand_tools = false;
     }
-    fn change_cwd(&mut self, arg: &str) {
-        let Some(cur) = self.with_agent_or_busy(|a| a.cwd()) else {
-            return;
-        };
-        if arg.is_empty() {
-            self.system(format!("cwd: {}", cur.display()));
-            return;
-        }
-        let new = resolve_under(&cur, arg);
-        if !new.is_dir() {
-            self.system(format!("not a directory: {}", new.display()));
-            return;
-        }
-        let new = new.canonicalize().unwrap_or(new);
-        self.apply_cwd(new.clone());
-        self.system(format!("cwd → {}", new.display()));
-    }
-    /// `/expand [all|off]` — no arg toggles the most recent tool result's full
-    /// view; `all` shows every tool result in full; `off` collapses everything.
-    fn expand_cmd(&mut self, arg: &str) {
-        match arg.trim().to_ascii_lowercase().as_str() {
-            "all" | "on" => {
+    /// Apply an `/expand` mode (shared dispatch parses the arg), returning the
+    /// status line. `expand_tools` is the sticky all-on flag; per-entry
+    /// expansion lives on the Tool entries.
+    pub(super) fn apply_tool_expansion(&mut self, mode: hrdr_app::ExpandMode) -> String {
+        match mode {
+            hrdr_app::ExpandMode::All => {
                 self.expand_tools = true;
-                self.system("tool output expanded (all)");
+                "tool output expanded (all)".to_string()
             }
-            "off" | "none" | "collapse" => {
+            hrdr_app::ExpandMode::Off => {
                 self.expand_tools = false;
                 for e in self.transcript.iter_mut() {
                     if let Entry::Tool { expanded, .. } = e {
                         *expanded = false;
                     }
                 }
-                self.system("tool output collapsed");
+                "tool output collapsed".to_string()
             }
-            "" => {
+            hrdr_app::ExpandMode::ToggleLast => {
                 let last = self.transcript.iter_mut().rev().find_map(|e| match e {
                     Entry::Tool { expanded, .. } => Some(expanded),
                     _ => None,
@@ -156,17 +119,15 @@ impl super::App {
                 match last {
                     Some(expanded) => {
                         *expanded = !*expanded;
-                        let now = *expanded;
-                        self.system(if now {
-                            "expanded last tool output"
+                        if *expanded {
+                            "expanded last tool output".to_string()
                         } else {
-                            "collapsed last tool output"
-                        });
+                            "collapsed last tool output".to_string()
+                        }
                     }
-                    None => self.system("no tool output to expand"),
+                    None => "no tool output to expand".to_string(),
                 }
             }
-            _ => self.system("usage: /expand [all | off]"),
         }
     }
     /// `/reload` — re-read config + `AGENTS.md`, applying the runtime bits that
@@ -188,45 +149,7 @@ impl super::App {
         ));
         self.scroll_offset = 0;
         self.pending_init = true;
-        self.launch_turn(INIT_PROMPT.to_string());
-    }
-    fn add_file(&mut self, arg: &str) {
-        if arg.is_empty() {
-            self.system("usage: /add <file>");
-            return;
-        }
-        let Some(cur) = self.with_agent_or_busy(|a| a.cwd()) else {
-            return;
-        };
-        let path = resolve_under(&cur, arg);
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let n = content.lines().count();
-                let block = format!("`{arg}`:\n```\n{content}\n```\n\n");
-                let existing = self.editor.content();
-                self.editor.set_content(&format!("{block}{existing}"));
-                self.system(format!("added {arg} ({n} lines) to the input"));
-            }
-            Err(e) => self.system(format!("can't read {arg}: {e}")),
-        }
-    }
-    fn set_temp_cmd(&mut self, arg: &str) {
-        if arg.is_empty() {
-            let t = self.with_agent(|a| a.temperature()).flatten();
-            self.system(format!(
-                "temperature: {}",
-                t.map(|t| t.to_string()).unwrap_or_else(|| "default".into())
-            ));
-            return;
-        }
-        match arg.parse::<f32>() {
-            Ok(t) => {
-                self.with_agent(|a| a.set_temperature(Some(t)));
-                self.persist_setting("temperature", hrdr_agent::ConfigValue::Float(t as f64));
-                self.system(format!("temperature → {t}"));
-            }
-            Err(_) => self.system("usage: /temp <number>"),
-        }
+        self.launch_turn(hrdr_app::INIT_PROMPT.to_string());
     }
     fn show_info(&mut self) {
         let temp = self.with_agent(|a| a.temperature()).flatten();
@@ -254,32 +177,23 @@ impl super::App {
         );
         self.system(info);
     }
-    fn undo_last(&mut self) {
-        if self.running {
-            self.system("can't undo while a turn is running");
-            return;
-        }
+    /// Rewind the last user turn out of the agent history + transcript,
+    /// returning the user's text (shared `/undo` and `/retry` core).
+    pub(super) fn rewind_last_turn(&mut self) -> Option<String> {
         let text = self
             .agent
             .try_lock()
             .ok()
-            .and_then(|mut a| a.rewind_last_user());
-        match text {
-            Some(t) => {
-                if let Some(idx) = self
-                    .transcript
-                    .iter()
-                    .rposition(|e| matches!(e, Entry::User(_)))
-                {
-                    self.truncate_transcript(idx);
-                }
-                self.editor.set_content(&t); // restore for editing
-                self.scroll_offset = 0;
-                self.autosave();
-                self.system("undid last turn — edit and resend");
-            }
-            None => self.system("nothing to undo"),
+            .and_then(|mut a| a.rewind_last_user())?;
+        if let Some(idx) = self
+            .transcript
+            .iter()
+            .rposition(|e| matches!(e, Entry::User(_)))
+        {
+            self.truncate_transcript(idx);
         }
+        self.scroll_offset = 0;
+        Some(text)
     }
     fn switch_provider(&mut self, name: &str) {
         if name.is_empty() {
@@ -551,110 +465,6 @@ impl super::App {
     fn transcript_text(&self) -> String {
         hrdr_app::transcript_to_text(&self.transcript)
     }
-    /// `/paste` — insert the system clipboard into the input. If the clipboard
-    /// holds a path to an existing file, attach it as an `@mention` instead.
-    fn paste_cmd(&mut self) {
-        let data = self
-            .clipboard
-            .as_ref()
-            .and_then(|cb| cb.get(Selection::Clipboard, MimeType::Text).ok());
-        let Some(bytes) = data else {
-            self.system("clipboard unavailable or empty");
-            return;
-        };
-        let text = String::from_utf8_lossy(&bytes).to_string();
-        if text.is_empty() {
-            self.system("clipboard is empty");
-            return;
-        }
-        // A single-line path to an existing file → attach as `@path`.
-        let trimmed = text.trim();
-        if !trimmed.is_empty()
-            && !trimmed.contains('\n')
-            && let Some(cwd) = self.with_agent(|a| a.cwd())
-        {
-            let full = resolve_under(&cwd, trimmed);
-            if full.is_file() {
-                self.editor.paste(&format!("@{trimmed} "));
-                self.system(format!("attached @{trimmed} from clipboard"));
-                return;
-            }
-        }
-        self.editor.paste(&text);
-    }
-    /// `/revert` — undo the most recent turn's file edits (restore pre-images).
-    fn revert_cmd(&mut self) {
-        if self.running {
-            self.system("can't revert while a turn is running");
-            return;
-        }
-        let Some(cp) = self.with_agent(|a| a.checkpoints()).flatten() else {
-            self.system("checkpoints are off (auto-disabled in git repos — use git, or set checkpoints = on)");
-            return;
-        };
-        let result = match cp.lock() {
-            Ok(mut c) => c.revert_last(),
-            Err(_) => {
-                self.system("checkpoint store busy");
-                return;
-            }
-        };
-        match result {
-            Ok(files) if files.is_empty() => self.system("nothing to revert"),
-            Ok(files) => {
-                let names = files
-                    .iter()
-                    .map(|p| {
-                        p.file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| p.display().to_string())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                self.file_index_cwd = None; // files changed; rebuild @-completion index
-                self.system(format!("reverted {} file(s): {names}", files.len()));
-            }
-            Err(e) => self.system(format!("revert failed: {e}")),
-        }
-    }
-    /// `/checkpoints` — list the revertible per-turn file checkpoints.
-    fn checkpoints_cmd(&mut self) {
-        let Some(cp) = self.with_agent(|a| a.checkpoints()).flatten() else {
-            self.system("checkpoints are off (auto-disabled in git repos — use git, or set checkpoints = on)");
-            return;
-        };
-        let infos = match cp.lock() {
-            Ok(c) => c.list(),
-            Err(_) => {
-                self.system("checkpoint store busy");
-                return;
-            }
-        };
-        if infos.is_empty() {
-            self.system("no file checkpoints yet");
-            return;
-        }
-        let mut s = String::from("file checkpoints (newest first; /revert undoes the latest):");
-        for info in infos.iter().take(20) {
-            let names = info
-                .files
-                .iter()
-                .map(|f| {
-                    std::path::Path::new(f)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| f.clone())
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            s.push_str(&format!(
-                "\n  turn {} · {} file(s): {names}",
-                info.turn,
-                info.files.len()
-            ));
-        }
-        self.system(s);
-    }
     /// `/edit <file>` — open a file (relative to the cwd) in `$EDITOR`.
     fn edit_file_cmd(&mut self, arg: &str) {
         if arg.is_empty() {
@@ -671,42 +481,6 @@ impl super::App {
         let path = resolve_under(&cwd, arg);
         // Consumed by the run loop (it owns the terminal needed to suspend).
         self.pending_edit = Some(path);
-    }
-    fn retry_last(&mut self, arg: &str) {
-        if self.running {
-            self.system("can't retry while a turn is running");
-            return;
-        }
-        // Optional model switch for this retry (and subsequent turns).
-        if !arg.is_empty() {
-            if self.with_agent(|a| a.set_model(arg)).is_some() {
-                self.model = arg.to_string();
-                self.system(format!("model → {arg}"));
-            } else {
-                self.system("busy — try again after the current turn");
-                return;
-            }
-        }
-        let text = self
-            .agent
-            .try_lock()
-            .ok()
-            .and_then(|mut a| a.rewind_last_user());
-        match text {
-            Some(t) => {
-                // Drop the old turn's transcript entries back to the last user message.
-                if let Some(idx) = self
-                    .transcript
-                    .iter()
-                    .rposition(|e| matches!(e, Entry::User(_)))
-                {
-                    self.truncate_transcript(idx);
-                }
-                self.scroll_offset = 0;
-                self.spawn_turn(t);
-            }
-            None => self.system("nothing to retry"),
-        }
     }
     /// `/compact [instructions]` — summarize the conversation to reclaim context.
     fn compact_cmd(&mut self, arg: &str) {
@@ -831,31 +605,60 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     fn supports_command(&self, _cmd: &str) -> bool {
         true // the TUI implements the full registry
     }
+    fn is_busy(&self) -> bool {
+        self.app.running
+    }
+    fn send_prompt(&mut self, prompt: String, show_as_user: bool) {
+        if show_as_user {
+            self.app.spawn_turn(prompt);
+        } else {
+            self.app.scroll_offset = 0;
+            self.app.launch_turn(prompt);
+        }
+    }
+    fn set_input(&mut self, text: String) {
+        self.app.editor.set_content(&text);
+    }
+    fn prepend_input(&mut self, text: String) {
+        let existing = self.app.editor.content();
+        self.app.editor.set_content(&format!("{text}{existing}"));
+    }
+    fn insert_input(&mut self, text: String) {
+        self.app.editor.paste(&text);
+    }
+    fn read_clipboard(&self) -> Option<String> {
+        let bytes = self
+            .app
+            .clipboard
+            .as_ref()
+            .and_then(|cb| cb.get(Selection::Clipboard, MimeType::Text).ok())?;
+        Some(String::from_utf8_lossy(&bytes).to_string())
+    }
+    fn set_tool_expansion(&mut self, mode: hrdr_app::ExpandMode) -> String {
+        self.app.apply_tool_expansion(mode)
+    }
+    fn rewind_last_turn(&mut self) -> Option<String> {
+        self.app.rewind_last_turn()
+    }
+    fn persist_setting(&mut self, key: &str, value: hrdr_agent::ConfigValue) {
+        // The TUI version also suppresses the config hot-reload it would cause.
+        self.app.persist_setting(key, value);
+    }
+    fn effort(&self) -> Option<String> {
+        self.app.effort.clone()
+    }
+    fn set_effort(&mut self, label: String) {
+        self.app.effort = Some(label);
+    }
+    fn cwd_changed(&mut self, new: &std::path::Path) {
+        self.app.dir = hrdr_app::display_dir(new);
+        self.app.branch = hrdr_app::git_branch(new);
+        self.app.file_index_cwd = None; // rebuild @-completion for the new dir
+    }
+    fn files_changed(&mut self) {
+        self.app.file_index_cwd = None;
+    }
     fn help_tips(&self) -> Option<String> {
         Some(HELP_TIPS.to_string())
     }
 }
-
-/// Instruction sent to the model by `/init` to author an `AGENTS.md`.
-const INIT_PROMPT: &str = "\
-Analyze this codebase and create an AGENTS.md file at the repository root to guide \
-AI coding agents working here (the open standard at https://agents.md).
-
-Do this:
-1. Explore the project with your tools — read the README(s), the build/manifest \
-   files (Cargo.toml, package.json, pyproject.toml, go.mod, Makefile, etc.), CI \
-   config, and skim the source layout with glob/grep/read_file to understand how \
-   it's organized.
-2. If an AGENTS.md (or CLAUDE.md / .cursorrules / similar) already exists, read it \
-   and improve it instead of discarding useful content.
-3. Write AGENTS.md (use the write_file tool) with concise, repo-specific sections:
-   - Project overview: what it is and does.
-   - Setup / build / run: the actual commands for THIS repo.
-   - Testing: how to run the test suite and a single test.
-   - Code style & conventions: formatting, linting, naming — inferred from config \
-     and existing code.
-   - Architecture / layout: key directories and how they fit together.
-   - Gotchas or rules an agent must follow.
-
-Prefer real commands, paths, and specifics over generic advice. Keep it tight. \
-When finished, give a one-line summary of what you wrote.";

@@ -8,6 +8,7 @@
 //! lifted out of `hrdr-tui` into a shared crate both frontends consume.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -159,21 +160,10 @@ fn main() -> anyhow::Result<()> {
     let ui = hrdr_app::UiConfig::load();
     let model = config.model.clone();
     let ctx_window = config.context_window;
-    let theme_path = ui.theme.clone();
     let base_url = config.base_url.clone();
-    let show_thinking = ui.show_thinking;
     let agent = Arc::new(TokioMutex::new(Agent::new(config)?));
 
-    floem::launch(move || {
-        app_view(
-            agent,
-            model,
-            ctx_window,
-            theme_path,
-            base_url,
-            show_thinking,
-        )
-    });
+    floem::launch(move || app_view(agent, model, ctx_window, base_url, ui));
     Ok(())
 }
 
@@ -181,11 +171,11 @@ fn app_view(
     agent: Arc<TokioMutex<Agent>>,
     model: String,
     ctx_window: Option<u32>,
-    theme_path: Option<String>,
     base_url: String,
-    show_thinking: bool,
+    ui: hrdr_app::UiConfig,
 ) -> impl IntoView {
-    let theme = GuiTheme::load(theme_path.as_deref());
+    let theme = GuiTheme::load(ui.theme.as_deref());
+    let show_thinking = ui.show_thinking;
     // Persistent scope for dynamically-created per-message signals, so they
     // outlive the effect that creates them.
     let cx = Scope::current();
@@ -199,13 +189,20 @@ fn app_view(
     // Cached relative file paths under the cwd, for `@file` completion. Built
     // lazily the first time an `@` mention is typed (see the effect below).
     let file_index: RwSignal<Vec<String>> = create_rw_signal(Vec::new());
-    // Populate the file index once, when the user starts an `@file` mention.
+    // Populate the file index once, when the user starts an `@file` mention
+    // (re-populated after /cwd or /revert empty it). Paths come from the
+    // agent's cwd, which follows /cwd and resumed sessions.
+    let agent_for_index = agent.clone();
     create_effect(move |_| {
-        if input.get().contains('@')
-            && file_index.with_untracked(Vec::is_empty)
-            && let Ok(cwd) = std::env::current_dir()
-        {
-            file_index.set(hrdr_app::walk_files(&cwd));
+        if input.get().contains('@') && file_index.with_untracked(Vec::is_empty) {
+            let cwd = agent_for_index
+                .try_lock()
+                .map(|a| a.cwd())
+                .ok()
+                .or_else(|| std::env::current_dir().ok());
+            if let Some(cwd) = cwd {
+                file_index.set(hrdr_app::walk_files(&cwd));
+            }
         }
     });
     // Last turn's reported (prompt, completion) token usage, for the status bar.
@@ -235,9 +232,115 @@ fn app_view(
     // Submitted-input history + Up/Down browsing (shared with the TUI).
     let history = Rc::new(RefCell::new(hrdr_app::HistoryBrowser::load()));
 
+    // Startup auto-resume: pick up the most recent saved session for this
+    // directory (like the TUI; `auto_resume = false` / --no-auto-resume in the
+    // TUI config disables it — the GUI honors the same knob).
+    if ui.auto_resume {
+        let cwd = agent
+            .try_lock()
+            .map(|a| a.cwd().display().to_string())
+            .unwrap_or_default();
+        if let Some((id, session)) = hrdr_app::latest_session_for_cwd(&cwd) {
+            if let Ok(mut a) = agent.try_lock() {
+                a.set_messages(session.messages.clone());
+                a.set_model(session.model.clone());
+            }
+            model.set(session.model.clone());
+            rebuild_transcript(cx, transcript, next_id, &session.messages);
+            session_id.set(Some(id));
+            session_label.set(Some(session.name.clone()));
+            system(
+                transcript,
+                next_id,
+                format!(
+                    "resumed most recent session '{}' ({} messages) — /clear to start fresh",
+                    session.name,
+                    session.messages.len()
+                ),
+            );
+        }
+    }
+
+    // Reasoning-effort label (status bar; `/effort` sets it).
+    let effort: RwSignal<Option<String>> = create_rw_signal(None);
+    // Messages submitted while a turn runs, sent FIFO as turns finish (like
+    // the TUI's queue).
+    let queue: Rc<RefCell<VecDeque<String>>> = Rc::new(RefCell::new(VecDeque::new()));
+
     // Bridge background turns → the UI thread over one long-lived channel.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiMsg>();
     let events = create_signal_from_tokio_channel(rx);
+
+    // Launch a model turn. Shared by Enter/Send, the queue drain on `Done`,
+    // and the CommandHost hooks (`/retry`, `/init`). `show_as_user` displays
+    // the prompt as a user message (`false` for /init's internal prompt).
+    let spawn_turn: Rc<dyn Fn(String, bool)> = {
+        let agent = agent.clone();
+        let tx = tx.clone();
+        let base_url = base_url.clone();
+        let th = turn_handle.clone();
+        Rc::new(move |text: String, show_as_user: bool| {
+            if show_as_user {
+                push_item(transcript, next_id, Body::User(text.clone()));
+            }
+            running.set(true);
+            // Start the TTFT clock; cleared until the first token of this turn.
+            turn_start.set(Some(Instant::now()));
+            ttft.set(None);
+            // Expand `@file` mentions for the model only; the transcript keeps
+            // the bare `@path` the user typed (same split as the TUI). Paths
+            // resolve against the agent's cwd (it follows /cwd and /resume).
+            let mention_cwd = agent
+                .try_lock()
+                .map(|a| a.cwd())
+                .ok()
+                .or_else(|| std::env::current_dir().ok());
+            let sent = match mention_cwd {
+                Some(cwd) => hrdr_app::expand_mentions(&text, &cwd),
+                None => text,
+            };
+            let agent = agent.clone();
+            let tx = tx.clone();
+            // Snapshot session state for the post-turn auto-save (signals
+            // can't be read from the spawned task).
+            let existing_id = session_id.get_untracked();
+            let session_label = session_label.get_untracked();
+            let cur_model = model.get_untracked();
+            let base_url = base_url.clone();
+            let generation = save_gen.get_untracked();
+            let handle = tokio::spawn(async move {
+                let tx_ev = tx.clone();
+                let result = agent
+                    .lock()
+                    .await
+                    .run(sent, move |ev| {
+                        let _ = tx_ev.send(UiMsg::Event(ev));
+                    })
+                    .await;
+                let _ = tx.send(UiMsg::Done(result.err().map(|e| e.to_string())));
+                // Auto-save the (now-updated) conversation, best-effort.
+                if let Some(o) = hrdr_app::save_agent_session(
+                    agent,
+                    existing_id,
+                    session_label,
+                    cur_model,
+                    base_url,
+                )
+                .await
+                {
+                    let _ = tx.send(UiMsg::Saved {
+                        id: o.id,
+                        first_save: o.first_save,
+                        generation,
+                    });
+                }
+            });
+            *th.borrow_mut() = Some(handle);
+        })
+    };
+
+    let spawn_for_done = spawn_turn.clone();
+    let queue_for_done = queue.clone();
     create_effect(move |_| {
         let Some(msg) = events.get() else { return };
         match msg {
@@ -257,6 +360,11 @@ fn app_view(
                 running.set(false);
                 if let Some(e) = err {
                     push_item(transcript, next_id, Body::Error(e));
+                }
+                // Start the next queued message, if any (FIFO, like the TUI).
+                let next = queue_for_done.borrow_mut().pop_front();
+                if let Some(next) = next {
+                    (spawn_for_done)(next, true);
                 }
             }
             UiMsg::System(s) => push_item(transcript, next_id, Body::System(s)),
@@ -283,12 +391,18 @@ fn app_view(
         }
     });
 
-    let th_for_send = turn_handle.clone();
     let history_for_send = history.clone();
+    let spawn_for_send = spawn_turn.clone();
+    let queue_for_send = queue.clone();
+    let th_for_host = turn_handle.clone();
+    let clipboard_for_send = clipboard.clone();
+    let agent_for_send = agent.clone();
+    let tx_for_send = tx.clone();
+    let base_url_for_send = base_url.clone();
     let send = move || {
         // Trim like the TUI does, so " /help" is still a command.
         let text = input.get().trim().to_string();
-        if text.is_empty() || running.get() {
+        if text.is_empty() {
             return;
         }
         // Record every submitted line for Up/Down recall, and reset browsing.
@@ -299,10 +413,11 @@ fn app_view(
             return;
         }
         // Slash commands run through the shared `hrdr_app` dispatcher (so the TUI
-        // and GUI share one implementation). An unrecognized `/…` falls through to
-        // the model (a literal path still works, matching the TUI) — unless it's a
-        // registered command the GUI just doesn't implement, which gets a notice
-        // instead of confusing the model.
+        // and GUI share one implementation) — also while a turn runs, like the
+        // TUI (turn-coupled commands busy-guard themselves). An unrecognized
+        // `/…` falls through to the model (a literal path still works) — unless
+        // it's a registered command the GUI just doesn't implement, which gets
+        // a notice instead of confusing the model.
         if let Some(rest) = text.strip_prefix('/') {
             let mut host = GuiHost {
                 cx,
@@ -310,16 +425,23 @@ fn app_view(
                 next_id,
                 usage,
                 model,
+                input,
+                effort,
+                running,
+                file_index,
                 session_id,
                 session_label,
                 save_gen,
                 turn_start,
                 ttft,
                 show_reasoning,
-                clipboard: clipboard.clone(),
-                agent: agent.clone(),
-                tx: tx.clone(),
-                base_url: base_url.clone(),
+                queue: queue_for_send.clone(),
+                turn_handle: th_for_host.clone(),
+                spawn_turn: spawn_for_send.clone(),
+                clipboard: clipboard_for_send.clone(),
+                agent: agent_for_send.clone(),
+                tx: tx_for_send.clone(),
+                base_url: base_url_for_send.clone(),
             };
             if hrdr_app::dispatch(&mut host, &text) {
                 input.set(String::new());
@@ -337,62 +459,29 @@ fn app_view(
             }
         }
         input.set(String::new());
-        push_item(transcript, next_id, Body::User(text.clone()));
-        running.set(true);
-        // Start the TTFT clock; cleared until the first token of this turn.
-        turn_start.set(Some(Instant::now()));
-        ttft.set(None);
-
-        // Expand `@file` mentions for the model only; the transcript keeps the
-        // bare `@path` the user typed (same split as the TUI). Paths resolve
-        // against the agent's cwd (it follows resumed sessions).
-        let mention_cwd = agent
-            .try_lock()
-            .map(|a| a.cwd())
-            .ok()
-            .or_else(|| std::env::current_dir().ok());
-        let sent = match mention_cwd {
-            Some(cwd) => hrdr_app::expand_mentions(&text, &cwd),
-            None => text,
-        };
-
-        let agent = agent.clone();
-        let tx = tx.clone();
-        // Snapshot session state for the post-turn auto-save (signals can't be
-        // read from the spawned task).
-        let existing_id = session_id.get_untracked();
-        let session_label = session_label.get_untracked();
-        let cur_model = model.get_untracked();
-        let base_url = base_url.clone();
-        let generation = save_gen.get_untracked();
-        let handle = tokio::spawn(async move {
-            let tx_ev = tx.clone();
-            let result = agent
-                .lock()
-                .await
-                .run(sent, move |ev| {
-                    let _ = tx_ev.send(UiMsg::Event(ev));
-                })
-                .await;
-            let _ = tx.send(UiMsg::Done(result.err().map(|e| e.to_string())));
-            // Auto-save the (now-updated) conversation, best-effort.
-            if let Some(o) =
-                hrdr_app::save_agent_session(agent, existing_id, session_label, cur_model, base_url)
-                    .await
-            {
-                let _ = tx.send(UiMsg::Saved {
-                    id: o.id,
-                    first_save: o.first_save,
-                    generation,
-                });
-            }
-        });
-        *th_for_send.borrow_mut() = Some(handle);
+        // A turn is running → queue the message; it's sent when the turn ends
+        // (FIFO, like the TUI).
+        if running.get_untracked() {
+            let n = {
+                let mut q = queue_for_send.borrow_mut();
+                q.push_back(text);
+                q.len()
+            };
+            system(
+                transcript,
+                next_id,
+                format!("queued ({n}) — sends when the current turn finishes"),
+            );
+            return;
+        }
+        (spawn_for_send)(text, true);
     };
 
     // Cancel the in-flight turn: abort the task (dropping its future releases
     // the agent lock; the next turn repairs any dangling tool calls) and mark
     // the turn done. Late buffered events are dropped via the `running` guard.
+    // Queued follow-ups are discarded, like the TUI's cancel.
+    let queue_for_cancel = queue.clone();
     let cancel = move || {
         if !running.get_untracked() {
             return;
@@ -401,7 +490,18 @@ fn app_view(
             h.abort();
         }
         running.set(false);
-        system(transcript, next_id, "[cancelled]");
+        let dropped = {
+            let mut q = queue_for_cancel.borrow_mut();
+            let n = q.len();
+            q.clear();
+            n
+        };
+        let msg = if dropped > 0 {
+            format!("[cancelled · {dropped} queued message(s) discarded]")
+        } else {
+            "[cancelled]".to_string()
+        };
+        system(transcript, next_id, msg);
     };
 
     let send_enter = send.clone();
@@ -543,7 +643,11 @@ fn app_view(
                 Some(secs) => format!("   ·   ttft {secs:.2}s"),
                 None => String::new(),
             };
-            format!("{}   ·   ctx {ctx}   ·   ↓{out}{ttft}", model.get())
+            let effort = match effort.get() {
+                Some(e) => format!("   ·   effort {e}"),
+                None => String::new(),
+            };
+            format!("{}   ·   ctx {ctx}   ·   ↓{out}{ttft}{effort}", model.get())
         })
         .style(move |s| s.color(theme.dim)),
         label(|| "● thinking…").style(move |s| {
@@ -739,12 +843,19 @@ struct GuiHost {
     next_id: RwSignal<u64>,
     usage: RwSignal<Option<(u32, u32)>>,
     model: RwSignal<String>,
+    input: RwSignal<String>,
+    effort: RwSignal<Option<String>>,
+    running: RwSignal<bool>,
+    file_index: RwSignal<Vec<String>>,
     session_id: RwSignal<Option<String>>,
     session_label: RwSignal<Option<String>>,
     save_gen: RwSignal<u64>,
     turn_start: RwSignal<Option<Instant>>,
     ttft: RwSignal<Option<f64>>,
     show_reasoning: RwSignal<bool>,
+    queue: Rc<RefCell<VecDeque<String>>>,
+    turn_handle: Rc<RefCell<Option<tokio::task::JoinHandle<()>>>>,
+    spawn_turn: Rc<dyn Fn(String, bool)>,
     clipboard: Rc<RefCell<Option<hjkl_clipboard::Clipboard>>>,
     agent: Arc<TokioMutex<Agent>>,
     tx: tokio::sync::mpsc::UnboundedSender<UiMsg>,
@@ -795,6 +906,15 @@ impl hrdr_app::CommandHost for GuiHost {
         let _ = hrdr_agent::persist_setting("show_thinking", hrdr_agent::ConfigValue::Bool(on));
     }
     fn clear_conversation(&mut self) {
+        // Cancel a running turn first (its autosave would otherwise write the
+        // old history to a fresh session) and drop queued follow-ups.
+        if self.running.get_untracked() {
+            if let Some(h) = self.turn_handle.borrow_mut().take() {
+                h.abort();
+            }
+            self.running.set(false);
+        }
+        self.queue.borrow_mut().clear();
         clear_items(self.transcript);
         self.next_id.set(0);
         self.usage.set(None);
@@ -919,6 +1039,101 @@ impl hrdr_app::CommandHost for GuiHost {
     }
     fn nth_message_text(&self, n: usize) -> Option<String> {
         nth_message_text(self.transcript, n)
+    }
+    fn is_busy(&self) -> bool {
+        self.running.get_untracked()
+    }
+    fn send_prompt(&mut self, prompt: String, show_as_user: bool) {
+        (self.spawn_turn)(prompt, show_as_user);
+    }
+    fn set_input(&mut self, text: String) {
+        self.input.set(text);
+    }
+    fn prepend_input(&mut self, text: String) {
+        self.input.update(|s| *s = format!("{text}{s}"));
+    }
+    fn insert_input(&mut self, text: String) {
+        self.input.update(|s| s.push_str(&text));
+    }
+    fn read_clipboard(&self) -> Option<String> {
+        use hjkl_clipboard::{MimeType, Selection};
+        let bytes = self
+            .clipboard
+            .borrow_mut()
+            .as_mut()
+            .and_then(|cb| cb.get(Selection::Clipboard, MimeType::Text).ok())?;
+        Some(String::from_utf8_lossy(&bytes).to_string())
+    }
+    fn set_tool_expansion(&mut self, mode: hrdr_app::ExpandMode) -> String {
+        let tools: Vec<Tool> = self.transcript.with_untracked(|t| {
+            t.iter()
+                .filter_map(|i| match &i.body {
+                    Body::Tool(tool) => Some(tool.clone()),
+                    _ => None,
+                })
+                .collect()
+        });
+        match mode {
+            hrdr_app::ExpandMode::All => {
+                for t in &tools {
+                    t.collapsed.set(false);
+                }
+                "tool output expanded (all)".to_string()
+            }
+            hrdr_app::ExpandMode::Off => {
+                for t in &tools {
+                    t.collapsed.set(true);
+                }
+                "tool output collapsed".to_string()
+            }
+            hrdr_app::ExpandMode::ToggleLast => match tools.last() {
+                Some(t) => {
+                    let now = !t.collapsed.get_untracked();
+                    t.collapsed.set(now);
+                    if now {
+                        "collapsed last tool output".to_string()
+                    } else {
+                        "expanded last tool output".to_string()
+                    }
+                }
+                None => "no tool output to expand".to_string(),
+            },
+        }
+    }
+    fn rewind_last_turn(&mut self) -> Option<String> {
+        let text = self
+            .agent
+            .try_lock()
+            .ok()
+            .and_then(|mut a| a.rewind_last_user())?;
+        // Drop display items from the last user message on, disposing their
+        // signal scopes (mirrors clear_items).
+        let idx = self
+            .transcript
+            .with_untracked(|t| t.iter().rposition(|i| matches!(i.body, Body::User(_))));
+        if let Some(idx) = idx {
+            let scopes: Vec<Scope> = self
+                .transcript
+                .with_untracked(|t| t[idx..].iter().filter_map(|i| i.scope).collect());
+            self.transcript.update(|t| t.truncate(idx));
+            for sc in scopes {
+                sc.dispose();
+            }
+        }
+        Some(text)
+    }
+    fn effort(&self) -> Option<String> {
+        self.effort.get_untracked()
+    }
+    fn set_effort(&mut self, label: String) {
+        self.effort.set(Some(label));
+    }
+    fn cwd_changed(&mut self, _new: &std::path::Path) {
+        // Rebuilt lazily on the next `@` mention, for the new directory.
+        self.file_index.set(Vec::new());
+    }
+    fn files_changed(&mut self) {
+        self.file_index.set(Vec::new());
     }
 }
 

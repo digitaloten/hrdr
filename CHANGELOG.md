@@ -6,6 +6,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **GUI feature parity, round one.** Twelve more commands moved into the shared
+  `hrdr-app` dispatcher behind new `CommandHost` capabilities (busy-guard,
+  send-prompt, input editing, clipboard read, tool-expansion, rewind-last-turn,
+  effort label, cwd/files-changed notifications, compaction) — the GUI gains
+  `/compact`, `/temp`, `/effort`, `/cwd` (+`/cd`), `/expand`, `/add`, `/paste`,
+  `/revert`, `/checkpoints`, `/retry`, `/undo`, and `/init`. The TUI drives the
+  same shared implementations through its host adapter (its bespoke copies are
+  deleted); only `/init`, `/compact`, and `/reload` keep richer TUI-local
+  versions (pending-docs reload, compaction progress/queue machinery,
+  hot-reload). `TUI_ONLY_COMMANDS` shrinks to the genuinely terminal-coupled
+  set: `/provider`, `/theme`, `/timestamps`, `/statusbar`, `/todo-ttl`,
+  `/reload`, `/goto`, `/find`, `/next`, `/prev`, `/edit`.
+
+- GUI behavior parity with the TUI:
+  - **Input queueing** — messages submitted while a turn runs are queued and
+    sent FIFO as turns finish (previously all input was dead during a turn);
+    cancel (Esc/Stop) discards the queue with a note, like the TUI.
+  - **Slash commands work mid-turn** — `/help`, `/copy`, `/sessions`, … run
+    while the model streams; turn-coupled commands (`/retry`, `/undo`,
+    `/compact`, `/cwd`, …) busy-guard themselves.
+  - **`/clear` cancels a running turn** (and drops queued messages) instead of
+    being blocked.
+  - **Startup auto-resume** — the GUI picks up the most recent saved session for
+    the working directory (honoring the same `auto_resume` config /
+    `$HRDR_AUTO_RESUME` knob); the lookup is shared
+    (`hrdr_app::latest_session_for_cwd`, now also used by the TUI).
+  - The status bar shows the `/effort` label; the `@file` index follows the
+    agent's cwd (after `/cwd` or a resumed session) and is invalidated by
+    `/revert`.
+  - `/init`'s instruction prompt (`hrdr_app::INIT_PROMPT`) is shared.
+
+  Still TUI-only, pending GUI rendering features: transcript search/jump
+  (`/find`/`/goto`), live theme swap, timestamps/status-bar modes, the TODO
+  panel (`/todo-ttl`), `$EDITOR` integration (`/edit`), `/provider`, and
+  `/reload`.
+
 ### Changed
 
 - Display/frontend knobs moved out of the core agent crate into

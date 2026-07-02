@@ -1,6 +1,6 @@
 //! Session persistence, restore, and transcript rebuild.
 
-use hrdr_agent::{Message, Session};
+use hrdr_agent::Message;
 
 use super::*;
 
@@ -9,27 +9,17 @@ impl super::App {
     /// directory (if any). No match → leave the fresh session as-is.
     pub(super) fn auto_resume_latest(&mut self) {
         let cwd = self.current_cwd();
-        let cur = hrdr_agent::cwd_slug(&cwd);
-        let Some(meta) = hrdr_agent::list_sessions()
-            .into_iter()
-            .find(|m| hrdr_agent::cwd_slug(&m.cwd) == cur)
-        else {
+        // Shared lookup (skips empty/system-prompt-only sessions).
+        let Some((id, session)) = hrdr_app::latest_session_for_cwd(&cwd) else {
             return; // nothing saved here yet — start fresh
         };
-        let Ok(session) = Session::load_path(&meta.path) else {
-            return;
-        };
-        // Skip empty sessions (system prompt only).
-        if session.messages.len() <= 1 {
-            return;
-        }
         self.with_agent(|a| {
             a.set_messages(session.messages.clone());
             a.set_model(session.model.clone());
         });
         self.model = session.model.clone();
         self.rebuild_transcript(&session.messages);
-        self.session_id = Some(meta.id);
+        self.session_id = Some(id);
         self.session_label = Some(session.name.clone());
         self.push_entry(Entry::System(format!(
             "resumed most recent session '{}' ({} messages) — /clear to start fresh",
