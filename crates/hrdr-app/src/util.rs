@@ -129,6 +129,14 @@ pub fn display_dir(cwd: &Path) -> String {
     s
 }
 
+/// Build the `@file` completion index off the UI thread — [`walk_files`] can
+/// touch tens of thousands of directory entries, which would stall a frame if
+/// run inline. Runs on a blocking task; `on_done` receives the file list there
+/// (send it back through your UI channel).
+pub fn spawn_file_index(cwd: PathBuf, on_done: impl FnOnce(Vec<String>) + Send + 'static) {
+    tokio::task::spawn_blocking(move || on_done(walk_files(&cwd)));
+}
+
 /// Current git branch (or short detached-HEAD sha) by walking up from `cwd` to
 /// the repo root and reading `.git/HEAD`. Cheap, no subprocess.
 pub fn git_branch(cwd: &Path) -> Option<String> {

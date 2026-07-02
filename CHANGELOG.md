@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Incremental code-block highlighting.** A streaming code block used to be
+  re-highlighted in full by syntect on every frame (TUI) / every token (GUI). A
+  shared `hrdr_app::HighlightCache` now resumes parser+highlight state across
+  appends: only new complete lines are highlighted (the partial tail line is
+  done on cloned state and redone next append), with a prefix-match LRU so
+  finished blocks are pure cache hits. Both frontends use it; a test asserts the
+  incremental path is span-identical to one-shot highlighting.
+
+- **`@file` index builds off the UI thread.** The first `@` mention ran
+  `walk_files` (up to 20k directory entries) synchronously on the UI thread in
+  both frontends, stalling a frame. It now runs on a blocking task
+  (`hrdr_app::spawn_file_index`) and lands via the frontend's channel; the popup
+  fills in when ready, and `/cwd` / `/revert` re-arm the rebuild.
+
 ## [0.1.0] - 2026-07-02
 
 ### Added

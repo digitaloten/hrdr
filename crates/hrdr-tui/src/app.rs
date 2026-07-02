@@ -79,6 +79,8 @@ pub(crate) enum TurnMsg {
     Diff(String),
     /// Compaction finished: `Ok((before, after))` message counts, or an error.
     Compacted(Result<(usize, usize), String>),
+    /// `@file` completion index built off-thread for `cwd`.
+    FileIndex(std::path::PathBuf, Vec<String>),
 }
 
 pub(crate) struct App {
@@ -124,6 +126,8 @@ pub(crate) struct App {
     file_index: Vec<String>,
     /// The cwd `file_index` was built for; rebuilt when the cwd changes.
     file_index_cwd: Option<std::path::PathBuf>,
+    /// An off-thread index build is in flight (don't spawn another).
+    file_index_building: bool,
     /// Whether to render the model's reasoning (`<think>`) blocks (`/reasoning`).
     pub(crate) show_reasoning: bool,
     /// Show every tool result in full (`/expand all`); per-entry `expanded`
@@ -282,6 +286,7 @@ impl App {
             history: hrdr_app::HistoryBrowser::load(),
             file_index: Vec::new(),
             file_index_cwd: None,
+            file_index_building: false,
             show_reasoning: show_thinking,
             expand_tools: false,
             compacting: false,
@@ -919,6 +924,11 @@ impl App {
                 if let Some(next) = self.queue.pop_front() {
                     self.spawn_turn(next);
                 }
+            }
+            TurnMsg::FileIndex(cwd, files) => {
+                self.file_index = files;
+                self.file_index_cwd = Some(cwd);
+                self.file_index_building = false;
             }
             TurnMsg::Compacted(res) => {
                 self.turn_handle = None;

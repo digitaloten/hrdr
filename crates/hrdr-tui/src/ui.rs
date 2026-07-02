@@ -12,12 +12,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use syntect::easy::HighlightLines;
-use syntect::util::LinesWithEndings;
 
 use crate::app::{App, Entry, StatusBarMode, TimestampStyle};
 use crate::theme::Theme;
-use hrdr_app::{relative_time, syntax_set, syntect_theme};
+use hrdr_app::relative_time;
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
 /// Diff results (edit/write_file) get a larger preview since the diff is the point.
@@ -659,6 +657,9 @@ thread_local! {
     // Cache highlighted code blocks (keyed by lang+content+width) so the ~8/sec
     // redraw doesn't re-run syntect every frame.
     static HL_CACHE: RefCell<HashMap<u64, Vec<Line<'static>>>> = RefCell::new(HashMap::new());
+    // Incremental syntect state for streaming blocks (misses in HL_CACHE —
+    // the content grows every token — only pay for the new lines).
+    static INC_HL: RefCell<hrdr_app::HighlightCache> = RefCell::new(hrdr_app::HighlightCache::new());
 }
 
 /// Render a fenced code block with syntect highlighting on a distinct
@@ -691,15 +692,8 @@ fn panel_bg() -> Color {
 }
 
 fn render_code_block(lang: &str, content: &str, width: u16) -> Vec<Line<'static>> {
-    let ss = syntax_set();
-    let theme = syntect_theme();
     let bg = panel_bg();
     let bg_only = Style::default().bg(bg);
-    let syntax = ss
-        .find_syntax_by_token(lang)
-        .or_else(|| ss.find_syntax_by_first_line(content))
-        .unwrap_or_else(|| ss.find_syntax_plain_text());
-    let mut hl = HighlightLines::new(syntax, theme);
     let w = width as usize;
     let mut out: Vec<Line<'static>> = Vec::new();
 
@@ -718,8 +712,10 @@ fn render_code_block(lang: &str, content: &str, width: u16) -> Vec<Line<'static>
         ));
     }
 
-    for line in LinesWithEndings::from(content) {
-        let ranges = hl.highlight_line(line, ss).unwrap_or_default();
+    // Incremental: a streaming block only highlights its new lines per frame
+    // (the shared cache resumes syntect state from the last call).
+    let hl_lines = INC_HL.with(|c| c.borrow_mut().highlight(lang, content));
+    for ranges in hl_lines {
         let mut spans: Vec<Span<'static>> = vec![Span::styled(" ", bg_only)]; // left gutter
         for (style, piece) in ranges {
             let piece = piece.trim_end_matches(['\n', '\r']);

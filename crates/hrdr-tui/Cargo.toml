@@ -22,7 +22,6 @@ crossterm.workspace = true
 ratatui.workspace = true
 hjkl-icons.workspace = true
 chrono.workspace = true
-syntect.workspace = true
 notify.workspace = true
 
 [dev-dependencies]

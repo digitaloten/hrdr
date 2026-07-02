@@ -14,9 +14,6 @@ use floem::text::{Attrs, AttrsList, FamilyOwned, Style as FontStyle, TextLayout,
 use floem::views::{Decorators, RichText, container, dyn_stack, empty, rich_text};
 use floem::{AnyView, IntoView};
 use hjkl_markdown::{Event, parse};
-use hrdr_app::{syntax_set, syntect_theme};
-use syntect::easy::HighlightLines;
-use syntect::util::LinesWithEndings;
 
 use crate::GuiTheme;
 
@@ -308,21 +305,16 @@ fn rich_runs(runs: Vec<Run>) -> RichText {
 /// Syntax-highlight a code block into a `TextLayout` of monospace colored runs.
 fn code_layout(lang: &str, content: &str) -> TextLayout {
     let mono = [FamilyOwned::Monospace];
-    let ss = syntax_set();
-    let theme = syntect_theme();
-    let syntax = ss
-        .find_syntax_by_token(lang)
-        .or_else(|| ss.find_syntax_by_first_line(content))
-        .unwrap_or_else(|| ss.find_syntax_plain_text());
-    let mut hl = HighlightLines::new(syntax, theme);
     let base = Attrs::new().family(&mono).font_size(CODE_SIZE);
     let mut s = String::new();
     let mut attrs = AttrsList::new(base);
-    for line in LinesWithEndings::from(content) {
-        let ranges = hl.highlight_line(line, ss).unwrap_or_default();
+    // Incremental: the actively-streaming block only highlights its new lines
+    // per update (the shared cache resumes syntect state across appends).
+    let hl_lines = INC_HL.with(|c| c.borrow_mut().highlight(lang, content));
+    for ranges in hl_lines {
         for (style, piece) in ranges {
             let start = s.len();
-            s.push_str(piece);
+            s.push_str(&piece);
             let end = s.len();
             if end == start {
                 continue;
@@ -338,6 +330,12 @@ fn code_layout(lang: &str, content: &str) -> TextLayout {
     layout.set_text(&s, attrs);
     layout.set_wrap(Wrap::Word);
     layout
+}
+
+thread_local! {
+    // Incremental syntect state for streaming code blocks.
+    static INC_HL: std::cell::RefCell<hrdr_app::HighlightCache> =
+        std::cell::RefCell::new(hrdr_app::HighlightCache::new());
 }
 
 /// Background for code blocks: the shared panel background as a floem color.

@@ -149,6 +149,8 @@ enum UiMsg {
     Done(Option<String>),
     /// Out-of-band system line (e.g. an async `/models` result).
     System(String),
+    /// `@file` completion index built off-thread.
+    FileIndex(Vec<String>),
     /// A completed turn was auto-saved; carries the session id and whether this
     /// was the first save (so the UI thread can adopt the id and notify once).
     /// `generation` is the save-generation at spawn time: `/clear` bumps it, so
@@ -212,22 +214,8 @@ fn app_view(
     // Cached relative file paths under the cwd, for `@file` completion. Built
     // lazily the first time an `@` mention is typed (see the effect below).
     let file_index: RwSignal<Vec<String>> = create_rw_signal(Vec::new());
-    // Populate the file index once, when the user starts an `@file` mention
-    // (re-populated after /cwd or /revert empty it). Paths come from the
-    // agent's cwd, which follows /cwd and resumed sessions.
-    let agent_for_index = agent.clone();
-    create_effect(move |_| {
-        if input.get().contains('@') && file_index.with_untracked(Vec::is_empty) {
-            let cwd = agent_for_index
-                .try_lock()
-                .map(|a| a.cwd())
-                .ok()
-                .or_else(|| std::env::current_dir().ok());
-            if let Some(cwd) = cwd {
-                file_index.set(hrdr_app::walk_files(&cwd));
-            }
-        }
-    });
+    // Off-thread build in flight / already built (reset by /cwd //revert).
+    let file_index_state: RwSignal<u8> = create_rw_signal(0); // 0 stale, 1 building, 2 ready
     // Last turn's reported (prompt, completion) token usage, for the status bar.
     let usage: RwSignal<Option<(u32, u32)>> = create_rw_signal(None);
     // Turn-start instant + measured time-to-first-token (seconds) for the last
@@ -400,6 +388,28 @@ fn app_view(
         })
     };
 
+    // Populate the file index off-thread when the user starts an `@file`
+    // mention (walking a big tree must not stall the UI); re-armed after
+    // /cwd //revert reset the state. Paths come from the agent's cwd.
+    let agent_for_index = agent.clone();
+    let tx_for_index = tx.clone();
+    create_effect(move |_| {
+        if input.get().contains('@') && file_index_state.get_untracked() == 0 {
+            let cwd = agent_for_index
+                .try_lock()
+                .map(|a| a.cwd())
+                .ok()
+                .or_else(|| std::env::current_dir().ok());
+            if let Some(cwd) = cwd {
+                file_index_state.set(1);
+                let tx = tx_for_index.clone();
+                hrdr_app::spawn_file_index(cwd, move |files| {
+                    let _ = tx.send(UiMsg::FileIndex(files));
+                });
+            }
+        }
+    });
+
     let spawn_for_done = spawn_turn.clone();
     let queue_for_done = queue.clone();
     let todos_for_events = todos.clone();
@@ -457,6 +467,10 @@ fn app_view(
                 }
             }
             UiMsg::System(s) => push_item(transcript, next_id, Body::System(s)),
+            UiMsg::FileIndex(files) => {
+                file_index.set(files);
+                file_index_state.set(2);
+            }
             UiMsg::Saved {
                 id,
                 first_save,
@@ -560,6 +574,7 @@ fn app_view(
                 effort,
                 running,
                 file_index,
+                file_index_state,
                 session_id,
                 session_label,
                 save_gen,
@@ -1289,6 +1304,7 @@ struct GuiHost {
     effort: RwSignal<Option<String>>,
     running: RwSignal<bool>,
     file_index: RwSignal<Vec<String>>,
+    file_index_state: RwSignal<u8>,
     session_id: RwSignal<Option<String>>,
     session_label: RwSignal<Option<String>>,
     save_gen: RwSignal<u64>,
@@ -1601,11 +1617,13 @@ impl hrdr_app::CommandHost for GuiHost {
     fn cwd_changed(&mut self, new: &std::path::Path) {
         self.dir.set(hrdr_app::display_dir(new));
         self.branch.set(hrdr_app::git_branch(new));
-        // Rebuilt lazily on the next `@` mention, for the new directory.
+        // Rebuilt lazily (off-thread) on the next `@` mention.
         self.file_index.set(Vec::new());
+        self.file_index_state.set(0);
     }
     fn files_changed(&mut self) {
         self.file_index.set(Vec::new());
+        self.file_index_state.set(0);
     }
     fn timestamp_style(&self) -> hrdr_app::TimestampStyle {
         self.timestamp_style.get_untracked()

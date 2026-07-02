@@ -1,6 +1,6 @@
 //! Slash-command and @file completion.
 
-use hrdr_app::{active_file_token, rank_file_matches, slash_completions, walk_files};
+use hrdr_app::{active_file_token, rank_file_matches, slash_completions};
 
 impl super::App {
     /// The active completion popup contents: slash commands when the line starts
@@ -63,8 +63,13 @@ impl super::App {
             .map(|p| (p, String::new()))
             .collect()
     }
-    /// Rebuild `file_index` if it's stale for the current cwd.
+    /// Kick off an off-thread rebuild of `file_index` if it's stale for the
+    /// current cwd. The popup shows once the [`TurnMsg::FileIndex`] result
+    /// lands — walking a big tree must not stall the frame.
     fn ensure_file_index(&mut self) {
+        if self.file_index_building {
+            return;
+        }
         let Some(cwd) = self
             .agent
             .try_lock()
@@ -74,11 +79,15 @@ impl super::App {
         else {
             return;
         };
-        if self.file_index_cwd.as_deref() == Some(cwd.as_path()) && !self.file_index.is_empty() {
+        if self.file_index_cwd.as_deref() == Some(cwd.as_path()) {
             return;
         }
-        self.file_index = walk_files(&cwd);
-        self.file_index_cwd = Some(cwd);
+        self.file_index_building = true;
+        let tx = self.tx.clone();
+        let sent_cwd = cwd.clone();
+        hrdr_app::spawn_file_index(cwd, move |files| {
+            let _ = tx.send(super::TurnMsg::FileIndex(sent_cwd, files));
+        });
     }
 }
 
