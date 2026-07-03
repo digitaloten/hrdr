@@ -299,6 +299,16 @@ jobs:
           Compress-Archive -Path dist/* -DestinationPath $archive
           $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
           "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
+      - name: Generate completions + man page for packaging
+        if: matrix.deb == 'true' || matrix.rpm == 'true'
+        run: |
+          # Host debug build: completions/man are target-independent text,
+          # and the cross-built (aarch64) target binary can't run here.
+          mkdir -p pkgext/completions
+          for shell in bash zsh fish; do
+            cargo run --locked -q -p hrdr -- --completions "$shell" > "pkgext/completions/hrdr.$shell"
+          done
+          cargo run --locked -q -p hrdr -- --man > pkgext/hrdr.1
       - name: Install cargo-deb
         if: matrix.deb == 'true'
         uses: taiki-e/install-action@v2

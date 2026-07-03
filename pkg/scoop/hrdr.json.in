@@ -10,6 +10,7 @@
     }
   },
   "bin": "hrdr.exe",
+  "notes": "Enable PowerShell completions: add 'hrdr --completions powershell | Out-String | Invoke-Expression' to your $PROFILE.",
   "checkver": {
     "github": "https://github.com/kryptic-sh/hrdr"
   },

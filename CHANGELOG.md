@@ -14,7 +14,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every GitHub Release; the AUR package installs bash/zsh/fish completions +
   `hrdr(1)` generated from the shipped binary, and the Homebrew formula does the
   same via `generate_completions_from_executable`. The CI smoke job verifies all
-  six shells + the man page generate cleanly on every PR.
+  six shells + the man page generate cleanly on every PR. The `.deb` and `.rpm`
+  packages carry bash/zsh/fish completions + the man page as assets (generated
+  in CI before packaging; zsh lands in `vendor-completions` on Debian,
+  `site-functions` on rpm), the Alpine `APKBUILD` installs them from the shipped
+  musl binary like the AUR package, and the Scoop manifest's install notes show
+  how to enable PowerShell completions from `$PROFILE`.
 
 - **Read-only tool calls run concurrently.** When the model requests several
   tools in one round, runs of consecutive read-only calls (`read_file`, `grep`,
