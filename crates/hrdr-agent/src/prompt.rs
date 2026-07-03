@@ -37,11 +37,62 @@ pub fn render_system(
 
     tmpl.render(context! {
         cwd => cwd.display().to_string(),
-        os => std::env::consts::OS,
+        os => os_context(),
         tool_names => tool_names,
         instructions => instructions,
     })
     .context("rendering system template")
+}
+
+/// One-line OS description for the system prompt: kernel/family, the distro
+/// (from `/etc/os-release` on Linux), and the system package manager actually
+/// installed — so "install X system-wide" reaches for pacman on Arch, apt on
+/// Debian/Ubuntu, brew on macOS, winget on Windows, etc.
+fn os_context() -> String {
+    let mut out = String::from(std::env::consts::OS);
+    if let Some(distro) = linux_distro() {
+        out.push_str(&format!(" ({distro})"));
+    }
+    if let Some(pm) = detect_package_manager() {
+        out.push_str(&format!(" — system package manager: {pm}"));
+    }
+    out
+}
+
+/// The distro's `PRETTY_NAME` from `/etc/os-release` (Linux only).
+fn linux_distro() -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let text = std::fs::read_to_string("/etc/os-release").ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("PRETTY_NAME="))
+        .map(|v| v.trim_matches('"').to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// First system package manager found on PATH, in this OS's conventional
+/// order of preference.
+fn detect_package_manager() -> Option<&'static str> {
+    let candidates: &[&str] = if cfg!(windows) {
+        &["winget", "scoop", "choco"]
+    } else if cfg!(target_os = "macos") {
+        &["brew", "port"]
+    } else {
+        &[
+            "pacman",
+            "apt-get",
+            "dnf",
+            "yum",
+            "zypper",
+            "apk",
+            "xbps-install",
+            "emerge",
+            "nix-env",
+            "pkg",
+        ]
+    };
+    candidates.iter().copied().find(|p| which::which(p).is_ok())
 }
 
 /// File name for the open-standard project instructions (https://agents.md).
@@ -104,6 +155,9 @@ mod tests {
         assert!(p.contains("old_string"));
         assert!(p.contains("/tmp/x"));
         assert!(!p.contains("Project instructions"));
+        // The OS line names the platform (and, where detectable, the distro +
+        // package manager) so system-wide installs use the right tool.
+        assert!(p.contains(&format!("- OS: {}", std::env::consts::OS)));
     }
 
     #[test]

@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The system prompt names the actual platform.** The OS line now carries the
+  distro (`PRETTY_NAME` from `/etc/os-release`) and the system package manager
+  found on PATH — e.g. `linux (Arch Linux) — system package manager: pacman`,
+  `macos — system package manager: brew`,
+  `windows — system package manager: winget` — so "install X system-wide"
+  reaches for the right tool instead of guessing apt everywhere.
+
+- **The curl-pipe-shell guardrail is platform-aware, and covers PowerShell.**
+  The recovery example is built at startup for the running machine — the real
+  temp dir plus the OS-native fetch command
+  (`curl -fsSL <url> -o /tmp/script.sh` on unix,
+  `Invoke-WebRequest <url> -OutFile %TEMP%\script.ps1` on Windows). The
+  PowerShell download-pipe-execute spellings
+  (`iwr`/`irm`/`Invoke-WebRequest`/`Invoke-RestMethod` piped into
+  `iex`/`Invoke-Expression`) are now blocked too, with the same message.
+
 - **Shell output truncation now keeps the tail.** Long build/test output ends
   with the failure summary; the old head-only 30 KB cut dropped exactly what the
   model needed. `bash`/`powershell` results now keep ~1/5 head + ~4/5 tail with
