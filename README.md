@@ -54,10 +54,12 @@ builds from source: `cargo run -p hrdr-gui --release`.
 - **Efficient, adaptive tool set.** Fewer, more powerful tools beat a big menu:
   `read_file`, `write_file`, `edit`, `grep`, `glob`, `todo_write`, `web_fetch`,
   `web_search`, plus a shell. Token-bounded outputs and line-numbered reads for
-  precise edits. Tools that shell out are **presence-aware**: the shell tool is
-  `bash` and/or `powershell` depending on what's installed, and `grep` uses
-  ripgrep → POSIX grep → a built-in walker — so the model is only ever offered
-  tools it can actually run.
+  precise edits — and when `bash`/`grep` output overflows, the **full** result
+  is saved to a temp file and the model is pointed at it (`read_file`/`grep`)
+  instead of losing the overflow. Tools that shell out are **presence-aware**:
+  the shell tool is `bash` and/or `powershell` depending on what's installed,
+  and `grep` uses ripgrep → POSIX grep → a built-in walker — so the model is
+  only ever offered tools it can actually run.
 - **Pluggable input discipline.** Default is a plain, claude-style input (always
   typing; `Enter` sends, `Shift+Enter` / `\`+`Enter` insert a newline, `Ctrl+G`
   opens `$EDITOR`, readline-ish `Ctrl+A`/`Ctrl+E`/`Ctrl+W`). `--vim` swaps in a

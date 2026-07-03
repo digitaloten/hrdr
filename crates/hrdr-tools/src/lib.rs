@@ -299,13 +299,7 @@ pub fn truncate_middle(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
-    let head_target = max / 5;
-    let tail_target = max - head_target;
-    let head_end = floor_char_boundary(text, head_target);
-    let mut tail_start = text.len() - tail_target;
-    while !text.is_char_boundary(tail_start) {
-        tail_start += 1;
-    }
+    let (head_end, tail_start) = middle_bounds(text, max);
     let omitted = tail_start - head_end;
     format!(
         "{}
@@ -316,6 +310,124 @@ pub fn truncate_middle(text: &str, max: usize) -> String {
         &text[..head_end],
         &text[tail_start..]
     )
+}
+
+/// The head-end / tail-start byte offsets for a ~1/5-head, ~4/5-tail split at
+/// `max` bytes (both on char boundaries). Shared by [`truncate_middle`] and
+/// [`truncate_saved`].
+fn middle_bounds(text: &str, max: usize) -> (usize, usize) {
+    let head_target = max / 5;
+    let tail_target = max - head_target;
+    let head_end = floor_char_boundary(text, head_target);
+    let mut tail_start = text.len() - tail_target;
+    while !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    (head_end, tail_start)
+}
+
+/// Which end of the output to keep when truncating: `Head` (start; searches,
+/// listings) or `Middle` (head + tail; shell output, where errors trail).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruncateSide {
+    Head,
+    Middle,
+}
+
+/// Directory holding full copies of truncated tool output. Under the system
+/// temp dir on purpose: it's already read-whitelisted for the cwd-confined
+/// `read_file`/`grep` tools, so the model can retrieve the overflow.
+pub fn tool_output_dir() -> PathBuf {
+    std::env::temp_dir().join("hrdr-tool-output")
+}
+
+/// Truncate `text` to `max` bytes for the model, but instead of *discarding* the
+/// overflow, write the **full** output to [`tool_output_dir`] and point the
+/// model at it (so it can `read_file` a range or `grep` it rather than re-run
+/// the tool). Falls back to a plain [`truncate`]/[`truncate_middle`] if the file
+/// can't be written. `label` tags the temp file (e.g. `"bash"`, `"grep"`).
+pub fn truncate_saved(text: &str, max: usize, side: TruncateSide, label: &str) -> String {
+    truncate_saved_in(text, max, side, label, &tool_output_dir())
+}
+
+/// [`truncate_saved`] with an explicit overflow directory (for tests).
+fn truncate_saved_in(
+    text: &str,
+    max: usize,
+    side: TruncateSide,
+    label: &str,
+    dir: &std::path::Path,
+) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let path = match save_overflow(dir, label, text) {
+        Ok(p) => p,
+        Err(_) => {
+            return match side {
+                TruncateSide::Head => truncate(text, max),
+                TruncateSide::Middle => truncate_middle(text, max),
+            };
+        }
+    };
+    let hint = format!(
+        "… [full output ({} bytes) saved to {} — `read_file` it (with offset/limit) or `grep` it \
+         (pattern + path) for the rest, don't re-run] …",
+        text.len(),
+        path.display()
+    );
+    match side {
+        TruncateSide::Head => {
+            let end = floor_char_boundary(text, max);
+            format!("{}\n\n{hint}", &text[..end])
+        }
+        TruncateSide::Middle => {
+            let (head_end, tail_start) = middle_bounds(text, max);
+            format!("{}\n\n{hint}\n\n{}", &text[..head_end], &text[tail_start..])
+        }
+    }
+}
+
+/// Write `text` to a uniquely-named file under `dir` (created if needed),
+/// returning the path. Best-effort prunes files older than 7 days first, so the
+/// scratch dir can't grow without bound.
+fn save_overflow(dir: &std::path::Path, label: &str, text: &str) -> std::io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    std::fs::create_dir_all(dir)?;
+    prune_old_overflow(dir);
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let safe: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let path = dir.join(format!("{safe}-{stamp}-{seq}.txt"));
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
+/// Remove overflow files older than 7 days (best-effort; ignores all errors).
+fn prune_old_overflow(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 60 * 60);
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|mtime| mtime < cutoff)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Cap search output at `max_matches` *matches*, appending a count of what
@@ -480,6 +592,45 @@ TAIL-ERROR-LINE",
         assert!(out.len() < 11_000);
         // Under the cap: untouched.
         assert_eq!(truncate_middle("short", 100), "short");
+    }
+
+    #[test]
+    fn truncate_saved_persists_overflow_and_points_at_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!("HEAD\n{}\nTAIL", "x".repeat(50_000));
+
+        // Head mode: keeps the start, saves the full output, points at the file.
+        let out = truncate_saved_in(&text, 10_000, TruncateSide::Head, "grep", dir.path());
+        assert!(out.starts_with("HEAD"));
+        assert!(out.contains("full output"));
+        assert!(out.contains("read_file"));
+        // Exactly one overflow file, containing the FULL text verbatim.
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::read_to_string(files[0].path()).unwrap(), text);
+        // The saved path is named after the label and referenced in the output.
+        let name = files[0].file_name().to_string_lossy().into_owned();
+        assert!(name.starts_with("grep-"));
+        assert!(out.contains(&files[0].path().display().to_string()));
+
+        // Middle mode keeps head and tail around the pointer.
+        let mid = truncate_saved_in(&text, 10_000, TruncateSide::Middle, "bash", dir.path());
+        assert!(mid.starts_with("HEAD"));
+        assert!(mid.trim_end().ends_with("TAIL"), "tail must survive");
+    }
+
+    #[test]
+    fn truncate_saved_leaves_small_output_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            truncate_saved_in("short", 100, TruncateSide::Head, "grep", dir.path()),
+            "short"
+        );
+        // No file written when nothing overflowed.
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
     }
 
     #[test]

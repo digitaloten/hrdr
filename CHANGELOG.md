@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Truncated `bash`/`grep` output is saved, not discarded.** When output
+  exceeds the per-tool cap, the full result is written to a temp file
+  (`<tmp>/hrdr-tool-output/`, read-whitelisted so the cwd-confined tools can
+  reach it) and the truncated reply points the model at it — "read_file it (with
+  offset/limit) or grep it for the rest, don't re-run." Previously the overflow
+  was lost, forcing a re-run to recover the tail. Files older than 7 days are
+  pruned on write. (`bash` keeps head+tail, `grep` keeps the head.)
+
 - **Tool-output pruning — bound context without a model call.** Before each
   request, tool-call _output_ older than a recent window is cleared from the
   model history (replaced with a short placeholder; the tool call + args stay).

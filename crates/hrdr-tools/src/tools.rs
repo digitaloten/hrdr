@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::{TodoItem, Tool, ToolContext, cap_matches, truncate, truncate_middle};
+use crate::{TodoItem, Tool, ToolContext, TruncateSide, cap_matches, truncate, truncate_saved};
 
 /// Hard cap on a rendered source line, so one minified file can't blow context.
 const MAX_LINE: usize = 2_000;
@@ -427,8 +427,14 @@ async fn run_streamed_command(
         return Ok("(no output)".to_string());
     }
     // Head+tail truncation: build/test output puts the failures at the end —
-    // plain head-only truncation would cut exactly what the model needs.
-    Ok(truncate_middle(out, ctx.max_output))
+    // plain head-only truncation would cut exactly what the model needs. The
+    // full output is saved off so the model can retrieve the omitted middle.
+    Ok(truncate_saved(
+        out,
+        ctx.max_output,
+        TruncateSide::Middle,
+        "bash",
+    ))
 }
 
 /// The available shell tools for this machine (bash and/or PowerShell), only
@@ -642,7 +648,12 @@ async fn run_search_cmd(
     }
     // Cap by match count first (with a "narrow the pattern" nudge), then by
     // bytes as the backstop.
-    Ok(truncate(&cap_matches(&stdout, max_matches), ctx.max_output))
+    Ok(truncate_saved(
+        &cap_matches(&stdout, max_matches),
+        ctx.max_output,
+        TruncateSide::Head,
+        "grep",
+    ))
 }
 
 /// Pure-Rust search fallback: walk the tree (honoring `.gitignore`) and match
@@ -733,7 +744,12 @@ fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     if out.is_empty() {
         Ok("(no matches)".to_string())
     } else {
-        Ok(truncate(out.trim_end(), ctx.max_output))
+        Ok(truncate_saved(
+            out.trim_end(),
+            ctx.max_output,
+            TruncateSide::Head,
+            "grep",
+        ))
     }
 }
 
