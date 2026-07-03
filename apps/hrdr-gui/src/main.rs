@@ -2060,13 +2060,12 @@ fn render_item(
             let args = hrdr_tools::truncate_inline(&t.args, hrdr_app::TOOL_ARGS_PREVIEW);
             let (output, result, ok, collapsed) = (t.output, t.result, t.ok, t.collapsed);
             v_stack((
-                // Clickable header — caret reflects/toggles the output collapse.
+                // Header — caret reflects the output collapse.
                 label(move || {
                     let caret = if collapsed.get() { "▸" } else { "▾" };
                     format!("{caret} ⚙ {name} {args}")
                 })
-                .style(move |s| s.color(th.tool).font_bold())
-                .on_click_stop(move |_| collapsed.update(|c| *c = !*c)),
+                .style(move |s| s.color(th.tool).font_bold()),
                 // Streamed output — hidden while collapsed.
                 label(move || output.get()).style(move |s| {
                     if collapsed.get() {
@@ -2079,7 +2078,15 @@ fn render_item(
                 label(move || result.get())
                     .style(move |s| s.color(if ok.get() { th.ok } else { th.err })),
             ))
-            .style(|s| s.padding(6.0).gap(2.0))
+            // The whole block toggles expansion (like the TUI's click target,
+            // and a far bigger target than the old header-only click).
+            .on_click_stop(move |_| collapsed.update(|c| *c = !*c))
+            .style(|s| {
+                s.padding(6.0)
+                    .gap(2.0)
+                    .border_radius(4.0)
+                    .hover(|s| s.background(md::tool_hover_bg()))
+            })
             .into_any()
         }
         Body::System(s) => text_label(s).style(move |st| st.color(th.dim)).into_any(),

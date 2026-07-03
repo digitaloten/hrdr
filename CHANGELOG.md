@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **GUI tool blocks: the whole block is the click target.** Clicking anywhere on
+  a tool call (header, output, result) toggles its expansion — previously only
+  the header line was clickable — with a hover background as the affordance.
+  Matches the TUI, where any visible part of a tool block has always been
+  clickable.
+
 - **`grep` gains a `context` param (`-C` style).** `context: 2–3` returns the
   lines around each match — matches as `path:NN:line`, context as
   `path-NN-line`, `--` between groups (the standard grep/rg `-C` format, all

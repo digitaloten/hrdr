@@ -344,6 +344,12 @@ fn panel_bg() -> Color {
     Color::rgb8(r, g, b)
 }
 
+/// Hover background for the clickable tool blocks (the code-panel color —
+/// subtle against the window background, obvious under the pointer).
+pub fn tool_hover_bg() -> Color {
+    panel_bg()
+}
+
 /// A unified diff as a single monospace layout with per-line +/− coloring
 /// (shared classification with the TUI via `hrdr_app::classify_diff_line`).
 pub fn diff_view(diff: &str, th: GuiTheme) -> AnyView {
