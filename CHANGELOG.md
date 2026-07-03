@@ -8,6 +8,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Read-only tool calls run concurrently.** When the model requests several
+  tools in one round, runs of consecutive read-only calls (`read_file`, `grep`,
+  `glob`, `web_fetch`, `web_search`) now execute in parallel; a mutating call
+  (`bash`, `edit`, `write_file`, `todo_write`) is a barrier and runs alone, so a
+  read after a write still observes the write. Streamed output stays attributed
+  per call and results land in call order. New `Tool::read_only` trait flag /
+  `ToolRegistry::is_read_only`.
+
+- **Graceful `max_steps` exhaustion.** With 3 tool rounds left in a turn the
+  model is warned ("finish up and summarize", appended to the round's last tool
+  result); when the budget runs out the harness runs one final **no-tools**
+  round so the model must answer in text — the turn ends with a summary of where
+  things stand instead of the old hard `agent exceeded max_steps` error.
+
 - **`/prompt` and `/guardrails` introspection commands** (both frontends, via
   the shared layer). `/prompt` (alias `/system`) shows the rendered system
   prompt currently in effect — handy for tuning `AGENTS.md` and checking the

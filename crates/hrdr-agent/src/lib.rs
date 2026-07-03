@@ -98,6 +98,10 @@ pub struct AgentConfig {
 /// so the next turn doesn't overflow).
 pub const DEFAULT_AUTO_COMPACT: f64 = 0.85;
 
+/// With this many tool rounds left in a turn, the model is told to wrap up
+/// (appended to the last tool result of that round).
+const WRAP_UP_WARNING_ROUNDS: usize = 3;
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -778,7 +782,7 @@ impl Agent {
         // Allow one automatic compaction per turn when the context overflows.
         let mut overflow_compacted = false;
 
-        for _ in 0..self.max_steps {
+        for step in 0..self.max_steps {
             // Stream one assistant turn, accumulating text + tool calls. The
             // connect is retried on transient errors and auto-compacted once on
             // a context-length overflow.
@@ -825,38 +829,176 @@ impl Agent {
                 return Ok(());
             }
 
-            // Execute each requested tool, feeding results back.
-            for call in tool_calls {
-                on_event(AgentEvent::ToolStart {
-                    id: call.id.clone(),
-                    name: call.function.name.clone(),
-                    args: call.function.arguments.clone(),
-                });
+            // Execute the requested tools, feeding results back. Runs of
+            // consecutive read-only calls (reads/searches/fetches) execute
+            // concurrently; a mutating call is a barrier, run alone — so a
+            // read after a write still observes the write, and results always
+            // land in call order.
+            let mut idx = 0;
+            while idx < tool_calls.len() {
+                let read_only = self.tools.is_read_only(&tool_calls[idx].function.name);
+                let mut end = idx + 1;
+                while read_only
+                    && end < tool_calls.len()
+                    && self.tools.is_read_only(&tool_calls[end].function.name)
+                {
+                    end += 1;
+                }
+                let batch = &tool_calls[idx..end];
+                idx = end;
 
-                let result = self
-                    .run_tool_streaming(
-                        &call.id,
-                        &call.function.name,
-                        &call.function.arguments,
-                        &mut on_event,
-                    )
-                    .await;
-                let (ok, body) = match result {
-                    Ok(s) => (true, s),
-                    Err(e) => (false, format!("Error: {e}")),
-                };
+                if batch.len() == 1 {
+                    let call = &batch[0];
+                    on_event(AgentEvent::ToolStart {
+                        id: call.id.clone(),
+                        name: call.function.name.clone(),
+                        args: call.function.arguments.clone(),
+                    });
+                    let result = self
+                        .run_tool_streaming(
+                            &call.id,
+                            &call.function.name,
+                            &call.function.arguments,
+                            &mut on_event,
+                        )
+                        .await;
+                    self.finish_tool_call(call, result, &mut on_event);
+                } else {
+                    self.run_tool_batch(batch, &mut on_event).await;
+                }
+            }
 
-                on_event(AgentEvent::ToolEnd {
-                    id: call.id.clone(),
-                    name: call.function.name.clone(),
-                    result: body.clone(),
-                    ok,
-                });
-                self.messages.push(ChatMessage::tool_result(call.id, body));
+            // Near the budget: tell the model so it wraps up instead of
+            // getting cut off mid-plan.
+            let remaining = self.max_steps - step - 1;
+            if remaining == WRAP_UP_WARNING_ROUNDS
+                && let Some(last) = self.messages.last_mut()
+                && let Some(content) = &mut last.content
+            {
+                content.push_str(&format!(
+                    "\n\n[note: only {remaining} tool rounds remain this turn — finish up \
+                     and summarize]"
+                ));
             }
         }
 
-        bail!("agent exceeded max_steps ({})", self.max_steps);
+        // Budget exhausted: instead of failing the turn, run one final round
+        // with no tools so the model must answer in text.
+        on_event(AgentEvent::Notice(format!(
+            "tool-round limit reached ({}) — asking the model to wrap up",
+            self.max_steps
+        )));
+        self.messages.push(ChatMessage::user(
+            "[The tool-call budget for this turn is exhausted. Do not request more tool \
+             calls. Summarize what you accomplished and what remains to be done.]"
+                .to_string(),
+        ));
+        let mut stream = self
+            .connect_stream(&[], &mut overflow_compacted, &mut on_event)
+            .await?;
+        let mut acc = Accumulator::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if let Some(choice) = chunk.choices.first()
+                && let Some(r) = &choice.delta.reasoning_content
+            {
+                on_event(AgentEvent::Reasoning(r.clone()));
+            }
+            if let Some(text) = acc.push(&chunk) {
+                on_event(AgentEvent::Text(text));
+            }
+        }
+        self.messages.push(acc.into_message());
+        on_event(AgentEvent::TurnDone);
+        Ok(())
+    }
+
+    /// Emit the `ToolEnd` event and push the tool-result message for a
+    /// completed call (shared by the sequential and concurrent paths).
+    fn finish_tool_call<F: FnMut(AgentEvent)>(
+        &mut self,
+        call: &hrdr_llm::ToolCall,
+        result: Result<String>,
+        on_event: &mut F,
+    ) {
+        let (ok, body) = match result {
+            Ok(s) => (true, s),
+            Err(e) => (false, format!("Error: {e}")),
+        };
+        on_event(AgentEvent::ToolEnd {
+            id: call.id.clone(),
+            name: call.function.name.clone(),
+            result: body.clone(),
+            ok,
+        });
+        self.messages
+            .push(ChatMessage::tool_result(call.id.clone(), body));
+    }
+
+    /// Run a batch of read-only tool calls concurrently, forwarding each
+    /// call's streamed output as `ToolOutput` events (attributed by call id)
+    /// while they run. Results are emitted and recorded in call order.
+    async fn run_tool_batch<F: FnMut(AgentEvent)>(
+        &mut self,
+        batch: &[hrdr_llm::ToolCall],
+        on_event: &mut F,
+    ) {
+        // One shared (id, chunk) channel; each call gets a private sink whose
+        // chunks a forwarder task tags with the call id.
+        let (shared_tx, mut shared_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        let mut futs = Vec::with_capacity(batch.len());
+        for call in batch {
+            on_event(AgentEvent::ToolStart {
+                id: call.id.clone(),
+                name: call.function.name.clone(),
+                args: call.function.arguments.clone(),
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let fwd_tx = shared_tx.clone();
+            let fwd_id = call.id.clone();
+            tokio::spawn(async move {
+                while let Some(chunk) = rx.recv().await {
+                    let _ = fwd_tx.send((fwd_id.clone(), chunk));
+                }
+            });
+            let mut ctx = self.ctx.clone();
+            ctx.stream = Some(tx);
+            let name = call.function.name.clone();
+            let raw_args = call.function.arguments.clone();
+            // Cheap clone (Arc-backed registry) so the futures don't borrow
+            // `self` — results are recorded with `&mut self` right after.
+            let tools = self.tools.clone();
+            futs.push(async move {
+                let args: serde_json::Value = if raw_args.trim().is_empty() {
+                    serde_json::json!({})
+                } else {
+                    match serde_json::from_str(&raw_args) {
+                        Ok(v) => v,
+                        Err(e) => return Err(anyhow::anyhow!("invalid tool arguments JSON: {e}")),
+                    }
+                };
+                tools.execute(&name, args, &ctx).await
+            });
+        }
+        drop(shared_tx); // forwarders hold the remaining senders
+
+        let joined = futures_util::future::join_all(futs);
+        tokio::pin!(joined);
+        let results = loop {
+            tokio::select! {
+                r = &mut joined => break r,
+                Some((id, chunk)) = shared_rx.recv() => {
+                    on_event(AgentEvent::ToolOutput { id, chunk });
+                }
+            }
+        };
+        // Drain chunks buffered between the last poll and completion.
+        while let Ok((id, chunk)) = shared_rx.try_recv() {
+            on_event(AgentEvent::ToolOutput { id, chunk });
+        }
+        for (call, result) in batch.iter().zip(results) {
+            self.finish_tool_call(call, result, on_event);
+        }
     }
 
     /// Open a chat stream, retrying transient network/server errors with

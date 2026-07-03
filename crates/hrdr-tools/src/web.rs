@@ -37,6 +37,9 @@ struct FetchArgs {
 
 #[async_trait]
 impl Tool for WebFetchTool {
+    fn read_only(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "web_fetch"
     }
@@ -100,6 +103,9 @@ struct SearchArgs {
 
 #[async_trait]
 impl Tool for WebSearchTool {
+    fn read_only(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "web_search"
     }

@@ -264,6 +264,10 @@ struct Harness {
 
 impl Harness {
     async fn new(replies: Vec<MockReply>) -> Self {
+        Self::with_max_steps(replies, 50).await
+    }
+
+    async fn with_max_steps(replies: Vec<MockReply>, max_steps: usize) -> Self {
         let mock = MockServer::start(replies).await;
         let tmp = tempfile::tempdir().unwrap();
         let config = AgentConfig {
@@ -272,6 +276,7 @@ impl Harness {
             cwd: tmp.path().to_path_buf(),
             checkpoints: Some("off".to_string()),
             context_window: Some(1000),
+            max_steps,
             ..Default::default()
         };
         let ui = hrdr_app::UiConfig {
@@ -417,6 +422,69 @@ async fn parallel_tool_calls_in_one_turn_all_run() {
     assert!(
         screen.contains("Both ran."),
         "final reply missing:\n{screen}"
+    );
+    assert!(!h.app.running);
+}
+
+#[tokio::test]
+async fn read_only_tool_calls_run_concurrently_in_order() {
+    // Two read-only calls in one turn exercise the concurrent batch path;
+    // results must land (and render) for both, in call order.
+    let mut h = Harness::new(vec![
+        MockReply::ToolCalls(vec![
+            ("glob".to_string(), r#"{"pattern":"*"}"#.to_string()),
+            (
+                "grep".to_string(),
+                r#"{"pattern":"nothing-matches-this"}"#.to_string(),
+            ),
+        ]),
+        MockReply::Text("Both read.".to_string()),
+    ])
+    .await;
+    h.submit("scan the project").await;
+    let screen = h.render();
+    assert!(
+        screen.contains("glob"),
+        "glob missing:
+{screen}"
+    );
+    assert!(
+        screen.contains("grep"),
+        "grep missing:
+{screen}"
+    );
+    assert!(
+        screen.contains("Both read."),
+        "final reply missing:
+{screen}"
+    );
+    assert!(!h.app.running);
+}
+
+#[tokio::test]
+async fn step_budget_exhaustion_wraps_up_instead_of_failing() {
+    // max_steps = 2: two tool rounds, then the harness must ask the model to
+    // wrap up (a final no-tools round) instead of erroring the turn.
+    let mut h = Harness::with_max_steps(
+        vec![
+            MockReply::ToolCalls(vec![("glob".to_string(), r#"{"pattern":"*"}"#.to_string())]),
+            MockReply::ToolCalls(vec![("glob".to_string(), r#"{"pattern":"*"}"#.to_string())]),
+            MockReply::Text("Ran out of budget; here's where things stand.".to_string()),
+        ],
+        2,
+    )
+    .await;
+    h.submit("loop forever").await;
+    let screen = h.render();
+    assert!(
+        screen.contains("here's where things stand."),
+        "wrap-up text missing:
+{screen}"
+    );
+    assert!(
+        screen.contains("tool-round limit reached"),
+        "notice missing:
+{screen}"
     );
     assert!(!h.app.running);
 }

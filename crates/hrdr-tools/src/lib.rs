@@ -185,6 +185,13 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for the call arguments.
     fn parameters(&self) -> serde_json::Value;
 
+    /// Whether this tool only observes state (read/search/fetch). The agent
+    /// runs consecutive read-only calls concurrently; mutating tools (the
+    /// default) stay strictly sequential in call order.
+    fn read_only(&self) -> bool {
+        false
+    }
+
     /// Run the tool. A returned `Err` is surfaced to the model as a tool
     /// result, not propagated as a hard failure — the agent keeps going.
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String>;
@@ -240,6 +247,12 @@ impl ToolRegistry {
             .filter_map(|n| self.tools.get(n))
             .map(|t| t.to_def())
             .collect()
+    }
+
+    /// Whether `name` is a registered read-only tool (see
+    /// [`Tool::read_only`]); unknown names count as mutating.
+    pub fn is_read_only(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(|t| t.read_only())
     }
 
     /// Execute a named tool. Errors from a missing tool are hard; errors from

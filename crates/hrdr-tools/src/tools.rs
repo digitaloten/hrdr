@@ -31,6 +31,9 @@ struct ReadArgs {
 
 #[async_trait]
 impl Tool for ReadTool {
+    fn read_only(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "read_file"
     }
@@ -500,6 +503,9 @@ const GREP_MAX_MATCHES: usize = 200;
 
 #[async_trait]
 impl Tool for GrepTool {
+    fn read_only(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "grep"
     }
@@ -658,6 +664,9 @@ struct GlobArgs {
 
 #[async_trait]
 impl Tool for GlobTool {
+    fn read_only(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "glob"
     }
