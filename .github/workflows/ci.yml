@@ -141,6 +141,13 @@ jobs:
       - run: cargo build --locked -p hrdr
       - run: cargo run --locked -p hrdr -- --version
       - run: cargo run --locked -p hrdr -- --help
+      - name: Completions + man page generate cleanly
+        shell: bash
+        run: |
+          for s in bash zsh fish powershell elvish nushell; do
+            cargo run --locked -q -p hrdr -- --completions "$s" > /dev/null
+          done
+          cargo run --locked -q -p hrdr -- --man > /dev/null
 
   # Runs on every main push (dry-run) and every v* tag / dispatch. Skips
   # PRs. Artifact upload happens always; publishing to the GitHub Release
@@ -344,6 +351,16 @@ jobs:
           pattern: hrdr-*
           merge-multiple: true
           path: dist
+      - name: Generate completions + man page
+        run: |
+          # Archive entries are prefixed ./ (tar -C dist .)
+          tar -xzf dist/hrdr-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz ./hrdr
+          mkdir -p pkgext/completions
+          for shell in bash zsh fish powershell elvish nushell; do
+            ./hrdr --completions "$shell" > "pkgext/completions/hrdr.$shell"
+          done
+          ./hrdr --man > pkgext/hrdr.1
+          tar -C pkgext -czf dist/hrdr-${GITHUB_REF_NAME}-completions-man.tar.gz .
       - uses: softprops/action-gh-release@v3
         with:
           files: dist/*

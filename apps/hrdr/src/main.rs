@@ -108,8 +108,47 @@ struct Cli {
     #[arg(long = "backend-arg", global = true)]
     backend_args: Vec<String>,
 
+    /// Print shell completions to stdout and exit
+    #[arg(long, value_enum, value_name = "SHELL", hide = true)]
+    completions: Option<CompletionShell>,
+
+    /// Print the man page (troff) to stdout and exit
+    #[arg(long, hide = true)]
+    man: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// Shells `--completions` can generate for: clap_complete's five core shells
+/// plus nushell (separate generator crate). Mirrors gpur's packaging helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    Powershell,
+    Elvish,
+    Nushell,
+}
+
+impl CompletionShell {
+    fn generate(self, cmd: &mut clap::Command) {
+        use clap_complete::Shell;
+        let out = &mut std::io::stdout();
+        match self {
+            CompletionShell::Bash => clap_complete::generate(Shell::Bash, cmd, "hrdr", out),
+            CompletionShell::Zsh => clap_complete::generate(Shell::Zsh, cmd, "hrdr", out),
+            CompletionShell::Fish => clap_complete::generate(Shell::Fish, cmd, "hrdr", out),
+            CompletionShell::Powershell => {
+                clap_complete::generate(Shell::PowerShell, cmd, "hrdr", out)
+            }
+            CompletionShell::Elvish => clap_complete::generate(Shell::Elvish, cmd, "hrdr", out),
+            CompletionShell::Nushell => {
+                clap_complete::generate(clap_complete_nushell::Nushell, cmd, "hrdr", out)
+            }
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -134,6 +173,19 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Packaging helpers (hidden): emit completions / man page and exit.
+    if let Some(shell) = cli.completions {
+        use clap::CommandFactory;
+        shell.generate(&mut Cli::command());
+        return Ok(());
+    }
+    if cli.man {
+        use clap::CommandFactory;
+        clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+        return Ok(());
+    }
+
     // Precedence: CLI flag > env var > config file > built-in default. Display
     // knobs live in UiConfig (hrdr-app); model/endpoint/loop knobs in
     // AgentConfig (hrdr-agent) — both read the same config.toml + HRDR_* vars.

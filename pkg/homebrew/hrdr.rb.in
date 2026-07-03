@@ -21,6 +21,11 @@ class Hrdr < Formula
 
   def install
     bin.install "hrdr"
+    # Default shell_parameter_format appends the shell name:
+    # `hrdr --completions bash|zsh|fish`.
+    generate_completions_from_executable(bin/"hrdr", "--completions",
+                                         shells: [:bash, :zsh, :fish])
+    (man1/"hrdr.1").write Utils.safe_popen_read(bin/"hrdr", "--man")
   end
 
   test do

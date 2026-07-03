@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Shell completions + man page** (mirroring gpur's packaging helpers). Hidden
+  `--completions <bash|zsh|fish|powershell|elvish|nushell>` and `--man` flags
+  emit to stdout; the release pipeline attaches a `completions-man.tar.gz` to
+  every GitHub Release; the AUR package installs bash/zsh/fish completions +
+  `hrdr(1)` generated from the shipped binary, and the Homebrew formula does the
+  same via `generate_completions_from_executable`. The CI smoke job verifies all
+  six shells + the man page generate cleanly on every PR.
+
 - **Read-only tool calls run concurrently.** When the model requests several
   tools in one round, runs of consecutive read-only calls (`read_file`, `grep`,
   `glob`, `web_fetch`, `web_search`) now execute in parallel; a mutating call
