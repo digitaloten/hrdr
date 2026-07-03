@@ -15,11 +15,13 @@ use hrdr_llm::ToolDef;
 
 mod checkpoint;
 mod guardrails;
+mod hooks;
 mod tools;
 mod web;
 
 pub use checkpoint::{CheckpointInfo, Checkpoints};
 pub use guardrails::{Guardrail, check_guardrails, default_guardrails};
+pub use hooks::{DEFAULT_HOOK_TIMEOUT_MS, Hook, run_file_hooks};
 pub use tools::{
     BashTool, EditTool, GlobTool, GrepTool, PowerShellTool, ReadTool, TodoTool, WriteTool,
     available_shell_tools,
@@ -71,6 +73,9 @@ pub struct ToolContext {
     /// working directory (the system temp dir is always allowed for scratch).
     /// Disable via config `allow_outside_cwd = true`.
     pub restrict_to_cwd: bool,
+    /// Post-edit hooks from `[[hooks]]` config (formatters, mostly), run by
+    /// `edit`/`write_file` after a successful mutation.
+    pub hooks: Arc<Vec<Hook>>,
 }
 
 impl ToolContext {
@@ -84,6 +89,7 @@ impl ToolContext {
             guardrails: Arc::new(default_guardrails()),
             read_files: Arc::new(Mutex::new(std::collections::HashSet::new())),
             restrict_to_cwd: true,
+            hooks: Arc::new(Vec::new()),
         }
     }
 

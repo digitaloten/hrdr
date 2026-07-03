@@ -249,6 +249,26 @@ Relatedly, `edit`/`write_file` refuse to mutate an existing file the model
 hasn't read this session — blind edits against guessed content are the top
 source of corrupt patches.
 
+### Post-edit hooks
+
+Run a shell command automatically after the agent edits or writes a matching
+file — formatters, mostly. The tool re-reads the file after hooks run, so the
+diff the model sees (and the text its next edit must match) is the post-hook
+content. A failing or hung hook becomes a warning in the tool result, never an
+error.
+
+```toml
+[[hooks]]
+on = "edit"                 # edit | write_file | * (default: *)
+glob = "*.rs"               # optional; name or cwd-relative path
+run = "cargo fmt -- {path}" # {path} = quoted file path
+timeout_ms = 30000          # optional (default 30000)
+
+[[hooks]]
+glob = "*.{md,ts,json}"
+run = "prettier --write {path}"
+```
+
 ### Theme
 
 The TUI colors come from an [hjkl](https://github.com/kryptic-sh/hjkl) theme.

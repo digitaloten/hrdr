@@ -2360,6 +2360,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "glob",
  "hjkl-xdg",
  "hrdr-llm",
  "hrdr-tools",

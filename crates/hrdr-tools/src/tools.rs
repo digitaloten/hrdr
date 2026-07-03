@@ -143,23 +143,37 @@ impl Tool for WriteTool {
         tokio::fs::write(&path, &a.content)
             .await
             .with_context(|| format!("writing {}", path.display()))?;
-        ctx.mark_read(&path); // the model authored this content
+        // Post-edit hooks (formatters); the diff below is taken against the
+        // post-hook content so the model's view matches the disk.
+        let notes = crate::run_file_hooks(&ctx.hooks, "write_file", &path, &ctx.cwd).await;
+        let finall = if notes.is_empty() && ctx.hooks.is_empty() {
+            a.content.clone()
+        } else {
+            tokio::fs::read_to_string(&path)
+                .await
+                .unwrap_or_else(|_| a.content.clone())
+        };
+        ctx.mark_read(&path); // the model authored (or just saw) this content
+        let mut warn = notes.join("\n");
+        if !warn.is_empty() {
+            warn.insert(0, '\n');
+        }
         if existed {
-            let diff = unified_diff(&path.display().to_string(), &old, &a.content);
+            let diff = unified_diff(&path.display().to_string(), &old, &finall);
             let body = if diff.is_empty() {
                 "(no changes)".to_string()
             } else {
                 diff
             };
             Ok(truncate(
-                &format!("Wrote {bytes} bytes to {}\n{body}", path.display()),
+                &format!("Wrote {bytes} bytes to {}{warn}\n{body}", path.display()),
                 ctx.max_output,
             ))
         } else {
             Ok(format!(
-                "Created {} ({} lines)",
+                "Created {} ({} lines){warn}",
                 path.display(),
-                a.content.lines().count()
+                finall.lines().count()
             ))
         }
     }
@@ -265,10 +279,22 @@ impl Tool for EditTool {
         tokio::fs::write(&path, &updated)
             .await
             .with_context(|| format!("writing {}", path.display()))?;
-        let diff = unified_diff(&path.display().to_string(), &text, &updated);
+        // Post-edit hooks (formatters); diff against the post-hook content so
+        // the model's next old_string matches what's really on disk.
+        let notes = crate::run_file_hooks(&ctx.hooks, "edit", &path, &ctx.cwd).await;
+        let finall = if ctx.hooks.is_empty() {
+            updated
+        } else {
+            tokio::fs::read_to_string(&path).await.unwrap_or(updated)
+        };
+        let mut warn = notes.join("\n");
+        if !warn.is_empty() {
+            warn.insert(0, '\n');
+        }
+        let diff = unified_diff(&path.display().to_string(), &text, &finall);
         Ok(truncate(
             &format!(
-                "Replaced {count} occurrence(s) in {}\n{diff}",
+                "Replaced {count} occurrence(s) in {}{warn}\n{diff}",
                 path.display()
             ),
             ctx.max_output,
@@ -1086,6 +1112,48 @@ mod tests {
             err.to_string().contains("outside the working directory"),
             "{err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_diff_reflects_post_hook_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "hello\n").unwrap();
+        let mut c = ctx(dir.path().to_path_buf());
+        c.hooks = std::sync::Arc::new(vec![crate::Hook {
+            on: "edit".to_string(),
+            glob: None,
+            run: "printf 'hooked\\n' >> {path}".to_string(),
+            timeout_ms: crate::DEFAULT_HOOK_TIMEOUT_MS,
+        }]);
+        c.mark_read(&path);
+        let out = EditTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "old_string": "hello", "new_string": "hi"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        // The hook ran, and the diff shows its effect too (post-hook state).
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hi\nhooked\n");
+        assert!(out.contains("+hooked"), "diff missing hook effect:\n{out}");
+        // A failing hook adds a warning but the edit still succeeds.
+        c.hooks = std::sync::Arc::new(vec![crate::Hook {
+            on: "edit".to_string(),
+            glob: None,
+            run: "exit 7".to_string(),
+            timeout_ms: crate::DEFAULT_HOOK_TIMEOUT_MS,
+        }]);
+        let out = EditTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "old_string": "hi", "new_string": "hey"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("[hook `exit 7` failed"), "{out}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hey\nhooked\n");
     }
 
     #[tokio::test]

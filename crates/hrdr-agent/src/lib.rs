@@ -92,6 +92,8 @@ pub struct AgentConfig {
     /// Let `write_file`/`edit` touch paths outside the working directory
     /// (default `false`; the system temp dir is always allowed).
     pub allow_outside_cwd: bool,
+    /// Post-edit hooks from `[[hooks]]` in config (formatters, mostly).
+    pub hooks: Vec<HookConfig>,
 }
 
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
@@ -119,6 +121,7 @@ impl Default for AgentConfig {
             providers: HashMap::new(),
             guardrails: Vec::new(),
             allow_outside_cwd: false,
+            hooks: Vec::new(),
         }
     }
 }
@@ -177,6 +180,30 @@ pub struct GuardrailConfig {
     pub message: String,
 }
 
+/// One post-edit hook from a `[[hooks]]` config entry: after tool `on`
+/// (`edit`, `write_file`, or `*`) successfully mutates a file matching
+/// `glob`, run shell command `run` (`{path}` is substituted). Formatters,
+/// mostly. Failures surface as warnings in the tool result, never as errors.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+pub struct HookConfig {
+    /// Triggering tool; defaults to `*` (any file-mutating tool).
+    #[serde(default = "default_hook_on")]
+    pub on: String,
+    /// File filter (matched against name and cwd-relative path); absent =
+    /// every file.
+    #[serde(default)]
+    pub glob: Option<String>,
+    /// Shell command template; `{path}` becomes the quoted file path.
+    pub run: String,
+    /// Per-run timeout in milliseconds (default 30000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+fn default_hook_on() -> String {
+    "*".to_string()
+}
+
 /// A fully-resolved provider preset.
 #[derive(Debug, Clone)]
 pub struct ResolvedProvider {
@@ -232,6 +259,8 @@ struct FileConfig {
     #[serde(default)]
     guardrails: Vec<GuardrailConfig>,
     allow_outside_cwd: Option<bool>,
+    #[serde(default)]
+    hooks: Vec<HookConfig>,
 }
 
 /// `hrdr`'s config directory — `$XDG_CONFIG_HOME/hrdr`, default
@@ -314,6 +343,9 @@ impl AgentConfig {
         }
         if let Some(v) = fc.allow_outside_cwd {
             self.allow_outside_cwd = v;
+        }
+        if !fc.hooks.is_empty() {
+            self.hooks = fc.hooks;
         }
     }
 
@@ -490,6 +522,26 @@ impl Agent {
         let tools = ToolRegistry::with_defaults();
         let mut ctx = ToolContext::new(config.cwd.clone());
         ctx.restrict_to_cwd = !config.allow_outside_cwd;
+        if !config.hooks.is_empty() {
+            // Invalid globs are skipped (lenient, like the rest of config).
+            let hooks: Vec<hrdr_tools::Hook> = config
+                .hooks
+                .iter()
+                .filter_map(|h| {
+                    let glob = match &h.glob {
+                        Some(g) => Some(glob::Pattern::new(g).ok()?),
+                        None => None,
+                    };
+                    Some(hrdr_tools::Hook {
+                        on: h.on.clone(),
+                        glob,
+                        run: h.run.clone(),
+                        timeout_ms: h.timeout_ms.unwrap_or(hrdr_tools::DEFAULT_HOOK_TIMEOUT_MS),
+                    })
+                })
+                .collect();
+            ctx.hooks = Arc::new(hooks);
+        }
         // User guardrails layer on top of the built-in set; an invalid regex
         // is skipped (lenient, like the rest of config parsing).
         if !config.guardrails.is_empty() {
@@ -1488,6 +1540,7 @@ mod tests {
             providers: HashMap::new(),
             guardrails: vec![],
             allow_outside_cwd: Some(true),
+            hooks: vec![],
         });
         assert_eq!(cfg.base_url, "http://custom/v1");
         assert_eq!(cfg.api_key.as_deref(), Some("key123"));
@@ -1522,6 +1575,30 @@ mod tests {
         assert_eq!(cfg.guardrails.len(), 2);
         assert_eq!(cfg.guardrails[0].message, "no recursive force-remove");
         assert_eq!(cfg.guardrails[1].pattern, r"\bnpm\s+publish\b");
+    }
+
+    #[test]
+    fn hooks_parse_from_config_toml() {
+        let fc: FileConfig = toml::from_str(
+            r#"
+            [[hooks]]
+            on = "edit"
+            glob = "*.rs"
+            run = "cargo fmt -- {path}"
+
+            [[hooks]]
+            run = "prettier --write {path}"
+            timeout_ms = 5000
+            "#,
+        )
+        .unwrap();
+        let mut cfg = AgentConfig::default();
+        cfg.apply_file(fc);
+        assert_eq!(cfg.hooks.len(), 2);
+        assert_eq!(cfg.hooks[0].on, "edit");
+        assert_eq!(cfg.hooks[0].glob.as_deref(), Some("*.rs"));
+        assert_eq!(cfg.hooks[1].on, "*"); // default: any file-mutating tool
+        assert_eq!(cfg.hooks[1].timeout_ms, Some(5000));
     }
 
     // ---- is_transient / is_context_overflow (additional variants) ----

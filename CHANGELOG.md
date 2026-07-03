@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Post-edit hooks (`[[hooks]]` in config).** Run a shell command after
+  `edit`/`write_file` mutates a matching file — formatters, mostly
+  (`on`/`glob`/`run` with `{path}` substitution + per-hook `timeout_ms`). The
+  tool re-reads the file after hooks run, so the diff the model sees (and the
+  text its next `old_string` must match) is the post-hook content. Failing or
+  hung hooks become warnings in the tool result, never errors; hook changes land
+  in the same per-turn checkpoint, so `/revert` undoes both.
+
 - **Shell completions + man page** (mirroring gpur's packaging helpers). Hidden
   `--completions <bash|zsh|fish|powershell|elvish|nushell>` and `--man` flags
   emit to stdout; the release pipeline attaches a `completions-man.tar.gz` to
