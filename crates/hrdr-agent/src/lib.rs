@@ -80,6 +80,13 @@ pub struct AgentConfig {
     /// `0` (or any value outside that range) disables it. Default
     /// [`DEFAULT_AUTO_COMPACT`].
     pub auto_compact: f64,
+    /// Prune old tool-call *output* from the model history before each request:
+    /// bodies older than the recent protected window are replaced with a short
+    /// placeholder (the tool call + args stay). Cheap, no model call — the first
+    /// line of defence against tool output ballooning context, before
+    /// compaction. Off leaves every result verbatim. Default `true`. Only the
+    /// model-facing history is touched; the UI transcript keeps the full output.
+    pub auto_prune: bool,
     /// File checkpointing: `on`, `off`, or `auto` (default) — `auto` enables it
     /// only outside a git repo (git already provides revert).
     pub checkpoints: Option<String>,
@@ -98,6 +105,19 @@ pub struct AgentConfig {
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
 /// so the next turn doesn't overflow).
 pub const DEFAULT_AUTO_COMPACT: f64 = 0.85;
+
+/// Tool-output pruning keeps the most recent this-many estimated tokens of tool
+/// output verbatim; older bodies are cleared. Sized for mid-to-large contexts —
+/// on a small-context model it simply never triggers (compaction handles those).
+const PRUNE_PROTECT_TOKENS: u32 = 16_000;
+/// Only prune when at least this many tokens would actually be reclaimed —
+/// clearing a few small results isn't worth the lost detail.
+const PRUNE_MINIMUM_TOKENS: u32 = 8_000;
+/// The most recent this-many turns (user messages) are never pruned, so the
+/// model always keeps the tool output it's actively working with.
+const PRUNE_KEEP_TURNS: usize = 2;
+/// Replacement body for a pruned tool result (the tool call + args are kept).
+const PRUNE_PLACEHOLDER: &str = "[old tool output cleared to save context]";
 
 /// With this many tool rounds left in a turn, the model is told to wrap up
 /// (appended to the last tool result of that round).
@@ -178,6 +198,7 @@ impl Default for AgentConfig {
             context_window: None,
             effort: None,
             auto_compact: DEFAULT_AUTO_COMPACT,
+            auto_prune: true,
             checkpoints: None,
             providers: HashMap::new(),
             guardrails: Vec::new(),
@@ -330,6 +351,7 @@ struct FileConfig {
     context_window: Option<u32>,
     effort: Option<String>,
     auto_compact: Option<f64>,
+    auto_prune: Option<bool>,
     checkpoints: Option<String>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
@@ -408,6 +430,9 @@ impl AgentConfig {
         if let Some(v) = fc.auto_compact {
             self.auto_compact = v;
         }
+        if let Some(v) = fc.auto_prune {
+            self.auto_prune = v;
+        }
         if let Some(v) = fc.checkpoints {
             self.checkpoints = Some(v);
         }
@@ -480,6 +505,11 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     ("HRDR_AUTO_COMPACT", |c, v| {
         if let Ok(f) = v.parse() {
             c.auto_compact = f;
+        }
+    }),
+    ("HRDR_AUTO_PRUNE", |c, v| {
+        if let Some(b) = parse_env_bool(&v) {
+            c.auto_prune = b;
         }
     }),
 ];
@@ -581,6 +611,9 @@ pub struct Agent {
     ctx: ToolContext,
     messages: Vec<ChatMessage>,
     max_steps: usize,
+    /// Prune old tool output from the history before each request (see
+    /// [`AgentConfig::auto_prune`]).
+    auto_prune: bool,
     /// Gathered `AGENTS.md` project instructions for the current cwd, if any.
     project_docs: Option<String>,
     /// File checkpoint store (per-turn pre-images), if a store dir is available.
@@ -662,6 +695,7 @@ impl Agent {
             ctx,
             messages: vec![ChatMessage::system(system)],
             max_steps: config.max_steps,
+            auto_prune: config.auto_prune,
             project_docs,
             checkpoints,
         })
@@ -921,6 +955,18 @@ impl Agent {
         let mut repeat = RepeatGuard::default();
 
         for step in 0..self.max_steps {
+            // Reclaim stale tool output before building the request — the cheap,
+            // no-model-call first line of defence against context ballooning
+            // (compaction is the expensive fallback). No-op until there's enough
+            // old output to matter.
+            if self.auto_prune {
+                let reclaimed = prune_tool_messages(&mut self.messages);
+                if reclaimed > 0 {
+                    on_event(AgentEvent::Notice(format!(
+                        "pruned ~{reclaimed} tokens of old tool output"
+                    )));
+                }
+            }
             // Stream one assistant turn, accumulating text + tool calls. The
             // connect is retried on transient errors and auto-compacted once on
             // a context-length overflow.
@@ -1257,6 +1303,57 @@ fn elide_tool_results(msgs: &[ChatMessage]) -> Vec<ChatMessage> {
         .collect()
 }
 
+/// Clear the bodies of *old* tool-result messages, keeping the most recent
+/// [`PRUNE_PROTECT_TOKENS`] of tool output — plus the last [`PRUNE_KEEP_TURNS`]
+/// turns — verbatim. Only `role:"tool"` bodies are replaced (with
+/// [`PRUNE_PLACEHOLDER`]); the assistant `tool_calls` metadata and every message
+/// stays, so the tool-call ↔ result pairing strict servers require is intact.
+///
+/// Returns the estimated tokens reclaimed, or `0` when that would be below
+/// [`PRUNE_MINIMUM_TOKENS`] (in which case nothing is changed — small reclaims
+/// aren't worth the lost detail). Cheap and model-only: the UI transcript keeps
+/// the full output; this just bounds what gets re-sent every request.
+fn prune_tool_messages(messages: &mut [ChatMessage]) -> u32 {
+    let mut turns = 0usize;
+    // Cumulative tool-output tokens seen scanning newest → oldest.
+    let mut seen_tokens = 0u32;
+    let mut reclaimable = 0u32;
+    let mut victims: Vec<usize> = Vec::new();
+    for i in (0..messages.len()).rev() {
+        let m = &messages[i];
+        if m.role == Role::User {
+            turns += 1;
+        }
+        // The last few turns are always kept whole — the model is still working
+        // with that output.
+        if turns < PRUNE_KEEP_TURNS {
+            continue;
+        }
+        if m.role != Role::Tool {
+            continue;
+        }
+        let body = m.content.as_deref().unwrap_or_default();
+        if body == PRUNE_PLACEHOLDER {
+            continue; // already pruned
+        }
+        let est = estimate_tokens(body);
+        seen_tokens += est;
+        // Keep the newest window verbatim; everything older is a prune target.
+        if seen_tokens <= PRUNE_PROTECT_TOKENS {
+            continue;
+        }
+        reclaimable += est;
+        victims.push(i);
+    }
+    if reclaimable < PRUNE_MINIMUM_TOKENS {
+        return 0;
+    }
+    for i in victims {
+        messages[i].content = Some(PRUNE_PLACEHOLDER.to_string());
+    }
+    reclaimable
+}
+
 /// The most recent `1/div` of `msgs` (at least two messages), aligned forward
 /// past any leading `role:"tool"` results so no result is orphaned from its
 /// assistant `tool_calls` message (strict servers reject that).
@@ -1363,10 +1460,11 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        Agent, AgentConfig, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig, ProviderConfig,
-        builtin_provider, compaction_split, elide_tool_results, estimate_tokens,
-        estimate_tokens_in_messages, in_git_repo, is_context_overflow, is_transient,
-        parse_env_bool, repair_dangling_tool_calls, tail_window,
+        Agent, AgentConfig, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig, PRUNE_MINIMUM_TOKENS,
+        PRUNE_PLACEHOLDER, PRUNE_PROTECT_TOKENS, ProviderConfig, builtin_provider,
+        compaction_split, elide_tool_results, estimate_tokens, estimate_tokens_in_messages,
+        in_git_repo, is_context_overflow, is_transient, parse_env_bool, prune_tool_messages,
+        repair_dangling_tool_calls, tail_window,
     };
     use crate::cwd_slug;
     use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
@@ -1616,6 +1714,7 @@ mod tests {
             context_window: Some(8192),
             effort: Some("high".to_string()),
             auto_compact: Some(0.7),
+            auto_prune: Some(false),
             checkpoints: Some("on".to_string()),
             providers: HashMap::new(),
             guardrails: vec![],
@@ -1630,6 +1729,7 @@ mod tests {
         assert_eq!(cfg.context_window, Some(8192));
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!((cfg.auto_compact - 0.7).abs() < f64::EPSILON);
+        assert!(!cfg.auto_prune);
         assert_eq!(cfg.checkpoints.as_deref(), Some("on"));
         assert!(cfg.allow_outside_cwd);
     }
@@ -1749,6 +1849,68 @@ mod tests {
         let out = tail_window(&msgs, 2);
         assert!(out[0].role != Role::Tool, "window starts on a tool result");
         assert!(!out.is_empty() && out.len() < msgs.len());
+    }
+
+    #[test]
+    fn prune_clears_old_tool_output_beyond_protected_window() {
+        // Four turns, each with one big tool result (~10k tokens: len/4).
+        let big = "x".repeat(40_000);
+        assert_eq!(estimate_tokens(&big), 10_000);
+        let mut msgs = vec![
+            ChatMessage::user("u1"),
+            assistant_with_calls(&["a"]),
+            ChatMessage::tool_result("a", big.clone()), // 2 — oldest → pruned
+            ChatMessage::user("u2"),
+            assistant_with_calls(&["b"]),
+            ChatMessage::tool_result("b", big.clone()), // 5 — inside protect window
+            ChatMessage::user("u3"),
+            assistant_with_calls(&["c"]),
+            ChatMessage::tool_result("c", big.clone()), // 8 — last-2-turns protected
+            ChatMessage::user("u4"),
+            assistant_with_calls(&["d"]),
+            ChatMessage::tool_result("d", big.clone()), // 11 — current turn protected
+        ];
+        let reclaimed = prune_tool_messages(&mut msgs);
+
+        // Protect window is 16k tokens: turn-3/4 output is shielded by the
+        // last-2-turns rule, turn-2's 10k fills the window, so only turn-1's
+        // 10k (the oldest) is cleared.
+        assert!(reclaimed >= PRUNE_MINIMUM_TOKENS);
+        assert_eq!(reclaimed, estimate_tokens(&big));
+        assert_eq!(msgs[2].content.as_deref(), Some(PRUNE_PLACEHOLDER));
+        for kept in [5, 8, 11] {
+            assert_eq!(msgs[kept].content.as_deref(), Some(big.as_str()));
+        }
+        // The assistant tool_calls metadata is never touched.
+        assert!(msgs[1].tool_calls.is_some());
+
+        // Idempotent: a second pass finds only the placeholder + kept window.
+        assert_eq!(prune_tool_messages(&mut msgs), 0);
+    }
+
+    #[test]
+    fn prune_is_a_noop_below_the_minimum() {
+        // Protect window (16k) is filled by one 14k result; the only prunable
+        // result is 3k tokens — below the 8k minimum, so nothing changes.
+        let within = "x".repeat(56_000); // 14k tokens
+        let tiny = "x".repeat(12_000); // 3k tokens
+        let mut msgs = vec![
+            ChatMessage::user("u1"),
+            assistant_with_calls(&["a"]),
+            ChatMessage::tool_result("a", tiny.clone()), // 2 — 3k prunable
+            ChatMessage::user("u2"),
+            assistant_with_calls(&["b"]),
+            ChatMessage::tool_result("b", within.clone()), // 5 — fills the window
+            ChatMessage::user("u3"),
+            assistant_with_calls(&["c"]),
+            ChatMessage::tool_result("c", "recent".to_string()), // 8 — protected
+            ChatMessage::user("u4"),
+        ];
+        assert!(estimate_tokens(&tiny) < PRUNE_MINIMUM_TOKENS);
+        assert!(estimate_tokens(&within) >= PRUNE_PROTECT_TOKENS - PRUNE_MINIMUM_TOKENS);
+        let reclaimed = prune_tool_messages(&mut msgs);
+        assert_eq!(reclaimed, 0);
+        assert_eq!(msgs[2].content.as_deref(), Some(tiny.as_str())); // untouched
     }
 
     #[test]

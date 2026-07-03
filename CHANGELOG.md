@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Tool-output pruning — bound context without a model call.** Before each
+  request, tool-call _output_ older than a recent window is cleared from the
+  model history (replaced with a short placeholder; the tool call + args stay).
+  The most recent `PRUNE_PROTECT_TOKENS` (16k) of tool output and the last 2
+  turns are always kept, and pruning only fires when it would reclaim at least
+  `PRUNE_MINIMUM_TOKENS` (8k). This is the cheap first line of defence against
+  tool results ballooning context, ahead of the (expensive) auto-compaction.
+  Only the model-facing history is touched — the TUI/GUI transcript keeps the
+  full output. On by default; toggle with `auto_prune` in config,
+  `HRDR_AUTO_PRUNE`, or `--auto-prune on|off`.
+
 - **`/login` — a guided provider + API-key wizard.** Run `/login` in the TUI or
   GUI, pick a provider from the list, and paste its API key; hrdr switches to it
   live and makes it the default for next launch. Keys are stored **separately

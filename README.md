@@ -344,6 +344,9 @@ The shell and search tools adapt to the host:
 - [x] Sessions (auto-save + auto-resume per cwd), `AGENTS.md` project
       instructions
 - [x] File checkpoints + `/revert`; network retry + auto-compact on overflow
+- [x] Tool-output pruning: old tool results are cleared from the model context
+      (recent window + last 2 turns kept) before compaction — cheap, no model
+      call (`auto_prune`, on by default)
 - [x] Config file with persistence + OS-level hot-reload
 - [x] Cross-platform CI (Linux/macOS/Windows)
 - [x] Provider-agnostic: presets (zen/openai/openrouter/claude/local) + custom

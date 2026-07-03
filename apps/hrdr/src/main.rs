@@ -52,6 +52,10 @@ struct Cli {
     #[arg(long, global = true)]
     auto_compact: Option<f64>,
 
+    /// Prune old tool output from the model context before each request (on|off; default on).
+    #[arg(long = "auto-prune", global = true, value_name = "on|off")]
+    auto_prune: Option<String>,
+
     /// Don't auto-resume the most recent session for the working directory.
     #[arg(long = "no-auto-resume", global = true)]
     no_auto_resume: bool,
@@ -228,6 +232,13 @@ async fn main() -> Result<()> {
     }
     if let Some(r) = cli.auto_compact {
         config.auto_compact = r;
+    }
+    if let Some(v) = cli
+        .auto_prune
+        .as_deref()
+        .and_then(hrdr_agent::parse_env_bool)
+    {
+        config.auto_prune = v;
     }
     if cli.no_auto_resume {
         ui.auto_resume = false;
