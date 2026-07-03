@@ -100,6 +100,12 @@ pub struct AgentConfig {
     pub allow_outside_cwd: bool,
     /// Post-edit hooks from `[[hooks]]` in config (formatters, mostly).
     pub hooks: Vec<HookConfig>,
+    /// Per-tool output byte cap before truncation (`[tool_output] max_bytes`).
+    /// Larger `bash`/`grep` output is truncated and the full text saved to disk.
+    pub tool_max_bytes: usize,
+    /// Per-tool output line cap before truncation (`[tool_output] max_lines`),
+    /// applied alongside [`tool_max_bytes`](Self::tool_max_bytes).
+    pub tool_max_lines: usize,
 }
 
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
@@ -204,6 +210,8 @@ impl Default for AgentConfig {
             guardrails: Vec::new(),
             allow_outside_cwd: false,
             hooks: Vec::new(),
+            tool_max_bytes: hrdr_tools::DEFAULT_MAX_OUTPUT,
+            tool_max_lines: hrdr_tools::DEFAULT_MAX_OUTPUT_LINES,
         }
     }
 }
@@ -340,6 +348,19 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
     })
 }
 
+/// `[tool_output]` config table: per-tool truncation thresholds. Mirrors
+/// opencode's `tool_output`. Output over either limit is truncated and (for
+/// `bash`/`grep`) the full text is saved to disk.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+pub struct ToolOutputConfig {
+    /// Max output lines before truncation (default 2000).
+    #[serde(default)]
+    pub max_lines: Option<usize>,
+    /// Max output bytes before truncation (default 51200).
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
 /// Subset of config.toml we parse; all fields are optional.
 #[derive(serde::Deserialize, Default)]
 struct FileConfig {
@@ -360,6 +381,7 @@ struct FileConfig {
     allow_outside_cwd: Option<bool>,
     #[serde(default)]
     hooks: Vec<HookConfig>,
+    tool_output: Option<ToolOutputConfig>,
 }
 
 /// `hrdr`'s config directory — `$XDG_CONFIG_HOME/hrdr`, default
@@ -447,6 +469,14 @@ impl AgentConfig {
         }
         if !fc.hooks.is_empty() {
             self.hooks = fc.hooks;
+        }
+        if let Some(to) = fc.tool_output {
+            if let Some(v) = to.max_lines {
+                self.tool_max_lines = v;
+            }
+            if let Some(v) = to.max_bytes {
+                self.tool_max_bytes = v;
+            }
         }
     }
 
@@ -626,6 +656,8 @@ impl Agent {
         let tools = ToolRegistry::with_defaults();
         let mut ctx = ToolContext::new(config.cwd.clone());
         ctx.restrict_to_cwd = !config.allow_outside_cwd;
+        ctx.max_output = config.tool_max_bytes;
+        ctx.max_output_lines = config.tool_max_lines;
         if !config.hooks.is_empty() {
             // Invalid globs are skipped (lenient, like the rest of config).
             let hooks: Vec<hrdr_tools::Hook> = config
@@ -1461,10 +1493,10 @@ mod tests {
 
     use super::{
         Agent, AgentConfig, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig, PRUNE_MINIMUM_TOKENS,
-        PRUNE_PLACEHOLDER, PRUNE_PROTECT_TOKENS, ProviderConfig, builtin_provider,
-        compaction_split, elide_tool_results, estimate_tokens, estimate_tokens_in_messages,
-        in_git_repo, is_context_overflow, is_transient, parse_env_bool, prune_tool_messages,
-        repair_dangling_tool_calls, tail_window,
+        PRUNE_PLACEHOLDER, PRUNE_PROTECT_TOKENS, ProviderConfig, ToolOutputConfig,
+        builtin_provider, compaction_split, elide_tool_results, estimate_tokens,
+        estimate_tokens_in_messages, in_git_repo, is_context_overflow, is_transient,
+        parse_env_bool, prune_tool_messages, repair_dangling_tool_calls, tail_window,
     };
     use crate::cwd_slug;
     use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
@@ -1720,7 +1752,13 @@ mod tests {
             guardrails: vec![],
             allow_outside_cwd: Some(true),
             hooks: vec![],
+            tool_output: Some(ToolOutputConfig {
+                max_lines: Some(500),
+                max_bytes: Some(20_000),
+            }),
         });
+        assert_eq!(cfg.tool_max_lines, 500);
+        assert_eq!(cfg.tool_max_bytes, 20_000);
         assert_eq!(cfg.base_url, "http://custom/v1");
         assert_eq!(cfg.api_key.as_deref(), Some("key123"));
         assert_eq!(cfg.model, "gpt-4");
@@ -1779,6 +1817,28 @@ mod tests {
         assert_eq!(cfg.hooks[0].glob.as_deref(), Some("*.rs"));
         assert_eq!(cfg.hooks[1].on, "*"); // default: any file-mutating tool
         assert_eq!(cfg.hooks[1].timeout_ms, Some(5000));
+    }
+
+    #[test]
+    fn tool_output_parses_from_config_toml() {
+        let fc: FileConfig = toml::from_str(
+            r#"
+            [tool_output]
+            max_lines = 1000
+            max_bytes = 32768
+            "#,
+        )
+        .unwrap();
+        let mut cfg = AgentConfig::default();
+        cfg.apply_file(fc);
+        assert_eq!(cfg.tool_max_lines, 1000);
+        assert_eq!(cfg.tool_max_bytes, 32768);
+        // A partial table leaves the unset field at its default.
+        let partial: FileConfig = toml::from_str("[tool_output]\nmax_bytes = 100\n").unwrap();
+        let mut cfg2 = AgentConfig::default();
+        cfg2.apply_file(partial);
+        assert_eq!(cfg2.tool_max_bytes, 100);
+        assert_eq!(cfg2.tool_max_lines, hrdr_tools::DEFAULT_MAX_OUTPUT_LINES);
     }
 
     // ---- is_transient / is_context_overflow (additional variants) ----

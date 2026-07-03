@@ -29,8 +29,14 @@ pub use tools::{
 pub use web::{WebFetchTool, WebSearchTool};
 
 /// Default cap on a single tool's textual output, in bytes. Larger results are
-/// truncated with a marker so the model's context is never blown by one call.
-pub const DEFAULT_MAX_OUTPUT: usize = 30_000;
+/// truncated (and, for `bash`/`grep`, saved to disk) so the model's context is
+/// never blown by one call. Matches opencode's `tool_output.max_bytes`.
+pub const DEFAULT_MAX_OUTPUT: usize = 51_200;
+
+/// Default cap on a single tool's output in *lines*, applied alongside
+/// [`DEFAULT_MAX_OUTPUT`] by [`truncate_saved`] (whichever limit is hit first).
+/// Matches opencode's `tool_output.max_lines`.
+pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2_000;
 
 /// A single TODO item tracked by `todo_write`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -54,6 +60,9 @@ pub struct ToolContext {
     pub todos: Arc<Mutex<Vec<TodoItem>>>,
     /// Per-call output byte cap.
     pub max_output: usize,
+    /// Per-call output line cap, applied alongside [`max_output`](Self::max_output)
+    /// by [`truncate_saved`] (whichever is hit first).
+    pub max_output_lines: usize,
     /// Optional live-output sink: long-running tools (e.g. `bash`) send partial
     /// output here as it's produced so the UI can show progress. `None` = no
     /// streaming consumer.
@@ -84,6 +93,7 @@ impl ToolContext {
             cwd: cwd.into(),
             todos: Arc::new(Mutex::new(Vec::new())),
             max_output: DEFAULT_MAX_OUTPUT,
+            max_output_lines: DEFAULT_MAX_OUTPUT_LINES,
             stream: None,
             checkpoints: None,
             guardrails: Arc::new(default_guardrails()),
@@ -341,51 +351,99 @@ pub fn tool_output_dir() -> PathBuf {
     std::env::temp_dir().join("hrdr-tool-output")
 }
 
-/// Truncate `text` to `max` bytes for the model, but instead of *discarding* the
+/// Truncate `text` to `max_bytes` **and** `max_lines` (whichever is hit first,
+/// matching opencode's `tool_output` limits), but instead of *discarding* the
 /// overflow, write the **full** output to [`tool_output_dir`] and point the
 /// model at it (so it can `read_file` a range or `grep` it rather than re-run
-/// the tool). Falls back to a plain [`truncate`]/[`truncate_middle`] if the file
-/// can't be written. `label` tags the temp file (e.g. `"bash"`, `"grep"`).
-pub fn truncate_saved(text: &str, max: usize, side: TruncateSide, label: &str) -> String {
-    truncate_saved_in(text, max, side, label, &tool_output_dir())
+/// the tool). Falls back to a plain byte truncation if the file can't be
+/// written. `label` tags the temp file (e.g. `"bash"`, `"grep"`).
+pub fn truncate_saved(
+    text: &str,
+    max_bytes: usize,
+    max_lines: usize,
+    side: TruncateSide,
+    label: &str,
+) -> String {
+    truncate_saved_in(text, max_bytes, max_lines, side, label, &tool_output_dir())
 }
 
 /// [`truncate_saved`] with an explicit overflow directory (for tests).
 fn truncate_saved_in(
     text: &str,
-    max: usize,
+    max_bytes: usize,
+    max_lines: usize,
     side: TruncateSide,
     label: &str,
     dir: &std::path::Path,
 ) -> String {
-    if text.len() <= max {
+    let lines: Vec<&str> = text.split('\n').collect();
+    // Within both caps: hand it back untouched.
+    if lines.len() <= max_lines && text.len() <= max_bytes {
         return text.to_string();
     }
     let path = match save_overflow(dir, label, text) {
         Ok(p) => p,
         Err(_) => {
+            // No file to point at — degrade to a plain byte truncation.
             return match side {
-                TruncateSide::Head => truncate(text, max),
-                TruncateSide::Middle => truncate_middle(text, max),
+                TruncateSide::Head => truncate(text, max_bytes),
+                TruncateSide::Middle => truncate_middle(text, max_bytes),
             };
         }
     };
     let hint = format!(
-        "… [full output ({} bytes) saved to {} — `read_file` it (with offset/limit) or `grep` it \
-         (pattern + path) for the rest, don't re-run] …",
+        "… [full output ({} lines, {} bytes) saved to {} — `read_file` it (with offset/limit) or \
+         `grep` it (pattern + path) for the rest, don't re-run] …",
+        lines.len(),
         text.len(),
         path.display()
     );
     match side {
         TruncateSide::Head => {
-            let end = floor_char_boundary(text, max);
-            format!("{}\n\n{hint}", &text[..end])
+            let head = collect_lines(&lines, max_lines, max_bytes, false);
+            format!("{head}\n\n{hint}")
         }
+        // ~1/5 of each budget for the head, the rest for the tail (shell errors
+        // trail), with the pointer bridging the gap.
         TruncateSide::Middle => {
-            let (head_end, tail_start) = middle_bounds(text, max);
-            format!("{}\n\n{hint}\n\n{}", &text[..head_end], &text[tail_start..])
+            let head = collect_lines(&lines, max_lines / 5, max_bytes / 5, false);
+            let tail = collect_lines(
+                &lines,
+                max_lines - max_lines / 5,
+                max_bytes - max_bytes / 5,
+                true,
+            );
+            format!("{head}\n\n{hint}\n\n{tail}")
         }
     }
+}
+
+/// Join whole lines from the head (or tail, when `from_tail`) of `lines`, up to
+/// `max_lines` lines and `max_bytes` bytes — whichever caps first. At least one
+/// line is always kept so the preview is never empty.
+fn collect_lines(lines: &[&str], max_lines: usize, max_bytes: usize, from_tail: bool) -> String {
+    let mut taken: Vec<&str> = Vec::new();
+    let mut bytes = 0usize;
+    let ordered: Vec<&&str> = if from_tail {
+        lines.iter().rev().collect()
+    } else {
+        lines.iter().collect()
+    };
+    for line in ordered {
+        if taken.len() >= max_lines {
+            break;
+        }
+        let add = line.len() + usize::from(!taken.is_empty()); // + the newline
+        if bytes + add > max_bytes && !taken.is_empty() {
+            break;
+        }
+        taken.push(line);
+        bytes += add;
+    }
+    if from_tail {
+        taken.reverse();
+    }
+    taken.join("\n")
 }
 
 /// Write `text` to a uniquely-named file under `dir` (created if needed),
@@ -600,7 +658,15 @@ TAIL-ERROR-LINE",
         let text = format!("HEAD\n{}\nTAIL", "x".repeat(50_000));
 
         // Head mode: keeps the start, saves the full output, points at the file.
-        let out = truncate_saved_in(&text, 10_000, TruncateSide::Head, "grep", dir.path());
+        // Generous line cap so the byte cap is what bites here.
+        let out = truncate_saved_in(
+            &text,
+            10_000,
+            100_000,
+            TruncateSide::Head,
+            "grep",
+            dir.path(),
+        );
         assert!(out.starts_with("HEAD"));
         assert!(out.contains("full output"));
         assert!(out.contains("read_file"));
@@ -617,16 +683,46 @@ TAIL-ERROR-LINE",
         assert!(out.contains(&files[0].path().display().to_string()));
 
         // Middle mode keeps head and tail around the pointer.
-        let mid = truncate_saved_in(&text, 10_000, TruncateSide::Middle, "bash", dir.path());
+        let mid = truncate_saved_in(
+            &text,
+            10_000,
+            100_000,
+            TruncateSide::Middle,
+            "bash",
+            dir.path(),
+        );
         assert!(mid.starts_with("HEAD"));
         assert!(mid.trim_end().ends_with("TAIL"), "tail must survive");
+    }
+
+    #[test]
+    fn truncate_saved_caps_on_lines_too() {
+        let dir = tempfile::tempdir().unwrap();
+        // 5000 short lines: well under any byte cap, but over the line cap.
+        let text = (0..5000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = truncate_saved_in(
+            &text,
+            10_000_000,
+            2000,
+            TruncateSide::Head,
+            "grep",
+            dir.path(),
+        );
+        // Truncated by lines (kept the head), full copy saved, pointer present.
+        assert!(out.starts_with("line 0"));
+        assert!(out.contains("5000 lines"));
+        assert!(out.lines().count() <= 2000 + 3); // preview + hint lines
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
     fn truncate_saved_leaves_small_output_untouched() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            truncate_saved_in("short", 100, TruncateSide::Head, "grep", dir.path()),
+            truncate_saved_in("short", 100, 100, TruncateSide::Head, "grep", dir.path()),
             "short"
         );
         // No file written when nothing overflowed.

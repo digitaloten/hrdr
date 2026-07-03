@@ -432,6 +432,7 @@ async fn run_streamed_command(
     Ok(truncate_saved(
         out,
         ctx.max_output,
+        ctx.max_output_lines,
         TruncateSide::Middle,
         "bash",
     ))
@@ -651,6 +652,7 @@ async fn run_search_cmd(
     Ok(truncate_saved(
         &cap_matches(&stdout, max_matches),
         ctx.max_output,
+        ctx.max_output_lines,
         TruncateSide::Head,
         "grep",
     ))
@@ -747,6 +749,7 @@ fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
         Ok(truncate_saved(
             out.trim_end(),
             ctx.max_output,
+            ctx.max_output_lines,
             TruncateSide::Head,
             "grep",
         ))
