@@ -53,9 +53,19 @@ impl Tool for ReadTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: ReadArgs = serde_json::from_value(args).context("invalid read_file args")?;
         let path = ctx.resolve(&a.path);
-        let text = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                bail!(
+                    "{} is not a text file (invalid UTF-8) — this tool only reads text; \
+                     inspect binaries via bash (`file`, `hexdump -C`, `strings`) if needed",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading {}", path.display()));
+            }
+        };
         ctx.mark_read(&path);
         let start = a.offset.unwrap_or(1).max(1);
         let limit = a.limit.unwrap_or(DEFAULT_READ_LIMIT);
@@ -296,6 +306,8 @@ impl Tool for BashTool {
     fn description(&self) -> &'static str {
         "Run a shell command via `bash -c` in the working directory. Use for build, test, \
          git, and anything without a dedicated tool. Output is captured and length-bounded. \
+         Each call starts fresh in the working directory — `cd` does NOT persist between \
+         calls; chain it in one command (`cd sub && …`) or use paths from the cwd. \
          Git: stage explicit paths (`git add <file> …`); blanket staging, force-push, \
          hook-skipping, and destructive commands are rejected."
     }
@@ -650,7 +662,8 @@ impl Tool for GlobTool {
         "glob"
     }
     fn description(&self) -> &'static str {
-        "Find files by glob pattern (supports `**`), relative to cwd. Returns matching paths."
+        "Find files by glob pattern (supports `**`), relative to cwd. Returns matching \
+         paths. Also the way to list a directory: pattern `src/*` lists src's contents."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({

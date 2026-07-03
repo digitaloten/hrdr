@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/prompt` and `/guardrails` introspection commands** (both frontends, via
+  the shared layer). `/prompt` (alias `/system`) shows the rendered system
+  prompt currently in effect — handy for tuning `AGENTS.md` and checking the
+  OS/package-manager line. `/guardrails` (alias `/rails`) lists the active shell
+  rules — built-ins plus `[[guardrails]]` config extras — with each pattern's
+  corrective message.
+
+- **Three more teaching fixes in the tools.** `bash` states that `cd` does not
+  persist between calls (each call starts fresh in the cwd — chain `cd sub && …`
+  in one command); `read_file` on a binary file explains itself ("not a text
+  file — inspect via bash `file`/`hexdump`") instead of a raw UTF-8 error;
+  `glob` says it's also the directory-listing tool (pattern `src/*`).
+
 - **The system prompt names the actual platform.** The OS line now carries the
   distro (`PRETTY_NAME` from `/etc/os-release`) and the system package manager
   found on PATH — e.g. `linux (Arch Linux) — system package manager: pacman`,

@@ -349,6 +349,29 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 msg
             }));
         }
+        "prompt" | "system" => {
+            let agent = host.agent();
+            host.spawn_line(Box::pin(async move {
+                match agent.lock().await.system_prompt() {
+                    Some(p) => format!("system prompt ({} chars):\n{p}", p.chars().count()),
+                    None => "no system prompt is set".to_string(),
+                }
+            }));
+        }
+        "guardrails" | "rails" => {
+            let agent = host.agent();
+            host.spawn_line(Box::pin(async move {
+                let specs = agent.lock().await.guardrail_specs();
+                let mut msg = format!(
+                    "{} guardrails (blocked shell commands; add more via [[guardrails]] in config):",
+                    specs.len()
+                );
+                for (pattern, message) in specs {
+                    msg.push_str(&format!("\n  {pattern}\n    → {message}"));
+                }
+                msg
+            }));
+        }
         "info" => {
             let agent = host.agent();
             let model = host.model();

@@ -623,6 +623,24 @@ impl Agent {
         self.refresh_system();
     }
 
+    /// The rendered system prompt currently in effect (message 0).
+    pub fn system_prompt(&self) -> Option<String> {
+        self.messages
+            .first()
+            .filter(|m| m.role == Role::System)
+            .and_then(|m| m.content.clone())
+    }
+
+    /// Active shell guardrails as `(pattern, message)` pairs — built-ins plus
+    /// any `[[guardrails]]` config extras (for `/guardrails`).
+    pub fn guardrail_specs(&self) -> Vec<(String, String)> {
+        self.ctx
+            .guardrails
+            .iter()
+            .map(|g| (g.pattern.as_str().to_string(), g.message.clone()))
+            .collect()
+    }
+
     /// Registered tools as `(name, description)` pairs.
     pub fn tools(&self) -> Vec<(String, String)> {
         self.tools

@@ -46,6 +46,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/theme", "switch theme (path, or reset)"),
     ("/cwd", "show or change working directory"),
     ("/tools", "list available tools"),
+    ("/prompt", "show the rendered system prompt"),
+    ("/guardrails", "list active shell guardrails"),
     ("/expand", "expand tool output (last, or 'all'/'off')"),
     ("/init", "analyze the project and write an AGENTS.md"),
     ("/add", "attach a file (or type @path inline)"),
