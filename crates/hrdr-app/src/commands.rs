@@ -1095,6 +1095,21 @@ pub fn agent_cwd(agent: &Arc<Mutex<Agent>>) -> PathBuf {
         .unwrap_or_default()
 }
 
+/// First-run guidance for an unreachable endpoint: what `base_url` failed and
+/// how to get hrdr talking to a model. Pure (no I/O) so it's unit-testable and
+/// identical across frontends. Now that hrdr never spawns a server, this is the
+/// nudge a fresh user sees when nothing is listening yet.
+fn unreachable_guidance(base_url: &str, err: &str) -> String {
+    format!(
+        "⚠ endpoint {base_url} looks unreachable: {err}\n\
+         hrdr talks to a running OpenAI-compatible server. Start one listening at \
+         {base_url} — e.g. `infr serve <model> --addr 127.0.0.1:8080` or `llama-server \
+         -hf <ref> --jinja --port 8080` — and it connects on your next message. Or \
+         switch to a hosted provider with `/provider <zen|openai|openrouter|claude>` \
+         (set its API key first)."
+    )
+}
+
 /// Probe the endpoint (list its models) and return a warning line when it
 /// looks unreachable or doesn't advertise `model`; `None` when healthy. The
 /// startup health-check core — both frontends spawn it and surface the
@@ -1106,7 +1121,7 @@ pub async fn endpoint_health_warning(
 ) -> Option<String> {
     let client = agent.lock().await.client();
     match client.list_models().await {
-        Err(e) => Some(format!("⚠ endpoint {base_url} looks unreachable: {e}")),
+        Err(e) => Some(unreachable_guidance(&base_url, &e.to_string())),
         Ok(models) => {
             if model != "default" && !models.is_empty() && !models.iter().any(|m| m == &model) {
                 let sample = models
@@ -1274,6 +1289,18 @@ pub fn conversation_to_json(msgs: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreachable_guidance_shows_setup_paths() {
+        let msg = unreachable_guidance("http://localhost:8080/v1", "connection refused");
+        // Names the failed endpoint + the underlying error…
+        assert!(msg.contains("http://localhost:8080/v1"));
+        assert!(msg.contains("connection refused"));
+        // …then points at both a local server and a hosted provider.
+        assert!(msg.contains("infr serve"));
+        assert!(msg.contains("llama-server"));
+        assert!(msg.contains("/provider"));
+    }
 
     #[test]
     fn auto_compact_threshold_and_messages() {

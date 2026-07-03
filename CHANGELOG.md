@@ -12,6 +12,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   length (system prompt + every turn and tool result). Surfaced through the
   shared command core, so it appears in both the TUI and the GUI.
 
+- **First-run guidance when the endpoint is unreachable.** The startup
+  health-check warning now explains how to get hrdr talking to a model — start a
+  local server (`infr serve …` / `llama-server …`) listening at the configured
+  URL, or switch to a hosted provider with `/provider <name>` after setting its
+  API key. Shared by the TUI and GUI. Fills the onboarding gap left by removing
+  the built-in server spawner.
+
 ### Changed
 
 - **Internal DRY/YAGNI cleanup of `hrdr-agent` (no behaviour change).** The
