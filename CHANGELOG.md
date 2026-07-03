@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-03
+
+### Fixed
+
+- **Alpine package builds again.** `abuild` rejects uncompressed man pages; the
+  `APKBUILD` now gzips `hrdr.1` on install. (The 0.2.0 apk publish failed on
+  this; every other channel shipped.)
+
 ## [0.2.0] - 2026-07-03
 
 ### Added
@@ -1204,6 +1212,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/kryptic-sh/hrdr/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/kryptic-sh/hrdr/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/kryptic-sh/hrdr/releases/tag/v0.1.0
