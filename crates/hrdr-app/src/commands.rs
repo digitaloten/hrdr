@@ -874,12 +874,6 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             }
             host.set_base_url(p.base_url.clone());
             host.info(format!("provider → {arg} ({})", p.base_url));
-            if !p.remote {
-                host.info(
-                    "note: a running backend isn't restarted; relaunch hrdr for a local backend"
-                        .to_string(),
-                );
-            }
         }
         "sessions" => {
             let all = crate::sessions_all_flag(&arg);

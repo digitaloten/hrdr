@@ -10,7 +10,7 @@ authors.workspace = true
 [package.metadata.deb]
 maintainer = "mxaddict <mxaddict@kryptic.sh>"
 copyright = "2026, mxaddict <mxaddict@kryptic.sh>"
-extended-description = "herder: a fast, agentic coding harness for OpenAI-compatible models — a terminal coding agent with tools (read/write/edit/bash/grep/glob/todo), sessions, and a local-backend spawner."
+extended-description = "herder: a fast, agentic coding harness for OpenAI-compatible models — a terminal coding agent with tools (read/write/edit/bash/grep/glob/todo), sessions, and provider presets."
 section = "utils"
 priority = "optional"
 assets = [
@@ -54,4 +54,3 @@ clap_complete = "4"
 clap_complete_nushell = "4"
 clap_mangen = "0.3"
 tracing-subscriber.workspace = true
-which = "7"

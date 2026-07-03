@@ -4,11 +4,9 @@
 //! turn headlessly, streaming to stdout (scriptable, pipeable).
 //! `hrdr models` lists available models from the configured endpoint.
 //!
-//! By default hrdr spawns a local `llama-server` backend (see [`backend`] —
-//! a TEMPORARY stopgap until infr's tool-calling serve path lands). Pass
-//! `--no-backend` to use an already-running endpoint at `--base-url`.
-
-mod backend;
+//! hrdr talks to any running OpenAI-compatible endpoint; choose one with
+//! `--base-url` or a `--provider` preset. It does not manage a model server —
+//! start your own (infr, llama.cpp, vLLM, …) or point at a hosted provider.
 
 use std::io::Write;
 
@@ -16,8 +14,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use hrdr_agent::{Agent, AgentConfig, AgentEvent};
 use hrdr_llm::Client;
-
-use backend::{Backend, BackendConfig};
 
 #[derive(Parser)]
 #[command(
@@ -35,8 +31,8 @@ struct Cli {
     #[arg(long, global = true)]
     model: Option<String>,
 
-    /// Provider preset: zen (OpenCode Zen), openai, or local. Sets the endpoint,
-    /// API key env, and (for remote providers) skips the local backend.
+    /// Provider preset: zen (OpenCode Zen), openai, or local. Sets the endpoint
+    /// and API-key env.
     #[arg(long, global = true)]
     provider: Option<String>,
 
@@ -87,26 +83,6 @@ struct Cli {
     /// Show the model's `<think>` reasoning: on/off/1/0 (default on).
     #[arg(long = "show-thinking", global = true, value_name = "on|off")]
     show_thinking: Option<String>,
-
-    /// Don't spawn a local backend; use the endpoint at --base-url.
-    #[arg(long, global = true)]
-    no_backend: bool,
-
-    /// Model ref (HF org/repo:quant or .gguf path) for the spawned backend.
-    #[arg(long, global = true)]
-    backend_model: Option<String>,
-
-    /// llama.cpp fallback binary to spawn when infr isn't on PATH (default: llama-server).
-    #[arg(long, global = true)]
-    backend_bin: Option<String>,
-
-    /// Context window size for the spawned backend (llama.cpp; display-only for infr).
-    #[arg(long, global = true)]
-    backend_ctx: Option<u32>,
-
-    /// Extra arg passed verbatim to the llama.cpp fallback (repeatable), e.g. --backend-arg=-ngl --backend-arg=99.
-    #[arg(long = "backend-arg", global = true)]
-    backend_args: Vec<String>,
 
     /// Print shell completions to stdout and exit
     #[arg(long, value_enum, value_name = "SHELL", hide = true)]
@@ -291,40 +267,18 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Bring up a local backend unless told not to — infr if it's on PATH, else
-    // a llama.cpp fallback. Remote providers never spawn one. Held for the
-    // command; dropping it kills the server.
-    let mut backend_ctx_fallback: Option<u32> = None;
-    let _backend = if cli.no_backend || remote_provider {
-        None
-    } else {
-        let mut bcfg = BackendConfig::default();
-        if let Some(m) = cli.backend_model {
-            bcfg.model = m;
-        }
-        if let Some(b) = cli.backend_bin {
-            bcfg.bin = b;
-        }
-        if let Some(c) = cli.backend_ctx {
-            bcfg.ctx = c;
-        }
-        bcfg.extra_args = cli.backend_args;
-        backend_ctx_fallback = Some(bcfg.ctx);
-        Some(Backend::ensure(&bcfg, &config.base_url).await?)
-    };
-
     // Resolve the context window (drives the status bar's "X of Y" + the
     // auto-compaction threshold). Precedence: explicit config/provider wins;
     // else ask the server (many OpenAI-compatible servers advertise it — vLLM's
-    // `max_model_len`, llama.cpp's `/props` n_ctx, …); else the spawned backend's
-    // configured ctx. Left unknown for a remote that advertises nothing.
+    // `max_model_len`, llama.cpp's `/props` n_ctx, …). Left unknown for an
+    // endpoint that advertises nothing.
     if config.context_window.is_none() {
         let probe = hrdr_llm::Client::new(
             config.base_url.clone(),
             config.api_key.clone(),
             config.model.clone(),
         );
-        config.context_window = probe.context_window().await.or(backend_ctx_fallback);
+        config.context_window = probe.context_window().await;
     }
 
     match cli.command {

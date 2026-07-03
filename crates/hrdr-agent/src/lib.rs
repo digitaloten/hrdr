@@ -70,7 +70,7 @@ pub struct AgentConfig {
     /// binary into `base_url`/`api_key`/backend behaviour via [`resolve_provider`].
     pub provider: Option<String>,
     /// Model context window in tokens, for the status bar's "X of Y" display.
-    /// Derived from the spawned backend when local; set in config for remotes.
+    /// Probed from the endpoint when unset; set in config to override.
     pub context_window: Option<u32>,
     /// Reasoning-effort label shown in the status bar (e.g. `low`/`medium`/`high`).
     pub effort: Option<String>,
@@ -222,7 +222,9 @@ pub struct ProviderConfig {
     /// Default model for this provider.
     #[serde(default)]
     pub model: Option<String>,
-    /// Whether hrdr should skip spawning a local backend (default: true).
+    /// Whether this is a remote/hosted provider that needs an API key
+    /// (default: true). A local/self-hosted endpoint sets `false` to silence
+    /// the missing-key and missing-model warnings.
     #[serde(default)]
     pub remote: Option<bool>,
     /// Model context window (for the status bar's "X of Y").
@@ -278,7 +280,7 @@ pub struct ResolvedProvider {
 ///
 /// - `zen` / `opencode` — OpenCode Zen gateway (`OPENCODE_API_KEY`).
 /// - `openai` — OpenAI (`OPENAI_API_KEY`).
-/// - `local` / `infr` — a local OpenAI-compatible server (spawned backend).
+/// - `local` / `infr` — a local OpenAI-compatible server you run yourself.
 pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
     let (base_url, key_env, remote) = match name.trim().to_ascii_lowercase().as_str() {
         "zen" | "opencode" | "opencode-zen" => {

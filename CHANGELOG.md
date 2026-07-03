@@ -12,13 +12,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   length (system prompt + every turn and tool result). Surfaced through the
   shared command core, so it appears in both the TUI and the GUI.
 
-### Fixed
-
-- **Verbatim-retry breaker messages no longer contain stray whitespace.** The
-  refusal and nudge strings had runs of literal spaces (missing line
-  continuations), so the model saw
-  `…failed 2 times                      in a row…`. Cleaned up to normal prose.
-
 ### Changed
 
 - **Internal DRY/YAGNI cleanup of `hrdr-agent` (no behaviour change).** The
@@ -29,6 +22,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deduplicated; and the unused `run_tool_streaming`, `session_dir` export, and
   `CheckpointInfo`/`FileCheckpoints` re-exports were removed. Net ~160 fewer
   lines.
+
+### Removed
+
+- **Local model-server spawning (breaking).** hrdr no longer launches or manages
+  a model server — the `infr serve` / `llama-server` bootstrap and its
+  `apps/hrdr/src/backend.rs` module are gone, along with the `--no-backend`,
+  `--backend-model`, `--backend-bin`, `--backend-ctx`, and `--backend-arg`
+  flags. hrdr now only talks to an already-running OpenAI-compatible endpoint:
+  select one with a `--provider` preset or `--base-url`, and start your own
+  server (infr, llama.cpp, vLLM, …) if you want one locally. The `local` /
+  `infr` preset still defaults to `http://localhost:8080/v1`, so a
+  locally-running server needs no flags.
+
+### Fixed
+
+- **Verbatim-retry breaker messages no longer contain stray whitespace.** The
+  refusal and nudge strings had runs of literal spaces (missing line
+  continuations), so the model saw
+  `…failed 2 times                      in a row…`. Cleaned up to normal prose.
+
+## [0.2.1] - 2026-07-03
 
 ### Fixed
 

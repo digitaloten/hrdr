@@ -12,9 +12,10 @@ job is done.
 
 > Active development, released as **v0.1.x**. The agent loop, adaptive tool set,
 > sessions, file checkpoints, config hot-reload, a rich TUI, **and a floem-based
-> GUI with full command parity** are in place. The default local backend is
-> [`infr`](https://github.com/kryptic-sh/infr) (with a `llama-server` fallback);
-> see the roadmap for what's next.
+> GUI with full command parity** are in place. hrdr connects to any running
+> OpenAI-compatible endpoint — a hosted provider or a server you run yourself
+> ([`infr`](https://github.com/kryptic-sh/infr), llama.cpp, vLLM, …). See the
+> roadmap for what's next.
 
 ## Install
 
@@ -139,45 +140,39 @@ Sessions auto-save per working directory and auto-resume on reopen. Project
 instructions are read from `AGENTS.md` (the open [agents.md](https://agents.md)
 standard) walking up from the cwd.
 
-### Local backend
+### Model endpoint
 
-By default hrdr **spawns a local backend** and shuts it down on exit. It's
-**presence-aware and infr-first**: if
-[`infr`](https://github.com/kryptic-sh/infr) is on `PATH` it's launched as
-`infr serve <model>` (native `tools`/`tool_calls`, SSE, GGUF Jinja chat
-template); otherwise it falls back to **`llama-server`** (llama.cpp, started
-with `--jinja` so tool calling works). If neither is installed, hrdr errors and
-points you at `--no-backend`. See `apps/hrdr/src/backend.rs`.
+hrdr does **not** manage a model server — it talks to any running
+OpenAI-compatible `/v1` endpoint. Point it at one with `--base-url` /
+`$HRDR_BASE_URL`, or use a `--provider` preset (below). The default endpoint is
+`http://localhost:8080/v1`, so a locally-running server needs no flags.
+
+To serve a model locally, run your own — for native tool calling either works:
 
 ```bash
-hrdr                                   # spawns infr (or llama-server); default model Qwen3-8B
-hrdr --backend-model unsloth/Qwen3-14B-GGUF:Q4_K_M       # pick a bigger model (HF ref or .gguf path)
-hrdr --backend-arg=-ngl --backend-arg=99                 # GPU offload passthrough (llama.cpp fallback)
-hrdr --no-backend                      # use an endpoint you started yourself
-```
+infr serve <model> --addr 127.0.0.1:8080          # infr (native tools/tool_calls, SSE)
+llama-server -hf <hf-ref> --jinja --port 8080     # llama.cpp (--jinja enables tool calls)
 
-If a backend is already answering at `--base-url`, hrdr reuses it instead of
-spawning. Spawn logs go to `~/.cache/hrdr/infr-serve.log` (or
-`llama-server.log`). infr tuning (sampling, max tokens) is via `INFR_*` env
-vars; the same `--backend-model` ref works for both backends.
+hrdr                                              # then just launch hrdr
+hrdr --base-url http://localhost:1234/v1          # or point at any other endpoint
+```
 
 ### Providers
 
 `--provider <name>` (or `provider = "..."` in config, or `$HRDR_PROVIDER`)
-selects a preset endpoint + API-key env, and remote providers skip the local
-backend:
+selects a preset endpoint + API-key env:
 
 Built-in presets:
 
-| Provider               | Endpoint                       | API key env          | Backend |
-| ---------------------- | ------------------------------ | -------------------- | ------- |
-| `zen` / `opencode`     | `https://opencode.ai/zen/v1`   | `OPENCODE_API_KEY`   | remote  |
-| `openai`               | `https://api.openai.com/v1`    | `OPENAI_API_KEY`     | remote  |
-| `openrouter`           | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | remote  |
-| `claude` / `anthropic` | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY`  | remote  |
-| `local` / `infr`       | `http://localhost:8080/v1`     | `HRDR_API_KEY`       | spawned |
+| Provider               | Endpoint                       | API key env          |
+| ---------------------- | ------------------------------ | -------------------- |
+| `zen` / `opencode`     | `https://opencode.ai/zen/v1`   | `OPENCODE_API_KEY`   |
+| `openai`               | `https://api.openai.com/v1`    | `OPENAI_API_KEY`     |
+| `openrouter`           | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| `claude` / `anthropic` | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY`  |
+| `local` / `infr`       | `http://localhost:8080/v1`     | `HRDR_API_KEY`       |
 
-(`claude` uses Anthropic's OpenAI-compatible endpoint.)
+(`claude` uses Anthropic's OpenAI-compatible endpoint. `local` needs no key.)
 
 ```bash
 export OPENCODE_API_KEY=sk-...
@@ -199,7 +194,7 @@ provider = "mylocal"            # default provider for this config
 [providers.mylocal]
 base_url = "http://localhost:8080/v1"
 model = "Qwen3-30B-A3B"
-remote = false                  # hrdr may spawn/own a local backend
+remote = false                  # self-hosted: no API key required
 context_window = 16384
 
 [providers.zen]
@@ -216,9 +211,8 @@ model = "gpt-5.5"
 
 `context_window` is optional: if you omit it, hrdr probes the endpoint on
 startup and uses what it advertises (vLLM's `max_model_len`, llama.cpp's
-`/props` `n_ctx`, etc.), falling back to the spawned backend's `--backend-ctx`
-(default 16384). Set it explicitly to override detection — the OpenAI API
-doesn't expose context length, and some servers (including infr today) don't
+`/props` `n_ctx`, etc.). Set it explicitly to override detection — the OpenAI
+API doesn't expose context length, and some servers (including infr today) don't
 advertise it. It drives the status bar's "X of Y" and the auto-compaction
 threshold.
 
@@ -299,14 +293,14 @@ Configuration (CLI flags override env):
 hrdr works with zero extra tools installed, but the agent is more capable when
 these are on `PATH`. It detects what's available and adapts.
 
-| Tool                           | Why                                                                                                          |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------ |
-| **bash** and/or **PowerShell** | The shell tool. At least one lets the model run builds/tests/commands. `bash` on unix; `pwsh` runs anywhere. |
-| **ripgrep** (`rg`)             | Fastest `grep` backend. Falls back to POSIX `grep`, then a built-in walker — but `rg` is best.               |
-| **git**                        | Repo awareness (branch in the status bar). In a git repo, file checkpoints auto-disable since git covers it. |
-| **`$EDITOR` / `$VISUAL`**      | Used by `Ctrl+G` and `/edit` (falls back to `vi`).                                                           |
-| A **Nerd Font**                | Status-bar icons. Otherwise set `icons = unicode` or `ascii` (config / `--icons` / `$HRDR_ICONS`).           |
-| **infr** or **llama.cpp**      | The managed local backend (infr preferred, `llama-server` fallback). Not needed with a remote provider.      |
+| Tool                           | Why                                                                                                               |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| **bash** and/or **PowerShell** | The shell tool. At least one lets the model run builds/tests/commands. `bash` on unix; `pwsh` runs anywhere.      |
+| **ripgrep** (`rg`)             | Fastest `grep` backend. Falls back to POSIX `grep`, then a built-in walker — but `rg` is best.                    |
+| **git**                        | Repo awareness (branch in the status bar). In a git repo, file checkpoints auto-disable since git covers it.      |
+| **`$EDITOR` / `$VISUAL`**      | Used by `Ctrl+G` and `/edit` (falls back to `vi`).                                                                |
+| A **Nerd Font**                | Status-bar icons. Otherwise set `icons = unicode` or `ascii` (config / `--icons` / `$HRDR_ICONS`).                |
+| **infr** or **llama.cpp**      | Only to self-host a model locally — run one yourself (infr or `llama-server`). Not needed with a hosted provider. |
 
 `SEARXNG_URL` (optional) points `web_search` at a SearXNG instance for more
 reliable results than the zero-config DuckDuckGo default.
@@ -338,8 +332,9 @@ The shell and search tools adapt to the host:
 - [x] File checkpoints + `/revert`; network retry + auto-compact on overflow
 - [x] Config file with persistence + OS-level hot-reload
 - [x] Cross-platform CI (Linux/macOS/Windows)
-- [x] Managed local backend — infr-first (native tool calls), `llama-server`
-      fallback
+- [x] Provider-agnostic: presets (zen/openai/openrouter/claude/local) + custom
+      `[providers.*]`, or any `--base-url`; bring your own OpenAI-compatible
+      server
 - [x] hjkl deps via crates.io registry pins (standalone CI)
 - [x] Shared UI-agnostic core (`hrdr-app`): one implementation of every slash
       command, sessions, status bar, and transcript model for both frontends
