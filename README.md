@@ -216,12 +216,21 @@ threshold.
 
 ### Guardrails
 
-The shell tools mechanically reject the classic git foot-guns before they run —
+The shell tools mechanically reject the classic foot-guns before they run —
 blanket staging (`git add -A` / `--all` / `.`), force-push (`--force-with-lease`
-is allowed), hook skipping (`--no-verify`), destructive commands
-(`reset --hard`, `clean -f`, `checkout/restore .`), and interactive commands
-that need a TTY. The model gets a corrective error instead ("stage the files you
-actually changed"), which is far more reliable than a prompt rule alone.
+is allowed), hook skipping (`--no-verify`), destructive git commands
+(`reset --hard`, `clean -f`, `checkout/restore .`), interactive commands that
+need a TTY, whole-tree deletes (`rm -rf /`, `~`, `.`, `*` — with or without
+`sudo`; specific paths stay allowed), and piping downloaded scripts into a shell
+(`curl … | sh` → save to a temp file, review, then run). The model gets a
+corrective error instead ("stage the files you actually changed"), which is far
+more reliable than a prompt rule alone. `sudo` itself is allowed — installing
+system packages at the user's request is the user's call — but it can't launder
+an otherwise-blocked command.
+
+File mutations (`write_file`/`edit`) are confined to the working directory (the
+system temp dir is always allowed for scratch); set `allow_outside_cwd = true`
+in config (or `$HRDR_ALLOW_OUTSIDE_CWD`) to lift that.
 
 Add project- or workflow-specific rules in config; they apply on top of the
 built-ins:

@@ -8,6 +8,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Shell output truncation now keeps the tail.** Long build/test output ends
+  with the failure summary; the old head-only 30 KB cut dropped exactly what the
+  model needed. `bash`/`powershell` results now keep ~1/5 head + ~4/5 tail with
+  a `[… N bytes omitted from the middle …]` marker
+  (`hrdr_tools::truncate_middle`). `read_file`/`grep` keep head-truncation
+  (pageable, deterministic). Timeout kills now suggest the recovery ("raise
+  timeout_ms or run a narrower command").
+
+- **Grep match cap.** A single `grep` call returns at most 200 matches, ending
+  with `… [N more matches — narrow the pattern or scope with path/glob]` instead
+  of silently flooding the context (all three backends: ripgrep, POSIX grep,
+  built-in walker).
+
+- **More guardrails: whole-tree deletes and curl-pipe-shell.** `rm` aimed at
+  `/`, `/*`, `~`, `$HOME`, `.`, `..`, or a bare `*` is rejected (specific paths
+  like `rm -rf target/` stay allowed), with or without a `sudo` prefix — `sudo`
+  itself stays permitted for user-requested system tasks, but can't launder a
+  blocked command. `curl/wget … | sh` is rejected with the recovery spelled out:
+  download to a temp file, review it, then run it.
+
+- **File mutations confined to the working directory.** `write_file`/`edit`
+  refuse paths outside the cwd (resolved through `..` and symlinks via
+  nearest-existing-ancestor canonicalization); the system temp dir is always
+  allowed for scratch. New config knob `allow_outside_cwd = true` /
+  `$HRDR_ALLOW_OUTSIDE_CWD` lifts the restriction.
+
+- **Edit near-match hint.** When `old_string` isn't found but a
+  whitespace-normalized match exists, the error says so ("a near-match differing
+  only in whitespace/indentation exists") instead of the generic stale-file
+  message — the #1 edit-retry cause on small models.
+
+- **System prompt: failure discipline + economy + safety.** New lines: never
+  re-run an identical failed call; read only what you need (narrow greps,
+  offset/limit); end with a short what-changed/how-verified summary. New Safety
+  section stating the mechanical limits (cwd confinement, sudo only on user
+  request, no curl-pipe-shell).
+
 - **Shell guardrails — mechanical enforcement of the git rules.** The `bash` /
   `powershell` tools now reject the classic foot-guns before they run, each with
   a corrective error the model learns from at the moment it matters: blanket

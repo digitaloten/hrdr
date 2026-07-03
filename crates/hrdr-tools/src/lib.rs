@@ -67,6 +67,10 @@ pub struct ToolContext {
     /// that isn't here — blind edits against guessed content are the top
     /// source of corrupt patches.
     pub read_files: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    /// When set (the default), `write_file`/`edit` refuse paths outside the
+    /// working directory (the system temp dir is always allowed for scratch).
+    /// Disable via config `allow_outside_cwd = true`.
+    pub restrict_to_cwd: bool,
 }
 
 impl ToolContext {
@@ -79,6 +83,7 @@ impl ToolContext {
             checkpoints: None,
             guardrails: Arc::new(default_guardrails()),
             read_files: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            restrict_to_cwd: true,
         }
     }
 
@@ -115,6 +120,29 @@ impl ToolContext {
         }
     }
 
+    /// Guard for the file-mutating tools: `Err` when `path` escapes both the
+    /// working directory and the system temp dir (scratch space) while
+    /// [`restrict_to_cwd`](Self::restrict_to_cwd) is on. Compares canonical
+    /// paths (via the nearest existing ancestor, so not-yet-created files
+    /// resolve too) — `../` tricks don't slip through.
+    pub fn ensure_within_cwd(&self, path: &std::path::Path) -> Result<()> {
+        if !self.restrict_to_cwd {
+            return Ok(());
+        }
+        let canon = canonicalize_nearest(path);
+        let cwd = canonicalize_nearest(&self.cwd);
+        if canon.starts_with(&cwd) || canon.starts_with(canonicalize_nearest(&std::env::temp_dir()))
+        {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "{} is outside the working directory ({}) — file changes are confined to the \
+             project; ask the user to change it themselves (or to set allow_outside_cwd)",
+            path.display(),
+            self.cwd.display()
+        ))
+    }
+
     /// Whether the model has seen `path`'s current content this session.
     pub fn was_read(&self, path: &std::path::Path) -> bool {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -122,6 +150,30 @@ impl ToolContext {
             .lock()
             .map(|set| set.contains(&canon))
             .unwrap_or(true) // poisoned lock: don't wedge edits
+    }
+}
+
+/// Canonicalize `path` by resolving its nearest existing ancestor (the path
+/// itself may not exist yet — e.g. a file about to be created) and re-joining
+/// the non-existent remainder.
+fn canonicalize_nearest(path: &std::path::Path) -> PathBuf {
+    let mut existing = path;
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(canon) = existing.canonicalize() {
+            let mut out = canon;
+            for c in rest.iter().rev() {
+                out.push(c);
+            }
+            return out;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
@@ -220,6 +272,52 @@ pub fn truncate(text: &str, max: usize) -> String {
     )
 }
 
+/// Truncate to `max` bytes keeping the **head and tail** with the omission in
+/// the middle. For shell output: build/test runs put the errors at the end, so
+/// head-only truncation (plain [`truncate`]) would cut exactly what the model
+/// needs. ~1/5 head, ~4/5 tail.
+pub fn truncate_middle(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let head_target = max / 5;
+    let tail_target = max - head_target;
+    let head_end = floor_char_boundary(text, head_target);
+    let mut tail_start = text.len() - tail_target;
+    while !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let omitted = tail_start - head_end;
+    format!(
+        "{}
+
+… [{omitted} bytes omitted from the middle — the end of the output follows] …
+
+{}",
+        &text[..head_end],
+        &text[tail_start..]
+    )
+}
+
+/// Cap line-per-match output at `max_matches` lines, appending a count of what
+/// was dropped and how to narrow the search. For search tools: a broad pattern
+/// shouldn't flood the context with thousands of hits.
+pub fn cap_matches(out: &str, max_matches: usize) -> String {
+    let total = out.lines().count();
+    if total <= max_matches {
+        return out.trim_end().to_string();
+    }
+    let kept: String = out.lines().take(max_matches).collect::<Vec<_>>().join(
+        "
+",
+    );
+    let more = total - max_matches;
+    format!(
+        "{kept}
+… [{more} more matches — narrow the pattern or scope with path/glob]"
+    )
+}
+
 /// Collapse `s` to a single line (newlines → spaces) and truncate to `max`
 /// **characters**, appending `…` if it was cut. For compact one-line previews
 /// (tool-arg previews, status lines) — width-based, unlike the byte-based
@@ -261,7 +359,7 @@ pub fn floor_char_boundary(s: &str, max: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     // ---- floor_char_boundary ----
 
@@ -326,6 +424,84 @@ mod tests {
     }
 
     // ---- ToolContext::resolve ----
+
+    #[test]
+    fn truncate_middle_keeps_head_and_tail() {
+        let text = format!(
+            "HEAD-MARKER
+{}
+TAIL-ERROR-LINE",
+            "x".repeat(50_000)
+        );
+        let out = truncate_middle(&text, 10_000);
+        assert!(out.starts_with("HEAD-MARKER"));
+        assert!(out.ends_with("TAIL-ERROR-LINE"), "tail must survive");
+        assert!(out.contains("bytes omitted from the middle"));
+        assert!(out.len() < 11_000);
+        // Under the cap: untouched.
+        assert_eq!(truncate_middle("short", 100), "short");
+    }
+
+    #[test]
+    fn cap_matches_limits_and_counts() {
+        let out: String = (0..300)
+            .map(|i| {
+                format!(
+                    "f.rs:{i}:hit
+"
+                )
+            })
+            .collect();
+        let capped = cap_matches(&out, 200);
+        assert_eq!(capped.lines().count(), 201); // 200 matches + marker
+        assert!(
+            capped.ends_with("[100 more matches — narrow the pattern or scope with path/glob]")
+        );
+        // Under the cap: untouched (minus trailing newline).
+        assert_eq!(
+            cap_matches(
+                "a:1:x
+b:2:y
+",
+                200
+            ),
+            "a:1:x
+b:2:y"
+        );
+    }
+
+    #[test]
+    fn ensure_within_cwd_confines_writes() {
+        // NB: tempdirs live under the system temp dir, which the gate always
+        // allows for scratch — so "outside" fixtures must be non-temp paths.
+        // The gate is a pure check (it fires before any I/O), so the paths
+        // don't need to exist or be writable.
+        let mut ctx = ToolContext::new("/etc");
+        // Inside cwd (including not-yet-created nested paths): allowed.
+        assert!(ctx.ensure_within_cwd(Path::new("/etc/sub/new.txt")).is_ok());
+        // Outside cwd: refused, with the recovery in the message.
+        let err = ctx
+            .ensure_within_cwd(Path::new("/usr/lib/x.txt"))
+            .unwrap_err();
+        assert!(err.to_string().contains("outside the working directory"));
+        // `..` escapes are resolved before the check.
+        assert!(
+            ctx.ensure_within_cwd(Path::new("/etc/../usr/escape.txt"))
+                .is_err()
+        );
+        // The system temp dir is always fair game for scratch…
+        assert!(
+            ctx.ensure_within_cwd(&std::env::temp_dir().join("hrdr-scratch.txt"))
+                .is_ok()
+        );
+        // …a temp cwd is inside by definition…
+        let dir = tempfile::tempdir().unwrap();
+        let tmp_ctx = ToolContext::new(dir.path());
+        assert!(tmp_ctx.ensure_within_cwd(&dir.path().join("a.txt")).is_ok());
+        // …and the knob disables the gate entirely.
+        ctx.restrict_to_cwd = false;
+        assert!(ctx.ensure_within_cwd(Path::new("/usr/lib/x.txt")).is_ok());
+    }
 
     #[test]
     fn tool_context_resolve_absolute_path() {

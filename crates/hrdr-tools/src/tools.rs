@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::{TodoItem, Tool, ToolContext, truncate};
+use crate::{TodoItem, Tool, ToolContext, cap_matches, truncate, truncate_middle};
 
 /// Hard cap on a rendered source line, so one minified file can't blow context.
 const MAX_LINE: usize = 2_000;
@@ -105,6 +105,7 @@ impl Tool for WriteTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: WriteArgs = serde_json::from_value(args).context("invalid write_file args")?;
         let path = ctx.resolve(&a.path);
+        ctx.ensure_within_cwd(&path)?;
         let existed = tokio::fs::try_exists(&path).await.unwrap_or(false);
         if existed && !ctx.was_read(&path) {
             bail!(
@@ -202,6 +203,7 @@ impl Tool for EditTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: EditArgs = serde_json::from_value(args).context("invalid edit args")?;
         let path = ctx.resolve(&a.path);
+        ctx.ensure_within_cwd(&path)?;
         if !ctx.was_read(&path) {
             bail!(
                 "you haven't read {} yet — call read_file first, then copy old_string \
@@ -214,6 +216,18 @@ impl Tool for EditTool {
             .with_context(|| format!("reading {}", path.display()))?;
         let count = text.matches(&a.old_string).count();
         if count == 0 {
+            // The #1 retry cause: right text, wrong whitespace. Detect it and
+            // say so instead of the generic error.
+            let norm = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+            let normalized_old = norm(&a.old_string);
+            if !normalized_old.is_empty() && norm(&text).contains(&normalized_old) {
+                bail!(
+                    "old_string not found in {}, but a near-match differing only in \
+                     whitespace/indentation exists — copy the exact text from read_file \
+                     output (keep tabs/spaces, strip the line-number prefix)",
+                    path.display()
+                );
+            }
             bail!(
                 "old_string not found in {} — the file may have changed since you read it; \
                  re-read it and copy the exact current text (whitespace included, no \
@@ -355,7 +369,8 @@ async fn run_streamed_command(
             // orphaned) and hand the model whatever it printed so far.
             let _ = child.kill().await;
             out.push_str(&format!(
-                "[command timed out after {}ms; process killed]\n",
+                "[command timed out after {}ms; process killed — raise timeout_ms or run a \
+                 narrower command]\n",
                 timeout.as_millis()
             ));
             None
@@ -370,7 +385,9 @@ async fn run_streamed_command(
     if out.is_empty() {
         return Ok("(no output)".to_string());
     }
-    Ok(truncate(out, ctx.max_output))
+    // Head+tail truncation: build/test output puts the failures at the end —
+    // plain head-only truncation would cut exactly what the model needs.
+    Ok(truncate_middle(out, ctx.max_output))
 }
 
 /// The available shell tools for this machine (bash and/or PowerShell), only
@@ -465,6 +482,10 @@ struct GrepArgs {
     glob: Option<String>,
 }
 
+/// Max matches a single grep call returns; beyond this the result ends with a
+/// "narrow the pattern" nudge instead of flooding the context.
+const GREP_MAX_MATCHES: usize = 200;
+
 #[async_trait]
 impl Tool for GrepTool {
     fn name(&self) -> &'static str {
@@ -543,7 +564,12 @@ async fn run_search_cmd(
         }
         return Ok("(no matches)".to_string());
     }
-    Ok(truncate(&stdout, ctx.max_output))
+    // Cap by match count first (with a "narrow the pattern" nudge), then by
+    // bytes as the backstop.
+    Ok(truncate(
+        &cap_matches(&stdout, GREP_MAX_MATCHES),
+        ctx.max_output,
+    ))
 }
 
 /// Pure-Rust search fallback: walk the tree (honoring `.gitignore`) and match
@@ -564,6 +590,7 @@ fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
         .context("invalid glob")?;
 
     let mut out = String::new();
+    let mut matches = 0usize;
     let walker = ignore::WalkBuilder::new(&root)
         .max_depth(Some(20))
         .hidden(true)
@@ -587,6 +614,13 @@ fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
         let disp = path.strip_prefix(&ctx.cwd).unwrap_or(path);
         for (i, line) in text.lines().enumerate() {
             if re.is_match(line) {
+                matches += 1;
+                if matches > GREP_MAX_MATCHES {
+                    out.push_str(
+                        "… [match limit reached — narrow the pattern or scope with path/glob]",
+                    );
+                    break 'walk;
+                }
                 out.push_str(&format!("{}:{}:{}\n", disp.display(), i + 1, line));
                 if out.len() > ctx.max_output {
                     break 'walk;
@@ -597,7 +631,7 @@ fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     if out.is_empty() {
         Ok("(no matches)".to_string())
     } else {
-        Ok(truncate(&out, ctx.max_output))
+        Ok(truncate(out.trim_end(), ctx.max_output))
     }
 }
 
@@ -971,6 +1005,65 @@ mod tests {
                 .unwrap();
             assert!(out.contains("ok"));
         }
+    }
+
+    #[tokio::test]
+    async fn edit_whitespace_near_match_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.rs");
+        std::fs::write(&path, "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        c.mark_read(&path);
+        // Same tokens, wrong indentation (tab instead of 4 spaces).
+        let err = EditTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "old_string": "\tlet x = 1;", "new_string": "\tlet x = 2;"}),
+                &c,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("whitespace/indentation"),
+            "expected the near-match hint, got: {err}"
+        );
+        // Genuinely absent text keeps the generic stale-file error.
+        let err = EditTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "old_string": "let y = 9;", "new_string": "z"}),
+                &c,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("may have changed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mutations_outside_cwd_refused() {
+        // Tempdirs are inside the always-allowed temp tree, so the "outside"
+        // target must be a non-temp path. The gate fires before any I/O, so
+        // it needn't exist (and /etc isn't writable anyway — belt & braces).
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let target = "/etc/hrdr-gate-test.txt";
+        let err = WriteTool
+            .execute(serde_json::json!({"path": target, "content": "pwned"}), &c)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the working directory"),
+            "{err}"
+        );
+        let err = EditTool
+            .execute(
+                serde_json::json!({"path": target, "old_string": "a", "new_string": "b"}),
+                &c,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the working directory"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

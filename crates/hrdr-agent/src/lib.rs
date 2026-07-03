@@ -89,6 +89,9 @@ pub struct AgentConfig {
     /// Extra shell guardrails from `[[guardrails]]` in config, applied on top
     /// of the built-in rules.
     pub guardrails: Vec<GuardrailConfig>,
+    /// Let `write_file`/`edit` touch paths outside the working directory
+    /// (default `false`; the system temp dir is always allowed).
+    pub allow_outside_cwd: bool,
 }
 
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
@@ -111,6 +114,7 @@ impl Default for AgentConfig {
             checkpoints: None,
             providers: HashMap::new(),
             guardrails: Vec::new(),
+            allow_outside_cwd: false,
         }
     }
 }
@@ -223,6 +227,7 @@ struct FileConfig {
     providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
     guardrails: Vec<GuardrailConfig>,
+    allow_outside_cwd: Option<bool>,
 }
 
 /// `hrdr`'s config directory — `$XDG_CONFIG_HOME/hrdr`, default
@@ -303,6 +308,9 @@ impl AgentConfig {
         if !fc.guardrails.is_empty() {
             self.guardrails = fc.guardrails;
         }
+        if let Some(v) = fc.allow_outside_cwd {
+            self.allow_outside_cwd = v;
+        }
     }
 
     /// Layer environment variables over the current config. Every knob is one
@@ -354,6 +362,11 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     ("HRDR_BASE_URL", |c, v| c.base_url = v),
     ("HRDR_MODEL", |c, v| c.model = v),
     ("HRDR_CHECKPOINTS", |c, v| c.checkpoints = Some(v)),
+    ("HRDR_ALLOW_OUTSIDE_CWD", |c, v| {
+        if let Some(b) = parse_env_bool(&v) {
+            c.allow_outside_cwd = b;
+        }
+    }),
     ("HRDR_AUTO_COMPACT", |c, v| {
         if let Ok(f) = v.parse() {
             c.auto_compact = f;
@@ -472,6 +485,7 @@ impl Agent {
     pub fn new(config: AgentConfig) -> Result<Self> {
         let tools = ToolRegistry::with_defaults();
         let mut ctx = ToolContext::new(config.cwd.clone());
+        ctx.restrict_to_cwd = !config.allow_outside_cwd;
         // User guardrails layer on top of the built-in set; an invalid regex
         // is skipped (lenient, like the rest of config parsing).
         if !config.guardrails.is_empty() {
@@ -1313,6 +1327,7 @@ mod tests {
             checkpoints: Some("on".to_string()),
             providers: HashMap::new(),
             guardrails: vec![],
+            allow_outside_cwd: Some(true),
         });
         assert_eq!(cfg.base_url, "http://custom/v1");
         assert_eq!(cfg.api_key.as_deref(), Some("key123"));
@@ -1323,6 +1338,7 @@ mod tests {
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!((cfg.auto_compact - 0.7).abs() < f64::EPSILON);
         assert_eq!(cfg.checkpoints.as_deref(), Some("on"));
+        assert!(cfg.allow_outside_cwd);
     }
 
     #[test]
