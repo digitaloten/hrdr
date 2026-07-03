@@ -193,15 +193,12 @@ async fn main() -> Result<()> {
         if !base_overridden {
             config.base_url = p.base_url.clone();
         }
-        // Key: an inline key wins, else the provider's key_env.
-        if let Some(key) = p.api_key.clone() {
+        // Key precedence: inline > key_env var > credential saved by `/login`.
+        if let Some(key) = hrdr_agent::resolve_api_key(name, &p) {
             config.api_key = Some(key);
-        } else if let Some(env) = &p.key_env {
-            if let Ok(key) = std::env::var(env) {
-                config.api_key = Some(key);
-            } else if p.remote && config.api_key.is_none() {
-                eprintln!("hrdr: provider '{name}' needs an API key — set ${env}");
-            }
+        } else if p.remote && config.api_key.is_none() {
+            let env = p.key_env.as_deref().unwrap_or("HRDR_API_KEY");
+            eprintln!("hrdr: provider '{name}' needs an API key — set ${env}, or run /login");
         }
         // Provider's default model, unless the user set one explicitly.
         let model_overridden = cli.model.is_some() || std::env::var_os("HRDR_MODEL").is_some();

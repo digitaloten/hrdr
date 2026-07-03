@@ -127,7 +127,8 @@ Type `/` to see the menu (fuzzy-matched, `Tab` to accept). Highlights:
 
 - **Session** — `/clear`, `/sessions`, `/resume <id|name>`, `/rename`,
   `/compact`, `/info`, `/goto <N|5m|top|end>`, `/find <text>` (`/next` `/prev`)
-- **Model** — `/model`, `/models`, `/provider`, `/temp`, `/effort`, `/reasoning`
+- **Model** — `/model`, `/models`, `/provider`, `/login` (guided provider + key
+  setup), `/temp`, `/effort`, `/reasoning`
 - **Files** — `/init` (write `AGENTS.md`), `/add`, `/edit <file>`, `/diff`,
   `/revert` + `/checkpoints` (file undo), `/tools`, `/expand`, `/paste`
 - **Reply** — `/copy [code|all|msg N]`, `/export [--json]`, `/retry [model]`,
@@ -181,6 +182,19 @@ hrdr --provider zen --model grok-build-0.1 # chat against a Zen model
 ```
 
 `--base-url` / `$HRDR_BASE_URL` still override a provider's endpoint.
+
+#### `/login` — guided setup
+
+Rather than exporting an env var, run **`/login`** in the TUI or GUI: pick a
+provider, paste its API key, and hrdr saves it as your default. The key is
+resolved at startup in the order **inline config → `key_env` → saved
+credential**, so a running server or an exported env var still wins.
+
+Credentials are stored **separately from `config.toml`**, in a dedicated
+`~/.config/hrdr/auth.toml` (`0600` on unix) — a flat `provider = "key"` map. The
+wizard prints the exact path and a plaintext-storage warning before it saves.
+Keeping keys out of `config.toml` means you can share or version that file
+without leaking secrets.
 
 #### Custom providers
 

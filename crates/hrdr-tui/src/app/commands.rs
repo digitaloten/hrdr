@@ -74,6 +74,7 @@ impl super::App {
         self.find = hrdr_app::FindState::default();
         self.pending_goto = None;
         self.pending_edit = None;
+        self.login = None;
         self.expand_tools = false;
     }
     /// Apply an `/expand` mode (shared dispatch parses the arg), returning the
@@ -415,7 +416,28 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
             self.app.context_window = tokens;
         }
     }
+    fn begin_login(&mut self) {
+        let wizard = hrdr_app::LoginWizard::start(self);
+        self.app.login = Some(wizard);
+    }
     fn help_tips(&self) -> Option<String> {
         Some(HELP_TIPS.to_string())
+    }
+}
+
+impl super::App {
+    /// Feed one submitted line to the active `/login` wizard, dropping the modal
+    /// slot when it finishes. Caller checks `self.login.is_some()` first.
+    pub(super) fn login_feed(&mut self, line: &str) {
+        let Some(mut wizard) = self.login.take() else {
+            return;
+        };
+        let done = {
+            let mut host = TuiHost { app: self };
+            wizard.step(line, &mut host)
+        };
+        if !done {
+            self.login = Some(wizard);
+        }
     }
 }

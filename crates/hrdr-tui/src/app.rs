@@ -142,6 +142,9 @@ pub(crate) struct App {
     pending_init: bool,
     /// A file `/edit` requested to open in `$EDITOR`, consumed by the run loop.
     pending_edit: Option<std::path::PathBuf>,
+    /// An in-progress `/login` wizard; while `Some`, submitted lines feed it
+    /// instead of the model or the slash dispatcher.
+    login: Option<hrdr_app::LoginWizard>,
     /// A `/goto` target message number, resolved to a scroll offset at draw.
     pub(crate) pending_goto: Option<usize>,
     /// Last `/find` query (also drives transcript highlighting) and the message
@@ -290,6 +293,7 @@ impl App {
             compacting: false,
             pending_init: false,
             pending_edit: None,
+            login: None,
             pending_goto: None,
             find: hrdr_app::FindState::default(),
             auto_compact_ratio: auto_compact,
@@ -500,6 +504,14 @@ impl App {
         if self.editor.wants_submit(&ekey) {
             let input = self.editor.content();
             if input.trim().is_empty() {
+                return Action::None;
+            }
+            // A running `/login` wizard captures the line (an API key must never
+            // reach input history or the transcript), before anything else.
+            if self.login.is_some() {
+                self.login_feed(input.trim());
+                self.editor.set_content("");
+                self.scroll_offset = 0;
                 return Action::None;
             }
             self.record_history(&input);

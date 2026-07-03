@@ -12,6 +12,7 @@ mod config;
 mod format;
 mod highlight;
 mod history;
+mod login;
 mod palette;
 mod sessions;
 mod status;
@@ -23,6 +24,7 @@ pub use config::*;
 pub use format::*;
 pub use highlight::*;
 pub use history::*;
+pub use login::*;
 pub use palette::*;
 pub use sessions::*;
 pub use status::*;
@@ -43,6 +45,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "show or switch model"),
     ("/models", "list models from the endpoint"),
     ("/provider", "switch provider preset"),
+    ("/login", "set up a provider + API key (wizard)"),
     ("/theme", "switch theme (path, or reset)"),
     ("/cwd", "show or change working directory"),
     ("/tools", "list available tools"),
@@ -107,6 +110,7 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/model",
             "/models",
             "/provider",
+            "/login",
             "/temp",
             "/effort",
             "/thinking",

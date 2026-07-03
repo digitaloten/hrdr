@@ -4,9 +4,11 @@
 //! complete: stream a turn, execute any requested tools, feed the results back,
 //! repeat. Emits [`AgentEvent`]s for a UI (or stdout) to render live.
 
+mod auth;
 mod prompt;
 mod session;
 
+pub use auth::{auth_file_path, auth_token, load_auth_tokens, save_auth_token};
 pub use session::{
     Session, SessionMeta, cwd_slug, list_sessions, resolve_session, sessions_dir, unique_session_id,
 };
@@ -274,6 +276,20 @@ pub struct ResolvedProvider {
     pub model: Option<String>,
     pub remote: bool,
     pub context_window: Option<u32>,
+}
+
+/// Canonical built-in provider names, in the order the `/login` wizard offers
+/// them. Each resolves through [`builtin_provider`]; `local` needs no API key.
+pub const BUILTIN_PROVIDERS: &[&str] = &["zen", "openai", "openrouter", "claude", "local"];
+
+/// Resolve the API key for a provider: an inline key wins, then the provider's
+/// `key_env` variable, then a credential saved by `/login`. `None` when none is
+/// available (a keyless local endpoint, or a remote that hasn't been set up).
+pub fn resolve_api_key(provider: &str, p: &ResolvedProvider) -> Option<String> {
+    p.api_key
+        .clone()
+        .or_else(|| p.key_env.as_ref().and_then(|e| std::env::var(e).ok()))
+        .or_else(|| auth_token(provider))
 }
 
 /// Resolve a built-in provider name (case-insensitive).

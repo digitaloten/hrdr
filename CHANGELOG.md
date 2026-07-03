@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/login` — a guided provider + API-key wizard.** Run `/login` in the TUI or
+  GUI, pick a provider from the list, and paste its API key; hrdr switches to it
+  live and makes it the default for next launch. Keys are stored **separately
+  from `config.toml`**, in a dedicated `~/.config/hrdr/auth.toml` (`0600` on
+  unix); the wizard shows the exact path and a plaintext-storage warning before
+  saving, and the entered key never touches the transcript or input history.
+  Startup key resolution is now **inline config → `key_env` → saved
+  credential**. Shared core, so both frontends get the same flow.
+
 - **`/info` now shows a `messages: N` line** — the raw conversation-history
   length (system prompt + every turn and tool result). Surfaced through the
   shared command core, so it appears in both the TUI and the GUI.

@@ -214,6 +214,9 @@ fn app_view(
     let transcript: RwSignal<Vec<Item>> = create_rw_signal(Vec::new());
     let input = create_rw_signal(String::new());
     let running = create_rw_signal(false);
+    // A running `/login` wizard; while `Some`, submitted lines feed it instead
+    // of the model or the slash dispatcher (an API key must never be echoed).
+    let login: RwSignal<Option<hrdr_app::LoginWizard>> = create_rw_signal(None);
     // Sticky `/expand all`: new tools spawn expanded while set (TUI parity).
     let expand_all = create_rw_signal(false);
     // Finish nudge (the TUI's bell → a desktop notification here); reloadable.
@@ -703,6 +706,68 @@ fn app_view(
         if text.is_empty() {
             return;
         }
+        // The command host, built once and reused by the `/login` wizard and the
+        // slash dispatcher below.
+        let mut host = GuiHost {
+            cx,
+            transcript,
+            next_id,
+            usage,
+            model,
+            input,
+            effort,
+            running,
+            file_index,
+            file_index_state,
+            session_id,
+            session_label,
+            save_gen,
+            turn_start,
+            ttft,
+            show_reasoning,
+            theme: theme_sig,
+            theme_rev,
+            timestamp_style,
+            statusbar_mode,
+            dir: dir_sig,
+            branch: branch_sig,
+            session_in,
+            session_out,
+            todo_ttl,
+            todos: todos_for_send.clone(),
+            todos_sig,
+            todo_turn,
+            todo_completed_at: todo_stamps_for_send.clone(),
+            expand_all,
+            bell,
+            auto_compact_ratio,
+            find_query,
+            find_pos,
+            ctx_window,
+            cfg: cfg_for_send.clone(),
+            queue: queue_for_send.clone(),
+            turn_handle: th_for_host.clone(),
+            spawn_turn: spawn_for_send.clone(),
+            start_compaction: compact_for_send.clone(),
+            compacting,
+            pending_init,
+            config_mtime_seen: mtime_for_send.clone(),
+            clipboard: clipboard_for_send.clone(),
+            agent: agent_for_send.clone(),
+            tx: tx_for_send.clone(),
+            base_url,
+            login,
+        };
+        // A running `/login` wizard captures the line before history/quit/
+        // dispatch — an API key must never be echoed, recalled, or sent.
+        if login.get_untracked().is_some() {
+            if let Some(mut wizard) = login.get_untracked() {
+                let done = wizard.step(&text, &mut host);
+                login.set((!done).then_some(wizard));
+            }
+            input.set(String::new());
+            return;
+        }
         // Record every submitted line for Up/Down recall, and reset browsing.
         history_for_send.borrow_mut().record(&text);
         // Common quit words (shared with the TUI) close the window.
@@ -757,55 +822,6 @@ fn app_view(
                     return;
                 }
             }
-            let mut host = GuiHost {
-                cx,
-                transcript,
-                next_id,
-                usage,
-                model,
-                input,
-                effort,
-                running,
-                file_index,
-                file_index_state,
-                session_id,
-                session_label,
-                save_gen,
-                turn_start,
-                ttft,
-                show_reasoning,
-                theme: theme_sig,
-                theme_rev,
-                timestamp_style,
-                statusbar_mode,
-                dir: dir_sig,
-                branch: branch_sig,
-                session_in,
-                session_out,
-                todo_ttl,
-                todos: todos_for_send.clone(),
-                todos_sig,
-                todo_turn,
-                todo_completed_at: todo_stamps_for_send.clone(),
-                expand_all,
-                bell,
-                auto_compact_ratio,
-                find_query,
-                find_pos,
-                ctx_window,
-                cfg: cfg_for_send.clone(),
-                queue: queue_for_send.clone(),
-                turn_handle: th_for_host.clone(),
-                spawn_turn: spawn_for_send.clone(),
-                start_compaction: compact_for_send.clone(),
-                compacting,
-                pending_init,
-                config_mtime_seen: mtime_for_send.clone(),
-                clipboard: clipboard_for_send.clone(),
-                agent: agent_for_send.clone(),
-                tx: tx_for_send.clone(),
-                base_url,
-            };
             if hrdr_app::dispatch(&mut host, &text) {
                 input.set(String::new());
                 return;
@@ -1574,6 +1590,7 @@ struct GuiHost {
     agent: Arc<TokioMutex<Agent>>,
     tx: tokio::sync::mpsc::UnboundedSender<UiMsg>,
     base_url: RwSignal<String>,
+    login: RwSignal<Option<hrdr_app::LoginWizard>>,
 }
 
 impl hrdr_app::CommandHost for GuiHost {
@@ -1623,6 +1640,7 @@ impl hrdr_app::CommandHost for GuiHost {
             self.running.set(false);
         }
         self.compacting.set(false);
+        self.login.set(None); // cancel an in-progress /login wizard
         self.queue.borrow_mut().clear();
         if let Ok(mut t) = self.todos.lock() {
             t.clear();
@@ -1914,6 +1932,10 @@ impl hrdr_app::CommandHost for GuiHost {
         if tokens.is_some() {
             self.ctx_window.set(tokens);
         }
+    }
+    fn begin_login(&mut self) {
+        let wizard = hrdr_app::LoginWizard::start(self);
+        self.login.set(Some(wizard));
     }
 }
 

@@ -277,6 +277,15 @@ pub trait CommandHost {
         let _ = tokens;
     }
 
+    /// Begin the `/login` wizard. A frontend that supports it stashes
+    /// [`LoginWizard::start`](crate::LoginWizard::start)'s result in a modal
+    /// slot and routes subsequent submitted lines to
+    /// [`LoginWizard::step`](crate::LoginWizard::step); the default reports it's
+    /// unavailable.
+    fn begin_login(&mut self) {
+        self.info("/login isn't available in this frontend".to_string());
+    }
+
     /// Whether this frontend supports `cmd` (used to filter `/help`). Default
     /// matches the GUI: everything not in [`crate::TUI_ONLY_COMMANDS`].
     fn supports_command(&self, cmd: &str) -> bool {
@@ -841,40 +850,15 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         "reload" => host.reload_config(),
         "provider" => {
             if arg.is_empty() {
-                host.info("usage: /provider <name>".to_string());
+                host.info("usage: /provider <name>  (or /login for guided setup)".to_string());
                 return true;
             }
-            let Some(p) = host.resolve_provider(&arg) else {
-                host.info(format!("unknown provider '{arg}'"));
-                return true;
-            };
-            if host.is_busy() {
-                host.info("busy — try again after the current turn".to_string());
-                return true;
+            match apply_provider(host, &arg, None) {
+                Ok(p) => host.info(format!("provider → {arg} ({})", p.base_url)),
+                Err(e) => host.info(e),
             }
-            let key = p
-                .api_key
-                .clone()
-                .or_else(|| p.key_env.as_ref().and_then(|e| std::env::var(e).ok()));
-            let agent = host.agent();
-            let (url, m) = (p.base_url.clone(), p.model.clone());
-            host.spawn_line(Box::pin(async move {
-                let mut a = agent.lock().await;
-                a.set_endpoint(url, key);
-                if let Some(m) = m {
-                    a.set_model(m);
-                }
-                String::new()
-            }));
-            if let Some(m) = &p.model {
-                host.set_model(m.clone());
-            }
-            if p.context_window.is_some() {
-                host.set_context_window(p.context_window);
-            }
-            host.set_base_url(p.base_url.clone());
-            host.info(format!("provider → {arg} ({})", p.base_url));
         }
+        "login" => host.begin_login(),
         "sessions" => {
             let all = crate::sessions_all_flag(&arg);
             host.info(crate::session_list_text(
@@ -1095,6 +1079,44 @@ pub fn agent_cwd(agent: &Arc<Mutex<Agent>>) -> PathBuf {
         .unwrap_or_default()
 }
 
+/// Switch the live session to provider `name`: repoint the endpoint (with the
+/// resolved or supplied API key), model, and context window, and update the
+/// displayed chrome. `key` overrides the resolved credential — the `/login`
+/// wizard passes the freshly-entered key. Returns the resolved provider on
+/// success; `Err(message)` when the name is unknown or a turn is running.
+/// Shared by `/provider` and `/login`.
+pub fn apply_provider(
+    host: &mut dyn CommandHost,
+    name: &str,
+    key: Option<String>,
+) -> Result<hrdr_agent::ResolvedProvider, String> {
+    let Some(p) = host.resolve_provider(name) else {
+        return Err(format!("unknown provider '{name}'"));
+    };
+    if host.is_busy() {
+        return Err("busy — try again after the current turn".to_string());
+    }
+    let key = key.or_else(|| hrdr_agent::resolve_api_key(name, &p));
+    let agent = host.agent();
+    let (url, model) = (p.base_url.clone(), p.model.clone());
+    host.spawn_line(Box::pin(async move {
+        let mut a = agent.lock().await;
+        a.set_endpoint(url, key);
+        if let Some(m) = model {
+            a.set_model(m);
+        }
+        String::new()
+    }));
+    if let Some(m) = &p.model {
+        host.set_model(m.clone());
+    }
+    if p.context_window.is_some() {
+        host.set_context_window(p.context_window);
+    }
+    host.set_base_url(p.base_url.clone());
+    Ok(p)
+}
+
 /// First-run guidance for an unreachable endpoint: what `base_url` failed and
 /// how to get hrdr talking to a model. Pure (no I/O) so it's unit-testable and
 /// identical across frontends. Now that hrdr never spawns a server, this is the
@@ -1104,9 +1126,8 @@ fn unreachable_guidance(base_url: &str, err: &str) -> String {
         "⚠ endpoint {base_url} looks unreachable: {err}\n\
          hrdr talks to a running OpenAI-compatible server. Start one listening at \
          {base_url} — e.g. `infr serve <model> --addr 127.0.0.1:8080` or `llama-server \
-         -hf <ref> --jinja --port 8080` — and it connects on your next message. Or \
-         switch to a hosted provider with `/provider <zen|openai|openrouter|claude>` \
-         (set its API key first)."
+         -hf <ref> --jinja --port 8080` — and it connects on your next message. Or run \
+         `/login` to set up a hosted provider (zen/openai/openrouter/claude) and its API key."
     )
 }
 
@@ -1296,10 +1317,10 @@ mod tests {
         // Names the failed endpoint + the underlying error…
         assert!(msg.contains("http://localhost:8080/v1"));
         assert!(msg.contains("connection refused"));
-        // …then points at both a local server and a hosted provider.
+        // …then points at both a local server and the /login wizard.
         assert!(msg.contains("infr serve"));
         assert!(msg.contains("llama-server"));
-        assert!(msg.contains("/provider"));
+        assert!(msg.contains("/login"));
     }
 
     #[test]
