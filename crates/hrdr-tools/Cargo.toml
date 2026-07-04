@@ -1,6 +1,6 @@
 [package]
 name = "hrdr-tools"
-description = "Agentic tool set for hrdr — read, write, edit, bash, grep, glob, todo. Native OpenAI tool calls."
+description = "Agentic tool set for hrdr — read, write, edit, patch, bash, grep, find, ls, todo, fetch, search, and MCP. Native OpenAI tool calls."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,6 +19,7 @@ regex = "1"
 similar.workspace = true
 reqwest.workspace = true
 async-trait = "0.1"
+diffy = "0.5"
 sha2 = "0.10"
 miniz_oxide = "0.8"
 which = "7"

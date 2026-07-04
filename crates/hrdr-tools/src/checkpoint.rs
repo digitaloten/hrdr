@@ -4,7 +4,7 @@
 //! Storage is git-like — each changed file's prior content is deflate-compressed
 //! and stored once per unique content (content-addressed by SHA-256), and a
 //! journal records which turn touched which file. Only files the agent modifies
-//! (via `edit`/`write_file`) are snapshotted, and only their pre-image (the
+//! (via `edit`/`write`) are snapshotted, and only their pre-image (the
 //! content just before the first edit in a turn), so it's fast and small.
 
 use std::collections::{BTreeMap, HashSet};

@@ -146,8 +146,8 @@ mod tests {
         let p = render_system(&tools, Path::new("/tmp/x"), None).unwrap();
         // Tool names present, one line, but not their long descriptions
         // (those ship natively as function defs — no double token spend).
-        assert!(p.contains("read_file"));
-        assert!(p.contains("todo_write"));
+        assert!(p.contains("read"));
+        assert!(p.contains("todo"));
         assert!(!p.contains("Replace an exact substring"));
         // The pitfall rules the guardrails enforce are also stated up front.
         assert!(p.contains("git add -A"));

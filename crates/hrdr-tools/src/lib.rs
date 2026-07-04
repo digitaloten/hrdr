@@ -1,7 +1,7 @@
 //! `hrdr-tools` — the agentic tool set.
 //!
-//! The locked MVP set: `read_file`, `write_file`, `edit`, `bash`, `grep`,
-//! `glob`, `todo_write`. Each implements [`Tool`] and is exposed to the model
+//! The built-in set: `read`, `write`, `edit`, `patch`, `bash`, `grep`, `find`, `ls`,
+//! `todo`, `fetch`, `search`. Each implements [`Tool`] and is exposed to the model
 //! as a native OpenAI function. Efficiency is in the design: token-bounded
 //! outputs, line-numbered reads for precise edits, ripgrep-backed search.
 
@@ -17,6 +17,7 @@ mod checkpoint;
 mod guardrails;
 mod hooks;
 mod mcp;
+mod patch;
 mod tools;
 mod web;
 
@@ -24,8 +25,9 @@ pub use checkpoint::{CheckpointInfo, Checkpoints};
 pub use guardrails::{Guardrail, check_guardrails, default_guardrails};
 pub use hooks::{DEFAULT_HOOK_TIMEOUT_MS, Hook, run_file_hooks};
 pub use mcp::McpClient;
+pub use patch::PatchTool;
 pub use tools::{
-    BashTool, EditTool, GlobTool, GrepTool, PowerShellTool, ReadTool, TodoTool, WriteTool,
+    BashTool, EditTool, FindTool, GrepTool, LsTool, PowerShellTool, ReadTool, TodoTool, WriteTool,
     available_shell_tools,
 };
 pub use web::{WebFetchTool, WebSearchTool};
@@ -40,7 +42,7 @@ pub const DEFAULT_MAX_OUTPUT: usize = 51_200;
 /// Matches opencode's `tool_output.max_lines`.
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2_000;
 
-/// A single TODO item tracked by `todo_write`.
+/// A single TODO item tracked by `todo`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
     pub content: String,
@@ -58,7 +60,7 @@ fn default_status() -> String {
 pub struct ToolContext {
     /// Working directory tool paths resolve against.
     pub cwd: PathBuf,
-    /// Shared TODO list, mutated by `todo_write`, surfaced to the UI.
+    /// Shared TODO list, mutated by `todo`, surfaced to the UI.
     pub todos: Arc<Mutex<Vec<TodoItem>>>,
     /// Per-call output byte cap.
     pub max_output: usize,
@@ -76,16 +78,16 @@ pub struct ToolContext {
     /// the shell tools reject a matching command with the rule's message.
     pub guardrails: Arc<Vec<Guardrail>>,
     /// Files whose current content the model has seen (read, or written by it
-    /// this session). `edit`/`write_file` refuse to mutate an existing file
+    /// this session). `edit`/`write` refuse to mutate an existing file
     /// that isn't here — blind edits against guessed content are the top
     /// source of corrupt patches.
     pub read_files: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
-    /// When set (the default), `write_file`/`edit` refuse paths outside the
+    /// When set (the default), `write`/`edit` refuse paths outside the
     /// working directory (the system temp dir is always allowed for scratch).
     /// Disable via config `allow_outside_cwd = true`.
     pub restrict_to_cwd: bool,
     /// Post-edit hooks from `[[hooks]]` config (formatters, mostly), run by
-    /// `edit`/`write_file` after a successful mutation.
+    /// `edit`/`write` after a successful mutation.
     pub hooks: Arc<Vec<Hook>>,
 }
 
@@ -238,13 +240,15 @@ impl ToolRegistry {
         r.register(Arc::new(ReadTool));
         r.register(Arc::new(WriteTool));
         r.register(Arc::new(EditTool));
+        r.register(Arc::new(patch::PatchTool));
         // Shell tools are presence-gated so the model is only offered a shell it
         // can actually use (bash on unix; PowerShell where installed, incl. Linux).
         for shell in available_shell_tools() {
             r.register(shell);
         }
         r.register(Arc::new(GrepTool::detect()));
-        r.register(Arc::new(GlobTool));
+        r.register(Arc::new(FindTool));
+        r.register(Arc::new(LsTool));
         r.register(Arc::new(TodoTool));
         r.register(Arc::new(WebFetchTool));
         r.register(Arc::new(WebSearchTool));
@@ -348,7 +352,7 @@ pub enum TruncateSide {
 
 /// Directory holding full copies of truncated tool output. Under the system
 /// temp dir on purpose: it's already read-whitelisted for the cwd-confined
-/// `read_file`/`grep` tools, so the model can retrieve the overflow.
+/// `read`/`grep` tools, so the model can retrieve the overflow.
 pub fn tool_output_dir() -> PathBuf {
     std::env::temp_dir().join("hrdr-tool-output")
 }
@@ -356,7 +360,7 @@ pub fn tool_output_dir() -> PathBuf {
 /// Truncate `text` to `max_bytes` **and** `max_lines` (whichever is hit first,
 /// matching opencode's `tool_output` limits), but instead of *discarding* the
 /// overflow, write the **full** output to [`tool_output_dir`] and point the
-/// model at it (so it can `read_file` a range or `grep` it rather than re-run
+/// model at it (so it can `read` a range or `grep` it rather than re-run
 /// the tool). Falls back to a plain byte truncation if the file can't be
 /// written. `label` tags the temp file (e.g. `"bash"`, `"grep"`).
 pub fn truncate_saved(
@@ -394,7 +398,7 @@ fn truncate_saved_in(
         }
     };
     let hint = format!(
-        "… [full output ({} lines, {} bytes) saved to {} — `read_file` it (with offset/limit) or \
+        "… [full output ({} lines, {} bytes) saved to {} — `read` it (with offset/limit) or \
          `grep` it (pattern + path) for the rest, don't re-run] …",
         lines.len(),
         text.len(),
@@ -671,7 +675,7 @@ TAIL-ERROR-LINE",
         );
         assert!(out.starts_with("HEAD"));
         assert!(out.contains("full output"));
-        assert!(out.contains("read_file"));
+        assert!(out.contains("read"));
         // Exactly one overflow file, containing the FULL text verbatim.
         let files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()

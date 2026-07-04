@@ -51,15 +51,15 @@ builds from source: `cargo run -p hrdr-gui --release`.
 - **Provider-agnostic client.** Speaks clean OpenAI chat-completions with native
   `tools`/`tool_calls` and SSE streaming. The server owns chat-template
   application; hrdr only ever sends structured `messages[]` + `tools[]`.
-- **Efficient, adaptive tool set.** Fewer, more powerful tools beat a big menu:
-  `read_file`, `write_file`, `edit`, `grep`, `glob`, `todo_write`, `web_fetch`,
-  `web_search`, plus a shell. Token-bounded outputs and line-numbered reads for
+- **Efficient, adaptive tool set.** `read`, `write`, `edit`, `patch` (multi-file
+  unified-diff), `find`, `ls`, `grep`, `todo`, `fetch`, `search`, a shell, and
+  any MCP-server tools. Token-bounded outputs and line-numbered reads for
   precise edits — and when `bash`/`grep` output overflows, the **full** result
-  is saved to a temp file and the model is pointed at it (`read_file`/`grep`)
-  instead of losing the overflow. Tools that shell out are **presence-aware**:
-  the shell tool is `bash` and/or `powershell` depending on what's installed,
-  and `grep` uses ripgrep → POSIX grep → a built-in walker — so the model is
-  only ever offered tools it can actually run.
+  is saved to a temp file and the model is pointed at it (`read`/`grep`) instead
+  of losing the overflow. Tools that shell out are **presence-aware**: the shell
+  tool is `bash` and/or `powershell` depending on what's installed, and `grep`
+  uses ripgrep → POSIX grep → a built-in walker — so the model is only ever
+  offered tools it can actually run.
 - **Pluggable input discipline.** Default is a plain, claude-style input (always
   typing; `Enter` sends, `Shift+Enter` / `\`+`Enter` insert a newline, `Ctrl+G`
   opens `$EDITOR`, readline-ish `Ctrl+A`/`Ctrl+E`/`Ctrl+W`). `--vim` swaps in a
@@ -239,7 +239,7 @@ tunable in `config.toml`:
 
 ```toml
 # Per-tool output caps: over either limit, bash/grep output is truncated and the
-# full text saved to a temp file the model can read_file/grep.
+# full text saved to a temp file the model can read/grep.
 [tool_output]
 max_lines = 2000
 max_bytes = 51200
@@ -297,7 +297,7 @@ more reliable than a prompt rule alone. `sudo` itself is allowed — installing
 system packages at the user's request is the user's call — but it can't launder
 an otherwise-blocked command.
 
-File mutations (`write_file`/`edit`) are confined to the working directory (the
+File mutations (`write`/`edit`) are confined to the working directory (the
 system temp dir is always allowed for scratch); set `allow_outside_cwd = true`
 in config (or `$HRDR_ALLOW_OUTSIDE_CWD`) to lift that.
 
@@ -314,9 +314,9 @@ pattern = "\\bkubectl\\s+delete\\b"
 message = "ask the user before deleting cluster resources"
 ```
 
-Relatedly, `edit`/`write_file` refuse to mutate an existing file the model
-hasn't read this session — blind edits against guessed content are the top
-source of corrupt patches.
+Relatedly, `edit`/`write` refuse to mutate an existing file the model hasn't
+read this session — blind edits against guessed content are the top source of
+corrupt patches.
 
 ### Post-edit hooks
 
@@ -328,7 +328,7 @@ error.
 
 ```toml
 [[hooks]]
-on = "edit"                 # edit | write_file | * (default: *)
+on = "edit"                 # edit | write | * (default: *)
 glob = "*.rs"               # optional; name or cwd-relative path
 run = "cargo fmt -- {path}" # {path} = quoted file path
 timeout_ms = 30000          # optional (default 30000)
@@ -369,8 +369,8 @@ these are on `PATH`. It detects what's available and adapts.
 | A **Nerd Font**                | Status-bar icons. Otherwise set `icons = unicode` or `ascii` (config / `--icons` / `$HRDR_ICONS`).                |
 | **infr** or **llama.cpp**      | Only to self-host a model locally — run one yourself (infr or `llama-server`). Not needed with a hosted provider. |
 
-`SEARXNG_URL` (optional) points `web_search` at a SearXNG instance for more
-reliable results than the zero-config DuckDuckGo default.
+`SEARXNG_URL` (optional) points `search` at a SearXNG instance for more reliable
+results than the zero-config DuckDuckGo default.
 
 ## Platform support
 
@@ -390,8 +390,8 @@ The shell and search tools adapt to the host:
 ## Status / roadmap
 
 - [x] OpenAI client (streaming + tool calls) + agent loop
-- [x] Adaptive tool set (files, `web_fetch`/`web_search`, presence-aware shell +
-      grep) with live output streaming
+- [x] Adaptive tool set (files, `fetch`/`search`, presence-aware shell + grep)
+      with live output streaming
 - [x] TUI: markdown + syntax-highlighted code, diffs, `@file`, slash commands,
       search/goto, timestamps, configurable status bar, themes
 - [x] Sessions (auto-save + auto-resume per cwd), `AGENTS.md` project

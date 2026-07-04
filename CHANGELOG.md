@@ -6,7 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Tool names shortened (breaking).** `read_file`→`read`, `write_file`→`write`,
+  `web_fetch`→`fetch`, `web_search`→`search`, `todo_write`→`todo`, and `glob` is
+  replaced by `find`. Update any `[[hooks]]` `on = "write_file"` to
+  `on = "write"`, and any custom prompts.
+
 ### Added
+
+- **`patch` tool — apply a unified diff across multiple files in one call.**
+  Takes git/patch format (`--- a/… / +++ b/… / @@` hunks; `/dev/null` to
+  create/delete), applied via `diffy` with hrdr's confinement, read-before-edit
+  gate, checkpoints, and hooks. **Atomic**: if any file's hunks don't apply,
+  nothing is written. Far fewer round-trips than repeated `edit` for multi-site
+  changes.
+
+- **`ls` tool** — list one directory's entries (dirs get `/`, symlinks `@`).
+  Complements `find` (tree search by glob).
 
 - **MCP client (stdio transport).** Connect
   [Model Context Protocol](https://modelcontextprotocol.io) servers via

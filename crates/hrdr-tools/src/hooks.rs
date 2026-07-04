@@ -1,5 +1,5 @@
 //! Post-edit hooks: user-configured shell commands that run after `edit` /
-//! `write_file` mutate a matching file — formatters, mostly (`cargo fmt`,
+//! `write` mutate a matching file — formatters, mostly (`cargo fmt`,
 //! `prettier --write`). Mechanical like the guardrails: a config rule the
 //! model can't forget. The mutating tool re-reads the file *after* hooks run,
 //! so the diff the model sees (and the text its next `old_string` must match)
@@ -12,7 +12,7 @@ use std::time::Duration;
 /// successfully mutates a file matching `glob`.
 #[derive(Debug, Clone)]
 pub struct Hook {
-    /// Tool that triggers it: `edit` or `write_file` (`*` for both).
+    /// Tool that triggers it: `edit` or `write` (`*` for both).
     pub on: String,
     /// File filter, matched against the file name and the cwd-relative path;
     /// `None` matches everything.
@@ -122,12 +122,12 @@ mod tests {
         let cwd = Path::new("/proj");
         let h = hook("edit", Some("*.rs"), "true");
         assert!(h.matches("edit", Path::new("/proj/src/main.rs"), cwd));
-        assert!(!h.matches("write_file", Path::new("/proj/src/main.rs"), cwd));
+        assert!(!h.matches("write", Path::new("/proj/src/main.rs"), cwd));
         assert!(!h.matches("edit", Path::new("/proj/README.md"), cwd));
         // `*` tool matches both; no glob matches every file.
         let any = hook("*", None, "true");
         assert!(any.matches("edit", Path::new("/proj/x"), cwd));
-        assert!(any.matches("write_file", Path::new("/proj/x"), cwd));
+        assert!(any.matches("write", Path::new("/proj/x"), cwd));
         // Path-shaped globs match against the cwd-relative path.
         let nested = hook("edit", Some("src/**/*.rs"), "true");
         assert!(nested.matches("edit", Path::new("/proj/src/a/b.rs"), cwd));

@@ -1,5 +1,5 @@
-//! Web tools: `web_fetch` (URL → readable text) and `web_search` (query → top
-//! results). `web_search` uses a zero-config DuckDuckGo HTML backend by default,
+//! Web tools: `fetch` (URL → readable text) and `search` (query → top
+//! results). `search` uses a zero-config DuckDuckGo HTML backend by default,
 //! or a SearXNG instance when `SEARXNG_URL` is set (a JSON API — more robust).
 
 use std::sync::LazyLock;
@@ -34,7 +34,7 @@ fn http_client() -> Result<&'static reqwest::Client> {
     HTTP_CLIENT.as_ref().map_err(|e| anyhow::anyhow!(e.clone()))
 }
 
-// ---- web_fetch ----
+// ---- fetch ----
 
 pub struct WebFetchTool;
 
@@ -52,7 +52,7 @@ impl Tool for WebFetchTool {
         true
     }
     fn name(&self) -> &'static str {
-        "web_fetch"
+        "fetch"
     }
     fn description(&self) -> &'static str {
         "Fetch a URL over HTTP(S) and return its content as text. HTML pages are reduced to \
@@ -101,7 +101,7 @@ impl Tool for WebFetchTool {
     }
 }
 
-// ---- web_search ----
+// ---- search ----
 
 pub struct WebSearchTool;
 
@@ -118,11 +118,11 @@ impl Tool for WebSearchTool {
         true
     }
     fn name(&self) -> &'static str {
-        "web_search"
+        "search"
     }
     fn description(&self) -> &'static str {
         "Search the web and return the top results (title, URL, snippet). Follow up with \
-         web_fetch to read a result in full. Uses DuckDuckGo by default, or a SearXNG instance \
+         fetch to read a result in full. Uses DuckDuckGo by default, or a SearXNG instance \
          if SEARXNG_URL is set."
     }
     fn parameters(&self) -> serde_json::Value {

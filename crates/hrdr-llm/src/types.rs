@@ -360,7 +360,7 @@ mod tests {
                 index: 0,
                 id: Some("call_abc".to_string()),
                 function: Some(FunctionDelta {
-                    name: Some("read_fi".to_string()),
+                    name: Some("re".to_string()),
                     arguments: Some("{\"pa".to_string()),
                 }),
             }]),
@@ -373,7 +373,7 @@ mod tests {
                 index: 0,
                 id: None,
                 function: Some(FunctionDelta {
-                    name: Some("le".to_string()),
+                    name: Some("ad".to_string()),
                     arguments: Some("th\": \"x\"}".to_string()),
                 }),
             }]),
@@ -384,7 +384,7 @@ mod tests {
         let calls = msg.tool_calls.expect("should have tool calls");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_abc");
-        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.name, "read");
         assert_eq!(calls[0].function.arguments, "{\"path\": \"x\"}");
     }
 

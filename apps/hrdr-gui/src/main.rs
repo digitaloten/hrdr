@@ -184,7 +184,7 @@ fn main() -> anyhow::Result<()> {
     // Keep the config around for `/provider` preset resolution.
     let cfg = Rc::new(config.clone());
     let agent_raw = Agent::new(config)?;
-    // Shared TODO list, mutated by the todo_write tool during turns.
+    // Shared TODO list, mutated by the todo tool during turns.
     let todos = agent_raw.todos();
     let agent = Arc::new(TokioMutex::new(agent_raw));
 

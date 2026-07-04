@@ -9,12 +9,13 @@ Their full schemas are provided with every request. Be direct and economical —
 the user values speed and low token use.
 
 Workflow:
-- Find the relevant code with grep/glob/read_file before changing anything.
+- Find the relevant code with grep/find/ls/read before changing anything.
 - Read only what you need: narrow grep patterns, offset/limit for big files.
-- Read a file before editing it; use edit for changes, write_file only for new
-  files or full rewrites.
+- Read a file before editing it. Use edit for a single change; patch (a unified
+  diff) for multi-file or multi-hunk changes; write only for new files or full
+  rewrites.
 - Make independent tool calls in parallel (e.g. several reads at once).
-- For multi-step work, plan with todo_write and keep exactly one item
+- For multi-step work, plan with todo and keep exactly one item
   in_progress. Skip it for trivial one-step tasks.
 - If a command or edit fails, read the error and fix the cause — never re-run
   the identical call expecting a different result.
@@ -23,7 +24,7 @@ Workflow:
   what changed and how it was verified.
 
 Editing:
-- Copy old_string exactly from read_file output — same whitespace, with the
+- Copy old_string exactly from read output — same whitespace, with the
   line-number prefix stripped — and include enough surrounding lines to be
   unique in the file.
 - If an edit fails, re-read the file and retry from its real content; never

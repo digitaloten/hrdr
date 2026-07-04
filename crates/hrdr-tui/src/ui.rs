@@ -18,7 +18,7 @@ use crate::theme::Theme;
 use hrdr_app::relative_time;
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
-/// Diff results (edit/write_file) get a larger preview since the diff is the point.
+/// Diff results (edit/write) get a larger preview since the diff is the point.
 const DIFF_PREVIEW_LINES: usize = 40;
 /// Max lines shown in the TODO panel (plus 2 for borders).
 const TODO_PANEL_MAX_ITEMS: u16 = 6;
@@ -973,8 +973,8 @@ fn push_tool(
     if result.is_empty() {
         return;
     }
-    // edit/write_file return a unified diff — color it and show more lines.
-    let is_diff = matches!(name, "edit" | "write_file");
+    // edit/write/patch return a unified diff — color it and show more lines.
+    let is_diff = matches!(name, "edit" | "write" | "patch");
     let preview = if is_diff {
         DIFF_PREVIEW_LINES
     } else {

@@ -1,4 +1,4 @@
-//! The seven MVP tools.
+//! The built-in tool set (read, write, edit, patch, shell, grep, find, ls, todo, fetch, search).
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -16,7 +16,7 @@ const MAX_LINE: usize = 2_000;
 const DEFAULT_READ_LIMIT: usize = 2_000;
 const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 
-// ---- read_file ----
+// ---- read ----
 
 pub struct ReadTool;
 
@@ -35,7 +35,7 @@ impl Tool for ReadTool {
         true
     }
     fn name(&self) -> &'static str {
-        "read_file"
+        "read"
     }
     fn description(&self) -> &'static str {
         "Read a file from disk. Returns 1-based line-numbered content (the `N\\t` prefix is \
@@ -54,7 +54,7 @@ impl Tool for ReadTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: ReadArgs = serde_json::from_value(args).context("invalid read_file args")?;
+        let a: ReadArgs = serde_json::from_value(args).context("invalid read args")?;
         let path = ctx.resolve(&a.path);
         let text = match tokio::fs::read_to_string(&path).await {
             Ok(t) => t,
@@ -85,7 +85,7 @@ impl Tool for ReadTool {
     }
 }
 
-// ---- write_file ----
+// ---- write ----
 
 pub struct WriteTool;
 
@@ -98,7 +98,7 @@ struct WriteArgs {
 #[async_trait]
 impl Tool for WriteTool {
     fn name(&self) -> &'static str {
-        "write_file"
+        "write"
     }
     fn description(&self) -> &'static str {
         "Create a new file or fully rewrite an existing one with `content`. Parent \
@@ -116,13 +116,13 @@ impl Tool for WriteTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: WriteArgs = serde_json::from_value(args).context("invalid write_file args")?;
+        let a: WriteArgs = serde_json::from_value(args).context("invalid write args")?;
         let path = ctx.resolve(&a.path);
         ctx.ensure_within_cwd(&path)?;
         let existed = tokio::fs::try_exists(&path).await.unwrap_or(false);
         if existed && !ctx.was_read(&path) {
             bail!(
-                "{} exists but you haven't read it — call read_file first so the rewrite \
+                "{} exists but you haven't read it — call read first so the rewrite \
                  starts from its real content (or use edit for a partial change)",
                 path.display()
             );
@@ -145,7 +145,7 @@ impl Tool for WriteTool {
             .with_context(|| format!("writing {}", path.display()))?;
         // Post-edit hooks (formatters); the diff below is taken against the
         // post-hook content so the model's view matches the disk.
-        let notes = crate::run_file_hooks(&ctx.hooks, "write_file", &path, &ctx.cwd).await;
+        let notes = crate::run_file_hooks(&ctx.hooks, "write", &path, &ctx.cwd).await;
         let finall = if notes.is_empty() && ctx.hooks.is_empty() {
             a.content.clone()
         } else {
@@ -211,7 +211,7 @@ impl Tool for EditTool {
     }
     fn description(&self) -> &'static str {
         "Replace an exact substring in a file (the preferred, token-cheap way to change \
-         it). Copy `old_string` exactly from read_file output — same whitespace, line-number \
+         it). Copy `old_string` exactly from read output — same whitespace, line-number \
          prefixes stripped — and include enough surrounding lines to be unique. Requires \
          having read the file first."
     }
@@ -233,7 +233,7 @@ impl Tool for EditTool {
         ctx.ensure_within_cwd(&path)?;
         if !ctx.was_read(&path) {
             bail!(
-                "you haven't read {} yet — call read_file first, then copy old_string \
+                "you haven't read {} yet — call read first, then copy old_string \
                  exactly from its output",
                 path.display()
             );
@@ -250,7 +250,7 @@ impl Tool for EditTool {
             if !normalized_old.is_empty() && norm(&text).contains(&normalized_old) {
                 bail!(
                     "old_string not found in {}, but a near-match differing only in \
-                     whitespace/indentation exists — copy the exact text from read_file \
+                     whitespace/indentation exists — copy the exact text from read \
                      output (keep tabs/spaces, strip the line-number prefix)",
                     path.display()
                 );
@@ -569,7 +569,7 @@ impl Tool for GrepTool {
         "Search file contents (via ripgrep, grep, or a built-in walker — whichever is available). \
          Returns `path:line:match`. Optionally scope to a `path` and/or filter files with a \
          `glob` (e.g. '*.rs'). Set `context` to 2–3 to see the lines around each match \
-         instead of making a follow-up read_file call."
+         instead of making a follow-up read call."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -793,24 +793,24 @@ fn emit_context_windows(
 
 // ---- glob ----
 
-pub struct GlobTool;
+pub struct FindTool;
 
 #[derive(Deserialize)]
-struct GlobArgs {
+struct FindArgs {
     pattern: String,
 }
 
 #[async_trait]
-impl Tool for GlobTool {
+impl Tool for FindTool {
     fn read_only(&self) -> bool {
         true
     }
     fn name(&self) -> &'static str {
-        "glob"
+        "find"
     }
     fn description(&self) -> &'static str {
         "Find files by glob pattern (supports `**`), relative to cwd. Returns matching \
-         paths. Also the way to list a directory: pattern `src/*` lists src's contents."
+         paths. Use `ls` to list one directory; use this to search a tree by name."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
@@ -822,7 +822,7 @@ impl Tool for GlobTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let a: GlobArgs = serde_json::from_value(args).context("invalid glob args")?;
+        let a: FindArgs = serde_json::from_value(args).context("invalid find args")?;
         // Escape the cwd prefix: only the user's pattern is glob syntax. A cwd
         // containing `[`, `*`, or `?` must match literally.
         let cwd_escaped = glob::Pattern::escape(&ctx.cwd.to_string_lossy());
@@ -848,14 +848,68 @@ impl Tool for GlobTool {
     }
 }
 
-// ---- todo_write ----
+// ---- ls ----
+
+pub struct LsTool;
+
+#[derive(Deserialize)]
+struct LsArgs {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[async_trait]
+impl Tool for LsTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn name(&self) -> &'static str {
+        "ls"
+    }
+    fn description(&self) -> &'static str {
+        "List the entries of one directory (defaults to cwd). Directories get a trailing `/`, \
+         symlinks a trailing `@`. Use `find` to search a whole tree by glob."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Directory to list (default: cwd)."}
+            }
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
+        let a: LsArgs = serde_json::from_value(args).context("invalid ls args")?;
+        let dir = ctx.resolve(a.path.as_deref().unwrap_or("."));
+        let mut rd = tokio::fs::read_dir(&dir)
+            .await
+            .with_context(|| format!("listing {}", dir.display()))?;
+        let mut entries: Vec<String> = Vec::new();
+        while let Some(e) = rd.next_entry().await? {
+            let name = e.file_name().to_string_lossy().to_string();
+            let suffix = match e.file_type().await {
+                Ok(t) if t.is_dir() => "/",
+                Ok(t) if t.is_symlink() => "@",
+                _ => "",
+            };
+            entries.push(format!("{name}{suffix}"));
+        }
+        entries.sort();
+        if entries.is_empty() {
+            return Ok("(empty directory)".to_string());
+        }
+        Ok(truncate(&entries.join("\n"), ctx.max_output))
+    }
+}
+
+// ---- todo ----
 
 pub struct TodoTool;
 
 #[async_trait]
 impl Tool for TodoTool {
     fn name(&self) -> &'static str {
-        "todo_write"
+        "todo"
     }
     fn description(&self) -> &'static str {
         "Replace the task list for the current work. Use it to plan and track multi-step \
@@ -881,7 +935,7 @@ impl Tool for TodoTool {
         })
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let items = parse_todos(args).context("invalid todo_write args")?;
+        let items = parse_todos(args).context("invalid todo args")?;
         let rendered = render_todos(&items);
         // A poisoned lock must not silently report success with a stale list.
         *ctx.todos
@@ -891,7 +945,7 @@ impl Tool for TodoTool {
     }
 }
 
-/// Forgivingly extract the todo list from `todo_write` arguments. The schema is
+/// Forgivingly extract the todo list from `todo` arguments. The schema is
 /// the standard `{"todos": [{content, status}, …]}`, but smaller models often
 /// echo the JSON-Schema shape into the value or drop/rename the wrapper, so we
 /// also accept `{"todos": {"items": […]}}` (the schema-echo mistake), a bare
@@ -1090,7 +1144,7 @@ mod tests {
         assert_eq!(out.matches("l5").count(), 1, "{out}");
     }
 
-    // ---- read_file ----
+    // ---- read ----
 
     #[tokio::test]
     async fn read_file_line_numbers() {
@@ -1126,7 +1180,7 @@ mod tests {
         assert!(!out.contains("     4\t"), "line 4 should be skipped");
     }
 
-    // ---- write_file ----
+    // ---- write ----
 
     #[tokio::test]
     async fn edit_and_overwrite_require_prior_read() {
@@ -1142,7 +1196,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("read_file first"), "{err}");
+        assert!(err.to_string().contains("read first"), "{err}");
         let err = WriteTool
             .execute(
                 serde_json::json!({"path": path.to_str().unwrap(), "content": "x"}),
@@ -1150,7 +1204,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("read_file first"), "{err}");
+        assert!(err.to_string().contains("read first"), "{err}");
         // A read (relative path — canonicalization must unify spellings)
         // unlocks the edit.
         ReadTool
@@ -1442,7 +1496,7 @@ mod tests {
         std::fs::write(dir.path().join("b.rs"), "").unwrap();
         std::fs::write(dir.path().join("c.txt"), "").unwrap();
         let c = ctx(dir.path().to_path_buf());
-        let out = GlobTool
+        let out = FindTool
             .execute(serde_json::json!({"pattern": "*.rs"}), &c)
             .await
             .unwrap();
@@ -1455,14 +1509,14 @@ mod tests {
     async fn glob_no_matches_returns_sentinel() {
         let dir = tempfile::tempdir().unwrap();
         let c = ctx(dir.path().to_path_buf());
-        let out = GlobTool
+        let out = FindTool
             .execute(serde_json::json!({"pattern": "*.nonexistent"}), &c)
             .await
             .unwrap();
         assert_eq!(out, "(no matches)");
     }
 
-    // ---- todo_write ----
+    // ---- todo ----
 
     #[tokio::test]
     async fn todo_write_render_marks() {

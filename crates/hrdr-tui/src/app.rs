@@ -177,7 +177,7 @@ pub(crate) struct App {
     /// Max scroll offset (rows from bottom to the very top) from the last draw;
     /// lets `Home` jump to the top and bound scrolling.
     pub(crate) max_scroll: usize,
-    /// Shared TODO list updated live by the `todo_write` tool.
+    /// Shared TODO list updated live by the `todo` tool.
     pub(crate) todos: Arc<Mutex<Vec<Todo>>>,
     /// Count of completed turns, used to age out finished TODO items.
     todo_turn: u64,

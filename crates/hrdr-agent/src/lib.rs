@@ -115,7 +115,7 @@ pub struct AgentConfig {
     /// Extra shell guardrails from `[[guardrails]]` in config, applied on top
     /// of the built-in rules.
     pub guardrails: Vec<GuardrailConfig>,
-    /// Let `write_file`/`edit` touch paths outside the working directory
+    /// Let `write`/`edit` touch paths outside the working directory
     /// (default `false`; the system temp dir is always allowed).
     pub allow_outside_cwd: bool,
     /// Post-edit hooks from `[[hooks]]` in config (formatters, mostly).
@@ -331,7 +331,7 @@ pub struct GuardrailConfig {
 }
 
 /// One post-edit hook from a `[[hooks]]` config entry: after tool `on`
-/// (`edit`, `write_file`, or `*`) successfully mutates a file matching
+/// (`edit`, `write`, or `*`) successfully mutates a file matching
 /// `glob`, run shell command `run` (`{path}` is substituted). Formatters,
 /// mostly. Failures surface as warnings in the tool result, never as errors.
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
@@ -1003,7 +1003,7 @@ impl Agent {
         text
     }
 
-    /// Shared TODO list, mutated by the `todo_write` tool.
+    /// Shared TODO list, mutated by the `todo` tool.
     pub fn todos(&self) -> Arc<Mutex<Vec<TodoItem>>> {
         self.ctx.todos.clone()
     }

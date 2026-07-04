@@ -372,7 +372,7 @@ async fn tool_call_runs_the_tool_then_finishes() {
     // First reply asks to write a todo; the follow-up turn ends with text.
     let mut h = Harness::new(vec![
         MockReply::ToolCall {
-            name: "todo_write".to_string(),
+            name: "todo".to_string(),
             args: r#"{"todos":[{"content":"write more tests","status":"in_progress"}]}"#
                 .to_string(),
         },
@@ -383,10 +383,7 @@ async fn tool_call_runs_the_tool_then_finishes() {
     let screen = h.render();
     // The tool call is surfaced, the todo panel shows the item, and the final
     // assistant text lands — proving the full tool round-trip drove two calls.
-    assert!(
-        screen.contains("todo_write"),
-        "tool call missing:\n{screen}"
-    );
+    assert!(screen.contains("todo"), "tool call missing:\n{screen}");
     assert!(
         screen.contains("write more tests"),
         "todo item missing:\n{screen}"
@@ -404,7 +401,7 @@ async fn parallel_tool_calls_in_one_turn_all_run() {
     let mut h = Harness::new(vec![
         MockReply::ToolCalls(vec![
             (
-                "todo_write".to_string(),
+                "todo".to_string(),
                 r#"{"todos":[{"content":"first task","status":"in_progress"}]}"#.to_string(),
             ),
             ("glob".to_string(), r#"{"pattern":"*"}"#.to_string()),
@@ -414,10 +411,7 @@ async fn parallel_tool_calls_in_one_turn_all_run() {
     .await;
     h.submit("do two things").await;
     let screen = h.render();
-    assert!(
-        screen.contains("todo_write"),
-        "first tool missing:\n{screen}"
-    );
+    assert!(screen.contains("todo"), "first tool missing:\n{screen}");
     assert!(screen.contains("glob"), "second tool missing:\n{screen}");
     assert!(
         screen.contains("Both ran."),
@@ -495,7 +489,7 @@ async fn verbatim_failing_retry_is_refused_on_third_attempt() {
     // the third must be refused without executing, then the turn ends.
     let bad = || {
         MockReply::ToolCalls(vec![(
-            "read_file".to_string(),
+            "read".to_string(),
             r#"{"path":"no/such/file.txt"}"#.to_string(),
         )])
     };

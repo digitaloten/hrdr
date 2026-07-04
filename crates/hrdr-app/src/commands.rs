@@ -920,11 +920,11 @@ AI coding agents working here (the open standard at https://agents.md).
 Do this:
 1. Explore the project with your tools — read the README(s), the build/manifest \
    files (Cargo.toml, package.json, pyproject.toml, go.mod, Makefile, etc.), CI \
-   config, and skim the source layout with glob/grep/read_file to understand how \
+   config, and skim the source layout with find/ls/grep/read to understand how \
    it's organized.
 2. If an AGENTS.md (or CLAUDE.md / .cursorrules / similar) already exists, read it \
    and improve it instead of discarding useful content.
-3. Write AGENTS.md (use the write_file tool) with concise, repo-specific sections:
+3. Write AGENTS.md (use the write tool) with concise, repo-specific sections:
    - Project overview: what it is and does.
    - Setup / build / run: the actual commands for THIS repo.
    - Testing: how to run the test suite and a single test.
