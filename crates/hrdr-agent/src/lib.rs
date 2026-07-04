@@ -125,9 +125,8 @@ pub const DEFAULT_AUTO_COMPACT: f64 = 0.85;
 
 /// Default token buffer reserved below the context window before auto-compaction
 /// fires — compaction triggers once usage reaches `context_window − reserved`,
-/// leaving room for the next turn's output. Matches opencode's `COMPACTION_BUFFER`
-/// / `compaction.reserved`.
-pub const DEFAULT_COMPACTION_RESERVED: u32 = 20_000;
+/// leaving room for the next turn's output. Matches pi's `reserveTokens` default.
+pub const DEFAULT_COMPACTION_RESERVED: u32 = 16_384;
 
 /// Tool-output pruning keeps the most recent this-many estimated tokens of tool
 /// output verbatim; older bodies are cleared. Matches opencode's `PRUNE_PROTECT`.
@@ -1331,18 +1330,47 @@ fn is_transient(e: &anyhow::Error) -> bool {
 }
 
 /// Whether an error is the server rejecting the request for exceeding the
-/// model's context window.
+/// model's context window. The marker phrases are ported from pi's
+/// provider-specific overflow patterns (`packages/ai/src/utils/overflow.ts`),
+/// covering ~20 OpenAI-compatible backends.
 fn is_context_overflow(e: &anyhow::Error) -> bool {
+    // Rate-limit / throttling errors sometimes contain overflow-ish wording
+    // (e.g. Bedrock's "Throttling: too many tokens") — exclude them first so
+    // they retry (via [`is_transient`]) rather than triggering a compaction.
+    if err_mentions(
+        e,
+        &["rate limit", "too many requests", "throttl", "returned 429"],
+    ) {
+        return false;
+    }
     err_mentions(
         e,
         &[
+            // Generic phrasings (cover most backends + our own error text).
             "context length",
             "context_length",
             "maximum context",
             "context window",
             "context size",
             "too many tokens",
+            "token limit exceeded",
             "reduce the length",
+            // Provider-specific (from pi's overflow.ts).
+            "prompt is too long",                     // Anthropic
+            "request_too_large",                      // Anthropic 413
+            "request too large",                      // Anthropic 413 (spaced)
+            "returned 413",                           // our formatting of a 413
+            "input is too long",                      // Bedrock
+            "exceeds the context window",             // OpenAI
+            "input token count",                      // Google Gemini
+            "maximum prompt length is",               // xAI Grok
+            "maximum allowed input length",           // OpenRouter/Poolside
+            "longer than the model's context length", // Together AI
+            "exceeds the limit of",                   // GitHub Copilot
+            "exceeded model token limit",             // Kimi
+            "too large for model with",               // Mistral
+            "model_context_window_exceeded",          // z.ai
+            "configured context size",                // DS4
         ],
     )
 }
@@ -1959,10 +1987,33 @@ mod tests {
             "please reduce the length of the messages",
             "context size limit reached",
             "context_length exceeded",
+            // Provider-specific patterns ported from pi.
+            "prompt is too long: 213462 tokens > 200000 maximum", // Anthropic
+            "request_too_large",                                  // Anthropic 413
+            "your input exceeds the context window of this model", // OpenAI
+            "the input token count (1196265) exceeds the maximum", // Gemini
+            "this model's maximum prompt length is 131072",       // xAI
+            "exceeds the maximum allowed input length of 8000 tokens", // OpenRouter
+            "is longer than the model's context length (4096 tokens)", // Together
+            "prompt token count of 5 exceeds the limit of 4",     // Copilot
+            "your request exceeded model token limit",            // Kimi
+            "too large for model with 8192 maximum context length", // Mistral
+            "model_context_window_exceeded",                      // z.ai
         ] {
             assert!(
                 is_context_overflow(&anyhow::anyhow!("{msg}")),
                 "expected context overflow for: {msg}"
+            );
+        }
+        // Rate-limit / throttling is NOT overflow, even when it mentions tokens.
+        for msg in [
+            "chat endpoint returned 429 Too Many Requests: slow down",
+            "ThrottlingException: too many tokens, please wait",
+            "rate limit exceeded, retry after 20s",
+        ] {
+            assert!(
+                !is_context_overflow(&anyhow::anyhow!("{msg}")),
+                "throttling must not be treated as overflow: {msg}"
             );
         }
     }

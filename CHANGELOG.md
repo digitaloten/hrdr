@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Provider-aware context-overflow detection.** `is_context_overflow` now
+  recognizes ~20 backends' "prompt too long" wordings (Anthropic, OpenAI,
+  Gemini, xAI, Groq, OpenRouter, Together, Mistral, Kimi, z.ai, Copilot, …),
+  ported from pi's `overflow.ts`, so overflow-triggered compaction fires on far
+  more servers. Rate-limit/throttling errors are now explicitly excluded so a
+  429 retries instead of compacting.
+
 - **Context management brought to parity with opencode.** Building on
   tool-output pruning and the truncate-to-file layer: (1) per-tool truncation
   now caps on **lines and bytes** (whichever first), both configurable via
@@ -16,7 +23,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   recent tail by **turns and a token budget** (`compaction_tail_turns` = 2,
   `preserve_recent_tokens` = 8000) instead of a fixed message count; (4)
   auto-compaction now triggers on a **reserved token buffer** —
-  `context_window − compaction_reserved` (default 20000, `--compaction-reserved`
+  `context_window − compaction_reserved` (default 16384, `--compaction-reserved`
   / `$HRDR_COMPACTION_RESERVED`) rather than a fixed 85% fraction
   (`auto_compact` is now the on/off toggle). The reserve is clamped to a quarter
   of the window so small-context models still get a sane trigger. All tunable in
