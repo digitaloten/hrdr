@@ -224,6 +224,7 @@ async fn main() -> Result<()> {
             config.context_window = p.context_window;
         }
         config.headers = p.headers.into_iter().collect();
+        config.api_version = p.api_version;
         remote_provider = p.remote;
     }
 

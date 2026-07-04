@@ -248,6 +248,18 @@ Each provider can carry `[providers.<name>.headers]` — arbitrary HTTP headers
 sent on every request (OpenRouter's `HTTP-Referer`/`X-Title`, or a custom
 auth/routing header). They apply at startup and follow a `/provider` switch.
 
+**Azure OpenAI:** set `api_version` — hrdr then appends `?api-version=<v>` to
+requests and authenticates with an `api-key` header (instead of `Bearer`). Point
+`base_url` at the deployment:
+
+```toml
+[providers.azure]
+base_url = "https://<resource>.openai.azure.com/openai/deployments/<deployment>"
+key_env = "AZURE_OPENAI_API_KEY"
+api_version = "2024-10-21"
+model = "<deployment>"
+```
+
 `context_window` is optional: if you omit it, hrdr probes the endpoint and uses
 what it advertises (vLLM's `max_model_len`, llama.cpp's `/props` `n_ctx`, etc.)
 — at startup **and** again after a `/model` or `/provider` switch, so the

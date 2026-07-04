@@ -86,6 +86,10 @@ pub struct Client {
     max_tokens: u32,
     /// Extra HTTP headers (provider-configured) sent with every request.
     extra_headers: Vec<(String, String)>,
+    /// Azure OpenAI API version. When set, requests append `?api-version=<v>` and
+    /// authenticate with an `api-key` header instead of `Bearer` (Azure is still
+    /// the OpenAI chat-completions wire, just a different URL + auth).
+    api_version: Option<String>,
     /// Wire protocol, derived from `base_url`.
     backend: Backend,
 }
@@ -143,6 +147,7 @@ impl Client {
             effort: None,
             max_tokens: ANTHROPIC_MAX_TOKENS,
             extra_headers: Vec::new(),
+            api_version: None,
             backend,
         }
     }
@@ -178,6 +183,21 @@ impl Client {
     /// Set the provider-configured extra headers sent with every request.
     pub fn set_headers(&mut self, headers: Vec<(String, String)>) {
         self.extra_headers = headers;
+    }
+
+    /// Set the Azure OpenAI API version (enables the Azure URL + `api-key` auth
+    /// quirks); `None` for a standard OpenAI-compatible endpoint.
+    pub fn set_api_version(&mut self, api_version: Option<String>) {
+        self.api_version = api_version;
+    }
+
+    /// Build a request URL for `path` (e.g. `chat/completions`), appending the
+    /// Azure `?api-version=` query when configured.
+    fn url(&self, path: &str) -> String {
+        match &self.api_version {
+            Some(v) => format!("{}/{path}?api-version={v}", self.base_url),
+            None => format!("{}/{path}", self.base_url),
+        }
     }
 
     /// The current endpoint base URL (including the `/v1` suffix).
@@ -217,11 +237,7 @@ impl Client {
     }
 
     fn post(&self, body: &serde_json::Value) -> reqwest::RequestBuilder {
-        self.auth(
-            self.http
-                .post(format!("{}/chat/completions", self.base_url))
-                .json(body),
-        )
+        self.auth(self.http.post(self.url("chat/completions")).json(body))
     }
 
     /// Apply the backend's auth + any provider-configured extra headers to a
@@ -233,6 +249,8 @@ impl Client {
                 Backend::Anthropic => req
                     .header("x-api-key", key)
                     .header("anthropic-version", crate::anthropic::API_VERSION),
+                // Azure OpenAI authenticates with an `api-key` header, not Bearer.
+                Backend::OpenAi if self.api_version.is_some() => req.header("api-key", key),
                 Backend::OpenAi => req.bearer_auth(key),
             };
         }
@@ -287,7 +305,7 @@ impl Client {
         log_wire(
             "request",
             serde_json::json!({
-                "url": format!("{}/chat/completions", self.base_url),
+                "url": self.url("chat/completions"),
                 "body": body,
             }),
         );
@@ -345,7 +363,7 @@ impl Client {
     /// List available models from `GET {base_url}/models`.
     /// Returns model ids sorted alphabetically.
     pub async fn list_models(&self) -> Result<Vec<String>> {
-        let req = self.auth(self.http.get(format!("{}/models", self.base_url)));
+        let req = self.auth(self.http.get(self.url("models")));
         let resp = req.send().await.context("models request failed")?;
         let status = resp.status();
         let text = resp.text().await.context("reading models response")?;
@@ -380,7 +398,7 @@ impl Client {
     /// Look for a context-length field on this client's model in `/v1/models`
     /// (falling back to the first entry if the id doesn't match).
     async fn context_from_models(&self) -> Option<u32> {
-        let v = self.get_json(&format!("{}/models", self.base_url)).await?;
+        let v = self.get_json(&self.url("models")).await?;
         let data = v.get("data")?.as_array()?;
         let entry = data
             .iter()
@@ -449,6 +467,36 @@ fn json_u32(v: &serde_json::Value) -> Option<u32> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn backend_detected_from_host() {
+        assert_eq!(
+            detect_backend("https://api.anthropic.com/v1"),
+            Backend::Anthropic
+        );
+        assert_eq!(detect_backend("https://api.openai.com/v1"), Backend::OpenAi);
+        assert_eq!(detect_backend("http://localhost:8080/v1"), Backend::OpenAi);
+    }
+
+    #[test]
+    fn url_appends_azure_api_version_when_set() {
+        let mut c = Client::new(
+            "https://r.openai.azure.com/openai/deployments/gpt4o",
+            None,
+            "gpt4o",
+        );
+        // Standard endpoint: plain path.
+        assert_eq!(
+            Client::new("https://api.openai.com/v1", None, "m").url("chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        // Azure: api-version query appended.
+        c.set_api_version(Some("2024-10-21".to_string()));
+        assert_eq!(
+            c.url("chat/completions"),
+            "https://r.openai.azure.com/openai/deployments/gpt4o/chat/completions?api-version=2024-10-21"
+        );
+    }
 
     #[test]
     fn reads_common_context_fields() {

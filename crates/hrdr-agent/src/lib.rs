@@ -147,6 +147,9 @@ pub struct AgentConfig {
     /// Extra HTTP headers for the active provider (from its `[providers.<name>]`
     /// `headers`), sent with every request. Populated when a provider is resolved.
     pub headers: Vec<(String, String)>,
+    /// Azure OpenAI API version for the active provider (see
+    /// [`ProviderConfig::api_version`]); enables the Azure URL + auth quirks.
+    pub api_version: Option<String>,
 }
 
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
@@ -265,6 +268,7 @@ impl Default for AgentConfig {
             mcp: Vec::new(),
             prompt_cache: None,
             headers: Vec::new(),
+            api_version: None,
         }
     }
 }
@@ -287,6 +291,7 @@ impl AgentConfig {
                 remote: c.remote.unwrap_or(true),
                 context_window: c.context_window,
                 headers: c.headers.clone(),
+                api_version: c.api_version.clone(),
             });
         }
         builtin_provider(name)
@@ -355,6 +360,11 @@ pub struct ProviderConfig {
     /// OpenRouter's `HTTP-Referer`/`X-Title`, or a custom auth/routing header).
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Azure OpenAI API version. When set, requests append `?api-version=<v>` and
+    /// auth via an `api-key` header instead of `Bearer` (point `base_url` at
+    /// `https://<resource>.openai.azure.com/openai/deployments/<deployment>`).
+    #[serde(default)]
+    pub api_version: Option<String>,
 }
 
 /// One user-defined shell guardrail from a `[[guardrails]]` config entry:
@@ -401,6 +411,8 @@ pub struct ResolvedProvider {
     pub context_window: Option<u32>,
     /// Extra HTTP headers to send with every request to this provider.
     pub headers: HashMap<String, String>,
+    /// Azure OpenAI API version, if this is an Azure endpoint.
+    pub api_version: Option<String>,
 }
 
 /// Canonical built-in provider names, in the order the `/login` wizard offers
@@ -443,6 +455,7 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
         remote,
         context_window: None,
         headers: HashMap::new(),
+        api_version: None,
     })
 }
 
@@ -934,6 +947,7 @@ impl Agent {
         client.set_effort(config.effort.clone());
         client.set_max_tokens(config.max_tokens);
         client.set_headers(config.headers.clone());
+        client.set_api_version(config.api_version.clone());
 
         Ok(Self {
             client,
@@ -1159,6 +1173,12 @@ impl Agent {
     /// switch so the new provider's headers apply).
     pub fn set_headers(&mut self, headers: Vec<(String, String)>) {
         self.client.set_headers(headers);
+    }
+
+    /// Set the Azure OpenAI API version (used on a `/provider` switch); `None`
+    /// for a standard endpoint.
+    pub fn set_api_version(&mut self, api_version: Option<String>) {
+        self.client.set_api_version(api_version);
     }
 
     /// Repoint at a different OpenAI-compatible endpoint + key (provider switch).
@@ -2145,6 +2165,7 @@ mod tests {
                 remote: Some(true),
                 context_window: Some(123),
                 headers: HashMap::from([("X-Title".to_string(), "hrdr".to_string())]),
+                api_version: None,
             },
         );
         // Custom "zen" shadows the built-in; an unknown custom name resolves too.

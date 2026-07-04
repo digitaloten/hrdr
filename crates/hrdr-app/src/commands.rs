@@ -1132,6 +1132,7 @@ pub fn apply_provider(
     let agent = host.agent();
     let (url, model) = (p.base_url.clone(), p.model.clone());
     let headers: Vec<(String, String)> = p.headers.clone().into_iter().collect();
+    let api_version = p.api_version.clone();
     // Probe the new endpoint for its advertised context window unless the
     // provider config already declares one (which wins).
     let probe_after = p.context_window.is_none();
@@ -1140,6 +1141,7 @@ pub fn apply_provider(
         let mut a = agent.lock().await;
         a.set_endpoint(url, key);
         a.set_headers(headers);
+        a.set_api_version(api_version);
         if let Some(m) = model {
             a.set_model(m);
         }

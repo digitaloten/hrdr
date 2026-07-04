@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Azure OpenAI support.** Set `api_version` on a provider and hrdr appends
+  `?api-version=<v>` to requests and authenticates with an `api-key` header
+  instead of `Bearer` (Azure is the OpenAI chat-completions wire, just a
+  different URL + auth). Point `base_url` at
+  `https://<resource>.openai.azure.com/openai/deployments/<deployment>`. Applied
+  at startup and on a `/provider` switch.
+
 ## [0.2.5] - 2026-07-04
 
 ### Added
