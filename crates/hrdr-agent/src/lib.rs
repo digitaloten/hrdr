@@ -105,6 +105,13 @@ pub struct AgentConfig {
     /// Ask for streamed token usage (`stream_options.include_usage`); default
     /// `true`. A few strict/old servers reject it — set `false` to omit.
     pub stream_usage: bool,
+    /// Connect + idle-read timeout in seconds for model requests. `None` = no
+    /// timeout (default). A hung/stalled provider fails instead of blocking.
+    pub request_timeout: Option<u64>,
+    /// Prompt-cache TTL: `5m` (default) or `1h`. `1h` emits a longer
+    /// `cache_control` TTL (Anthropic native + OpenRouter) — cheaper for stable
+    /// prompts reused across a longer window. Only meaningful when caching is on.
+    pub prompt_cache_ttl: Option<String>,
     /// Reasoning-effort label shown in the status bar (e.g. `low`/`medium`/`high`).
     pub effort: Option<String>,
     /// Auto-compaction trigger as a fraction of the context window (`0.0`–`1.0`);
@@ -267,6 +274,8 @@ impl Default for AgentConfig {
             seed: None,
             stop: Vec::new(),
             stream_usage: true,
+            request_timeout: None,
+            prompt_cache_ttl: None,
             effort: None,
             auto_compact: DEFAULT_AUTO_COMPACT,
             compaction_reserved: DEFAULT_COMPACTION_RESERVED,
@@ -502,6 +511,8 @@ struct FileConfig {
     #[serde(default)]
     stop: Vec<String>,
     stream_usage: Option<bool>,
+    request_timeout: Option<u64>,
+    prompt_cache_ttl: Option<String>,
     effort: Option<String>,
     auto_compact: Option<f64>,
     compaction_reserved: Option<u32>,
@@ -598,6 +609,12 @@ impl AgentConfig {
         }
         if let Some(v) = fc.stream_usage {
             self.stream_usage = v;
+        }
+        if let Some(v) = fc.request_timeout {
+            self.request_timeout = Some(v);
+        }
+        if let Some(v) = fc.prompt_cache_ttl {
+            self.prompt_cache_ttl = Some(v);
         }
         if let Some(v) = fc.effort {
             self.effort = Some(v);
@@ -736,6 +753,12 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
             c.stream_usage = b;
         }
     }),
+    ("HRDR_REQUEST_TIMEOUT", |c, v| {
+        if let Ok(n) = v.parse() {
+            c.request_timeout = Some(n);
+        }
+    }),
+    ("HRDR_PROMPT_CACHE_TTL", |c, v| c.prompt_cache_ttl = Some(v)),
 ];
 
 /// Resolve the prompt-cache `setting` (`off`/`on`/`ephemeral`/`auto`; `None` =
@@ -1001,6 +1024,8 @@ impl Agent {
         });
         client.set_headers(config.headers.clone());
         client.set_api_version(config.api_version.clone());
+        client.set_cache_ttl_1h(config.prompt_cache_ttl.as_deref().map(str::trim) == Some("1h"));
+        client.set_timeout(config.request_timeout.map(std::time::Duration::from_secs));
 
         Ok(Self {
             client,
@@ -2321,6 +2346,8 @@ mod tests {
             seed: Some(42),
             stop: vec!["<END>".to_string()],
             stream_usage: Some(false),
+            request_timeout: Some(30),
+            prompt_cache_ttl: Some("1h".to_string()),
             effort: Some("high".to_string()),
             auto_compact: Some(0.7),
             compaction_reserved: Some(12_345),
@@ -2355,6 +2382,8 @@ mod tests {
         assert_eq!(cfg.seed, Some(42));
         assert_eq!(cfg.stop, vec!["<END>".to_string()]);
         assert!(!cfg.stream_usage);
+        assert_eq!(cfg.request_timeout, Some(30));
+        assert_eq!(cfg.prompt_cache_ttl.as_deref(), Some("1h"));
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!((cfg.auto_compact - 0.7).abs() < f64::EPSILON);
         assert_eq!(cfg.compaction_reserved, 12_345);

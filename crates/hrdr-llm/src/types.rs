@@ -145,10 +145,14 @@ pub struct ChatRequest {
     /// unknown fields anyway).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
-    /// Output-token cap. Sent only when configured (some models — OpenAI's
-    /// o-series — want `max_completion_tokens` instead, so this stays opt-in).
+    /// Output-token cap. Sent only when configured. OpenAI's reasoning models
+    /// (o-series, gpt-5) reject `max_tokens` and require `max_completion_tokens`,
+    /// so the client routes the value to whichever the model expects.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// `max_tokens` alias for OpenAI reasoning models (see `max_tokens`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
     /// Nucleus-sampling probability mass. Opt-in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
@@ -235,7 +239,7 @@ pub enum CacheMode {
 /// [`CacheMode::Ephemeral`]. No-op when there are no messages, or a target's
 /// `content` isn't a plain string (already parts, or a tool-call-only assistant
 /// turn with no text).
-pub fn apply_cache_breakpoints(body: &mut serde_json::Value) {
+pub fn apply_cache_breakpoints(body: &mut serde_json::Value, ttl_1h: bool) {
     let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return;
     };
@@ -247,16 +251,26 @@ pub fn apply_cache_breakpoints(body: &mut serde_json::Value) {
         .iter()
         .position(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"));
     if let Some(i) = system {
-        mark_cache(&mut messages[i]);
+        mark_cache(&mut messages[i], ttl_1h);
     }
     // Rolling breakpoint on the last message (unless it's the system we marked).
     if Some(last) != system {
-        mark_cache(&mut messages[last]);
+        mark_cache(&mut messages[last], ttl_1h);
+    }
+}
+
+/// A `cache_control` marker; `ttl_1h` requests the extended 1-hour cache TTL
+/// (default is the provider's ~5-minute ephemeral).
+pub(crate) fn cache_control(ttl_1h: bool) -> serde_json::Value {
+    if ttl_1h {
+        serde_json::json!({ "type": "ephemeral", "ttl": "1h" })
+    } else {
+        serde_json::json!({ "type": "ephemeral" })
     }
 }
 
 /// Rewrite a message's string `content` into `[{type:text, text, cache_control}]`.
-fn mark_cache(msg: &mut serde_json::Value) {
+fn mark_cache(msg: &mut serde_json::Value, ttl_1h: bool) {
     let Some(text) = msg
         .get("content")
         .and_then(|c| c.as_str())
@@ -267,7 +281,7 @@ fn mark_cache(msg: &mut serde_json::Value) {
     msg["content"] = serde_json::json!([{
         "type": "text",
         "text": text,
-        "cache_control": { "type": "ephemeral" },
+        "cache_control": cache_control(ttl_1h),
     }]);
 }
 
@@ -512,7 +526,7 @@ mod tests {
                 { "role": "user", "content": "u2" },
             ]
         });
-        apply_cache_breakpoints(&mut body);
+        apply_cache_breakpoints(&mut body, false);
         let msgs = body["messages"].as_array().unwrap();
         // System marked: content became a one-element parts array with the marker.
         assert_eq!(msgs[0]["content"][0]["text"], "sys");
@@ -528,7 +542,7 @@ mod tests {
     #[test]
     fn cache_breakpoints_single_message_marked_once() {
         let mut body = json!({ "messages": [{ "role": "system", "content": "only" }] });
-        apply_cache_breakpoints(&mut body);
+        apply_cache_breakpoints(&mut body, false);
         let c = &body["messages"][0]["content"];
         assert_eq!(c.as_array().unwrap().len(), 1);
         assert_eq!(c[0]["cache_control"]["type"], "ephemeral");
@@ -544,7 +558,7 @@ mod tests {
                 { "role": "assistant", "tool_calls": [{ "id": "1" }] },
             ]
         });
-        apply_cache_breakpoints(&mut body);
+        apply_cache_breakpoints(&mut body, false);
         assert_eq!(
             body["messages"][0]["content"][0]["cache_control"]["type"],
             "ephemeral"
@@ -555,8 +569,23 @@ mod tests {
     #[test]
     fn cache_breakpoints_noop_without_messages() {
         let mut body = json!({ "model": "x" });
-        apply_cache_breakpoints(&mut body);
+        apply_cache_breakpoints(&mut body, false);
         assert!(body.get("messages").is_none());
+    }
+
+    #[test]
+    fn cache_control_carries_1h_ttl_when_requested() {
+        assert_eq!(cache_control(false), json!({ "type": "ephemeral" }));
+        assert_eq!(
+            cache_control(true),
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+        let mut body = json!({ "messages": [{ "role": "system", "content": "s" }] });
+        apply_cache_breakpoints(&mut body, true);
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["ttl"],
+            "1h"
+        );
     }
 
     /// Build a minimal ChatChunk with optional text content and tool-call deltas.
@@ -821,6 +850,7 @@ mod tests {
             temperature: Some(0.5),
             reasoning_effort: None,
             max_tokens: None,
+            max_completion_tokens: None,
             top_p: None,
             seed: None,
             stop: vec![],
@@ -843,6 +873,7 @@ mod tests {
             temperature: None,
             reasoning_effort: None,
             max_tokens: None,
+            max_completion_tokens: None,
             top_p: None,
             seed: None,
             stop: vec![],
@@ -876,6 +907,7 @@ mod tests {
             temperature: None,
             reasoning_effort: None,
             max_tokens: None,
+            max_completion_tokens: None,
             top_p: None,
             seed: None,
             stop: vec![],
@@ -910,6 +942,7 @@ mod tests {
             temperature: None,
             reasoning_effort: Some("high".to_string()),
             max_tokens: None,
+            max_completion_tokens: None,
             top_p: None,
             seed: None,
             stop: vec![],

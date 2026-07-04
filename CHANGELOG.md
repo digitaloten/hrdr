@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`max_completion_tokens` for OpenAI reasoning models.** `max_tokens` set on
+  an o-series or `gpt-5` model is now sent as `max_completion_tokens` (which
+  those models require), so setting an output cap no longer 400s on them.
+- **1-hour prompt-cache TTL.** `prompt_cache_ttl = "1h"`
+  (`$HRDR_PROMPT_CACHE_TTL`) emits the extended `cache_control` TTL — cheaper
+  for a stable prompt reused across a longer gap (native Anthropic adds the
+  `extended-cache-ttl` beta; OpenRouter passes it through). Default stays
+  ~5-minute ephemeral.
+- **Request timeout.** `request_timeout` (seconds, `$HRDR_REQUEST_TIMEOUT`) sets
+  a connect + idle-read timeout so a hung or stalled provider fails the request
+  instead of blocking forever; a slow-but-progressing stream isn't killed.
+  Default: no timeout.
+
 - **Opt-in request parameters.** `max_tokens` (now also sent on the OpenAI path,
   not just Anthropic), `top_p`, `seed`, and `stop` are configurable (config /
   `$HRDR_MAX_TOKENS` / `$HRDR_TOP_P` / `$HRDR_SEED`), and `stream_usage = false`

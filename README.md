@@ -321,13 +321,15 @@ rejects an unexpected field:
 temperature = 0.2
 top_p = 0.9
 seed = 42                # best-effort determinism (provider support varies)
-max_tokens = 8192        # output cap (required by the Anthropic backend)
+max_tokens = 8192        # output cap; sent as max_completion_tokens for o-series/gpt-5
 stop = ["<END>"]         # stop sequences
 stream_usage = true      # set false only if a server rejects stream_options
+prompt_cache_ttl = "5m"  # or "1h" for the extended cache TTL
+request_timeout = 120    # seconds; connect + idle-read timeout (default: none)
 ```
 
 Scalars also honor `$HRDR_MAX_TOKENS` / `$HRDR_TOP_P` / `$HRDR_SEED` /
-`$HRDR_STREAM_USAGE`.
+`$HRDR_STREAM_USAGE` / `$HRDR_PROMPT_CACHE_TTL` / `$HRDR_REQUEST_TIMEOUT`.
 
 ### MCP servers
 

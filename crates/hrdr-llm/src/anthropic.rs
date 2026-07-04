@@ -41,9 +41,10 @@ pub(crate) fn build_body(
     max_tokens: u32,
     effort: Option<&str>,
     temperature: Option<f32>,
+    cache: CacheMode,
+    ttl_1h: bool,
     messages: &[ChatMessage],
     tools: &[ToolDef],
-    cache: CacheMode,
 ) -> Value {
     let ephemeral = cache == CacheMode::Ephemeral;
     let (system, msgs) = split_system_and_messages(messages);
@@ -72,7 +73,7 @@ pub(crate) fn build_body(
     if !system.is_empty() {
         let mut blocks = system;
         if ephemeral {
-            mark_last_block(&mut blocks);
+            mark_last_block(&mut blocks, ttl_1h);
         }
         body["system"] = Value::Array(blocks);
     }
@@ -89,7 +90,7 @@ pub(crate) fn build_body(
             })
             .collect();
         if ephemeral && let Some(last) = defs.last_mut() {
-            last["cache_control"] = json!({ "type": "ephemeral" });
+            last["cache_control"] = crate::types::cache_control(ttl_1h);
         }
         body["tools"] = Value::Array(defs);
     }
@@ -99,7 +100,7 @@ pub(crate) fn build_body(
         && let Some(last) = body["messages"].as_array_mut().and_then(|m| m.last_mut())
         && let Some(blocks) = last.get_mut("content").and_then(|c| c.as_array_mut())
     {
-        mark_last_block(blocks);
+        mark_last_block(blocks, ttl_1h);
     }
 
     body
@@ -204,12 +205,13 @@ fn assistant_blocks(m: &ChatMessage) -> Vec<Value> {
     blocks
 }
 
-/// Tag the last block in a block array with an ephemeral cache breakpoint.
-fn mark_last_block(blocks: &mut [Value]) {
+/// Tag the last block in a block array with a cache breakpoint (`ttl_1h` selects
+/// the 1-hour TTL).
+fn mark_last_block(blocks: &mut [Value], ttl_1h: bool) {
     if let Some(last) = blocks.last_mut()
         && let Some(obj) = last.as_object_mut()
     {
-        obj.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+        obj.insert("cache_control".into(), crate::types::cache_control(ttl_1h));
     }
 }
 
@@ -225,6 +227,7 @@ pub(crate) async fn chat_stream(
     effort: Option<&str>,
     temperature: Option<f32>,
     cache: CacheMode,
+    ttl_1h: bool,
     extra_headers: &[(String, String)],
     messages: Vec<ChatMessage>,
     tools: Vec<ToolDef>,
@@ -234,9 +237,10 @@ pub(crate) async fn chat_stream(
         max_tokens,
         effort,
         temperature,
+        cache,
+        ttl_1h,
         &messages,
         &tools,
-        cache,
     );
     let mut req = http
         .post(format!("{base_url}/messages"))
@@ -248,10 +252,17 @@ pub(crate) async fn chat_stream(
     for (k, v) in extra_headers {
         req = req.header(k, v);
     }
-    // Interleaved thinking lets Claude reason between tool calls — valuable in the
-    // agent loop, so enable it when thinking is on and tools are offered.
+    // Betas: interleaved thinking (reason between tool calls) when thinking is on
+    // with tools; extended 1-hour cache TTL when requested.
+    let mut betas: Vec<&str> = Vec::new();
     if body.get("thinking").is_some() && !tools.is_empty() {
-        req = req.header("anthropic-beta", "interleaved-thinking-2025-05-14");
+        betas.push("interleaved-thinking-2025-05-14");
+    }
+    if ttl_1h && cache == CacheMode::Ephemeral {
+        betas.push("extended-cache-ttl-2025-04-11");
+    }
+    if !betas.is_empty() {
+        req = req.header("anthropic-beta", betas.join(","));
     }
     let resp = req.send().await.context("chat stream request failed")?;
     let status = resp.status();
@@ -492,7 +503,16 @@ mod tests {
     #[test]
     fn system_is_hoisted_and_messages_alternate() {
         let msgs = vec![sys("you are hrdr"), user("hi"), user("still me")];
-        let body = build_body("claude", 1024, None, None, &msgs, &[], CacheMode::Off);
+        let body = build_body(
+            "claude",
+            1024,
+            None,
+            None,
+            CacheMode::Off,
+            false,
+            &msgs,
+            &[],
+        );
         // System hoisted to a top-level block array.
         assert_eq!(body["system"][0]["text"], "you are hrdr");
         // Two consecutive user turns coalesce into one message.
@@ -527,9 +547,10 @@ mod tests {
             512,
             None,
             None,
+            CacheMode::Off,
+            false,
             &[user("go"), assistant, result],
             &[],
-            CacheMode::Off,
         );
         let m = body["messages"].as_array().unwrap();
         // user, assistant(text+tool_use), user(tool_result)
@@ -551,7 +572,7 @@ mod tests {
             ChatMessage::tool_result("t1", "one"),
             ChatMessage::tool_result("t2", "two"),
         ];
-        let body = build_body("claude", 256, None, None, &msgs, &[], CacheMode::Off);
+        let body = build_body("claude", 256, None, None, CacheMode::Off, false, &msgs, &[]);
         let m = body["messages"].as_array().unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0]["content"].as_array().unwrap().len(), 2);
@@ -569,9 +590,10 @@ mod tests {
             256,
             None,
             None,
+            CacheMode::Off,
+            false,
             &[user("go")],
             &tools,
-            CacheMode::Off,
         );
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(
@@ -588,9 +610,10 @@ mod tests {
             256,
             None,
             None,
+            CacheMode::Ephemeral,
+            false,
             &[sys("s"), user("hi")],
             &tools,
-            CacheMode::Ephemeral,
         );
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
@@ -607,9 +630,10 @@ mod tests {
             256,
             None,
             None,
+            CacheMode::Off,
+            false,
             &[sys("s"), user("hi")],
             &[],
-            CacheMode::Off,
         );
         assert!(body["system"][0].get("cache_control").is_none());
         assert!(
@@ -627,9 +651,10 @@ mod tests {
             8192,
             None,
             Some(0.3),
+            CacheMode::Off,
+            false,
             &[user("hi")],
             &[],
-            CacheMode::Off,
         );
         assert!(plain.get("thinking").is_none());
         let t = plain["temperature"].as_f64().unwrap();
@@ -641,9 +666,10 @@ mod tests {
             8192,
             Some("high"),
             Some(0.3),
+            CacheMode::Off,
+            false,
             &[user("hi")],
             &[],
-            CacheMode::Off,
         );
         assert_eq!(think["thinking"]["type"], "enabled");
         let budget = think["thinking"]["budget_tokens"].as_u64().unwrap() as u32;

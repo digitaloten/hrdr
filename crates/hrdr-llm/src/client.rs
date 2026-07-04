@@ -78,6 +78,8 @@ pub struct Client {
     pub temperature: Option<f32>,
     /// Prompt-caching strategy (default [`CacheMode::Off`]).
     cache: CacheMode,
+    /// Use the extended 1-hour cache TTL instead of the ~5-minute default.
+    cache_1h: bool,
     /// Reasoning-effort label; sent as `reasoning_effort` when it names a known
     /// level (see [`crate::normalize_effort`]).
     effort: Option<String>,
@@ -104,6 +106,22 @@ pub(crate) fn retry_after_suffix(headers: &reqwest::header::HeaderMap) -> String
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(|secs| format!(" (retry-after: {secs}s)"))
         .unwrap_or_default()
+}
+
+/// Whether `model` is an OpenAI reasoning model that wants `max_completion_tokens`
+/// instead of `max_tokens` (o-series, gpt-5). Handles a provider prefix like
+/// `openai/o3-mini`. Non-OpenAI models are unaffected (they use `max_tokens`).
+fn uses_max_completion_tokens(model: &str) -> bool {
+    let m = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.starts_with("o5")
+        || m.starts_with("gpt-5")
 }
 
 /// Native Anthropic Messages API iff the endpoint host is `api.anthropic.com`.
@@ -144,6 +162,7 @@ impl Client {
             model: model.into(),
             temperature: None,
             cache: CacheMode::Off,
+            cache_1h: false,
             effort: None,
             params: crate::RequestParams::default(),
             extra_headers: Vec::new(),
@@ -168,6 +187,12 @@ impl Client {
         self.cache = cache;
     }
 
+    /// Use the extended 1-hour cache TTL (`true`) or the default ~5-minute
+    /// ephemeral (`false`).
+    pub fn set_cache_ttl_1h(&mut self, one_hour: bool) {
+        self.cache_1h = one_hour;
+    }
+
     /// Set the reasoning-effort label; only recognized levels
     /// ([`crate::normalize_effort`]) are actually sent.
     pub fn set_effort(&mut self, effort: Option<String>) {
@@ -178,6 +203,21 @@ impl Client {
     /// `include_usage`).
     pub fn set_params(&mut self, params: crate::RequestParams) {
         self.params = params;
+    }
+
+    /// Rebuild the HTTP client with a connect + idle-read timeout (so a hung or
+    /// stalled provider fails the request instead of blocking forever). `None`
+    /// restores the default (no timeout). The read timeout is per-chunk, so a
+    /// slow-but-progressing stream isn't killed. A build error keeps the current
+    /// client.
+    pub fn set_timeout(&mut self, timeout: Option<std::time::Duration>) {
+        let mut builder = reqwest::Client::builder();
+        if let Some(t) = timeout {
+            builder = builder.connect_timeout(t).read_timeout(t);
+        }
+        if let Ok(http) = builder.build() {
+            self.http = http;
+        }
     }
 
     /// Set the provider-configured extra headers sent with every request.
@@ -222,13 +262,19 @@ impl Client {
         tools: Vec<ToolDef>,
         stream: bool,
     ) -> ChatRequest {
+        // OpenAI reasoning models want `max_completion_tokens`, not `max_tokens`.
+        let (max_tokens, max_completion_tokens) = match self.params.max_tokens {
+            Some(n) if uses_max_completion_tokens(&self.model) => (None, Some(n)),
+            other => (other, None),
+        };
         ChatRequest {
             model: self.model.clone(),
             messages,
             tools,
             temperature: self.temperature,
             reasoning_effort: self.effort.as_deref().and_then(crate::normalize_effort),
-            max_tokens: self.params.max_tokens,
+            max_tokens,
+            max_completion_tokens,
             top_p: self.params.top_p,
             seed: self.params.seed,
             stop: self.params.stop.clone(),
@@ -271,7 +317,7 @@ impl Client {
     fn body_json(&self, body: &ChatRequest) -> serde_json::Value {
         let mut json = serde_json::to_value(body).unwrap_or_default();
         if self.cache == CacheMode::Ephemeral {
-            crate::types::apply_cache_breakpoints(&mut json);
+            crate::types::apply_cache_breakpoints(&mut json, self.cache_1h);
         }
         json
     }
@@ -294,6 +340,7 @@ impl Client {
                 self.effort.as_deref(),
                 self.temperature,
                 self.cache,
+                self.cache_1h,
                 &self.extra_headers,
                 messages,
                 tools,
@@ -474,6 +521,35 @@ fn json_u32(v: &serde_json::Value) -> Option<u32> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn max_tokens_routes_to_completion_field_for_reasoning_models() {
+        assert!(uses_max_completion_tokens("o3-mini"));
+        assert!(uses_max_completion_tokens("openai/gpt-5"));
+        assert!(uses_max_completion_tokens("o1"));
+        assert!(!uses_max_completion_tokens("gpt-4o"));
+        assert!(!uses_max_completion_tokens("claude-opus-4-8"));
+
+        // A reasoning model routes the cap to `max_completion_tokens`.
+        let mut c = Client::new("https://api.openai.com/v1", None, "o3-mini");
+        c.set_params(crate::RequestParams {
+            max_tokens: Some(1000),
+            ..Default::default()
+        });
+        let r = c.request(vec![], vec![], false);
+        assert_eq!(r.max_tokens, None);
+        assert_eq!(r.max_completion_tokens, Some(1000));
+
+        // A normal model uses `max_tokens`.
+        let mut c = Client::new("https://api.openai.com/v1", None, "gpt-4o");
+        c.set_params(crate::RequestParams {
+            max_tokens: Some(1000),
+            ..Default::default()
+        });
+        let r = c.request(vec![], vec![], false);
+        assert_eq!(r.max_tokens, Some(1000));
+        assert_eq!(r.max_completion_tokens, None);
+    }
 
     #[test]
     fn backend_detected_from_host() {
