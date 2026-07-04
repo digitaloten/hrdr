@@ -924,18 +924,27 @@ import sys, json, os
 CAPS = {"tools":{}} if os.environ.get("MOCK_NOCAPS") else {"tools":{},"resources":{},"prompts":{}}
 EMPTY = bool(os.environ.get("MOCK_EMPTY"))
 
-def handle(m):
+def handle(m, session=None):
     i = m.get("id"); method = m.get("method")
     if method == "initialize":
         return {"jsonrpc":"2.0","id":i,"result":{"protocolVersion":"2025-06-18","capabilities":CAPS,"serverInfo":{"name":"mock","version":"0"}}}
     if method == "tools/list":
         return {"jsonrpc":"2.0","id":i,"result":{"tools":[
             {"name":"echo","description":"Echo the input back","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}},"annotations":{"readOnlyHint":True}},
-            {"name":"boom","description":"Always fails","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":False}}]}}
+            {"name":"boom","description":"Always fails","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":False}},
+            {"name":"rpcfail","description":"Returns a JSON-RPC error","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":True}},
+            {"name":"pic","description":"Returns an image part","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":True}},
+            {"name":"whoami","description":"Echoes the session id the server saw","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":True}}]}}
     if method == "tools/call":
         p = m.get("params",{}); name = p.get("name",""); args = p.get("arguments",{})
         if name == "boom":
             return {"jsonrpc":"2.0","id":i,"result":{"content":[{"type":"text","text":"kaboom"}],"isError":True}}
+        if name == "rpcfail":
+            return {"jsonrpc":"2.0","id":i,"error":{"code":-32000,"message":"tool exploded"}}
+        if name == "pic":
+            return {"jsonrpc":"2.0","id":i,"result":{"content":[{"type":"image","data":"aGk=","mimeType":"image/png"}],"isError":False}}
+        if name == "whoami":
+            return {"jsonrpc":"2.0","id":i,"result":{"content":[{"type":"text","text":str(session or "(none)")}],"isError":False}}
         return {"jsonrpc":"2.0","id":i,"result":{"content":[{"type":"text","text":"echo: "+str(args.get("text",""))}],"isError":False}}
     if method == "resources/list":
         res = [] if EMPTY else [{"uri":"file:///readme","name":"readme","description":"the readme"},{"uri":"blob://logo","name":"logo"}]
@@ -970,7 +979,7 @@ def run_http():
         def do_POST(self):
             n = int(self.headers.get("Content-Length","0"))
             m = json.loads(self.rfile.read(n) or "{}")
-            r = handle(m)
+            r = handle(m, self.headers.get("Mcp-Session-Id"))
             if r is None:
                 self.send_response(202); self.end_headers(); return
             body = json.dumps(r).encode()
@@ -1099,6 +1108,32 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         let err = boom.execute(json!({}), &ctx).await.unwrap_err();
         assert!(err.to_string().contains("kaboom"), "err: {err}");
 
+        // A JSON-RPC `error` object (distinct from `isError` content) surfaces too.
+        let rpc_err = by("rpcfail").execute(json!({}), &ctx).await.unwrap_err();
+        assert!(
+            rpc_err.to_string().contains("tool exploded"),
+            "err: {rpc_err}"
+        );
+
+        // Non-text (image) tool content is noted, not dumped inline.
+        let pic = by("pic").execute(json!({}), &ctx).await.unwrap();
+        assert_eq!(pic, "[image content omitted]");
+
+        // Concurrent calls are routed back to the right caller by id.
+        let outs = futures_util::future::join_all((0..8).map(|n| {
+            let echo = echo.clone();
+            let ctx = &ctx;
+            async move {
+                echo.execute(json!({ "text": format!("n{n}") }), ctx)
+                    .await
+                    .unwrap()
+            }
+        }))
+        .await;
+        for (n, out) in outs.iter().enumerate() {
+            assert_eq!(*out, format!("echo: n{n}"));
+        }
+
         let listed = by("list_resources").execute(json!({}), &ctx).await.unwrap();
         assert!(listed.contains("file:///readme"), "resources: {listed}");
         let read = by("read_resource")
@@ -1144,8 +1179,8 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         let (_client, tools) = McpClient::connect_stdio("stdio", py, &args, &[])
             .await
             .expect("connect + handshake + tools/list");
-        // echo + boom + {list,read}_resources + {list,get}_prompt.
-        assert_eq!(tools.len(), 6);
+        // 5 real tools + {list,read}_resources + {list,get}_prompt.
+        assert_eq!(tools.len(), 9);
         exercise_all("stdio", tools).await;
     }
 
@@ -1160,7 +1195,12 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         let (_client, tools) = McpClient::connect_http("http", &url, &[])
             .await
             .expect("connect over Streamable HTTP");
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 9);
+        // The `Mcp-Session-Id` the server returned on `initialize` is resent on
+        // later requests: `whoami` echoes back the session id it saw.
+        let ctx = ToolContext::new(".");
+        let whoami = tools.iter().find(|t| t.name() == "http_whoami").unwrap();
+        assert_eq!(whoami.execute(json!({}), &ctx).await.unwrap(), "sess-1");
         exercise_all("http", tools).await;
     }
 
@@ -1175,7 +1215,7 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
         let (_client, tools) = McpClient::connect_sse("sse", &url, &[])
             .await
             .expect("connect over legacy HTTP+SSE");
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 9);
         exercise_all("sse", tools).await;
     }
 
@@ -1209,9 +1249,9 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
             eprintln!("skipping: no python interpreter");
             return;
         };
-        // Only the two real tools — no list/read/get op-tools.
+        // Only the real tools — no list/read/get op-tools.
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert_eq!(tools.len(), 2, "tools: {names:?}");
+        assert_eq!(tools.len(), 5, "tools: {names:?}");
         assert!(names.contains(&"nocaps_echo"));
         assert!(names.contains(&"nocaps_boom"));
         assert!(
