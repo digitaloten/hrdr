@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-04
+
 ### Fixed
 
 - **Prompt caching no longer breaks non-caching providers by default.** In 0.2.2
@@ -1396,7 +1398,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/kryptic-sh/hrdr/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/kryptic-sh/hrdr/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/kryptic-sh/hrdr/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/kryptic-sh/hrdr/compare/v0.1.0...v0.2.0
