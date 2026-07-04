@@ -151,6 +151,62 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
+/// Prompt-caching strategy for outgoing requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheMode {
+    /// No cache breakpoints emitted.
+    #[default]
+    Off,
+    /// Emit `cache_control: {"type": "ephemeral"}` breakpoints (Anthropic native
+    /// and OpenRouter passthrough): one on the system prompt, one rolling on the
+    /// last message. Providers that don't support it ignore the marker.
+    Ephemeral,
+}
+
+/// Mark cache breakpoints on a serialized chat-request body (`messages[]`): the
+/// first `system` message and the last message each get a `cache_control`
+/// marker, converting their string `content` into a one-element content-parts
+/// array. Anthropic caches the prefix up to and including each marked block
+/// (≤4 breakpoints allowed; we use ≤2), so the stable system+tools prefix and
+/// the growing conversation prefix are reused turn to turn. No-op when there are
+/// no messages, or a target's `content` isn't a plain string (already parts, or
+/// a tool-call-only assistant turn with no text).
+pub fn apply_cache_breakpoints(body: &mut serde_json::Value) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    if messages.is_empty() {
+        return;
+    }
+    let last = messages.len() - 1;
+    let system = messages
+        .iter()
+        .position(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"));
+    if let Some(i) = system {
+        mark_cache(&mut messages[i]);
+    }
+    // Rolling breakpoint on the last message (unless it's the system we marked).
+    if Some(last) != system {
+        mark_cache(&mut messages[last]);
+    }
+}
+
+/// Rewrite a message's string `content` into `[{type:text, text, cache_control}]`.
+fn mark_cache(msg: &mut serde_json::Value) {
+    let Some(text) = msg
+        .get("content")
+        .and_then(|c| c.as_str())
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    msg["content"] = serde_json::json!([{
+        "type": "text",
+        "text": text,
+        "cache_control": { "type": "ephemeral" },
+    }]);
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Usage {
     #[serde(default)]
@@ -294,6 +350,64 @@ impl Accumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cache_breakpoints_mark_system_and_last_only() {
+        let mut body = json!({
+            "messages": [
+                { "role": "system", "content": "sys" },
+                { "role": "user", "content": "u1" },
+                { "role": "assistant", "content": "a1" },
+                { "role": "user", "content": "u2" },
+            ]
+        });
+        apply_cache_breakpoints(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        // System marked: content became a one-element parts array with the marker.
+        assert_eq!(msgs[0]["content"][0]["text"], "sys");
+        assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        // Middle messages left as plain strings.
+        assert_eq!(msgs[1]["content"], "u1");
+        assert_eq!(msgs[2]["content"], "a1");
+        // Last marked.
+        assert_eq!(msgs[3]["content"][0]["text"], "u2");
+        assert_eq!(msgs[3]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_breakpoints_single_message_marked_once() {
+        let mut body = json!({ "messages": [{ "role": "system", "content": "only" }] });
+        apply_cache_breakpoints(&mut body);
+        let c = &body["messages"][0]["content"];
+        assert_eq!(c.as_array().unwrap().len(), 1);
+        assert_eq!(c[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_breakpoints_skip_contentless_last_message() {
+        // A tool-call-only assistant turn (no `content`) can't be marked; the
+        // system breakpoint still applies.
+        let mut body = json!({
+            "messages": [
+                { "role": "system", "content": "sys" },
+                { "role": "assistant", "tool_calls": [{ "id": "1" }] },
+            ]
+        });
+        apply_cache_breakpoints(&mut body);
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(body["messages"][1].get("content").is_none());
+    }
+
+    #[test]
+    fn cache_breakpoints_noop_without_messages() {
+        let mut body = json!({ "model": "x" });
+        apply_cache_breakpoints(&mut body);
+        assert!(body.get("messages").is_none());
+    }
 
     /// Build a minimal ChatChunk with optional text content and tool-call deltas.
     fn chunk(content: Option<&str>, tool_calls: Option<Vec<ToolCallDelta>>) -> ChatChunk {

@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Prompt caching.** hrdr now marks `cache_control` breakpoints on each request
+  — one on the system prompt, one rolling on the last message — so the stable
+  system+tools prefix and the growing conversation prefix are cached across
+  turns (Anthropic natively, or Anthropic/Gemini via OpenRouter; other providers
+  ignore the marker). Controlled by `prompt_cache = "auto" | "on" | "off"`
+  (config), `$HRDR_PROMPT_CACHE`, or `--prompt-cache`; `auto` (default) enables
+  it for remote endpoints and skips local servers. `/info` shows the active
+  state.
 - **MCP resources & prompts.** When a server advertises `resources` / `prompts`
   capabilities, hrdr exposes them as extra tools: `<name>_list_resources` +
   `<name>_read_resource` (`resources/list` + `resources/read`) and

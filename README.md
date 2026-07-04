@@ -257,6 +257,22 @@ preserve_recent_tokens = 8000  # …bounded by this token budget
 
 `auto_prune` also honors `$HRDR_AUTO_PRUNE` / `--auto-prune on|off`.
 
+### Prompt caching
+
+For providers that support it (Anthropic natively, or Anthropic/Gemini models
+via OpenRouter), hrdr marks `cache_control` breakpoints on the request so the
+stable system+tools prefix and the growing conversation prefix are cached across
+turns — cutting cost and latency. Providers that don't support the marker simply
+ignore it.
+
+```toml
+prompt_cache = "auto"   # auto (default) | on | off
+```
+
+`auto` enables caching for remote endpoints and disables it for a local server
+(which may reject the content-parts form). Override with `$HRDR_PROMPT_CACHE` or
+`--prompt-cache off|on|auto`; `/info` shows whether it's currently active.
+
 ### MCP servers
 
 Connect [Model Context Protocol](https://modelcontextprotocol.io) servers to add

@@ -134,6 +134,11 @@ pub struct AgentConfig {
     pub preserve_recent_tokens: u32,
     /// MCP servers from `[[mcp]]` config; connected by [`Agent::connect_mcp`].
     pub mcp: Vec<McpServerConfig>,
+    /// Prompt-caching mode: `off`, `on` (alias `ephemeral`), or `auto` (default).
+    /// `auto` emits `cache_control` breakpoints for remote endpoints and skips
+    /// them for a local server (which may reject the content-parts form). `None`
+    /// means `auto`. See [`resolve_cache_mode`].
+    pub prompt_cache: Option<String>,
 }
 
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
@@ -249,6 +254,7 @@ impl Default for AgentConfig {
             compaction_tail_turns: DEFAULT_TAIL_TURNS,
             preserve_recent_tokens: DEFAULT_PRESERVE_RECENT_TOKENS,
             mcp: Vec::new(),
+            prompt_cache: None,
         }
     }
 }
@@ -460,6 +466,7 @@ struct FileConfig {
     preserve_recent_tokens: Option<u32>,
     #[serde(default)]
     mcp: Vec<McpServerConfig>,
+    prompt_cache: Option<String>,
 }
 
 /// `hrdr`'s config directory — `$XDG_CONFIG_HOME/hrdr`, default
@@ -568,6 +575,9 @@ impl AgentConfig {
         if !fc.mcp.is_empty() {
             self.mcp = fc.mcp;
         }
+        if let Some(v) = fc.prompt_cache {
+            self.prompt_cache = Some(v);
+        }
     }
 
     /// Layer environment variables over the current config. Every knob is one
@@ -637,7 +647,43 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
             c.auto_prune = b;
         }
     }),
+    ("HRDR_PROMPT_CACHE", |c, v| c.prompt_cache = Some(v)),
 ];
+
+/// Resolve the prompt-cache `setting` (`off`/`on`/`ephemeral`/`auto`; `None` =
+/// `auto`) against the endpoint into a concrete [`CacheMode`]. `auto` enables
+/// caching for a remote endpoint and disables it for a local one (a local
+/// OpenAI-compatible server may reject the `cache_control` content-parts form,
+/// and cloud providers that don't support the marker simply ignore it).
+pub fn resolve_cache_mode(setting: Option<&str>, base_url: &str) -> hrdr_llm::CacheMode {
+    use hrdr_llm::CacheMode;
+    match setting.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("off") | Some("none") | Some("false") | Some("no") => CacheMode::Off,
+        Some("on") | Some("ephemeral") | Some("true") | Some("yes") => CacheMode::Ephemeral,
+        _ if is_local_url(base_url) => CacheMode::Off,
+        _ => CacheMode::Ephemeral,
+    }
+}
+
+/// Whether `base_url` points at a loopback/local endpoint (no prompt caching in
+/// `auto` mode).
+fn is_local_url(base_url: &str) -> bool {
+    let host = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    matches!(
+        host,
+        "localhost" | "127.0.0.1" | "0.0.0.0" | "::1" | "[::1]"
+    )
+}
 
 /// A value to persist into the user config file.
 pub enum ConfigValue<'a> {
@@ -753,6 +799,9 @@ pub struct Agent {
     /// Live MCP connections, kept alive for the process (their tools hold clones
     /// too; dropping these kills the server processes).
     mcp_clients: Vec<Arc<hrdr_tools::McpClient>>,
+    /// Raw prompt-cache setting, re-resolved against the endpoint on a provider
+    /// switch (see [`resolve_cache_mode`]).
+    prompt_cache: Option<String>,
 }
 
 impl Agent {
@@ -821,13 +870,16 @@ impl Agent {
             .map(|c| Arc::new(Mutex::new(c)));
         ctx.checkpoints = checkpoints.clone();
 
-        let mut client = Client::new(config.base_url, config.api_key, config.model);
+        let cache_mode = resolve_cache_mode(config.prompt_cache.as_deref(), &config.base_url);
+        let mut client =
+            Client::new(config.base_url, config.api_key, config.model).with_cache(cache_mode);
         if let Some(t) = config.temperature {
             client = client.with_temperature(t);
         }
 
         Ok(Self {
             client,
+            prompt_cache: config.prompt_cache,
             tools,
             ctx,
             messages: vec![ChatMessage::system(system)],
@@ -1019,6 +1071,13 @@ impl Agent {
         self.client.temperature
     }
 
+    /// Whether prompt caching is active for the current endpoint (see
+    /// [`resolve_cache_mode`]).
+    pub fn prompt_cache_active(&self) -> bool {
+        resolve_cache_mode(self.prompt_cache.as_deref(), self.client.base_url())
+            == hrdr_llm::CacheMode::Ephemeral
+    }
+
     /// Set (or clear) the sampling temperature.
     pub fn set_temperature(&mut self, t: Option<f32>) {
         self.client.temperature = t;
@@ -1026,8 +1085,11 @@ impl Agent {
 
     /// Repoint at a different OpenAI-compatible endpoint + key (provider switch).
     pub fn set_endpoint(&mut self, base_url: impl Into<String>, api_key: Option<String>) {
+        let base_url = base_url.into();
+        let cache = resolve_cache_mode(self.prompt_cache.as_deref(), &base_url);
         self.client.set_base_url(base_url);
         self.client.set_api_key(api_key);
+        self.client.set_cache(cache);
     }
 
     /// Drop the last user turn (and everything after it) from history, returning
@@ -2081,7 +2143,9 @@ mod tests {
             compaction_tail_turns: Some(4),
             preserve_recent_tokens: Some(12_000),
             mcp: vec![],
+            prompt_cache: Some("on".to_string()),
         });
+        assert_eq!(cfg.prompt_cache.as_deref(), Some("on"));
         assert_eq!(cfg.tool_max_lines, 500);
         assert_eq!(cfg.tool_max_bytes, 20_000);
         assert_eq!(cfg.compaction_tail_turns, 4);
@@ -2098,6 +2162,39 @@ mod tests {
         assert!(!cfg.auto_prune);
         assert_eq!(cfg.checkpoints.as_deref(), Some("on"));
         assert!(cfg.allow_outside_cwd);
+    }
+
+    #[test]
+    fn cache_mode_resolves_setting_and_endpoint() {
+        use super::resolve_cache_mode;
+        use hrdr_llm::CacheMode;
+        // Explicit settings win regardless of endpoint.
+        assert_eq!(
+            resolve_cache_mode(Some("off"), "https://api.openai.com/v1"),
+            CacheMode::Off
+        );
+        assert_eq!(
+            resolve_cache_mode(Some("on"), "http://localhost:8080/v1"),
+            CacheMode::Ephemeral
+        );
+        // auto (None or "auto"): on for remote, off for local.
+        assert_eq!(
+            resolve_cache_mode(None, "https://openrouter.ai/api/v1"),
+            CacheMode::Ephemeral
+        );
+        assert_eq!(
+            resolve_cache_mode(Some("auto"), "http://127.0.0.1:8080/v1"),
+            CacheMode::Off
+        );
+        assert_eq!(
+            resolve_cache_mode(None, "http://localhost:1234/v1"),
+            CacheMode::Off
+        );
+        // A local host with credentials in the URL is still detected as local.
+        assert_eq!(
+            resolve_cache_mode(None, "http://user:pass@localhost:8080/v1"),
+            CacheMode::Off
+        );
     }
 
     #[test]

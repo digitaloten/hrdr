@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 
-use crate::types::{ChatChunk, ChatMessage, ChatRequest, ToolDef};
+use crate::types::{CacheMode, ChatChunk, ChatMessage, ChatRequest, ToolDef};
 
 /// Wire-level debug log, enabled by `HRDR_LOG_REQUESTS=<path>`: every chat
 /// request body, every raw SSE data line, and every non-2xx response body is
@@ -63,6 +63,8 @@ pub struct Client {
     /// Model id sent with each request (a public field; set it directly).
     pub model: String,
     pub temperature: Option<f32>,
+    /// Prompt-caching strategy (default [`CacheMode::Off`]).
+    cache: CacheMode,
 }
 
 impl Client {
@@ -79,12 +81,29 @@ impl Client {
             api_key,
             model: model.into(),
             temperature: None,
+            cache: CacheMode::Off,
         }
     }
 
     pub fn with_temperature(mut self, t: f32) -> Self {
         self.temperature = Some(t);
         self
+    }
+
+    /// Set the prompt-caching strategy (builder form).
+    pub fn with_cache(mut self, cache: CacheMode) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// Set the prompt-caching strategy (e.g. after a mid-session provider switch).
+    pub fn set_cache(&mut self, cache: CacheMode) {
+        self.cache = cache;
+    }
+
+    /// The current endpoint base URL (including the `/v1` suffix).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Repoint the client at a different endpoint (for mid-session provider switch).
@@ -116,7 +135,7 @@ impl Client {
         }
     }
 
-    fn post(&self, body: &ChatRequest) -> reqwest::RequestBuilder {
+    fn post(&self, body: &serde_json::Value) -> reqwest::RequestBuilder {
         let mut req = self
             .http
             .post(format!("{}/chat/completions", self.base_url))
@@ -127,18 +146,27 @@ impl Client {
         req
     }
 
+    /// Serialize a request and apply cache breakpoints per the active [`CacheMode`].
+    fn body_json(&self, body: &ChatRequest) -> serde_json::Value {
+        let mut json = serde_json::to_value(body).unwrap_or_default();
+        if self.cache == CacheMode::Ephemeral {
+            crate::types::apply_cache_breakpoints(&mut json);
+        }
+        json
+    }
+
     /// Streaming completion. Yields decoded chunks as they arrive.
     pub async fn chat_stream(
         &self,
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDef>,
     ) -> Result<ChatStream> {
-        let body = self.request(messages, tools, true);
+        let body = self.body_json(&self.request(messages, tools, true));
         log_wire(
             "request",
             serde_json::json!({
                 "url": format!("{}/chat/completions", self.base_url),
-                "body": serde_json::to_value(&body).unwrap_or_default(),
+                "body": body,
             }),
         );
         let resp = self

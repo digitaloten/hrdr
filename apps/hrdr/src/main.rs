@@ -62,6 +62,10 @@ struct Cli {
     #[arg(long = "auto-prune", global = true, value_name = "on|off")]
     auto_prune: Option<String>,
 
+    /// Prompt caching: off, on, or auto (default; on for remote endpoints).
+    #[arg(long = "prompt-cache", global = true, value_name = "off|on|auto")]
+    prompt_cache: Option<String>,
+
     /// Don't auto-resume the most recent session for the working directory.
     #[arg(long = "no-auto-resume", global = true)]
     no_auto_resume: bool,
@@ -266,6 +270,9 @@ async fn main() -> Result<()> {
     }
     if let Some(c) = cli.checkpoints {
         config.checkpoints = Some(c);
+    }
+    if let Some(p) = cli.prompt_cache {
+        config.prompt_cache = Some(p);
     }
     if let Some(n) = cli.todo_ttl {
         ui.todo_ttl = n;
