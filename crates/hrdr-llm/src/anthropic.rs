@@ -617,7 +617,7 @@ mod tests {
         let big = thinking_budget(Some("high"), 32000).unwrap();
         assert!(big > small);
         // Budget always leaves ≥1024 for the answer and is ≥1024 itself.
-        assert!(small >= 1024 && small <= 8192 - 1024);
+        assert!((1024..=8192 - 1024).contains(&small));
         // A window too small to fit a budget + answer → thinking off.
         assert_eq!(thinking_budget(Some("high"), 1500), None);
     }
