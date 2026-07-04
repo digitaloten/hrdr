@@ -108,17 +108,17 @@ In the TUI, type a message and press `Enter` to send. `@path` attaches a file
 
 ### Keybindings
 
-| Key                       | Action                                                    |
-| ------------------------- | --------------------------------------------------------- |
-| `Enter`                   | Send (queues a follow-up if a reply is already running)   |
-| `Alt+Enter` / `\`+`Enter` | Insert a newline (`Shift+Enter` too, where supported)     |
-| `Up` / `Down`             | Recall previous inputs (single-line); drive the `/` menu  |
-| `@path`                   | Attach a file to the message                              |
-| `Ctrl+G`                  | Edit the input in `$EDITOR` / `$VISUAL`                   |
-| `PageUp/Down`, mouse      | Scroll the transcript; `End` follows the newest output    |
-| `Ctrl+L`                  | Clear + repaint the screen                                |
-| `Esc` / `Ctrl+C`          | Interrupt the running turn                                |
-| `Ctrl+C` twice / `Ctrl+D` | Quit (`Ctrl+D` on an empty input); `Ctrl+Q` quits at once |
+| Key                       | Action                                                                           |
+| ------------------------- | -------------------------------------------------------------------------------- |
+| `Enter`                   | Send; **while a reply runs, steers it** (delivered after the current tool round) |
+| `Alt+Enter` / `\`+`Enter` | Insert a newline (`Shift+Enter` too, where supported)                            |
+| `Up` / `Down`             | Recall previous inputs (single-line); drive the `/` menu                         |
+| `@path`                   | Attach a file to the message                                                     |
+| `Ctrl+G`                  | Edit the input in `$EDITOR` / `$VISUAL`                                          |
+| `PageUp/Down`, mouse      | Scroll the transcript; `End` follows the newest output                           |
+| `Ctrl+L`                  | Clear + repaint the screen                                                       |
+| `Esc` / `Ctrl+C`          | Interrupt the running turn                                                       |
+| `Ctrl+C` twice / `Ctrl+D` | Quit (`Ctrl+D` on an empty input); `Ctrl+Q` quits at once                        |
 
 Pass `--vim` for a full [hjkl](https://github.com/kryptic-sh/hjkl) vim editor in
 the input pane instead of the default plain input.

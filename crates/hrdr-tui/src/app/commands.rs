@@ -59,6 +59,9 @@ impl super::App {
         }
         self.clear_transcript();
         self.queue.clear();
+        if let Ok(mut q) = self.steering.lock() {
+            q.clear();
+        }
         if let Ok(mut todos) = self.todos.lock() {
             todos.clear();
         }

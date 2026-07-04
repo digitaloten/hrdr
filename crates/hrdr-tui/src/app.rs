@@ -165,6 +165,9 @@ pub(crate) struct App {
     session_label: Option<String>,
     /// Handle to the in-flight turn task; `abort()` cancels it.
     turn_handle: Option<JoinHandle<()>>,
+    /// Messages submitted while a turn runs, delivered mid-turn ("steering").
+    /// Shared with the running `Agent::run`, which drains it between rounds.
+    steering: hrdr_agent::SteeringQueue,
     /// Transcript scroll offset in raw lines from the natural bottom.
     /// 0 = auto-follow (pin to newest content).
     pub(crate) scroll_offset: usize,
@@ -307,6 +310,7 @@ impl App {
             session_id: None,
             session_label: None,
             turn_handle: None,
+            steering: hrdr_agent::steering_queue(),
             scroll_offset: 0,
             transcript_height: 24,
             max_scroll: 0,
@@ -536,11 +540,19 @@ impl App {
             }
             self.editor.set_content("");
             self.scroll_offset = 0; // auto-follow on new submission
-            if self.running {
-                // A turn is in flight — queue it. It renders as pending at the
-                // bottom (following the output) and is committed into history
-                // only when it's actually sent (see `spawn_turn`).
+            if self.compacting {
+                // The agent is summarizing, not in `run()` — queue for after.
                 self.queue.push_back(input);
+            } else if self.running {
+                // A turn is in flight — steer it: show the message now and hand
+                // the expanded text to the running `Agent::run`, which drains
+                // steering between rounds so the model sees it after the current
+                // tool round (not only after the whole turn).
+                self.push_entry(Entry::User(input.clone()));
+                let sent = hrdr_app::expand_mentions(&input, &hrdr_app::agent_cwd(&self.agent));
+                if let Ok(mut q) = self.steering.lock() {
+                    q.push_back(sent);
+                }
             } else {
                 self.spawn_turn(input);
             }
@@ -771,6 +783,7 @@ impl App {
         // Keep last_usage so the status-bar context size persists between turns;
         // it's refreshed when this turn's Usage event arrives.
         let agent = self.agent.clone();
+        let steering = self.steering.clone();
         let tx = self.tx.clone();
         let tx_events = tx.clone();
         let handle = tokio::spawn(async move {
@@ -778,7 +791,7 @@ impl App {
             // auto-save (try_lock) can run immediately afterward.
             let result = {
                 let mut a = agent.lock().await;
-                a.run(input, |ev| {
+                a.run(input, steering, |ev| {
                     let _ = tx_events.send(TurnMsg::Event(ev));
                 })
                 .await
@@ -891,6 +904,15 @@ impl App {
                 if self.pending_init {
                     self.pending_init = false;
                     self.reload_project_docs();
+                }
+                // A steering message that raced past the turn's end (submitted
+                // after `run()` returned but before `running` cleared) is still
+                // in the queue — flush it as a continuation (already displayed;
+                // `run("")` drains steering before its first request).
+                let has_steering = self.steering.lock().map(|q| !q.is_empty()).unwrap_or(false);
+                if has_steering {
+                    self.launch_turn(String::new());
+                    return;
                 }
                 // Auto-compact near the context limit before doing more work;
                 // its Compacted handler resumes the queue afterward.
@@ -1033,6 +1055,8 @@ impl App {
                 self.push_entry(Entry::System(text));
                 self.scroll_offset = 0;
             }
+            // Delivery signal only; the message was already shown at submit time.
+            AgentEvent::Steered(_) => {}
             AgentEvent::TurnDone => {}
         }
     }

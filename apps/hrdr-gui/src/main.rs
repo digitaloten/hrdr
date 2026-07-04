@@ -364,10 +364,15 @@ fn app_view(
     // Launch a model turn. Shared by Enter/Send, the queue drain on `Done`,
     // and the CommandHost hooks (`/retry`, `/init`). `show_as_user` displays
     // the prompt as a user message (`false` for /init's internal prompt).
+    // Messages submitted mid-turn ("steering"), drained by the running
+    // `Agent::run` between rounds so a correction reaches the model after the
+    // current tool round rather than only after the whole turn.
+    let steering = hrdr_agent::steering_queue();
     let spawn_turn: Rc<dyn Fn(String, bool)> = {
         let agent = agent.clone();
         let tx = tx.clone();
         let th = turn_handle.clone();
+        let steering = steering.clone();
         Rc::new(move |text: String, show_as_user: bool| {
             if show_as_user {
                 push_item(transcript, next_id, Body::User(text.clone()));
@@ -382,6 +387,7 @@ fn app_view(
             // resolve against the agent's cwd (it follows /cwd and /resume).
             let sent = hrdr_app::expand_mentions(&text, &hrdr_app::agent_cwd(&agent));
             let agent = agent.clone();
+            let steering = steering.clone();
             let tx = tx.clone();
             // Snapshot session state for the post-turn auto-save (signals
             // can't be read from the spawned task).
@@ -395,7 +401,7 @@ fn app_view(
                 let result = agent
                     .lock()
                     .await
-                    .run(sent, move |ev| {
+                    .run(sent, steering, move |ev| {
                         let _ = tx_ev.send(UiMsg::Event(ev));
                     })
                     .await;
@@ -486,6 +492,7 @@ fn app_view(
 
     let spawn_for_done = spawn_turn.clone();
     let queue_for_done = queue.clone();
+    let steering_for_done = steering.clone();
     let compact_for_done = start_compaction.clone();
     let agent_for_events = agent.clone();
     let tx_for_events = tx.clone();
@@ -580,6 +587,17 @@ fn app_view(
                         todo_ttl.get_untracked(),
                     );
                     todos_sig.set(t.clone());
+                }
+                // A steering message that raced past the turn's end is still
+                // queued — flush it as a continuation (`run("")` drains steering
+                // before its first request; already displayed at submit).
+                let has_steering = steering_for_done
+                    .lock()
+                    .map(|q| !q.is_empty())
+                    .unwrap_or(false);
+                if has_steering {
+                    (spawn_for_done)(String::new(), false);
+                    return;
                 }
                 // Proactively compact near the context limit before more work
                 // (shared threshold; the queue resumes from Compacted).
@@ -706,6 +724,7 @@ fn app_view(
     let todos_for_send = todos.clone();
     let todo_stamps_for_send = todo_completed_at.clone();
     let cfg_for_send = cfg.clone();
+    let steering_for_send = steering.clone();
     let send = move || {
         // Trim like the TUI does, so " /help" is still a command.
         let text = input.get().trim().to_string();
@@ -764,6 +783,7 @@ fn app_view(
             tx: tx_for_send.clone(),
             base_url,
             login,
+            steering: steering_for_send.clone(),
         };
         // A running `/login` wizard captures the line before history/quit/
         // dispatch — an API key must never be echoed, recalled, or sent.
@@ -845,19 +865,29 @@ fn app_view(
             }
         }
         input.set(String::new());
-        // A turn is running → queue the message; it's sent when the turn ends
-        // (FIFO, like the TUI).
         if running.get_untracked() {
-            let n = {
-                let mut q = queue_for_send.borrow_mut();
-                q.push_back(text);
-                q.len()
-            };
-            system(
-                transcript,
-                next_id,
-                format!("queued ({n}) — sends when the current turn finishes"),
-            );
+            if compacting.get_untracked() {
+                // The agent is summarizing, not in `run()` — queue for after.
+                let n = {
+                    let mut q = queue_for_send.borrow_mut();
+                    q.push_back(text);
+                    q.len()
+                };
+                system(
+                    transcript,
+                    next_id,
+                    format!("queued ({n}) — sends when the current turn finishes"),
+                );
+            } else {
+                // Steer the running turn: show it now and hand the expanded text
+                // to the running `Agent::run`, which drains steering between
+                // rounds (delivered after the current tool round).
+                push_item(transcript, next_id, Body::User(text.clone()));
+                let sent = hrdr_app::expand_mentions(&text, &hrdr_app::agent_cwd(&agent_for_send));
+                if let Ok(mut q) = steering_for_send.lock() {
+                    q.push_back(sent);
+                }
+            }
             return;
         }
         (spawn_for_send)(text, true);
@@ -1603,6 +1633,7 @@ struct GuiHost {
     tx: tokio::sync::mpsc::UnboundedSender<UiMsg>,
     base_url: RwSignal<String>,
     login: RwSignal<Option<hrdr_app::LoginWizard>>,
+    steering: hrdr_agent::SteeringQueue,
 }
 
 impl hrdr_app::CommandHost for GuiHost {
@@ -1653,6 +1684,9 @@ impl hrdr_app::CommandHost for GuiHost {
         }
         self.compacting.set(false);
         self.login.set(None); // cancel an in-progress /login wizard
+        if let Ok(mut q) = self.steering.lock() {
+            q.clear();
+        }
         self.queue.borrow_mut().clear();
         if let Ok(mut t) = self.todos.lock() {
             t.clear();
@@ -2041,6 +2075,8 @@ fn handle_event(
             }
         }
         AgentEvent::Notice(s) => push_item(transcript, next_id, Body::System(s)),
+        // Delivery signal only; the message was already shown at submit time.
+        AgentEvent::Steered(_) => {}
         AgentEvent::Usage {
             prompt_tokens,
             completion_tokens,

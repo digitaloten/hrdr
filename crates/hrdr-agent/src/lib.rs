@@ -54,8 +54,23 @@ pub enum AgentEvent {
     /// An out-of-band notice from the agent (e.g. a retry or auto-compaction),
     /// surfaced to the user as a system line.
     Notice(String),
+    /// A steering message (submitted mid-turn) was just delivered into the
+    /// conversation — the frontend shows it as a user message at this point, so
+    /// display order matches the model's view.
+    Steered(String),
     /// The model produced a final answer with no further tool calls.
     TurnDone,
+}
+
+/// A shared FIFO of user messages submitted *during* a running turn ("steering").
+/// The frontend pushes to it while a turn runs; [`Agent::run`] drains it before
+/// each model request, so a correction reaches the model after the current tool
+/// round instead of only after the whole turn finishes.
+pub type SteeringQueue = Arc<Mutex<std::collections::VecDeque<String>>>;
+
+/// Create an empty [`SteeringQueue`].
+pub fn steering_queue() -> SteeringQueue {
+    Arc::new(Mutex::new(std::collections::VecDeque::new()))
 }
 
 /// Agent configuration.
@@ -1011,8 +1026,34 @@ impl Agent {
         Ok(acc.into_message().content.unwrap_or_default())
     }
 
-    /// Run one user turn to completion, emitting events as it goes.
-    pub async fn run<F>(&mut self, user_input: impl Into<String>, mut on_event: F) -> Result<()>
+    /// Drain any steering messages submitted since the last request into the
+    /// conversation as user messages, emitting [`AgentEvent::Steered`] for each
+    /// so the frontend can display it at delivery time.
+    fn drain_steering<F: FnMut(AgentEvent)>(&mut self, steering: &SteeringQueue, on_event: &mut F) {
+        let pending: Vec<String> = steering
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default();
+        for msg in pending {
+            on_event(AgentEvent::Steered(msg.clone()));
+            self.messages.push(ChatMessage::user(msg));
+        }
+    }
+
+    /// Whether the steering queue has any undelivered messages.
+    fn has_steering(steering: &SteeringQueue) -> bool {
+        steering.lock().map(|q| !q.is_empty()).unwrap_or(false)
+    }
+
+    /// Run one user turn to completion, emitting events as it goes. `steering` is
+    /// a shared queue the caller can push to mid-turn (see [`SteeringQueue`]);
+    /// pass [`steering_queue()`] when there's no interactive steering.
+    pub async fn run<F>(
+        &mut self,
+        user_input: impl Into<String>,
+        steering: SteeringQueue,
+        mut on_event: F,
+    ) -> Result<()>
     where
         F: FnMut(AgentEvent),
     {
@@ -1020,7 +1061,10 @@ impl Agent {
         // with an assistant `tool_calls` message whose results are missing —
         // strict servers reject that. Backfill stubs before the new user turn.
         repair_dangling_tool_calls(&mut self.messages);
-        self.messages.push(ChatMessage::user(user_input.into()));
+        let user_input = user_input.into();
+        if !user_input.trim().is_empty() {
+            self.messages.push(ChatMessage::user(user_input));
+        }
         // Start a fresh file checkpoint for this turn's edits.
         if let Some(cp) = &self.checkpoints
             && let Ok(mut c) = cp.lock()
@@ -1034,6 +1078,9 @@ impl Agent {
         let mut repeat = RepeatGuard::default();
 
         for step in 0..self.max_steps {
+            // Deliver any steering messages submitted since the last request — a
+            // mid-turn correction reaches the model after the current tool round.
+            self.drain_steering(&steering, &mut on_event);
             // Reclaim stale tool output before building the request — the cheap,
             // no-model-call first line of defence against context ballooning
             // (compaction is the expensive fallback). No-op until there's enough
@@ -1082,6 +1129,12 @@ impl Agent {
             self.messages.push(assistant);
 
             if tool_calls.is_empty() {
+                // A steering message that arrived during this response continues
+                // the turn (deliver it) rather than ending — the next iteration
+                // drains it before the request.
+                if Self::has_steering(&steering) {
+                    continue;
+                }
                 on_event(AgentEvent::TurnDone);
                 return Ok(());
             }
@@ -1605,11 +1658,11 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        Agent, AgentConfig, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig, PRUNE_PLACEHOLDER,
-        ProviderConfig, ToolOutputConfig, builtin_provider, compaction_tail_start,
-        elide_tool_results, estimate_tokens, estimate_tokens_in_messages, in_git_repo,
-        is_context_overflow, is_transient, parse_env_bool, prune_tool_messages,
-        repair_dangling_tool_calls, tail_window,
+        Agent, AgentConfig, AgentEvent, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig,
+        PRUNE_PLACEHOLDER, ProviderConfig, ToolOutputConfig, builtin_provider,
+        compaction_tail_start, elide_tool_results, estimate_tokens, estimate_tokens_in_messages,
+        in_git_repo, is_context_overflow, is_transient, parse_env_bool, prune_tool_messages,
+        repair_dangling_tool_calls, steering_queue, tail_window,
     };
     use crate::cwd_slug;
     use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
@@ -1714,6 +1767,48 @@ mod tests {
         std::fs::remove_file(&agents_md).unwrap();
         agent.clear();
         assert!(!system_prompt(&agent).contains("UPDATED_MARKER"));
+    }
+
+    #[test]
+    fn drain_steering_injects_messages_and_signals() {
+        let cfg = AgentConfig {
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(cfg).unwrap();
+        let steering = steering_queue();
+        {
+            let mut q = steering.lock().unwrap();
+            q.push_back("use ripgrep instead".to_string());
+            q.push_back("and skip the tests".to_string());
+        }
+        assert!(Agent::has_steering(&steering));
+
+        let mut events = Vec::new();
+        agent.drain_steering(&steering, &mut |e| events.push(e));
+
+        // Both messages are appended verbatim as user turns…
+        let msgs = agent.messages();
+        assert_eq!(
+            msgs[msgs.len() - 2].content.as_deref(),
+            Some("use ripgrep instead")
+        );
+        assert_eq!(
+            msgs[msgs.len() - 1].content.as_deref(),
+            Some("and skip the tests")
+        );
+        assert!(msgs[msgs.len() - 1].role == Role::User);
+        // …a Steered event fires for each (frontends display at delivery)…
+        let steered: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Steered(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steered, ["use ripgrep instead", "and skip the tests"]);
+        // …and the queue is drained.
+        assert!(!Agent::has_steering(&steering));
     }
 
     #[test]

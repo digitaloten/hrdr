@@ -320,8 +320,9 @@ async fn main() -> Result<()> {
 /// `--quiet`: text only. Exit code 0 on a completed turn, 1 on error.
 async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bool) -> Result<()> {
     let mut agent = Agent::new(config)?;
+    // Headless runs have no interactive steering.
     let result = agent
-        .run(prompt, |ev| {
+        .run(prompt, hrdr_agent::steering_queue(), |ev| {
             if json {
                 println!("{}", event_json(&ev));
                 let _ = std::io::stdout().flush();
@@ -398,6 +399,7 @@ fn event_json(ev: &AgentEvent) -> String {
             json!({"type": "tool_end", "id": id, "name": name, "ok": ok, "result": result})
         }
         AgentEvent::Notice(text) => json!({"type": "notice", "text": text}),
+        AgentEvent::Steered(text) => json!({"type": "steer", "text": text}),
         AgentEvent::Usage {
             prompt_tokens,
             completion_tokens,

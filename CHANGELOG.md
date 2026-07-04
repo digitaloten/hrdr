@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Steering — course-correct a running turn (pi-style).** Submit a message
+  while a reply is in flight and it's now delivered to the model **after the
+  current tool round**, instead of waiting for the whole turn to finish. The
+  running `Agent::run` drains a shared steering queue between rounds and
+  continues after a text response if you've steered; a new `Steered` event marks
+  delivery (surfaced on `hrdr run --json` as a `steer` event). Works in the TUI
+  and GUI; messages submitted mid-compaction still queue as before.
+
 - **Provider-aware context-overflow detection.** `is_context_overflow` now
   recognizes ~20 backends' "prompt too long" wordings (Anthropic, OpenAI,
   Gemini, xAI, Groq, OpenRouter, Together, Mistral, Kimi, z.ai, Copilot, …),
