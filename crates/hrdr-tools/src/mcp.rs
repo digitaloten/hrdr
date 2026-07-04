@@ -2,7 +2,9 @@
 //!
 //! Connects to an MCP server, runs the `initialize` handshake, discovers its
 //! tools (`tools/list`), and exposes each as a [`Tool`] the model can call
-//! (`tools/call`). Two transports:
+//! (`tools/call`). If the server advertises `resources` / `prompts`
+//! capabilities, list/read/get operations are exposed as tools too. Three
+//! transports:
 //!
 //! - **stdio** — spawn a process; newline-delimited JSON-RPC 2.0 on its
 //!   stdin/stdout. One background reader routes responses to pending requests by
@@ -11,9 +13,13 @@
 //!   response is either `application/json` (one message) or an SSE stream
 //!   (`text/event-stream`). The server's `Mcp-Session-Id` header is echoed back
 //!   on later requests.
+//! - **legacy HTTP+SSE** — open a persistent GET stream that first emits an
+//!   `endpoint` event (the POST URL) then carries server→client messages;
+//!   requests are POSTed to that URL and their responses arrive back on the
+//!   stream, routed by id like stdio.
 //!
-//! Scope (v1): tools only (no resources/prompts) and no server-initiated
-//! requests (we don't open the optional GET stream).
+//! Scope: no server-initiated requests over Streamable HTTP (we don't open the
+//! optional GET stream there).
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -23,11 +29,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::{Tool, ToolContext, truncate};
 
@@ -50,6 +57,7 @@ pub struct McpClient {
 enum Transport {
     Stdio(StdioTransport),
     Http(HttpTransport),
+    Sse(SseTransport),
 }
 
 /// stdio transport: a spawned child + a writer channel + the id→response map.
@@ -67,6 +75,18 @@ struct HttpTransport {
     url: String,
     headers: HeaderMap,
     session: StdMutex<Option<String>>,
+}
+
+/// Legacy HTTP+SSE transport: a persistent GET stream carries server→client
+/// messages (and the initial `endpoint` event giving the POST URL); requests are
+/// POSTed to that URL and their responses arrive back on the stream, routed by id
+/// like stdio.
+struct SseTransport {
+    http: reqwest::Client,
+    headers: HeaderMap,
+    /// POST endpoint from the `endpoint` SSE event (`None` until received).
+    post_url: watch::Receiver<Option<String>>,
+    pending: Pending,
 }
 
 /// A tool advertised by an MCP server's `tools/list`.
@@ -155,14 +175,7 @@ impl McpClient {
         url: &str,
         headers: &[(String, String)],
     ) -> Result<(Arc<Self>, Vec<Arc<dyn Tool>>)> {
-        let mut map = HeaderMap::new();
-        for (k, v) in headers {
-            let name = HeaderName::from_bytes(k.as_bytes())
-                .with_context(|| format!("invalid MCP header name '{k}'"))?;
-            let val = HeaderValue::from_str(v)
-                .with_context(|| format!("invalid MCP header value for '{k}'"))?;
-            map.insert(name, val);
-        }
+        let map = build_headers(headers)?;
         let client = Arc::new(Self {
             server: server.to_string(),
             next_id: AtomicU64::new(1),
@@ -177,27 +190,150 @@ impl McpClient {
         Ok((client, tools))
     }
 
-    /// Run `initialize` + `tools/list`, wrapping each discovered tool.
+    /// Connect over the legacy HTTP+SSE transport: open the SSE GET stream at
+    /// `sse_url`, wait for its `endpoint` event, then POST requests there.
+    pub async fn connect_sse(
+        server: &str,
+        sse_url: &str,
+        headers: &[(String, String)],
+    ) -> Result<(Arc<Self>, Vec<Arc<dyn Tool>>)> {
+        let http = reqwest::Client::new();
+        let map = build_headers(headers)?;
+        let base =
+            reqwest::Url::parse(sse_url).with_context(|| format!("bad MCP url '{sse_url}'"))?;
+        let resp = http
+            .get(sse_url)
+            .headers(map.clone())
+            .header(ACCEPT, "text/event-stream")
+            .send()
+            .await
+            .context("opening SSE stream")?
+            .error_for_status()
+            .context("opening SSE stream")?;
+
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (ep_tx, ep_rx) = watch::channel::<Option<String>>(None);
+        {
+            let pending = pending.clone();
+            tokio::spawn(async move {
+                let mut stream = resp.bytes_stream();
+                let mut buf = String::new();
+                while let Some(Ok(chunk)) = stream.next().await {
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                    while let Some(pos) = buf.find("\n\n") {
+                        let block: String = buf.drain(..pos + 2).collect();
+                        let (event, data) = parse_sse_block(&block);
+                        if event.as_deref() == Some("endpoint") {
+                            if let Ok(u) = base.join(data.trim()) {
+                                let _ = ep_tx.send(Some(u.to_string()));
+                            }
+                        } else if let Ok(msg) = serde_json::from_str::<Value>(&data)
+                            && let Some(id) = msg.get("id").and_then(Value::as_u64)
+                            && let Some(tx) = pending.lock().await.remove(&id)
+                        {
+                            let _ = tx.send(msg);
+                        }
+                    }
+                }
+                pending.lock().await.clear();
+            });
+        }
+
+        // Wait for the server to announce its POST endpoint.
+        let mut ready = ep_rx.clone();
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, ready.wait_for(|v| v.is_some()))
+            .await
+            .map_err(|_| anyhow!("MCP '{server}': no `endpoint` event before timeout"))?
+            .map_err(|_| anyhow!("MCP '{server}': SSE stream closed during handshake"))?;
+
+        let client = Arc::new(Self {
+            server: server.to_string(),
+            next_id: AtomicU64::new(1),
+            transport: Transport::Sse(SseTransport {
+                http,
+                headers: map,
+                post_url: ep_rx,
+                pending,
+            }),
+        });
+        let tools = client.clone().handshake_and_list().await?;
+        Ok((client, tools))
+    }
+
+    /// Run `initialize` + `tools/list`, wrapping each discovered tool. If the
+    /// server advertises `resources` / `prompts` capabilities, add
+    /// list/read/get tools for those too.
     async fn handshake_and_list(self: Arc<Self>) -> Result<Vec<Arc<dyn Tool>>> {
-        self.initialize().await?;
-        let discovered = self.list_tools().await?;
+        let caps = self.initialize().await?;
         let server = self.server.clone();
-        Ok(discovered
-            .into_iter()
-            .map(|d| {
-                let exposed = sanitize_tool_name(&format!("{server}_{}", d.name));
-                Arc::new(McpTool {
-                    client: self.clone(),
-                    // Leaked once at startup (bounded): the registry keys on
-                    // `&'static str`, and these tools live for the process.
-                    exposed_name: Box::leak(exposed.into_boxed_str()),
-                    description: Box::leak(d.description.into_boxed_str()),
-                    schema: d.schema,
-                    remote_name: d.name,
-                    read_only: d.read_only,
-                }) as Arc<dyn Tool>
+        let op_tool = |op_name: &str, desc: &str, schema: Value, op: McpOp| -> Arc<dyn Tool> {
+            Arc::new(McpTool {
+                client: self.clone(),
+                exposed_name: Box::leak(
+                    sanitize_tool_name(&format!("{server}_{op_name}")).into_boxed_str(),
+                ),
+                description: Box::leak(desc.to_string().into_boxed_str()),
+                schema,
+                op,
+                read_only: true,
             })
-            .collect())
+        };
+
+        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        for d in self.list_tools().await? {
+            tools.push(Arc::new(McpTool {
+                client: self.clone(),
+                // Leaked once at startup (bounded): the registry keys on
+                // `&'static str`, and these tools live for the process.
+                exposed_name: Box::leak(
+                    sanitize_tool_name(&format!("{server}_{}", d.name)).into_boxed_str(),
+                ),
+                description: Box::leak(d.description.into_boxed_str()),
+                schema: d.schema,
+                op: McpOp::Tool(d.name),
+                read_only: d.read_only,
+            }));
+        }
+        if caps.get("resources").is_some() {
+            tools.push(op_tool(
+                "list_resources",
+                "List the resources this MCP server exposes (each a `uri` + name).",
+                json!({ "type": "object" }),
+                McpOp::ListResources,
+            ));
+            tools.push(op_tool(
+                "read_resource",
+                "Read one MCP resource by `uri` (from list_resources).",
+                json!({
+                    "type": "object",
+                    "properties": { "uri": { "type": "string", "description": "Resource URI." } },
+                    "required": ["uri"]
+                }),
+                McpOp::ReadResource,
+            ));
+        }
+        if caps.get("prompts").is_some() {
+            tools.push(op_tool(
+                "list_prompts",
+                "List the prompt templates this MCP server exposes (name + arguments).",
+                json!({ "type": "object" }),
+                McpOp::ListPrompts,
+            ));
+            tools.push(op_tool(
+                "get_prompt",
+                "Render an MCP prompt template by `name` with optional `arguments`.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Prompt name." },
+                        "arguments": { "type": "object", "description": "Template arguments." }
+                    },
+                    "required": ["name"]
+                }),
+                McpOp::GetPrompt,
+            ));
+        }
+        Ok(tools)
     }
 
     /// Send a JSON-RPC request over whichever transport, and extract its result.
@@ -207,6 +343,7 @@ impl McpClient {
         let msg = match &self.transport {
             Transport::Stdio(t) => stdio_request(t, id, req, timeout).await,
             Transport::Http(t) => http_request(t, id, req, timeout).await,
+            Transport::Sse(t) => sse_request(t, id, req, timeout).await,
         }
         .with_context(|| format!("MCP '{}' {method}", self.server))?;
         if let Some(err) = msg.get("error") {
@@ -225,19 +362,37 @@ impl McpClient {
             Transport::Http(t) => {
                 let _ = http_send(t, &msg).await;
             }
+            Transport::Sse(t) => {
+                // Clone out of the watch guard before the await (guard isn't Send).
+                let url = t.post_url.borrow().clone();
+                if let Some(url) = url {
+                    let _ = t
+                        .http
+                        .post(&url)
+                        .headers(t.headers.clone())
+                        .json(&msg)
+                        .send()
+                        .await;
+                }
+            }
         }
     }
 
-    async fn initialize(&self) -> Result<()> {
+    /// Run the handshake; returns the server's advertised `capabilities`.
+    async fn initialize(&self) -> Result<Value> {
         let params = json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": { "name": "hrdr", "version": env!("CARGO_PKG_VERSION") },
         });
-        self.request("initialize", params, HANDSHAKE_TIMEOUT)
+        let res = self
+            .request("initialize", params, HANDSHAKE_TIMEOUT)
             .await?;
         self.notify("notifications/initialized", json!({})).await;
-        Ok(())
+        Ok(res
+            .get("capabilities")
+            .cloned()
+            .unwrap_or_else(|| json!({})))
     }
 
     async fn list_tools(&self) -> Result<Vec<Discovered>> {
@@ -298,6 +453,120 @@ impl McpClient {
             );
         }
         Ok(text)
+    }
+
+    async fn list_resources(&self) -> Result<String> {
+        let res = self
+            .request("resources/list", json!({}), HANDSHAKE_TIMEOUT)
+            .await?;
+        let mut out = String::new();
+        for r in res
+            .get("resources")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let uri = r.get("uri").and_then(Value::as_str).unwrap_or("");
+            let name = r.get("name").and_then(Value::as_str).unwrap_or("");
+            let desc = r.get("description").and_then(Value::as_str).unwrap_or("");
+            out.push_str(&format!("{uri}\t{name}"));
+            if !desc.is_empty() {
+                out.push_str(&format!("\t{desc}"));
+            }
+            out.push('\n');
+        }
+        Ok(if out.is_empty() {
+            "(no resources)".to_string()
+        } else {
+            out
+        })
+    }
+
+    async fn read_resource(&self, uri: &str) -> Result<String> {
+        let res = self
+            .request("resources/read", json!({ "uri": uri }), CALL_TIMEOUT)
+            .await?;
+        let mut out = String::new();
+        for c in res
+            .get("contents")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(t) = c.get("text").and_then(Value::as_str) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(t);
+            } else if c.get("blob").is_some() {
+                out.push_str("[binary resource content omitted]");
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_prompts(&self) -> Result<String> {
+        let res = self
+            .request("prompts/list", json!({}), HANDSHAKE_TIMEOUT)
+            .await?;
+        let mut out = String::new();
+        for p in res
+            .get("prompts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let name = p.get("name").and_then(Value::as_str).unwrap_or("");
+            let desc = p.get("description").and_then(Value::as_str).unwrap_or("");
+            let args: Vec<&str> = p
+                .get("arguments")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.get("name").and_then(Value::as_str))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push_str(&format!("{name}({})", args.join(", ")));
+            if !desc.is_empty() {
+                out.push_str(&format!("\t{desc}"));
+            }
+            out.push('\n');
+        }
+        Ok(if out.is_empty() {
+            "(no prompts)".to_string()
+        } else {
+            out
+        })
+    }
+
+    async fn get_prompt(&self, name: &str, arguments: Value) -> Result<String> {
+        let res = self
+            .request(
+                "prompts/get",
+                json!({ "name": name, "arguments": arguments }),
+                CALL_TIMEOUT,
+            )
+            .await?;
+        let mut out = String::new();
+        for m in res
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+            let text = m
+                .get("content")
+                .and_then(|c| c.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&format!("{role}: {text}"));
+        }
+        Ok(out)
     }
 }
 
@@ -360,6 +629,68 @@ async fn http_send(t: &HttpTransport, msg: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Legacy HTTP+SSE: POST the request to the endpoint; the response arrives back
+/// on the persistent SSE stream and is delivered via `pending`.
+async fn sse_request(t: &SseTransport, id: u64, req: Value, timeout: Duration) -> Result<Value> {
+    let post_url = t
+        .post_url
+        .borrow()
+        .clone()
+        .ok_or_else(|| anyhow!("no endpoint"))?;
+    let (tx, rx) = oneshot::channel();
+    t.pending.lock().await.insert(id, tx);
+    let resp = t
+        .http
+        .post(&post_url)
+        .headers(t.headers.clone())
+        .json(&req)
+        .send()
+        .await
+        .context("request failed")?;
+    if !resp.status().is_success() {
+        t.pending.lock().await.remove(&id);
+        bail!("HTTP {}", resp.status());
+    }
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(msg)) => Ok(msg),
+        Ok(Err(_)) => bail!("connection closed"),
+        Err(_) => {
+            t.pending.lock().await.remove(&id);
+            bail!("timed out")
+        }
+    }
+}
+
+/// Build a [`HeaderMap`] from `(name, value)` pairs (config auth headers).
+fn build_headers(headers: &[(String, String)]) -> Result<HeaderMap> {
+    let mut map = HeaderMap::new();
+    for (k, v) in headers {
+        let name = HeaderName::from_bytes(k.as_bytes())
+            .with_context(|| format!("invalid MCP header name '{k}'"))?;
+        let val = HeaderValue::from_str(v)
+            .with_context(|| format!("invalid MCP header value for '{k}'"))?;
+        map.insert(name, val);
+    }
+    Ok(map)
+}
+
+/// Parse one SSE event block into its `(event, data)` — `data:` lines joined.
+fn parse_sse_block(block: &str) -> (Option<String>, String) {
+    let mut event = None;
+    let mut data = String::new();
+    for line in block.lines() {
+        if let Some(rest) = line.strip_prefix("event:") {
+            event = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    (event, data)
+}
+
 /// Build a POST request with the MCP headers + session id.
 fn http_post(t: &HttpTransport, body: &Value) -> reqwest::RequestBuilder {
     let mut req = t
@@ -405,13 +736,24 @@ fn parse_sse_for_id(body: &str, id: u64) -> Result<Value> {
     bail!("no response for request {id} in the SSE stream")
 }
 
-/// One MCP-server tool, exposed to the model as a native [`Tool`].
+/// What an [`McpTool`] does when the model calls it.
+enum McpOp {
+    /// `tools/call` with this server-side tool name.
+    Tool(String),
+    ListResources,
+    ReadResource,
+    ListPrompts,
+    GetPrompt,
+}
+
+/// One MCP capability, exposed to the model as a native [`Tool`] — either a
+/// server tool or a resource/prompt list/read/get operation.
 struct McpTool {
     client: Arc<McpClient>,
     exposed_name: &'static str,
     description: &'static str,
     schema: Value,
-    remote_name: String,
+    op: McpOp,
     read_only: bool,
 }
 
@@ -430,7 +772,26 @@ impl Tool for McpTool {
         self.read_only
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
-        let out = self.client.call_tool(&self.remote_name, args).await?;
+        let out = match &self.op {
+            McpOp::Tool(name) => self.client.call_tool(name, args).await?,
+            McpOp::ListResources => self.client.list_resources().await?,
+            McpOp::ReadResource => {
+                let uri = args
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("read_resource needs a `uri` argument"))?;
+                self.client.read_resource(uri).await?
+            }
+            McpOp::ListPrompts => self.client.list_prompts().await?,
+            McpOp::GetPrompt => {
+                let name = args
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("get_prompt needs a `name` argument"))?;
+                let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                self.client.get_prompt(name, arguments).await?
+            }
+        };
         Ok(truncate(&out, ctx.max_output))
     }
 }
@@ -547,24 +908,107 @@ data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}
         assert!(parse_sse_for_id(body, 99).is_err());
     }
 
-    /// A newline-delimited JSON-RPC MCP server that advertises one read-only
-    /// `echo` tool. `-u` keeps stdout unbuffered so responses aren't withheld.
+    /// A mock MCP server that advertises `tools` + `resources` + `prompts`
+    /// capabilities and speaks all three transports. `argv[1]` selects the mode:
+    /// `stdio` (newline-delimited JSON-RPC on stdin/stdout), `http`
+    /// (Streamable-HTTP, one JSON response per POST), or `sse` (legacy HTTP+SSE:
+    /// a GET stream that emits the `endpoint` event then carries responses to
+    /// requests POSTed there). HTTP modes print their ephemeral port on the first
+    /// stdout line. `-u` keeps stdout unbuffered so responses aren't withheld.
     #[cfg(unix)]
     const MOCK_SERVER: &str = r#"
 import sys, json
-def send(o):
-    sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    m = json.loads(line); i = m.get("id"); method = m.get("method")
+
+def handle(m):
+    i = m.get("id"); method = m.get("method")
     if method == "initialize":
-        send({"jsonrpc":"2.0","id":i,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}})
-    elif method == "tools/list":
-        send({"jsonrpc":"2.0","id":i,"result":{"tools":[{"name":"echo","description":"Echo the input back","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}},"annotations":{"readOnlyHint":True}}]}})
-    elif method == "tools/call":
+        return {"jsonrpc":"2.0","id":i,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{},"resources":{},"prompts":{}},"serverInfo":{"name":"mock","version":"0"}}}
+    if method == "tools/list":
+        return {"jsonrpc":"2.0","id":i,"result":{"tools":[{"name":"echo","description":"Echo the input back","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}},"annotations":{"readOnlyHint":True}}]}}
+    if method == "tools/call":
         args = m.get("params",{}).get("arguments",{})
-        send({"jsonrpc":"2.0","id":i,"result":{"content":[{"type":"text","text":"echo: "+str(args.get("text",""))}],"isError":False}})
+        return {"jsonrpc":"2.0","id":i,"result":{"content":[{"type":"text","text":"echo: "+str(args.get("text",""))}],"isError":False}}
+    if method == "resources/list":
+        return {"jsonrpc":"2.0","id":i,"result":{"resources":[{"uri":"file:///readme","name":"readme","description":"the readme"}]}}
+    if method == "resources/read":
+        uri = m.get("params",{}).get("uri","")
+        return {"jsonrpc":"2.0","id":i,"result":{"contents":[{"uri":uri,"text":"resource body for "+uri}]}}
+    if method == "prompts/list":
+        return {"jsonrpc":"2.0","id":i,"result":{"prompts":[{"name":"greet","description":"greet someone","arguments":[{"name":"who","required":True}]}]}}
+    if method == "prompts/get":
+        args = m.get("params",{}).get("arguments",{})
+        return {"jsonrpc":"2.0","id":i,"result":{"messages":[{"role":"user","content":{"type":"text","text":"Hello "+str(args.get("who",""))}}]}}
+    if i is None:
+        return None  # a notification (e.g. notifications/initialized)
+    return {"jsonrpc":"2.0","id":i,"error":{"code":-32601,"message":"Method not found"}}
+
+def run_stdio():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line: continue
+        r = handle(json.loads(line))
+        if r is not None:
+            sys.stdout.write(json.dumps(r) + "\n"); sys.stdout.flush()
+
+def run_http():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length","0"))
+            m = json.loads(self.rfile.read(n) or "{}")
+            r = handle(m)
+            if r is None:
+                self.send_response(202); self.end_headers(); return
+            body = json.dumps(r).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            if m.get("method") == "initialize":
+                self.send_header("Mcp-Session-Id","sess-1")
+            self.send_header("Content-Length",str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    srv = ThreadingHTTPServer(("127.0.0.1",0), H)
+    print(srv.server_address[1], flush=True)
+    srv.serve_forever()
+
+def run_sse():
+    import queue
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    q = queue.Queue()
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type","text/event-stream")
+            self.send_header("Cache-Control","no-cache")
+            self.end_headers()
+            self.wfile.write(b"event: endpoint\ndata: /messages\n\n"); self.wfile.flush()
+            while True:
+                try:
+                    msg = q.get(timeout=1)
+                except queue.Empty:
+                    try:
+                        self.wfile.write(b": ping\n\n"); self.wfile.flush()
+                    except Exception:
+                        return
+                    continue
+                try:
+                    self.wfile.write(("event: message\ndata: "+json.dumps(msg)+"\n\n").encode()); self.wfile.flush()
+                except Exception:
+                    return
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length","0"))
+            r = handle(json.loads(self.rfile.read(n) or "{}"))
+            self.send_response(202); self.end_headers()
+            if r is not None:
+                q.put(r)
+    srv = ThreadingHTTPServer(("127.0.0.1",0), H)
+    print(srv.server_address[1], flush=True)
+    srv.serve_forever()
+
+mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
+{"http": run_http, "sse": run_sse}.get(mode, run_stdio)()
 "#;
 
     #[cfg(unix)]
@@ -578,32 +1022,134 @@ for line in sys.stdin:
         })
     }
 
-    // The MCP client is cross-platform; this end-to-end test is unix-only to
+    /// Kills its child process (and reaps it) on drop, so an HTTP/SSE mock server
+    /// doesn't outlive the test even if an assertion panics.
+    #[cfg(unix)]
+    struct Killer(std::process::Child);
+    #[cfg(unix)]
+    impl Drop for Killer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Spawn the mock server in `http`/`sse` mode; returns the child (as a
+    /// [`Killer`] guard) and the port it bound. `None` if python is unavailable.
+    #[cfg(unix)]
+    fn spawn_mock_server(mode: &str) -> Option<(Killer, u16)> {
+        use std::io::BufRead;
+        let py = python()?;
+        let mut child = std::process::Command::new(py)
+            .args(["-u", "-c", MOCK_SERVER, mode])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take()?)
+            .read_line(&mut line)
+            .ok()?;
+        let port: u16 = line.trim().parse().ok()?;
+        Some((Killer(child), port))
+    }
+
+    /// Exercise every capability the mock advertises: the `echo` tool, resource
+    /// list/read, and prompt list/get. Shared across all three transports.
+    #[cfg(unix)]
+    async fn exercise_all(server: &str, tools: Vec<Arc<dyn Tool>>) {
+        let by = |suffix: &str| {
+            let want = format!("{server}_{suffix}");
+            tools
+                .iter()
+                .find(|t| t.name() == want)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing tool {want}"))
+        };
+        let ctx = ToolContext::new(".");
+
+        let echo = by("echo");
+        assert!(echo.read_only());
+        assert!(echo.description().contains("Echo"));
+        assert_eq!(
+            echo.execute(json!({ "text": "hi there" }), &ctx)
+                .await
+                .unwrap(),
+            "echo: hi there"
+        );
+
+        let listed = by("list_resources").execute(json!({}), &ctx).await.unwrap();
+        assert!(listed.contains("file:///readme"), "resources: {listed}");
+        let read = by("read_resource")
+            .execute(json!({ "uri": "file:///readme" }), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(read, "resource body for file:///readme");
+
+        let prompts = by("list_prompts").execute(json!({}), &ctx).await.unwrap();
+        assert!(prompts.contains("greet(who)"), "prompts: {prompts}");
+        let rendered = by("get_prompt")
+            .execute(
+                json!({ "name": "greet", "arguments": { "who": "Sam" } }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rendered, "user: Hello Sam");
+    }
+
+    // The MCP client is cross-platform; these end-to-end tests are unix-only to
     // avoid Windows python/newline-translation flakiness in CI (the pure-logic
     // tests above run everywhere).
     #[cfg(unix)]
     #[tokio::test]
-    async fn connects_lists_and_calls_a_mock_stdio_server() {
+    async fn stdio_transport_tools_resources_prompts() {
         let Some(py) = python() else {
             eprintln!("skipping: no python interpreter");
             return;
         };
-        let args = vec!["-u".to_string(), "-c".to_string(), MOCK_SERVER.to_string()];
-        let (_client, tools) = McpClient::connect_stdio("mock", py, &args, &[])
+        let args = vec![
+            "-u".to_string(),
+            "-c".to_string(),
+            MOCK_SERVER.to_string(),
+            "stdio".to_string(),
+        ];
+        let (_client, tools) = McpClient::connect_stdio("stdio", py, &args, &[])
             .await
             .expect("connect + handshake + tools/list");
+        // echo + {list,read}_resources + {list,get}_prompt.
+        assert_eq!(tools.len(), 5);
+        exercise_all("stdio", tools).await;
+    }
 
-        assert_eq!(tools.len(), 1);
-        let tool = &tools[0];
-        assert_eq!(tool.name(), "mock_echo");
-        assert!(tool.read_only());
-        assert!(tool.description().contains("Echo"));
-
-        let ctx = ToolContext::new(".");
-        let out = tool
-            .execute(json!({ "text": "hi there" }), &ctx)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streamable_http_transport_tools_resources_prompts() {
+        let Some((_guard, port)) = spawn_mock_server("http") else {
+            eprintln!("skipping: no python interpreter");
+            return;
+        };
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        let (_client, tools) = McpClient::connect_http("http", &url, &[])
             .await
-            .expect("tools/call");
-        assert_eq!(out, "echo: hi there");
+            .expect("connect over Streamable HTTP");
+        assert_eq!(tools.len(), 5);
+        exercise_all("http", tools).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_http_sse_transport_tools_resources_prompts() {
+        let Some((_guard, port)) = spawn_mock_server("sse") else {
+            eprintln!("skipping: no python interpreter");
+            return;
+        };
+        let url = format!("http://127.0.0.1:{port}/sse");
+        let (_client, tools) = McpClient::connect_sse("sse", &url, &[])
+            .await
+            .expect("connect over legacy HTTP+SSE");
+        assert_eq!(tools.len(), 5);
+        exercise_all("sse", tools).await;
     }
 }

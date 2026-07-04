@@ -277,9 +277,11 @@ impl AgentConfig {
 }
 
 /// One MCP server from a `[[mcp]]` config entry, registered with its tools
-/// namespaced `<name>_<tool>`. Two transports: **stdio** (set `command`) spawns
-/// `command args…` with `env`; **HTTP** (set `url`) POSTs to a Streamable-HTTP
-/// endpoint with `headers` (e.g. auth). Exactly one of `command`/`url` is
+/// namespaced `<name>_<tool>`. Three transports: **stdio** (set `command`)
+/// spawns `command args…` with `env`; **HTTP** (set `url`) POSTs to a
+/// Streamable-HTTP endpoint with `headers` (e.g. auth); **legacy HTTP+SSE**
+/// (set `url` and `transport = "sse"`) opens a persistent SSE stream and POSTs
+/// to the server-advertised endpoint. Exactly one of `command`/`url` is
 /// required. `disabled = true` keeps the entry but skips it.
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
 pub struct McpServerConfig {
@@ -294,9 +296,14 @@ pub struct McpServerConfig {
     /// Extra environment variables for the `command` process.
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// HTTP transport: the Streamable-HTTP endpoint URL.
+    /// HTTP transport: the endpoint URL. Streamable-HTTP by default; legacy
+    /// two-endpoint HTTP+SSE when `transport = "sse"`.
     #[serde(default)]
     pub url: Option<String>,
+    /// HTTP transport selector: `"http"` (Streamable-HTTP, default) or `"sse"`
+    /// (legacy HTTP+SSE). Ignored for the stdio transport.
+    #[serde(default)]
+    pub transport: Option<String>,
     /// Extra HTTP headers sent with every request (e.g. `Authorization`).
     #[serde(default)]
     pub headers: HashMap<String, String>,
@@ -851,8 +858,12 @@ impl Agent {
             let pairs = |m: &HashMap<String, String>| -> Vec<(String, String)> {
                 m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
             };
-            // Transport: `url` → HTTP, else `command` → stdio.
+            // Transport: `url` → HTTP (Streamable, or legacy SSE when
+            // `transport = "sse"`), else `command` → stdio.
             let connected = match (&cfg.url, &cfg.command) {
+                (Some(url), _) if cfg.transport.as_deref() == Some("sse") => {
+                    hrdr_tools::McpClient::connect_sse(&cfg.name, url, &pairs(&cfg.headers)).await
+                }
                 (Some(url), _) => {
                     hrdr_tools::McpClient::connect_http(&cfg.name, url, &pairs(&cfg.headers)).await
                 }
@@ -2179,12 +2190,17 @@ mod tests {
             url = "https://example.com/mcp"
             [mcp.headers]
             Authorization = "Bearer xyz"
+
+            [[mcp]]
+            name = "legacy"
+            url = "https://example.com/sse"
+            transport = "sse"
             "#,
         )
         .unwrap();
         let mut cfg = AgentConfig::default();
         cfg.apply_file(fc);
-        assert_eq!(cfg.mcp.len(), 3);
+        assert_eq!(cfg.mcp.len(), 4);
         // stdio server.
         assert_eq!(cfg.mcp[0].name, "fs");
         assert_eq!(cfg.mcp[0].command.as_deref(), Some("npx"));
@@ -2196,13 +2212,17 @@ mod tests {
             cfg.mcp[1].env.get("GITHUB_TOKEN").map(String::as_str),
             Some("secret")
         );
-        // HTTP server.
+        // HTTP (Streamable) server.
         assert_eq!(cfg.mcp[2].url.as_deref(), Some("https://example.com/mcp"));
         assert!(cfg.mcp[2].command.is_none());
+        assert!(cfg.mcp[2].transport.is_none());
         assert_eq!(
             cfg.mcp[2].headers.get("Authorization").map(String::as_str),
             Some("Bearer xyz")
         );
+        // Legacy HTTP+SSE server.
+        assert_eq!(cfg.mcp[3].url.as_deref(), Some("https://example.com/sse"));
+        assert_eq!(cfg.mcp[3].transport.as_deref(), Some("sse"));
     }
 
     // ---- is_transient / is_context_overflow (additional variants) ----

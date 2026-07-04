@@ -8,12 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **MCP resources & prompts.** When a server advertises `resources` / `prompts`
+  capabilities, hrdr exposes them as extra tools: `<name>_list_resources` +
+  `<name>_read_resource` (`resources/list` + `resources/read`) and
+  `<name>_list_prompts` + `<name>_get_prompt` (`prompts/list` + `prompts/get`).
+- **MCP legacy HTTP+SSE transport.** Set `url` plus `transport = "sse"` to use
+  the two-endpoint SSE flow: hrdr opens the persistent GET stream, waits for the
+  server's `endpoint` event, then POSTs requests there and routes responses back
+  off the stream by id.
 - **MCP over HTTP (Streamable-HTTP transport).** `[[mcp]]` servers can now be
   remote: set `url` (instead of `command`) plus optional `[mcp.headers]` for
   auth. hrdr POSTs JSON-RPC to the endpoint, handling both `application/json`
   and SSE (`text/event-stream`) responses and echoing the server's
   `Mcp-Session-Id`. stdio and HTTP share one client behind a transport
   abstraction; `command` is now optional (exactly one of `command`/`url`).
+- **MCP end-to-end tests across all transports.** A mock server exercises
+  tools + resources + prompts over stdio, Streamable-HTTP, and legacy HTTP+SSE.
 
 ### Changed
 

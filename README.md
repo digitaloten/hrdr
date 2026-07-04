@@ -262,9 +262,10 @@ preserve_recent_tokens = 8000  # …bounded by this token budget
 Connect [Model Context Protocol](https://modelcontextprotocol.io) servers to add
 their tools to the model's tool set. Each `[[mcp]]` entry connects at startup;
 its tools are namespaced `<name>_<tool>` and a status line is shown per server.
-A server that fails to connect is skipped (the rest still load). Two transports
-— set `command` for a local **stdio** server, or `url` for a remote
-**Streamable-HTTP** one:
+A server that fails to connect is skipped (the rest still load). Three
+transports — set `command` for a local **stdio** server, or `url` for a remote
+HTTP one (**Streamable-HTTP** by default, or the legacy two-endpoint
+**HTTP+SSE** with `transport = "sse"`):
 
 ```toml
 # stdio: a spawned local process
@@ -282,16 +283,24 @@ url = "https://mcp.example.com/mcp"
 [mcp.headers]               # sent with every request (auth, etc.)
 Authorization = "Bearer ghp_…"
 
+# legacy HTTP+SSE: a persistent SSE stream + server-advertised POST endpoint
+[[mcp]]
+name = "sse"
+url = "https://mcp.example.com/sse"
+transport = "sse"
+
 [[mcp]]
 name = "github"
 command = "github-mcp-server"
 disabled = true             # keep the entry but skip connecting
 ```
 
-Tools flagged `readOnlyHint` are batched concurrently like the built-in read
-tools; everything else runs sequentially. (The HTTP transport handles both
-`application/json` and SSE responses and carries the server's session id;
-resources/prompts and the legacy HTTP+SSE transport are follow-ups.)
+If a server advertises `resources` or `prompts` capabilities, hrdr exposes them
+as extra tools too: `<name>_list_resources` / `<name>_read_resource` and
+`<name>_list_prompts` / `<name>_get_prompt`. Tools flagged `readOnlyHint` are
+batched concurrently like the built-in read tools; everything else runs
+sequentially. (The Streamable-HTTP transport handles both `application/json` and
+SSE responses and carries the server's session id.)
 
 ### Guardrails
 
@@ -422,8 +431,8 @@ The shell and search tools adapt to the host:
       search/goto scrolling, live theme swap, multi-line input, queueing)
 - [x] Release pipeline: 7-target binaries, GitHub Releases, crates.io, AUR,
       Homebrew, Scoop, Alpine
-- [x] MCP client (stdio + Streamable-HTTP) — `[[mcp]]` servers' tools join the
-      set
+- [x] MCP client (stdio + Streamable-HTTP + legacy HTTP+SSE) — `[[mcp]]`
+      servers' tools, resources, and prompts join the set
 - [ ] LSP diagnostics feedback
 - [ ] Vim input discipline in the GUI (needs a render-agnostic `EditorEngine`
       seam)

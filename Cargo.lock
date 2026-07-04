@@ -2451,6 +2451,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "diffy",
+ "futures-util",
  "glob",
  "hrdr-llm",
  "ignore",

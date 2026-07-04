@@ -19,6 +19,7 @@ regex = "1"
 similar.workspace = true
 reqwest.workspace = true
 async-trait = "0.1"
+futures-util = { workspace = true }
 diffy = "0.5"
 sha2 = "0.10"
 miniz_oxide = "0.8"
