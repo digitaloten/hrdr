@@ -226,12 +226,13 @@ key_env = "OPENAI_API_KEY"
 model = "gpt-5.5"
 ```
 
-`context_window` is optional: if you omit it, hrdr probes the endpoint on
-startup and uses what it advertises (vLLM's `max_model_len`, llama.cpp's
-`/props` `n_ctx`, etc.). Set it explicitly to override detection — the OpenAI
-API doesn't expose context length, and some servers (including infr today) don't
-advertise it. It drives the status bar's "X of Y" and the auto-compaction
-threshold.
+`context_window` is optional: if you omit it, hrdr probes the endpoint and uses
+what it advertises (vLLM's `max_model_len`, llama.cpp's `/props` `n_ctx`, etc.)
+— at startup **and** again after a `/model` or `/provider` switch, so the
+compaction threshold always tracks the current model's real max. Set it
+explicitly to override detection — the OpenAI API doesn't expose context length,
+and some servers (including infr today) don't advertise it. It drives the status
+bar's "X of Y" and the auto-compaction threshold.
 
 ### Context management
 

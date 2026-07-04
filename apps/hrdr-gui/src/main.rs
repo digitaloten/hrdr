@@ -158,6 +158,8 @@ enum UiMsg {
     ConfigChanged,
     /// Out-of-band diff block (the async `/diff` result).
     Diff(String),
+    /// A model/provider switch re-probed the endpoint's advertised context window.
+    ContextWindow(u32),
     /// A completed turn was auto-saved; carries the session id and whether this
     /// was the first save (so the UI thread can adopt the id and notify once).
     /// `generation` is the save-generation at spawn time: `/clear` bumps it, so
@@ -179,11 +181,16 @@ fn main() -> anyhow::Result<()> {
     let config = AgentConfig::load();
     let ui = hrdr_app::UiConfig::load();
     let model = config.model.clone();
-    let ctx_window = config.context_window;
+    let mut ctx_window = config.context_window;
     let base_url = config.base_url.clone();
     // Keep the config around for `/provider` preset resolution.
     let cfg = Rc::new(config.clone());
     let agent_raw = Agent::new(config)?;
+    // Honor the endpoint's advertised context window when config didn't pin one
+    // (the TUI/headless paths probe in `main`; the GUI must too).
+    if ctx_window.is_none() {
+        ctx_window = rt.block_on(agent_raw.probe_context_window());
+    }
     // Shared TODO list, mutated by the todo tool during turns.
     let todos = agent_raw.todos();
     let agent = Arc::new(TokioMutex::new(agent_raw));
@@ -640,6 +647,11 @@ fn app_view(
             }
             UiMsg::System(s) => push_item(transcript, next_id, Body::System(s)),
             UiMsg::Diff(d) => push_item(transcript, next_id, Body::Diff(d)),
+            UiMsg::ContextWindow(tokens) => {
+                // A model/provider switch re-probed the endpoint; honor the new
+                // advertised max (drives "X of Y" + the auto-compaction trigger).
+                ctx_window.set(Some(tokens));
+            }
             UiMsg::FileIndex(files) => {
                 file_index.set(files);
                 file_index_state.set(2);
@@ -1660,6 +1672,12 @@ impl hrdr_app::CommandHost for GuiHost {
                 hrdr_app::LineKind::System => UiMsg::System(line),
             };
             let _ = tx.send(msg);
+        })
+    }
+    fn context_window_poster(&self) -> Box<dyn Fn(u32) + Send> {
+        let tx = self.tx.clone();
+        Box::new(move |tokens| {
+            let _ = tx.send(UiMsg::ContextWindow(tokens));
         })
     }
     fn agent(&self) -> Arc<TokioMutex<Agent>> {

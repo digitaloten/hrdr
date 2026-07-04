@@ -277,6 +277,15 @@ pub trait CommandHost {
         let _ = tokens;
     }
 
+    /// A `Send`able sink that delivers a freshly-probed context window onto the
+    /// UI thread (the async analogue of [`set_context_window`](Self::set_context_window),
+    /// like [`line_poster`](Self::line_poster)). Default drops the value; a
+    /// frontend overrides it to route through its channel so a model/provider
+    /// switch can honor the new model's advertised max context.
+    fn context_window_poster(&self) -> Box<dyn Fn(u32) + Send> {
+        Box::new(|_| {})
+    }
+
     /// Begin the `/login` wizard. A frontend that supports it stashes
     /// [`LoginWizard::start`](crate::LoginWizard::start)'s result in a modal
     /// slot and routes subsequent submitted lines to
@@ -325,13 +334,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             if arg.is_empty() {
                 host.info(format!("model: {}", host.model()));
             } else {
-                host.set_model(arg.clone());
-                let agent = host.agent();
-                let name = arg.clone();
-                host.spawn_line(Box::pin(async move {
-                    agent.lock().await.set_model(name);
-                    String::new()
-                }));
+                switch_model(host, arg.clone());
                 host.info(format!("model → {arg}"));
             }
         }
@@ -706,13 +709,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             }
             // Optional model switch for this retry (and subsequent turns).
             if !arg.is_empty() {
-                host.set_model(arg.clone());
-                let agent = host.agent();
-                let name = arg.clone();
-                host.spawn_line(Box::pin(async move {
-                    agent.lock().await.set_model(name);
-                    String::new()
-                }));
+                switch_model(host, arg.clone());
                 host.info(format!("model → {arg}"));
             }
             match host.rewind_last_turn() {
@@ -1095,6 +1092,25 @@ pub fn agent_cwd(agent: &Arc<Mutex<Agent>>) -> PathBuf {
         .unwrap_or_default()
 }
 
+/// Switch the live agent's model and, in the *same* locked step, re-probe the
+/// endpoint for the new model's advertised context window — delivering it to the
+/// UI so auto-compaction honors the model's real max. Folding the probe into the
+/// model-change future (rather than a separate task) avoids racing a probe of the
+/// old model against the switch.
+fn switch_model(host: &mut dyn CommandHost, name: String) {
+    host.set_model(name.clone());
+    let agent = host.agent();
+    let post = host.context_window_poster();
+    host.spawn_line(Box::pin(async move {
+        let mut a = agent.lock().await;
+        a.set_model(name);
+        if let Some(w) = a.probe_context_window().await {
+            post(w);
+        }
+        String::new()
+    }));
+}
+
 /// Switch the live session to provider `name`: repoint the endpoint (with the
 /// resolved or supplied API key), model, and context window, and update the
 /// displayed chrome. `key` overrides the resolved credential — the `/login`
@@ -1115,11 +1131,18 @@ pub fn apply_provider(
     let key = key.or_else(|| hrdr_agent::resolve_api_key(name, &p));
     let agent = host.agent();
     let (url, model) = (p.base_url.clone(), p.model.clone());
+    // Probe the new endpoint for its advertised context window unless the
+    // provider config already declares one (which wins).
+    let probe_after = p.context_window.is_none();
+    let post = host.context_window_poster();
     host.spawn_line(Box::pin(async move {
         let mut a = agent.lock().await;
         a.set_endpoint(url, key);
         if let Some(m) = model {
             a.set_model(m);
+        }
+        if probe_after && let Some(w) = a.probe_context_window().await {
+            post(w);
         }
         String::new()
     }));

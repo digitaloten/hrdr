@@ -260,6 +260,12 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
             let _ = tx.send(msg);
         })
     }
+    fn context_window_poster(&self) -> Box<dyn Fn(u32) + Send> {
+        let tx = self.app.tx.clone();
+        Box::new(move |tokens| {
+            let _ = tx.send(TurnMsg::ContextWindow(tokens));
+        })
+    }
     fn agent(&self) -> std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>> {
         self.app.agent.clone()
     }

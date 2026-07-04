@@ -80,6 +80,8 @@ pub(crate) enum TurnMsg {
     Diff(String),
     /// Compaction finished: `Ok((before, after))` message counts, or an error.
     Compacted(Result<(usize, usize), String>),
+    /// A model/provider switch re-probed the endpoint's advertised context window.
+    ContextWindow(u32),
     /// `@file` completion index built off-thread for `cwd`.
     FileIndex(std::path::PathBuf, Vec<String>),
     /// The config file changed on disk (from the shared watcher).
@@ -941,6 +943,11 @@ impl App {
                 self.file_index = files;
                 self.file_index_cwd = Some(cwd);
                 self.file_index_building = false;
+            }
+            TurnMsg::ContextWindow(tokens) => {
+                // A model/provider switch re-probed the endpoint; honor the new
+                // advertised max (drives "X of Y" + the auto-compaction trigger).
+                self.context_window = Some(tokens);
             }
             TurnMsg::ConfigChanged => self.maybe_reload_config(),
             TurnMsg::Compacted(res) => {

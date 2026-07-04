@@ -1028,6 +1028,14 @@ impl Agent {
         self.client.clone()
     }
 
+    /// Probe the current endpoint for the model's advertised context window (the
+    /// max context size the API reports — vLLM's `max_model_len`, llama.cpp's
+    /// `n_ctx`, etc.). `None` when the server advertises nothing. Used to honor
+    /// the API's real limit after a model/provider switch.
+    pub async fn probe_context_window(&self) -> Option<u32> {
+        self.client.context_window().await
+    }
+
     /// Working directory the tools operate in.
     pub fn cwd(&self) -> std::path::PathBuf {
         self.ctx.cwd.clone()

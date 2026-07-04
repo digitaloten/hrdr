@@ -44,6 +44,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (absent `resources`/`prompts` omit their op-tools), and empty-list
   placeholders.
 
+### Fixed
+
+- **The endpoint's advertised max context is honored everywhere.** The GUI now
+  probes the model's context window at startup like the TUI/headless paths did
+  (previously it only used a configured value), and both frontends **re-probe**
+  after a `/model`, `/retry <model>`, or `/provider` switch so the
+  auto-compaction threshold and the "X of Y" gauge track the current model's
+  real limit instead of a stale one. An explicit `context_window` (config or
+  provider preset) still wins.
+
 ### Changed
 
 - **Tool names shortened (breaking).** `read_file`→`read`, `write_file`→`write`,
