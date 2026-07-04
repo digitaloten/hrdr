@@ -89,6 +89,11 @@ pub struct AgentConfig {
     /// Model context window in tokens, for the status bar's "X of Y" display.
     /// Probed from the endpoint when unset; set in config to override.
     pub context_window: Option<u32>,
+    /// Output-token cap for the native Anthropic backend (`max_tokens`, required
+    /// by that API). `None` uses the backend default (8192). Raising it gives
+    /// Claude more room for long replies and extended thinking; the OpenAI path
+    /// ignores it.
+    pub max_tokens: Option<u32>,
     /// Reasoning-effort label shown in the status bar (e.g. `low`/`medium`/`high`).
     pub effort: Option<String>,
     /// Auto-compaction trigger as a fraction of the context window (`0.0`–`1.0`);
@@ -240,6 +245,7 @@ impl Default for AgentConfig {
             max_steps: 50,
             provider: None,
             context_window: None,
+            max_tokens: None,
             effort: None,
             auto_compact: DEFAULT_AUTO_COMPACT,
             compaction_reserved: DEFAULT_COMPACTION_RESERVED,
@@ -450,6 +456,7 @@ struct FileConfig {
     temperature: Option<f32>,
     provider: Option<String>,
     context_window: Option<u32>,
+    max_tokens: Option<u32>,
     effort: Option<String>,
     auto_compact: Option<f64>,
     compaction_reserved: Option<u32>,
@@ -531,6 +538,9 @@ impl AgentConfig {
         }
         if let Some(v) = fc.context_window {
             self.context_window = Some(v);
+        }
+        if let Some(v) = fc.max_tokens {
+            self.max_tokens = Some(v);
         }
         if let Some(v) = fc.effort {
             self.effort = Some(v);
@@ -649,6 +659,11 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
         }
     }),
     ("HRDR_PROMPT_CACHE", |c, v| c.prompt_cache = Some(v)),
+    ("HRDR_MAX_TOKENS", |c, v| {
+        if let Ok(n) = v.parse() {
+            c.max_tokens = Some(n);
+        }
+    }),
 ];
 
 /// Resolve the prompt-cache `setting` (`off`/`on`/`ephemeral`/`auto`; `None` =
@@ -905,6 +920,7 @@ impl Agent {
             client = client.with_temperature(t);
         }
         client.set_effort(config.effort.clone());
+        client.set_max_tokens(config.max_tokens);
 
         Ok(Self {
             client,
@@ -1599,6 +1615,8 @@ fn is_transient(e: &anyhow::Error) -> bool {
             "returned 502",
             "returned 503",
             "returned 504",
+            "returned 529", // Anthropic "Overloaded"
+            "overloaded",   // Anthropic mid-stream overloaded_error
         ],
     )
 }
@@ -2173,6 +2191,7 @@ mod tests {
             temperature: Some(0.5),
             provider: Some("zen".to_string()),
             context_window: Some(8192),
+            max_tokens: Some(16_000),
             effort: Some("high".to_string()),
             auto_compact: Some(0.7),
             compaction_reserved: Some(12_345),
@@ -2202,6 +2221,7 @@ mod tests {
         assert_eq!(cfg.temperature, Some(0.5));
         assert_eq!(cfg.provider.as_deref(), Some("zen"));
         assert_eq!(cfg.context_window, Some(8192));
+        assert_eq!(cfg.max_tokens, Some(16_000));
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!((cfg.auto_compact - 0.7).abs() < f64::EPSILON);
         assert_eq!(cfg.compaction_reserved, 12_345);
@@ -2402,6 +2422,8 @@ mod tests {
             "chat endpoint returned 503 Service Unavailable",
             "chat endpoint returned 504 Gateway Timeout",
             "connection reset by peer",
+            "chat endpoint returned 529 : {\"type\":\"overloaded_error\"}", // Anthropic
+            "anthropic stream error: Overloaded",
         ] {
             assert!(
                 is_transient(&anyhow::anyhow!("{msg}")),

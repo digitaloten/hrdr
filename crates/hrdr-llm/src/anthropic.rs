@@ -9,9 +9,13 @@
 //! understands, so the agent loop and frontends are unchanged.
 //!
 //! Why native (not Anthropic's OpenAI-compat endpoint): the compat endpoint
-//! **silently drops** `cache_control`, so prompt caching (and extended thinking)
-//! are only reachable here. Scope of this backend: system + messages + tools +
-//! streaming + prompt caching. Extended thinking is a follow-up.
+//! **silently drops** `cache_control` and doesn't expose thinking, so prompt
+//! caching and extended thinking are only reachable here. Covers: system +
+//! messages + tools + streaming, prompt caching (`cache_control` on system, the
+//! last tool, and the last message), and **extended thinking** (a reasoning
+//! `effort` level turns on a `thinking` budget that scales with `max_tokens`;
+//! interleaved-thinking is enabled alongside tools; `thinking_delta`s stream to
+//! hrdr's reasoning channel).
 //!
 //! [`Accumulator`]: crate::Accumulator
 
@@ -31,9 +35,12 @@ pub(crate) const API_VERSION: &str = "2023-06-01";
 /// history. When `cache == Ephemeral`, `cache_control` breakpoints are placed on
 /// the last system block, the last tool, and the last content block of the last
 /// message (Anthropic allows ≤4; we use ≤3).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_body(
     model: &str,
     max_tokens: u32,
+    effort: Option<&str>,
+    temperature: Option<f32>,
     messages: &[ChatMessage],
     tools: &[ToolDef],
     cache: CacheMode,
@@ -47,6 +54,20 @@ pub(crate) fn build_body(
         "messages": msgs,
         "stream": true,
     });
+
+    // Extended thinking: an effort level turns on a thinking budget (which fits
+    // inside `max_tokens`). Anthropic requires the temperature to default to 1
+    // while thinking, so `temperature` is only sent when thinking is off.
+    match thinking_budget(effort, max_tokens) {
+        Some(budget) => {
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        }
+        None => {
+            if let Some(t) = temperature {
+                body["temperature"] = json!(t);
+            }
+        }
+    }
 
     if !system.is_empty() {
         let mut blocks = system;
@@ -82,6 +103,26 @@ pub(crate) fn build_body(
     }
 
     body
+}
+
+/// Extended-thinking budget (tokens) for a reasoning `effort` level, or `None`
+/// to leave thinking off (no effort set, an unrecognized label, or a
+/// `max_tokens` window too small to fit a budget plus room for the answer).
+/// The budget scales with `max_tokens` so raising the output cap gives Claude
+/// more room to think; Anthropic requires `budget ≥ 1024` and `budget <
+/// max_tokens`.
+pub(crate) fn thinking_budget(effort: Option<&str>, max_tokens: u32) -> Option<u32> {
+    let level = effort.and_then(crate::normalize_effort)?;
+    let frac = match level.as_str() {
+        "minimal" => 0.25,
+        "low" => 0.40,
+        "medium" => 0.60,
+        "high" => 0.75,
+        _ => return None,
+    };
+    // Reserve at least 1024 tokens below `max_tokens` for the actual answer.
+    let ceiling = max_tokens.checked_sub(1024).filter(|c| *c >= 1024)?;
+    Some(((max_tokens as f64 * frac) as u32).clamp(1024, ceiling))
 }
 
 /// Split hrdr history into Anthropic `system` blocks + `messages`. Consecutive
@@ -181,17 +222,32 @@ pub(crate) async fn chat_stream(
     api_key: Option<&str>,
     model: &str,
     max_tokens: u32,
+    effort: Option<&str>,
+    temperature: Option<f32>,
     cache: CacheMode,
     messages: Vec<ChatMessage>,
     tools: Vec<ToolDef>,
 ) -> Result<(Value, crate::ChatStream)> {
-    let body = build_body(model, max_tokens, &messages, &tools, cache);
+    let body = build_body(
+        model,
+        max_tokens,
+        effort,
+        temperature,
+        &messages,
+        &tools,
+        cache,
+    );
     let mut req = http
         .post(format!("{base_url}/messages"))
         .header("anthropic-version", API_VERSION)
         .json(&body);
     if let Some(key) = api_key {
         req = req.header("x-api-key", key);
+    }
+    // Interleaved thinking lets Claude reason between tool calls — valuable in the
+    // agent loop, so enable it when thinking is on and tools are offered.
+    if body.get("thinking").is_some() && !tools.is_empty() {
+        req = req.header("anthropic-beta", "interleaved-thinking-2025-05-14");
     }
     let resp = req.send().await.context("chat stream request failed")?;
     let status = resp.status();
@@ -393,7 +449,7 @@ mod tests {
     #[test]
     fn system_is_hoisted_and_messages_alternate() {
         let msgs = vec![sys("you are hrdr"), user("hi"), user("still me")];
-        let body = build_body("claude", 1024, &msgs, &[], CacheMode::Off);
+        let body = build_body("claude", 1024, None, None, &msgs, &[], CacheMode::Off);
         // System hoisted to a top-level block array.
         assert_eq!(body["system"][0]["text"], "you are hrdr");
         // Two consecutive user turns coalesce into one message.
@@ -426,6 +482,8 @@ mod tests {
         let body = build_body(
             "claude",
             512,
+            None,
+            None,
             &[user("go"), assistant, result],
             &[],
             CacheMode::Off,
@@ -450,7 +508,7 @@ mod tests {
             ChatMessage::tool_result("t1", "one"),
             ChatMessage::tool_result("t2", "two"),
         ];
-        let body = build_body("claude", 256, &msgs, &[], CacheMode::Off);
+        let body = build_body("claude", 256, None, None, &msgs, &[], CacheMode::Off);
         let m = body["messages"].as_array().unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0]["content"].as_array().unwrap().len(), 2);
@@ -463,7 +521,15 @@ mod tests {
             "read a file",
             json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
         )];
-        let body = build_body("claude", 256, &[user("go")], &tools, CacheMode::Off);
+        let body = build_body(
+            "claude",
+            256,
+            None,
+            None,
+            &[user("go")],
+            &tools,
+            CacheMode::Off,
+        );
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(
             body["tools"][0]["input_schema"]["properties"]["path"]["type"],
@@ -477,6 +543,8 @@ mod tests {
         let body = build_body(
             "claude",
             256,
+            None,
+            None,
             &[sys("s"), user("hi")],
             &tools,
             CacheMode::Ephemeral,
@@ -491,13 +559,67 @@ mod tests {
 
     #[test]
     fn off_places_no_breakpoints() {
-        let body = build_body("claude", 256, &[sys("s"), user("hi")], &[], CacheMode::Off);
+        let body = build_body(
+            "claude",
+            256,
+            None,
+            None,
+            &[sys("s"), user("hi")],
+            &[],
+            CacheMode::Off,
+        );
         assert!(body["system"][0].get("cache_control").is_none());
         assert!(
             body["messages"][0]["content"][0]
                 .get("cache_control")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn effort_enables_thinking_and_suppresses_temperature() {
+        // No effort → no thinking; temperature passes through.
+        let plain = build_body(
+            "claude",
+            8192,
+            None,
+            Some(0.3),
+            &[user("hi")],
+            &[],
+            CacheMode::Off,
+        );
+        assert!(plain.get("thinking").is_none());
+        let t = plain["temperature"].as_f64().unwrap();
+        assert!((t - 0.3).abs() < 1e-6, "temperature {t}");
+
+        // An effort level → thinking budget within max_tokens, temperature omitted.
+        let think = build_body(
+            "claude",
+            8192,
+            Some("high"),
+            Some(0.3),
+            &[user("hi")],
+            &[],
+            CacheMode::Off,
+        );
+        assert_eq!(think["thinking"]["type"], "enabled");
+        let budget = think["thinking"]["budget_tokens"].as_u64().unwrap() as u32;
+        assert!((1024..8192).contains(&budget), "budget {budget}");
+        assert!(think.get("temperature").is_none());
+    }
+
+    #[test]
+    fn thinking_budget_scales_and_guards_small_windows() {
+        assert_eq!(thinking_budget(None, 8192), None); // no effort → off
+        assert_eq!(thinking_budget(Some("nonsense"), 8192), None); // unknown → off
+        // Scales with max_tokens.
+        let small = thinking_budget(Some("high"), 8192).unwrap();
+        let big = thinking_budget(Some("high"), 32000).unwrap();
+        assert!(big > small);
+        // Budget always leaves ≥1024 for the answer and is ≥1024 itself.
+        assert!(small >= 1024 && small <= 8192 - 1024);
+        // A window too small to fit a budget + answer → thinking off.
+        assert_eq!(thinking_budget(Some("high"), 1500), None);
     }
 
     #[test]

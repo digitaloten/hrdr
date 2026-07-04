@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Extended thinking on the native Anthropic backend.** `/effort`
+  (`minimal`/`low`/`medium`/`high`) now turns on a Claude `thinking` budget that
+  scales with `max_tokens` (always leaving room for the answer); the
+  interleaved-thinking beta is enabled alongside tools so Claude can reason
+  between tool calls, and `thinking_delta`s stream to hrdr's reasoning pane.
+  Temperature is sent only when thinking is off (Anthropic requires the default
+  while thinking).
+- **`max_tokens` config knob** (`max_tokens` / `$HRDR_MAX_TOKENS`, default 8192)
+  caps output on the native Anthropic backend — raise it for longer replies and
+  deeper thinking (the OpenAI path ignores it).
+- **`529 Overloaded` retries.** Anthropic's overloaded errors (HTTP `529` and
+  the mid-stream `overloaded_error`) are now treated as transient, so they back
+  off and retry instead of failing the turn.
+
 ## [0.2.4] - 2026-07-04
 
 ### Added

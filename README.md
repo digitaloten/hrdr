@@ -134,7 +134,8 @@ Type `/` to see the menu (fuzzy-matched, `Tab` to accept). Highlights:
   `/compact`, `/info`, `/goto <N|5m|top|end>`, `/find <text>` (`/next` `/prev`)
 - **Model** — `/model`, `/models`, `/provider`, `/login` (guided provider + key
   setup), `/temp`, `/effort <minimal|low|medium|high>` (sent as
-  `reasoning_effort` to reasoning models), `/reasoning`
+  `reasoning_effort` to OpenAI-style reasoning models, or a `thinking` budget on
+  the native Anthropic backend), `/reasoning`
 - **Files** — `/init` (write `AGENTS.md`), `/add`, `/edit <file>`, `/diff`,
   `/revert` + `/checkpoints` (file undo), `/tools`, `/expand`, `/paste`
 - **Reply** — `/copy [code|all|msg N]`, `/export [--json]`, `/retry [model]`,
@@ -181,9 +182,12 @@ Built-in presets:
 
 (`claude` / `anthropic` talks to Anthropic's **native Messages API**
 (`/v1/messages`, `x-api-key` auth) rather than its OpenAI-compat endpoint — that
-unlocks native prompt caching on Claude. Backend selection is automatic from the
-endpoint host, so pointing `--base-url` at `api.anthropic.com` works too.
-`local` needs no key.)
+unlocks native **prompt caching** and **extended thinking** on Claude. Backend
+selection is automatic from the endpoint host, so pointing `--base-url` at
+`api.anthropic.com` works too. On this backend, `/effort` turns on a `thinking`
+budget (scaled from `max_tokens`; streamed to the reasoning pane), and
+`max_tokens` (config / `$HRDR_MAX_TOKENS`, default 8192) caps output — raise it
+for longer replies and deeper thinking. `local` needs no key.)
 
 ```bash
 export OPENCODE_API_KEY=sk-...

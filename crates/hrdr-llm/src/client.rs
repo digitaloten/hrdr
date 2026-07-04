@@ -81,6 +81,9 @@ pub struct Client {
     /// Reasoning-effort label; sent as `reasoning_effort` when it names a known
     /// level (see [`crate::normalize_effort`]).
     effort: Option<String>,
+    /// Output-token cap for the native Anthropic backend (required by that API;
+    /// unused by the OpenAI path).
+    max_tokens: u32,
     /// Wire protocol, derived from `base_url`.
     backend: Backend,
 }
@@ -124,6 +127,7 @@ impl Client {
             temperature: None,
             cache: CacheMode::Off,
             effort: None,
+            max_tokens: ANTHROPIC_MAX_TOKENS,
             backend,
         }
     }
@@ -148,6 +152,12 @@ impl Client {
     /// ([`crate::normalize_effort`]) are actually sent.
     pub fn set_effort(&mut self, effort: Option<String>) {
         self.effort = effort;
+    }
+
+    /// Set the output-token cap for the native Anthropic backend. `None` keeps
+    /// the default ([`ANTHROPIC_MAX_TOKENS`]).
+    pub fn set_max_tokens(&mut self, max_tokens: Option<u32>) {
+        self.max_tokens = max_tokens.unwrap_or(ANTHROPIC_MAX_TOKENS);
     }
 
     /// The current endpoint base URL (including the `/v1` suffix).
@@ -231,7 +241,9 @@ impl Client {
                 &self.base_url,
                 self.api_key.as_deref(),
                 &self.model,
-                ANTHROPIC_MAX_TOKENS,
+                self.max_tokens,
+                self.effort.as_deref(),
+                self.temperature,
                 self.cache,
                 messages,
                 tools,
