@@ -184,7 +184,11 @@ impl SubagentTool {
         if profiles.is_empty() {
             desc.push('.');
         } else {
-            desc.push_str(", or delegate to a specialized `agent`:\n");
+            desc.push_str(
+                ", or delegate to a specialized `agent`. **Proactively** reach for a matching \
+                 agent when a sub-task fits its role (don't wait to be asked) — the ★ ones \
+                 especially:\n",
+            );
             for p in &profiles {
                 let mut tags = match (&p.provider, &p.model) {
                     (Some(pr), Some(m)) => format!("{pr} · {m}"),
@@ -202,7 +206,8 @@ impl SubagentTool {
                         .join("/");
                     tags.push_str(&format!(" · read-only + writes {list}"));
                 }
-                desc.push_str(&format!("- {} ({tags})", p.name));
+                let star = if p.proactive { "★ " } else { "" };
+                desc.push_str(&format!("- {star}{} ({tags})", p.name));
                 if let Some(d) = &p.description {
                     desc.push_str(&format!(" — {d}"));
                 }
@@ -515,6 +520,12 @@ pub struct SubagentProfile {
     /// agent's `max_steps` — e.g. a small cap on a quick focused sub-task.
     #[serde(default)]
     pub max_steps: Option<usize>,
+    /// Nudge the main agent to **delegate matching work here on its own** (rather
+    /// than only when told). The `task` tool lists proactive agents with a
+    /// stronger call-to-action so the model reaches for them when a sub-task fits
+    /// their `description`.
+    #[serde(default)]
+    pub proactive: bool,
 }
 
 /// The full agent-profile set for `config`, layered by precedence — each source
@@ -552,8 +563,8 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             model: None,
             description: Some(
                 "Read-only codebase investigator — trace files, types, and call \
-                 paths and report back. Use for broad exploration without spending \
-                 the main context."
+                 paths and report back. Use proactively when a question needs \
+                 broad exploration, to keep the main context lean."
                     .to_string(),
             ),
             prompt: Some(EXPLORE_PROMPT.to_string()),
@@ -563,6 +574,7 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             temperature: None,
             effort: None,
             max_steps: None,
+            proactive: true,
         },
         SubagentProfile {
             name: "review".to_string(),
@@ -570,7 +582,8 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             model: None,
             description: Some(
                 "Read-only code reviewer — audit code or a change for bugs, edge \
-                 cases, and security issues. Use before finalizing risky work."
+                 cases, and security issues. Use proactively after writing or \
+                 changing non-trivial code, before finalizing."
                     .to_string(),
             ),
             prompt: Some(REVIEW_PROMPT.to_string()),
@@ -580,6 +593,7 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             temperature: None,
             effort: None,
             max_steps: None,
+            proactive: true,
         },
         SubagentProfile {
             name: "plan".to_string(),
@@ -598,6 +612,7 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             temperature: None,
             effort: None,
             max_steps: None,
+            proactive: false,
         },
         SubagentProfile {
             name: "general".to_string(),
@@ -616,6 +631,7 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             temperature: None,
             effort: None,
             max_steps: None,
+            proactive: false,
         },
     ]
 }
@@ -2897,6 +2913,7 @@ mod tests {
             temperature: None,
             effort: None,
             max_steps: None,
+            proactive: false,
         };
         let sub = config_for_agent_profile(&base, &prof).unwrap();
         assert_eq!(sub.base_url, "https://openrouter.ai/api/v1");
@@ -2918,6 +2935,7 @@ mod tests {
                 temperature: None,
                 effort: None,
                 max_steps: None,
+                proactive: false,
             },
         )
         .unwrap();
@@ -2939,6 +2957,7 @@ mod tests {
                     temperature: None,
                     effort: None,
                     max_steps: None,
+                    proactive: false,
                 },
             )
             .is_err()
@@ -3032,6 +3051,9 @@ mod tests {
             Some(&["md".to_string(), "markdown".to_string()][..])
         );
         assert!(!by("general").read_only && by("general").write_ext.is_none());
+        // explore/review are proactive; plan/general are opt-in.
+        assert!(by("explore").proactive && by("review").proactive);
+        assert!(!by("plan").proactive && !by("general").proactive);
     }
 
     #[test]
@@ -3109,6 +3131,7 @@ mod tests {
             temperature: t,
             effort: e.map(str::to_string),
             max_steps: s,
+            proactive: false,
         };
         // Set knobs override the inherited ones.
         let over =

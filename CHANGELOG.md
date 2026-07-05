@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Proactive sub-agent delegation.** Agents can be marked `proactive` so the
+  main agent reaches for them on its own when a sub-task fits their role, rather
+  than only when told. The built-in `explore` and `review` agents are proactive
+  (explore for broad investigation, review after non-trivial changes); the
+  `task` tool lists proactive agents with a ★ and a stronger call-to-action.
+  `[[subagent]]` profiles and agent files take a `proactive` flag.
+
 - **Persistent memory (`memory` tool).** The agent can save durable notes that
   survive across sessions, in two scopes — **project** (per working directory)
   and **global** (all projects). Storage is plain Markdown under the XDG data

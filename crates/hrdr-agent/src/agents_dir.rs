@@ -142,10 +142,8 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Option<SubagentProfi
         .find_map(|k| fm.get(*k))
         .and_then(|v| v.scalar().parse().ok());
 
-    let read_only = fm
-        .get("read_only")
-        .map(|v| matches!(v.scalar().as_str(), "true" | "yes" | "1"))
-        .unwrap_or(false);
+    let is_true = |v: &FmValue| matches!(v.scalar().as_str(), "true" | "yes" | "1");
+    let read_only = fm.get("read_only").map(is_true).unwrap_or(false);
     let write_ext = fm
         .get("write_ext")
         .map(|v| v.list())
@@ -153,6 +151,7 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Option<SubagentProfi
     // Only an allow-list form is honored (Claude/hrdr). opencode's boolean
     // `tools:` map is nested, so it parses to an empty list here and is ignored.
     let tools = fm.get("tools").map(|v| v.list()).filter(|l| !l.is_empty());
+    let proactive = fm.get("proactive").map(is_true).unwrap_or(false);
 
     Some(SubagentProfile {
         name,
@@ -166,6 +165,7 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Option<SubagentProfi
         temperature,
         effort,
         max_steps,
+        proactive,
     })
 }
 
@@ -369,6 +369,14 @@ mod tests {
         assert_eq!(p.description.as_deref(), Some("Build agent"));
         assert_eq!(p.model.as_deref(), Some("anthropic/claude-sonnet-4"));
         assert!(p.tools.is_none(), "nested bool-map must not become a list");
+    }
+
+    #[test]
+    fn parses_proactive_flag() {
+        let text = "---\nname: reviewer\nproactive: true\n---\nreview stuff\n";
+        assert!(parse_agent_file(text, "x").unwrap().proactive);
+        let text = "---\nname: reviewer\n---\nreview stuff\n";
+        assert!(!parse_agent_file(text, "x").unwrap().proactive);
     }
 
     #[test]
