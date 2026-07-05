@@ -90,6 +90,49 @@ jobs:
       # TUI-side refactor can't silently break it.
       - run: cargo clippy -p hrdr-gui --all-targets --all-features --locked -- -D warnings
 
+  build-gui:
+    name: build hrdr-gui (dry-run, ${{ matrix.target }})
+    # Dry-run only: proves the GUI release binary compiles + links on the
+    # native-buildable platforms (macOS x86_64/aarch64, Windows, native Linux
+    # x86_64). It does NOT upload artifacts or ship the GUI. The zig-cross Linux
+    # targets (aarch64/musl) are intentionally excluded — floem needs
+    # X11/Wayland/font system libs that don't cross-compile cleanly with
+    # zigbuild. Runs on merges to main + tags + manual dispatch, not every PR
+    # (clippy-gui already covers per-PR GUI compilation on Linux).
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install floem system deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libxkbcommon-dev
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          cache: false
+      - run: rustup update --no-self-update stable
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: build-gui-${{ matrix.target }}
+      - name: Build hrdr-gui (release)
+        run:
+          cargo build --release --locked --target ${{ matrix.target }} -p
+          hrdr-gui --bin hrdr-gui
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
