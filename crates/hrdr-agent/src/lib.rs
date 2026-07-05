@@ -441,6 +441,11 @@ pub struct AgentConfig {
     /// Default `true`; `$HRDR_MEMORY`. Storage lives under the XDG data dir
     /// (project-scoped by cwd, plus a shared global scope).
     pub memory: bool,
+    /// Override the base memory directory (default `<XDG data>/memory`) — point
+    /// hrdr at another tool's memory store. The `projects/<cwd-slug>/` and
+    /// `global/` scope subdirectories still apply beneath it. Config
+    /// `memory_dir`, `--memory-dir`, `$HRDR_MEMORY_DIR`.
+    pub memory_dir: Option<PathBuf>,
     /// Default model for delegated sub-agents (same provider/endpoint as the main
     /// agent). `None` reuses the main agent's model; the `task` tool's `model`
     /// argument overrides per call. This is the "Opus drives, Sonnet implements"
@@ -773,6 +778,7 @@ impl Default for AgentConfig {
             api_version: None,
             subagents: true,
             memory: true,
+            memory_dir: None,
             subagent_model: None,
             subagent_profiles: Vec::new(),
             agent_prompt: None,
@@ -1001,6 +1007,7 @@ struct FileConfig {
     prompt_cache_ttl: Option<String>,
     subagents: Option<bool>,
     memory: Option<bool>,
+    memory_dir: Option<String>,
     subagent_model: Option<String>,
     #[serde(default)]
     subagent: Vec<SubagentProfile>,
@@ -1112,6 +1119,9 @@ impl AgentConfig {
         }
         if let Some(v) = fc.memory {
             self.memory = v;
+        }
+        if let Some(v) = fc.memory_dir {
+            self.memory_dir = Some(PathBuf::from(v));
         }
         if let Some(v) = fc.subagent_model {
             self.subagent_model = Some(v);
@@ -1271,6 +1281,11 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     ("HRDR_MEMORY", |c, v| {
         if let Some(b) = parse_env_bool(&v) {
             c.memory = b;
+        }
+    }),
+    ("HRDR_MEMORY_DIR", |c, v| {
+        if !v.trim().is_empty() {
+            c.memory_dir = Some(PathBuf::from(v));
         }
     }),
 ];
@@ -1460,6 +1475,9 @@ pub struct Agent {
     /// Whether the `memory` tool + auto-loaded memory index are active; drives
     /// re-resolving the memory roots on `clear`/`set_cwd`.
     memory_enabled: bool,
+    /// Base-directory override for memory storage (see [`AgentConfig::memory_dir`]),
+    /// kept so the roots re-resolve correctly on `clear`/`set_cwd`.
+    memory_dir: Option<PathBuf>,
 }
 
 /// Append a sub-agent persona (its role / operating instructions) after the base
@@ -1492,9 +1510,16 @@ fn memory_index_file(root: &std::path::Path) -> Option<PathBuf> {
 }
 
 /// Storage roots for agent memory: `(project, global)` — project scoped by cwd,
-/// global shared across projects. `None` when no XDG data dir is resolvable.
-fn memory_dirs(cwd: &std::path::Path) -> Option<(PathBuf, PathBuf)> {
-    let base = hjkl_xdg::data_dir("hrdr").ok()?.join("memory");
+/// global shared across projects, beneath `override_base` (from `memory_dir`
+/// config) or the default `<XDG data>/memory`. `None` when neither resolves.
+fn memory_dirs(
+    cwd: &std::path::Path,
+    override_base: Option<&std::path::Path>,
+) -> Option<(PathBuf, PathBuf)> {
+    let base = match override_base {
+        Some(p) => p.to_path_buf(),
+        None => hjkl_xdg::data_dir("hrdr").ok()?.join("memory"),
+    };
     let project = base.join("projects").join(cwd_slug(&cwd.to_string_lossy()));
     let global = base.join("global");
     Some((project, global))
@@ -1593,7 +1618,10 @@ impl Agent {
         // Memory: expose the `memory` tool (registered before scoping so a
         // read-only sub-agent drops the writer) and resolve its storage roots
         // (used for the `ctx` below and the auto-loaded index).
-        let mem_dirs = config.memory.then(|| memory_dirs(&config.cwd)).flatten();
+        let mem_dirs = config
+            .memory
+            .then(|| memory_dirs(&config.cwd, config.memory_dir.as_deref()))
+            .flatten();
         if config.memory {
             tools.register(Arc::new(hrdr_tools::MemoryTool));
         }
@@ -1720,6 +1748,7 @@ impl Agent {
             mcp_clients: Vec::new(),
             agent_prompt: config.agent_prompt,
             memory_enabled: config.memory,
+            memory_dir: config.memory_dir,
         })
     }
 
@@ -1826,7 +1855,7 @@ impl Agent {
         // Re-resolve memory roots for the (possibly changed) cwd and reload the
         // index, so `/clear` and `set_cwd` reflect saved notes for this project.
         let memory = if self.memory_enabled {
-            if let Some((proj, glob)) = memory_dirs(&self.ctx.cwd) {
+            if let Some((proj, glob)) = memory_dirs(&self.ctx.cwd, self.memory_dir.as_deref()) {
                 let mem = gather_memory(&proj, &glob);
                 self.ctx.memory_project = Some(proj);
                 self.ctx.memory_global = Some(glob);
@@ -2971,6 +3000,12 @@ mod tests {
         // A huge index is bounded, with a pointer to read the rest.
         std::fs::write(proj.join("MEMORY.md"), "line\n".repeat(10_000)).unwrap();
         assert!(read_memory_index(&proj).unwrap().1.contains("truncated"));
+        // A base override relocates both scopes under it (still scope subdirs).
+        let over = dir.path().join("elsewhere");
+        let (p2, g2) =
+            super::memory_dirs(std::path::Path::new("/home/x/proj"), Some(&over)).unwrap();
+        assert_eq!(p2, over.join("projects").join("home-x-proj"));
+        assert_eq!(g2, over.join("global"));
         // OKF-style `index.md` is recognized too (copy from either ecosystem).
         std::fs::remove_file(proj.join("MEMORY.md")).unwrap();
         std::fs::remove_file(glob.join("MEMORY.md")).unwrap();
@@ -3333,6 +3368,7 @@ mod tests {
             prompt_cache_ttl: Some("1h".to_string()),
             subagents: Some(false),
             memory: Some(false),
+            memory_dir: Some("/tmp/mem".to_string()),
             subagent_model: Some("claude-sonnet-4-6".to_string()),
             subagent: vec![],
             effort: Some("high".to_string()),
@@ -3373,6 +3409,10 @@ mod tests {
         assert_eq!(cfg.prompt_cache_ttl.as_deref(), Some("1h"));
         assert!(!cfg.subagents);
         assert!(!cfg.memory);
+        assert_eq!(
+            cfg.memory_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/mem"))
+        );
         assert_eq!(cfg.subagent_model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!((cfg.auto_compact - 0.7).abs() < f64::EPSILON);

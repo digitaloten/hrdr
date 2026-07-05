@@ -543,8 +543,11 @@ files on demand with `read`/`grep`, and the index re-loads after `/clear` and
 a scope, or read a file), `write`, `append`, and `delete`; writes are confined
 to the memory store.
 
-Disable with `memory = false` in config or `$HRDR_MEMORY=0`. Memory is distinct
-from `AGENTS.md`, which stays the human-authored, read-only project
+Override the storage location with `memory_dir` in config, `--memory-dir`, or
+`$HRDR_MEMORY_DIR` — point hrdr at another tool's memory store (the
+`projects/<cwd>/` and `global/` scope subdirectories still apply beneath it).
+Disable entirely with `memory = false` in config or `$HRDR_MEMORY=0`. Memory is
+distinct from `AGENTS.md`, which stays the human-authored, read-only project
 instructions.
 
 ### Guardrails

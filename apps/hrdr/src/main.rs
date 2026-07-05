@@ -60,6 +60,12 @@ struct Cli {
     #[arg(long = "agent", global = true, value_name = "NAME")]
     agent: Option<String>,
 
+    /// Override the base memory directory (default `<XDG data>/memory`) — point
+    /// hrdr at another tool's memory store. `projects/<cwd>/` + `global/` still
+    /// apply beneath it.
+    #[arg(long = "memory-dir", global = true, value_name = "DIR")]
+    memory_dir: Option<std::path::PathBuf>,
+
     /// Auto-compact toggle: any value in 0.0–1.0 enables it, 0 disables (the
     /// trigger point is set by --compaction-reserved).
     #[arg(long, global = true)]
@@ -256,6 +262,9 @@ async fn main() -> Result<()> {
     }
     if let Some(m) = cli.subagent_model {
         config.subagent_model = Some(m);
+    }
+    if let Some(d) = cli.memory_dir {
+        config.memory_dir = Some(d);
     }
     // `--agent NAME`: run the main loop AS that agent — adopt its prompt, tool
     // scope, model/provider, and knobs. Resolved from the same set as the `task`

@@ -19,9 +19,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/clear` and compaction, so memory survives context resets; topic files are
   read on demand via `read`/`grep`. Tool actions
   `view`/`write`/`append`/`delete` are confined to the memory store (path
-  -traversal guarded). Disable with `memory = false` / `$HRDR_MEMORY=0`.
-  Distinct from `AGENTS.md`, which stays the human-authored, read-only
-  instructions.
+  -traversal guarded). Override the location with `memory_dir` / `--memory-dir`
+  / `$HRDR_MEMORY_DIR` to point hrdr at another tool's store; disable with
+  `memory = false` / `$HRDR_MEMORY=0`. Distinct from `AGENTS.md`, which stays
+  the human-authored, read-only instructions.
 - **`--agent <name>` primary-agent mode.** Run the main loop as a named agent —
   it adopts that agent's system prompt, tool scope, model/provider, and knobs,
   rather than only being available for delegation. Resolves from the same set as
