@@ -27,7 +27,9 @@ mod util;
 use completion::CompletionKind;
 pub(crate) use completion::Completions;
 use hrdr_app::config_mtime as current_config_mtime;
-use hrdr_app::{age_completed_todos, display_dir, git_branch, is_quit_command};
+use hrdr_app::{
+    PanelHit, SubAgentPanel, age_completed_todos, display_dir, git_branch, is_quit_command,
+};
 use util::timestamp_now;
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
@@ -63,26 +65,6 @@ impl HitRect {
     pub fn contains(&self, col: u16, row: u16) -> bool {
         col >= self.x && col < self.x + self.w && row >= self.y && row < self.y + self.h
     }
-}
-
-/// A running blocking `task` sub-agent, shown live in the sub-agent panel until
-/// it finishes. `log` is the full streamed progress/output (the panel shows the
-/// tail collapsed, all of it expanded).
-pub(crate) struct SubAgent {
-    /// The task tool-call id (matches the `ToolOutput`/`ToolEnd` id).
-    pub id: String,
-    /// Accumulated live output (starts with the `↳ task (model): label` header).
-    pub log: String,
-    /// Whether the panel shows this agent's full log (toggled by a click).
-    pub expanded: bool,
-}
-
-/// What a click on a sub-agent panel row toggles: a blocking sub-agent (by
-/// `App.subagents` index) or a detached background task (by its registry id).
-#[derive(Clone, Copy)]
-pub(crate) enum SubagentHit {
-    Blocking(usize),
-    Background(u64),
 }
 
 // The transcript item model + its representation-independent queries
@@ -218,10 +200,9 @@ pub(crate) struct App {
     /// set during draw. A left click toggles that tool's `expanded` (like a
     /// per-entry `/expand`).
     pub(crate) tool_hits: Vec<(HitRect, usize)>,
-    /// Running *blocking* `task` sub-agents, shown live in the sub-agent panel
-    /// (removed on completion). Populated from the `task` tool's `ToolOutput`
-    /// stream.
-    pub(crate) subagents: Vec<SubAgent>,
+    /// Live blocking `task` sub-agents in the sub-agent panel, updated by the
+    /// event-fold methods as `ToolStart`/`ToolOutput`/`ToolEnd` events arrive.
+    pub(crate) subagent_panel: SubAgentPanel,
     /// Shared registry of *detached background* sub-agents (a clone of the
     /// agent's `ctx.background_tasks`), read live for the panel.
     pub(crate) background_tasks: Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>>,
@@ -229,7 +210,7 @@ pub(crate) struct App {
     pub(crate) background_expanded: std::collections::HashSet<u64>,
     /// Clickable screen rects for each sub-agent panel row → the thing it
     /// toggles; a left click expands/collapses that row.
-    pub(crate) subagent_hits: Vec<(HitRect, SubagentHit)>,
+    pub(crate) subagent_hits: Vec<(HitRect, PanelHit)>,
     /// Set after one idle Ctrl+C; a second consecutive Ctrl+C quits. Any other
     /// key (or a mouse action) disarms it.
     pub(crate) quit_armed: bool,
@@ -359,7 +340,7 @@ impl App {
             queue: VecDeque::new(),
             follow_button: None,
             tool_hits: Vec::new(),
-            subagents: Vec::new(),
+            subagent_panel: SubAgentPanel::default(),
             background_tasks,
             background_expanded: std::collections::HashSet::new(),
             subagent_hits: Vec::new(),
@@ -593,7 +574,7 @@ impl App {
                 // steering between rounds so the model sees it after the current
                 // tool round (not only after the whole turn).
                 self.push_entry(Entry::User(input.clone()));
-                let sent = hrdr_app::expand_mentions(&input, &hrdr_app::agent_cwd(&self.agent));
+                let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input);
                 if let Ok(mut q) = self.steering.lock() {
                     q.push_back(sent);
                 }
@@ -632,18 +613,11 @@ impl App {
                     .find(|(r, _)| r.contains(m.column, m.row))
                     .map(|(_, h)| *h)
                 {
-                    match hit {
-                        SubagentHit::Blocking(idx) => {
-                            if let Some(sa) = self.subagents.get_mut(idx) {
-                                sa.expanded = !sa.expanded;
-                            }
-                        }
-                        SubagentHit::Background(id) => {
-                            if !self.background_expanded.remove(&id) {
-                                self.background_expanded.insert(id);
-                            }
-                        }
-                    }
+                    hrdr_app::toggle_panel_hit(
+                        &mut self.subagent_panel,
+                        &mut self.background_expanded,
+                        hit,
+                    );
                     return;
                 }
                 // Click a tool block to toggle its full output (per-entry /expand).
@@ -831,18 +805,9 @@ impl App {
         // Commit the message into history at send time (a queued message lives
         // as a pending bottom item until this point).
         self.push_entry(Entry::User(input.clone()));
-        // Expand `@file` mentions into attached contents for the model only; the
-        // transcript still shows the message as the user typed it. An `@agent`
-        // mention (matching a known sub-agent) instead routes the turn to that
-        // agent via a delegation directive.
-        let cwd = hrdr_app::agent_cwd(&self.agent);
-        let names = hrdr_app::agent_names(&self.agent);
-        let sent = match hrdr_app::extract_agent_mention(&input, &names) {
-            Some((agent, body)) => {
-                hrdr_app::agent_mention_message(&agent, &hrdr_app::expand_mentions(&body, &cwd))
-            }
-            None => hrdr_app::expand_mentions(&input, &cwd),
-        };
+        // Prepare the outgoing message: expand `@file` mentions and route any
+        // `@agent` mention to the matching sub-agent via a delegation directive.
+        let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input);
         self.launch_turn(sent);
     }
 
@@ -970,7 +935,7 @@ impl App {
                 self.running = false;
                 // The turn is over — clear any sub-agents still in the live panel
                 // (an interrupted turn may not have delivered their ToolEnd).
-                self.subagents.clear();
+                self.subagent_panel.clear();
                 if let Some(e) = err {
                     self.push_entry(Entry::System(format!("[error] {e}")));
                 }
@@ -1101,11 +1066,7 @@ impl App {
             AgentEvent::ToolStart { id, name, args } => {
                 // A `task` call opens a live entry in the sub-agent panel.
                 if name == "task" {
-                    self.subagents.push(SubAgent {
-                        id: id.clone(),
-                        log: String::new(),
-                        expanded: false,
-                    });
+                    self.subagent_panel.on_tool_start(id.clone());
                 }
                 self.push_entry(Entry::Tool {
                     id,
@@ -1135,9 +1096,7 @@ impl App {
                 }
                 // Mirror into the sub-agent panel's live log (the full stream,
                 // which the transcript discards at ToolEnd).
-                if let Some(sa) = self.subagents.iter_mut().find(|s| s.id == id) {
-                    sa.log.push_str(&chunk);
-                }
+                self.subagent_panel.on_tool_output(&id, &chunk);
             }
             AgentEvent::ToolEnd {
                 id,
@@ -1164,7 +1123,7 @@ impl App {
                 }
                 // The sub-agent finished — its result is now in the transcript;
                 // drop it from the live panel.
-                self.subagents.retain(|s| s.id != id);
+                self.subagent_panel.on_tool_end(&id);
             }
             AgentEvent::Notice(text) => {
                 self.push_entry(Entry::System(text));

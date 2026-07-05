@@ -300,29 +300,6 @@ pub fn transcript_to_text(entries: &[Entry]) -> String {
     out.trim_end().to_string()
 }
 
-/// The conversation as a pretty-printed JSON array of `{n, role, time, content}`
-/// objects (user/assistant messages only). `times` is parallel to `entries`.
-pub fn transcript_to_json(entries: &[Entry], times: &[DateTime<Local>]) -> String {
-    let mut arr = Vec::new();
-    let mut num = 0;
-    for (i, e) in entries.iter().enumerate() {
-        let (role, content) = match e {
-            Entry::User(s) => ("user", s),
-            Entry::Assistant(s) => ("assistant", s),
-            _ => continue,
-        };
-        num += 1;
-        let time = times.get(i).map(|t| t.to_rfc3339()).unwrap_or_default();
-        arr.push(serde_json::json!({
-            "n": num,
-            "role": role,
-            "time": time,
-            "content": content,
-        }));
-    }
-    serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,25 +350,6 @@ mod tests {
         assert!(txt.contains("[welcome]"));
         assert!(!txt.contains("thinking")); // reasoning dropped
         assert!(!txt.ends_with('\n')); // trailing whitespace trimmed
-    }
-
-    #[test]
-    fn to_json_covers_only_messages_with_times() {
-        use chrono::Duration;
-        let e = sample();
-        let base = Local::now();
-        // Parallel timestamps; only the message entries' times surface.
-        let times: Vec<_> = (0..e.len() as i64)
-            .map(|i| base + Duration::seconds(i))
-            .collect();
-        let json = transcript_to_json(&e, &times);
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let arr = v.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
-        assert_eq!(arr[0]["n"], 1);
-        assert_eq!(arr[0]["role"], "user");
-        assert_eq!(arr[1]["role"], "assistant");
-        assert!(!arr[0]["time"].as_str().unwrap().is_empty());
     }
 
     #[test]

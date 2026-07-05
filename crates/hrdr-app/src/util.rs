@@ -128,6 +128,18 @@ pub fn expand_mentions(input: &str, cwd: &Path) -> String {
     out
 }
 
+/// Prepare an outgoing user message for sending to the model: expand `@file`
+/// mentions into their contents (via [`expand_mentions`]) and, when an `@agent`
+/// mention matches a known sub-agent name, wrap the body in a delegation
+/// directive (via [`agent_mention_message`]). This is the canonical "input →
+/// sent" transform shared by the TUI, GUI, and headless frontends.
+pub fn prepare_outgoing(input: &str, names: &[String], cwd: &Path) -> String {
+    match extract_agent_mention(input, names) {
+        Some((agent, body)) => agent_mention_message(&agent, &expand_mentions(&body, cwd)),
+        None => expand_mentions(input, cwd),
+    }
+}
+
 /// Largest byte index `<= index` that lands on a UTF-8 char boundary of `s`.
 fn floor_char_boundary(s: &str, index: usize) -> usize {
     if index >= s.len() {
@@ -524,6 +536,42 @@ mod tests {
         // The directive names the agent and carries the body.
         let msg = agent_mention_message("explore", "find X");
         assert!(msg.contains("`explore`") && msg.ends_with("find X"));
+    }
+
+    #[test]
+    fn prepare_outgoing_routes_and_expands() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("note.txt"), "content of note").unwrap();
+
+        let names = vec!["bot".to_string()];
+
+        // Known @agent mention: body gets expand_mentions treatment and a routing
+        // directive is prepended.
+        let out = prepare_outgoing("@bot check @note.txt please", &names, root);
+        assert!(
+            out.contains("[Directed to the `bot` agent"),
+            "delegation directive missing: {out}"
+        );
+        assert!(
+            out.contains("content of note"),
+            "@file expansion missing: {out}"
+        );
+
+        // Plain input with a resolvable @file: no delegation, just expansion.
+        let out = prepare_outgoing("look at @note.txt", &names, root);
+        assert!(
+            !out.contains("[Directed to"),
+            "no agent mention, should not route: {out}"
+        );
+        assert!(
+            out.contains("content of note"),
+            "@file expansion missing: {out}"
+        );
+
+        // No matches at all: passes through unchanged.
+        let out = prepare_outgoing("just some text", &names, root);
+        assert_eq!(out, "just some text");
     }
 
     #[test]

@@ -2414,6 +2414,7 @@ dependencies = [
  "hjkl-theme",
  "hjkl-xdg",
  "hrdr-agent",
+ "hrdr-tools",
  "ignore",
  "notify",
  "serde",

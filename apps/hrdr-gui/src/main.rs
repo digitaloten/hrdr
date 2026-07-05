@@ -193,9 +193,22 @@ fn main() -> anyhow::Result<()> {
     }
     // Shared TODO list, mutated by the todo tool during turns.
     let todos = agent_raw.todos();
+    // Shared background-task registry for the sub-agent panel poll.
+    let background_tasks = agent_raw.background_tasks();
     let agent = Arc::new(TokioMutex::new(agent_raw));
 
-    floem::launch(move || app_view(agent, todos, model, ctx_window, base_url, cfg, ui));
+    floem::launch(move || {
+        app_view(
+            agent,
+            todos,
+            background_tasks,
+            model,
+            ctx_window,
+            base_url,
+            cfg,
+            ui,
+        )
+    });
     Ok(())
 }
 
@@ -203,6 +216,7 @@ fn main() -> anyhow::Result<()> {
 fn app_view(
     agent: Arc<TokioMutex<Agent>>,
     todos: Arc<std::sync::Mutex<Vec<hrdr_tools::TodoItem>>>,
+    background_tasks: Arc<std::sync::Mutex<Vec<hrdr_tools::BackgroundTask>>>,
     model: String,
     ctx_window: Option<u32>,
     base_url: String,
@@ -337,6 +351,28 @@ fn app_view(
     let todo_completed_at: Rc<RefCell<std::collections::HashMap<String, u64>>> =
         Rc::new(RefCell::new(std::collections::HashMap::new()));
     let todo_ttl: RwSignal<u64> = create_rw_signal(ui.todo_ttl);
+    // Sub-agent panel: live blocking agents + background task poll.
+    let subagent_panel: Rc<RefCell<hrdr_app::SubAgentPanel>> =
+        Rc::new(RefCell::new(hrdr_app::SubAgentPanel::default()));
+    let background_expanded: Rc<RefCell<std::collections::HashSet<u64>>> =
+        Rc::new(RefCell::new(std::collections::HashSet::new()));
+    // Reactive panel item list refreshed on turn events and by the background
+    // task poll timer.
+    let subagent_sig: RwSignal<Vec<hrdr_app::PanelItem>> = create_rw_signal(Vec::new());
+    // Recompute the panel signal from current state — shared by the event fold,
+    // the row-click toggle, and the background poll.
+    let refresh_subagents: Rc<dyn Fn()> = {
+        let panel = subagent_panel.clone();
+        let bg_exp = background_expanded.clone();
+        let bg_tasks = background_tasks.clone();
+        Rc::new(move || {
+            let items = hrdr_app::panel_items(&panel.borrow().agents, &bg_tasks, &bg_exp.borrow());
+            subagent_sig.set(items);
+        })
+    };
+    // Whether a background poll chain is live (so queued turns don't stack one
+    // re-arming chain per spawn).
+    let subagent_poll_armed: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
     // `/find` state: the active query + the message number cycling last landed on.
     let find_query: RwSignal<Option<String>> = create_rw_signal(None);
     let find_pos: RwSignal<usize> = create_rw_signal(0);
@@ -395,19 +431,34 @@ fn app_view(
         let tx = tx.clone();
         let th = turn_handle.clone();
         let steering = steering.clone();
+        let bg_tasks_for_spawn = background_tasks.clone();
+        let refresh_for_spawn = refresh_subagents.clone();
+        let poll_armed_spawn = subagent_poll_armed.clone();
         Rc::new(move |text: String, show_as_user: bool| {
             if show_as_user {
                 push_item(transcript, next_id, Body::User(text.clone()));
             }
             running.set(true);
+            // Arm the background-task poll so the panel updates while tasks run
+            // (once — a live chain re-arms itself, queued turns must not stack).
+            if !poll_armed_spawn.get() {
+                poll_armed_spawn.set(true);
+                arm_bg_poll(
+                    running,
+                    bg_tasks_for_spawn.clone(),
+                    refresh_for_spawn.clone(),
+                    poll_armed_spawn.clone(),
+                );
+            }
             // Start the TTFT clock; cleared until the first token of this turn.
             turn_start.set(Some(Instant::now()));
             ttft.set(None);
             out_tokens.set(0);
-            // Expand `@file` mentions for the model only; the transcript keeps
-            // the bare `@path` the user typed (same split as the TUI). Paths
-            // resolve against the agent's cwd (it follows /cwd and /resume).
-            let sent = hrdr_app::expand_mentions(&text, &hrdr_app::agent_cwd(&agent));
+            // Prepare the outgoing message: expand `@file` mentions and route
+            // any `@agent` mention to the matching sub-agent (same split as the
+            // TUI — the transcript keeps the bare user text, the model gets the
+            // expanded/routed form).
+            let sent = hrdr_app::prepare_outgoing_via(&agent, &text);
             let agent = agent.clone();
             let steering = steering.clone();
             let tx = tx.clone();
@@ -522,6 +573,9 @@ fn app_view(
     let base_url_for_events = base_url;
     let todos_for_events = todos.clone();
     let todo_stamps_for_done = todo_completed_at.clone();
+    // Sub-agent panel clones for the event effect.
+    let subagent_panel_ev = subagent_panel.clone();
+    let refresh_subagents_ev = refresh_subagents.clone();
     create_effect(move |_| {
         let Some(msg) = events.get() else { return };
         match msg {
@@ -552,6 +606,22 @@ fn app_view(
                     cached_tokens.set(*cached_prompt_tokens);
                     reasoning_tokens.set(*reasoning);
                 }
+                // Sub-agent panel event fold.
+                match &ev {
+                    AgentEvent::ToolStart { id, name, .. } if name == "task" => {
+                        subagent_panel_ev.borrow_mut().on_tool_start(id.clone());
+                        (refresh_subagents_ev)();
+                    }
+                    AgentEvent::ToolOutput { id, chunk } => {
+                        subagent_panel_ev.borrow_mut().on_tool_output(id, chunk);
+                        (refresh_subagents_ev)();
+                    }
+                    AgentEvent::ToolEnd { id, .. } => {
+                        subagent_panel_ev.borrow_mut().on_tool_end(id);
+                        (refresh_subagents_ev)();
+                    }
+                    _ => {}
+                }
                 // Tool completions may have rewritten the shared TODO list.
                 let refresh_todos = matches!(ev, AgentEvent::ToolEnd { .. });
                 handle_event(cx, transcript, next_id, usage, expand_all, ev);
@@ -566,6 +636,10 @@ fn app_view(
                     return;
                 }
                 running.set(false);
+                // Clear the blocking sub-agent panel; background tasks persist
+                // until they finish and deliver their results.
+                subagent_panel_ev.borrow_mut().clear();
+                (refresh_subagents_ev)();
                 let failed = err.is_some();
                 if let Some(e) = err {
                     push_item(transcript, next_id, Body::Error(e));
@@ -917,7 +991,7 @@ fn app_view(
                 // to the running `Agent::run`, which drains steering between
                 // rounds (delivered after the current tool round).
                 push_item(transcript, next_id, Body::User(text.clone()));
-                let sent = hrdr_app::expand_mentions(&text, &hrdr_app::agent_cwd(&agent_for_send));
+                let sent = hrdr_app::prepare_outgoing_via(&agent_for_send, &text);
                 if let Ok(mut q) = steering_for_send.lock() {
                     q.push_back(sent);
                 }
@@ -991,6 +1065,79 @@ fn app_view(
     // Bring the /goto //find target into view when one is set.
     .scroll_to_view(move || goto_view.get())
     .style(|s| s.flex_grow(1.0).width_full().padding(10.0));
+
+    // Sub-agent panel: live blocking sub-agents and detached background tasks,
+    // shown while non-empty. Each row's header toggles its log expanded/collapsed.
+    // The key carries the row's content fingerprint (log length + flags) —
+    // dyn_stack only rebuilds a child when its key changes, so a bare-id key
+    // would freeze the streamed log at first render (same trick as the TODO
+    // panel's content-bearing key).
+    let subagent_panel_for_view = subagent_panel.clone();
+    let bg_exp_for_view = background_expanded.clone();
+    let refresh_for_view = refresh_subagents.clone();
+    let subagent_panel_view = dyn_stack(
+        move || {
+            let rev = theme_rev.get();
+            subagent_sig
+                .get()
+                .into_iter()
+                .map(move |i| (rev, i))
+                .collect::<Vec<_>>()
+        },
+        |(rev, item): &(u64, hrdr_app::PanelItem)| {
+            let tag = match item.hit {
+                hrdr_app::PanelHit::Blocking(i) => format!("b:{i}"),
+                hrdr_app::PanelHit::Background(id) => format!("g:{id}"),
+            };
+            format!(
+                "{rev}:{tag}:{}:{}:{}",
+                item.expanded,
+                item.done,
+                item.log.len()
+            )
+        },
+        move |(_, item)| {
+            let th = theme_sig.get_untracked();
+            let hit = item.hit;
+            let header_color = if item.done { th.ok } else { th.accent };
+            let header_text = hrdr_app::panel_item_header(&item);
+            let body_lines = hrdr_app::panel_item_body(&item);
+            let panel_for_click = subagent_panel_for_view.clone();
+            let bg_exp_for_click = bg_exp_for_view.clone();
+            let refresh_for_click = refresh_for_view.clone();
+            let header = label(move || header_text.clone())
+                .style(move |s| s.color(header_color).font_bold())
+                .on_click_stop(move |_| {
+                    hrdr_app::toggle_panel_hit(
+                        &mut panel_for_click.borrow_mut(),
+                        &mut bg_exp_for_click.borrow_mut(),
+                        hit,
+                    );
+                    (refresh_for_click)();
+                });
+            let body = v_stack_from_iter(body_lines.into_iter().map(move |line| {
+                label(move || line.clone())
+                    .style(move |s| s.color(th.dim))
+                    .into_any()
+            }));
+            v_stack((header, body))
+                .style(|s| {
+                    s.flex_col()
+                        .width_full()
+                        .padding_vert(2.0)
+                        .padding_horiz(10.0)
+                })
+                .into_any()
+        },
+    )
+    .style(move |s| {
+        let s = s.flex_col().width_full();
+        if subagent_sig.with(Vec::is_empty) {
+            s.hide()
+        } else {
+            s
+        }
+    });
 
     // TODO panel (mirrors the TUI's): the model's task list, shown while
     // non-empty; completed items age out via todo_ttl.
@@ -1306,6 +1453,7 @@ fn app_view(
 
     v_stack((
         transcript_view,
+        subagent_panel_view,
         todo_panel,
         completions,
         status_bar,
@@ -2323,6 +2471,31 @@ fn slot_color(slot: hrdr_app::ThemeSlot, th: GuiTheme) -> Color {
         ThemeSlot::Accent => th.accent,
         ThemeSlot::Accent2 => th.accent2,
     }
+}
+
+/// Re-arming background-task panel poll: fires every 500 ms while background
+/// tasks remain in the registry, refreshing the sub-agent panel signal (their
+/// logs stream outside turn events, so nothing else triggers a refresh). The
+/// chain re-arms itself while the turn runs or tasks remain; `armed` is cleared
+/// when it dies so the next turn can start a fresh one.
+fn arm_bg_poll(
+    running: floem::reactive::RwSignal<bool>,
+    bg_tasks: std::sync::Arc<std::sync::Mutex<Vec<hrdr_tools::BackgroundTask>>>,
+    refresh: Rc<dyn Fn()>,
+    armed: Rc<std::cell::Cell<bool>>,
+) {
+    floem::action::exec_after(std::time::Duration::from_millis(500), move |_| {
+        let has_tasks = bg_tasks.lock().map(|v| !v.is_empty()).unwrap_or(false);
+        if has_tasks {
+            (refresh)();
+        }
+        // Re-arm while the turn is running or background tasks remain.
+        if running.get_untracked() || has_tasks {
+            arm_bg_poll(running, bg_tasks, refresh, armed);
+        } else {
+            armed.set(false);
+        }
+    });
 }
 
 /// Map a shared status color role onto the GUI theme (semantics live in

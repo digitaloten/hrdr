@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 hrdr-agent.workspace = true
+hrdr-tools.workspace = true
 hjkl-clipboard.workspace = true
 hjkl-theme.workspace = true
 hjkl-xdg.workspace = true

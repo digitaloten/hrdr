@@ -15,83 +15,22 @@ use std::hash::{Hash, Hasher};
 
 use crate::app::{App, Entry, StatusBarMode, TimestampStyle};
 use crate::theme::Theme;
-use hrdr_app::relative_time;
+use hrdr_app::{
+    PanelHit, PanelItem, panel_item_body, panel_item_header, panel_item_rows, panel_items,
+    relative_time,
+};
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
 /// Diff results (edit/write) get a larger preview since the diff is the point.
 const DIFF_PREVIEW_LINES: usize = 40;
 /// Max lines shown in the TODO panel (plus 2 for borders).
 const TODO_PANEL_MAX_ITEMS: u16 = 6;
-/// Tail lines shown per collapsed sub-agent in the sub-agent panel.
-const SUBAGENT_TAIL_LINES: usize = 4;
 /// Max content rows the sub-agent panel occupies (plus 2 for borders); beyond
 /// this the panel scrolls its content off the top (newest at the bottom).
 const SUBAGENT_PANEL_MAX_ROWS: u16 = 18;
 
-/// One row in the sub-agent panel — a blocking sub-agent or a detached
-/// background task, unified for rendering.
-struct PanelItem {
-    title: String,
-    log: String,
-    expanded: bool,
-    done: bool,
-    hit: crate::app::SubagentHit,
-}
-
-/// Collect the panel's rows: blocking sub-agents (from the `ToolOutput` stream)
-/// then detached background tasks (from the shared registry).
-fn panel_items(app: &App) -> Vec<PanelItem> {
-    let mut items = Vec::new();
-    for (i, sa) in app.subagents.iter().enumerate() {
-        items.push(PanelItem {
-            title: sa
-                .log
-                .lines()
-                .next()
-                .unwrap_or("sub-agent…")
-                .trim()
-                .to_string(),
-            log: sa.log.clone(),
-            expanded: sa.expanded,
-            done: false,
-            hit: crate::app::SubagentHit::Blocking(i),
-        });
-    }
-    if let Ok(v) = app.background_tasks.lock() {
-        for t in v.iter() {
-            let mut log = t.log.clone();
-            if t.done
-                && let Some(r) = &t.result
-            {
-                log.push_str(&format!("\n[result] {r}"));
-            }
-            items.push(PanelItem {
-                title: t.log.lines().next().unwrap_or(&t.label).trim().to_string(),
-                log,
-                expanded: app.background_expanded.contains(&t.id),
-                done: t.done,
-                hit: crate::app::SubagentHit::Background(t.id),
-            });
-        }
-    }
-    items
-}
-
-/// Content rows one panel item occupies: a header line plus its body (all lines
-/// when expanded, else the last [`SUBAGENT_TAIL_LINES`]).
-fn panel_item_rows(item: &PanelItem) -> usize {
-    let rest = item.log.lines().count().saturating_sub(1);
-    let body = if item.expanded {
-        rest
-    } else {
-        rest.min(SUBAGENT_TAIL_LINES)
-    };
-    1 + body
-}
-
 /// Outer height (with borders) of the sub-agent panel; 0 when nothing is shown.
-fn subagent_panel_height(app: &App) -> u16 {
-    let items = panel_items(app);
+fn subagent_panel_height(items: &[PanelItem]) -> u16 {
     if items.is_empty() {
         return 0;
     }
@@ -102,12 +41,13 @@ fn subagent_panel_height(app: &App) -> u16 {
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
-    // Snapshot TODO count while briefly holding the lock.
-    let todo_count = app.todos.lock().map(|t| t.len()).unwrap_or(0);
-    let todo_height = if todo_count > 0 {
-        (todo_count as u16).min(TODO_PANEL_MAX_ITEMS) + 2
-    } else {
+    // Snapshot the TODO list while briefly holding the lock; the height and
+    // the renderer both use the same snapshot.
+    let todos = app.todos.lock().map(|t| t.clone()).unwrap_or_default();
+    let todo_height = if todos.is_empty() {
         0
+    } else {
+        (todos.len() as u16).min(TODO_PANEL_MAX_ITEMS) + 2
     };
 
     // The inference loader sits just above the input while a turn runs.
@@ -121,7 +61,14 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         .desired_rows(input_inner_w, hrdr_app::INPUT_MAX_ROWS)
         + 2;
 
-    let subagent_height = subagent_panel_height(app);
+    // Built once per frame; both the layout height and the renderer use it
+    // (each sub-agent's log is cloned into the items, so don't recompute).
+    let subagent_items = panel_items(
+        &app.subagent_panel.agents,
+        &app.background_tasks,
+        &app.background_expanded,
+    );
+    let subagent_height = subagent_panel_height(&subagent_items);
 
     // Build the row stack dynamically, remembering each section's index.
     let mut constraints = vec![Constraint::Min(3)];
@@ -157,12 +104,12 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 
     draw_transcript(f, app, chunks[0]);
     if let Some(i) = subagent_idx {
-        draw_subagents(f, app, chunks[i]);
+        draw_subagents(f, app, chunks[i], &subagent_items);
     } else {
         app.subagent_hits.clear();
     }
     if let Some(i) = todo_idx {
-        draw_todos(f, app, chunks[i]);
+        draw_todos(f, app, chunks[i], &todos);
     }
     if let Some(i) = loader_idx {
         draw_loader(f, app, chunks[i]);
@@ -337,11 +284,7 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(scrollbar, area, &mut sb_state);
 }
 
-fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
-    let todos = match app.todos.lock() {
-        Ok(guard) => guard.clone(),
-        Err(_) => return,
-    };
+fn draw_todos(f: &mut Frame, app: &App, area: Rect, todos: &[hrdr_agent::Todo]) {
     if todos.is_empty() {
         return;
     }
@@ -375,9 +318,8 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
 /// (its `↳ task …` line) plus the tail of its output (collapsed) or the whole
 /// log (expanded). A left click on a row toggles that agent's expansion; the
 /// clickable rects are recorded in `app.subagent_hits`.
-fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect, items: &[PanelItem]) {
     let (accent, dim, success) = (app.theme.accent, app.theme.dim, app.theme.success);
-    let items = panel_items(app);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" sub-agents ({}) ", items.len()))
@@ -386,27 +328,19 @@ fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(block, area);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut hits: Vec<(crate::app::HitRect, crate::app::SubagentHit)> = Vec::new();
-    for item in &items {
+    let mut hits: Vec<(crate::app::HitRect, PanelHit)> = Vec::new();
+    for item in items {
         let start = lines.len();
-        let indicator = if item.expanded { "▾" } else { "▸" };
-        let badge = if item.done { "✓ " } else { "" };
         let header_color = if item.done { success } else { accent };
         lines.push(Line::from(Span::styled(
-            format!("{indicator} {badge}{}", item.title),
+            panel_item_header(item),
             Style::default()
                 .fg(header_color)
                 .add_modifier(Modifier::BOLD),
         )));
-        let rest: Vec<&str> = item.log.lines().skip(1).collect();
-        let shown = if item.expanded {
-            &rest[..]
-        } else {
-            &rest[rest.len().saturating_sub(SUBAGENT_TAIL_LINES)..]
-        };
-        for l in shown {
+        for l in panel_item_body(item) {
             lines.push(Line::from(Span::styled(
-                format!("  {}", l.trim_end()),
+                format!("  {l}"),
                 Style::default().fg(dim),
             )));
         }
@@ -1188,8 +1122,7 @@ fn diff_line_color(line: &str, theme: &Theme) -> Color {
 
 #[cfg(test)]
 mod subagent_tests {
-    use super::{PanelItem, SUBAGENT_TAIL_LINES, panel_item_rows};
-    use crate::app::SubagentHit;
+    use hrdr_app::{PanelHit, PanelItem, SUBAGENT_TAIL_LINES, panel_item_rows};
 
     fn item(log: &str, expanded: bool) -> PanelItem {
         PanelItem {
@@ -1197,7 +1130,7 @@ mod subagent_tests {
             log: log.to_string(),
             expanded,
             done: false,
-            hit: SubagentHit::Blocking(0),
+            hit: PanelHit::Blocking(0),
         }
     }
 

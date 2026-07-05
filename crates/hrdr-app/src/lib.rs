@@ -16,6 +16,7 @@ mod login;
 mod palette;
 mod sessions;
 mod status;
+mod subagents;
 mod transcript;
 mod util;
 pub use commands::*;
@@ -28,6 +29,7 @@ pub use login::*;
 pub use palette::*;
 pub use sessions::*;
 pub use status::*;
+pub use subagents::*;
 pub use transcript::*;
 pub use util::*;
 
@@ -186,15 +188,11 @@ pub fn resolve_alias(cmd: &str) -> &str {
 }
 
 /// The grouped, aligned `/help` body: a `Commands` header followed by each
-/// `HELP_GROUPS` section with its commands and descriptions. Frontends append
-/// their own keybinding "Tips:" tail (those keys differ per frontend).
-pub fn help_body() -> String {
-    help_body_for(|_| true)
-}
-
-/// Like [`help_body`], but only listing commands `show` accepts — so a
-/// frontend's `/help` advertises exactly what it supports (the GUI passes its
-/// [`CommandHost::supports_command`]). Groups left empty are omitted.
+/// `HELP_GROUPS` section with its commands and descriptions, only listing
+/// commands `show` accepts — so a frontend's `/help` advertises exactly what
+/// it supports (the GUI passes its [`CommandHost::supports_command`]). Groups
+/// left empty are omitted. Frontends append their own keybinding "Tips:" tail
+/// (those keys differ per frontend).
 pub fn help_body_for(show: impl Fn(&str) -> bool) -> String {
     let desc = |name: &str| {
         SLASH_COMMANDS
@@ -324,7 +322,7 @@ mod tests {
         assert!(!is_known_command("/frobnicate"));
         // With an empty TUI-only list, the filtered help equals the full one.
         let gui_help = help_body_for(|n| !is_tui_only(n));
-        assert_eq!(gui_help, help_body());
+        assert_eq!(gui_help, help_body_for(|_| true));
     }
 
     #[test]

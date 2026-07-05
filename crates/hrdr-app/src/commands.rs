@@ -1101,6 +1101,12 @@ pub fn agent_names(agent: &Arc<Mutex<Agent>>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// [`crate::prepare_outgoing`] for frontends holding the shared agent handle:
+/// fetches the sub-agent names ([`agent_names`]) and cwd ([`agent_cwd`]) itself.
+pub fn prepare_outgoing_via(agent: &Arc<Mutex<Agent>>, input: &str) -> String {
+    crate::prepare_outgoing(input, &agent_names(agent), &agent_cwd(agent))
+}
+
 /// Switch the live agent's model and, in the *same* locked step, re-probe the
 /// endpoint for the new model's advertised context window — delivering it to the
 /// UI so auto-compaction honors the model's real max. Folding the probe into the
