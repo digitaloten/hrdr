@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-07-05
+
 ### Added
 
 - **Detached background sub-agents.** `task` gained a `background: true` param:
@@ -16,6 +18,66 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   panel (with a ✓ on completion). Backed by a shared `background_tasks` registry
   on `ToolContext`; the run loop delivers + prunes finished tasks. (Background +
   worktree isolation together isn't supported yet.)
+- **GUI sub-agent panel + `@agent` mention parity.** The floem GUI now shows the
+  live sub-agent panel (blocking sub-agents + detached background tasks,
+  click-to-expand) and routes `@agent` mentions to the matching sub-agent. The
+  panel model was lifted into `hrdr-app` (`SubAgentPanel`, `PanelItem`,
+  `panel_items`) and `prepare_outgoing`/`prepare_outgoing_via` is now the shared
+  input→sent transform across the TUI, GUI, steering, and headless paths.
+- **Credential guardrails on `read`/`grep`.** A mechanical deny-list refuses the
+  hrdr auth store, `~/.ssh`, `.aws/credentials`, `gh/hosts.yml`,
+  `*.pem`/`*.key`, and `.env` files
+  (`.env.example`/`.sample`/`.template`/`.dist` stay readable), resolving
+  `..`/symlink escapes first. `fetch` now caps the response body and blocks
+  loopback / cloud-metadata (SSRF) hosts.
+
+### Changed
+
+- **`auto_compact` is now a plain on/off toggle** (config / `$HRDR_AUTO_COMPACT`
+  / `--auto-compact` / both frontends). Legacy fractional spellings (`0.85`,
+  `0`) still parse for backward compatibility.
+- **One shared SSE decoder** (`hrdr_llm::SseDecoder`) backs the OpenAI,
+  Anthropic, and MCP streaming paths, replacing three hand-rolled parsers; an
+  EOF flush keeps line-lenient servers (ending `data: [DONE]\n` without a blank
+  line) working.
+- **`chat_stream` borrows the history** (`&[ChatMessage]`) instead of cloning
+  the full `Vec` on every tool round and retry.
+- Chat-endpoint errors now carry a typed
+  `ChatError { status, retry_after, kind }`; retry/compaction match on the kind
+  first and fall back to text scanning.
+- The TUI batches redraws per streamed burst (was one redraw per token), caches
+  transcript rendering, and the sub-agent panel scrolls instead of clipping the
+  newest rows. `find` now respects `.gitignore`/`.ignore`.
+
+### Fixed
+
+- **Native Anthropic extended thinking + tool use no longer 400s** on the
+  follow-up request: thinking blocks and their signatures are captured while
+  streaming and re-emitted first in the assistant message. Two-phase Anthropic
+  usage (prompt/cache in `message_start`, completion in `message_delta`) is
+  merged instead of clobbered to zero.
+- **Streaming resilience:** a transient mid-stream disconnect now retries (not
+  just the connect), and a stream that ends without `[DONE]`/`message_stop` is
+  treated as an incomplete-stream retry rather than a truncated answer whose
+  half-streamed tool-call JSON executes.
+- **Guardrails can't be bypassed** by wrapping a blocked command in a nested
+  `bash -c '…'` — the payload is re-scanned (depth-capped).
+- **The `bash` tool bounds output in memory** (head + tail ring, per-line cap)
+  and spills the full output to an overflow file incrementally — no OOM on huge
+  output.
+- **Background sub-agents** get a read-only tool scope (they share the main
+  cwd), keep abortable handles cleared on `/clear`/session reset, and no longer
+  wedge as "running" on panic; finished handles are reaped. **Worktree
+  sub-agents** clean up their worktree + branch on a cancelled turn (`Drop`) and
+  stale worktrees are pruned at startup.
+- **Session autosave is atomic** (temp file + fsync + rename). **Checkpoints**
+  prune by turn cap + age, GC orphan blobs, and serialize concurrent instances
+  with a journal lock (legacy records survive the upgrade).
+- **MCP** removes the pending-request id on a send failure (no leak). The
+  `$EDITOR` draft uses a `0600` tempfile; a panic hook restores the terminal so
+  the message survives the alt screen; async notices no longer yank the scroll;
+  the steering queue is cleared on cancel; and startup no longer hangs forever
+  on the context-window probe (3s timeout).
 
 ## [0.2.7] - 2026-07-05
 
