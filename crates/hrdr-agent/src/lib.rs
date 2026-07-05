@@ -151,7 +151,8 @@ impl SubagentTool {
              it to keep the main context clean — broad exploration, or a focused piece of \
              implementation. The sub-agent has the normal tools (read/write/edit/bash/grep/…) \
              but can't itself delegate. It runs to completion and returns its final summary. \
-             Run cheaper/faster work on a different `model`",
+             Issue several `task` calls in one turn to run sub-agents in **parallel** (e.g. \
+             explore several areas at once). Run cheaper/faster work on a different `model`",
         );
         if profiles.is_empty() {
             desc.push('.');
@@ -221,6 +222,12 @@ impl hrdr_tools::Tool for SubagentTool {
 
     fn read_only(&self) -> bool {
         false
+    }
+
+    // Each sub-agent runs in its own isolated context, so multiple `task` calls
+    // in one turn run concurrently (parallel exploration/implementation).
+    fn concurrent(&self) -> bool {
+        true
     }
 
     async fn execute(
@@ -1780,17 +1787,17 @@ impl Agent {
             }
 
             // Execute the requested tools, feeding results back. Runs of
-            // consecutive read-only calls (reads/searches/fetches) execute
-            // concurrently; a mutating call is a barrier, run alone — so a
-            // read after a write still observes the write, and results always
-            // land in call order.
+            // consecutive concurrency-safe calls (reads/searches/fetches, and
+            // `task` sub-agents) execute concurrently; a file-mutating call is a
+            // barrier, run alone — so a read after a write still observes the
+            // write, and results always land in call order.
             let mut idx = 0;
             while idx < tool_calls.len() {
-                let read_only = self.tools.is_read_only(&tool_calls[idx].function.name);
+                let concurrent = self.tools.is_concurrent(&tool_calls[idx].function.name);
                 let mut end = idx + 1;
-                while read_only
+                while concurrent
                     && end < tool_calls.len()
-                    && self.tools.is_read_only(&tool_calls[end].function.name)
+                    && self.tools.is_concurrent(&tool_calls[end].function.name)
                 {
                     end += 1;
                 }

@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Parallel sub-agents.** Issuing several `task` calls in one turn now runs the
+  sub-agents concurrently (e.g. explore several areas at once), each streaming
+  into its own tool block. A new `Tool::concurrent()` signal (defaults to
+  `read_only()`) drives the tool-batcher: `task` opts in while staying
+  non-read-only; the parent's own file-mutating tools stay a sequential barrier.
+
 - **Sub-agents (`task` tool).** The model can delegate a self-contained sub-task
   to a fresh sub-agent with its own context, keeping the main conversation clean
   — broad exploration, or a focused piece of implementation. Crucially the

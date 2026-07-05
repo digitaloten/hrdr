@@ -212,6 +212,17 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether consecutive calls of this tool are safe to run **concurrently**
+    /// with each other (and with read-only calls). Read-only tools qualify by
+    /// definition; a mutating tool whose calls are self-contained and don't need
+    /// to observe each other's effects in order (e.g. `task` sub-agents, each in
+    /// its own isolated context) can opt in by overriding this to `true` while
+    /// staying non-`read_only`. The parent's own file-mutating tools keep the
+    /// default (barrier, sequential).
+    fn concurrent(&self) -> bool {
+        self.read_only()
+    }
+
     /// Run the tool. A returned `Err` is surfaced to the model as a tool
     /// result, not propagated as a hard failure — the agent keeps going.
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String>;
@@ -275,6 +286,12 @@ impl ToolRegistry {
     /// [`Tool::read_only`]); unknown names count as mutating.
     pub fn is_read_only(&self, name: &str) -> bool {
         self.tools.get(name).is_some_and(|t| t.read_only())
+    }
+
+    /// Whether `name`'s calls are safe to run concurrently (see
+    /// [`Tool::concurrent`]); unknown names are not.
+    pub fn is_concurrent(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(|t| t.concurrent())
     }
 
     /// Execute a named tool. Errors from a missing tool are hard; errors from
@@ -576,6 +593,35 @@ pub fn floor_char_boundary(s: &str, max: usize) -> usize {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    // ---- concurrency defaults ----
+
+    #[test]
+    fn concurrent_defaults_to_read_only() {
+        struct RoTool;
+        #[async_trait::async_trait]
+        impl Tool for RoTool {
+            fn name(&self) -> &'static str {
+                "ro"
+            }
+            fn description(&self) -> &'static str {
+                ""
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn read_only(&self) -> bool {
+                true
+            }
+            async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<String> {
+                Ok(String::new())
+            }
+        }
+        // A read-only tool is concurrent by default; a mutating one is not.
+        assert!(RoTool.concurrent());
+        assert!(!WriteTool.concurrent());
+        assert!(!EditTool.concurrent());
+    }
 
     // ---- floor_char_boundary ----
 
