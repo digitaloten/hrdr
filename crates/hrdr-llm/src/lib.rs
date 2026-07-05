@@ -8,7 +8,7 @@ mod anthropic;
 mod client;
 mod types;
 
-pub use client::{ChatStream, Client};
+pub use client::{ChatError, ChatErrorKind, ChatStream, Client};
 pub use types::{
     Accumulator, CacheMode, ChatChunk, ChatMessage, ChatRequest, ChunkChoice, Delta, FunctionCall,
     FunctionDef, RequestParams, Role, ToolCall, ToolDef, Usage, apply_cache_breakpoints,

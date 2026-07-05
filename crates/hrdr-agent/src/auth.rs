@@ -55,41 +55,35 @@ fn load_tokens_at(path: &Path) -> HashMap<String, String> {
         .collect()
 }
 
-/// Write `provider = "token"` into the file at `path`, preserving other entries
-/// and ensuring owner-only (`0600`) permissions on unix. The path-based core of
-/// [`save_auth_token`].
+/// Write `data` to `path` atomically: write to a temp file in the same
+/// directory, fsync, then rename over the target — a concurrent reader never
+/// sees a partial write. On unix the temp file is created with `0o600`
+/// permissions from the start so there is no window where it exists with
+/// broader permissions.
 ///
-/// The write is done through a temp file in the same directory, then renamed
-/// atomically over the target — a concurrent reader never sees a partial write.
-/// On unix the temp file is created with `0o600` from the start, so there is no
-/// window where the file exists with broader permissions.
-fn save_token_at(path: &Path, provider: &str, token: &str) -> Result<()> {
-    let mut doc = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
-        .unwrap_or_default();
-    doc[provider] = toml_edit::value(token);
+/// The parent directory must already exist. A rename failure removes the temp
+/// so no stray file is left behind.
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-
     // Write to a temp file in the same directory, then rename atomically.
     // tempfile is a dev-dependency only, so we build the temp name manually.
     let tmp = tmp_path(path, parent);
-    let content = doc.to_string();
 
     #[cfg(unix)]
-    let create_file = || -> Result<std::fs::File> {
+    let create_file = || -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))
     };
     #[cfg(not(unix))]
-    let create_file = || -> Result<std::fs::File> {
-        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))
+    let create_file = || -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
     };
 
     // `create_new` guarantees we own `tmp`; a failure here means someone else's
@@ -97,9 +91,8 @@ fn save_token_at(path: &Path, provider: &str, token: &str) -> Result<()> {
     // cleanup-on-error guard so a failed save never leaves a stray temp behind
     // (notably: a rename that fails still removes the temp we wrote).
     let mut f = create_file()?;
-    let result = (|| -> Result<()> {
-        f.write_all(content.as_bytes())
-            .with_context(|| format!("writing {}", tmp.display()))?;
+    let result = (|| -> std::io::Result<()> {
+        f.write_all(data)?;
         // Flush + fsync so the data is on disk before the rename.
         f.flush()?;
         #[cfg(unix)]
@@ -107,10 +100,7 @@ fn save_token_at(path: &Path, provider: &str, token: &str) -> Result<()> {
         Ok(())
     })();
     drop(f);
-    let result = result.and_then(|()| {
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))
-    });
+    let result = result.and_then(|()| std::fs::rename(&tmp, path));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -121,10 +111,28 @@ fn save_token_at(path: &Path, provider: &str, token: &str) -> Result<()> {
     result
 }
 
+/// Write `provider = "token"` into the file at `path`, preserving other entries
+/// and ensuring owner-only (`0600`) permissions on unix. The path-based core of
+/// [`save_auth_token`].
+///
+/// The write is done through [`write_atomic`] — a concurrent reader never sees a
+/// partial write.
+fn save_token_at(path: &Path, provider: &str, token: &str) -> Result<()> {
+    let mut doc = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
+        .unwrap_or_default();
+    doc[provider] = toml_edit::value(token);
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let content = doc.to_string();
+    write_atomic(path, content.as_bytes()).with_context(|| format!("writing {}", path.display()))
+}
+
 /// A unique temp-file path inside `parent` (same filesystem as `path`, so the
 /// subsequent rename is atomic). The name includes a timestamp and PID so
 /// concurrent writes don't collide.
-fn tmp_path(path: &Path, parent: &Path) -> PathBuf {
+pub(crate) fn tmp_path(path: &Path, parent: &Path) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -177,6 +185,21 @@ mod tests {
             .filter(|n| n != "auth.toml")
             .collect();
         assert!(leftovers.is_empty(), "unexpected files left: {leftovers:?}");
+    }
+
+    #[test]
+    fn write_atomic_produces_content_and_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        write_atomic(&path, b"hello world").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "out.txt")
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected files: {leftovers:?}");
     }
 
     #[cfg(unix)]

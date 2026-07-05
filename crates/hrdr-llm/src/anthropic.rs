@@ -274,9 +274,18 @@ pub(crate) async fn chat_stream(
     let resp = req.send().await.context("chat stream request failed")?;
     let status = resp.status();
     if !status.is_success() {
-        let retry = crate::client::retry_after_suffix(resp.headers());
+        let retry_after = crate::client::retry_after_from_headers(resp.headers());
         let text = resp.text().await.unwrap_or_default();
-        bail!("chat endpoint returned {status}: {text}{retry}");
+        let status_u16 = status.as_u16();
+        return Err(anyhow::Error::new(crate::client::ChatError {
+            status: Some(status_u16),
+            retry_after,
+            kind: crate::client::classify_status(status_u16),
+            message: format!(
+                "chat endpoint returned {status}: {text}{}",
+                crate::client::retry_after_suffix_from(retry_after)
+            ),
+        }));
     }
 
     let stream = async_stream::try_stream! {
@@ -345,10 +354,14 @@ pub(crate) async fn chat_stream(
         // If message_stop never arrived, the stream was cut mid-response.
         // This classifies as transient so the retry loop can re-request.
         if !message_stop_seen {
-            Err(anyhow::anyhow!(
-                "incomplete stream: Anthropic stream ended without message_stop \
-                 (partial response, safe to retry)"
-            ))?;
+            Err(crate::client::ChatError {
+                status: None,
+                retry_after: None,
+                kind: crate::client::ChatErrorKind::Transient,
+                message: "incomplete stream: Anthropic stream ended without message_stop \
+                          (partial response, safe to retry)"
+                    .to_string(),
+            })?;
         }
     };
     Ok((body, Box::pin(stream)))

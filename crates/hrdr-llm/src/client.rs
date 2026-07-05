@@ -51,6 +51,78 @@ fn log_wire(kind: &str, fields: serde_json::Value) {
     }
 }
 
+/// Classification of a chat-endpoint error for the agent's retry and
+/// compaction logic. Carried in the typed [`ChatError`] so hrdr-agent can
+/// match on the kind directly rather than scanning Display strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatErrorKind {
+    /// The request exceeded the model's context window; compaction may help.
+    Overflow,
+    /// A transient network or server error worth retrying with backoff.
+    Transient,
+    /// Any other error (bad request, auth failure, unsupported parameter, …).
+    Other,
+}
+
+/// A typed chat-endpoint error, emitted by [`Client::chat_stream`] for HTTP
+/// non-2xx responses and truncated streams. Prefer matching on [`ChatErrorKind`]
+/// for retry/compaction decisions; `message` preserves the full display string
+/// for the fallback text-scanner in hrdr-agent (which handles errors that arrive
+/// only as mid-stream bodies and never go through this path).
+#[derive(Debug)]
+pub struct ChatError {
+    /// HTTP status code, if this was an HTTP-level error.
+    pub status: Option<u16>,
+    /// Server-requested retry delay parsed from the `Retry-After` header, if
+    /// present (only meaningful for 429 responses). Clamped to 60 s upstream.
+    pub retry_after: Option<std::time::Duration>,
+    /// Coarse classification for retry/compaction decisions.
+    pub kind: ChatErrorKind,
+    /// Full display string — preserved so hrdr-agent's text-fallback scanner
+    /// sees the same content it used to (and can scan the body text for e.g.
+    /// 400-overflow messages whose kind can't be determined from status alone).
+    pub message: String,
+}
+
+impl std::fmt::Display for ChatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ChatError {}
+
+/// Map an HTTP status code to a [`ChatErrorKind`]. 413 is always overflow;
+/// 429/5xx are transient. Everything else needs body-text analysis (handled
+/// by hrdr-agent's fallback scanner on the `Other` path).
+pub(crate) fn classify_status(status: u16) -> ChatErrorKind {
+    match status {
+        413 => ChatErrorKind::Overflow,
+        429 | 500 | 502 | 503 | 504 | 529 => ChatErrorKind::Transient,
+        _ => ChatErrorKind::Other,
+    }
+}
+
+/// Parse a `Retry-After` header into a [`Duration`], clamped to 60 s.
+pub(crate) fn retry_after_from_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<std::time::Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(|s| std::time::Duration::from_secs(s.min(60)))
+}
+
+/// Format a retry-after duration as ` (retry-after: Ns)` for embedding in
+/// error messages (preserves the text format hrdr-agent's fallback scanner
+/// used to rely on).
+pub(crate) fn retry_after_suffix_from(d: Option<std::time::Duration>) -> String {
+    d.map(|d| format!(" (retry-after: {}s)", d.as_secs()))
+        .unwrap_or_default()
+}
+
 /// Boxed stream of decoded streaming chunks.
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
 
@@ -94,18 +166,6 @@ pub struct Client {
     api_version: Option<String>,
     /// Wire protocol, derived from `base_url`.
     backend: Backend,
-}
-
-/// Format a `Retry-After` response header as ` (retry-after: Ns)` so the agent's
-/// retry loop can honor the server's requested wait (integer-seconds form only;
-/// empty string when the header is absent or not a plain number).
-pub(crate) fn retry_after_suffix(headers: &reqwest::header::HeaderMap) -> String {
-    headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|secs| format!(" (retry-after: {secs}s)"))
-        .unwrap_or_default()
 }
 
 /// Whether `model` is an OpenAI reasoning model that wants `max_completion_tokens`
@@ -370,13 +430,22 @@ impl Client {
             .context("chat stream request failed")?;
         let status = resp.status();
         if !status.is_success() {
-            let retry = retry_after_suffix(resp.headers());
+            let retry_after = retry_after_from_headers(resp.headers());
             let text = resp.text().await.unwrap_or_default();
+            let status_u16 = status.as_u16();
             log_wire(
                 "error_response",
-                serde_json::json!({"status": status.as_u16(), "body": text}),
+                serde_json::json!({"status": status_u16, "body": text}),
             );
-            bail!("chat endpoint returned {status}: {text}{retry}");
+            return Err(anyhow::Error::new(ChatError {
+                status: Some(status_u16),
+                retry_after,
+                kind: classify_status(status_u16),
+                message: format!(
+                    "chat endpoint returned {status}: {text}{}",
+                    retry_after_suffix_from(retry_after)
+                ),
+            }));
         }
 
         let mut bytes = resp.bytes_stream();
@@ -413,10 +482,14 @@ impl Client {
             // Reaching here means the byte stream closed without the [DONE]
             // sentinel — truncated response or network drop. Classify as
             // transient so the agent retry loop can re-request.
-            Err(anyhow::anyhow!(
-                "incomplete stream: OpenAI stream ended without [DONE] \
-                 (partial response, safe to retry)"
-            ))?;
+            Err(ChatError {
+                status: None,
+                retry_after: None,
+                kind: ChatErrorKind::Transient,
+                message: "incomplete stream: OpenAI stream ended without [DONE] \
+                          (partial response, safe to retry)"
+                    .to_string(),
+            })?;
         };
         Ok(Box::pin(stream))
     }

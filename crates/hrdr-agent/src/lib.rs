@@ -83,15 +83,40 @@ pub fn steering_queue() -> SteeringQueue {
 /// Monotonic id source for detached background sub-agents (`task` background mode).
 static BG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Shared list of background-task `JoinHandle`s, keyed by task id.
+type BgHandles = Arc<Mutex<Vec<(u64, tokio::task::JoinHandle<()>)>>>;
+
+/// Create an empty [`BgHandles`] store.
+fn bg_handles() -> BgHandles {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
 /// Spawn `cfg`'s sub-agent detached: it streams into the shared background
 /// registry and, on completion, records its result there for the run loop to
 /// deliver. Returns immediately with an acknowledgement for the model.
+///
+/// Background tasks default to read-only: they share the main agent's cwd and
+/// there is no isolation, so interleaved file writes are a race. An explicit
+/// `allowed_tools` from a pre-scoped profile takes precedence.
+///
+/// The task is wrapped in a nested spawn so a panic in the body sets
+/// `done = true` with an error message rather than leaving the registry entry
+/// live forever. The outer [`JoinHandle`](tokio::task::JoinHandle) is stored in
+/// `handles` so [`Agent::clear`] can abort running tasks on session reset.
 fn spawn_background(
-    cfg: AgentConfig,
+    mut cfg: AgentConfig,
     prompt: String,
     label: String,
     registry: &Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>>,
+    handles: &BgHandles,
 ) -> String {
+    // Background tasks default to read-only: they share the main agent's cwd
+    // and there's no isolation, so interleaved file writes are a race. An
+    // explicit `allowed_tools` from a pre-scoped profile takes precedence.
+    if cfg.allowed_tools.is_none() {
+        cfg.read_only = true;
+        cfg.write_ext = None;
+    }
     use std::sync::atomic::Ordering;
     let id = BG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     let header = format!("↳ task#{id} ({}): {label}", cfg.model);
@@ -106,47 +131,67 @@ fn spawn_background(
         });
     }
     let reg = registry.clone();
-    tokio::spawn(async move {
-        let mut out = String::new();
-        let outcome: Result<()> = async {
-            let mut sub = Agent::new(cfg)?;
-            sub.run(prompt, steering_queue(), |ev| {
-                let chunk = match ev {
-                    AgentEvent::Text(t) => {
-                        out.push_str(&t);
-                        Some(t)
+    let reg_done = reg.clone();
+    // The inner task does the actual work; the outer task is the panic guard:
+    // it always sets `done = true` + a result, even on panic.
+    let handle = tokio::spawn(async move {
+        // Run the body in a nested spawn so a panic propagates as a JoinError
+        // (non-panicking error path: Result::Err) rather than crashing the
+        // outer task and leaving the registry entry live forever.
+        let inner = tokio::spawn(async move {
+            let mut out = String::new();
+            let result: anyhow::Result<()> = async {
+                let mut sub = Agent::new(cfg)?;
+                sub.run(prompt, steering_queue(), |ev| {
+                    let chunk = match ev {
+                        AgentEvent::Text(t) => {
+                            out.push_str(&t);
+                            Some(t)
+                        }
+                        AgentEvent::ToolStart { name, .. } => Some(format!("\n· {name}")),
+                        _ => None,
+                    };
+                    if let Some(c) = chunk
+                        && let Ok(mut v) = reg.lock()
+                        && let Some(t) = v.iter_mut().find(|t| t.id == id)
+                    {
+                        t.log.push_str(&c);
                     }
-                    AgentEvent::ToolStart { name, .. } => Some(format!("\n· {name}")),
-                    _ => None,
-                };
-                if let Some(c) = chunk
-                    && let Ok(mut v) = reg.lock()
-                    && let Some(t) = v.iter_mut().find(|t| t.id == id)
-                {
-                    t.log.push_str(&c);
-                }
-            })
-            .await?;
-            Ok(())
-        }
-        .await;
-        if let Ok(mut v) = reg.lock()
-            && let Some(t) = v.iter_mut().find(|t| t.id == id)
-        {
-            t.done = true;
-            t.result = Some(match outcome {
+                })
+                .await?;
+                Ok(())
+            }
+            .await;
+            match result {
                 Ok(()) => {
-                    let o = out.trim();
+                    let o = out.trim().to_string();
                     if o.is_empty() {
                         "(no text output)".to_string()
                     } else {
-                        o.to_string()
+                        o
                     }
                 }
                 Err(e) => format!("(background task failed: {e})"),
-            });
+            }
+        });
+        // Always set done = true, even if the inner task panicked.
+        let final_result = match inner.await {
+            Ok(s) => s,
+            Err(join_err) if join_err.is_panic() => {
+                format!("(background task panicked: {join_err})")
+            }
+            Err(_) => "(background task was cancelled)".to_string(),
+        };
+        if let Ok(mut v) = reg_done.lock()
+            && let Some(t) = v.iter_mut().find(|t| t.id == id)
+        {
+            t.done = true;
+            t.result = Some(final_result);
         }
     });
+    if let Ok(mut v) = handles.lock() {
+        v.push((id, handle));
+    }
     format!(
         "Started background task #{id} ({label}) — it runs concurrently. Its result will be \
          delivered to you automatically when it finishes; continue with other work and don't wait."
@@ -241,10 +286,13 @@ struct SubagentTool {
     /// Description string (leaked once at startup — lists the configured
     /// profiles so the model knows what it can delegate to).
     description: &'static str,
+    /// Registry of background-task `JoinHandle`s, shared with the owning
+    /// [`Agent`] so it can abort live tasks on `clear()` / session reset.
+    bg_handles: BgHandles,
 }
 
 impl SubagentTool {
-    fn new(base: AgentConfig, profiles: Vec<SubagentProfile>) -> Self {
+    fn new(base: AgentConfig, profiles: Vec<SubagentProfile>, bg_handles: BgHandles) -> Self {
         let mut desc = String::from(
             "Delegate a self-contained sub-task to a fresh sub-agent with its own context \
              (it can't see this conversation, so make `prompt` complete and standalone). Use \
@@ -296,6 +344,7 @@ impl SubagentTool {
             base,
             profiles,
             description: Box::leak(desc.into_boxed_str()),
+            bg_handles,
         }
     }
 }
@@ -412,7 +461,13 @@ impl hrdr_tools::Tool for SubagentTool {
             if isolation.is_some() {
                 bail!("a background task can't also use `isolation` (worktree) yet");
             }
-            return Ok(spawn_background(cfg, prompt, label, &ctx.background_tasks));
+            return Ok(spawn_background(
+                cfg,
+                prompt,
+                label,
+                &ctx.background_tasks,
+                &self.bg_handles,
+            ));
         }
 
         // `isolation = "worktree"`: run the sub-agent in a fresh git worktree so
@@ -1546,6 +1601,9 @@ pub fn in_git_repo(cwd: &std::path::Path) -> bool {
 /// A throwaway git worktree for an isolated sub-agent (`isolation = "worktree"`).
 /// Created on a scratch branch off the current `HEAD`; [`finish`](Self::finish)
 /// removes it if the sub-agent made no changes, else leaves it with a pointer.
+///
+/// Implements [`Drop`] for best-effort cleanup when the owning future is
+/// cancelled before [`finish`](Self::finish) is called.
 struct Worktree {
     /// The repo the worktree belongs to (the sub-agent's original cwd).
     repo: PathBuf,
@@ -1553,6 +1611,31 @@ struct Worktree {
     path: PathBuf,
     /// The scratch branch the worktree is on.
     branch: String,
+    /// Set to `true` by `finish()` so `Drop` knows cleanup already happened
+    /// and should not run again.
+    cleaned: bool,
+}
+
+impl Drop for Worktree {
+    fn drop(&mut self) {
+        if self.cleaned {
+            return; // already handled by finish() or a previous drop
+        }
+        // Best-effort synchronous cleanup for a worktree abandoned by a
+        // cancelled future. `--force` removes even if the index is dirty
+        // (the parent turn was interrupted, so no commit was made).
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.path)
+            .output();
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["branch", "-D", &self.branch])
+            .output();
+    }
 }
 
 impl Worktree {
@@ -1562,6 +1645,8 @@ impl Worktree {
         if !in_git_repo(repo) {
             bail!("isolation = \"worktree\" requires a git repository");
         }
+        // Best-effort prune of any stale worktrees from previously aborted runs.
+        prune_stale_worktrees(repo).await;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -1595,23 +1680,23 @@ impl Worktree {
             repo: repo.to_path_buf(),
             path,
             branch,
+            cleaned: false,
         })
     }
 
     /// After the sub-agent finishes: if the worktree is clean, remove it and its
     /// branch and return `None`; otherwise leave it and return a note pointing at
     /// the branch/path so the parent can review and merge.
-    async fn finish(self) -> Option<String> {
-        let git = |args: &[&std::ffi::OsStr]| {
-            let mut c = std::process::Command::new("git");
-            c.arg("-C").arg(&self.repo).args(args);
-            c.output().ok()
-        };
-        let dirty = std::process::Command::new("git")
+    async fn finish(mut self) -> Option<String> {
+        // Mark cleaned first so Drop doesn't double-clean if this future is
+        // aborted or dropped after completion.
+        self.cleaned = true;
+        let dirty = tokio::process::Command::new("git")
             .arg("-C")
             .arg(&self.path)
             .args(["status", "--porcelain"])
             .output()
+            .await
             .ok()
             .map(|o| !o.stdout.is_empty())
             .unwrap_or(false);
@@ -1624,20 +1709,35 @@ impl Worktree {
             ));
         }
         // Clean: tear down the worktree and its branch.
-        let path = self.path.as_os_str().to_os_string();
-        git(&[
-            std::ffi::OsStr::new("worktree"),
-            std::ffi::OsStr::new("remove"),
-            std::ffi::OsStr::new("--force"),
-            &path,
-        ]);
-        git(&[
-            std::ffi::OsStr::new("branch"),
-            std::ffi::OsStr::new("-D"),
-            std::ffi::OsStr::new(&self.branch),
-        ]);
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.path)
+            .output()
+            .await;
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["branch", "-D", &self.branch])
+            .output()
+            .await;
         None
     }
+}
+
+/// Run `git worktree prune` in `repo` to clean up leftover worktree entries
+/// from previously aborted agents. This is the safest possible prune — git
+/// only removes entries whose checkout directory no longer exists. Branch
+/// cleanup is intentionally skipped here: task branches may contain committed
+/// work that a user hasn't reviewed yet.
+async fn prune_stale_worktrees(repo: &std::path::Path) {
+    let _ = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "prune"])
+        .output()
+        .await;
 }
 
 /// Directory for this cwd's file checkpoints (`…/hrdr/checkpoints/<cwd-slug>`).
@@ -1729,6 +1829,10 @@ pub struct Agent {
     /// Names of the sub-agents available via the `task` tool (built-ins +
     /// discovered files + config), for `@name` mention routing in the frontend.
     agent_names: Vec<String>,
+    /// `JoinHandle`s for all running background sub-agent tasks (`task` with
+    /// `background: true`), keyed by task id. Stored so [`Self::clear`] can
+    /// abort them and so callers can query the live count.
+    bg_handles: BgHandles,
 }
 
 /// Append a sub-agent persona (its role / operating instructions) after the base
@@ -1861,12 +1965,14 @@ impl Agent {
         // listed for the model. The profile set (built-ins + discovered files +
         // config) is resolved by [`resolve_agent_profiles`].
         let mut agent_names: Vec<String> = Vec::new();
+        let bg_handles: BgHandles = bg_handles();
         if config.subagents {
             let profiles = resolve_agent_profiles(&config);
             agent_names = profiles.iter().map(|p| p.name.clone()).collect();
             tools.register(Arc::new(SubagentTool::new(
                 subagent_base_config(&config),
                 profiles,
+                Arc::clone(&bg_handles),
             )));
         }
         // Memory: expose the `memory` tool (registered before scoping so a
@@ -2004,6 +2110,7 @@ impl Agent {
             memory_enabled: config.memory,
             memory_dir: config.memory_dir,
             agent_names,
+            bg_handles,
         })
     }
 
@@ -2093,10 +2200,31 @@ impl Agent {
     /// constructed for the current cwd. Drops all history and **re-reads
     /// `AGENTS.md`**, so an updated or removed project-instructions file is
     /// reflected (the old system prompt is not kept around).
+    ///
+    /// Also aborts any running background sub-agent tasks so stale results from
+    /// a previous session don't land in the new conversation.
     pub fn clear(&mut self) {
+        self.abort_background_tasks();
         self.messages.clear();
         self.reset_read_files();
         self.refresh_system();
+    }
+
+    /// Abort all running background sub-agent tasks and clear the handle list.
+    /// A task that has already finished is a no-op.
+    pub fn abort_background_tasks(&mut self) {
+        if let Ok(mut v) = self.bg_handles.lock() {
+            for (_, handle) in v.drain(..) {
+                handle.abort();
+            }
+        }
+    }
+
+    /// Number of background sub-agent tasks currently tracked (running or
+    /// completed but not yet reaped by the OS — a handle is not removed from
+    /// the list until the next `clear` / `abort_background_tasks`).
+    pub fn bg_handle_count(&self) -> usize {
+        self.bg_handles.lock().map(|v| v.len()).unwrap_or(0)
     }
 
     /// Forget which files the model has "seen": once the transcript no longer
@@ -2788,7 +2916,20 @@ fn err_mentions(e: &anyhow::Error, needles: &[&str]) -> bool {
 
 /// Whether an error looks like a transient network/server failure worth
 /// retrying (connection issues `request failed`/`timed out`/…, 429, or 5xx).
+///
+/// Checks the typed [`hrdr_llm::ChatError`] first; falls back to a
+/// case-insensitive substring scan of the display string for errors that
+/// predate the typed form.
 fn is_transient(e: &anyhow::Error) -> bool {
+    if let Some(ce) = e.downcast_ref::<hrdr_llm::ChatError>() {
+        match ce.kind {
+            hrdr_llm::ChatErrorKind::Transient => return true,
+            hrdr_llm::ChatErrorKind::Overflow => return false,
+            // `Other` (e.g. a 400 whose meaning is only in the body) falls
+            // through to the text scan below — the status alone isn't decisive.
+            hrdr_llm::ChatErrorKind::Other => {}
+        }
+    }
     err_mentions(
         e,
         &[
@@ -2813,7 +2954,21 @@ fn is_transient(e: &anyhow::Error) -> bool {
 /// model's context window. The marker phrases are ported from pi's
 /// provider-specific overflow patterns (`packages/ai/src/utils/overflow.ts`),
 /// covering ~20 OpenAI-compatible backends.
+///
+/// Checks the typed [`hrdr_llm::ChatError`] first; falls back to a
+/// case-insensitive substring scan of the display string for errors that
+/// predate the typed form.
 fn is_context_overflow(e: &anyhow::Error) -> bool {
+    if let Some(ce) = e.downcast_ref::<hrdr_llm::ChatError>() {
+        match ce.kind {
+            hrdr_llm::ChatErrorKind::Overflow => return true,
+            hrdr_llm::ChatErrorKind::Transient => return false,
+            // `Other` falls through to the body-text scan: many providers
+            // signal context overflow with a 400 + descriptive body, which
+            // `classify_status` can't distinguish from an ordinary bad request.
+            hrdr_llm::ChatErrorKind::Other => {}
+        }
+    }
     // Rate-limit / throttling errors sometimes contain overflow-ish wording
     // (e.g. Bedrock's "Throttling: too many tokens") — exclude them first so
     // they retry (via [`is_transient`]) rather than triggering a compaction.
@@ -3001,7 +3156,13 @@ fn retry_backoff(attempt: usize) -> std::time::Duration {
 /// one in the error as `retry-after: <seconds>s` (see the client's rate-limit
 /// error formatting). Clamped to 60s so a hostile/oversized value can't stall the
 /// turn. Only the integer-seconds form is parsed (the HTTP-date form is ignored).
+///
+/// Checks the typed [`hrdr_llm::ChatError`] first; falls back to a text scan
+/// of the display string for errors that predate the typed form.
 fn retry_after_hint(e: &anyhow::Error) -> Option<std::time::Duration> {
+    if let Some(ce) = e.downcast_ref::<hrdr_llm::ChatError>() {
+        return ce.retry_after;
+    }
     let msg = e.to_string().to_ascii_lowercase();
     let after = msg.split("retry-after:").nth(1)?;
     let secs: u64 = after
@@ -3105,7 +3266,7 @@ mod tests {
         PRUNE_PLACEHOLDER, ProviderConfig, ToolOutputConfig, builtin_provider,
         compaction_tail_start, elide_tool_results, estimate_tokens, estimate_tokens_in_messages,
         in_git_repo, is_context_overflow, is_transient, parse_env_bool, prune_tool_messages,
-        repair_dangling_tool_calls, steering_queue, tail_window,
+        repair_dangling_tool_calls, retry_after_hint, steering_queue, tail_window,
     };
     use crate::cwd_slug;
     use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
@@ -3663,6 +3824,170 @@ mod tests {
         let plain = anyhow::anyhow!("chat endpoint returned 400 Bad Request: invalid tool schema");
         assert!(!is_transient(&plain));
         assert!(!is_context_overflow(&plain));
+
+        // Incomplete stream errors are transient (the server dropped the connection).
+        assert!(is_transient(&anyhow::anyhow!(
+            "incomplete stream: something"
+        )));
+    }
+
+    #[test]
+    fn typed_chat_error_classified_correctly() {
+        use hrdr_llm::{ChatError, ChatErrorKind};
+        use std::time::Duration;
+
+        // Overflow typed error.
+        let overflow = anyhow::Error::new(ChatError {
+            status: Some(413),
+            kind: ChatErrorKind::Overflow,
+            retry_after: None,
+            message: "request too large".to_string(),
+        });
+        assert!(is_context_overflow(&overflow));
+        assert!(!is_transient(&overflow));
+        assert_eq!(retry_after_hint(&overflow), None);
+
+        // Transient typed error with Retry-After.
+        let delay = Duration::from_secs(30);
+        let rate = anyhow::Error::new(ChatError {
+            status: Some(429),
+            kind: ChatErrorKind::Transient,
+            retry_after: Some(delay),
+            message: "rate limited".to_string(),
+        });
+        assert!(is_transient(&rate));
+        assert!(!is_context_overflow(&rate));
+        assert_eq!(retry_after_hint(&rate), Some(delay));
+
+        // Other typed error: neither transient nor overflow.
+        let other = anyhow::Error::new(ChatError {
+            status: Some(400),
+            kind: ChatErrorKind::Other,
+            retry_after: None,
+            message: "bad request".to_string(),
+        });
+        assert!(!is_transient(&other));
+        assert!(!is_context_overflow(&other));
+
+        // A 400 whose body describes a context overflow classifies as Other by
+        // status, but must still fall through to the body-text scan and be
+        // treated as overflow (many OpenAI-compatible providers do this instead
+        // of 413) — otherwise auto-compaction silently stops firing for them.
+        let overflow_400 = anyhow::Error::new(ChatError {
+            status: Some(400),
+            kind: ChatErrorKind::Other,
+            retry_after: None,
+            message: "chat endpoint returned 400: maximum context length exceeded".to_string(),
+        });
+        assert!(is_context_overflow(&overflow_400));
+        assert!(!is_transient(&overflow_400));
+    }
+
+    #[tokio::test]
+    async fn worktree_drop_without_finish_cleans_up() {
+        use super::Worktree;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return; // git unavailable — skip
+        }
+        let wt = Worktree::create(repo).await.unwrap();
+        let wt_path = wt.path.clone();
+        assert!(wt_path.exists(), "worktree was created");
+        // Drop without calling finish — the Drop impl must clean up.
+        drop(wt);
+        // Give the sync command a moment to settle (it's blocking but on the
+        // same thread; Drop completed synchronously before this point).
+        assert!(!wt_path.exists(), "Drop cleaned up the abandoned worktree");
+    }
+
+    #[test]
+    fn background_abort_clears_handles() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cfg = AgentConfig {
+                checkpoints: Some("off".to_string()),
+                ..Default::default()
+            };
+            let mut agent = Agent::new(cfg).unwrap();
+            // Inject a fake long-running handle.
+            {
+                let h = tokio::spawn(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await
+                });
+                if let Ok(mut v) = agent.bg_handles.lock() {
+                    v.push((1, h));
+                }
+            }
+            assert_eq!(agent.bg_handle_count(), 1);
+            agent.abort_background_tasks();
+            assert_eq!(agent.bg_handle_count(), 0, "abort drains the handle list");
+        });
+    }
+
+    #[tokio::test]
+    async fn background_task_panic_sets_done_with_error() {
+        use std::sync::{Arc, Mutex};
+        let registry: Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let handles = super::bg_handles();
+        // A config that will panic immediately in the inner spawn.
+        // We can't actually run a sub-agent in unit tests (no server), so we
+        // simulate by injecting a panicking inner task directly.
+        let reg_clone = registry.clone();
+        let id: u64 = 99;
+        registry.lock().unwrap().push(hrdr_tools::BackgroundTask {
+            id,
+            label: "panic-test".to_string(),
+            log: String::new(),
+            done: false,
+            result: None,
+            delivered: false,
+        });
+        // Build the outer-panics-inner structure manually.
+        let handle = tokio::spawn(async move {
+            let inner = tokio::spawn(async move { panic!("deliberate test panic") });
+            let final_result = match inner.await {
+                Ok(s) => s,
+                Err(join_err) if join_err.is_panic() => {
+                    format!("(background task panicked: {join_err})")
+                }
+                Err(_) => "(background task was cancelled)".to_string(),
+            };
+            if let Ok(mut v) = reg_clone.lock()
+                && let Some(t) = v.iter_mut().find(|t| t.id == id)
+            {
+                t.done = true;
+                t.result = Some(final_result);
+            }
+        });
+        handles.lock().unwrap().push((id, handle));
+        // Wait for the outer task to settle.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let v = registry.lock().unwrap();
+        let t = v.iter().find(|t| t.id == id).unwrap();
+        assert!(t.done, "done must be set even after inner panic");
+        assert!(
+            t.result.as_deref().unwrap_or_default().contains("panicked"),
+            "result should mention the panic"
+        );
     }
 
     #[test]

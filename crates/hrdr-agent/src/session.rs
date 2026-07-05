@@ -130,7 +130,8 @@ impl Session {
             snap.created = prev.created;
         }
         let json = serde_json::to_string_pretty(&snap).context("serializing session")?;
-        std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+        crate::auth::write_atomic(&path, json.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
         Ok(path)
     }
 
