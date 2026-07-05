@@ -138,6 +138,16 @@ fn subagent_config_for_profile(
     cfg.allowed_tools = profile.tools.clone();
     cfg.read_only = profile.read_only;
     cfg.write_ext = profile.write_ext.clone();
+    // Per-agent runtime knobs, each inheriting the main agent's when omitted.
+    if profile.temperature.is_some() {
+        cfg.temperature = profile.temperature;
+    }
+    if profile.effort.is_some() {
+        cfg.effort = profile.effort.clone();
+    }
+    if let Some(s) = profile.max_steps {
+        cfg.max_steps = s;
+    }
     Ok(cfg)
 }
 
@@ -480,6 +490,17 @@ pub struct SubagentProfile {
     /// Takes precedence over `read_only`; ignored when `tools` is set.
     #[serde(default)]
     pub write_ext: Option<Vec<String>>,
+    /// Sampling temperature for this sub-agent. Omit to inherit the main agent's.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Reasoning effort (`minimal`/`low`/`medium`/`high`) for this sub-agent.
+    /// Omit to inherit the main agent's — e.g. `high` for a careful reviewer.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Tool-call iteration cap for this sub-agent. Omit to inherit the main
+    /// agent's `max_steps` — e.g. a small cap on a quick focused sub-task.
+    #[serde(default)]
+    pub max_steps: Option<usize>,
 }
 
 /// The always-available built-in sub-agents: read-only `explore` and `review`
@@ -501,6 +522,9 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             read_only: true,
             tools: None,
             write_ext: None,
+            temperature: None,
+            effort: None,
+            max_steps: None,
         },
         SubagentProfile {
             name: "review".to_string(),
@@ -515,6 +539,9 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             read_only: true,
             tools: None,
             write_ext: None,
+            temperature: None,
+            effort: None,
+            max_steps: None,
         },
         SubagentProfile {
             name: "plan".to_string(),
@@ -530,6 +557,9 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             read_only: false,
             tools: None,
             write_ext: Some(vec!["md".to_string(), "markdown".to_string()]),
+            temperature: None,
+            effort: None,
+            max_steps: None,
         },
         SubagentProfile {
             name: "general".to_string(),
@@ -545,6 +575,9 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             read_only: false,
             tools: None,
             write_ext: None,
+            temperature: None,
+            effort: None,
+            max_steps: None,
         },
     ]
 }
@@ -2658,6 +2691,9 @@ mod tests {
             read_only: false,
             tools: None,
             write_ext: None,
+            temperature: None,
+            effort: None,
+            max_steps: None,
         };
         let sub = subagent_config_for_profile(&base, &prof).unwrap();
         assert_eq!(sub.base_url, "https://openrouter.ai/api/v1");
@@ -2676,6 +2712,9 @@ mod tests {
                 read_only: false,
                 tools: None,
                 write_ext: None,
+                temperature: None,
+                effort: None,
+                max_steps: None,
             },
         )
         .unwrap();
@@ -2694,6 +2733,9 @@ mod tests {
                     read_only: false,
                     tools: None,
                     write_ext: None,
+                    temperature: None,
+                    effort: None,
+                    max_steps: None,
                 },
             )
             .is_err()
@@ -2788,6 +2830,42 @@ mod tests {
         // (The write gate that confines mutations to Markdown is exercised by
         // `write_allow_ext_confines_mutations_to_listed_extensions` in hrdr-tools.)
         assert!(system_prompt(&agent).contains("PLAN sub-agent"));
+    }
+
+    #[test]
+    fn profile_knobs_override_else_inherit() {
+        use super::{SubagentProfile, subagent_base_config, subagent_config_for_profile};
+        let cfg = AgentConfig {
+            temperature: Some(0.2),
+            effort: Some("low".to_string()),
+            max_steps: 40,
+            ..Default::default()
+        };
+        let base = subagent_base_config(&cfg);
+        let profile = |t, e: Option<&str>, s| SubagentProfile {
+            name: "k".to_string(),
+            provider: None,
+            model: None,
+            description: None,
+            prompt: None,
+            read_only: false,
+            tools: None,
+            write_ext: None,
+            temperature: t,
+            effort: e.map(str::to_string),
+            max_steps: s,
+        };
+        // Set knobs override the inherited ones.
+        let over =
+            subagent_config_for_profile(&base, &profile(Some(0.9), Some("high"), Some(5))).unwrap();
+        assert_eq!(over.temperature, Some(0.9));
+        assert_eq!(over.effort.as_deref(), Some("high"));
+        assert_eq!(over.max_steps, 5);
+        // Omitted knobs inherit the main agent's.
+        let inherit = subagent_config_for_profile(&base, &profile(None, None, None)).unwrap();
+        assert_eq!(inherit.temperature, Some(0.2));
+        assert_eq!(inherit.effort.as_deref(), Some("low"));
+        assert_eq!(inherit.max_steps, 40);
     }
 
     #[test]

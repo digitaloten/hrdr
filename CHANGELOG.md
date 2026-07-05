@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Per-agent runtime knobs.** `[[subagent]]` profiles gained `temperature`,
+  `effort` (`minimal`/`low`/`medium`/`high`), and `max_steps` (tool-call
+  iteration cap) — each inheriting the main agent's value when omitted. Lets a
+  profile run, e.g., a careful `high`-effort reviewer or a tightly capped quick
+  sub-task.
 - **Four built-in agents.** The `task` tool now always offers `explore` (a
   read-only code investigator — trace files, types, and call paths), `review` (a
   read-only code reviewer — bugs, edge cases, security), `plan` (investigates

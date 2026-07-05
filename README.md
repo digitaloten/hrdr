@@ -457,6 +457,20 @@ scopes it to the read-only tools; `write_ext` grants the read-only tools plus
 file writes limited to those extensions (e.g. `write_ext = ["md"]`, how `plan`
 is built); `tools` is an explicit allow-list that takes precedence over both.
 
+A profile can also tune the sub-agent's runtime knobs, each inheriting the main
+agent's when omitted: `temperature`, `effort` (`minimal`/`low`/`medium`/`high`),
+and `max_steps` (the tool-call iteration cap) — e.g. a careful `high`-effort
+reviewer, or a tightly capped quick task:
+
+```toml
+[[subagent]]
+name = "reviewer"
+read_only = true
+effort = "high"        # think harder than the main agent
+temperature = 0.1
+# max_steps = 20       # cap the sub-agent's tool-call rounds
+```
+
 Sub-agents can't themselves delegate (recursion is bounded to one level) and
 don't spawn MCP servers. Their file edits aren't captured by the parent's
 `/revert` yet — use git.
