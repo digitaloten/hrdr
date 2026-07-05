@@ -85,6 +85,11 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     let mut base = config.clone();
     base.subagents = false;
     base.mcp = Vec::new();
+    // The unnamed default sub-agent runs the main prompt with the full tool set;
+    // profiles opt into a persona / read-only scope via `subagent_config_for_profile`.
+    base.agent_prompt = None;
+    base.allowed_tools = None;
+    base.read_only = false;
     base.model = config
         .subagent_model
         .clone()
@@ -126,6 +131,11 @@ fn subagent_config_for_profile(
     if let Some(m) = &profile.model {
         cfg.model = m.clone();
     }
+    // Persona + tool scope: an explicit `tools` list wins; otherwise `read_only`
+    // (resolved to the read-only tool set in `Agent::new`, which has the registry).
+    cfg.agent_prompt = profile.prompt.clone();
+    cfg.allowed_tools = profile.tools.clone();
+    cfg.read_only = profile.read_only;
     Ok(cfg)
 }
 
@@ -157,15 +167,18 @@ impl SubagentTool {
         if profiles.is_empty() {
             desc.push('.');
         } else {
-            desc.push_str(", or on a different provider via `agent`:\n");
+            desc.push_str(", or delegate to a specialized `agent`:\n");
             for p in &profiles {
-                let where_ = match (&p.provider, &p.model) {
+                let mut tags = match (&p.provider, &p.model) {
                     (Some(pr), Some(m)) => format!("{pr} · {m}"),
                     (Some(pr), None) => pr.clone(),
                     (None, Some(m)) => m.clone(),
                     (None, None) => "main provider".to_string(),
                 };
-                desc.push_str(&format!("- {} ({where_})", p.name));
+                if p.read_only {
+                    tags.push_str(" · read-only");
+                }
+                desc.push_str(&format!("- {} ({tags})", p.name));
                 if let Some(d) = &p.description {
                     desc.push_str(&format!(" — {d}"));
                 }
@@ -409,6 +422,15 @@ pub struct AgentConfig {
     /// provider + model. The `task` tool's `agent` argument selects one, letting
     /// a sub-agent run on a **different provider** than the main agent.
     pub subagent_profiles: Vec<SubagentProfile>,
+    /// Persona appended to this (sub-)agent's system prompt (its role). Set from
+    /// a sub-agent profile's `prompt`; `None` for the main agent.
+    pub agent_prompt: Option<String>,
+    /// Tool allow-list scoping this (sub-)agent's registry. `None` = the full
+    /// default set. Takes precedence over [`read_only`](Self::read_only).
+    pub allowed_tools: Option<Vec<String>>,
+    /// Scope this (sub-)agent to the read-only tools (see
+    /// [`ToolRegistry::read_only_names`]). Ignored when `allowed_tools` is set.
+    pub read_only: bool,
 }
 
 /// A named sub-agent profile (`[[subagent]]`): a provider + model the `task` tool
@@ -428,7 +450,74 @@ pub struct SubagentProfile {
     /// One-line hint shown to the model so it can pick the right sub-agent.
     #[serde(default)]
     pub description: Option<String>,
+    /// Persona / operating instructions appended to the sub-agent's system
+    /// prompt (its role). Omit to reuse the main agent's prompt unchanged.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Restrict this sub-agent to the read-only tool set (read/grep/find/ls/web
+    /// — no write/edit/patch/shell). Ignored when `tools` is set explicitly.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Explicit tool allow-list for this sub-agent (overrides `read_only`).
+    /// Omit for the full default tool set.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
 }
+
+/// The always-available built-in sub-agents: read-only `explore` and `review`
+/// personas. Merged with the user's `[[subagent]]` profiles in [`Agent::new`]
+/// (a user profile of the same name overrides the built-in).
+pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
+    vec![
+        SubagentProfile {
+            name: "explore".to_string(),
+            provider: None,
+            model: None,
+            description: Some(
+                "Read-only codebase investigator — trace files, types, and call \
+                 paths and report back. Use for broad exploration without spending \
+                 the main context."
+                    .to_string(),
+            ),
+            prompt: Some(EXPLORE_PROMPT.to_string()),
+            read_only: true,
+            tools: None,
+        },
+        SubagentProfile {
+            name: "review".to_string(),
+            provider: None,
+            model: None,
+            description: Some(
+                "Read-only code reviewer — audit code or a change for bugs, edge \
+                 cases, and security issues. Use before finalizing risky work."
+                    .to_string(),
+            ),
+            prompt: Some(REVIEW_PROMPT.to_string()),
+            read_only: true,
+            tools: None,
+        },
+    ]
+}
+
+const EXPLORE_PROMPT: &str = "\
+You are an EXPLORE sub-agent: a read-only code investigator. You have read and \
+search tools only — you cannot modify files or run mutating commands. Investigate \
+the area described and report back so the parent agent can act on your findings.
+
+- Trace the relevant files, types, and call paths; quote key code with `path:line`.
+- Answer the question directly. Lead with the conclusion, then the evidence.
+- Don't speculate past what the code shows; if something is missing, say so.
+- Return a tight, structured summary — not a narrative of your search.";
+
+const REVIEW_PROMPT: &str = "\
+You are a REVIEW sub-agent: a read-only code reviewer. You have read and search \
+tools only — you cannot modify files. Review the code or change described and \
+report your findings.
+
+- Focus on correctness, edge cases, security, and real bugs over style nits.
+- For each finding give: severity, `path:line`, what's wrong, and a concrete fix.
+- Lead with the most serious issues, grouped by severity. If it's clean, say so.
+- Be specific and back every claim with the code — no vague concerns.";
 
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
 /// so the next turn doesn't overflow).
@@ -556,6 +645,9 @@ impl Default for AgentConfig {
             subagents: true,
             subagent_model: None,
             subagent_profiles: Vec::new(),
+            agent_prompt: None,
+            allowed_tools: None,
+            read_only: false,
         }
     }
 }
@@ -1222,6 +1314,19 @@ pub struct Agent {
     /// Raw prompt-cache setting, re-resolved against the endpoint on a provider
     /// switch (see [`resolve_cache_mode`]).
     prompt_cache: Option<String>,
+    /// Persona appended to the system prompt (a sub-agent's role); re-applied
+    /// when the prompt is rebuilt on `clear`/`set_cwd`. `None` for the main agent.
+    agent_prompt: Option<String>,
+}
+
+/// Append a sub-agent persona (its role / operating instructions) after the base
+/// system prompt. A no-op when `persona` is empty.
+fn append_persona(mut system: String, persona: Option<&str>) -> String {
+    if let Some(p) = persona.map(str::trim).filter(|p| !p.is_empty()) {
+        system.push_str("\n\n# Your role\n\n");
+        system.push_str(p);
+    }
+    system
 }
 
 impl Agent {
@@ -1230,12 +1335,31 @@ impl Agent {
         let mut tools = ToolRegistry::with_defaults();
         // Expose the `task` delegation tool unless disabled (or this *is* a
         // sub-agent). Registered before the system prompt is rendered so it's
-        // listed for the model.
+        // listed for the model. The built-in `explore`/`review` read-only agents
+        // are always offered; a user `[[subagent]]` of the same name overrides.
         if config.subagents {
+            let mut profiles = builtin_subagent_profiles();
+            for up in config.subagent_profiles.clone() {
+                match profiles
+                    .iter_mut()
+                    .find(|p| p.name.eq_ignore_ascii_case(&up.name))
+                {
+                    Some(slot) => *slot = up,
+                    None => profiles.push(up),
+                }
+            }
             tools.register(Arc::new(SubagentTool::new(
                 subagent_base_config(&config),
-                config.subagent_profiles.clone(),
+                profiles,
             )));
+        }
+        // Scope the tool set for a restricted sub-agent (e.g. a read-only
+        // explorer): an explicit allow-list wins, else the read-only set.
+        if let Some(allow) = &config.allowed_tools {
+            tools.retain_only(allow);
+        } else if config.read_only {
+            let ro = tools.read_only_names();
+            tools.retain_only(&ro);
         }
         let mut ctx = ToolContext::new(config.cwd.clone());
         ctx.restrict_to_cwd = !config.allow_outside_cwd;
@@ -1274,7 +1398,10 @@ impl Agent {
             ctx.guardrails = Arc::new(rails);
         }
         let project_docs = gather_agent_docs(&config.cwd);
-        let system = render_system(&tools, &config.cwd, project_docs.as_deref())?;
+        let system = append_persona(
+            render_system(&tools, &config.cwd, project_docs.as_deref())?,
+            config.agent_prompt.as_deref(),
+        );
 
         // File checkpoint store, keyed by working directory (like sessions).
         // `auto` (default) enables it only outside a git repo — git already
@@ -1332,6 +1459,7 @@ impl Agent {
             checkpoints,
             mcp_configs: config.mcp,
             mcp_clients: Vec::new(),
+            agent_prompt: config.agent_prompt,
         })
     }
 
@@ -1439,6 +1567,7 @@ impl Agent {
         else {
             return;
         };
+        let system = append_persona(system, self.agent_prompt.as_deref());
         if self.messages.first().map(|m| m.role == Role::System) == Some(true) {
             self.messages[0] = ChatMessage::system(system);
         } else {
@@ -2454,11 +2583,15 @@ mod tests {
             provider: Some("openrouter".to_string()),
             model: Some("moonshotai/kimi-k2".to_string()),
             description: None,
+            prompt: Some("Implement precisely.".to_string()),
+            read_only: false,
+            tools: None,
         };
         let sub = subagent_config_for_profile(&base, &prof).unwrap();
         assert_eq!(sub.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(sub.model, "moonshotai/kimi-k2");
         assert!(!sub.subagents); // still can't nest
+        assert_eq!(sub.agent_prompt.as_deref(), Some("Implement precisely."));
         // No provider → stays on the main endpoint, just the profile's model.
         let same = subagent_config_for_profile(
             &base,
@@ -2467,6 +2600,9 @@ mod tests {
                 provider: None,
                 model: Some("claude-haiku".to_string()),
                 description: None,
+                prompt: None,
+                read_only: false,
+                tools: None,
             },
         )
         .unwrap();
@@ -2481,6 +2617,9 @@ mod tests {
                     provider: Some("nope".to_string()),
                     model: None,
                     description: None,
+                    prompt: None,
+                    read_only: false,
+                    tools: None,
                 },
             )
             .is_err()
@@ -2503,6 +2642,43 @@ mod tests {
         };
         assert!(has_task(true));
         assert!(!has_task(false)); // e.g. inside a sub-agent
+    }
+
+    #[test]
+    fn builtin_agents_are_read_only_and_named() {
+        use super::builtin_subagent_profiles;
+        // The `explore` and `review` built-ins ship even with no user config.
+        let names: Vec<String> = builtin_subagent_profiles()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, vec!["explore".to_string(), "review".to_string()]);
+        assert!(builtin_subagent_profiles().iter().all(|p| p.read_only));
+    }
+
+    #[test]
+    fn read_only_subagent_scopes_tools_and_appends_persona() {
+        use super::{builtin_subagent_profiles, subagent_base_config, subagent_config_for_profile};
+        // A read-only profile (like `explore`) drops the mutating tools and
+        // appends its persona to the system prompt.
+        let base = AgentConfig {
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        };
+        let prof = &builtin_subagent_profiles()[0]; // explore
+        let cfg = subagent_config_for_profile(&subagent_base_config(&base), prof).unwrap();
+        assert!(cfg.read_only);
+        let agent = Agent::new(cfg).unwrap();
+        let tools: Vec<String> = agent.tools().into_iter().map(|(n, _)| n).collect();
+        assert!(tools.iter().any(|n| n == "read"));
+        assert!(tools.iter().any(|n| n == "grep"));
+        assert!(!tools.iter().any(|n| n == "write"));
+        assert!(!tools.iter().any(|n| n == "edit"));
+        assert!(!tools.iter().any(|n| n == "bash"));
+        // A read-only sub-agent can't itself delegate.
+        assert!(!tools.iter().any(|n| n == "task"));
+        // The persona made it into the system prompt.
+        assert!(system_prompt(&agent).contains("EXPLORE sub-agent"));
     }
 
     #[test]

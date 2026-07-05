@@ -389,6 +389,17 @@ several `task` calls in one turn runs the sub-agents **in parallel** — e.g.
 explore several areas of the codebase at once — each streaming into its own tool
 block.
 
+Two **built-in agents** ship out of the box, selected with the `task` tool's
+`agent` argument:
+
+- **`explore`** — a read-only code investigator (read/search tools only, no
+  write/edit/shell). Traces files, types, and call paths and reports back.
+- **`review`** — a read-only code reviewer. Audits code or a change for bugs,
+  edge cases, and security issues, with `path:line` findings.
+
+Both run on the main provider (respecting `subagent_model`) with a specialized
+system prompt and a tool set scoped to read-only, so they can't touch the tree.
+
 A sub-agent can run on a **different model on the same provider** — e.g. an Opus
 main agent delegating implementation to a cheaper/faster Sonnet:
 
@@ -420,9 +431,28 @@ description = "read-only codebase exploration"
 The sub-agent runs on that profile's provider (its own endpoint, key, headers,
 and Azure/Anthropic quirks). The model can also override the model per call
 (`model` argument); also `$HRDR_SUBAGENT_MODEL` / `--subagent-model` for the
-default. Sub-agents can't themselves delegate (recursion is bounded to one
-level) and don't spawn MCP servers. Their file edits aren't captured by the
-parent's `/revert` yet — use git.
+default.
+
+A profile can also carry a **custom system prompt** and a **scoped tool set** —
+this is how the built-in `explore`/`review` agents are defined, and a user
+profile of the same name overrides the built-in:
+
+```toml
+[[subagent]]
+name = "review"
+description = "security-focused review"
+read_only = true                 # scope to read/grep/find/ls/web — no write/edit/shell
+prompt = "You are a security reviewer. Focus on authn, injection, and secrets…"
+# tools = ["read", "grep"]       # or an explicit allow-list (overrides read_only)
+```
+
+`prompt` is appended to the sub-agent's system prompt (its role); `read_only`
+scopes it to the read-only tools; `tools` is an explicit allow-list that takes
+precedence over `read_only`.
+
+Sub-agents can't themselves delegate (recursion is bounded to one level) and
+don't spawn MCP servers. Their file edits aren't captured by the parent's
+`/revert` yet — use git.
 
 ### Guardrails
 

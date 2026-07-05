@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Built-in `explore` and `review` agents.** The `task` tool now always offers
+  two read-only sub-agents: `explore` (a code investigator — trace files, types,
+  and call paths) and `review` (a code reviewer — bugs, edge cases, security).
+  Each runs on the main provider with a specialized system prompt and a tool set
+  scoped to read-only (read/grep/find/ls/web — no write/edit/shell), so they
+  can't modify the tree.
+- **Custom sub-agent personas + tool scoping.** `[[subagent]]` profiles gained
+  `prompt` (a system-prompt persona appended to the sub-agent's role),
+  `read_only` (scope to the read-only tools), and `tools` (an explicit tool
+  allow-list, overriding `read_only`). A user profile named `explore`/`review`
+  overrides the matching built-in. New `ToolRegistry::retain_only` /
+  `read_only_names` back the scoping.
 - **Parallel sub-agents.** Issuing several `task` calls in one turn now runs the
   sub-agents concurrently (e.g. explore several areas at once), each streaming
   into its own tool block. A new `Tool::concurrent()` signal (defaults to

@@ -288,6 +288,27 @@ impl ToolRegistry {
         self.tools.get(name).is_some_and(|t| t.read_only())
     }
 
+    /// Scope the registry to an allow-list of tool names (for a restricted
+    /// sub-agent). Anything not in `allowed` is dropped; unknown names in
+    /// `allowed` are simply ignored. Registration order is preserved.
+    pub fn retain_only(&mut self, allowed: &[String]) {
+        let keep = |n: &str| allowed.iter().any(|a| a == n);
+        self.order.retain(|n| keep(n));
+        self.tools.retain(|n, _| keep(n));
+    }
+
+    /// Names of the currently-registered read-only tools, in registration
+    /// order — the allow-list for a read-only sub-agent (see [`retain_only`]).
+    ///
+    /// [`retain_only`]: Self::retain_only
+    pub fn read_only_names(&self) -> Vec<String> {
+        self.order
+            .iter()
+            .filter(|n| self.is_read_only(n))
+            .map(|n| n.to_string())
+            .collect()
+    }
+
     /// Whether `name`'s calls are safe to run concurrently (see
     /// [`Tool::concurrent`]); unknown names are not.
     pub fn is_concurrent(&self, name: &str) -> bool {
@@ -621,6 +642,30 @@ mod tests {
         assert!(RoTool.concurrent());
         assert!(!WriteTool.concurrent());
         assert!(!EditTool.concurrent());
+    }
+
+    // ---- tool scoping ----
+
+    #[test]
+    fn read_only_names_are_only_the_read_tools() {
+        let r = ToolRegistry::with_defaults();
+        let ro = r.read_only_names();
+        // Read/search/web tools are read-only …
+        assert!(ro.iter().any(|n| n == "read"));
+        assert!(ro.iter().any(|n| n == "grep"));
+        // … but the mutating ones never are.
+        assert!(!ro.iter().any(|n| n == "write"));
+        assert!(!ro.iter().any(|n| n == "edit"));
+        assert!(!ro.iter().any(|n| n == "bash"));
+    }
+
+    #[test]
+    fn retain_only_scopes_to_the_allow_list() {
+        let mut r = ToolRegistry::with_defaults();
+        r.retain_only(&["read".into(), "grep".into(), "nonexistent".into()]);
+        let names: Vec<String> = r.defs().into_iter().map(|d| d.function.name).collect();
+        assert_eq!(names, vec!["read".to_string(), "grep".to_string()]);
+        assert!(!r.is_read_only("write")); // gone → unknown → not read-only
     }
 
     // ---- floor_char_boundary ----
