@@ -89,7 +89,7 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     base.subagents = false;
     base.mcp = Vec::new();
     // The unnamed default sub-agent runs the main prompt with the full tool set;
-    // profiles opt into a persona / read-only scope via `subagent_config_for_profile`.
+    // profiles opt into a persona / read-only scope via `config_for_agent_profile`.
     base.agent_prompt = None;
     base.allowed_tools = None;
     base.read_only = false;
@@ -101,11 +101,13 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     base
 }
 
-/// Build a sub-agent config for a named `[[subagent]]` profile: start from the
-/// sub-agent base, then (if the profile names a provider) repoint the endpoint,
-/// auth, headers, and `api-version` to that provider and adopt its model — so the
-/// sub-agent can run on a **different provider** than the main agent.
-fn subagent_config_for_profile(
+/// Apply a named agent profile onto `base`: (if the profile names a provider)
+/// repoint the endpoint, auth, headers, and `api-version` to that provider and
+/// adopt its model — so the agent can run on a **different provider** — then set
+/// the persona, tool scope, and runtime knobs. Used both for delegated
+/// sub-agents (with a [`subagent_base_config`] base) and for `--agent` primary
+/// mode (applied directly onto the main config, keeping delegation + MCP).
+pub fn config_for_agent_profile(
     base: &AgentConfig,
     profile: &SubagentProfile,
 ) -> Result<AgentConfig> {
@@ -293,7 +295,7 @@ impl hrdr_tools::Tool for SubagentTool {
                             known.join(", ")
                         )
                     })?;
-                subagent_config_for_profile(&self.base, profile)?
+                config_for_agent_profile(&self.base, profile)?
             }
             _ => self.base.clone(),
         };
@@ -504,6 +506,30 @@ pub struct SubagentProfile {
     /// agent's `max_steps` — e.g. a small cap on a quick focused sub-task.
     #[serde(default)]
     pub max_steps: Option<usize>,
+}
+
+/// The full agent-profile set for `config`, layered by precedence — each source
+/// overriding a same-named agent from the one before it:
+/// built-ins < discovered files (`.claude`/`.opencode`/`.hrdr`) < `[[subagent]]`
+/// config. Used both to populate the `task` tool and to resolve `--agent`.
+pub fn resolve_agent_profiles(config: &AgentConfig) -> Vec<SubagentProfile> {
+    fn overlay(profiles: &mut Vec<SubagentProfile>, incoming: SubagentProfile) {
+        match profiles
+            .iter_mut()
+            .find(|p| p.name.eq_ignore_ascii_case(&incoming.name))
+        {
+            Some(slot) => *slot = incoming,
+            None => profiles.push(incoming),
+        }
+    }
+    let mut profiles = builtin_subagent_profiles();
+    for p in discover_agent_profiles(&config.cwd) {
+        overlay(&mut profiles, p);
+    }
+    for up in config.subagent_profiles.clone() {
+        overlay(&mut profiles, up);
+    }
+    profiles
 }
 
 /// The always-available built-in sub-agents: read-only `explore` and `review`
@@ -1435,28 +1461,12 @@ impl Agent {
         let mut tools = ToolRegistry::with_defaults();
         // Expose the `task` delegation tool unless disabled (or this *is* a
         // sub-agent). Registered before the system prompt is rendered so it's
-        // listed for the model. Profiles are layered by precedence, each source
-        // overriding a same-named agent from the one before it:
-        //   built-ins  <  discovered files (.claude/.opencode/.hrdr)  <  config.
+        // listed for the model. The profile set (built-ins + discovered files +
+        // config) is resolved by [`resolve_agent_profiles`].
         if config.subagents {
-            let overlay =
-                |profiles: &mut Vec<SubagentProfile>, incoming: SubagentProfile| match profiles
-                    .iter_mut()
-                    .find(|p| p.name.eq_ignore_ascii_case(&incoming.name))
-                {
-                    Some(slot) => *slot = incoming,
-                    None => profiles.push(incoming),
-                };
-            let mut profiles = builtin_subagent_profiles();
-            for p in discover_agent_profiles(&config.cwd) {
-                overlay(&mut profiles, p);
-            }
-            for up in config.subagent_profiles.clone() {
-                overlay(&mut profiles, up);
-            }
             tools.register(Arc::new(SubagentTool::new(
                 subagent_base_config(&config),
-                profiles,
+                resolve_agent_profiles(&config),
             )));
         }
         // Scope the tool set for a restricted sub-agent: an explicit allow-list
@@ -2682,7 +2692,7 @@ mod tests {
 
     #[test]
     fn subagent_profile_repoints_to_a_different_provider() {
-        use super::{SubagentProfile, subagent_base_config, subagent_config_for_profile};
+        use super::{SubagentProfile, config_for_agent_profile, subagent_base_config};
         let cfg = AgentConfig {
             base_url: "https://api.anthropic.com/v1".to_string(),
             api_key: Some("main-key".to_string()),
@@ -2704,13 +2714,13 @@ mod tests {
             effort: None,
             max_steps: None,
         };
-        let sub = subagent_config_for_profile(&base, &prof).unwrap();
+        let sub = config_for_agent_profile(&base, &prof).unwrap();
         assert_eq!(sub.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(sub.model, "moonshotai/kimi-k2");
         assert!(!sub.subagents); // still can't nest
         assert_eq!(sub.agent_prompt.as_deref(), Some("Implement precisely."));
         // No provider → stays on the main endpoint, just the profile's model.
-        let same = subagent_config_for_profile(
+        let same = config_for_agent_profile(
             &base,
             &SubagentProfile {
                 name: "x".to_string(),
@@ -2731,7 +2741,7 @@ mod tests {
         assert_eq!(same.model, "claude-haiku");
         // Unknown provider → error.
         assert!(
-            subagent_config_for_profile(
+            config_for_agent_profile(
                 &base,
                 &SubagentProfile {
                     name: "y".to_string(),
@@ -2790,7 +2800,7 @@ mod tests {
 
     #[test]
     fn read_only_subagent_scopes_tools_and_appends_persona() {
-        use super::{builtin_subagent_profiles, subagent_base_config, subagent_config_for_profile};
+        use super::{builtin_subagent_profiles, config_for_agent_profile, subagent_base_config};
         // A read-only profile (like `explore`) drops the mutating tools and
         // appends its persona to the system prompt.
         let base = AgentConfig {
@@ -2798,7 +2808,7 @@ mod tests {
             ..Default::default()
         };
         let prof = &builtin_subagent_profiles()[0]; // explore
-        let cfg = subagent_config_for_profile(&subagent_base_config(&base), prof).unwrap();
+        let cfg = config_for_agent_profile(&subagent_base_config(&base), prof).unwrap();
         assert!(cfg.read_only);
         let agent = Agent::new(cfg).unwrap();
         let tools: Vec<String> = agent.tools().into_iter().map(|(n, _)| n).collect();
@@ -2815,7 +2825,7 @@ mod tests {
 
     #[test]
     fn plan_agent_gets_read_tools_plus_markdown_writes() {
-        use super::{builtin_subagent_profiles, subagent_base_config, subagent_config_for_profile};
+        use super::{builtin_subagent_profiles, config_for_agent_profile, subagent_base_config};
         let base = AgentConfig {
             checkpoints: Some("off".to_string()),
             ..Default::default()
@@ -2824,7 +2834,7 @@ mod tests {
             .into_iter()
             .find(|p| p.name == "plan")
             .unwrap();
-        let cfg = subagent_config_for_profile(&subagent_base_config(&base), &plan).unwrap();
+        let cfg = config_for_agent_profile(&subagent_base_config(&base), &plan).unwrap();
         assert_eq!(
             cfg.write_ext.as_deref(),
             Some(&["md".to_string(), "markdown".to_string()][..])
@@ -2843,7 +2853,7 @@ mod tests {
 
     #[test]
     fn profile_knobs_override_else_inherit() {
-        use super::{SubagentProfile, subagent_base_config, subagent_config_for_profile};
+        use super::{SubagentProfile, config_for_agent_profile, subagent_base_config};
         let cfg = AgentConfig {
             temperature: Some(0.2),
             effort: Some("low".to_string()),
@@ -2866,15 +2876,37 @@ mod tests {
         };
         // Set knobs override the inherited ones.
         let over =
-            subagent_config_for_profile(&base, &profile(Some(0.9), Some("high"), Some(5))).unwrap();
+            config_for_agent_profile(&base, &profile(Some(0.9), Some("high"), Some(5))).unwrap();
         assert_eq!(over.temperature, Some(0.9));
         assert_eq!(over.effort.as_deref(), Some("high"));
         assert_eq!(over.max_steps, 5);
         // Omitted knobs inherit the main agent's.
-        let inherit = subagent_config_for_profile(&base, &profile(None, None, None)).unwrap();
+        let inherit = config_for_agent_profile(&base, &profile(None, None, None)).unwrap();
         assert_eq!(inherit.temperature, Some(0.2));
         assert_eq!(inherit.effort.as_deref(), Some("low"));
         assert_eq!(inherit.max_steps, 40);
+    }
+
+    #[test]
+    fn primary_agent_keeps_delegation_unlike_subagent_base() {
+        // `--agent` applies a profile onto the MAIN config, so the primary agent
+        // keeps delegation (the `task` tool) — unlike a delegated sub-agent,
+        // whose base sets `subagents = false` to bound recursion to depth 1.
+        use super::{config_for_agent_profile, resolve_agent_profiles, subagent_base_config};
+        let base = AgentConfig {
+            subagents: true,
+            ..Default::default()
+        };
+        let general = resolve_agent_profiles(&base)
+            .into_iter()
+            .find(|p| p.name == "general")
+            .unwrap();
+        // Primary mode: applied onto the main config → delegation preserved.
+        let primary = config_for_agent_profile(&base, &general).unwrap();
+        assert!(primary.subagents, "primary agent can still delegate");
+        // Sub-agent mode: applied onto the bounded base → no delegation.
+        let delegated = config_for_agent_profile(&subagent_base_config(&base), &general).unwrap();
+        assert!(!delegated.subagents, "a delegated sub-agent can't nest");
     }
 
     #[test]

@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--agent <name>` primary-agent mode.** Run the main loop as a named agent —
+  it adopts that agent's system prompt, tool scope, model/provider, and knobs,
+  rather than only being available for delegation. Resolves from the same set as
+  the `task` tool (built-ins + discovered files + config); unlike a delegated
+  sub-agent, a primary agent keeps delegation and MCP. E.g.
+  `hrdr --agent explore` for a read-only session, or `hrdr --agent plan "…"` to
+  investigate and write a plan. New `hrdr_agent::resolve_agent_profiles` /
+  `config_for_agent_profile` (the latter renamed from the internal
+  `subagent_config_for_profile`).
 - **Agents as discoverable files.** hrdr now loads sub-agent definitions from
   Markdown files (frontmatter + body-as-system-prompt), reading both the Claude
   Code and opencode locations plus its own: project `.hrdr/agents/`,

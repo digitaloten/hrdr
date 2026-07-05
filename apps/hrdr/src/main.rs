@@ -54,6 +54,12 @@ struct Cli {
     #[arg(long = "subagent-model", global = true)]
     subagent_model: Option<String>,
 
+    /// Run the main agent AS a named agent (a built-in like `explore`/`plan`, a
+    /// discovered `.claude`/`.opencode`/`.hrdr` agent file, or a `[[subagent]]`):
+    /// adopt its system prompt, tool scope, model/provider, and knobs.
+    #[arg(long = "agent", global = true, value_name = "NAME")]
+    agent: Option<String>,
+
     /// Auto-compact toggle: any value in 0.0–1.0 enables it, 0 disables (the
     /// trigger point is set by --compaction-reserved).
     #[arg(long, global = true)]
@@ -250,6 +256,21 @@ async fn main() -> Result<()> {
     }
     if let Some(m) = cli.subagent_model {
         config.subagent_model = Some(m);
+    }
+    // `--agent NAME`: run the main loop AS that agent — adopt its prompt, tool
+    // scope, model/provider, and knobs. Resolved from the same set as the `task`
+    // tool (built-ins + discovered files + config), applied onto the main config
+    // (delegation + MCP are kept, unlike a delegated sub-agent).
+    if let Some(name) = cli.agent.as_deref() {
+        let profiles = hrdr_agent::resolve_agent_profiles(&config);
+        let profile = profiles
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name.trim()))
+            .ok_or_else(|| {
+                let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+                anyhow::anyhow!("unknown --agent '{name}' (available: {})", names.join(", "))
+            })?;
+        config = hrdr_agent::config_for_agent_profile(&config, profile)?;
     }
     if let Some(r) = cli.auto_compact {
         config.auto_compact = r;

@@ -507,6 +507,22 @@ files > user files > built-ins, so any layer overrides a same-named agent from
 the one below it. (opencode's boolean `tools:` map is ignored — only an
 allow-list `tools` is honored.)
 
+#### Running as an agent (`--agent`)
+
+`--agent <name>` runs the **main** loop as a named agent — it adopts that
+agent's system prompt, tool scope, model/provider, and knobs, instead of only
+being able to delegate to it. The name resolves from the same set as the `task`
+tool (built-ins, discovered files, `[[subagent]]` config):
+
+```bash
+hrdr --agent explore            # a read-only session for spelunking a codebase
+hrdr --agent plan "design the migration"   # investigate, then write PLAN.md
+```
+
+Unlike a delegated sub-agent, a primary agent keeps delegation (the `task` tool)
+and its MCP servers — it's a full session, just wearing the agent's persona and
+scope. An unknown name lists the available agents.
+
 ### Guardrails
 
 The shell tools mechanically reject the classic foot-guns before they run —
