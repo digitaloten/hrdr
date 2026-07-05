@@ -49,7 +49,15 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
                 Some(Ok(_)) => {}
                 Some(Err(_)) | None => break,
             },
-            Some(msg) = rx.recv() => app.on_turn_msg(msg),
+            Some(msg) = rx.recv() => {
+                app.on_turn_msg(msg);
+                // Drain any further messages that arrived in the same burst so
+                // fast-streaming endpoints don't cause 100+ full redraws/sec —
+                // all buffered tokens are folded into state before the next draw.
+                while let Ok(msg) = rx.try_recv() {
+                    app.on_turn_msg(msg);
+                }
+            }
             _ = ticker.tick() => {}
         }
     }

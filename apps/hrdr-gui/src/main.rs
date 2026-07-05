@@ -188,8 +188,18 @@ fn main() -> anyhow::Result<()> {
     let agent_raw = Agent::new(config)?;
     // Honor the endpoint's advertised context window when config didn't pin one
     // (the TUI/headless paths probe in `main`; the GUI must too).
+    // A 3-second timeout prevents a firewall-DROPped endpoint from blocking the
+    // window open indefinitely. Timeout ≡ context window left unknown (None).
     if ctx_window.is_none() {
-        ctx_window = rt.block_on(agent_raw.probe_context_window());
+        ctx_window = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                agent_raw.probe_context_window(),
+            )
+            .await
+            .ok()
+            .flatten()
+        });
     }
     // Shared TODO list, mutated by the todo tool during turns.
     let todos = agent_raw.todos();

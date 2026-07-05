@@ -9,6 +9,7 @@
 //! start your own (infr, llama.cpp, vLLM, …) or point at a hosted provider.
 
 use std::io::Write;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -337,13 +338,20 @@ async fn main() -> Result<()> {
     // else ask the server (many OpenAI-compatible servers advertise it — vLLM's
     // `max_model_len`, llama.cpp's `/props` n_ctx, …). Left unknown for an
     // endpoint that advertises nothing.
+    //
+    // A 3-second timeout prevents a firewall-DROPped endpoint from hanging
+    // startup forever before the TUI appears. Timeout ≡ no context window known.
     if config.context_window.is_none() {
         let probe = hrdr_llm::Client::new(
             config.base_url.clone(),
             config.api_key.clone(),
             config.model.clone(),
         );
-        config.context_window = probe.context_window().await;
+        config.context_window =
+            tokio::time::timeout(Duration::from_secs(3), probe.context_window())
+                .await
+                .ok()
+                .flatten();
     }
 
     match cli.command {

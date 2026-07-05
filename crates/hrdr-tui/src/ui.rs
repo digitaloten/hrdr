@@ -187,17 +187,19 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // Cumulative wrapped-row height at each logical-line boundary, so each tool
     // block's span can be mapped to on-screen rows for click hit-testing. Built
     // before `lines` is consumed by the Paragraph below.
-    let cum: Vec<u16> = if tool_regions.is_empty() {
+    //
+    // Use usize throughout to avoid u16 overflow on long transcripts; only
+    // the final Paragraph::scroll cast (u16) is clamped at the last moment.
+    // Per-line heights come from LINE_WRAP_CACHE so stable lines don't get
+    // re-measured every frame.
+    let cum: Vec<usize> = if tool_regions.is_empty() {
         Vec::new()
     } else {
         let mut cum = Vec::with_capacity(lines.len() + 1);
-        let mut acc = 0u16;
-        cum.push(0);
+        let mut acc: usize = 0;
+        cum.push(0usize);
         for line in &lines {
-            let h = Paragraph::new(line.clone())
-                .wrap(Wrap { trim: false })
-                .line_count(text_area.width)
-                .max(1) as u16;
+            let h = cached_line_wrap(line, text_area.width);
             acc = acc.saturating_add(h);
             cum.push(acc);
         }
@@ -243,22 +245,25 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Map each tool block's wrapped-row span to the visible screen rows (clipped
     // to the viewport) so a left click can toggle that tool's expansion.
+    // Arithmetic is in usize (cum values) to avoid overflow; only the final
+    // HitRect fields are cast back to u16.
     app.tool_hits.clear();
     if !cum.is_empty() {
-        let view_end = scroll.saturating_add(area.height);
+        let scroll_us = scroll as usize;
+        let view_end = scroll_us.saturating_add(area.height as usize);
         let last = cum.len() - 1;
         for (lstart, lend, idx) in tool_regions {
             let ws = cum[lstart.min(last)];
             let we = cum[lend.min(last)];
-            let vis_start = ws.max(scroll);
+            let vis_start = ws.max(scroll_us);
             let vis_end = we.min(view_end);
             if vis_end > vis_start {
                 app.tool_hits.push((
                     crate::app::HitRect {
                         x: text_area.x,
-                        y: text_area.y + (vis_start - scroll),
+                        y: text_area.y + (vis_start - scroll_us) as u16,
                         w: text_area.width,
-                        h: vis_end - vis_start,
+                        h: (vis_end - vis_start) as u16,
                     },
                     idx,
                 ));
@@ -314,10 +319,40 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect, todos: &[hrdr_agent::Todo]) 
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Pure helper: given the `(row_start, row_end)` spans of each panel item and
+/// the inner panel height, compute the scroll offset (rows clipped from the top
+/// so the newest content sits at the bottom) and, for each item, the visible
+/// screen row range `(start_from_panel_top, end_from_panel_top)` — `None` for
+/// items fully scrolled off. Extracted as a pure function so the scroll math is unit-testable
+/// independent of ratatui rendering.
+fn subagent_scroll(
+    item_spans: &[(usize, usize)],
+    inner_height: u16,
+) -> (u16, Vec<Option<(u16, u16)>>) {
+    let total = item_spans.last().map(|&(_, end)| end).unwrap_or(0);
+    let scroll = total.saturating_sub(inner_height as usize) as u16;
+    let vis = item_spans
+        .iter()
+        .map(|&(start, end)| {
+            let vis_start = (start as u16).max(scroll);
+            let vis_end = (end as u16).min(scroll.saturating_add(inner_height));
+            if vis_end > vis_start {
+                Some((vis_start - scroll, vis_end - scroll))
+            } else {
+                None
+            }
+        })
+        .collect();
+    (scroll, vis)
+}
+
 /// The live sub-agent panel: one block per running `task`, each showing a header
 /// (its `↳ task …` line) plus the tail of its output (collapsed) or the whole
 /// log (expanded). A left click on a row toggles that agent's expansion; the
 /// clickable rects are recorded in `app.subagent_hits`.
+///
+/// When the total content rows exceed `SUBAGENT_PANEL_MAX_ROWS`, the panel
+/// scrolls so the newest agents/logs stay visible at the bottom.
 fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect, items: &[PanelItem]) {
     let (accent, dim, success) = (app.theme.accent, app.theme.dim, app.theme.success);
     let block = Block::default()
@@ -327,8 +362,10 @@ fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect, items: &[PanelItem])
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // First pass: build all lines and track each item's row span.
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut hits: Vec<(crate::app::HitRect, PanelHit)> = Vec::new();
+    let mut item_spans: Vec<(usize, usize)> = Vec::new(); // (row_start, row_end) per item
+    let mut item_hits: Vec<PanelHit> = Vec::new();
     for item in items {
         let start = lines.len();
         let header_color = if item.done { success } else { accent };
@@ -344,22 +381,34 @@ fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect, items: &[PanelItem])
                 Style::default().fg(dim),
             )));
         }
-        // Clickable region for this item (only while it's within the viewport).
-        let rows = (lines.len() - start) as u16;
-        if (start as u16) < inner.height {
-            let h = rows.min(inner.height - start as u16);
-            hits.push((
-                crate::app::HitRect {
-                    x: inner.x,
-                    y: inner.y + start as u16,
-                    w: inner.width,
-                    h,
-                },
-                item.hit,
-            ));
-        }
+        item_spans.push((start, lines.len()));
+        item_hits.push(item.hit);
     }
-    f.render_widget(Paragraph::new(lines), inner);
+
+    // Compute scroll offset so the newest rows stay visible at the bottom,
+    // and derive each item's visible screen-row range.
+    let (scroll, vis_ranges) = subagent_scroll(&item_spans, inner.height);
+
+    // Build hit rects for rows that are at least partially visible.
+    let hits: Vec<(crate::app::HitRect, PanelHit)> = vis_ranges
+        .into_iter()
+        .zip(item_hits)
+        .filter_map(|(vis, hit)| {
+            vis.map(|(y_start, y_end)| {
+                (
+                    crate::app::HitRect {
+                        x: inner.x,
+                        y: inner.y + y_start,
+                        w: inner.width,
+                        h: y_end - y_start,
+                    },
+                    hit,
+                )
+            })
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
     app.subagent_hits = hits;
 }
 
@@ -739,6 +788,10 @@ fn highlight_line(line: Line<'static>, needle: &str, hl: Style) -> Line<'static>
     Line::from(spans)
 }
 
+/// Cache key for rendered transcript entry content lines.
+/// Fields: (entry_idx, content_fingerprint, render_width, expand_all, show_reasoning).
+type TranscriptKey = (usize, u64, u16, bool, bool);
+
 thread_local! {
     // Cache highlighted code blocks (keyed by lang+content+width) so the ~8/sec
     // redraw doesn't re-run syntect every frame.
@@ -746,6 +799,15 @@ thread_local! {
     // Incremental syntect state for streaming blocks (misses in HL_CACHE —
     // the content grows every token — only pay for the new lines).
     static INC_HL: RefCell<hrdr_app::HighlightCache> = RefCell::new(hrdr_app::HighlightCache::new());
+    // Cache rendered transcript entry content lines (excluding the per-message
+    // timestamp meta line, which is always fresh).
+    // Key: (entry_idx, content_fingerprint, render_width, expand_all, show_reasoning).
+    // Evicted in bulk at 256 entries — same policy as HL_CACHE.
+    static TRANSCRIPT_CACHE: RefCell<HashMap<TranscriptKey, Vec<Line<'static>>>> = RefCell::new(HashMap::new());
+    // Cached wrapped-row height per logical line, keyed on (span-content hash,
+    // width). Avoids repeated Paragraph::line_count calls for stable lines when
+    // building the cumulative-height array used for tool click hit-testing.
+    static LINE_WRAP_CACHE: RefCell<HashMap<(u64, u16), usize>> = RefCell::new(HashMap::new());
 }
 
 /// Render a fenced code block with syntect highlighting on a distinct
@@ -832,6 +894,86 @@ fn pad_line(mut spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'sta
     Line::from(spans)
 }
 
+/// Compute a stable fingerprint for the content-dependent parts of a transcript
+/// entry. Only the parts that affect the visual output are hashed; the
+/// timestamp meta line (which changes on /timestamps) is rendered separately and
+/// is intentionally excluded so timestamp-only frames still get cache hits.
+fn entry_content_hash(entry: &Entry, expand_all: bool) -> u64 {
+    let mut h = DefaultHasher::new();
+    match entry {
+        Entry::User(t)
+        | Entry::Assistant(t)
+        | Entry::Reasoning(t)
+        | Entry::System(t)
+        | Entry::Stats(t)
+        | Entry::Diff(t) => t.hash(&mut h),
+        Entry::Tool {
+            name,
+            args,
+            result,
+            ok,
+            done,
+            expanded,
+            ..
+        } => {
+            name.hash(&mut h);
+            args.hash(&mut h);
+            result.hash(&mut h);
+            ok.hash(&mut h);
+            done.hash(&mut h);
+            (*expanded || expand_all).hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Look up `key` in [`TRANSCRIPT_CACHE`]; on miss, call `render()` to produce
+/// lines, cache them (evicting the whole map when it exceeds 256 entries), then
+/// return. The same eviction policy as `HL_CACHE`.
+fn cache_entry<F>(key: TranscriptKey, render: F) -> Vec<Line<'static>>
+where
+    F: FnOnce() -> Vec<Line<'static>>,
+{
+    if let Some(cached) = TRANSCRIPT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    let lines = render();
+    TRANSCRIPT_CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        if m.len() > 256 {
+            m.clear();
+        }
+        m.insert(key, lines.clone());
+    });
+    lines
+}
+
+/// Return the wrapped-row height of `line` at `width`, using [`LINE_WRAP_CACHE`]
+/// so repeated calls for stable lines don't re-measure every frame. Style is
+/// omitted from the key (style doesn't affect wrapping, only color).
+fn cached_line_wrap(line: &Line<'static>, width: u16) -> usize {
+    let mut h = DefaultHasher::new();
+    for span in &line.spans {
+        span.content.hash(&mut h);
+    }
+    let key = (h.finish(), width);
+    LINE_WRAP_CACHE.with(|c| {
+        if let Some(&wc) = c.borrow().get(&key) {
+            return wc;
+        }
+        let wc = Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .max(1);
+        let mut m = c.borrow_mut();
+        if m.len() > 2048 {
+            m.clear();
+        }
+        m.insert(key, wc);
+        wc
+    })
+}
+
 /// Returns the rendered transcript lines, the logical-line index each 1-based
 /// user/assistant message starts at (for `/goto`), and each tool block's
 /// `(logical_start, logical_end, transcript_index)` span (for click-to-expand).
@@ -868,17 +1010,32 @@ fn transcript_lines(
         )));
     };
     for (i, entry) in app.transcript.iter().enumerate() {
+        // Cache key shared by all arms (Reasoning skip happens before this).
+        let ck = (
+            i,
+            entry_content_hash(entry, app.expand_tools),
+            width,
+            app.expand_tools,
+            app.show_reasoning,
+        );
         match entry {
             Entry::User(text) => {
                 msg_num += 1;
                 msg_starts.push(out.len());
+                // Timestamp meta is always rendered fresh (it changes with time).
                 meta(&mut out, i, msg_num, "you");
-                push_text(
-                    &mut out,
-                    Span::styled("❯ ", Style::default().fg(theme.user).bold()),
-                    text,
-                    Style::default().fg(theme.user),
-                );
+                // Content lines are cached by (index, content hash, width, flags).
+                let user_color = theme.user;
+                out.extend(cache_entry(ck, || {
+                    let mut buf = Vec::new();
+                    push_text(
+                        &mut buf,
+                        Span::styled("❯ ", Style::default().fg(user_color).bold()),
+                        text,
+                        Style::default().fg(user_color),
+                    );
+                    buf
+                }));
             }
             // Assistant text is rendered as markdown (headings, lists, emphasis,
             // inline/code spans) via hjkl-markdown; fenced code blocks are pulled
@@ -886,32 +1043,51 @@ fn transcript_lines(
             Entry::Assistant(text) => {
                 msg_num += 1;
                 msg_starts.push(out.len());
+                // Timestamp meta is always rendered fresh.
                 meta(&mut out, i, msg_num, "assistant");
-                let mut buf: Vec<hjkl_markdown::Event> = Vec::new();
-                for ev in hjkl_markdown::parse(text) {
-                    if let hjkl_markdown::Event::CodeBlock { lang, content } = ev {
-                        if !buf.is_empty() {
-                            out.extend(hjkl_markdown_tui::to_lines(&buf, &md_theme, width.max(1)));
-                            buf.clear();
+                let md_theme_c = md_theme.clone();
+                out.extend(cache_entry(ck, || {
+                    let mut buf = Vec::new();
+                    let mut ev_buf: Vec<hjkl_markdown::Event> = Vec::new();
+                    for ev in hjkl_markdown::parse(text) {
+                        if let hjkl_markdown::Event::CodeBlock { lang, content } = ev {
+                            if !ev_buf.is_empty() {
+                                buf.extend(hjkl_markdown_tui::to_lines(
+                                    &ev_buf,
+                                    &md_theme_c,
+                                    width.max(1),
+                                ));
+                                ev_buf.clear();
+                            }
+                            buf.extend(highlight_code_block(&lang, &content, width.max(1)));
+                        } else {
+                            ev_buf.push(ev);
                         }
-                        out.extend(highlight_code_block(&lang, &content, width.max(1)));
-                    } else {
-                        buf.push(ev);
                     }
-                }
-                if !buf.is_empty() {
-                    out.extend(hjkl_markdown_tui::to_lines(&buf, &md_theme, width.max(1)));
-                }
+                    if !ev_buf.is_empty() {
+                        buf.extend(hjkl_markdown_tui::to_lines(
+                            &ev_buf,
+                            &md_theme_c,
+                            width.max(1),
+                        ));
+                    }
+                    buf
+                }));
             }
             Entry::Reasoning(_) if !app.show_reasoning => continue, // hidden via /reasoning
-            Entry::Reasoning(text) => push_text(
-                &mut out,
-                Span::styled("· ", Style::default().fg(theme.dim)),
-                text,
-                Style::default()
-                    .fg(theme.dim)
-                    .add_modifier(Modifier::ITALIC),
-            ),
+            Entry::Reasoning(text) => {
+                let dim = theme.dim;
+                out.extend(cache_entry(ck, || {
+                    let mut buf = Vec::new();
+                    push_text(
+                        &mut buf,
+                        Span::styled("· ", Style::default().fg(dim)),
+                        text,
+                        Style::default().fg(dim).add_modifier(Modifier::ITALIC),
+                    );
+                    buf
+                }));
+            }
             Entry::Tool {
                 name,
                 args,
@@ -922,40 +1098,66 @@ fn transcript_lines(
                 ..
             } => {
                 let start = out.len();
-                push_tool(
-                    &mut out,
-                    theme,
-                    name,
-                    args,
-                    result,
-                    *ok,
-                    *done,
-                    *expanded || app.expand_tools,
-                    width as usize,
-                );
+                let expand = *expanded || app.expand_tools;
+                let (ok_v, done_v) = (*ok, *done);
+                let (name_s, args_s, result_s) = (name.clone(), args.clone(), result.clone());
+                let theme_snap = theme.clone();
+                let w = width as usize;
+                out.extend(cache_entry(ck, || {
+                    let mut buf = Vec::new();
+                    push_tool(
+                        &mut buf,
+                        &theme_snap,
+                        &name_s,
+                        &args_s,
+                        &result_s,
+                        ok_v,
+                        done_v,
+                        expand,
+                        w,
+                    );
+                    buf
+                }));
                 tool_regions.push((start, out.len(), i));
             }
-            Entry::System(text) => push_text(
-                &mut out,
-                Span::raw(""),
-                text,
-                Style::default()
-                    .fg(theme.dim)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-            Entry::Stats(text) => push_text(
-                &mut out,
-                Span::styled("└ ", Style::default().fg(theme.dim)),
-                text,
-                Style::default().fg(theme.dim),
-            ),
+            Entry::System(text) => {
+                let dim = theme.dim;
+                out.extend(cache_entry(ck, || {
+                    let mut buf = Vec::new();
+                    push_text(
+                        &mut buf,
+                        Span::raw(""),
+                        text,
+                        Style::default().fg(dim).add_modifier(Modifier::ITALIC),
+                    );
+                    buf
+                }));
+            }
+            Entry::Stats(text) => {
+                let dim = theme.dim;
+                out.extend(cache_entry(ck, || {
+                    let mut buf = Vec::new();
+                    push_text(
+                        &mut buf,
+                        Span::styled("└ ", Style::default().fg(dim)),
+                        text,
+                        Style::default().fg(dim),
+                    );
+                    buf
+                }));
+            }
             Entry::Diff(text) => {
-                for line in text.lines() {
-                    out.push(Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(diff_line_color(line, theme)),
-                    )));
-                }
+                let theme_snap = theme.clone();
+                out.extend(cache_entry(ck, || {
+                    let mut buf = Vec::new();
+                    for line in text.lines() {
+                        buf.push(Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(diff_line_color(line, &theme_snap)),
+                        )));
+                    }
+                    buf
+                }));
             }
         }
         out.push(Line::raw(""));
@@ -1122,6 +1324,7 @@ fn diff_line_color(line: &str, theme: &Theme) -> Color {
 
 #[cfg(test)]
 mod subagent_tests {
+    use super::subagent_scroll;
     use hrdr_app::{PanelHit, PanelItem, SUBAGENT_TAIL_LINES, panel_item_rows};
 
     fn item(log: &str, expanded: bool) -> PanelItem {
@@ -1144,5 +1347,46 @@ mod subagent_tests {
         assert_eq!(panel_item_rows(&item(log, true)), 1 + 6);
         // A just-started agent (no output yet) is one header row.
         assert_eq!(panel_item_rows(&item("", false)), 1);
+    }
+
+    /// 3 items × 2 rows each = 6 total rows, panel height = 4.
+    /// scroll = 2: items 0 (rows 0-2) scrolled off, items 1-2 visible.
+    #[test]
+    fn scroll_pins_newest_to_bottom() {
+        let spans = &[(0usize, 2usize), (2, 4), (4, 6)];
+        let (scroll, vis) = subagent_scroll(spans, 4);
+        assert_eq!(scroll, 2);
+        assert_eq!(vis[0], None, "item 0 fully scrolled off");
+        assert_eq!(vis[1], Some((0, 2)), "item 1 at top of viewport");
+        assert_eq!(vis[2], Some((2, 4)), "item 2 at bottom of viewport");
+    }
+
+    /// Content fits without scrolling: scroll = 0, all items fully visible.
+    #[test]
+    fn no_scroll_when_content_fits() {
+        let spans = &[(0, 2), (2, 4)];
+        let (scroll, vis) = subagent_scroll(spans, 10);
+        assert_eq!(scroll, 0);
+        assert_eq!(vis[0], Some((0, 2)));
+        assert_eq!(vis[1], Some((2, 4)));
+    }
+
+    /// Empty panel: no items, no scroll.
+    #[test]
+    fn empty_panel_no_scroll() {
+        let (scroll, vis) = subagent_scroll(&[], 10);
+        assert_eq!(scroll, 0);
+        assert!(vis.is_empty());
+    }
+
+    /// Partially visible item at the scroll boundary.
+    #[test]
+    fn partial_visibility_at_boundary() {
+        // 1 item of 6 rows, panel height = 4 → scroll = 2.
+        // Item spans rows 0-6; vis: start = max(0,2)=2, end = min(6,2+4)=6 → (0,4).
+        let spans = &[(0usize, 6usize)];
+        let (scroll, vis) = subagent_scroll(spans, 4);
+        assert_eq!(scroll, 2);
+        assert_eq!(vis[0], Some((0, 4)));
     }
 }
