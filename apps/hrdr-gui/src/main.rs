@@ -1016,6 +1016,7 @@ fn app_view(
     // the turn done. Late buffered events are dropped via the `running` guard.
     // Queued follow-ups are discarded, like the TUI's cancel.
     let queue_for_cancel = queue.clone();
+    let steering_for_cancel = steering.clone();
     let cancel = move || {
         if !running.get_untracked() {
             return;
@@ -1032,6 +1033,11 @@ fn app_view(
             q.clear();
             n
         };
+        // Drop any un-drained steering message so a mid-turn steer that raced
+        // the cancel doesn't leak into the next turn (parity with the TUI).
+        if let Ok(mut q) = steering_for_cancel.lock() {
+            q.clear();
+        }
         let msg = hrdr_app::cancel_message(dropped);
         system(transcript, next_id, msg);
     };

@@ -798,6 +798,11 @@ impl App {
         self.compacting = false;
         let dropped = self.queue.len();
         self.queue.clear();
+        // Drop any steering message that raced in mid-turn but wasn't drained —
+        // otherwise the cancelled turn's steer silently leaks into the next one.
+        if let Ok(mut q) = self.steering.lock() {
+            q.clear();
+        }
         self.push_entry(Entry::System(hrdr_app::cancel_message(dropped)));
     }
 
