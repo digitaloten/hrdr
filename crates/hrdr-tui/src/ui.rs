@@ -28,11 +28,60 @@ const SUBAGENT_TAIL_LINES: usize = 4;
 /// this the panel scrolls its content off the top (newest at the bottom).
 const SUBAGENT_PANEL_MAX_ROWS: u16 = 18;
 
-/// Content rows one sub-agent occupies: a header line plus its body (all lines
+/// One row in the sub-agent panel — a blocking sub-agent or a detached
+/// background task, unified for rendering.
+struct PanelItem {
+    title: String,
+    log: String,
+    expanded: bool,
+    done: bool,
+    hit: crate::app::SubagentHit,
+}
+
+/// Collect the panel's rows: blocking sub-agents (from the `ToolOutput` stream)
+/// then detached background tasks (from the shared registry).
+fn panel_items(app: &App) -> Vec<PanelItem> {
+    let mut items = Vec::new();
+    for (i, sa) in app.subagents.iter().enumerate() {
+        items.push(PanelItem {
+            title: sa
+                .log
+                .lines()
+                .next()
+                .unwrap_or("sub-agent…")
+                .trim()
+                .to_string(),
+            log: sa.log.clone(),
+            expanded: sa.expanded,
+            done: false,
+            hit: crate::app::SubagentHit::Blocking(i),
+        });
+    }
+    if let Ok(v) = app.background_tasks.lock() {
+        for t in v.iter() {
+            let mut log = t.log.clone();
+            if t.done
+                && let Some(r) = &t.result
+            {
+                log.push_str(&format!("\n[result] {r}"));
+            }
+            items.push(PanelItem {
+                title: t.log.lines().next().unwrap_or(&t.label).trim().to_string(),
+                log,
+                expanded: app.background_expanded.contains(&t.id),
+                done: t.done,
+                hit: crate::app::SubagentHit::Background(t.id),
+            });
+        }
+    }
+    items
+}
+
+/// Content rows one panel item occupies: a header line plus its body (all lines
 /// when expanded, else the last [`SUBAGENT_TAIL_LINES`]).
-fn subagent_item_rows(sa: &crate::app::SubAgent) -> usize {
-    let rest = sa.log.lines().count().saturating_sub(1);
-    let body = if sa.expanded {
+fn panel_item_rows(item: &PanelItem) -> usize {
+    let rest = item.log.lines().count().saturating_sub(1);
+    let body = if item.expanded {
         rest
     } else {
         rest.min(SUBAGENT_TAIL_LINES)
@@ -40,12 +89,13 @@ fn subagent_item_rows(sa: &crate::app::SubAgent) -> usize {
     1 + body
 }
 
-/// Outer height (with borders) of the sub-agent panel; 0 when none are running.
+/// Outer height (with borders) of the sub-agent panel; 0 when nothing is shown.
 fn subagent_panel_height(app: &App) -> u16 {
-    if app.subagents.is_empty() {
+    let items = panel_items(app);
+    if items.is_empty() {
         return 0;
     }
-    let content: usize = app.subagents.iter().map(subagent_item_rows).sum();
+    let content: usize = items.iter().map(panel_item_rows).sum();
     (content as u16).min(SUBAGENT_PANEL_MAX_ROWS) + 2
 }
 
@@ -326,31 +376,30 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
 /// log (expanded). A left click on a row toggles that agent's expansion; the
 /// clickable rects are recorded in `app.subagent_hits`.
 fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect) {
-    let (accent, dim) = (app.theme.accent, app.theme.dim);
+    let (accent, dim, success) = (app.theme.accent, app.theme.dim, app.theme.success);
+    let items = panel_items(app);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" sub-agents ({}) ", app.subagents.len()))
+        .title(format!(" sub-agents ({}) ", items.len()))
         .border_style(Style::default().fg(dim));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut hits: Vec<(crate::app::HitRect, usize)> = Vec::new();
-    for (i, sa) in app.subagents.iter().enumerate() {
+    let mut hits: Vec<(crate::app::HitRect, crate::app::SubagentHit)> = Vec::new();
+    for item in &items {
         let start = lines.len();
-        let header = sa
-            .log
-            .lines()
-            .next()
-            .unwrap_or("sub-agent starting…")
-            .trim();
-        let indicator = if sa.expanded { "▾" } else { "▸" };
+        let indicator = if item.expanded { "▾" } else { "▸" };
+        let badge = if item.done { "✓ " } else { "" };
+        let header_color = if item.done { success } else { accent };
         lines.push(Line::from(Span::styled(
-            format!("{indicator} {header}"),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            format!("{indicator} {badge}{}", item.title),
+            Style::default()
+                .fg(header_color)
+                .add_modifier(Modifier::BOLD),
         )));
-        let rest: Vec<&str> = sa.log.lines().skip(1).collect();
-        let shown = if sa.expanded {
+        let rest: Vec<&str> = item.log.lines().skip(1).collect();
+        let shown = if item.expanded {
             &rest[..]
         } else {
             &rest[rest.len().saturating_sub(SUBAGENT_TAIL_LINES)..]
@@ -372,7 +421,7 @@ fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect) {
                     w: inner.width,
                     h,
                 },
-                i,
+                item.hit,
             ));
         }
     }
@@ -1139,14 +1188,16 @@ fn diff_line_color(line: &str, theme: &Theme) -> Color {
 
 #[cfg(test)]
 mod subagent_tests {
-    use super::{SUBAGENT_TAIL_LINES, subagent_item_rows};
-    use crate::app::SubAgent;
+    use super::{PanelItem, SUBAGENT_TAIL_LINES, panel_item_rows};
+    use crate::app::SubagentHit;
 
-    fn sa(log: &str, expanded: bool) -> SubAgent {
-        SubAgent {
-            id: "1".to_string(),
+    fn item(log: &str, expanded: bool) -> PanelItem {
+        PanelItem {
+            title: log.lines().next().unwrap_or("").to_string(),
             log: log.to_string(),
             expanded,
+            done: false,
+            hit: SubagentHit::Blocking(0),
         }
     }
 
@@ -1155,10 +1206,10 @@ mod subagent_tests {
         // header + 6 body lines
         let log = "↳ task: x\na\nb\nc\nd\ne\nf";
         // Collapsed = header + last SUBAGENT_TAIL_LINES.
-        assert_eq!(subagent_item_rows(&sa(log, false)), 1 + SUBAGENT_TAIL_LINES);
+        assert_eq!(panel_item_rows(&item(log, false)), 1 + SUBAGENT_TAIL_LINES);
         // Expanded = header + all 6.
-        assert_eq!(subagent_item_rows(&sa(log, true)), 1 + 6);
+        assert_eq!(panel_item_rows(&item(log, true)), 1 + 6);
         // A just-started agent (no output yet) is one header row.
-        assert_eq!(subagent_item_rows(&sa("", false)), 1);
+        assert_eq!(panel_item_rows(&item("", false)), 1);
     }
 }

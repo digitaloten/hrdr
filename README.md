@@ -392,6 +392,12 @@ collapsed to the tail (a header + last few lines); **click a sub-agent to expand
 its full log** (click again to collapse). Finished sub-agents drop from the
 panel and their result lands in the transcript.
 
+For work you don't need before continuing, set **`background: true`** on a
+`task` call: it runs **detached** — the tool returns immediately and the main
+agent keeps going, while the sub-agent's result is **delivered back into the
+conversation automatically** when it finishes. Background sub-agents show live
+in the same panel (with a ✓ on completion).
+
 Four **built-in agents** ship out of the box, selected with the `task` tool's
 `agent` argument:
 

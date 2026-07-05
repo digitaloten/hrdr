@@ -57,6 +57,26 @@ fn default_status() -> String {
     "pending".to_string()
 }
 
+/// A detached background sub-agent (`task` with `background: true`): it runs
+/// concurrently with the main agent, streaming into `log`; when `done`, its
+/// `result` is delivered into the conversation and the entry is pruned. Shared
+/// via [`ToolContext::background_tasks`] so the frontend can show live progress.
+#[derive(Debug, Clone)]
+pub struct BackgroundTask {
+    /// Stable id for the run — shown to the model and used for delivery matching.
+    pub id: u64,
+    /// Short label (agent/description) for the panel and delivery notice.
+    pub label: String,
+    /// Accumulated live output (streamed answer text + tool-activity markers).
+    pub log: String,
+    /// Whether the sub-agent has finished.
+    pub done: bool,
+    /// The final result, once `done`.
+    pub result: Option<String>,
+    /// Whether the result has been injected into the conversation yet.
+    pub delivered: bool,
+}
+
 /// Shared execution context handed to every tool call.
 #[derive(Clone)]
 pub struct ToolContext {
@@ -99,6 +119,9 @@ pub struct ToolContext {
     /// Storage root for **global** [`MemoryTool`] notes (all projects).
     /// `None` disables global memory.
     pub memory_global: Option<PathBuf>,
+    /// Detached background sub-agents (`task` with `background: true`), shared so
+    /// the run loop can deliver their results and the frontend can show progress.
+    pub background_tasks: Arc<Mutex<Vec<BackgroundTask>>>,
     /// Post-edit hooks from `[[hooks]]` config (formatters, mostly), run by
     /// `edit`/`write` after a successful mutation.
     pub hooks: Arc<Vec<Hook>>,
@@ -119,6 +142,7 @@ impl ToolContext {
             write_allow_ext: None,
             memory_project: None,
             memory_global: None,
+            background_tasks: Arc::new(Mutex::new(Vec::new())),
             hooks: Arc::new(Vec::new()),
         }
     }

@@ -80,6 +80,79 @@ pub fn steering_queue() -> SteeringQueue {
     Arc::new(Mutex::new(std::collections::VecDeque::new()))
 }
 
+/// Monotonic id source for detached background sub-agents (`task` background mode).
+static BG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Spawn `cfg`'s sub-agent detached: it streams into the shared background
+/// registry and, on completion, records its result there for the run loop to
+/// deliver. Returns immediately with an acknowledgement for the model.
+fn spawn_background(
+    cfg: AgentConfig,
+    prompt: String,
+    label: String,
+    registry: &Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>>,
+) -> String {
+    use std::sync::atomic::Ordering;
+    let id = BG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let header = format!("↳ task#{id} ({}): {label}", cfg.model);
+    if let Ok(mut v) = registry.lock() {
+        v.push(hrdr_tools::BackgroundTask {
+            id,
+            label: label.clone(),
+            log: header,
+            done: false,
+            result: None,
+            delivered: false,
+        });
+    }
+    let reg = registry.clone();
+    tokio::spawn(async move {
+        let mut out = String::new();
+        let outcome: Result<()> = async {
+            let mut sub = Agent::new(cfg)?;
+            sub.run(prompt, steering_queue(), |ev| {
+                let chunk = match ev {
+                    AgentEvent::Text(t) => {
+                        out.push_str(&t);
+                        Some(t)
+                    }
+                    AgentEvent::ToolStart { name, .. } => Some(format!("\n· {name}")),
+                    _ => None,
+                };
+                if let Some(c) = chunk
+                    && let Ok(mut v) = reg.lock()
+                    && let Some(t) = v.iter_mut().find(|t| t.id == id)
+                {
+                    t.log.push_str(&c);
+                }
+            })
+            .await?;
+            Ok(())
+        }
+        .await;
+        if let Ok(mut v) = reg.lock()
+            && let Some(t) = v.iter_mut().find(|t| t.id == id)
+        {
+            t.done = true;
+            t.result = Some(match outcome {
+                Ok(()) => {
+                    let o = out.trim();
+                    if o.is_empty() {
+                        "(no text output)".to_string()
+                    } else {
+                        o.to_string()
+                    }
+                }
+                Err(e) => format!("(background task failed: {e})"),
+            });
+        }
+    });
+    format!(
+        "Started background task #{id} ({label}) — it runs concurrently. Its result will be \
+         delivered to you automatically when it finishes; continue with other work and don't wait."
+    )
+}
+
 /// Derive the base config for delegated sub-agents from the main agent's config:
 /// same provider/endpoint and cwd, but the sub-agent model, no nested `task` tool
 /// (recursion is bounded to one level), and no MCP servers (subs don't spawn
@@ -179,7 +252,9 @@ impl SubagentTool {
              implementation. The sub-agent has the normal tools (read/write/edit/bash/grep/…) \
              but can't itself delegate. It runs to completion and returns its final summary. \
              Issue several `task` calls in one turn to run sub-agents in **parallel** (e.g. \
-             explore several areas at once). Run cheaper/faster work on a different `model`",
+             explore several areas at once), or set `background: true` to fire one off and keep \
+             working — its result is delivered to you automatically when it finishes. Run \
+             cheaper/faster work on a different `model`",
         );
         if profiles.is_empty() {
             desc.push('.');
@@ -248,6 +323,10 @@ impl hrdr_tools::Tool for SubagentTool {
             "model": {
                 "type": "string",
                 "description": "Optional model override (on the selected provider). Defaults to the profile's / configured subagent model, else the main model."
+            },
+            "background": {
+                "type": "boolean",
+                "description": "Run detached: return immediately with a task id and keep working; its result is delivered to you automatically when it finishes. Use for independent work you don't need before continuing. Default false (block until done)."
             }
         });
         if !self.profiles.is_empty() {
@@ -317,6 +396,24 @@ impl hrdr_tools::Tool for SubagentTool {
         {
             cfg.model = m.trim().to_string();
         }
+        let label = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("sub-task")
+            .to_string();
+
+        // Detached background mode: spawn and return immediately; the run loop
+        // delivers the result when it lands (the frontend shows live progress).
+        if args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            if isolation.is_some() {
+                bail!("a background task can't also use `isolation` (worktree) yet");
+            }
+            return Ok(spawn_background(cfg, prompt, label, &ctx.background_tasks));
+        }
 
         // `isolation = "worktree"`: run the sub-agent in a fresh git worktree so
         // its edits don't touch the working tree until reviewed.
@@ -332,11 +429,6 @@ impl hrdr_tools::Tool for SubagentTool {
         };
 
         let model = cfg.model.clone();
-        let label = args
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("sub-task")
-            .to_string();
         ctx.emit(format!("↳ task ({model}): {label}\n"));
 
         let mut sub = Agent::new(cfg)?;
@@ -2178,6 +2270,12 @@ impl Agent {
         self.ctx.todos.clone()
     }
 
+    /// Shared registry of detached background sub-agents (for the frontend's
+    /// live panel). Mutated by the `task` tool's `background` mode.
+    pub fn background_tasks(&self) -> Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>> {
+        self.ctx.background_tasks.clone()
+    }
+
     /// Number of messages currently in history (including the system prompt).
     pub fn message_count(&self) -> usize {
         self.messages.len()
@@ -2292,6 +2390,34 @@ impl Agent {
         steering.lock().map(|q| !q.is_empty()).unwrap_or(false)
     }
 
+    /// Deliver any finished **detached background sub-agents** (`task` with
+    /// `background: true`) into the conversation as user-role context messages,
+    /// pruning them from the shared registry — so a background result folds in
+    /// mid-turn (before the next model request) or at the next turn. Emits a
+    /// [`AgentEvent::Notice`] per delivery.
+    fn drain_background<F: FnMut(AgentEvent)>(&mut self, on_event: &mut F) {
+        let finished: Vec<(u64, String, String)> = {
+            let Ok(mut v) = self.ctx.background_tasks.lock() else {
+                return;
+            };
+            let mut out = Vec::new();
+            for t in v.iter_mut().filter(|t| t.done && !t.delivered) {
+                t.delivered = true;
+                out.push((t.id, t.label.clone(), t.result.clone().unwrap_or_default()));
+            }
+            v.retain(|t| !t.delivered);
+            out
+        };
+        for (id, label, result) in finished {
+            on_event(AgentEvent::Notice(format!(
+                "background task #{id} ({label}) finished"
+            )));
+            self.messages.push(ChatMessage::user(format!(
+                "[Background task #{id} ({label}) finished — its result:]\n{result}"
+            )));
+        }
+    }
+
     /// Run one user turn to completion, emitting events as it goes. `steering` is
     /// a shared queue the caller can push to mid-turn (see [`SteeringQueue`]);
     /// pass [`steering_queue()`] when there's no interactive steering.
@@ -2328,6 +2454,8 @@ impl Agent {
             // Deliver any steering messages submitted since the last request — a
             // mid-turn correction reaches the model after the current tool round.
             self.drain_steering(&steering, &mut on_event);
+            // Fold in any detached background sub-agent results that have landed.
+            self.drain_background(&mut on_event);
             // Reclaim stale tool output before building the request — the cheap,
             // no-model-call first line of defence against context ballooning
             // (compaction is the expensive fallback). No-op until there's enough
@@ -3323,6 +3451,58 @@ mod tests {
         // Sub-agent mode: applied onto the bounded base → no delegation.
         let delegated = config_for_agent_profile(&subagent_base_config(&base), &general).unwrap();
         assert!(!delegated.subagents, "a delegated sub-agent can't nest");
+    }
+
+    #[test]
+    fn drain_background_delivers_finished_and_prunes() {
+        let cfg = AgentConfig {
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(cfg).unwrap();
+        let before = agent.message_count();
+        {
+            let reg = agent.background_tasks();
+            let mut v = reg.lock().unwrap();
+            v.push(hrdr_tools::BackgroundTask {
+                id: 1,
+                label: "explore: x".to_string(),
+                log: "…".to_string(),
+                done: true,
+                result: Some("found it".to_string()),
+                delivered: false,
+            });
+            v.push(hrdr_tools::BackgroundTask {
+                id: 2,
+                label: "y".to_string(),
+                log: "…".to_string(),
+                done: false,
+                result: None,
+                delivered: false,
+            });
+        }
+        let mut events = Vec::new();
+        agent.drain_background(&mut |e| events.push(e));
+        // The finished task is delivered as one user message + a Notice…
+        assert_eq!(agent.message_count(), before + 1);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("#1")))
+        );
+        assert!(
+            agent
+                .messages()
+                .last()
+                .and_then(|m| m.content.as_deref())
+                .unwrap_or_default()
+                .contains("found it")
+        );
+        // …and it's pruned, while the still-running one stays.
+        let reg = agent.background_tasks();
+        let v = reg.lock().unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].id, 2);
     }
 
     #[tokio::test]

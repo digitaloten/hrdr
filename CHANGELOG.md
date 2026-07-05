@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Detached background sub-agents.** `task` gained a `background: true` param:
+  the sub-agent runs concurrently while the main agent keeps working — the tool
+  returns immediately with a task id, and the result is **delivered into the
+  conversation automatically** when it finishes (folded in before the next model
+  request, mid-turn or at the next turn). Progress shows live in the sub-agent
+  panel (with a ✓ on completion). Backed by a shared `background_tasks` registry
+  on `ToolContext`; the run loop delivers + prunes finished tasks. (Background +
+  worktree isolation together isn't supported yet.)
+
 ## [0.2.7] - 2026-07-05
 
 ### Added

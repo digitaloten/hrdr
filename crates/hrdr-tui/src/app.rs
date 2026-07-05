@@ -65,8 +65,8 @@ impl HitRect {
     }
 }
 
-/// A running `task` sub-agent, shown live in the sub-agent panel until it
-/// finishes. `log` is the full streamed progress/output (the panel shows the
+/// A running blocking `task` sub-agent, shown live in the sub-agent panel until
+/// it finishes. `log` is the full streamed progress/output (the panel shows the
 /// tail collapsed, all of it expanded).
 pub(crate) struct SubAgent {
     /// The task tool-call id (matches the `ToolOutput`/`ToolEnd` id).
@@ -75,6 +75,14 @@ pub(crate) struct SubAgent {
     pub log: String,
     /// Whether the panel shows this agent's full log (toggled by a click).
     pub expanded: bool,
+}
+
+/// What a click on a sub-agent panel row toggles: a blocking sub-agent (by
+/// `App.subagents` index) or a detached background task (by its registry id).
+#[derive(Clone, Copy)]
+pub(crate) enum SubagentHit {
+    Blocking(usize),
+    Background(u64),
 }
 
 // The transcript item model + its representation-independent queries
@@ -210,12 +218,18 @@ pub(crate) struct App {
     /// set during draw. A left click toggles that tool's `expanded` (like a
     /// per-entry `/expand`).
     pub(crate) tool_hits: Vec<(HitRect, usize)>,
-    /// Running `task` sub-agents, shown live in the sub-agent panel (removed on
-    /// completion). Populated from the `task` tool's `ToolOutput` stream.
+    /// Running *blocking* `task` sub-agents, shown live in the sub-agent panel
+    /// (removed on completion). Populated from the `task` tool's `ToolOutput`
+    /// stream.
     pub(crate) subagents: Vec<SubAgent>,
-    /// Clickable screen rects for each sub-agent panel row → its `subagents`
-    /// index; a left click toggles that agent's `expanded`.
-    pub(crate) subagent_hits: Vec<(HitRect, usize)>,
+    /// Shared registry of *detached background* sub-agents (a clone of the
+    /// agent's `ctx.background_tasks`), read live for the panel.
+    pub(crate) background_tasks: Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>>,
+    /// Ids of background tasks the user has expanded in the panel.
+    pub(crate) background_expanded: std::collections::HashSet<u64>,
+    /// Clickable screen rects for each sub-agent panel row → the thing it
+    /// toggles; a left click expands/collapses that row.
+    pub(crate) subagent_hits: Vec<(HitRect, SubagentHit)>,
     /// Set after one idle Ctrl+C; a second consecutive Ctrl+C quits. Any other
     /// key (or a mouse action) disarms it.
     pub(crate) quit_armed: bool,
@@ -266,6 +280,7 @@ impl App {
         let cfg = config.clone();
         let agent = Agent::new(config)?;
         let todos = agent.todos();
+        let background_tasks = agent.background_tasks();
         let project_docs_loaded = agent.project_docs().is_some();
         let (tx, rx) = mpsc::unbounded_channel();
         let editor: Box<dyn TuiEditorEngine> = if vim_mode {
@@ -345,6 +360,8 @@ impl App {
             follow_button: None,
             tool_hits: Vec::new(),
             subagents: Vec::new(),
+            background_tasks,
+            background_expanded: std::collections::HashSet::new(),
             subagent_hits: Vec::new(),
             quit_armed: false,
             turn_started: None,
@@ -609,14 +626,24 @@ impl App {
                     return;
                 }
                 // Click a sub-agent panel row to expand/collapse its live output.
-                if let Some(idx) = self
+                if let Some(hit) = self
                     .subagent_hits
                     .iter()
                     .find(|(r, _)| r.contains(m.column, m.row))
-                    .map(|(_, i)| *i)
-                    && let Some(sa) = self.subagents.get_mut(idx)
+                    .map(|(_, h)| *h)
                 {
-                    sa.expanded = !sa.expanded;
+                    match hit {
+                        SubagentHit::Blocking(idx) => {
+                            if let Some(sa) = self.subagents.get_mut(idx) {
+                                sa.expanded = !sa.expanded;
+                            }
+                        }
+                        SubagentHit::Background(id) => {
+                            if !self.background_expanded.remove(&id) {
+                                self.background_expanded.insert(id);
+                            }
+                        }
+                    }
                     return;
                 }
                 // Click a tool block to toggle its full output (per-entry /expand).
