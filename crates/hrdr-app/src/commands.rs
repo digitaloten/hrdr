@@ -1092,6 +1092,15 @@ pub fn agent_cwd(agent: &Arc<Mutex<Agent>>) -> PathBuf {
         .unwrap_or_default()
 }
 
+/// The names of sub-agents the live agent can delegate to (for `@name` mention
+/// routing). Empty when the lock is held (a turn is running) or delegation is off.
+pub fn agent_names(agent: &Arc<Mutex<Agent>>) -> Vec<String> {
+    agent
+        .try_lock()
+        .map(|a| a.agent_names().to_vec())
+        .unwrap_or_default()
+}
+
 /// Switch the live agent's model and, in the *same* locked step, re-probe the
 /// endpoint for the new model's advertised context window — delivering it to the
 /// UI so auto-compaction honors the model's real max. Folding the probe into the

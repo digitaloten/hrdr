@@ -406,6 +406,12 @@ Each runs on the main provider (respecting `subagent_model`) with a specialized
 system prompt and a scoped tool set — `explore`/`review` are read-only, `plan`
 adds Markdown-only writes, `general` gets everything.
 
+`explore` and `review` are **proactive** — the main agent reaches for them on
+its own (explore for broad investigation, review after non-trivial changes)
+without being asked. You can also **`@name`-mention** an agent in a message
+(`@explore find the auth flow`) to route that turn to it; an `@token` that isn't
+a known agent stays a normal `@file` mention.
+
 A sub-agent can run on a **different model on the same provider** — e.g. an Opus
 main agent delegating implementation to a cheaper/faster Sonnet:
 

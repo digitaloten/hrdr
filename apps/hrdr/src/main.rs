@@ -368,6 +368,11 @@ async fn main() -> Result<()> {
 /// `--quiet`: text only. Exit code 0 on a completed turn, 1 on error.
 async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bool) -> Result<()> {
     let mut agent = Agent::new(config)?;
+    // An `@agent` mention routes the run to that sub-agent (parity with the TUI).
+    let prompt = match hrdr_app::extract_agent_mention(&prompt, agent.agent_names()) {
+        Some((a, body)) => hrdr_app::agent_mention_message(&a, &body),
+        None => prompt,
+    };
     // Connect any configured MCP servers before the turn (their tools join the
     // set); surface the per-server status on stderr unless quiet.
     for notice in agent.connect_mcp().await {

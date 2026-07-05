@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`@agent` mentions.** Typing `@name` where `name` matches a known sub-agent
+  (built-in, discovered file, or config) routes that message to the agent — the
+  main agent handles it by delegating via the `task` tool. Context-aware: an
+  `@token` that isn't a known agent stays a normal `@file` mention, so file
+  attach is unaffected. Works in the TUI and `hrdr run`.
 - **Proactive sub-agent delegation.** Agents can be marked `proactive` so the
   main agent reaches for them on its own when a sub-task fits their role, rather
   than only when told. The built-in `explore` and `review` agents are proactive

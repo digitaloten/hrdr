@@ -774,8 +774,17 @@ impl App {
         // as a pending bottom item until this point).
         self.push_entry(Entry::User(input.clone()));
         // Expand `@file` mentions into attached contents for the model only; the
-        // transcript still shows the message as the user typed it.
-        let sent = hrdr_app::expand_mentions(&input, &hrdr_app::agent_cwd(&self.agent));
+        // transcript still shows the message as the user typed it. An `@agent`
+        // mention (matching a known sub-agent) instead routes the turn to that
+        // agent via a delegation directive.
+        let cwd = hrdr_app::agent_cwd(&self.agent);
+        let names = hrdr_app::agent_names(&self.agent);
+        let sent = match hrdr_app::extract_agent_mention(&input, &names) {
+            Some((agent, body)) => {
+                hrdr_app::agent_mention_message(&agent, &hrdr_app::expand_mentions(&body, &cwd))
+            }
+            None => hrdr_app::expand_mentions(&input, &cwd),
+        };
         self.launch_turn(sent);
     }
 

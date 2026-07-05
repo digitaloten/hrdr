@@ -62,6 +62,39 @@ pub fn session_name_from(msgs: &[Message]) -> String {
 /// duplicate references are skipped. Returns `input` unchanged when nothing
 /// resolves. The display copy should keep the bare `@path`; only the sent copy
 /// carries the expansion.
+/// If `input` mentions a known agent via `@name` (matching one of `names`,
+/// case-insensitively), return `(canonical_name, input_without_that_token)`.
+/// `@`-tokens that don't match an agent are left alone (they may be `@file`
+/// mentions). Only the first match is honored.
+pub fn extract_agent_mention(input: &str, names: &[String]) -> Option<(String, String)> {
+    for raw in input.split_whitespace() {
+        let Some(tok) = raw.strip_prefix('@') else {
+            continue;
+        };
+        let tok = tok.trim_end_matches([',', '.', ';', ':', ')', ']', '}']);
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some(canon) = names.iter().find(|n| n.eq_ignore_ascii_case(tok)) {
+            // Drop the first occurrence of the whole `@name` token, then tidy
+            // the doubled/edge whitespace it leaves behind.
+            let cleaned = input.replacen(raw, "", 1);
+            let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+            return Some((canon.clone(), cleaned));
+        }
+    }
+    None
+}
+
+/// Wrap a message directed at `@agent` with a directive that tells the main
+/// agent to handle it by delegating to that sub-agent via the `task` tool.
+pub fn agent_mention_message(agent: &str, body: &str) -> String {
+    format!(
+        "[Directed to the `{agent}` agent — handle this request by delegating it to the \
+         `{agent}` sub-agent via the task tool (agent=\"{agent}\").]\n\n{body}"
+    )
+}
+
 pub fn expand_mentions(input: &str, cwd: &Path) -> String {
     const MAX_BYTES: usize = 100 * 1024;
     let mut attached: Vec<(String, String)> = Vec::new();
@@ -473,6 +506,24 @@ mod tests {
 
         // A missing mention resolves nothing → unchanged.
         assert_eq!(expand_mentions("@nope.txt", root), "@nope.txt");
+    }
+
+    #[test]
+    fn extract_agent_mention_routes_known_agents_only() {
+        let names = vec!["explore".to_string(), "review".to_string()];
+        // A known agent is matched (case-insensitive) and stripped from the body.
+        let (a, body) = extract_agent_mention("@Explore find the auth flow", &names).unwrap();
+        assert_eq!(a, "explore");
+        assert_eq!(body, "find the auth flow");
+        // Trailing punctuation on the token is tolerated.
+        let (a, _) = extract_agent_mention("hey @review, look here", &names).unwrap();
+        assert_eq!(a, "review");
+        // An unknown `@token` (e.g. a file mention) is left for file expansion.
+        assert!(extract_agent_mention("open @src/main.rs", &names).is_none());
+        assert!(extract_agent_mention("no mention here", &names).is_none());
+        // The directive names the agent and carries the body.
+        let msg = agent_mention_message("explore", "find X");
+        assert!(msg.contains("`explore`") && msg.ends_with("find X"));
     }
 
     #[test]

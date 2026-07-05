@@ -1494,6 +1494,9 @@ pub struct Agent {
     /// Base-directory override for memory storage (see [`AgentConfig::memory_dir`]),
     /// kept so the roots re-resolve correctly on `clear`/`set_cwd`.
     memory_dir: Option<PathBuf>,
+    /// Names of the sub-agents available via the `task` tool (built-ins +
+    /// discovered files + config), for `@name` mention routing in the frontend.
+    agent_names: Vec<String>,
 }
 
 /// Append a sub-agent persona (its role / operating instructions) after the base
@@ -1625,10 +1628,13 @@ impl Agent {
         // sub-agent). Registered before the system prompt is rendered so it's
         // listed for the model. The profile set (built-ins + discovered files +
         // config) is resolved by [`resolve_agent_profiles`].
+        let mut agent_names: Vec<String> = Vec::new();
         if config.subagents {
+            let profiles = resolve_agent_profiles(&config);
+            agent_names = profiles.iter().map(|p| p.name.clone()).collect();
             tools.register(Arc::new(SubagentTool::new(
                 subagent_base_config(&config),
-                resolve_agent_profiles(&config),
+                profiles,
             )));
         }
         // Memory: expose the `memory` tool (registered before scoping so a
@@ -1765,7 +1771,14 @@ impl Agent {
             agent_prompt: config.agent_prompt,
             memory_enabled: config.memory,
             memory_dir: config.memory_dir,
+            agent_names,
         })
+    }
+
+    /// Names of the sub-agents this agent can delegate to (for `@name` mention
+    /// routing in the frontend). Empty when delegation is disabled.
+    pub fn agent_names(&self) -> &[String] {
+        &self.agent_names
     }
 
     /// Connect to the configured `[[mcp]]` servers, registering each server's
