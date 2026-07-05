@@ -86,6 +86,11 @@ pub struct ToolContext {
     /// working directory (the system temp dir is always allowed for scratch).
     /// Disable via config `allow_outside_cwd = true`.
     pub restrict_to_cwd: bool,
+    /// When set, file-mutating tools (`write`/`edit`/`patch`) may only touch
+    /// files with one of these extensions (case-insensitive, no dot — e.g.
+    /// `["md", "markdown"]`). `None` = any extension. Used to scope a sub-agent
+    /// to writing only certain file types (e.g. a planner that persists Markdown).
+    pub write_allow_ext: Option<Vec<String>>,
     /// Post-edit hooks from `[[hooks]]` config (formatters, mostly), run by
     /// `edit`/`write` after a successful mutation.
     pub hooks: Arc<Vec<Hook>>,
@@ -103,6 +108,7 @@ impl ToolContext {
             guardrails: Arc::new(default_guardrails()),
             read_files: Arc::new(Mutex::new(std::collections::HashSet::new())),
             restrict_to_cwd: true,
+            write_allow_ext: None,
             hooks: Arc::new(Vec::new()),
         }
     }
@@ -146,6 +152,7 @@ impl ToolContext {
     /// paths (via the nearest existing ancestor, so not-yet-created files
     /// resolve too) — `../` tricks don't slip through.
     pub fn ensure_within_cwd(&self, path: &std::path::Path) -> Result<()> {
+        self.ensure_writable_ext(path)?;
         if !self.restrict_to_cwd {
             return Ok(());
         }
@@ -160,6 +167,31 @@ impl ToolContext {
              project; ask the user to change it themselves (or to set allow_outside_cwd)",
             path.display(),
             self.cwd.display()
+        ))
+    }
+
+    /// Guard for [`write_allow_ext`](Self::write_allow_ext): `Err` when a
+    /// mutating tool targets a file whose extension isn't in the allow-list.
+    /// A no-op when no list is set.
+    pub fn ensure_writable_ext(&self, path: &std::path::Path) -> Result<()> {
+        let Some(allowed) = &self.write_allow_ext else {
+            return Ok(());
+        };
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default();
+        if allowed.iter().any(|a| a.eq_ignore_ascii_case(ext)) {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "this agent may only modify {} files — {} is not allowed",
+            allowed
+                .iter()
+                .map(|e| format!(".{e}"))
+                .collect::<Vec<_>>()
+                .join("/"),
+            path.display()
         ))
     }
 
@@ -903,6 +935,32 @@ b:2:y"
         // …and the knob disables the gate entirely.
         ctx.restrict_to_cwd = false;
         assert!(ctx.ensure_within_cwd(Path::new("/usr/lib/x.txt")).is_ok());
+    }
+
+    #[test]
+    fn write_allow_ext_confines_mutations_to_listed_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ToolContext::new(dir.path());
+        ctx.write_allow_ext = Some(vec!["md".into(), "markdown".into()]);
+        // Listed extensions pass (case-insensitive)…
+        assert!(ctx.ensure_within_cwd(&dir.path().join("PLAN.md")).is_ok());
+        assert!(
+            ctx.ensure_within_cwd(&dir.path().join("a.MARKDOWN"))
+                .is_ok()
+        );
+        // …anything else is refused, even inside cwd.
+        let err = ctx
+            .ensure_within_cwd(&dir.path().join("src/main.rs"))
+            .unwrap_err();
+        assert!(err.to_string().contains("only modify"), "{err}");
+        // Extensionless paths aren't in the list → refused.
+        assert!(ctx.ensure_within_cwd(&dir.path().join("Makefile")).is_err());
+        // No list → no restriction.
+        ctx.write_allow_ext = None;
+        assert!(
+            ctx.ensure_within_cwd(&dir.path().join("src/main.rs"))
+                .is_ok()
+        );
     }
 
     #[test]

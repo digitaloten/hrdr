@@ -8,18 +8,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Built-in `explore` and `review` agents.** The `task` tool now always offers
-  two read-only sub-agents: `explore` (a code investigator — trace files, types,
-  and call paths) and `review` (a code reviewer — bugs, edge cases, security).
-  Each runs on the main provider with a specialized system prompt and a tool set
-  scoped to read-only (read/grep/find/ls/web — no write/edit/shell), so they
-  can't modify the tree.
+- **Four built-in agents.** The `task` tool now always offers `explore` (a
+  read-only code investigator — trace files, types, and call paths), `review` (a
+  read-only code reviewer — bugs, edge cases, security), `plan` (investigates
+  read-only, then persists a step-by-step plan as a **Markdown file** — can
+  create/edit `.md` only), and `general` (full tool access; the same agent as
+  `task` with no `agent`). Each runs on the main provider with a specialized
+  system prompt and a scoped tool set.
 - **Custom sub-agent personas + tool scoping.** `[[subagent]]` profiles gained
   `prompt` (a system-prompt persona appended to the sub-agent's role),
-  `read_only` (scope to the read-only tools), and `tools` (an explicit tool
-  allow-list, overriding `read_only`). A user profile named `explore`/`review`
-  overrides the matching built-in. New `ToolRegistry::retain_only` /
-  `read_only_names` back the scoping.
+  `read_only` (scope to the read-only tools), `write_ext` (read-only tools plus
+  writes limited to the given file extensions — e.g. `["md"]`), and `tools` (an
+  explicit allow-list, overriding the others). A user profile named
+  `explore`/`review`/`plan`/`general` overrides the matching built-in. New
+  `ToolRegistry::retain_only` / `read_only_names` and
+  `ToolContext::write_allow_ext` back the scoping.
 - **Parallel sub-agents.** Issuing several `task` calls in one turn now runs the
   sub-agents concurrently (e.g. explore several areas at once), each streaming
   into its own tool block. A new `Tool::concurrent()` signal (defaults to

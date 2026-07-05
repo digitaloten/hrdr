@@ -90,6 +90,7 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     base.agent_prompt = None;
     base.allowed_tools = None;
     base.read_only = false;
+    base.write_ext = None;
     base.model = config
         .subagent_model
         .clone()
@@ -136,6 +137,7 @@ fn subagent_config_for_profile(
     cfg.agent_prompt = profile.prompt.clone();
     cfg.allowed_tools = profile.tools.clone();
     cfg.read_only = profile.read_only;
+    cfg.write_ext = profile.write_ext.clone();
     Ok(cfg)
 }
 
@@ -177,6 +179,13 @@ impl SubagentTool {
                 };
                 if p.read_only {
                     tags.push_str(" · read-only");
+                } else if let Some(exts) = &p.write_ext {
+                    let list = exts
+                        .iter()
+                        .map(|e| format!(".{e}"))
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    tags.push_str(&format!(" · read-only + writes {list}"));
                 }
                 desc.push_str(&format!("- {} ({tags})", p.name));
                 if let Some(d) = &p.description {
@@ -431,6 +440,10 @@ pub struct AgentConfig {
     /// Scope this (sub-)agent to the read-only tools (see
     /// [`ToolRegistry::read_only_names`]). Ignored when `allowed_tools` is set.
     pub read_only: bool,
+    /// Grant this (sub-)agent the read-only tools **plus** file writes limited to
+    /// these extensions (see [`ToolContext::write_allow_ext`]). Takes precedence
+    /// over [`read_only`](Self::read_only); ignored when `allowed_tools` is set.
+    pub write_ext: Option<Vec<String>>,
 }
 
 /// A named sub-agent profile (`[[subagent]]`): a provider + model the `task` tool
@@ -462,6 +475,11 @@ pub struct SubagentProfile {
     /// Omit for the full default tool set.
     #[serde(default)]
     pub tools: Option<Vec<String>>,
+    /// Grant read-only tools **plus** file writes restricted to these
+    /// extensions (no dot — e.g. `["md"]` for a planner that persists Markdown).
+    /// Takes precedence over `read_only`; ignored when `tools` is set.
+    #[serde(default)]
+    pub write_ext: Option<Vec<String>>,
 }
 
 /// The always-available built-in sub-agents: read-only `explore` and `review`
@@ -482,6 +500,7 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             prompt: Some(EXPLORE_PROMPT.to_string()),
             read_only: true,
             tools: None,
+            write_ext: None,
         },
         SubagentProfile {
             name: "review".to_string(),
@@ -495,6 +514,37 @@ pub fn builtin_subagent_profiles() -> Vec<SubagentProfile> {
             prompt: Some(REVIEW_PROMPT.to_string()),
             read_only: true,
             tools: None,
+            write_ext: None,
+        },
+        SubagentProfile {
+            name: "plan".to_string(),
+            provider: None,
+            model: None,
+            description: Some(
+                "Planner — investigates read-only, then writes a step-by-step plan \
+                 to a Markdown file (can create/edit `.md` files only, no other \
+                 changes)."
+                    .to_string(),
+            ),
+            prompt: Some(PLAN_PROMPT.to_string()),
+            read_only: false,
+            tools: None,
+            write_ext: Some(vec!["md".to_string(), "markdown".to_string()]),
+        },
+        SubagentProfile {
+            name: "general".to_string(),
+            provider: None,
+            model: None,
+            description: Some(
+                "General-purpose agent — full tool access for open-ended, \
+                 multi-step tasks (explore and modify). Same as `task` with no \
+                 `agent`."
+                    .to_string(),
+            ),
+            prompt: None,
+            read_only: false,
+            tools: None,
+            write_ext: None,
         },
     ]
 }
@@ -518,6 +568,19 @@ report your findings.
 - For each finding give: severity, `path:line`, what's wrong, and a concrete fix.
 - Lead with the most serious issues, grouped by severity. If it's clean, say so.
 - Be specific and back every claim with the code — no vague concerns.";
+
+const PLAN_PROMPT: &str = "\
+You are a PLAN sub-agent. Investigate the task read-only, then produce a concrete \
+implementation plan and PERSIST it to disk as a Markdown file. You can read and \
+search freely and create/edit Markdown (`.md`) files — but you cannot modify any \
+other file or run mutating commands.
+
+- First understand the task: trace the relevant code with your read/search tools.
+- Write a step-by-step plan: files to change, the approach, edge cases, risks, and \
+  how to verify. Be specific — name the functions, types, and files.
+- Save the plan to a Markdown file (e.g. `PLAN.md`, or a path the caller names): \
+  create it if absent, update it if it exists.
+- Return a short summary plus the path you wrote — the parent agent executes it.";
 
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
 /// so the next turn doesn't overflow).
@@ -648,6 +711,7 @@ impl Default for AgentConfig {
             agent_prompt: None,
             allowed_tools: None,
             read_only: false,
+            write_ext: None,
         }
     }
 }
@@ -1353,10 +1417,15 @@ impl Agent {
                 profiles,
             )));
         }
-        // Scope the tool set for a restricted sub-agent (e.g. a read-only
-        // explorer): an explicit allow-list wins, else the read-only set.
+        // Scope the tool set for a restricted sub-agent: an explicit allow-list
+        // wins; else `write_ext` grants the read-only tools plus the writers
+        // (writes are extension-gated below); else the plain read-only set.
         if let Some(allow) = &config.allowed_tools {
             tools.retain_only(allow);
+        } else if config.write_ext.is_some() {
+            let mut allow = tools.read_only_names();
+            allow.extend(["write", "edit", "patch"].map(String::from));
+            tools.retain_only(&allow);
         } else if config.read_only {
             let ro = tools.read_only_names();
             tools.retain_only(&ro);
@@ -1365,6 +1434,8 @@ impl Agent {
         ctx.restrict_to_cwd = !config.allow_outside_cwd;
         ctx.max_output = config.tool_max_bytes;
         ctx.max_output_lines = config.tool_max_lines;
+        // A write-scoped sub-agent (e.g. `plan`) may only touch these extensions.
+        ctx.write_allow_ext = config.write_ext.clone();
         if !config.hooks.is_empty() {
             // Invalid globs are skipped (lenient, like the rest of config).
             let hooks: Vec<hrdr_tools::Hook> = config
@@ -2586,6 +2657,7 @@ mod tests {
             prompt: Some("Implement precisely.".to_string()),
             read_only: false,
             tools: None,
+            write_ext: None,
         };
         let sub = subagent_config_for_profile(&base, &prof).unwrap();
         assert_eq!(sub.base_url, "https://openrouter.ai/api/v1");
@@ -2603,6 +2675,7 @@ mod tests {
                 prompt: None,
                 read_only: false,
                 tools: None,
+                write_ext: None,
             },
         )
         .unwrap();
@@ -2620,6 +2693,7 @@ mod tests {
                     prompt: None,
                     read_only: false,
                     tools: None,
+                    write_ext: None,
                 },
             )
             .is_err()
@@ -2645,15 +2719,22 @@ mod tests {
     }
 
     #[test]
-    fn builtin_agents_are_read_only_and_named() {
+    fn builtin_agents_are_named_and_scoped() {
         use super::builtin_subagent_profiles;
-        // The `explore` and `review` built-ins ship even with no user config.
-        let names: Vec<String> = builtin_subagent_profiles()
-            .into_iter()
-            .map(|p| p.name)
-            .collect();
-        assert_eq!(names, vec!["explore".to_string(), "review".to_string()]);
-        assert!(builtin_subagent_profiles().iter().all(|p| p.read_only));
+        // The four built-ins ship even with no user config.
+        let ps = builtin_subagent_profiles();
+        let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["explore", "review", "plan", "general"]);
+        // explore/review are read-only; plan writes Markdown; general is full.
+        let by = |n: &str| ps.iter().find(|p| p.name == n).unwrap();
+        assert!(by("explore").read_only);
+        assert!(by("review").read_only);
+        assert!(!by("plan").read_only);
+        assert_eq!(
+            by("plan").write_ext.as_deref(),
+            Some(&["md".to_string(), "markdown".to_string()][..])
+        );
+        assert!(!by("general").read_only && by("general").write_ext.is_none());
     }
 
     #[test]
@@ -2679,6 +2760,34 @@ mod tests {
         assert!(!tools.iter().any(|n| n == "task"));
         // The persona made it into the system prompt.
         assert!(system_prompt(&agent).contains("EXPLORE sub-agent"));
+    }
+
+    #[test]
+    fn plan_agent_gets_read_tools_plus_markdown_writes() {
+        use super::{builtin_subagent_profiles, subagent_base_config, subagent_config_for_profile};
+        let base = AgentConfig {
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        };
+        let plan = builtin_subagent_profiles()
+            .into_iter()
+            .find(|p| p.name == "plan")
+            .unwrap();
+        let cfg = subagent_config_for_profile(&subagent_base_config(&base), &plan).unwrap();
+        assert_eq!(
+            cfg.write_ext.as_deref(),
+            Some(&["md".to_string(), "markdown".to_string()][..])
+        );
+        let agent = Agent::new(cfg).unwrap();
+        let tools: Vec<String> = agent.tools().into_iter().map(|(n, _)| n).collect();
+        // Read/search tools plus the writers, but not the shell.
+        assert!(tools.iter().any(|n| n == "read"));
+        assert!(tools.iter().any(|n| n == "write"));
+        assert!(tools.iter().any(|n| n == "edit"));
+        assert!(!tools.iter().any(|n| n == "bash"));
+        // (The write gate that confines mutations to Markdown is exercised by
+        // `write_allow_ext_confines_mutations_to_listed_extensions` in hrdr-tools.)
+        assert!(system_prompt(&agent).contains("PLAN sub-agent"));
     }
 
     #[test]

@@ -389,16 +389,22 @@ several `task` calls in one turn runs the sub-agents **in parallel** — e.g.
 explore several areas of the codebase at once — each streaming into its own tool
 block.
 
-Two **built-in agents** ship out of the box, selected with the `task` tool's
+Four **built-in agents** ship out of the box, selected with the `task` tool's
 `agent` argument:
 
 - **`explore`** — a read-only code investigator (read/search tools only, no
   write/edit/shell). Traces files, types, and call paths and reports back.
 - **`review`** — a read-only code reviewer. Audits code or a change for bugs,
   edge cases, and security issues, with `path:line` findings.
+- **`plan`** — a planner. Investigates read-only, then writes a step-by-step
+  plan to disk as a **Markdown file** — it can create/edit `.md` files only, no
+  other file changes.
+- **`general`** — full tool access for open-ended, multi-step tasks (explore and
+  modify). The same agent you get from `task` with no `agent` argument.
 
-Both run on the main provider (respecting `subagent_model`) with a specialized
-system prompt and a tool set scoped to read-only, so they can't touch the tree.
+Each runs on the main provider (respecting `subagent_model`) with a specialized
+system prompt and a scoped tool set — `explore`/`review` are read-only, `plan`
+adds Markdown-only writes, `general` gets everything.
 
 A sub-agent can run on a **different model on the same provider** — e.g. an Opus
 main agent delegating implementation to a cheaper/faster Sonnet:
@@ -447,8 +453,9 @@ prompt = "You are a security reviewer. Focus on authn, injection, and secrets…
 ```
 
 `prompt` is appended to the sub-agent's system prompt (its role); `read_only`
-scopes it to the read-only tools; `tools` is an explicit allow-list that takes
-precedence over `read_only`.
+scopes it to the read-only tools; `write_ext` grants the read-only tools plus
+file writes limited to those extensions (e.g. `write_ext = ["md"]`, how `plan`
+is built); `tools` is an explicit allow-list that takes precedence over both.
 
 Sub-agents can't themselves delegate (recursion is bounded to one level) and
 don't spawn MCP servers. Their file edits aren't captured by the parent's
