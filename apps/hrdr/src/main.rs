@@ -49,6 +49,11 @@ struct Cli {
     #[arg(long, global = true)]
     effort: Option<String>,
 
+    /// Model for delegated sub-agents (the `task` tool). Same provider as the
+    /// main agent; defaults to the main model. E.g. Opus main + Sonnet subs.
+    #[arg(long = "subagent-model", global = true)]
+    subagent_model: Option<String>,
+
     /// Auto-compact toggle: any value in 0.0–1.0 enables it, 0 disables (the
     /// trigger point is set by --compaction-reserved).
     #[arg(long, global = true)]
@@ -242,6 +247,9 @@ async fn main() -> Result<()> {
     }
     if let Some(e) = cli.effort {
         config.effort = Some(e);
+    }
+    if let Some(m) = cli.subagent_model {
+        config.subagent_model = Some(m);
     }
     if let Some(r) = cli.auto_compact {
         config.auto_compact = r;

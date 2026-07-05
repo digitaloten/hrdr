@@ -77,6 +77,119 @@ pub fn steering_queue() -> SteeringQueue {
     Arc::new(Mutex::new(std::collections::VecDeque::new()))
 }
 
+/// Derive the base config for delegated sub-agents from the main agent's config:
+/// same provider/endpoint and cwd, but the sub-agent model, no nested `task` tool
+/// (recursion is bounded to one level), and no MCP servers (subs don't spawn
+/// them). The `task` tool clones this per call and may override the model.
+fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
+    let mut base = config.clone();
+    base.subagents = false;
+    base.mcp = Vec::new();
+    base.model = config
+        .subagent_model
+        .clone()
+        .unwrap_or_else(|| config.model.clone());
+    base
+}
+
+/// The `task` tool: delegate a self-contained sub-task to a fresh sub-agent that
+/// has its own context and (optionally) a different model. The sub-agent runs to
+/// completion and its final text becomes the tool result; its tool activity is
+/// streamed to the parent as live output.
+struct SubagentTool {
+    /// Base config for derived sub-agents (see [`subagent_base_config`]); cloned
+    /// and model-overridden per call.
+    base: AgentConfig,
+}
+
+#[async_trait::async_trait]
+impl hrdr_tools::Tool for SubagentTool {
+    fn name(&self) -> &'static str {
+        "task"
+    }
+
+    fn description(&self) -> &'static str {
+        "Delegate a self-contained sub-task to a fresh sub-agent with its own context \
+         (it can't see this conversation, so make `prompt` complete and standalone). Use \
+         it to keep the main context clean — broad exploration, or a focused piece of \
+         implementation — and to run cheaper/faster work on a different `model`. The \
+         sub-agent has the normal tools (read/write/edit/bash/grep/…) but can't itself \
+         delegate. It runs to completion and returns its final summary as the result."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "A 3-6 word label for the sub-task (shown to the user)."
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The complete, standalone task for the sub-agent: what to do and exactly what to report back."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model to run the sub-agent on (must be available on the current provider). Defaults to the configured subagent model, else the main model."
+                }
+            },
+            "required": ["prompt"]
+        })
+    }
+
+    fn read_only(&self) -> bool {
+        false
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &hrdr_tools::ToolContext,
+    ) -> anyhow::Result<String> {
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .filter(|p| !p.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("task needs a non-empty `prompt` argument"))?
+            .to_string();
+
+        let mut cfg = self.base.clone();
+        cfg.cwd = ctx.cwd.clone();
+        if let Some(m) = args
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|m| !m.trim().is_empty())
+        {
+            cfg.model = m.trim().to_string();
+        }
+        let model = cfg.model.clone();
+        let label = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("sub-task")
+            .to_string();
+        ctx.emit(format!("↳ task ({model}): {label}\n"));
+
+        let mut sub = Agent::new(cfg)?;
+        let mut output = String::new();
+        let steering = steering_queue();
+        sub.run(prompt, steering, |ev| match ev {
+            AgentEvent::Text(t) => output.push_str(&t),
+            AgentEvent::ToolStart { name, .. } => ctx.emit(format!("  · {name}\n")),
+            _ => {}
+        })
+        .await?;
+
+        let output = output.trim();
+        Ok(if output.is_empty() {
+            "(sub-agent finished with no text output)".to_string()
+        } else {
+            output.to_string()
+        })
+    }
+}
+
 /// Agent configuration.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -168,6 +281,15 @@ pub struct AgentConfig {
     /// Azure OpenAI API version for the active provider (see
     /// [`ProviderConfig::api_version`]); enables the Azure URL + auth quirks.
     pub api_version: Option<String>,
+    /// Expose the `task` tool so the model can delegate self-contained sub-tasks
+    /// to a fresh sub-agent. Default `true`; forced `false` inside a sub-agent so
+    /// it can't spawn its own (bounding recursion to one level).
+    pub subagents: bool,
+    /// Default model for delegated sub-agents (same provider/endpoint as the main
+    /// agent). `None` reuses the main agent's model; the `task` tool's `model`
+    /// argument overrides per call. This is the "Opus drives, Sonnet implements"
+    /// knob.
+    pub subagent_model: Option<String>,
 }
 
 /// Default auto-compaction trigger: 85% of the context window (leaves headroom
@@ -293,6 +415,8 @@ impl Default for AgentConfig {
             prompt_cache: None,
             headers: Vec::new(),
             api_version: None,
+            subagents: true,
+            subagent_model: None,
         }
     }
 }
@@ -513,6 +637,8 @@ struct FileConfig {
     stream_usage: Option<bool>,
     request_timeout: Option<u64>,
     prompt_cache_ttl: Option<String>,
+    subagents: Option<bool>,
+    subagent_model: Option<String>,
     effort: Option<String>,
     auto_compact: Option<f64>,
     compaction_reserved: Option<u32>,
@@ -615,6 +741,12 @@ impl AgentConfig {
         }
         if let Some(v) = fc.prompt_cache_ttl {
             self.prompt_cache_ttl = Some(v);
+        }
+        if let Some(v) = fc.subagents {
+            self.subagents = v;
+        }
+        if let Some(v) = fc.subagent_model {
+            self.subagent_model = Some(v);
         }
         if let Some(v) = fc.effort {
             self.effort = Some(v);
@@ -759,6 +891,12 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
         }
     }),
     ("HRDR_PROMPT_CACHE_TTL", |c, v| c.prompt_cache_ttl = Some(v)),
+    ("HRDR_SUBAGENT_MODEL", |c, v| c.subagent_model = Some(v)),
+    ("HRDR_SUBAGENTS", |c, v| {
+        if let Some(b) = parse_env_bool(&v) {
+            c.subagents = b;
+        }
+    }),
 ];
 
 /// Resolve the prompt-cache `setting` (`off`/`on`/`ephemeral`/`auto`; `None` =
@@ -945,7 +1083,15 @@ pub struct Agent {
 impl Agent {
     /// Construct an agent, seeding the system prompt for the default tool set.
     pub fn new(config: AgentConfig) -> Result<Self> {
-        let tools = ToolRegistry::with_defaults();
+        let mut tools = ToolRegistry::with_defaults();
+        // Expose the `task` delegation tool unless disabled (or this *is* a
+        // sub-agent). Registered before the system prompt is rendered so it's
+        // listed for the model.
+        if config.subagents {
+            tools.register(Arc::new(SubagentTool {
+                base: subagent_base_config(&config),
+            }));
+        }
         let mut ctx = ToolContext::new(config.cwd.clone());
         ctx.restrict_to_cwd = !config.allow_outside_cwd;
         ctx.max_output = config.tool_max_bytes;
@@ -2128,6 +2274,44 @@ mod tests {
     }
 
     #[test]
+    fn subagent_base_bounds_recursion_and_picks_model() {
+        use super::subagent_base_config;
+        let cfg = AgentConfig {
+            model: "opus".to_string(),
+            subagent_model: Some("sonnet".to_string()),
+            ..Default::default()
+        };
+        let base = subagent_base_config(&cfg);
+        assert!(!base.subagents, "sub-agents can't spawn sub-agents");
+        assert!(base.mcp.is_empty());
+        assert_eq!(base.model, "sonnet", "uses the configured subagent model");
+        // No subagent model → reuse the main model.
+        let cfg = AgentConfig {
+            model: "opus".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(subagent_base_config(&cfg).model, "opus");
+    }
+
+    #[test]
+    fn task_tool_present_only_when_subagents_enabled() {
+        let has_task = |subagents: bool| {
+            let cfg = AgentConfig {
+                subagents,
+                checkpoints: Some("off".to_string()),
+                ..Default::default()
+            };
+            Agent::new(cfg)
+                .unwrap()
+                .tools()
+                .iter()
+                .any(|(n, _)| n == "task")
+        };
+        assert!(has_task(true));
+        assert!(!has_task(false)); // e.g. inside a sub-agent
+    }
+
+    #[test]
     fn clear_rereads_agents_md() {
         let dir = tempfile::tempdir().unwrap();
         let agents_md = dir.path().join("AGENTS.md");
@@ -2348,6 +2532,8 @@ mod tests {
             stream_usage: Some(false),
             request_timeout: Some(30),
             prompt_cache_ttl: Some("1h".to_string()),
+            subagents: Some(false),
+            subagent_model: Some("claude-sonnet-4-6".to_string()),
             effort: Some("high".to_string()),
             auto_compact: Some(0.7),
             compaction_reserved: Some(12_345),
@@ -2384,6 +2570,8 @@ mod tests {
         assert!(!cfg.stream_usage);
         assert_eq!(cfg.request_timeout, Some(30));
         assert_eq!(cfg.prompt_cache_ttl.as_deref(), Some("1h"));
+        assert!(!cfg.subagents);
+        assert_eq!(cfg.subagent_model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!((cfg.auto_compact - 0.7).abs() < f64::EPSILON);
         assert_eq!(cfg.compaction_reserved, 12_345);

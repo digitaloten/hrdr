@@ -376,6 +376,28 @@ batched concurrently like the built-in read tools; everything else runs
 sequentially. (The Streamable-HTTP transport handles both `application/json` and
 SSE responses and carries the server's session id.)
 
+### Sub-agents
+
+The model can delegate a self-contained sub-task to a fresh **sub-agent** via
+the `task` tool — useful for broad exploration or a focused piece of
+implementation, so the main conversation stays clean. The sub-agent has its own
+context and the normal tools, runs to completion, and returns its summary as the
+result (its tool activity streams live).
+
+A sub-agent can run on a **different model on the same provider** — e.g. an Opus
+main agent delegating implementation to a cheaper/faster Sonnet:
+
+```toml
+subagent_model = "claude-sonnet-4-6"   # default for delegated sub-agents
+# subagents = false                    # disable the task tool entirely
+```
+
+The model can also override the model per call (the `task` tool's `model`
+argument). Also `$HRDR_SUBAGENT_MODEL` / `--subagent-model`. Sub-agents can't
+themselves delegate (recursion is bounded to one level) and don't spawn MCP
+servers. Their file edits aren't captured by the parent's `/revert` yet — use
+git.
+
 ### Guardrails
 
 The shell tools mechanically reject the classic foot-guns before they run —

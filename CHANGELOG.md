@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Sub-agents (`task` tool).** The model can delegate a self-contained sub-task
+  to a fresh sub-agent with its own context, keeping the main conversation clean
+  — broad exploration, or a focused piece of implementation. Crucially the
+  sub-agent can run on a **different model on the same provider** (via the
+  tool's `model` argument, or a `subagent_model` / `$HRDR_SUBAGENT_MODEL` /
+  `--subagent-model` default) — e.g. an Opus main agent delegating
+  implementation to Sonnet. The sub-agent gets the normal tools but can't itself
+  delegate (recursion bounded to one level) and doesn't spawn MCP servers; its
+  tool activity streams to the parent as live output and its final summary
+  becomes the tool result. Disable with `subagents = false` / `$HRDR_SUBAGENTS`.
+  (Sub-agent file edits aren't captured by the parent's `/revert` yet — use
+  git.)
+
 ## [0.2.6] - 2026-07-05
 
 ### Added
