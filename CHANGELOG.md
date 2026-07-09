@@ -48,6 +48,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   entry (`EntryKind::Reasoning { text, took_ms }`) rather than a string spliced
   into the thought's text, so it no longer passes through markdown or gets
   persisted into the transcript.
+- **Fenced code renders at its block's own indentation**, with no language tag
+  row above it — it reads as the file's text rather than a framed widget.
+- **Blank separator rows only between tinted blocks.** A prompt and the tool
+  call it triggered, or two tool calls, would otherwise merge into one slab; a
+  block on the terminal background already begins and ends in a blank row.
 - **User prompts render like the model's output**: same markdown pipeline, same
   foreground colors. Only the block's background differs. Queued messages too.
 - **Tool blocks show tool-specific detail**: the shell command and its output,

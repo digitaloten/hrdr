@@ -2108,3 +2108,142 @@ async fn user_prompts_render_like_the_models_output() {
     assert_eq!(prompt_bg, h.app.theme.user_bg);
     assert_eq!(reply_bg, Color::Reset);
 }
+
+/// Fenced code renders at the block's own indentation, with no language tag row
+/// above it — it is the file's text, not a framed widget.
+///
+/// Regression: code blocks were padded into a solid rectangle (an extra leading
+/// column) and prefixed with a dim `rs` tag line.
+#[tokio::test]
+async fn fenced_code_has_no_extra_indent_or_language_row() {
+    let mut h = Harness::new(vec![MockReply::Text(
+        "text\n\n```rs\nfn main() {\n    let x = 1;\n}\n```\n".into(),
+    )])
+    .await;
+    h.submit("go").await;
+    h.app
+        .state
+        .transcript
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+
+    let mut term = Terminal::new(TestBackend::new(44, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+    let rows: Vec<&str> = screen.lines().collect();
+
+    let prose_y = rows
+        .iter()
+        .position(|l| l.contains("text"))
+        .expect("prose rendered");
+    let indent = |l: &str| l.len() - l.trim_start().len();
+
+    // No `rs` tag row between the prose and the code.
+    assert!(
+        rows[prose_y + 1].contains("fn main()"),
+        "a language row was inserted:\n{screen}"
+    );
+    // The code starts in the same column as the prose around it…
+    assert_eq!(
+        indent(rows[prose_y + 1]),
+        indent(rows[prose_y]),
+        "code is indented past the prose:\n{screen}"
+    );
+    // …and the file's own indentation is preserved exactly.
+    assert_eq!(
+        indent(rows[prose_y + 2]) - indent(rows[prose_y]),
+        4,
+        "the file's 4-space indent changed:\n{screen}"
+    );
+}
+
+/// A blank separator row appears only between two *tinted* blocks. Their padded
+/// rows carry their backgrounds, so a prompt and the tool call it triggered — or
+/// two tool calls — would otherwise merge into one slab. A block on the terminal
+/// background already begins and ends in a blank row, so it needs no separator
+/// on either side.
+///
+/// prompt │ tool │ tool │ thought │ tool │ output
+///        ↑blank ↑blank ↑         ↑      ↑
+#[tokio::test]
+async fn separator_rows_appear_only_between_tinted_blocks() {
+    let tool = |id: &str, name: &str| {
+        Entry::now(EntryKind::Tool {
+            id: id.into(),
+            name: name.into(),
+            args: "{}".into(),
+            result: format!("res-{id}"),
+            ok: true,
+            done: true,
+            expanded: false,
+        })
+    };
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .state
+        .transcript
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::user("prompt"));
+    h.app.push_entry(tool("a", "ls"));
+    h.app.push_entry(tool("b", "cat"));
+    h.app.push_entry(Entry::reasoning("thought"));
+    h.app.push_entry(tool("c", "grep"));
+    h.app.push_entry(Entry::assistant("output"));
+
+    let mut term = Terminal::new(TestBackend::new(40, 40)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+
+    let row_of = |needle: &str| -> u16 {
+        (0..40)
+            .find(|&y| {
+                (0..39)
+                    .filter_map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol().to_string())
+                    })
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no row containing {needle:?}:\n{screen}"))
+    };
+    // Blank rows strictly between two blocks' content rows. Two blocks always
+    // contribute their own bottom + top pad; a separator makes it three.
+    let blank = |y: u16| {
+        (0..39)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect::<String>()
+            .trim()
+            .is_empty()
+    };
+    let gap = |from: u16, to: u16| (from + 1..to).filter(|&y| blank(y)).count();
+
+    // Anchor on each block's *last* content row and the next block's first.
+    let (prompt_end, ls_end, cat_end) = (row_of("#1 you"), row_of("res-a"), row_of("res-b"));
+    let (thought, grep_end) = (row_of("thought"), row_of("res-c"));
+
+    // Tinted → tinted: both blocks' pads, plus a separator row between them.
+    assert_eq!(
+        gap(prompt_end, row_of("ls")),
+        3,
+        "prompt → tool needs a separator:\n{screen}"
+    );
+    assert_eq!(
+        gap(ls_end, row_of("cat")),
+        3,
+        "tool → tool needs a separator:\n{screen}"
+    );
+
+    // Tinted → untinted and back: just the two pads, no separator.
+    assert_eq!(gap(cat_end, thought), 2, "tool → thought:\n{screen}");
+    assert_eq!(gap(thought, row_of("grep")), 2, "thought → tool:\n{screen}");
+    assert_eq!(
+        gap(grep_end, row_of("output")),
+        2,
+        "tool → output:\n{screen}"
+    );
+}

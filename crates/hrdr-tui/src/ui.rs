@@ -791,68 +791,19 @@ fn highlight_line(line: Line<'static>, needle: &str, hl: Style) -> Line<'static>
 type TranscriptKey = (usize, u64, u16, bool, bool);
 
 thread_local! {
-    // Cache highlighted code blocks (keyed by lang+content+width) so the ~8/sec
-    // redraw doesn't re-run syntect every frame.
-    static HL_CACHE: RefCell<HashMap<u64, Vec<Line<'static>>>> = RefCell::new(HashMap::new());
-    // Incremental syntect state for streaming blocks (misses in HL_CACHE —
-    // the content grows every token — only pay for the new lines).
+    // Incremental syntect state: a streaming block's content grows every token,
+    // so only pay for the new lines. (The rendered rows are cached per entry by
+    // TRANSCRIPT_CACHE below.)
     static INC_HL: RefCell<hrdr_app::HighlightCache> = RefCell::new(hrdr_app::HighlightCache::new());
     // Cache rendered transcript entry content lines (excluding the per-message
     // timestamp meta line, which is always fresh).
     // Key: (entry_idx, content_fingerprint, render_width, expand_all, show_reasoning).
-    // Evicted in bulk at 1024 entries — same policy as HL_CACHE.
+    // Evicted in bulk at 1024 entries.
     static TRANSCRIPT_CACHE: RefCell<HashMap<TranscriptKey, Vec<Line<'static>>>> = RefCell::new(HashMap::new());
     // Cached wrapped-row height per logical line, keyed on (span-content hash,
     // width). Avoids repeated Paragraph::line_count calls for stable lines when
     // building the cumulative-height array used for tool click hit-testing.
     static LINE_WRAP_CACHE: RefCell<HashMap<(u64, u16), usize>> = RefCell::new(HashMap::new());
-}
-
-/// Render a fenced code block with syntect highlighting on a distinct
-/// background, padded to a solid rectangle. Cached per (lang, content, width, bg).
-fn highlight_code_block(lang: &str, content: &str, width: u16, bg: Color) -> Vec<Line<'static>> {
-    let mut hasher = DefaultHasher::new();
-    lang.hash(&mut hasher);
-    content.hash(&mut hasher);
-    width.hash(&mut hasher);
-    bg.hash(&mut hasher);
-    let key = hasher.finish();
-    if let Some(cached) = HL_CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        return cached;
-    }
-    let lines = render_code_block(lang, content, width, bg);
-    HL_CACHE.with(|c| {
-        let mut m = c.borrow_mut();
-        if m.len() > 1024 {
-            m.clear();
-        }
-        m.insert(key, lines.clone());
-    });
-    lines
-}
-
-fn render_code_block(lang: &str, content: &str, width: u16, bg: Color) -> Vec<Line<'static>> {
-    let w = width as usize;
-    let mut out: Vec<Line<'static>> = Vec::new();
-
-    // A small language tag bar atop the block.
-    if !lang.is_empty() {
-        out.push(pad_line(
-            vec![Span::styled(
-                format!("{lang} "),
-                Style::default()
-                    .fg(Color::Gray)
-                    .bg(bg)
-                    .add_modifier(Modifier::ITALIC),
-            )],
-            w,
-            bg,
-        ));
-    }
-    for line in highlight_lines(lang, content, bg) {
-        out.push(pad_line(line.spans, w, bg));
-    }
-    out
 }
 
 /// Syntax-highlight `content` into unpadded lines on `bg` — the raw text, one
@@ -1217,7 +1168,7 @@ pub(crate) fn clear_transcript_cache() {
 
 /// Look up `key` in [`TRANSCRIPT_CACHE`]; on miss, call `render()` to produce
 /// lines, cache them (evicting the whole map when it exceeds 256 entries), then
-/// return. The same eviction policy as `HL_CACHE`.
+/// return, evicting the whole map when it exceeds its cap.
 fn cache_entry<F>(key: TranscriptKey, render: F) -> Vec<Line<'static>>
 where
     F: FnOnce() -> Vec<Line<'static>>,
@@ -1290,25 +1241,35 @@ impl PendingBlock {
 
 /// Paint a held block, recording where its messages start and (for a tool call)
 /// the row span a click can hit.
+///
+/// `next_bg` is the background of the block that follows, if any. A blank
+/// separator row is emitted only between two *tinted* blocks: their padded rows
+/// carry their backgrounds, so a prompt followed by the tool call it triggered
+/// (or two tool calls) would otherwise merge into one slab. A block on the
+/// terminal background already begins and ends in a blank row, so pairing it
+/// with anything needs no separator.
 fn flush(
     out: &mut Vec<Line<'static>>,
     msg_starts: &mut Vec<usize>,
     tool_regions: &mut Vec<(usize, usize, usize)>,
     pending: Option<PendingBlock>,
+    next_bg: Option<Color>,
     width: usize,
     theme: &Theme,
 ) {
     let Some(block) = pending else { return };
     let start = out.len();
-    out.extend(render_block(block.lines, width, block.kind.bg(theme)));
+    let bg = block.kind.bg(theme);
+    out.extend(render_block(block.lines, width, bg));
     for _ in 0..block.msgs {
         msg_starts.push(start);
     }
     if let Some(i) = block.tool_idx {
         tool_regions.push((start, out.len(), i));
     }
-    // One blank row between blocks; each block carries its own top/bottom pad.
-    out.push(Line::raw(""));
+    if bg != Color::Reset && next_bg.is_some_and(|n| n != Color::Reset) {
+        out.push(Line::raw(""));
+    }
 }
 
 /// Returns the rendered transcript lines, the logical-line index each 1-based
@@ -1534,6 +1495,7 @@ fn transcript_lines(
             &mut msg_starts,
             &mut tool_regions,
             pending.take(),
+            Some(kind.bg(theme)),
             w,
             theme,
         );
@@ -1548,11 +1510,15 @@ fn transcript_lines(
             footer_len,
         });
     }
+    // Queued prompts follow the transcript, so the last block is separated from
+    // them exactly as it would be from any other tinted block.
+    let queued_bg = (!app.queue.is_empty()).then(|| BlockKind::Queued.bg(theme));
     flush(
         &mut out,
         &mut msg_starts,
         &mut tool_regions,
         pending.take(),
+        queued_bg,
         w,
         theme,
     );
@@ -1580,11 +1546,13 @@ fn transcript_lines(
     if !app.queue.is_empty() {
         let bg = BlockKind::Queued.bg(theme);
         let badge = Style::default().fg(Color::Black).bg(theme.warn).bold();
-        for msg in &app.queue {
+        for (i, msg) in app.queue.iter().enumerate() {
+            if i > 0 {
+                out.push(Line::raw("")); // between two tinted queued blocks
+            }
             let mut body = markdown_lines(msg, &md_theme, bg, inner);
             body.push(Line::from(Span::styled(" Queued ", badge)));
             out.extend(render_block(body, w, bg));
-            out.push(Line::raw(""));
         }
     }
 
@@ -1601,7 +1569,8 @@ fn text_lines(text: &str, style: Style) -> Vec<Line<'static>> {
 
 /// Render markdown into block-body lines: prose through hjkl-markdown, fenced
 /// code blocks pulled out and syntax-highlighted. `bg` is the enclosing block's
-/// background — code blocks sit on it rather than a surface of their own.
+/// background — code sits on it rather than a surface of its own, at the block's
+/// own indentation and with no language tag.
 fn markdown_lines(
     text: &str,
     md: &hjkl_markdown_tui::MdTheme,
@@ -1616,7 +1585,7 @@ fn markdown_lines(
                 buf.extend(hjkl_markdown_tui::to_lines(&ev_buf, md, width.max(1)));
                 ev_buf.clear();
             }
-            buf.extend(highlight_code_block(&lang, &content, width.max(1), bg));
+            buf.extend(highlight_lines(&lang, &content, bg));
         } else {
             ev_buf.push(ev);
         }
