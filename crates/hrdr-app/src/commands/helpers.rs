@@ -1,0 +1,193 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use hrdr_agent::{Agent, Session};
+use tokio::sync::Mutex;
+
+pub fn busy_guard(action: &str) -> String {
+    format!("can't {action} while a turn is running")
+}
+
+pub fn busy_generic() -> String {
+    "busy — try again after the current turn".to_string()
+}
+
+/// `/expand` status lines (both frontends show the same wording).
+pub mod expand_msg {
+    pub const ALL: &str = "tool output expanded (all)";
+    pub const OFF: &str = "tool output collapsed";
+    pub const LAST_COLLAPSED: &str = "collapsed last tool output";
+    pub const LAST_EXPANDED: &str = "expanded last tool output";
+    pub const NONE: &str = "no tool output to expand";
+}
+
+/// `/reload` + hot-reload status lines (both frontends).
+pub const RELOAD_MANUAL_MSG: &str = "reloaded config (theme, effort, toggles)";
+pub const RELOAD_HOT_MSG: &str = "config changed on disk — reloaded";
+/// Invalid config file on reload: keep the current settings and warn.
+pub fn reload_invalid_message(e: &dyn std::fmt::Display) -> String {
+    format!("config invalid — keeping current settings: {e}")
+}
+
+/// Startup notice when `AGENTS.md` was gathered into the system prompt.
+pub const PROJECT_DOCS_LOADED_MSG: &str = "loaded project instructions from AGENTS.md";
+
+/// Startup warning when the config file exists but is invalid (the running
+/// config already fell back to defaults + env).
+pub fn startup_config_warning() -> Option<String> {
+    hrdr_agent::AgentConfig::load_checked()
+        .err()
+        .map(|e| format!("config file is invalid — using defaults: {e}"))
+}
+
+/// Guard shown when `/resume` is attempted mid-turn (the running turn holds
+/// the agent mutex: the message swap would silently no-op while the transcript
+/// and session id switched, and the turn's autosave would then overwrite the
+/// resumed session's file with the old conversation).
+pub const RESUME_BUSY_MSG: &str = "a turn is running — interrupt it before /resume";
+
+/// What restoring a session changes beyond the host's own state swap: the
+/// working directory to adopt (if any) and the system lines to show, in order.
+pub struct ResumePlan {
+    /// The session's cwd when it exists and differs from the current one.
+    pub new_cwd: Option<PathBuf>,
+    /// Notices: the "resumed …" line, then cwd / missing-cwd / endpoint notes.
+    pub lines: Vec<String>,
+}
+
+/// The shared `/resume` semantics both frontends apply: follow the session's
+/// working directory (in-process only) and surface the same notices.
+pub fn resume_plan(session: &Session, prev_cwd: &Path, current_base_url: &str) -> ResumePlan {
+    let mut lines = vec![format!(
+        "resumed '{}' ({} messages)",
+        session.name,
+        session.messages.len()
+    )];
+    let mut new_cwd = None;
+    if !session.cwd.is_empty() && Path::new(&session.cwd) != prev_cwd {
+        let target = PathBuf::from(&session.cwd);
+        if target.is_dir() {
+            lines.push(format!("cwd → {}", target.display()));
+            new_cwd = Some(target);
+        } else {
+            lines.push(format!(
+                "note: session cwd {} no longer exists; staying in {}",
+                session.cwd,
+                prev_cwd.display()
+            ));
+        }
+    }
+    if session.base_url != current_base_url {
+        lines.push(format!(
+            "note: session endpoint was {} (current: {current_base_url})",
+            session.base_url
+        ));
+    }
+    ResumePlan { new_cwd, lines }
+}
+
+/// Minimum turn duration before the finish nudge fires (terminal bell in the
+/// TUI, desktop notification in the GUI) — quick replies stay silent.
+pub const BELL_MIN_SECS: f64 = 5.0;
+
+/// Whether a finished turn warrants the nudge: the knob is on and the turn ran
+/// at least [`BELL_MIN_SECS`].
+pub fn should_bell(enabled: bool, elapsed_secs: Option<f64>) -> bool {
+    enabled && elapsed_secs.is_some_and(|e| e >= BELL_MIN_SECS)
+}
+
+/// The cancel notice both frontends show (with the discarded-queue count).
+pub fn cancel_message(dropped: usize) -> String {
+    if dropped > 0 {
+        format!("[cancelled · {dropped} queued message(s) discarded]")
+    } else {
+        "[cancelled]".to_string()
+    }
+}
+
+/// The one-time notice when a session file is first created.
+pub fn session_saved_notice(id: &str) -> String {
+    format!("session saved as '{id}' — /resume {id}")
+}
+
+/// Copy `text` to the OS clipboard, returning the status line both frontends
+/// show. `cb` is the frontend's long-lived clipboard handle (`None` when the
+/// platform has none).
+pub fn clipboard_copy_status(
+    cb: &mut Option<hjkl_clipboard::Clipboard>,
+    text: &str,
+    label: &str,
+) -> String {
+    use hjkl_clipboard::{MimeType, Selection};
+    match cb
+        .as_mut()
+        .map(|cb| cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()))
+    {
+        Some(Ok(())) => format!("copied {label} to clipboard"),
+        Some(Err(_)) => "clipboard write failed".to_string(),
+        None => "clipboard unavailable".to_string(),
+    }
+}
+
+/// Read the OS clipboard as text (`/paste`).
+pub fn clipboard_read_text(cb: &Option<hjkl_clipboard::Clipboard>) -> Option<String> {
+    use hjkl_clipboard::{MimeType, Selection};
+    let bytes = cb
+        .as_ref()
+        .and_then(|cb| cb.get(Selection::Clipboard, MimeType::Text).ok())?;
+    Some(String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// The tools' working directory: the agent's cwd when the lock is free
+/// (a turn may hold it), else the process cwd.
+pub fn agent_cwd(agent: &Arc<Mutex<Agent>>) -> PathBuf {
+    agent
+        .try_lock()
+        .map(|a| a.cwd())
+        .ok()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default()
+}
+
+/// The names of sub-agents the live agent can delegate to (for `@name` mention
+/// routing). Empty when the lock is held (a turn is running) or delegation is off.
+pub fn agent_names(agent: &Arc<Mutex<Agent>>) -> Vec<String> {
+    agent
+        .try_lock()
+        .map(|a| a.agent_names().to_vec())
+        .unwrap_or_default()
+}
+
+/// [`crate::prepare_outgoing`] for frontends holding the shared agent handle:
+/// fetches the sub-agent names ([`agent_names`]) and cwd ([`agent_cwd`]) itself.
+pub fn prepare_outgoing_via(agent: &Arc<Mutex<Agent>>, input: &str) -> String {
+    crate::prepare_outgoing(input, &agent_names(agent), &agent_cwd(agent))
+}
+
+/// Re-read `AGENTS.md` into the system prompt (used by `/reload` and after an
+/// `/init` turn writes the file). Returns the standard system line when
+/// project docs were loaded, `None` when there are none.
+pub async fn reload_project_docs(agent: Arc<Mutex<Agent>>) -> Option<String> {
+    let mut a = agent.lock().await;
+    let cwd = a.cwd();
+    a.set_cwd(cwd); // re-runs the AGENTS.md gather for the (unchanged) cwd
+    a.project_docs()
+        .is_some()
+        .then(|| "loaded AGENTS.md into the system prompt".to_string())
+}
+
+/// The working-tree `git diff` for `cwd` (stdout on success, stderr message on
+/// failure). Shared by `/diff`.
+pub async fn git_working_diff(cwd: &Path) -> Result<String, String> {
+    let out = tokio::process::Command::new("git")
+        .arg("diff")
+        .current_dir(cwd)
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}

@@ -88,10 +88,7 @@ impl UiConfig {
     /// absent (the agent-side `load_checked` already surfaces the warning).
     pub fn load() -> Self {
         let mut cfg = Self::default();
-        if let Some(path) = hrdr_agent::config_file_path()
-            && let Ok(text) = std::fs::read_to_string(&path)
-            && let Ok(fc) = toml::from_str::<UiFileConfig>(&text)
-        {
+        if let Some(fc) = hrdr_agent::read_config_file::<UiFileConfig>() {
             cfg.apply_file(fc);
         }
         cfg.apply_env();

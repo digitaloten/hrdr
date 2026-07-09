@@ -1194,7 +1194,7 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
 /// opencode's `tool_output`. Output over either limit is truncated and (for
 /// `bash`/`grep`) the full text is saved to disk.
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
-pub struct ToolOutputConfig {
+pub(crate) struct ToolOutputConfig {
     /// Max output lines before truncation (default 2000).
     #[serde(default)]
     pub max_lines: Option<usize>,
@@ -1260,6 +1260,14 @@ pub fn config_file_path() -> Option<std::path::PathBuf> {
     Some(config_dir()?.join("config.toml"))
 }
 
+/// Read the config TOML file and deserialize it into `T`. Returns `None` when
+/// the file is missing or unreadable.
+pub fn read_config_file<T: serde::de::DeserializeOwned>() -> Option<T> {
+    let path = config_file_path()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    toml::from_str(&text).ok()
+}
+
 impl AgentConfig {
     /// Load config with precedence: env > `~/.config/hrdr/config.toml` > built-in
     /// defaults. Lenient: a malformed config file is ignored (treated as absent).
@@ -1278,11 +1286,7 @@ impl AgentConfig {
     /// and fails to parse (for surfacing a warning + falling back to defaults).
     pub fn load_checked() -> Result<Self> {
         let mut cfg = Self::default();
-        if let Some(path) = config_file_path()
-            && let Ok(text) = std::fs::read_to_string(&path)
-        {
-            let fc: FileConfig =
-                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        if let Some(fc) = read_config_file::<FileConfig>() {
             cfg.apply_file(fc);
         }
         cfg.apply_env();

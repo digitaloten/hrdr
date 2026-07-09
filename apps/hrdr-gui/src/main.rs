@@ -1302,8 +1302,6 @@ fn app_view(
         if inp.starts_with('/') {
             return hrdr_app::slash_completions(&inp)
                 .into_iter()
-                // Only offer what the GUI implements (see TUI_ONLY_COMMANDS).
-                .filter(|(name, _)| !hrdr_app::is_tui_only(name))
                 .map(|(name, desc)| CompRow::Slash { name, desc })
                 .collect();
         }

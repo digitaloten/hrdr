@@ -166,8 +166,7 @@ impl ToolContext {
 
     /// Resolve a possibly-relative path against `cwd`.
     pub fn resolve(&self, path: &str) -> PathBuf {
-        let p = PathBuf::from(path);
-        if p.is_absolute() { p } else { self.cwd.join(p) }
+        resolve_under(&self.cwd, path)
     }
 
     /// Record that the model has seen `path`'s current content (a successful
@@ -236,6 +235,17 @@ impl ToolContext {
             .lock()
             .map(|set| set.contains(&canon))
             .unwrap_or(true) // poisoned lock: don't wedge edits
+    }
+}
+
+/// Resolve `path` against `base`: absolute paths pass through unchanged,
+/// relative ones are joined onto `base`.
+pub fn resolve_under(base: &std::path::Path, path: &str) -> PathBuf {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
     }
 }
 

@@ -141,21 +141,6 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
     ("Other", &["/reload", "/help", "/exit"]),
 ];
 
-/// Commands only the TUI implements today (terminal-coupled, or not yet ported
-/// to the GUI). Canonical names; aliases resolve before matching. The GUI
-/// filters these out of completion and `/help`, and answers with a notice
-/// instead of sending the text to the model.
-pub const TUI_ONLY_COMMANDS: &[&str] = &[];
-
-/// Whether `cmd` (with or without the leading `/`; aliases welcome) is a
-/// TUI-only command per [`TUI_ONLY_COMMANDS`].
-pub fn is_tui_only(cmd: &str) -> bool {
-    let c = resolve_alias(cmd.trim().trim_start_matches('/'));
-    TUI_ONLY_COMMANDS
-        .iter()
-        .any(|n| n.trim_start_matches('/') == c)
-}
-
 /// Whether `cmd` (with or without the leading `/`; aliases welcome) is a
 /// registered slash command at all — used by frontends to tell "command I
 /// don't support" apart from "not a command, send it to the model".
@@ -302,27 +287,10 @@ mod tests {
     }
 
     #[test]
-    fn tui_only_and_known_command_classification() {
-        // Every TUI-only entry must exist in the registry.
-        for name in TUI_ONLY_COMMANDS {
-            assert!(
-                SLASH_COMMANDS.iter().any(|(n, _)| n == name),
-                "TUI-only references unknown command {name}"
-            );
-        }
-        assert!(!is_tui_only("/theme")); // shared since the GUI live-swaps
-        assert!(!is_tui_only("cd")); // alias of /cwd — shared now
-        assert!(!is_tui_only("/summarize")); // alias of /compact — shared now
-        assert!(!is_tui_only("/help"));
-        assert!(!is_tui_only("/export"));
-        assert!(!is_tui_only("/retry"));
-        assert!(!is_tui_only("/edit")); // shared: OS opener in the GUI
+    fn known_command_classification() {
         assert!(is_known_command("/new")); // alias entries count
         assert!(is_known_command("model"));
         assert!(!is_known_command("/frobnicate"));
-        // With an empty TUI-only list, the filtered help equals the full one.
-        let gui_help = help_body_for(|n| !is_tui_only(n));
-        assert_eq!(gui_help, help_body_for(|_| true));
     }
 
     #[test]

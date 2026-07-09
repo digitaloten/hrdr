@@ -141,27 +141,11 @@ pub fn prepare_outgoing(input: &str, names: &[String], cwd: &Path) -> String {
 }
 
 /// Largest byte index `<= index` that lands on a UTF-8 char boundary of `s`.
-fn floor_char_boundary(s: &str, index: usize) -> usize {
-    if index >= s.len() {
-        return s.len();
-    }
-    let mut i = index;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
+pub use hrdr_tools::floor_char_boundary;
 
 /// Resolve `path` against `base`: absolute paths pass through unchanged,
 /// relative ones are joined onto `base`.
-pub fn resolve_under(base: &Path, path: &str) -> PathBuf {
-    let p = Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        base.join(p)
-    }
-}
+pub use hrdr_tools::resolve_under;
 
 /// Display form of `cwd`, with the home directory collapsed to `~`.
 pub fn display_dir(cwd: &Path) -> String {

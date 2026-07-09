@@ -225,7 +225,7 @@ impl super::App {
             return;
         }
         if self.running {
-            self.system("can't /edit while a turn is running");
+            self.system(hrdr_app::busy_guard("/edit"));
             return;
         }
         let Some(cwd) = self.with_agent_or_busy(|a| a.cwd()) else {
