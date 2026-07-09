@@ -2431,3 +2431,55 @@ async fn collapsing_while_following_stays_at_the_bottom() {
 
     assert_eq!(h.app.scroll_offset, 0, "still following the newest output");
 }
+
+/// A tinted block at the end of the scrollback gets the same blank row it would
+/// get before another tinted block, so it doesn't butt up against the input.
+#[tokio::test]
+async fn a_trailing_tinted_block_ends_with_a_blank_row() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .state
+        .transcript
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::user("go"));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "c1".into(),
+        name: "bash".into(),
+        args: "{}".into(),
+        result: "res".into(),
+        ok: true,
+        done: true,
+        expanded: false,
+    }));
+
+    let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+
+    let last_content = (0..h.app.transcript_height)
+        .rev()
+        .find(|&y| {
+            (0..39)
+                .filter_map(|x| {
+                    buf.cell(Position::new(x, y))
+                        .map(|c| c.symbol().to_string())
+                })
+                .collect::<String>()
+                .contains("res")
+        })
+        .expect("tool output rendered");
+    let bg_at = |y: u16| buf.cell(Position::new(2, y)).unwrap().bg;
+
+    // Its own bottom pad (tinted), then a blank row on the terminal background.
+    assert_eq!(
+        bg_at(last_content + 1),
+        h.app.theme.user_bg,
+        "bottom pad:\n{screen}"
+    );
+    assert_eq!(
+        bg_at(last_content + 2),
+        Color::Reset,
+        "a blank row closes the scrollback:\n{screen}"
+    );
+}

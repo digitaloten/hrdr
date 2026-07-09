@@ -1262,6 +1262,9 @@ impl PendingBlock {
 /// * **untinted → untinted** — both pads are plain blank rows, and two of them
 ///   is one too many between the model's thought and its output. One is dropped.
 /// * **mixed** — the two pads already read as a single gap. Left alone.
+/// * **tinted → nothing** — the last block in the scrollback gets the same blank
+///   row it would get before another tinted block, so it doesn't butt up against
+///   whatever sits below the transcript.
 fn flush(
     out: &mut Vec<Line<'static>>,
     msg_starts: &mut Vec<usize>,
@@ -1282,7 +1285,7 @@ fn flush(
         tool_regions.push((start, out.len(), i));
     }
     match (bg == Color::Reset, next_bg.map(|n| n == Color::Reset)) {
-        (false, Some(false)) => out.push(Line::raw("")),
+        (false, Some(false) | None) => out.push(Line::raw("")),
         // Drop this block's bottom pad; the next block's top pad is the gap.
         (true, Some(true)) => {
             out.pop();
@@ -1565,13 +1568,13 @@ fn transcript_lines(
     if !app.queue.is_empty() {
         let bg = BlockKind::Queued.bg(theme);
         let badge = Style::default().fg(Color::Black).bg(theme.warn).bold();
-        for (i, msg) in app.queue.iter().enumerate() {
-            if i > 0 {
-                out.push(Line::raw("")); // between two tinted queued blocks
-            }
+        for msg in &app.queue {
             let mut body = markdown_lines(msg, &md_theme, bg, inner);
             body.push(Line::from(Span::styled(" Queued ", badge)));
             out.extend(render_block(body, w, bg));
+            // Queued blocks are tinted: a blank row separates them from each
+            // other, and the last one from the input pane below.
+            out.push(Line::raw(""));
         }
     }
 
@@ -2288,8 +2291,8 @@ mod block_tests {
         assert_eq!(gap(tinted, Some(plain)), 2, "tinted → untinted");
         assert_eq!(gap(plain, Some(tinted)), 2, "untinted → tinted");
 
-        // Nothing follows: a tinted block gets no trailing separator, and an
-        // untinted one keeps its bottom pad.
+        // Nothing follows: a tinted block still gets its blank row (so it doesn't
+        // butt up against the input pane); an untinted one just keeps its pad.
         let trailing = |kind: BlockKind| -> usize {
             let mut out = Vec::new();
             let (mut starts, mut regions) = (Vec::new(), Vec::new());
@@ -2310,8 +2313,8 @@ mod block_tests {
             );
             out.len() - 2 // minus the content row and the top pad
         };
-        assert_eq!(trailing(tinted), 1, "bottom pad only, no separator");
-        assert_eq!(trailing(plain), 1, "bottom pad kept");
+        assert_eq!(trailing(tinted), 2, "bottom pad + a blank row");
+        assert_eq!(trailing(plain), 1, "bottom pad only");
     }
 
     /// `flush` still records where a block's messages start and, for a tool
