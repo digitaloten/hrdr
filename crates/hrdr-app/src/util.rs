@@ -166,9 +166,15 @@ pub fn config_mtime() -> Option<std::time::SystemTime> {
 }
 
 /// Keeps a config watch alive; drop it to stop watching.
+///
+/// Field order is the drop order, and it matters: the watcher (and the poller,
+/// aborted in `Drop`) must release their `Sender` clones before `_debounce_tx`
+/// does, or the debounce thread's channel never disconnects and the thread
+/// leaks.
 pub struct ConfigWatcherGuard {
     _watcher: Option<notify::RecommendedWatcher>,
     poller: Option<tokio::task::JoinHandle<()>>,
+    _debounce_tx: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl Drop for ConfigWatcherGuard {
@@ -179,21 +185,59 @@ impl Drop for ConfigWatcherGuard {
     }
 }
 
-/// Watch the user config file, invoking `on_change` (from a background
-/// thread/task) on every modification — the unified hot-reload source for
-/// both frontends. Uses an OS-level watcher (inotify/FSEvents/…) on the
-/// config's parent directory (so atomic saves via rename are caught) and
-/// falls back to 2s mtime polling when a watcher can't be created. The
-/// callback should just ping the frontend's channel; dedup (e.g. ignoring
-/// self-inflicted writes from persisting a setting) is the receiver's job.
+/// How long the config watcher waits for the dust to settle before reloading.
+/// A single editor save emits a burst of filesystem events (truncate, write,
+/// chmod, rename); reacting to each one would reload — and announce the reload —
+/// several times per save.
+pub const CONFIG_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Coalesce a stream of change pings into one `on_change` call per quiet period.
+///
+/// Blocks until a ping arrives, then keeps swallowing pings until `window`
+/// passes with none — so a burst of ten events 50ms apart fires exactly once,
+/// `window` after the *last* of them. Returns when the sender is dropped.
+fn debounce_loop(
+    rx: std::sync::mpsc::Receiver<()>,
+    window: std::time::Duration,
+    on_change: impl Fn(),
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+    while rx.recv().is_ok() {
+        // Swallow the rest of the burst; each new ping restarts the window.
+        loop {
+            match rx.recv_timeout(window) {
+                Ok(()) => continue,
+                Err(RecvTimeoutError::Timeout) => break,
+                // Watcher dropped mid-burst: fire nothing, we're shutting down.
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        on_change();
+    }
+}
+
+/// Watch the user config file, invoking `on_change` (from a background thread)
+/// once per burst of modifications — the unified hot-reload source for both
+/// frontends. Uses an OS-level watcher (inotify/FSEvents/…) on the config's
+/// parent directory (so atomic saves via rename are caught) and falls back to
+/// 2s mtime polling when a watcher can't be created.
+///
+/// Events are debounced by [`CONFIG_DEBOUNCE`], so one editor save triggers one
+/// reload no matter how many filesystem events it emits. The callback should
+/// just ping the frontend's channel; dedup of self-inflicted writes (persisting
+/// a setting) is still the receiver's job.
 pub fn watch_config(on_change: impl Fn() + Send + Sync + 'static) -> ConfigWatcherGuard {
     use notify::{RecursiveMode, Watcher};
-    let on_change = std::sync::Arc::new(on_change);
+    // Every event source pings this channel; the debounce thread is the only
+    // caller of `on_change`.
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || debounce_loop(rx, CONFIG_DEBOUNCE, on_change));
+
     let watcher = hrdr_agent::config_file_path().and_then(|path| {
         let dir = path.parent()?.to_path_buf();
         let _ = std::fs::create_dir_all(&dir);
         let file_name = path.file_name()?.to_os_string();
-        let cb = on_change.clone();
+        let tx = tx.clone();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if let Ok(event) = res
                 && event
@@ -201,7 +245,7 @@ pub fn watch_config(on_change: impl Fn() + Send + Sync + 'static) -> ConfigWatch
                     .iter()
                     .any(|p| p.file_name() == Some(file_name.as_os_str()))
             {
-                cb();
+                let _ = tx.send(());
             }
         })
         .ok()?;
@@ -210,7 +254,7 @@ pub fn watch_config(on_change: impl Fn() + Send + Sync + 'static) -> ConfigWatch
     });
     // Fallback: poll the mtime when no OS watcher could be established.
     let poller = if watcher.is_none() {
-        let cb = on_change;
+        let tx = tx.clone();
         Some(tokio::spawn(async move {
             let mut last = config_mtime();
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -219,7 +263,9 @@ pub fn watch_config(on_change: impl Fn() + Send + Sync + 'static) -> ConfigWatch
                 let now = config_mtime();
                 if now != last {
                     last = now;
-                    cb();
+                    if tx.send(()).is_err() {
+                        return; // guard dropped
+                    }
                 }
             }
         }))
@@ -229,6 +275,7 @@ pub fn watch_config(on_change: impl Fn() + Send + Sync + 'static) -> ConfigWatch
     ConfigWatcherGuard {
         _watcher: watcher,
         poller,
+        _debounce_tx: Some(tx),
     }
 }
 
@@ -624,6 +671,119 @@ mod tests {
         assert!(
             !files.iter().any(|f| f == "sub/ignored.txt"),
             "nested sub/.gitignore not honored: {files:?}"
+        );
+    }
+}
+
+/// The config-watcher debounce. `debounce_loop` is the whole of the coalescing
+/// logic, and it's pure w.r.t. the filesystem — drive it with a channel.
+#[cfg(test)]
+mod debounce_tests {
+    use super::{CONFIG_DEBOUNCE, debounce_loop};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Run `debounce_loop` on a thread with a short window; returns the sender,
+    /// the fire counter, and the thread handle.
+    fn spawn(
+        window: Duration,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        Arc<AtomicUsize>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let handle = std::thread::spawn(move || {
+            debounce_loop(rx, window, || {
+                h.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        (tx, hits, handle)
+    }
+
+    /// Wait until `hits` reaches `want`, or time out. Returns the final count.
+    fn wait_for(hits: &AtomicUsize, want: usize, timeout: Duration) -> usize {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if hits.load(Ordering::SeqCst) >= want {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        hits.load(Ordering::SeqCst)
+    }
+
+    /// A burst of events closer together than the window fires exactly once,
+    /// after the last of them.
+    ///
+    /// Regression: one editor save emits several filesystem events (truncate,
+    /// write, chmod, rename). Reacting per-event reloaded the config — and
+    /// printed the "config reloaded" notice — a handful of times per save.
+    #[test]
+    fn a_burst_of_events_fires_once() {
+        let window = Duration::from_millis(60);
+        let (tx, hits, handle) = spawn(window);
+
+        // 10 pings, 20ms apart — every gap is well inside the window.
+        for _ in 0..10 {
+            tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Still quiet-period; nothing should have fired during the burst.
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "fired mid-burst");
+
+        assert_eq!(wait_for(&hits, 1, Duration::from_secs(2)), 1);
+        // And it stays at one — no trailing fire per swallowed event.
+        std::thread::sleep(window * 3);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "one reload per burst");
+
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    /// Two bursts separated by more than the window fire once each — debouncing
+    /// must not swallow a genuinely later edit.
+    #[test]
+    fn separate_bursts_each_fire() {
+        let window = Duration::from_millis(40);
+        let (tx, hits, handle) = spawn(window);
+
+        tx.send(()).unwrap();
+        tx.send(()).unwrap();
+        assert_eq!(wait_for(&hits, 1, Duration::from_secs(2)), 1);
+
+        // Well after the first burst settled.
+        std::thread::sleep(window * 3);
+        tx.send(()).unwrap();
+        assert_eq!(wait_for(&hits, 2, Duration::from_secs(2)), 2);
+
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    /// Dropping the sender ends the loop rather than leaking the thread —
+    /// including while a burst is still pending, where the pending reload is
+    /// abandoned (we're shutting down).
+    #[test]
+    fn dropping_the_sender_stops_the_loop() {
+        // Idle → disconnect.
+        let (tx, _hits, handle) = spawn(CONFIG_DEBOUNCE);
+        drop(tx);
+        handle.join().expect("loop exits when idle");
+
+        // Mid-burst → disconnect.
+        let (tx, hits, handle) = spawn(Duration::from_secs(30));
+        tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        drop(tx);
+        handle.join().expect("loop exits mid-burst");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a pending reload is abandoned on shutdown, not fired"
         );
     }
 }
