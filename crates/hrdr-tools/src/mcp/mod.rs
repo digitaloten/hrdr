@@ -51,7 +51,6 @@ pub(crate) use util::{extract_content_text, rpc_error_message, sanitize_tool_nam
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::Duration;
 
     use serde_json::{Value, json};
     use tokio::sync::{Mutex, oneshot};
