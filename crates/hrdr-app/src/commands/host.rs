@@ -33,6 +33,15 @@ pub trait CommandHost {
     /// Update the displayed model (the agent is switched separately by dispatch).
     fn set_model(&mut self, model: String);
 
+    /// Current provider name (e.g. "zen", "openai"), when one is active.
+    fn provider(&self) -> Option<String> {
+        None
+    }
+    /// Update the active provider name (used by `/provider` / auto-save).
+    fn set_provider(&mut self, name: String) {
+        let _ = name;
+    }
+
     /// Whether `<think>` reasoning is shown.
     fn show_thinking(&self) -> bool;
     /// Toggle reasoning display (persisting if the frontend supports it).

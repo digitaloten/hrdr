@@ -18,6 +18,7 @@ impl super::App {
             a.set_model(session.model.clone());
         });
         self.model = session.model.clone();
+        self.cfg.provider = session.provider.clone();
         self.rebuild_transcript(&session.messages);
         self.session_id = Some(id);
         self.session_label = Some(session.name.clone());
@@ -44,6 +45,7 @@ impl super::App {
             self.session_id.as_deref(),
             self.session_label.as_deref(),
             &self.model,
+            self.cfg.provider.as_deref(),
             &self.base_url,
             &cwd.display().to_string(),
             msgs,
@@ -80,6 +82,7 @@ impl super::App {
             a.set_model(session.model.clone());
         });
         self.model = session.model.clone();
+        self.cfg.provider = session.provider.clone();
         self.rebuild_transcript(&session.messages);
         self.session_id = Some(id.clone());
         self.session_label = Some(session.name.clone());

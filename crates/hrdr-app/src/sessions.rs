@@ -26,6 +26,7 @@ pub fn save_session(
     existing_id: Option<&str>,
     label: Option<&str>,
     model: &str,
+    provider: Option<&str>,
     base_url: &str,
     cwd: &str,
     messages: Vec<Message>,
@@ -41,7 +42,15 @@ pub fn save_session(
         Some(id) => (id.to_string(), false),
         None => (hrdr_agent::unique_session_id(cwd, &name), true),
     };
-    let _ = hrdr_agent::Session::new(&name, model, base_url, cwd, messages).save(&id);
+    let _ = hrdr_agent::Session::new(
+        &name,
+        model,
+        provider.map(|s| s.to_string()),
+        base_url,
+        cwd,
+        messages,
+    )
+    .save(&id);
     Some(SaveOutcome { id, first_save })
 }
 
@@ -55,6 +64,7 @@ pub async fn save_agent_session(
     existing_id: Option<String>,
     label: Option<String>,
     model: String,
+    provider: Option<String>,
     base_url: String,
 ) -> Option<SaveOutcome> {
     let (msgs, cwd) = {
@@ -65,6 +75,7 @@ pub async fn save_agent_session(
         existing_id.as_deref(),
         label.as_deref(),
         &model,
+        provider.as_deref(),
         &base_url,
         &cwd,
         msgs,
@@ -131,9 +142,9 @@ mod tests {
     fn save_session_skips_conversations_with_no_user_message() {
         // System/assistant-only histories aren't worth persisting → no id, and
         // (importantly) no file is written.
-        assert!(save_session(None, None, "m", "", "/tmp/x", vec![]).is_none());
+        assert!(save_session(None, None, "m", None, "", "/tmp/x", vec![]).is_none());
         let assistant_only = vec![Message::assistant("hi there")];
-        assert!(save_session(None, None, "m", "", "/tmp/x", assistant_only).is_none());
+        assert!(save_session(None, None, "m", None, "", "/tmp/x", assistant_only).is_none());
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub struct Session {
     /// Human-friendly session name (defaults to the first user message).
     pub name: String,
     pub model: String,
+    pub provider: Option<String>,
     pub base_url: String,
     pub cwd: String,
     /// Unix seconds.
@@ -100,6 +101,7 @@ impl Session {
     pub fn new(
         name: impl Into<String>,
         model: impl Into<String>,
+        provider: Option<String>,
         base_url: impl Into<String>,
         cwd: impl Into<String>,
         messages: Vec<ChatMessage>,
@@ -109,6 +111,7 @@ impl Session {
             version: SESSION_VERSION,
             name: name.into(),
             model: model.into(),
+            provider,
             base_url: base_url.into(),
             cwd: cwd.into(),
             created: t,
@@ -297,7 +300,7 @@ mod tests {
                 .to_string_lossy()
                 .to_string();
             assert_eq!(unique_session_id(&cwd, "chat"), "chat");
-            let sess = Session::new("chat", "model", "http://x/v1", &cwd, vec![]);
+            let sess = Session::new("chat", "model", None, "http://x/v1", &cwd, vec![]);
             sess.save("chat").unwrap();
             assert_eq!(unique_session_id(&cwd, "chat"), "chat-2");
         });
@@ -316,7 +319,7 @@ mod tests {
             let cwd = tmp.path().join("project");
             std::fs::create_dir(&cwd).unwrap();
             let cwd = cwd.to_str().unwrap().to_string();
-            let sess = Session::new("My Chat", "model", "http://x/v1", &cwd, vec![]);
+            let sess = Session::new("My Chat", "model", None, "http://x/v1", &cwd, vec![]);
             sess.save("my-chat").unwrap();
             let (id, s) = resolve_session(&cwd, "my-chat").unwrap();
             assert_eq!(id, "my-chat");
@@ -331,7 +334,7 @@ mod tests {
             let cwd = tmp.path().join("proj");
             std::fs::create_dir(&cwd).unwrap();
             let cwd = cwd.to_str().unwrap().to_string();
-            let sess = Session::new("Work Session", "model", "http://x/v1", &cwd, vec![]);
+            let sess = Session::new("Work Session", "model", None, "http://x/v1", &cwd, vec![]);
             sess.save("work").unwrap();
             let result = resolve_session(&cwd, "WORK SESSION");
             assert!(result.is_some(), "case-insensitive name match must work");
@@ -351,10 +354,10 @@ mod tests {
             let a = cwd_a.to_str().unwrap().to_string();
             let b = cwd_b.to_str().unwrap().to_string();
 
-            Session::new("Alpha A", "m", "http://x/v1", &a, vec![])
+            Session::new("Alpha A", "m", None, "http://x/v1", &a, vec![])
                 .save("alpha")
                 .unwrap();
-            Session::new("Alpha B", "m", "http://x/v1", &b, vec![])
+            Session::new("Alpha B", "m", None, "http://x/v1", &b, vec![])
                 .save("alpha")
                 .unwrap();
 

@@ -493,7 +493,8 @@ impl hrdr_tools::Tool for SubagentTool {
         let model = cfg.model.clone();
         ctx.emit(format!("↳ task ({model}): {label}\n"));
 
-        let mut sub = Agent::new(cfg)?;
+        let mut sub =
+            Agent::new(cfg).with_context(|| format!("creating sub-agent (model={model})"))?;
         let mut output = String::new();
         let steering = steering_queue();
         let run = sub
@@ -513,7 +514,7 @@ impl hrdr_tools::Tool for SubagentTool {
             Some(wt) => wt.finish().await,
             None => None,
         };
-        run?;
+        run.with_context(|| format!("sub-agent (model={model}) failed"))?;
 
         let mut output = output.trim().to_string();
         if let Some(note) = worktree_note {

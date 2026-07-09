@@ -495,6 +495,7 @@ fn app_view(
                     existing_id,
                     session_label,
                     cur_model,
+                    None,
                     base_url,
                 )
                 .await
@@ -788,9 +789,10 @@ fn app_view(
                     let url = base_url_for_events.get_untracked();
                     let generation = save_gen.get_untracked();
                     tokio::spawn(async move {
-                        if let Some(o) =
-                            hrdr_app::save_agent_session(agent, existing, label, cur_model, url)
-                                .await
+                        if let Some(o) = hrdr_app::save_agent_session(
+                            agent, existing, label, cur_model, None, url,
+                        )
+                        .await
                         {
                             let _ = tx.send(UiMsg::Saved {
                                 id: o.id,
@@ -1929,7 +1931,7 @@ impl hrdr_app::CommandHost for GuiHost {
         let generation = self.save_gen.get_untracked();
         tokio::spawn(async move {
             if let Some(o) =
-                hrdr_app::save_agent_session(agent, existing, label, model, base_url).await
+                hrdr_app::save_agent_session(agent, existing, label, model, None, base_url).await
             {
                 let _ = tx.send(UiMsg::Saved {
                     id: o.id,

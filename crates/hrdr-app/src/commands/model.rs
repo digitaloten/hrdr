@@ -71,6 +71,7 @@ pub fn apply_provider(
         host.set_context_window(p.context_window);
     }
     host.set_base_url(p.base_url.clone());
+    host.set_provider(name.to_string());
     Ok(p)
 }
 
