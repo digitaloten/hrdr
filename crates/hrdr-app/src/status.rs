@@ -1,8 +1,7 @@
 //! Shared status-bar content: which sections exist, their text, their drop
-//! priority, and their color roles — identical in the TUI and GUI so the two
-//! bars can't drift. Layout is the frontend's job: the TUI fits sections to
-//! the terminal width (truncate/wrap per [`crate::StatusBarMode`]), the GUI
-//! lays them out with flexbox; both map [`StatusRole`]s onto their theme.
+//! priority, and their color roles. Layout is the frontend's job — the TUI fits
+//! sections to the terminal width (truncate/wrap per [`crate::StatusBarMode`])
+//! — and each maps [`StatusRole`]s onto its own theme.
 
 use crate::fmt_count;
 
@@ -90,8 +89,7 @@ pub fn status_role_style(role: StatusRole) -> RoleStyle {
     }
 }
 
-/// The gauge-fill color slot for a context-usage level (also used by the
-/// GUI's real progress-bar gauge).
+/// The gauge-fill color slot for a context-usage level.
 pub fn ctx_level_slot(level: CtxLevel) -> ThemeSlot {
     match level {
         CtxLevel::Ok => ThemeSlot::Success,
@@ -130,8 +128,8 @@ pub struct StatusRun {
     pub role: StatusRole,
 }
 
-/// The context gauge's raw data, for frontends that can draw a real progress
-/// bar (the GUI) instead of the character-cell fill the text runs encode.
+/// The context gauge's raw data, for a frontend that can draw a real progress
+/// bar instead of the character-cell fill the text runs encode.
 #[derive(Debug, Clone)]
 pub struct CtxGauge {
     /// Fill fraction, `0.0..=1.0`.

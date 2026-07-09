@@ -11,11 +11,10 @@ OpenAI, llama.cpp, OpenRouter — and it streams tokens and runs tools until the
 job is done.
 
 > Active development, released as **v0.1.x**. The agent loop, adaptive tool set,
-> sessions, file checkpoints, config hot-reload, a rich TUI, **and a floem-based
-> GUI with full command parity** are in place. hrdr connects to any running
-> OpenAI-compatible endpoint — a hosted provider or a server you run yourself
-> ([`infr`](https://github.com/kryptic-sh/infr), llama.cpp, vLLM, …). See the
-> roadmap for what's next.
+> sessions, file checkpoints, config hot-reload, and a rich TUI are in place.
+> hrdr connects to any running OpenAI-compatible endpoint — a hosted provider or
+> a server you run yourself ([`infr`](https://github.com/kryptic-sh/infr),
+> llama.cpp, vLLM, …). See the roadmap for what's next.
 
 ## Install
 
@@ -42,9 +41,6 @@ scoop install hrdr
 sudo dpkg -i hrdr_*.deb
 sudo rpm -i hrdr-*.rpm
 ```
-
-The desktop GUI (`hrdr-gui`, [floem](https://github.com/lapce/floem)-based)
-builds from source: `cargo run -p hrdr-gui --release`.
 
 ## Design
 
@@ -83,7 +79,6 @@ builds from source: `cargo run -p hrdr-gui --release`.
 | `hrdr-app`    | UI-agnostic app core: shared slash commands, sessions, status.  |
 | `hrdr-tui`    | Ratatui UI: transcript + vim input pane, live streaming.        |
 | `hrdr`        | Binary: TUI by default, `hrdr run <task>` for headless.         |
-| `hrdr-gui`    | floem desktop GUI (full command parity with the TUI).           |
 
 ## Usage
 
@@ -199,10 +194,10 @@ hrdr --provider zen --model grok-build-0.1 # chat against a Zen model
 
 #### `/login` — guided setup
 
-Rather than exporting an env var, run **`/login`** in the TUI or GUI: pick a
-provider, paste its API key, and hrdr saves it as your default. The key is
-resolved at startup in the order **inline config → `key_env` → saved
-credential**, so a running server or an exported env var still wins.
+Rather than exporting an env var, run **`/login`** in the TUI: pick a provider,
+paste its API key, and hrdr saves it as your default. The key is resolved at
+startup in the order **inline config → `key_env` → saved credential**, so a
+running server or an exported env var still wins.
 
 Credentials are stored **separately from `config.toml`**, in a dedicated
 `~/.config/hrdr/auth.toml` (`0600` on unix) — a flat `provider = "key"` map. The
@@ -692,16 +687,12 @@ The shell and search tools adapt to the host:
       server
 - [x] hjkl deps via crates.io registry pins (standalone CI)
 - [x] Shared UI-agnostic core (`hrdr-app`): one implementation of every slash
-      command, sessions, status bar, and transcript model for both frontends
-- [x] floem desktop GUI with **full command parity** (TODO panel, timestamps,
-      search/goto scrolling, live theme swap, multi-line input, queueing)
+      command, sessions, status bar, and transcript model
 - [x] Release pipeline: 7-target binaries, GitHub Releases, crates.io, AUR,
       Homebrew, Scoop, Alpine
 - [x] MCP client (stdio + Streamable-HTTP + legacy HTTP+SSE) — `[[mcp]]`
       servers' tools, resources, and prompts join the set
 - [ ] LSP diagnostics feedback
-- [ ] Vim input discipline in the GUI (needs a render-agnostic `EditorEngine`
-      seam)
 
 ## License
 

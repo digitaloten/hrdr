@@ -17,7 +17,7 @@ impl super::App {
         let arg = parts.next().unwrap_or("").trim();
         // Commands with a richer TUI rendering or that touch terminal-only state
         // are handled here; everything else falls through to the shared
-        // `hrdr_app` dispatcher (so the TUI and GUI run one implementation).
+        // `hrdr_app` dispatcher (so every frontend runs one implementation).
         match cmd {
             "edit" => self.edit_file_cmd(arg),
             "reload" => self.reload_cmd(),
@@ -51,7 +51,7 @@ impl super::App {
             a.clear();
         } else {
             // The just-aborted turn still holds the lock until its task drops;
-            // clear through an awaited lock (the GUI does the same).
+            // clear through an awaited lock.
             let agent = self.agent.clone();
             tokio::spawn(async move {
                 agent.lock().await.clear();

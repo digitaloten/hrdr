@@ -1,7 +1,7 @@
 //! `hrdr-app` — the UI-agnostic application core shared by hrdr's frontends.
 //!
 //! Logic that is identical regardless of how it's rendered lives here so the TUI
-//! (`hrdr-tui`) and GUI (`hrdr-gui`) share one implementation instead of each
+//! (`hrdr-tui`) and the headless runner share one implementation instead of each
 //! reimplementing it. Today: the slash-command registry, alias resolution, and
 //! "quit command" detection. More (help metadata is already here) will move in
 //! as the frontends converge.
@@ -184,7 +184,7 @@ pub fn resolve_alias(cmd: &str) -> &str {
 /// The grouped, aligned `/help` body: a `Commands` header followed by each
 /// `HELP_GROUPS` section with its commands and descriptions, only listing
 /// commands `show` accepts — so a frontend's `/help` advertises exactly what
-/// it supports (the GUI passes its [`CommandHost::supports_command`]). Groups
+/// it supports (via [`CommandHost::supports_command`]). Groups
 /// left empty are omitted. Frontends append their own keybinding "Tips:" tail
 /// (those keys differ per frontend).
 pub fn help_body_for(show: impl Fn(&str) -> bool) -> String {

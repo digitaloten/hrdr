@@ -2,7 +2,7 @@
 //!
 //! hrdr reuses hjkl's theme system (a theme TOML with a palette + `[ui]`
 //! styles). The role mapping — which palette entries feed which chat role —
-//! is shared with the GUI via [`hrdr_app::ChatPalette`]; this module only
+//! is shared via [`hrdr_app::ChatPalette`]; this module only
 //! converts the resolved RGB roles to ratatui colors.
 
 use hjkl_markdown_tui::MdTheme;

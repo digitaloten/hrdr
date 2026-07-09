@@ -2,7 +2,7 @@
 //! (the knobs that affect how a frontend renders and behaves, split out of
 //! `hrdr_agent::AgentConfig` so the core agent crate stays
 //! representation-agnostic) plus the config-string ⇄ enum mappings for the
-//! display modes, so the TUI and GUI resolve and persist settings identically.
+//! display modes, so every frontend resolves and persists settings identically.
 
 use hrdr_agent::parse_env_bool;
 

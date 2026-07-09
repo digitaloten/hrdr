@@ -96,8 +96,8 @@ pub fn resume_plan(session: &SessionState, prev_cwd: &Path, current_base_url: &s
     ResumePlan { new_cwd, lines }
 }
 
-/// Minimum turn duration before the finish nudge fires (terminal bell in the
-/// TUI, desktop notification in the GUI) — quick replies stay silent.
+/// Minimum turn duration before the finish nudge fires (the TUI's terminal
+/// bell) — quick replies stay silent.
 pub const BELL_MIN_SECS: f64 = 5.0;
 
 /// Whether a finished turn warrants the nudge: the knob is on and the turn ran

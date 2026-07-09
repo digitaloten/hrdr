@@ -40,7 +40,7 @@ pub fn key_from_crossterm(key: &crossterm::event::KeyEvent) -> Option<EditorKey>
 /// Implementors hide their concrete editor/FSM entirely, and nothing here
 /// names a UI toolkit: keys arrive as [`EditorKey`]s (each frontend converts
 /// its native events) and painting lives behind the separate [`TuiRender`]
-/// half (or a future GUI adapter).
+/// half (or another render adapter).
 pub trait EditorEngine {
     /// Feed a key into the engine.
     fn feed_key(&mut self, key: EditorKey);
@@ -89,7 +89,7 @@ pub trait EditorEngine {
 }
 
 /// The terminal renderer half of the seam (ratatui). Kept out of
-/// [`EditorEngine`] so the core stays renderer-agnostic — a GUI frontend can
+/// [`EditorEngine`] so the core stays renderer-agnostic — another frontend can
 /// host the same engines behind its own render adapter.
 pub trait TuiRender {
     /// Draw the editable pane into `area` and place the cursor.

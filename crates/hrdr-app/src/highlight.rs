@@ -2,7 +2,7 @@
 //! fenced code blocks (and tint tool-output panels) with the same syntax set,
 //! theme, and panel background — loading them once here keeps the two visually
 //! identical and drops the duplicated setup. The actual span→color rendering
-//! stays per-frontend (ratatui `Line`s vs floem `TextLayout`s).
+//! stays per-frontend (the TUI maps them onto ratatui `Line`s).
 //!
 //! [`HighlightCache`] adds *incremental* highlighting for streaming blocks: a
 //! code block that only grows (tokens appending during a turn) re-highlights

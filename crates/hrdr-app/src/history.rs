@@ -38,8 +38,8 @@ pub fn load_history() -> Vec<String> {
 /// Input-history browsing shared by the frontends: record with
 /// consecutive-duplicate skip + [`MAX_HISTORY`] cap + persistence, and Up/Down
 /// recall that stashes the live draft on the first step back and restores it
-/// past the newest entry. The frontends only differ in where the returned text
-/// goes (the TUI's editor buffer vs the GUI's input signal).
+/// past the newest entry. A frontend decides where the returned text goes (for
+/// the TUI, its editor buffer).
 #[derive(Default)]
 pub struct HistoryBrowser {
     entries: Vec<String>,

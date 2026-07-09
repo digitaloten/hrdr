@@ -3,10 +3,10 @@
 //! hrdr reuses hjkl's theme system (a palette + `[ui]` styles TOML). The
 //! mapping from that editor-oriented palette onto hrdr's *chat roles* — which
 //! palette entries feed which role, and in what fallback order — lives here so
-//! the TUI and GUI can't drift. Each role resolves to an RGB triple or `None`
-//! (the theme doesn't cover it); the frontends convert to their own color type
-//! and apply their own medium-appropriate final fallbacks (ANSI names in the
-//! terminal, RGB constants in the GUI).
+//! frontends can't drift. Each role resolves to an RGB triple or `None` (the
+//! theme doesn't cover it); a frontend converts to its own color type and
+//! applies its own medium-appropriate final fallbacks (ANSI names in the
+//! terminal).
 
 use hjkl_theme::Theme as HjklTheme;
 use hjkl_theme::loader;

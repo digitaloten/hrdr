@@ -10,18 +10,6 @@ ignore = [
   # upgrade, pulled transitively by `syntect` (code-block syntax highlighting).
   { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained; transitive via syntect" },
   { id = "RUSTSEC-2024-0320", reason = "yaml-rust unmaintained; transitive via syntect" },
-  # Unmaintained advisories pulled transitively by floem (hrdr-gui): `paste`
-  # via wgpu/metal, `ttf-parser` via cosmic-text. No safe upgrade until floem
-  # bumps its stack.
-  { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive via floem → wgpu → metal" },
-  { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; transitive via floem → cosmic-text" },
-  # Quadratic runtime parsing attacker-controlled XML attributes; patched only
-  # in quick-xml >= 0.41, which neither dependent allows yet (plist/syntect,
-  # wayland-scanner). Our quick-xml inputs are trusted, bundled data (syntect
-  # theme/syntax dumps; Wayland protocol codegen at build time), not
-  # attacker-controlled. Re-check when plist/wayland-scanner bump.
-  { id = "RUSTSEC-2026-0194", reason = "quick-xml DoS needs untrusted XML; ours parses trusted bundled data; no upgrade path yet" },
-  { id = "RUSTSEC-2026-0195", reason = "quick-xml NsReader DoS — same crate/preconditions/patch range as RUSTSEC-2026-0194" },
 ]
 
 [licenses]
@@ -37,7 +25,7 @@ allow = [
   "Unicode-DFS-2016",
   "Zlib",
   "CC0-1.0",
-  # Boost — permissive, OSI approved; clipboard-win/error-code (floem tree).
+  # Boost — permissive, OSI approved; clipboard-win/error-code (clipboard tree).
   "BSL-1.0",
 ]
 exceptions = [

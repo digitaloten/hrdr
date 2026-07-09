@@ -132,7 +132,7 @@ pub fn expand_mentions(input: &str, cwd: &Path) -> String {
 /// mentions into their contents (via [`expand_mentions`]) and, when an `@agent`
 /// mention matches a known sub-agent name, wrap the body in a delegation
 /// directive (via [`agent_mention_message`]). This is the canonical "input →
-/// sent" transform shared by the TUI, GUI, and headless frontends.
+/// sent" transform shared by the TUI and the headless runner.
 pub fn prepare_outgoing(input: &str, names: &[String], cwd: &Path) -> String {
     match extract_agent_mention(input, names) {
         Some((agent, body)) => agent_mention_message(&agent, &expand_mentions(&body, cwd)),

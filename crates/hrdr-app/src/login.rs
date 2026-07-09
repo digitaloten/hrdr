@@ -6,8 +6,8 @@
 
 use crate::commands::{CommandHost, apply_provider};
 
-/// A running `/login` conversation. Cloneable so the GUI can hold it in a
-/// reactive signal.
+/// A running `/login` conversation. Cloneable so a frontend can hold it in
+/// whatever state cell it uses.
 #[derive(Clone)]
 pub struct LoginWizard {
     step: Step,

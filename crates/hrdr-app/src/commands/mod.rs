@@ -1,6 +1,6 @@
 //! Shared slash-command layer. The command *implementations* live here, behind
-//! the [`CommandHost`] trait, so both frontends (TUI, GUI) drive the exact same
-//! logic and gain new commands for free — a frontend just implements the host
+//! the [`CommandHost`] trait, so every frontend drives the exact same logic and
+//! gains new commands for free — a frontend just implements the host
 //! capabilities (emit a line, access the agent, clipboard, sessions, …) and
 //! calls [`dispatch`]. Frontend-coupled commands (scrolling, find/goto, expand,
 //! theme/timestamps, editor) stay in the frontends and are handled before
@@ -8,8 +8,9 @@
 //!
 //! Async work (network, subprocess, filesystem, agent lock) is expressed as a
 //! [`LineFuture`] the host spawns; its returned string (if non-empty) is shown
-//! as a system line. This keeps the layer uniform across the sync-polled TUI and
-//! the async-locked GUI, which both hold the agent as `Arc<tokio::sync::Mutex>`.
+//! as a system line. This keeps the layer uniform across a sync-polled frontend
+//! (the TUI) and an async-locked one, which both hold the agent as
+//! `Arc<tokio::sync::Mutex>`.
 
 mod compaction;
 mod conversation;

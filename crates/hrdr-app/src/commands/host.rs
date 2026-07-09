@@ -210,8 +210,8 @@ pub trait CommandHost {
     }
 
     /// Open `path` in an editor (`/edit`). The default launches the OS default
-    /// handler (`xdg-open` / `open` / `start`) — right for GUI frontends; the
-    /// TUI overrides to suspend the terminal and run `$EDITOR` instead.
+    /// handler (`xdg-open` / `open` / `start`); the TUI overrides to suspend the
+    /// terminal and run `$EDITOR` instead.
     fn open_editor(&mut self, path: PathBuf) {
         let line = match open_system_handler(&path) {
             Ok(()) => format!("opened {} in the system editor", path.display()),

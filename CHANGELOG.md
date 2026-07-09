@@ -6,6 +6,68 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- **`hrdr-gui` (the floem desktop frontend).** hrdr is TUI-only going forward.
+  The `apps/hrdr-gui` crate, its CI job, and the floem-only `cargo-deny`
+  advisory exemptions (`paste`, `ttf-parser`, both `quick-xml` DoS advisories)
+  are gone. `hrdr-app` remains the UI-agnostic core, shared by the TUI and the
+  headless `hrdr run` path.
+
+### Added
+
+- **Session header.** A new `EntryKind::Header` opens every session: the `hrdr`
+  wordmark, animated with `hjkl-splash`, beside the version, model, provider,
+  effort, and cwd. It stores no data, so the details always reflect live session
+  state. The art is owned by the binary (it doubles as the `--help` banner) and
+  passed into `hrdr_tui::run`.
+- **Full transcript persistence.** Session files now store the whole display
+  transcript — the model's reasoning, system notices, the per-turn stats line,
+  `/diff` output — plus the status-bar token counters and context window. A
+  resume restores what was on screen rather than rebuilding a lossy
+  approximation from the chat messages.
+
+### Changed
+
+- **Unified block rendering.** Every transcript entry renders through one
+  `render_block`: padded on all four sides, each kind with its own overridable
+  background (header, user, assistant, tool, command, stats). Slash-command
+  output renders as markdown in undimmed colors; reasoning shares the assistant
+  colors, dimmer. The `#N you` / `#N assistant` labels close their block.
+- **Tool blocks show tool-specific detail**: the shell command and its output,
+  `write`'s path and raw file contents, `edit`/`patch`'s diff, `read`'s tail.
+- **One `SessionState` is the on-disk payload.** `Entry` is now `{ kind, time }`
+  and doubles as the session file's record; the parallel timestamp vector and
+  the duplicate `SavedEntry` type are gone. Saving is a serialize, resuming an
+  assignment. `session.rs` moved from `hrdr-agent` to `hrdr-app`.
+- **`model` / `provider` precedence is `flag > env > session > config`**,
+  honored by `/resume` as well as startup auto-resume. A session never overrides
+  a pinned model, and never supplies the endpoint.
+
+### Fixed
+
+- **`--provider` was never recorded.** The preset was resolved and applied, but
+  the name was dropped — the status bar showed no provider and every saved
+  session recorded `provider: null`.
+- **The model's thinking was dropped from session files.** `ChatMessage`'s
+  `Serialize` is the OpenAI wire format, which omits `reasoning_content` and
+  `anthropic_thinking_blocks`; the session file reused it. Losing the latter
+  breaks a resumed Anthropic conversation whose last assistant turn has a
+  pending `tool_use`. Session files now encode both, with the wire form
+  untouched.
+- **Config-watcher storm.** One editor save emits a burst of filesystem events
+  (28 on inotify here) and each one reloaded the config and printed a notice.
+  Events are now debounced on a 100ms trailing edge.
+- **Session notices no longer accumulate.** The welcome banner,
+  `resumed session …`, `session saved as …` and other lifecycle chrome are a new
+  ephemeral `EntryKind::Notice` that is never persisted; previously each resume
+  restored the old ones and appended a fresh copy.
+- **Resuming no longer clobbers the endpoint.** `base_url` belongs to the
+  process, which is what the "session endpoint was X (current: Y)" notice
+  already claimed.
+- Long lines wrap inside their block instead of breaking out to column 0.
+- The per-turn stats line renders as a block (and lost its `└` prefix).
+
 ## [0.2.8] - 2026-07-05
 
 ### Added

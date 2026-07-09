@@ -1,7 +1,7 @@
 //! The terminal driver: owns the ratatui `Terminal` + the crossterm event loop,
 //! translating input into [`App`] method calls and rendering `App` state. This
 //! is the only place tied to the terminal — `App` itself carries no terminal
-//! I/O or renderer types, so a GUI frontend can drive the same `App` with its
+//! I/O or renderer types, so another frontend can drive the same `App` with its
 //! own loop + renderer.
 
 use std::time::Duration;

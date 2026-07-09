@@ -52,12 +52,9 @@ jobs:
           cache: false
       - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
-      # hrdr-gui (floem) is excluded for now — its large X11/Wayland/font
-      # dependency tree slows CI and needs Linux system libs. Wiring the GUI
-      # into CI (with those deps, like pikr/buffr) is a follow-up.
       - run:
-          cargo clippy --workspace --exclude hrdr-gui --all-targets
-          --all-features --locked -- -D warnings
+          cargo clippy --workspace --all-targets --all-features --locked -- -D
+          warnings
 
   machete:
     name: cargo-machete (unused deps)
@@ -68,27 +65,6 @@ jobs:
         with:
           tool: cargo-machete
       - run: cargo machete
-
-  clippy-gui:
-    name: clippy hrdr-gui (linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install floem system deps
-        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libxkbcommon-dev
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-          components: clippy
-          cache: false
-      - run: rustup update --no-self-update stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: gui
-      # The GUI is excluded from the workspace-wide jobs (heavy dependency
-      # tree); this job keeps it compiling + lint-clean on Linux so a
-      # TUI-side refactor can't silently break it.
-      - run: cargo clippy -p hrdr-gui --all-targets --all-features --locked -- -D warnings
 
   deny:
     name: cargo-deny
@@ -117,10 +93,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - run:
-          cargo nextest run --workspace --exclude hrdr-gui --all-features
+          cargo nextest run --workspace --all-features
           --locked --no-fail-fast
       - run:
-          cargo test --workspace --exclude hrdr-gui --doc --all-features
+          cargo test --workspace --doc --all-features
           --locked
 
   smoke:
@@ -436,7 +412,7 @@ jobs:
             echo "::error::publish failed for ${crate} after 3 rate-limit retries"
             return 1
           }
-          # Dependency order; hrdr-gui (floem app) is not published.
+          # Dependency order.
           for CRATE in hrdr-llm hrdr-tools hrdr-agent hrdr-editor hrdr-app hrdr-tui hrdr; do
             publish_if_missing "$CRATE"
           done

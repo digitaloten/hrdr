@@ -396,7 +396,7 @@ async fn main() -> Result<()> {
 async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bool) -> Result<()> {
     let mut agent = Agent::new(config)?;
     // Prepare the outgoing prompt: expand `@file` mentions and route any
-    // `@agent` mention to the matching sub-agent (parity with the TUI/GUI).
+    // `@agent` mention to the matching sub-agent (parity with the TUI).
     let prompt = hrdr_app::prepare_outgoing(&prompt, agent.agent_names(), &agent.cwd());
     // Connect any configured MCP servers before the turn (their tools join the
     // set); surface the per-server status on stderr unless quiet.
