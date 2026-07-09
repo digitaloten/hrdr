@@ -2483,3 +2483,95 @@ async fn a_trailing_tinted_block_ends_with_a_blank_row() {
         "a blank row closes the scrollback:\n{screen}"
     );
 }
+
+/// The input pane is borderless, on the user prompt's background, with one blank
+/// row above and below and two columns either side — the same chrome a
+/// transcript block wears.
+#[tokio::test]
+async fn the_input_pane_matches_the_user_prompt_block() {
+    let mut h = Harness::new(vec![]).await;
+    h.type_str("hello world");
+
+    let mut term = Terminal::new(TestBackend::new(50, 26)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+
+    let row = |y: u16| -> String {
+        (0..50)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect()
+    };
+    let text_y = (0..26)
+        .find(|&y| row(y).contains("hello world"))
+        .expect("the draft renders");
+    let bg_at = |x: u16, y: u16| buf.cell(Position::new(x, y)).unwrap().bg;
+
+    // No border glyphs anywhere on the pane.
+    for y in text_y - 1..=text_y + 1 {
+        let r = row(y);
+        for ch in ['┌', '┐', '└', '┘', '│', '─'] {
+            assert!(!r.contains(ch), "border glyph {ch:?} on row {y}:\n{screen}");
+        }
+    }
+
+    // The prompt's background, across the full width and the padding rows.
+    for x in [0, 2, 49] {
+        for y in [text_y - 1, text_y, text_y + 1] {
+            assert_eq!(bg_at(x, y), h.app.theme.user_bg, "({x},{y}):\n{screen}");
+        }
+    }
+    // One blank row above and below the text.
+    assert_eq!(row(text_y - 1).trim(), "", "top padding:\n{screen}");
+    assert_eq!(row(text_y + 1).trim(), "", "bottom padding:\n{screen}");
+    // Two columns of padding on the left.
+    assert!(row(text_y).starts_with("  hello world"), "{screen}");
+
+    // The chrome the border used to carry moved to the help line below.
+    let help = (text_y + 1..26)
+        .map(row)
+        .find(|r| r.contains("[TEXT]"))
+        .unwrap_or_else(|| panic!("no help line with the editor mode:\n{screen}"));
+    assert!(help.contains("~3 tok · 11 ch"), "the draft size:\n{screen}");
+}
+
+/// The "follow output" button overlays the input pane's top padding row (it used
+/// to sit on the top border), and clicking it returns to following.
+#[tokio::test]
+async fn the_follow_button_sits_on_the_input_pad_row_and_is_clickable() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let mut h = Harness::new(vec![]).await;
+    for i in 0..30 {
+        h.app.push_entry(Entry::system(format!("filler {i}")));
+    }
+    let mut term = Terminal::new(TestBackend::new(50, 20)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(h.app.follow_button.is_none(), "no button while following");
+
+    // Scroll up: the button appears.
+    h.app.scroll_offset = 5;
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let rect = h.app.follow_button.expect("the follow button is drawn");
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+    let row: String = (0..50)
+        .filter_map(|x| {
+            buf.cell(Position::new(x, rect.y))
+                .map(|c| c.symbol().to_string())
+        })
+        .collect();
+    assert!(row.contains("follow output"), "on its own row:\n{screen}");
+
+    // Clicking it resumes following.
+    h.app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: rect.x + 1,
+        row: rect.y,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    });
+    assert_eq!(h.app.scroll_offset, 0, "the click resumed following");
+}

@@ -54,9 +54,10 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // The inference loader sits just above the input while a turn runs.
     let loader_height: u16 = if app.running { 1 } else { 0 };
 
-    // Input box auto-grows 1..=INPUT_MAX_ROWS text rows with the content.
-    // Inner width = full width minus 2 border + 2 horizontal padding columns.
-    let input_inner_w = area.width.saturating_sub(4);
+    // Input pane auto-grows 1..=INPUT_MAX_ROWS text rows with the content.
+    // Inner width = full width minus the horizontal padding on both sides; the
+    // extra two rows are the blank padding above and below.
+    let input_inner_w = area.width.saturating_sub(INPUT_PAD_X as u16 * 2);
     let input_height = app
         .editor
         .desired_rows(input_inner_w, hrdr_app::INPUT_MAX_ROWS)
@@ -497,32 +498,21 @@ fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
-    let mode = app.editor.mode_label();
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" input [{mode}] "))
-        .border_style(Style::default().fg(app.theme.dim))
-        .padding(Padding::horizontal(1));
-    // Rough size of the draft on the bottom-right border (~4 chars/token).
-    let chars = app.editor.content().chars().count();
-    if chars > 0 {
-        let toks = chars.div_ceil(4);
-        block = block.title_bottom(
-            Line::from(Span::styled(
-                format!(" ~{toks} tok · {chars} ch "),
-                Style::default().fg(app.theme.dim),
-            ))
-            .right_aligned(),
-        );
-    }
+    // The input is the user's own surface, so it wears the prompt's background
+    // and the same padding as a transcript block: two columns either side, one
+    // blank row above and below.
+    let bg = app.theme.user_bg;
+    let block = Block::default()
+        .style(Style::default().bg(bg))
+        .padding(Padding::new(INPUT_PAD_X as u16, INPUT_PAD_X as u16, 1, 1));
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.editor.render(f, inner);
 
-    // Overlay on the top border. The quit-confirm hint takes priority over the
-    // "follow output" button when both would apply.
+    // Overlay on the top padding row. The quit-confirm hint takes priority over
+    // the "follow output" button when both would apply.
     if app.quit_armed {
-        top_border_button(
+        top_row_button(
             f,
             area,
             " Press Ctrl+C again to quit ",
@@ -534,7 +524,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
         // Not clickable; and it sits over the follow button's spot.
         app.follow_button = None;
     } else if app.scroll_offset > 0 {
-        let rect = top_border_button(
+        let rect = top_row_button(
             f,
             area,
             " Press END to follow output ↓ ",
@@ -554,9 +544,9 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Render a centered, single-row label over the top border of `area` and
+/// Render a centered, single-row label over the top padding row of `area` and
 /// return its screen rect (for click hit-testing).
-fn top_border_button(f: &mut Frame, area: Rect, label: &str, style: Style) -> Rect {
+fn top_row_button(f: &mut Frame, area: Rect, label: &str, style: Style) -> Rect {
     let w = (label.chars().count() as u16).min(area.width);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let rect = Rect {
@@ -746,8 +736,10 @@ fn status_wrap_lines(sections: &[StatusSection], width: usize, t: &Theme) -> Vec
     lines
 }
 
-/// Help / keybind line. (Turn state is shown by the loader above the input, so
-/// no ready/thinking status is repeated here.)
+/// Help / keybind line, below the input pane. Also carries the chrome the
+/// input's border used to hold: the editor's mode, and a rough size of the draft
+/// on the right (~4 chars/token). (Turn state is shown by the loader above the
+/// input, so no ready/thinking status is repeated here.)
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let scroll_hint = if app.scroll_offset > 0 {
         format!("  [scroll: {}↑]", app.scroll_offset)
@@ -759,9 +751,24 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     } else {
         format!("  [{} queued]", app.queue.len())
     };
-    let text = format!("{}{queue_hint}{scroll_hint}", app.editor.keybind_hint());
-    let para = Paragraph::new(text).style(Style::default().fg(app.theme.dim));
-    f.render_widget(para, area);
+    let dim = Style::default().fg(app.theme.dim);
+    let text = format!(
+        "[{}] {}{queue_hint}{scroll_hint}",
+        app.editor.mode_label(),
+        app.editor.keybind_hint()
+    );
+    f.render_widget(Paragraph::new(text).style(dim), area);
+
+    let chars = app.editor.content().chars().count();
+    if chars > 0 {
+        let toks = chars.div_ceil(4);
+        f.render_widget(
+            Paragraph::new(
+                Line::from(Span::styled(format!("~{toks} tok · {chars} ch "), dim)).right_aligned(),
+            ),
+            area,
+        );
+    }
 }
 
 /// Restyle every (ASCII case-insensitive) occurrence of `needle` within `line`
@@ -986,6 +993,9 @@ fn header_lines(app: &App, anchor: std::time::Instant, width: u16) -> Vec<Line<'
 /// Columns of padding between a block's edge and its content, per side. The
 /// vertical padding is one blank row above and below (see [`render_block`]).
 pub(crate) const BLOCK_PAD_X: usize = 2;
+
+/// The input pane wears the same horizontal padding as a transcript block.
+const INPUT_PAD_X: usize = BLOCK_PAD_X;
 
 /// The visual identity of a transcript block. `bg` is the only thing that
 /// varies between kinds today; text styling is decided by each body builder.

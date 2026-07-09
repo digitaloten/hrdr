@@ -53,6 +53,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Blank separator rows only between tinted blocks.** A prompt and the tool
   call it triggered, or two tool calls, would otherwise merge into one slab; a
   block on the terminal background already begins and ends in a blank row.
+- **The input pane is borderless**, on the user prompt's background, with one
+  blank row above and below and two columns either side — the same chrome a
+  transcript block wears. The editor mode and the draft's size moved from the
+  border to the help line below.
 - **User prompts render like the model's output**: same markdown pipeline, same
   foreground colors. Only the block's background differs. Queued messages too.
 - **Tool blocks show tool-specific detail**: the shell command and its output,
@@ -67,6 +71,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Toggling a long tool block no longer scrolls the view.** `scroll_offset` is
+  measured from the bottom, so collapsing a block kept the view the same
+  distance from the end and the block jumped. Its top is now pulled to the top
+  of the viewport, as `/goto` does; following the newest output is left pinned.
 - **A text-less assistant turn no longer paints an empty block.** When the model
   thinks and calls a tool without emitting any output, the assistant entry has
   no text: it rendered as a lone `#N assistant` label floating over blank
