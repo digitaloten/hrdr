@@ -1,10 +1,9 @@
 //! Session listing + auto-save shared by hrdr's frontends. The listing text
 //! (which sessions to show for the current cwd, or all, and how to render each
 //! row) and the auto-save policy (when to write, how the file id is assigned)
-//! are representation-independent, so both the TUI's `/sessions` + continuous
-//! auto-save and the GUI's build them identically. Resuming itself is
-//! per-frontend (it rebuilds each one's own transcript representation), so that
-//! stays in the frontends.
+//! are representation-independent, so a frontend's `/sessions` + continuous
+//! auto-save build them from here. Resuming itself is per-frontend (it swaps in
+//! the saved [`crate::SessionState`]), so that stays in the frontends.
 
 use crate::{Session, SessionState};
 
@@ -19,10 +18,11 @@ pub struct SaveOutcome {
 /// swallowed). Returns `None` when there's nothing worth saving yet (no user
 /// message).
 ///
-/// `state` is the frontend's whole session state; it is written verbatim. The
-/// file id comes from `state.id` when the session already has one, otherwise a
-/// fresh collision-free id is derived from its name (see
-/// [`crate::unique_session_id`]) and reported back as `first_save`.
+/// `state` is the frontend's whole session state, written as-is apart from the
+/// ephemeral session-chrome notices ([`SessionState::persisted`]). The file id
+/// comes from `state.id` when the session already has one, otherwise a fresh
+/// collision-free id is derived from its name (see [`crate::unique_session_id`])
+/// and reported back as `first_save`.
 pub fn save_session(state: &SessionState) -> Option<SaveOutcome> {
     if !state.is_saveable() {
         return None;
@@ -31,7 +31,7 @@ pub fn save_session(state: &SessionState) -> Option<SaveOutcome> {
         Some(id) => (id.clone(), false),
         None => (crate::unique_session_id(&state.cwd, &state.name), true),
     };
-    let _ = Session::new(state.clone()).save(&id);
+    let _ = Session::new(state.persisted()).save(&id);
     Some(SaveOutcome { id, first_save })
 }
 

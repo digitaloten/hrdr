@@ -1223,16 +1223,30 @@ async fn autosave_writes_the_state_and_it_loads_back_identically() {
     let loaded = hrdr_app::Session::load(&h.app.current_cwd(), &id).expect("session file written");
 
     // The transcript came back verbatim — including the model's reasoning and
-    // the per-turn stats line, neither of which exists in `messages`. The live
-    // transcript has one entry more: the "session saved as …" notice, pushed
-    // after the write. Times persist as whole seconds.
+    // the per-turn stats line, neither of which exists in `messages`. The only
+    // difference is the ephemeral chrome (welcome banner, "session saved as …"),
+    // which is never written. Times persist as whole seconds.
     let saved = &loaded.state.transcript;
-    let live = &h.app.state.transcript[..saved.len()];
-    for (a, b) in saved.iter().zip(live) {
+    let live: Vec<&Entry> = h
+        .app
+        .state
+        .transcript
+        .iter()
+        .filter(|e| !matches!(e.kind, EntryKind::Notice(_)))
+        .collect();
+    assert_eq!(
+        saved.len(),
+        live.len(),
+        "one saved entry per non-notice entry"
+    );
+    for (a, b) in saved.iter().zip(&live) {
         assert_eq!(a.kind, b.kind);
         assert_eq!(a.time.timestamp(), b.time.timestamp());
     }
-    assert_eq!(saved.len() + 1, h.app.state.transcript.len());
+    assert!(
+        !saved.iter().any(|e| matches!(e.kind, EntryKind::Notice(_))),
+        "no chrome on disk"
+    );
     assert!(
         loaded
             .state
@@ -1507,4 +1521,70 @@ async fn an_unpinned_model_and_provider_yield_to_the_session() {
         );
         assert_eq!(h.app.state.provider.as_deref(), Some("zen"));
     }
+}
+
+/// Session chrome — the welcome banner, "resumed session …", "session saved
+/// as …" — is regenerated on every launch and every resume, so it is never
+/// persisted.
+///
+/// Regression: notices were saved with the transcript, so each resume restored
+/// the previous run's notices *and* appended a fresh one. Ten resumes, ten
+/// stacked "resumed session" lines.
+#[tokio::test]
+async fn resume_notices_do_not_accumulate() {
+    let data_home = tempfile::tempdir().unwrap();
+    // SAFETY: `sessions_dir()` reads this; only this test uses the value.
+    unsafe { std::env::set_var("XDG_DATA_HOME", data_home.path()) };
+
+    let mut h = Harness::new(vec![MockReply::Text("ok".into())]).await;
+    h.submit("hi").await;
+    let id = h.app.state.id.clone().expect("session saved");
+    let cwd = h.app.current_cwd();
+
+    let notices = |app: &App| {
+        app.state
+            .transcript
+            .iter()
+            .filter(|e| matches!(e.kind, EntryKind::Notice(_)))
+            .count()
+    };
+    let saved_notices = |id: &str, cwd: &str| {
+        hrdr_app::Session::load(cwd, id)
+            .unwrap()
+            .state
+            .transcript
+            .iter()
+            .filter(|e| matches!(e.kind, EntryKind::Notice(_)))
+            .count()
+    };
+    assert_eq!(saved_notices(&id, &cwd), 0, "no chrome written");
+
+    // Resume the session repeatedly, autosaving each time as a real run would.
+    for round in 1..=3 {
+        let session = hrdr_app::Session::load(&cwd, &id).unwrap();
+        h.app.apply_session(id.clone(), session);
+        h.app.autosave();
+
+        assert_eq!(
+            saved_notices(&id, &cwd),
+            0,
+            "round {round}: chrome must never reach disk"
+        );
+        // The live transcript shows this resume's notices, not a pile of them.
+        assert!(
+            notices(&h.app) <= 3,
+            "round {round}: {} notices on screen — they are accumulating",
+            notices(&h.app)
+        );
+    }
+
+    // The conversation itself is untouched by all that resuming.
+    let user_msgs = h
+        .app
+        .state
+        .transcript
+        .iter()
+        .filter(|e| matches!(&e.kind, EntryKind::User(t) if t == "hi"))
+        .count();
+    assert_eq!(user_msgs, 1, "the conversation is not duplicated");
 }

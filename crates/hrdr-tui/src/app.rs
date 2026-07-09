@@ -35,7 +35,7 @@ use util::format_duration;
 // can reach these terminal-facing helpers.
 pub(crate) use util::run_editor;
 
-// The display-mode enums live in the shared `hrdr-app` core so the TUI and GUI
+// The display-mode enums live in the shared `hrdr-app` core so every frontend
 // resolve/persist these settings identically.
 pub(crate) use hrdr_app::{StatusBarMode, TimestampStyle};
 
@@ -128,7 +128,7 @@ pub(crate) struct App {
     clipboard: Option<Clipboard>,
     /// Selected row in the completion popup (slash command or `@file`).
     pub(crate) completion_idx: usize,
-    /// Submitted-input history + Up/Down browsing (shared with the GUI).
+    /// Submitted-input history + Up/Down browsing (from the shared core).
     history: hrdr_app::HistoryBrowser,
     /// Cached relative file paths under the cwd, for `@file` completion.
     file_index: Vec<String>,
@@ -284,14 +284,15 @@ impl App {
              to quit. Submit while a reply runs to queue follow-ups."
         };
         // The banner opens every new session; the welcome text follows it.
-        let mut transcript = vec![Entry::header(), Entry::system(welcome)];
+        // Both are chrome: a resumed session gets a fresh pair, not the saved one.
+        let mut transcript = vec![Entry::header(), Entry::notice(welcome)];
         // Warn (but don't fail) if the config file exists but is invalid — the
         // running config has already fallen back to defaults + env in that case.
         if let Some(warning) = hrdr_app::startup_config_warning() {
-            transcript.push(Entry::system(warning));
+            transcript.push(Entry::notice(warning));
         }
         if project_docs_loaded {
-            transcript.push(Entry::system(hrdr_app::PROJECT_DOCS_LOADED_MSG));
+            transcript.push(Entry::notice(hrdr_app::PROJECT_DOCS_LOADED_MSG));
         }
         let state = hrdr_app::SessionState {
             model,
@@ -647,8 +648,15 @@ impl App {
         }
     }
 
+    /// Show a transient status line: a command's output, a usage hint, a busy
+    /// guard, a reload notice. These are chrome — regenerated on demand and
+    /// never persisted (see [`hrdr_app::EntryKind::Notice`]).
+    ///
+    /// Content that belongs to the conversation's history — a turn's error, a
+    /// cancel, a compaction result, an agent warning — pushes `Entry::system`
+    /// directly instead.
     pub(crate) fn system(&mut self, msg: impl Into<String>) {
-        self.push_entry(Entry::system(msg.into()));
+        self.push_entry(Entry::notice(msg.into()));
     }
 
     /// Run `f` with the locked agent, returning its result — or `None` if a turn
@@ -719,7 +727,7 @@ impl App {
     }
 
     /// Age out finished TODO items. Called once per turn (on `Done`, so it also
-    /// runs when a turn errors — same trigger as the GUI).
+    /// runs when a turn errors).
     fn prune_completed_todos(&mut self) {
         if let Ok(mut todos) = self.todos.lock() {
             age_completed_todos(
@@ -967,7 +975,7 @@ impl App {
                 }
             }
             TurnMsg::System(text) => {
-                self.push_entry(Entry::system(text));
+                self.push_entry(Entry::notice(text));
                 // Do NOT reset scroll_offset here: this is an async/passive line
                 // (e.g. a late `/models` result). Resetting would yank the user's
                 // view when they are scrolled up reading back-scroll. When the
@@ -1019,7 +1027,7 @@ impl App {
                 // Auto-compact near the context limit before doing more work;
                 // its Compacted handler resumes the queue afterward.
                 if self.should_auto_compact() {
-                    self.push_entry(Entry::system(
+                    self.push_entry(Entry::notice(
                         "context near the limit — auto-compacting…".to_string(),
                     ));
                     self.spawn_compaction(None);

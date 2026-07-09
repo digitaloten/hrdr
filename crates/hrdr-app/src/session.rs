@@ -172,6 +172,20 @@ impl SessionState {
         }
     }
 
+    /// A copy of this state as it should be written to disk: the session-chrome
+    /// notices are dropped.
+    ///
+    /// Every launch prints its own welcome, and every resume prints its own
+    /// "resumed session …" line. Persisting them means the next resume restores
+    /// the old ones *and* appends a fresh one, so they accrete one copy per
+    /// resume, forever.
+    pub fn persisted(&self) -> SessionState {
+        let mut out = self.clone();
+        out.transcript
+            .retain(|e| !matches!(e.kind, crate::EntryKind::Notice(_)));
+        out
+    }
+
     /// Whether this conversation is worth persisting: it has at least one user
     /// message.
     pub fn is_saveable(&self) -> bool {

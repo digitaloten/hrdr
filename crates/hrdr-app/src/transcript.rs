@@ -3,7 +3,7 @@
 //! representation-independent queries over a slice of entries — search, message
 //! counting/indexing, and text/JSON export. How an `Entry` is painted is the
 //! frontend's business; what counts as a "message", how `/find` matches, and the
-//! export formats are shared here so the TUI and GUI stay consistent.
+//! export formats are shared here so every frontend stays consistent.
 //!
 //! `Entry` is also the on-disk form: a session file stores its transcript as
 //! exactly these entries (see [`crate::Session`]), so a resume restores what was
@@ -50,6 +50,11 @@ pub enum EntryKind {
         expanded: bool,
     },
     System(String),
+    /// Session-lifecycle chrome: the welcome banner, "resumed session …",
+    /// "session saved as …", "config reloaded …". Rendered like [`Self::System`]
+    /// but **never persisted** — every launch and every resume regenerates its
+    /// own, so saving them would accrete a fresh copy per resume.
+    Notice(String),
     /// Final per-turn stats line, appended below the last output.
     Stats(String),
     /// A unified diff (e.g. `/diff`), rendered with diff coloring.
@@ -86,6 +91,10 @@ impl Entry {
     }
     pub fn system(text: impl Into<String>) -> Self {
         Self::now(EntryKind::System(text.into()))
+    }
+    /// Ephemeral session chrome — see [`EntryKind::Notice`].
+    pub fn notice(text: impl Into<String>) -> Self {
+        Self::now(EntryKind::Notice(text.into()))
     }
     pub fn stats(text: impl Into<String>) -> Self {
         Self::now(EntryKind::Stats(text.into()))
@@ -163,7 +172,7 @@ pub fn extract_shell_command(name: &str, args: &str) -> Option<String> {
 
 /// How a tool call's detail area should be painted. Frontends map each variant
 /// onto their own renderer; the classification (which tool shows what) lives
-/// here so the TUI and GUI agree.
+/// here so every frontend agrees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolBody {
     /// Shell call: the command, rendered as its own `$ …` line above the output.
@@ -393,8 +402,8 @@ pub fn goto_action(
 }
 
 /// The `/find` / `/next` / `/prev` state machine: active query + last-visited
-/// message number. Both frontends hold one (the GUI behind signals) and route
-/// the returned [`FindAction`] to their scroll primitive.
+/// message number. A frontend holds one and routes the returned [`FindAction`]
+/// to its scroll primitive.
 #[derive(Debug, Default, Clone)]
 pub struct FindState {
     /// The active query, if a search is live (also drives match highlighting).
@@ -479,6 +488,7 @@ pub fn transcript_to_text(entries: &[Entry]) -> String {
             EntryKind::System(s) => out.push_str(&format!("[{s}]\n\n")),
             EntryKind::Diff(s) => out.push_str(&format!("{s}\n\n")),
             EntryKind::Tool { name, .. } => out.push_str(&format!("[tool: {name}]\n\n")),
+            EntryKind::Notice(s) => out.push_str(&format!("[{s}]\n\n")),
             EntryKind::Reasoning(_) | EntryKind::Stats(_) | EntryKind::Header => {}
         }
     }

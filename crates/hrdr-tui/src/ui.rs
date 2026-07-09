@@ -568,7 +568,7 @@ fn status_section_width(s: &StatusSection) -> usize {
 }
 
 /// Build the status-bar sections from the shared content model
-/// ([`hrdr_app::status_sections`] — same sections/priorities as the GUI),
+/// ([`hrdr_app::status_sections`] — the shared sections/priorities),
 /// mapping each color role onto the terminal theme.
 fn build_status_sections(app: &App) -> Vec<StatusSection> {
     let t = &app.theme;
@@ -1181,6 +1181,7 @@ fn entry_content_hash(entry: &Entry, expand_all: bool) -> u64 {
         | EntryKind::Assistant(t)
         | EntryKind::Reasoning(t)
         | EntryKind::System(t)
+        | EntryKind::Notice(t)
         | EntryKind::Stats(t)
         | EntryKind::Diff(t) => t.hash(&mut h),
         EntryKind::Tool {
@@ -1394,9 +1395,9 @@ fn transcript_lines(
                 });
                 (BlockKind::Tool, body)
             }
-            // Slash-command output reads like assistant output — same markdown,
-            // same colors, no dimming — on its own background.
-            EntryKind::System(text) => {
+            // Slash-command output and status notices read like assistant output
+            // — same markdown, same colors, no dimming — on their own background.
+            EntryKind::System(text) | EntryKind::Notice(text) => {
                 let md = md_theme.clone();
                 let code_bg = theme.tool_bg;
                 let body = cache_entry(ck, || markdown_lines(text, &md, code_bg, inner));
@@ -1636,7 +1637,7 @@ fn more_hint(extra: usize) -> String {
 /// Color for one unified-diff line: additions green, deletions red, hunk
 /// headers in the accent color, file headers and context dim.
 fn diff_line_color(line: &str, theme: &Theme) -> Color {
-    // Shared classification + color semantics (same mapping in the GUI).
+    // Shared classification + color semantics.
     slot_color(
         hrdr_app::diff_kind_slot(hrdr_app::classify_diff_line(line)),
         theme,

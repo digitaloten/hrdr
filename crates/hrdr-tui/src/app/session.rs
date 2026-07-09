@@ -24,7 +24,7 @@ impl super::App {
         let name = state.name.clone();
         let messages = state.messages.len();
         self.adopt_state(state, Some(id));
-        self.push_entry(Entry::system(format!(
+        self.push_entry(Entry::notice(format!(
             "resumed most recent session '{name}' ({messages} messages) — /clear to start fresh"
         )));
     }
@@ -50,7 +50,7 @@ impl super::App {
         if let Some(o) = hrdr_app::save_session(&self.state) {
             // Notify once, when the session is first created.
             if o.first_save {
-                self.push_entry(Entry::system(hrdr_app::session_saved_notice(&o.id)));
+                self.push_entry(Entry::notice(hrdr_app::session_saved_notice(&o.id)));
             }
             self.state.id = Some(o.id);
         }
