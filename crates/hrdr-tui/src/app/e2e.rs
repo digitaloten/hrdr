@@ -1331,7 +1331,7 @@ async fn a_new_session_opens_with_the_header_banner() {
     // The harness runs in a temp dir, and macOS hands out long `/var/folders/…`
     // paths that push the cwd's value onto a wrapped row of its own — which the
     // column check below can't read. Pin it short so the row stays one line.
-    h.app.state.cwd = "/w".into();
+    h.app.dir = "/w".into();
 
     let mut term = Terminal::new(TestBackend::new(64, 32)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();

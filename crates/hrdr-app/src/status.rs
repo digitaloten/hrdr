@@ -198,7 +198,15 @@ pub fn status_sections(i: &StatusInputs) -> Vec<StatusSeg> {
     // cwd basename + folder icon (Nerd glyphs only when the icon mode allows).
     let folder = if i.nerd_icons { "\u{f07b} " } else { "" };
     let branch_icon = if i.nerd_icons { "\u{e0a0} " } else { "" };
-    let dir_label = i.dir.rsplit('/').find(|s| !s.is_empty()).unwrap_or(i.dir);
+    // Both separators: on Windows a `C:\…\project` path has no `/` to split on,
+    // so the whole path became the label — and being the highest-priority
+    // section, it crowded every other one (the context gauge included) out of a
+    // narrow bar.
+    let dir_label = i
+        .dir
+        .rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .unwrap_or(i.dir);
     sections.push(StatusSeg::one(
         0,
         format!(" {folder}{dir_label}"),
@@ -299,6 +307,28 @@ mod tests {
             ttft: Some(1.5),
             nerd_icons: false,
         }
+    }
+
+    /// The dir section shows the cwd's basename, whichever separator the
+    /// platform writes paths with.
+    ///
+    /// Regression: only `/` was split on, so on Windows the whole
+    /// `C:\Users\…\project` path became the label. It carries priority 0, so a
+    /// narrow bar dropped every other section — the context gauge included —
+    /// before it would drop that.
+    #[test]
+    fn the_dir_section_shows_the_basename_on_either_separator() {
+        let label = |dir: &str| -> String {
+            let i = StatusInputs { dir, ..inputs() };
+            status_sections(&i)[0]
+                .runs
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<String>()
+        };
+        assert_eq!(label("/home/me/proj"), " proj");
+        assert_eq!(label(r"C:\Users\me\proj"), " proj");
+        assert_eq!(label(r"C:\Users\me\proj\"), " proj");
     }
 
     #[test]
