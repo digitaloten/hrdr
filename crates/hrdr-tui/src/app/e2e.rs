@@ -2584,3 +2584,42 @@ async fn the_follow_button_sits_on_the_input_pad_row_and_is_clickable() {
     });
     assert_eq!(h.app.scroll_offset, 0, "the click resumed following");
 }
+
+/// A blank row sits between the inference loader and the input pane below it.
+#[tokio::test]
+async fn a_blank_row_follows_the_generating_line() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.running = true;
+    h.app.turn_started = Some(std::time::Instant::now());
+
+    let mut term = Terminal::new(TestBackend::new(56, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+
+    let row = |y: u16| -> String {
+        (0..56)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect()
+    };
+    let loader_y = (0..24)
+        .find(|&y| row(y).contains("inferring"))
+        .expect("the loader renders while a turn runs");
+
+    // The row below it is blank, and on the terminal background — the input
+    // pane's own (tinted) top padding comes after that.
+    assert_eq!(row(loader_y + 1).trim(), "", "blank row below:\n{screen}");
+    assert_eq!(
+        buf.cell(Position::new(2, loader_y + 1)).unwrap().bg,
+        Color::Reset,
+        "the blank row is not the input pane's padding:\n{screen}"
+    );
+    assert_eq!(
+        buf.cell(Position::new(2, loader_y + 2)).unwrap().bg,
+        h.app.theme.user_bg,
+        "the input pane starts after it:\n{screen}"
+    );
+}

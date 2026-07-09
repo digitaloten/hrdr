@@ -52,7 +52,8 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     };
 
     // The inference loader sits just above the input while a turn runs.
-    let loader_height: u16 = if app.running { 1 } else { 0 };
+    // One row for the loader itself, one blank row below it.
+    let loader_height: u16 = if app.running { 2 } else { 0 };
 
     // Input pane auto-grows 1..=INPUT_MAX_ROWS text rows with the content.
     // Inner width = full width minus the horizontal padding on both sides; the
@@ -118,7 +119,15 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         draw_todos(f, app, chunks[i], &todos);
     }
     if let Some(i) = loader_idx {
-        draw_loader(f, app, chunks[i]);
+        // Only the first row; the second is the blank line below it.
+        draw_loader(
+            f,
+            app,
+            Rect {
+                height: 1,
+                ..chunks[i]
+            },
+        );
     }
     draw_input(f, app, chunks[input_idx]);
     if let Some(i) = statusbar_idx {
