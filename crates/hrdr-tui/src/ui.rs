@@ -884,6 +884,13 @@ fn pad_line(mut spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'sta
     Line::from(spans)
 }
 
+/// Pad every line in `lines` to full `width` with `bg`-colored spaces.
+fn pad_lines(lines: &mut Vec<Line<'static>>, width: usize, bg: Color) {
+    for line in lines {
+        *line = pad_line(std::mem::take(line).spans, width, bg);
+    }
+}
+
 /// Compute a stable fingerprint for the content-dependent parts of a transcript
 /// entry. Only the parts that affect the visual output are hashed; the
 /// timestamp meta line (which changes on /timestamps) is rendered separately and
@@ -1031,10 +1038,7 @@ fn transcript_lines(
                         text,
                         Style::default().fg(user_color).bg(user_bg),
                     );
-                    // Pad every line to full width so the background is a solid block.
-                    for line in &mut buf {
-                        *line = pad_line(std::mem::take(line).spans, w, user_bg);
-                    }
+                    pad_lines(&mut buf, w, user_bg);
                     buf
                 }));
             }
@@ -1047,6 +1051,7 @@ fn transcript_lines(
                 meta(&mut out, i, msg_num, "assistant");
                 let md_theme_c = md_theme.clone();
                 let tool_bg = theme.tool_bg;
+                let w = width as usize;
                 out.extend(cache_entry(ck, || {
                     let mut buf = Vec::new();
                     let mut ev_buf: Vec<hjkl_markdown::Event> = Vec::new();
@@ -1077,14 +1082,14 @@ fn transcript_lines(
                             width.max(1),
                         ));
                     }
+                    pad_lines(&mut buf, w, Color::Reset);
                     buf
                 }));
             }
             Entry::Reasoning(_) if !app.show_reasoning => continue, // hidden via /reasoning
             Entry::Reasoning(text) => {
                 let dim = theme.dim;
-                // Show the live spinner header while the model is still thinking
-                // (this reasoning block is actively being streamed into).
+                let w = width as usize;
                 let is_streaming =
                     app.running && app.reasoning_start.is_some() && i == app.transcript.len() - 1;
                 if is_streaming && let Some(elapsed) = app.reasoning_start.map(|t| t.elapsed()) {
@@ -1094,14 +1099,38 @@ fn transcript_lines(
                         Style::default().fg(dim).add_modifier(Modifier::ITALIC),
                     )));
                 }
+                // Same markdown pipeline as assistant, but fully dimmed.
+                let dim_md = hjkl_markdown_tui::MdTheme::new(
+                    dim, dim, dim, dim, dim, dim, dim, dim, dim, dim,
+                );
+                let tool_bg = theme.tool_bg;
                 out.extend(cache_entry(ck, || {
                     let mut buf = Vec::new();
-                    push_text(
-                        &mut buf,
-                        Span::styled("· ", Style::default().fg(dim)),
-                        text,
-                        Style::default().fg(dim).add_modifier(Modifier::ITALIC),
-                    );
+                    let mut ev_buf: Vec<hjkl_markdown::Event> = Vec::new();
+                    for ev in hjkl_markdown::parse(text) {
+                        if let hjkl_markdown::Event::CodeBlock { lang, content } = ev {
+                            if !ev_buf.is_empty() {
+                                buf.extend(hjkl_markdown_tui::to_lines(
+                                    &ev_buf,
+                                    &dim_md,
+                                    width.max(1),
+                                ));
+                                ev_buf.clear();
+                            }
+                            buf.extend(highlight_code_block(
+                                &lang,
+                                &content,
+                                width.max(1),
+                                tool_bg,
+                            ));
+                        } else {
+                            ev_buf.push(ev);
+                        }
+                    }
+                    if !ev_buf.is_empty() {
+                        buf.extend(hjkl_markdown_tui::to_lines(&ev_buf, &dim_md, width.max(1)));
+                    }
+                    pad_lines(&mut buf, w, Color::Reset);
                     buf
                 }));
             }
@@ -1139,6 +1168,7 @@ fn transcript_lines(
             }
             Entry::System(text) => {
                 let dim = theme.dim;
+                let w = width as usize;
                 out.extend(cache_entry(ck, || {
                     let mut buf = Vec::new();
                     push_text(
@@ -1147,11 +1177,13 @@ fn transcript_lines(
                         text,
                         Style::default().fg(dim).add_modifier(Modifier::ITALIC),
                     );
+                    pad_lines(&mut buf, w, Color::Reset);
                     buf
                 }));
             }
             Entry::Stats(text) => {
                 let dim = theme.dim;
+                let w = width as usize;
                 out.extend(cache_entry(ck, || {
                     let mut buf = Vec::new();
                     push_text(
@@ -1160,11 +1192,13 @@ fn transcript_lines(
                         text,
                         Style::default().fg(dim),
                     );
+                    pad_lines(&mut buf, w, Color::Reset);
                     buf
                 }));
             }
             Entry::Diff(text) => {
                 let theme_snap = theme.clone();
+                let w = width as usize;
                 out.extend(cache_entry(ck, || {
                     let mut buf = Vec::new();
                     for line in text.lines() {
@@ -1173,6 +1207,7 @@ fn transcript_lines(
                             Style::default().fg(diff_line_color(line, &theme_snap)),
                         )));
                     }
+                    pad_lines(&mut buf, w, Color::Reset);
                     buf
                 }));
             }
@@ -1205,20 +1240,29 @@ fn transcript_lines(
         let q_badge_fg = Color::Black;
         let user_bg = theme.user_bg;
         let user_fg = theme.user;
+        let w = width as usize;
         for msg in &app.queue {
-            // Blank line before each queued message for separation.
             out.push(Line::raw(""));
+            let start = out.len();
             push_text(
                 &mut out,
                 Span::styled("❯ ", Style::default().fg(user_fg).bold()),
                 msg,
                 Style::default().fg(user_fg).bg(user_bg),
             );
-            // "Queued" badge as the last line, distinct bg from the prompt block.
-            out.push(Line::from(Span::styled(
-                "  Queued",
-                Style::default().fg(q_badge_fg).bg(q_badge_bg).bold(),
-            )));
+            // Pad the message lines to full block width with user_bg.
+            for line in &mut out[start..] {
+                *line = pad_line(std::mem::take(line).spans, w, user_bg);
+            }
+            // "Queued" badge — padded to full width on its own bg.
+            out.push(pad_line(
+                vec![Span::styled(
+                    "  Queued",
+                    Style::default().fg(q_badge_fg).bg(q_badge_bg).bold(),
+                )],
+                w,
+                q_badge_bg,
+            ));
         }
     }
 
