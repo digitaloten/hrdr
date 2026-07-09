@@ -143,3 +143,60 @@ fn default_hjkl_theme() -> HjklTheme {
     HjklTheme::from_toml_str(DEFAULT_THEME_TOML)
         .unwrap_or_else(|_| hjkl_theme::loader::default_theme())
 }
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+    fn hex(c: Color) -> String {
+        match c {
+            Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+            other => panic!("expected an RGB color, got {other:?}"),
+        }
+    }
+
+    /// The bundled theme must *parse*. `Theme::load` swallows a parse error and
+    /// silently falls back to hjkl's bundled default (a different palette
+    /// entirely), so a typo here would ship the wrong colors with no warning.
+    ///
+    /// Regression: `[palette]` values must be literal hex — only `[ui]` resolves
+    /// `$refs` — and writing `bg_user = "$bg_visual"` broke the whole file.
+    #[test]
+    fn the_bundled_theme_parses() {
+        hjkl_theme::Theme::from_toml_str(DEFAULT_THEME_TOML)
+            .expect("the bundled theme must parse, or Theme::load silently uses another palette");
+    }
+
+    /// Every chat role resolves to its Tokyo Night (night) value — i.e. the
+    /// bundled theme really is the theme in force, not a fallback.
+    #[test]
+    fn every_role_resolves_to_a_tokyo_night_color() {
+        let t = Theme::default();
+        assert_eq!(hex(t.user), "#7dcfff", "cyan");
+        assert_eq!(hex(t.assistant), "#c0caf5", "fg");
+        assert_eq!(hex(t.dim), "#565f89", "comment");
+        assert_eq!(hex(t.warn), "#e0af68", "yellow");
+        assert_eq!(hex(t.success), "#9ece6a", "green");
+        assert_eq!(hex(t.error), "#f7768e", "red");
+        assert_eq!(hex(t.accent), "#7aa2f7", "blue");
+        assert_eq!(hex(t.accent2), "#bb9af7", "magenta");
+
+        assert_eq!(hex(t.user_bg), "#283457", "bg_visual");
+        assert_eq!(hex(t.assistant_bg), "#1f2335", "bg_dark1");
+        assert_eq!(hex(t.tool_bg), "#16161e", "bg_dark");
+        assert_eq!(hex(t.command_bg), "#24283b", "bg_storm");
+        assert_eq!(hex(t.stats_bg), "#222436", "bg_moon");
+        assert_eq!(hex(t.header_bg), "#292e42", "bg_highlight");
+    }
+
+    /// The two accents must differ.
+    ///
+    /// Regression: the theme named the purple `mauve` (a Catppuccin name) while
+    /// `ChatPalette` looks up `magenta` (Tokyo Night's). The lookup missed and
+    /// `accent2` silently fell through to `blue` — the same color as `accent`.
+    #[test]
+    fn the_two_accents_are_distinct() {
+        let t = Theme::default();
+        assert_ne!(t.accent, t.accent2, "accent2 fell back to accent");
+    }
+}

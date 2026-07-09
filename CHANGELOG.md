@@ -55,6 +55,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The bundled theme now uses the real Tokyo Night palette.** The purple was
+  named `mauve` (a Catppuccin name) while the code looks up `magenta`, so
+  `accent2` silently fell back to `blue` — identical to `accent`. `teal` held
+  Tokyo Night's `cyan` value, and the six block backgrounds were invented rather
+  than palette colors. Every chat role now resolves to an upstream value, and a
+  test asserts it (`Theme::load` swallows a parse error and falls back to a
+  different palette, so a typo would otherwise ship silently).
 - **`--provider` was never recorded.** The preset was resolved and applied, but
   the name was dropped — the status bar showed no provider and every saved
   session recorded `provider: null`.

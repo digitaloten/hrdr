@@ -74,7 +74,8 @@ impl ChatPalette {
         let panel = crate::panel_bg_rgb();
         Self {
             background: t.ui.background.map(rgb),
-            user: pal("teal").or_else(|| pal("blue")),
+            // Tokyo Night calls this `cyan`; some palettes name it `teal`.
+            user: pal("cyan").or_else(|| pal("teal")).or_else(|| pal("blue")),
             user_bg: pal("bg_user")
                 .or_else(|| pal("ui_selection"))
                 .or(Some((0, 48, 60))),
@@ -92,7 +93,7 @@ impl ChatPalette {
             header_bg: pal("bg_header").or_else(|| pal("ui_cursorline")),
             success: pal("green"),
             error: t.ui.diagnostic_error.map(rgb).or_else(|| pal("red")),
-            accent: pal("blue").or_else(|| pal("teal")),
+            accent: pal("blue").or_else(|| pal("cyan")),
             accent2: pal("magenta")
                 .or_else(|| pal("purple"))
                 .or_else(|| pal("blue")),
