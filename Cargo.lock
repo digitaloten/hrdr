@@ -2502,6 +2502,7 @@ dependencies = [
  "hjkl-icons",
  "hjkl-markdown",
  "hjkl-markdown-tui",
+ "hjkl-theme",
  "hrdr-agent",
  "hrdr-app",
  "hrdr-editor",

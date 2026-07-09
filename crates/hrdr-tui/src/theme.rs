@@ -3,12 +3,15 @@
 //! hrdr reuses hjkl's theme system (a theme TOML with a palette + `[ui]`
 //! styles). The role mapping — which palette entries feed which chat role —
 //! is shared with the GUI via [`hrdr_app::ChatPalette`]; this module only
-//! converts the resolved RGB roles to ratatui colors with ANSI fallbacks for
-//! anything the theme omits.
+//! converts the resolved RGB roles to ratatui colors.
 
 use hjkl_markdown_tui::MdTheme;
+use hjkl_theme::Theme as HjklTheme;
 use hrdr_app::ChatPalette;
 use ratatui::style::Color;
+
+/// The default theme, baked into the binary at compile time.
+const DEFAULT_THEME_TOML: &str = include_str!("theme.toml");
 
 /// Resolved colors for hrdr's chat surfaces.
 #[derive(Debug, Clone)]
@@ -36,14 +39,20 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Load a theme from `path` (an hjkl theme TOML), falling back to hjkl's
-    /// bundled default if the path is `None` or fails to parse.
+    /// Load a theme from `path` (an hjkl theme TOML). When `path` is `None` or
+    /// fails to parse, falls back to the baked-in default theme.
     pub fn load(path: Option<&str>) -> Self {
-        Self::from_palette(&ChatPalette::load(path))
+        let hjkl = match path {
+            Some(p) => HjklTheme::from_path(std::path::Path::new(p))
+                .unwrap_or_else(|_| default_hjkl_theme()),
+            None => default_hjkl_theme(),
+        };
+        Self::from_palette(&ChatPalette::from_hjkl(&hjkl))
     }
 
-    /// Apply terminal-appropriate (ANSI) fallbacks to the shared role palette —
-    /// the role→palette-entry mapping itself lives in [`ChatPalette`].
+    /// Apply terminal fallback colors to any palette role that the theme
+    /// omitted. The baked-in default theme defines every role, so these
+    /// only fire for incomplete user themes.
     fn from_palette(p: &ChatPalette) -> Self {
         let c = |rgb: Option<(u8, u8, u8)>, fb: Color| {
             rgb.map(|(r, g, b)| Color::Rgb(r, g, b)).unwrap_or(fb)
@@ -84,4 +93,10 @@ impl Default for Theme {
     fn default() -> Self {
         Self::load(None)
     }
+}
+
+/// Parse the baked-in default theme TOML.
+fn default_hjkl_theme() -> HjklTheme {
+    HjklTheme::from_toml_str(DEFAULT_THEME_TOML)
+        .unwrap_or_else(|_| hjkl_theme::loader::default_theme())
 }
