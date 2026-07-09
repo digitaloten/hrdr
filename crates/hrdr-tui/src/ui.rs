@@ -177,9 +177,10 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // Publish the height so key handlers can compute half-page offsets.
     app.transcript_height = area.height;
 
-    // Reserve the rightmost column for the scrollbar.
+    // Reserve 1 column on the left for padding and 1 on the right for scrollbar.
     let text_area = Rect {
-        width: area.width.saturating_sub(1),
+        x: area.x.saturating_add(1),
+        width: area.width.saturating_sub(2),
         ..area
     };
 
@@ -1163,6 +1164,7 @@ fn transcript_lines(
                 }));
             }
         }
+        out.push(Line::raw(""));
         out.push(Line::raw(""));
     }
 

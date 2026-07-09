@@ -99,9 +99,9 @@ fn detect_package_manager() -> Option<&'static str> {
 const AGENTS_FILE: &str = "AGENTS.md";
 
 /// Collect project instructions from `AGENTS.md` files, walking from `cwd` up to
-/// the filesystem root, plus an optional global `~/.config/hrdr/AGENTS.md`. Less
-/// specific files (global, then ancestors) come first so nearer files override
-/// by appearing later. Returns `None` if nothing is found.
+/// the filesystem root, plus global instruction files from standard locations.
+/// Less specific files (system, then user-global, then ancestors) come first so
+/// nearer files override by appearing later. Returns `None` if nothing is found.
 pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
     // Walk up from cwd; collect cwd-first (most specific first).
     let mut docs: Vec<String> = Vec::new();
@@ -118,10 +118,21 @@ pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
     // Reverse to outer-first (root ancestor … cwd).
     docs.reverse();
 
-    // Global personal instructions, least specific of all. Same directory as
-    // config.toml (XDG-aware, cross-platform) — see [`crate::config_dir`].
-    if let Some(dir) = crate::config_dir()
-        && let Ok(text) = std::fs::read_to_string(dir.join(AGENTS_FILE))
+    // A single global instruction file, if any — first match wins.
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    let mut global_paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dir) = crate::config_dir() {
+        global_paths.push(dir.join(AGENTS_FILE));
+    }
+    if let Some(ref home) = home {
+        global_paths.push(home.join(".config/agents/AGENTS.md"));
+        global_paths.push(home.join(".config/opencode/AGENTS.md"));
+        global_paths.push(home.join(".claude/CLAUDE.md"));
+    }
+    if let Some(path) = global_paths.iter().find(|p| p.is_file())
+        && let Ok(text) = std::fs::read_to_string(path)
     {
         let text = text.trim();
         if !text.is_empty() {
@@ -166,5 +177,26 @@ mod tests {
         let p = render_system(&tools, Path::new("/tmp/x"), Some("Use tabs.")).unwrap();
         assert!(p.contains("Project instructions"));
         assert!(p.ends_with("Use tabs."));
+    }
+
+    #[test]
+    fn gather_agent_docs_loads_project_via_cwd_walk() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir(&proj).unwrap();
+        let mut f = std::fs::File::create(proj.join("AGENTS.md")).unwrap();
+        writeln!(f, "Project-level").unwrap();
+
+        let home = tmp.path().join("home");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        // Project AGENTS.md is found via cwd walk-up regardless of global state.
+        let docs = gather_agent_docs(&proj).unwrap();
+        unsafe { std::env::remove_var("HOME") };
+
+        assert!(docs.contains("Project-level"));
     }
 }
