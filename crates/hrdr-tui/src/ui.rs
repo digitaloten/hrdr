@@ -935,6 +935,13 @@ fn entry_content_hash(entry: &Entry, expand_all: bool) -> u64 {
     h.finish()
 }
 
+/// Clear the thread-local transcript render cache. Call after mutating the
+/// transcript vector (prune, clear, truncate) so stale entry indices — which
+/// are part of the cache key — don't cause the wrong content to be displayed.
+pub(crate) fn clear_transcript_cache() {
+    TRANSCRIPT_CACHE.with(|c| c.borrow_mut().clear());
+}
+
 /// Look up `key` in [`TRANSCRIPT_CACHE`]; on miss, call `render()` to produce
 /// lines, cache them (evicting the whole map when it exceeds 256 entries), then
 /// return. The same eviction policy as `HL_CACHE`.

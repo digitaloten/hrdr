@@ -48,6 +48,9 @@ pub struct UiConfig {
     /// Show the model's `<think>` reasoning blocks. Default `true`. Toggled at
     /// runtime by `/thinking` (aka `/reasoning`).
     pub show_thinking: bool,
+    /// Max transcript entries kept in the scrollback buffer. Older entries are
+    /// evicted from the front to keep render performance stable. Default 500.
+    pub scrollback: usize,
 }
 
 impl Default for UiConfig {
@@ -62,6 +65,7 @@ impl Default for UiConfig {
             auto_resume: true,
             todo_ttl: DEFAULT_TODO_TTL,
             show_thinking: true,
+            scrollback: 500,
         }
     }
 }
@@ -80,6 +84,7 @@ struct UiFileConfig {
     auto_resume: Option<bool>,
     todo_ttl: Option<u64>,
     show_thinking: Option<bool>,
+    scrollback: Option<usize>,
 }
 
 impl UiConfig {
@@ -123,6 +128,9 @@ impl UiConfig {
         if let Some(v) = fc.show_thinking {
             self.show_thinking = v;
         }
+        if let Some(v) = fc.scrollback {
+            self.scrollback = v;
+        }
     }
 
     fn apply_env(&mut self) {
@@ -160,6 +168,11 @@ const UI_ENV_SETTERS: &[(&str, UiEnvSetter)] = &[
     ("HRDR_SHOW_THINKING", |c, v| {
         if let Some(b) = parse_env_bool(&v) {
             c.show_thinking = b;
+        }
+    }),
+    ("HRDR_SCROLLBACK", |c, v| {
+        if let Ok(n) = v.parse() {
+            c.scrollback = n;
         }
     }),
 ];

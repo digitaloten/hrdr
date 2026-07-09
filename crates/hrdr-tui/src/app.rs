@@ -178,6 +178,9 @@ pub(crate) struct App {
     /// Height of the transcript area as measured during the last draw; used
     /// by key handlers to compute half-page scroll amounts.
     pub(crate) transcript_height: u16,
+    /// Max entries kept in the display transcript before oldest are evicted
+    /// from the front (keeping welcome heads). Default 500.
+    scrollback: usize,
     /// Max scroll offset (rows from bottom to the very top) from the last draw;
     /// lets `Home` jump to the top and bound scrolling.
     pub(crate) max_scroll: usize,
@@ -247,6 +250,7 @@ impl App {
         let bell = ui.bell;
         let todo_ttl = ui.todo_ttl;
         let show_thinking = ui.show_thinking;
+        let scrollback = ui.scrollback;
         let timestamp_style = TimestampStyle::from_config(ui.timestamps.as_deref());
         let statusbar_mode = StatusBarMode::from_config(ui.statusbar.as_deref());
         // No portable terminal-font probe, so an unset/`auto` icons setting
@@ -332,6 +336,7 @@ impl App {
             steering: hrdr_agent::steering_queue(),
             scroll_offset: 0,
             transcript_height: 24,
+            scrollback: scrollback,
             max_scroll: 0,
             todos,
             todo_turn: 0,
@@ -663,18 +668,51 @@ impl App {
     fn push_entry(&mut self, e: Entry) {
         self.transcript.push(e);
         self.entry_times.push(timestamp_now());
+        self.prune_scrollback();
+    }
+
+    /// Evict oldest entries from the transcript front when the scrollback cap
+    /// is exceeded. The window of `System` startup entries (welcome + config
+    /// warning) is always kept so the user never loses the intro banner.
+    fn prune_scrollback(&mut self) {
+        if self.transcript.len() <= self.scrollback {
+            return;
+        }
+        // Count leading `System` entries: they form the intro block and should
+        // never be evicted.  Everything else past them is fair game.
+        let head = self
+            .transcript
+            .iter()
+            .take_while(|e| matches!(e, Entry::System(_)))
+            .count();
+        let excess = self.transcript.len().saturating_sub(self.scrollback);
+        // Ensure we always keep at least `head` entries.
+        let remove = excess.min(self.transcript.len().saturating_sub(head));
+        if remove == 0 {
+            return;
+        }
+        // Drop the oldest non-head entries.
+        let keep_start = head.saturating_add(remove).min(self.transcript.len());
+        self.transcript.drain(head..keep_start);
+        self.entry_times.drain(head..keep_start);
+        // Prune the render cache: any key with an entry_idx that has shifted
+        // is stale.  Easiest way: clear the whole thread-local transcript cache
+        // once (cheap — it rebuilds lazily on the next frame).
+        crate::ui::clear_transcript_cache();
     }
 
     /// Clear the transcript (and its parallel timestamps).
     fn clear_transcript(&mut self) {
         self.transcript.clear();
         self.entry_times.clear();
+        crate::ui::clear_transcript_cache();
     }
 
     /// Truncate the transcript (and its parallel timestamps) to `len`.
     fn truncate_transcript(&mut self, len: usize) {
         self.transcript.truncate(len);
         self.entry_times.truncate(len);
+        crate::ui::clear_transcript_cache();
     }
 
     /// Age out finished TODO items. Called once per turn (on `Done`, so it also
