@@ -119,16 +119,17 @@ pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
     docs.reverse();
 
     // A single global instruction file, if any — first match wins.
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from);
+    // Priority: hrdr → agents → opencode → claude.
     let mut global_paths: Vec<std::path::PathBuf> = Vec::new();
     if let Some(dir) = crate::config_dir() {
         global_paths.push(dir.join(AGENTS_FILE));
     }
-    if let Some(ref home) = home {
-        global_paths.push(home.join(".config/agents/AGENTS.md"));
-        global_paths.push(home.join(".config/opencode/AGENTS.md"));
+    for app in &["agents", "opencode"] {
+        if let Ok(d) = hjkl_xdg::config_dir(app) {
+            global_paths.push(d.join(AGENTS_FILE));
+        }
+    }
+    if let Some(home) = crate::agents_dir::home_dir() {
         global_paths.push(home.join(".claude/CLAUDE.md"));
     }
     if let Some(path) = global_paths.iter().find(|p| p.is_file())
@@ -188,14 +189,17 @@ mod tests {
         let mut f = std::fs::File::create(proj.join("AGENTS.md")).unwrap();
         writeln!(f, "Project-level").unwrap();
 
+        // Isolate from real global files — point XDG config and HOME at empty dirs.
         let home = tmp.path().join("home");
         unsafe {
             std::env::set_var("HOME", &home);
-            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
         }
-        // Project AGENTS.md is found via cwd walk-up regardless of global state.
         let docs = gather_agent_docs(&proj).unwrap();
-        unsafe { std::env::remove_var("HOME") };
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("HOME");
+        }
 
         assert!(docs.contains("Project-level"));
     }

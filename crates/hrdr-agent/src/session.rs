@@ -242,19 +242,18 @@ mod tests {
     /// vars (std::env::set_var is not thread-safe in Rust tests).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Set HOME and XDG_DATA_HOME to an isolated temp dir for the duration of
-    /// `f`. Returns the guard — drop it to restore.
+    /// Set XDG_DATA_HOME to an isolated temp dir for the duration of `f`.
+    /// HOME is intentionally not set — `sessions_dir()` uses `hjkl_xdg::data_dir`
+    /// which reads XDG_DATA_HOME, never HOME directly.
     fn with_test_env(f: impl FnOnce(&tempfile::TempDir)) {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
-            std::env::set_var("HOME", tmp.path());
             std::env::set_var("XDG_DATA_HOME", tmp.path());
         }
         f(&tmp);
         unsafe {
             std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("HOME");
         }
     }
 

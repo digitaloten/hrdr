@@ -57,7 +57,7 @@ fn agent_dirs(cwd: &Path) -> Vec<PathBuf> {
 }
 
 /// Home directory, cross-platform (`$HOME`, else `%USERPROFILE%`).
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
