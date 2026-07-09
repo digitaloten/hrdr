@@ -177,10 +177,10 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // Publish the height so key handlers can compute half-page offsets.
     app.transcript_height = area.height;
 
-    // Reserve 1 column on the left for padding and 1 on the right for scrollbar.
+    // Reserve the rightmost column for the scrollbar. Left padding is applied
+    // per-block via pad_line's leading bg-coloured space.
     let text_area = Rect {
-        x: area.x.saturating_add(1),
-        width: area.width.saturating_sub(2),
+        width: area.width.saturating_sub(1),
         ..area
     };
 
@@ -871,9 +871,10 @@ fn render_code_block(lang: &str, content: &str, width: u16, bg: Color) -> Vec<Li
     out
 }
 
-/// Pad a line of spans with background-colored spaces out to `width` columns so
-/// the code block renders as a solid block.
+/// Pad a line of spans to full `width` with `bg`-coloured spaces. A leading
+/// bg space is always prepended for the block's left padding.
 fn pad_line(mut spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> {
+    spans.insert(0, Span::styled(" ", Style::default().bg(bg)));
     let used: usize = spans.iter().map(Span::width).sum();
     if used < width {
         spans.push(Span::styled(
@@ -1034,7 +1035,7 @@ fn transcript_lines(
                     let mut buf = Vec::new();
                     push_text(
                         &mut buf,
-                        Span::styled("❯ ", Style::default().fg(user_color).bold()),
+                        Span::raw(""),
                         text,
                         Style::default().fg(user_color).bg(user_bg),
                     );
@@ -1246,7 +1247,7 @@ fn transcript_lines(
             let start = out.len();
             push_text(
                 &mut out,
-                Span::styled("❯ ", Style::default().fg(user_fg).bold()),
+                Span::raw(""),
                 msg,
                 Style::default().fg(user_fg).bg(user_bg),
             );
@@ -1315,10 +1316,10 @@ fn push_tool(
         hrdr_tools::truncate_inline(args, hrdr_app::TOOL_ARGS_PREVIEW)
     };
 
-    // Header line: ✓ bash   (just name for shell tools, name + args for others)
+    // Header line: mark name args — pad_line prepends the left-padding space.
     out.push(pad_line(
         vec![
-            Span::styled(format!(" {} ", mark.0), Style::default().fg(mark.1).bg(bg)),
+            Span::styled(format!("{} ", mark.0), Style::default().fg(mark.1).bg(bg)),
             Span::styled(
                 name.to_string(),
                 Style::default().fg(theme.warn).bg(bg).bold(),
@@ -1336,7 +1337,7 @@ fn push_tool(
     // Shell tools: render the raw command on its own line (monospaced feel).
     if let Some(cmd) = hrdr_app::extract_shell_command(name, args) {
         out.push(pad_line(
-            vec![Span::styled(format!("   $ {cmd}"), dim_bg)],
+            vec![Span::styled(format!("  $ {cmd}"), dim_bg)],
             width,
             bg,
         ));
@@ -1370,7 +1371,7 @@ fn push_tool(
             };
             out.push(pad_line(
                 vec![Span::styled(
-                    format!("   {line}"),
+                    format!("  {line}"),
                     Style::default().fg(color).bg(bg),
                 )],
                 width,
@@ -1380,9 +1381,9 @@ fn push_tool(
         let extra = lines.len().saturating_sub(shown);
         if extra > 0 {
             let hint = if expanded {
-                "   ⌃ (click or /expand off to collapse)".to_string()
+                " ⌃ (click or /expand off to collapse)".to_string()
             } else {
-                format!("   … (+{extra} more lines · click or /expand)")
+                format!(" … (+{extra} more lines · click or /expand)")
             };
             out.push(pad_line(vec![Span::styled(hint, dim_bg)], width, bg));
         }
@@ -1392,7 +1393,7 @@ fn push_tool(
         if start > 0 {
             out.push(pad_line(
                 vec![Span::styled(
-                    format!("   ⋮ (live · {start} earlier line(s))"),
+                    format!("  ⋮ (live · {start} earlier line(s))"),
                     dim_bg,
                 )],
                 width,
@@ -1401,7 +1402,7 @@ fn push_tool(
         }
         for line in &lines[start..] {
             out.push(pad_line(
-                vec![Span::styled(format!("   {line}"), dim_bg)],
+                vec![Span::styled(format!(" {line}"), dim_bg)],
                 width,
                 bg,
             ));
