@@ -1078,21 +1078,11 @@ fn transcript_lines(
             Entry::Reasoning(_) if !app.show_reasoning => continue, // hidden via /reasoning
             Entry::Reasoning(text) => {
                 let dim = theme.dim;
-                let is_last = app
-                    .transcript
-                    .iter()
-                    .rev()
-                    .find_map(|e| match e {
-                        Entry::Reasoning(_) => Some(true),
-                        _ => None,
-                    })
-                    .is_some()
-                    && i == app.transcript.len() - 1;
-                // Live spinner header while the model is still thinking.
-                if app.running
-                    && is_last
-                    && let Some(elapsed) = app.reasoning_start.map(|t| t.elapsed())
-                {
+                // Show the live spinner header while the model is still thinking
+                // (this reasoning block is actively being streamed into).
+                let is_streaming =
+                    app.running && app.reasoning_start.is_some() && i == app.transcript.len() - 1;
+                if is_streaming && let Some(elapsed) = app.reasoning_start.map(|t| t.elapsed()) {
                     let frame = SPINNER[(elapsed.as_millis() / 120) as usize % SPINNER.len()];
                     out.push(Line::from(Span::styled(
                         format!(" {frame} Thinking"),

@@ -637,7 +637,7 @@ async fn reasoning_entry_appended_to_transcript() {
         .app
         .transcript
         .iter()
-        .any(|e| matches!(e, Entry::Reasoning(t) if t.as_str() == "I am thinking."));
+        .any(|e| matches!(e, Entry::Reasoning(t) if t.contains("I am thinking.")));
     assert!(has_reasoning, "Entry::Reasoning missing from transcript");
     let has_text = h
         .app

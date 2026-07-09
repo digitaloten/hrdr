@@ -1086,7 +1086,7 @@ impl App {
         self.out_tokens += 1;
     }
 
-    /// Stamp a "Thought:" footer on the last reasoning entry when thinking ends.
+    /// Stamp a "Thought:" marker on the last reasoning entry when thinking ends.
     fn finish_reasoning(&mut self) {
         let Some(start) = self.reasoning_start.take() else {
             return;
@@ -1094,7 +1094,8 @@ impl App {
         let elapsed = start.elapsed();
         let dur_str = format_duration(elapsed);
         if let Some(Entry::Reasoning(s)) = self.transcript.last_mut() {
-            s.push_str(&format!("\nThought: {dur_str}"));
+            // Prepend the footer so it renders at the top of the think block.
+            s.insert_str(0, &format!("Thought: {dur_str}\n\n"));
         }
     }
 
