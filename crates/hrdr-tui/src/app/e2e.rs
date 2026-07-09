@@ -2530,6 +2530,15 @@ async fn the_input_pane_matches_the_user_prompt_block() {
     // Two columns of padding on the left.
     assert!(row(text_y).starts_with("  hello world"), "{screen}");
 
+    // A blank row separates the tinted pane from the chrome below it.
+    let below = row(text_y + 2);
+    assert_eq!(below.trim(), "", "blank row below the input:\n{screen}");
+    assert_eq!(
+        bg_at(2, text_y + 2),
+        Color::Reset,
+        "and it is not tinted:\n{screen}"
+    );
+
     // The chrome the border used to carry moved to the help line below.
     let help = (text_y + 1..26)
         .map(row)

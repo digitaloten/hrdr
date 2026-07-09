@@ -88,6 +88,10 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     });
     constraints.push(Constraint::Length(input_height));
     let input_idx = constraints.len() - 1;
+    // A blank row separating the input pane from the chrome below it. The pane
+    // is tinted, so it would otherwise butt straight up against the status bar —
+    // the same rule the transcript's trailing tinted block follows.
+    constraints.push(Constraint::Length(1));
     // Status bar: hidden (0 rows), one row (truncate), or wrapped (≤4 rows).
     let sb_sections = build_status_sections(app);
     let sb_height: u16 = match app.statusbar_mode {
