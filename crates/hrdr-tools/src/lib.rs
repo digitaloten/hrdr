@@ -29,8 +29,8 @@ pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use patch::PatchTool;
 pub use tools::{
-    BashTool, EditTool, FindTool, GrepTool, LsTool, PowerShellTool, ReadTool, TodoTool, TreeTool, WriteTool,
-    available_shell_tools,
+    BashTool, EditTool, FindTool, GrepTool, LsTool, PowerShellTool, ReadTool, TodoTool, TreeTool,
+    WriteTool, available_shell_tools,
 };
 pub use web::{WebFetchTool, WebSearchTool};
 

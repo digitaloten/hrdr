@@ -84,7 +84,7 @@ impl Tool for TreeTool {
         let entries = collect_entries(&root, depth, max_entries)?;
 
         // Render to a string.
-        let root_label = if a.path.as_deref().map_or(true, |p| p == ".") {
+        let root_label = if a.path.as_deref().is_none_or(|p| p == ".") {
             ".".to_string()
         } else {
             root.file_name()
@@ -122,13 +122,19 @@ fn collect_entries(root: &Path, max_depth: usize, max_entries: usize) -> Result<
         let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
         let is_symlink = entry.file_type().is_some_and(|t| t.is_symlink());
 
-        let parent = path.parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf());
+        let parent = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.to_path_buf());
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
 
-        by_parent.entry(parent).or_default().push((name, is_dir, is_symlink));
+        by_parent
+            .entry(parent)
+            .or_default()
+            .push((name, is_dir, is_symlink));
     }
 
     // Sort and cap each parent's children.
@@ -163,14 +169,7 @@ fn collect_entries(root: &Path, max_depth: usize, max_entries: usize) -> Result<
     // Build the result: recursively walk from root, emitting dirs/files
     // in sorted order, only descending into dirs that have kept entries.
     let mut result: Vec<Collected> = Vec::new();
-    build_sorted(
-        root,
-        &[],
-        &by_parent,
-        &kept_paths,
-        max_depth,
-        &mut result,
-    );
+    build_sorted(root, &[], &by_parent, &kept_paths, max_depth, &mut result);
 
     Ok(result)
 }
@@ -334,7 +333,10 @@ mod tests {
         assert!(out.contains("README.md"), "README.md: {out}");
         assert!(out.contains("Cargo.toml"), "Cargo.toml: {out}");
         // Box-drawing characters present.
-        assert!(out.contains("├── ") || out.contains("└── "), "connectors: {out}");
+        assert!(
+            out.contains("├── ") || out.contains("└── "),
+            "connectors: {out}"
+        );
     }
 
     #[tokio::test]
@@ -380,7 +382,10 @@ mod tests {
             .unwrap();
         assert!(out1.contains("a/"), "depth 1: {out1}");
         assert!(!out1.contains("b/"), "depth 1 must not show b/: {out1}");
-        assert!(!out1.contains("deep.rs"), "depth 1 must not show deep.rs: {out1}");
+        assert!(
+            !out1.contains("deep.rs"),
+            "depth 1 must not show deep.rs: {out1}"
+        );
 
         // depth 3: shows a/b/c/ but not d/
         let out3 = TreeTool
@@ -417,11 +422,8 @@ mod tests {
 
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(
-                dir.path().join("file.txt"),
-                dir.path().join("link.txt"),
-            )
-            .unwrap();
+            std::os::unix::fs::symlink(dir.path().join("file.txt"), dir.path().join("link.txt"))
+                .unwrap();
             let c = ToolContext::new(dir.path().to_path_buf());
             let out = TreeTool
                 .execute(
@@ -487,9 +489,6 @@ mod tests {
             "nested non-last needs │: {out}"
         );
         // y.rs inside a/ (last child) should have blank prefix from parent
-        assert!(
-            out.contains("    └── y.rs"),
-            "nested last child: {out}"
-        );
+        assert!(out.contains("    └── y.rs"), "nested last child: {out}");
     }
 }
