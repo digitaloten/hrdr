@@ -8,6 +8,7 @@ mod mutation;
 pub(crate) mod read;
 pub(crate) mod shell;
 pub(crate) mod todo;
+pub(crate) mod tree;
 pub(crate) mod write;
 
 /// Hard cap on a rendered source line, so one minified file can't blow context.
@@ -25,6 +26,7 @@ pub use ls::LsTool;
 pub use read::ReadTool;
 pub use shell::{BashTool, PowerShellTool, available_shell_tools};
 pub use todo::TodoTool;
+pub use tree::TreeTool;
 pub use write::WriteTool;
 
 #[cfg(test)]

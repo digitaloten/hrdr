@@ -29,7 +29,7 @@ pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use patch::PatchTool;
 pub use tools::{
-    BashTool, EditTool, FindTool, GrepTool, LsTool, PowerShellTool, ReadTool, TodoTool, WriteTool,
+    BashTool, EditTool, FindTool, GrepTool, LsTool, PowerShellTool, ReadTool, TodoTool, TreeTool, WriteTool,
     available_shell_tools,
 };
 pub use web::{WebFetchTool, WebSearchTool};
@@ -427,6 +427,7 @@ impl ToolRegistry {
         r.register(Arc::new(GrepTool::detect()));
         r.register(Arc::new(FindTool));
         r.register(Arc::new(LsTool));
+        r.register(Arc::new(TreeTool));
         r.register(Arc::new(TodoTool));
         r.register(Arc::new(WebFetchTool));
         r.register(Arc::new(WebSearchTool));
