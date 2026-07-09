@@ -309,10 +309,9 @@ pub fn parse_duration(s: &str) -> Option<i64> {
         (n, 60)
     } else if let Some(n) = s.strip_suffix('h') {
         (n, 3600)
-    } else if let Some(n) = s.strip_suffix('d') {
-        (n, 86_400)
     } else {
-        return None;
+        let n = s.strip_suffix('d')?;
+        (n, 86_400)
     };
     digits.trim().parse::<i64>().ok().map(|v| v * mult)
 }

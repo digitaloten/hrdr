@@ -338,7 +338,7 @@ impl App {
             steering: hrdr_agent::steering_queue(),
             scroll_offset: 0,
             transcript_height: 24,
-            scrollback: scrollback,
+            scrollback,
             max_scroll: 0,
             todos,
             todo_turn: 0,
