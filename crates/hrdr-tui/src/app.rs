@@ -1121,6 +1121,9 @@ impl App {
                 self.count_token();
                 match self.state.transcript.last_mut().map(|e| &mut e.kind) {
                     Some(EntryKind::Assistant(s)) => s.push_str(&t),
+                    // Don't open an assistant entry for an empty delta — a turn
+                    // that only calls tools would leave an empty one behind.
+                    _ if t.is_empty() => {}
                     _ => self.push_entry(Entry::assistant(t)),
                 }
             }

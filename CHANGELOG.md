@@ -59,6 +59,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A text-less assistant turn no longer paints an empty block.** When the model
+  thinks and calls a tool without emitting any output, the assistant entry has
+  no text: it rendered as a lone `#N assistant` label floating over blank
+  padding, and consumed a message number. It is now skipped entirely, as is a
+  whitespace-only thinking block.
 - **The bundled theme now uses the real Tokyo Night palette.** The purple was
   named `mauve` (a Catppuccin name) while the code looks up `magenta`, so
   `accent2` silently fell back to `blue` — identical to `accent`. `teal` held

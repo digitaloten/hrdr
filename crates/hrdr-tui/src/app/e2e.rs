@@ -1803,3 +1803,74 @@ async fn fenced_code_inherits_its_blocks_background() {
         "code inside a command block"
     );
 }
+
+/// A turn that thinks and calls a tool but emits no text must not paint an empty
+/// assistant block, and must not consume a message number.
+///
+/// Regression: `markdown_lines("")` yields no rows, so the body was empty — but
+/// the `#N assistant` meta row was appended to it, and the block rendered as a
+/// label floating over blank padding.
+#[tokio::test]
+async fn an_assistant_turn_with_no_text_renders_nothing() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .state
+        .transcript
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::user("go"));
+    h.app
+        .push_entry(Entry::reasoning("thought about something"));
+    h.app.push_entry(Entry::assistant("")); // text-less turn: tool calls only
+    h.app
+        .push_entry(Entry::tool_running("c1", "bash", r#"{"command":"ls"}"#));
+
+    let mut term = Terminal::new(TestBackend::new(40, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+
+    assert!(
+        !screen.contains("assistant"),
+        "no assistant block for a text-less turn:\n{screen}"
+    );
+    // The user prompt keeps message #1; nothing else claims a number.
+    assert!(screen.contains("#1 you"), "{screen}");
+    assert!(
+        !screen.contains("#2"),
+        "the empty turn took a number:\n{screen}"
+    );
+    // The thought and the tool call still render.
+    assert!(screen.contains("thought about something"), "{screen}");
+    assert!(screen.contains("bash"), "{screen}");
+}
+
+/// A whitespace-only thinking block renders nothing either — no lone
+/// `Thought: …` label over blank padding.
+#[tokio::test]
+async fn an_empty_thinking_block_renders_nothing() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .state
+        .transcript
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::user("go"));
+    h.app.push_entry(Entry::reasoning("   \n"));
+
+    let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(!screen.contains("Thought"), "{screen}");
+}
+
+/// An empty text delta must not open an assistant entry in the first place.
+#[tokio::test]
+async fn an_empty_text_delta_opens_no_entry() {
+    let mut h = Harness::new(vec![]).await;
+    let before = h.app.state.transcript.len();
+    h.app
+        .on_turn_msg(TurnMsg::Event(hrdr_agent::AgentEvent::Text(String::new())));
+    assert_eq!(
+        h.app.state.transcript.len(),
+        before,
+        "an empty delta created a transcript entry"
+    );
+}

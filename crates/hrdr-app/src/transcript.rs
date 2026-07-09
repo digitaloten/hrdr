@@ -299,7 +299,10 @@ impl Entry {
     /// `/goto`, `/copy msg N`, and export.
     pub fn message_text(&self) -> Option<&str> {
         match &self.kind {
-            EntryKind::User(s) | EntryKind::Assistant(s) => Some(s),
+            EntryKind::User(s) => Some(s),
+            // An assistant turn that only called tools has no text: it isn't
+            // rendered, so it isn't a numbered message either.
+            EntryKind::Assistant(s) if !s.trim().is_empty() => Some(s),
             _ => None,
         }
     }

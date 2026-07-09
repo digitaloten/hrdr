@@ -1331,6 +1331,12 @@ fn transcript_lines(
                 BlockKind::Header,
                 header_lines(app, app.header_anchor, width),
             ),
+            // An assistant turn that produced only tool calls has no text. Don't
+            // number it, and don't paint a block containing nothing but its
+            // `#N assistant` label.
+            EntryKind::Assistant(text) if text.trim().is_empty() => continue,
+            // Likewise a thinking block with no thought in it.
+            EntryKind::Reasoning { text, .. } if text.trim().is_empty() => continue,
             EntryKind::User(text) => {
                 msg_num += 1;
                 msg_starts.push(out.len());
