@@ -53,6 +53,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Blank separator rows only between tinted blocks.** A prompt and the tool
   call it triggered, or two tool calls, would otherwise merge into one slab; a
   block on the terminal background already begins and ends in a blank row.
+- **The input cursor blinks**: a bar while inserting, a block in vim's Normal
+  mode. `EditorEngine::is_insert()` — long documented as a cursor-shape hint —
+  finally drives it. The terminal's own shape is restored on exit and while
+  `$EDITOR` has the screen.
 - **The input pane is borderless**, on the user prompt's background, with one
   blank row above and below and two columns either side — the same chrome a
   transcript block wears. The editor mode and the draft's size moved from the

@@ -7,11 +7,38 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{Event, EventStream};
+use crossterm::execute;
 use futures_util::StreamExt;
 
 use crate::app::{Action, App, run_editor};
 use crate::{Tui, resume_terminal, suspend_terminal, ui};
+
+/// Tell the terminal what the cursor should look like, when it changes.
+///
+/// The editor already places the real cursor (`Frame::set_cursor_position`), so
+/// this only picks its *shape*: a blinking bar while inserting text, a blinking
+/// block otherwise (vim's Normal mode). Terminals often default to a steady
+/// cursor, which is why it has to be asked for. Emitted only on a change — an
+/// escape sequence per frame would be noise.
+fn sync_cursor<W: std::io::Write>(
+    out: &mut W,
+    insert: bool,
+    last: &mut Option<bool>,
+) -> Result<()> {
+    if *last == Some(insert) {
+        return Ok(());
+    }
+    let style = if insert {
+        SetCursorStyle::BlinkingBar
+    } else {
+        SetCursorStyle::BlinkingBlock
+    };
+    execute!(out, style)?;
+    *last = Some(insert);
+    Ok(())
+}
 
 /// Drive `app` against the terminal until it quits: draw, then await terminal
 /// input, agent messages, config-file changes, or a spinner tick.
@@ -26,9 +53,17 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
     // Shared config watch (OS watcher with polling fallback); pings arrive as
     // TurnMsg::ConfigChanged. Kept alive for the loop.
     let _config_watch = app.start_config_watch();
+    // The editor's insert state drives the cursor shape (see `sync_cursor`).
+    // `None` forces the first frame to emit it.
+    let mut cursor_insert: Option<bool> = None;
 
     loop {
         terminal.draw(|f| ui::draw(f, app))?;
+        sync_cursor(
+            terminal.backend_mut(),
+            app.editor.is_insert(),
+            &mut cursor_insert,
+        )?;
         if app.should_quit {
             break;
         }
@@ -36,8 +71,16 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
         tokio::select! {
             maybe_ev = events.next() => match maybe_ev {
                 Some(Ok(Event::Key(key))) => match app.on_key(key) {
-                    Action::OpenEditor => open_in_editor(app, terminal)?,
-                    Action::OpenFile(path) => open_file_in_editor(app, terminal, &path)?,
+                    // Leaving the alt screen for `$EDITOR` resets the cursor
+                    // shape; forget ours so the next frame asks for it again.
+                    Action::OpenEditor => {
+                        open_in_editor(app, terminal)?;
+                        cursor_insert = None;
+                    }
+                    Action::OpenFile(path) => {
+                        open_file_in_editor(app, terminal, &path)?;
+                        cursor_insert = None;
+                    }
                     Action::Redraw => terminal.clear()?,
                     Action::None => {}
                 },
@@ -113,4 +156,45 @@ fn open_file_in_editor(app: &mut App, terminal: &mut Tui, path: &std::path::Path
         Err(e) => app.system(format!("editor failed: {e}")),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::sync_cursor;
+
+    /// The cursor blinks: a bar while inserting text, a block otherwise (vim's
+    /// Normal mode). The escape is emitted only when the shape changes — one per
+    /// frame would be noise on the wire.
+    ///
+    /// Regression: nothing ever asked for a shape, so the cursor kept whatever
+    /// the terminal defaulted to, which is usually steady.
+    #[test]
+    fn the_cursor_style_is_emitted_on_change_only() {
+        // DECSCUSR: 5 = blinking bar, 1 = blinking block.
+        const BLINKING_BAR: &str = "\x1b[5 q";
+        const BLINKING_BLOCK: &str = "\x1b[1 q";
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut last = None;
+
+        // First frame always emits, whatever the state.
+        sync_cursor(&mut out, true, &mut last).unwrap();
+        assert_eq!(String::from_utf8(out.clone()).unwrap(), BLINKING_BAR);
+        assert_eq!(last, Some(true));
+
+        // Unchanged: nothing on the wire.
+        out.clear();
+        sync_cursor(&mut out, true, &mut last).unwrap();
+        assert!(out.is_empty(), "re-emitted an unchanged cursor style");
+
+        // Leaving insert switches to a blinking block.
+        sync_cursor(&mut out, false, &mut last).unwrap();
+        assert_eq!(String::from_utf8(out.clone()).unwrap(), BLINKING_BLOCK);
+        assert_eq!(last, Some(false));
+
+        // …and back.
+        out.clear();
+        sync_cursor(&mut out, true, &mut last).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), BLINKING_BAR);
+    }
 }

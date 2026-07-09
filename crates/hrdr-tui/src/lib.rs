@@ -15,6 +15,7 @@ mod ui;
 use std::io::{Stdout, stdout};
 
 use anyhow::Result;
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -52,6 +53,8 @@ impl Drop for TerminalGuard {
         let mut out = stdout();
         let _ = execute!(
             out,
+            // Hand the cursor back the way we found it.
+            SetCursorStyle::DefaultUserShape,
             PopKeyboardEnhancementFlags,
             DisableMouseCapture,
             LeaveAlternateScreen,
@@ -69,6 +72,7 @@ pub(crate) fn suspend_terminal(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        SetCursorStyle::DefaultUserShape,
         PopKeyboardEnhancementFlags,
         DisableMouseCapture,
         LeaveAlternateScreen,
@@ -110,6 +114,8 @@ pub async fn run(config: AgentConfig, ui: hrdr_app::UiConfig, logo: &'static str
         let mut out = stdout();
         let _ = execute!(
             out,
+            // Hand the cursor back the way we found it.
+            SetCursorStyle::DefaultUserShape,
             PopKeyboardEnhancementFlags,
             DisableMouseCapture,
             LeaveAlternateScreen,
