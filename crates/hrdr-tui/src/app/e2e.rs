@@ -14,6 +14,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Position;
+use ratatui::style::Color;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -348,6 +349,21 @@ fn buffer_to_string(buf: &Buffer) -> String {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Point `sessions_dir()` at a temp directory for the duration of a test.
+///
+/// `XDG_DATA_HOME` is process-global, so the tests that write session files must
+/// not run concurrently — they'd overwrite each other's `sessions/` root. The
+/// returned guard holds a lock for the whole test and keeps the temp dir alive.
+fn isolated_data_home() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A previous test's panic must not poison the lock for everyone else.
+    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    // SAFETY: the lock above serializes every writer and reader of this var.
+    unsafe { std::env::set_var("XDG_DATA_HOME", tmp.path()) };
+    (guard, tmp)
+}
 
 #[tokio::test]
 async fn plain_message_gets_a_streamed_reply() {
@@ -923,7 +939,11 @@ async fn transcript_renders_padded_blocks_with_per_kind_backgrounds() {
     // The tool block: status mark + name on the header, command below it, both
     // on the tool background.
     let tool_y = find_row("✓ bash").expect("tool header rendered");
-    assert_eq!(bg_at(0, tool_y), theme.tool_bg, "tool block bg");
+    assert_eq!(
+        bg_at(0, tool_y),
+        theme.user_bg,
+        "tool blocks share the prompt bg"
+    );
     assert!(
         row_text(tool_y + 1).starts_with(&format!("{pad}$ echo hi")),
         "command line"
@@ -1073,10 +1093,9 @@ async fn slash_command_output_renders_as_markdown_on_the_command_background() {
 
     let cell = buf.cell(Position::new(2, y)).unwrap();
     assert_eq!(cell.bg, theme.command_bg, "own background");
-    assert_ne!(theme.command_bg, theme.tool_bg, "distinct from tool blocks");
     assert_ne!(
         theme.command_bg, theme.user_bg,
-        "distinct from user prompts"
+        "distinct from user prompts (and so from tool blocks, which share it)"
     );
     // Markdown was parsed: the `**` markers are gone and the text is bold.
     assert!(
@@ -1213,9 +1232,7 @@ async fn a_saved_context_window_never_clobbers_the_probed_one() {
 /// no conversion layer in between.
 #[tokio::test]
 async fn autosave_writes_the_state_and_it_loads_back_identically() {
-    let data_home = tempfile::tempdir().unwrap();
-    // SAFETY: `sessions_dir()` reads this; the value is only used by this test.
-    unsafe { std::env::set_var("XDG_DATA_HOME", data_home.path()) };
+    let _data_home = isolated_data_home();
 
     let mut h = Harness::new(vec![MockReply::TextWithReasoning {
         reasoning: "think".into(),
@@ -1543,9 +1560,7 @@ async fn an_unpinned_model_and_provider_yield_to_the_session() {
 /// stacked "resumed session" lines.
 #[tokio::test]
 async fn resume_notices_do_not_accumulate() {
-    let data_home = tempfile::tempdir().unwrap();
-    // SAFETY: `sessions_dir()` reads this; only this test uses the value.
-    unsafe { std::env::set_var("XDG_DATA_HOME", data_home.path()) };
+    let _data_home = isolated_data_home();
 
     let mut h = Harness::new(vec![MockReply::Text("ok".into())]).await;
     h.submit("hi").await;
@@ -1605,9 +1620,7 @@ async fn resume_notices_do_not_accumulate() {
 /// first message.
 #[tokio::test]
 async fn clear_and_new_take_a_session_name() {
-    let data_home = tempfile::tempdir().unwrap();
-    // SAFETY: `sessions_dir()` reads this; only this test uses the value.
-    unsafe { std::env::set_var("XDG_DATA_HOME", data_home.path()) };
+    let _data_home = isolated_data_home();
 
     let mut h = Harness::new(vec![
         MockReply::Text("ok".into()),
@@ -1732,4 +1745,61 @@ async fn thinking_and_thought_labels_render_identically() {
     let (blank, text) = rows_after_label(&screen, "Thinking");
     assert_eq!(blank, "", "exactly one blank row after the label");
     assert_eq!(text, "streaming thoughts", "then the thought");
+}
+
+/// Fenced code doesn't paint a surface of its own: it inherits whatever block it
+/// sits in. Inside the model's output that's the terminal background; inside a
+/// slash-command block it's the command background.
+///
+/// Regression: code blocks were painted on a dedicated `code_bg`, so a snippet
+/// in an assistant message rendered as a dark slab over the terminal background.
+#[tokio::test]
+async fn fenced_code_inherits_its_blocks_background() {
+    let mut h = Harness::new(vec![MockReply::Text(
+        "text\n\n```rs\nfn main() {}\n```\n".into(),
+    )])
+    .await;
+    h.submit("go").await;
+    h.app
+        .push_entry(Entry::system("out\n\n```rs\nlet y = 2;\n```\n"));
+    // Drop the startup chrome so both blocks fit on one screen.
+    h.app
+        .state
+        .transcript
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+
+    let mut term = Terminal::new(TestBackend::new(50, 44)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let theme = &h.app.theme;
+
+    let row_of = |needle: &str| -> u16 {
+        (0..44)
+            .find(|&y| {
+                (0..49)
+                    .filter_map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol().to_string())
+                    })
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no row containing {needle:?}"))
+    };
+    // Column 2 is inside the block's content (past the padding).
+    let bg_at = |y: u16| buf.cell(Position::new(2, y)).unwrap().bg;
+
+    // Assistant output: the code sits on the terminal background, like its prose.
+    let code_y = row_of("fn main()");
+    let prose_y = row_of("text");
+    assert_eq!(bg_at(code_y), Color::Reset, "code in assistant output");
+    assert_eq!(bg_at(prose_y), Color::Reset, "the prose around it");
+
+    // Slash-command output: the code sits on the command background.
+    let cmd_code_y = row_of("let y = 2;");
+    assert_eq!(
+        bg_at(cmd_code_y),
+        theme.command_bg,
+        "code inside a command block"
+    );
 }

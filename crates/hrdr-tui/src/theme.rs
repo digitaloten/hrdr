@@ -22,14 +22,10 @@ pub struct Theme {
     pub user_bg: Color,
     /// Assistant message text.
     pub assistant: Color,
-    /// Assistant / reasoning block background.
-    pub assistant_bg: Color,
     /// Dimmed chrome: reasoning, system lines, stats, borders, hints, scrollbar.
     pub dim: Color,
     /// Attention color: tool names, the inference loader, the follow button.
     pub warn: Color,
-    /// Tool-call block background.
-    pub tool_bg: Color,
     /// Slash-command output block background.
     pub command_bg: Color,
     /// Per-turn stats block background.
@@ -69,10 +65,8 @@ impl Theme {
             user: c(p.user, Color::Cyan),
             user_bg: c(p.user_bg, Color::Rgb(0, 48, 60)),
             assistant: c(p.assistant, Color::White),
-            assistant_bg: c(p.assistant_bg, Color::Rgb(27, 30, 46)),
             dim: c(p.dim, Color::DarkGray),
             warn: c(p.warn, Color::Yellow),
-            tool_bg: c(p.tool_bg, Color::Rgb(30, 32, 40)),
             command_bg: c(p.command_bg, Color::Rgb(32, 34, 58)),
             stats_bg: c(p.stats_bg, Color::Rgb(25, 27, 43)),
             header_bg: c(p.header_bg, Color::Rgb(22, 24, 42)),
@@ -182,8 +176,6 @@ mod theme_tests {
         assert_eq!(hex(t.accent2), "#bb9af7", "magenta");
 
         assert_eq!(hex(t.user_bg), "#283457", "bg_visual");
-        assert_eq!(hex(t.assistant_bg), "#1f2335", "bg_dark1");
-        assert_eq!(hex(t.tool_bg), "#16161e", "bg_dark");
         assert_eq!(hex(t.command_bg), "#24283b", "bg_storm");
         assert_eq!(hex(t.stats_bg), "#222436", "bg_moon");
         assert_eq!(hex(t.header_bg), "#292e42", "bg_highlight");

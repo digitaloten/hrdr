@@ -1050,12 +1050,13 @@ impl BlockKind {
     fn bg(self, theme: &Theme) -> Color {
         match self {
             BlockKind::Header => theme.header_bg,
-            BlockKind::User | BlockKind::Queued => theme.user_bg,
-            BlockKind::Tool => theme.tool_bg,
+            // A tool call is something the user's turn set in motion, so it
+            // sits on the prompt's background rather than a surface of its own.
+            BlockKind::User | BlockKind::Queued | BlockKind::Tool => theme.user_bg,
             BlockKind::Command => theme.command_bg,
-            // Reasoning shares the assistant background: it's the same voice,
-            // just quieter text.
-            BlockKind::Assistant | BlockKind::Reasoning => theme.assistant_bg,
+            // The model's output and its thinking sit on the terminal's own
+            // background — no override, so they read as the page itself.
+            BlockKind::Assistant | BlockKind::Reasoning => Color::Reset,
             BlockKind::Stats => theme.stats_bg,
         }
     }
@@ -1346,8 +1347,8 @@ fn transcript_lines(
                 msg_starts.push(out.len());
                 footer.extend(meta(i, msg_num, "assistant"));
                 let md = md_theme.clone();
-                let code_bg = theme.tool_bg;
-                let body = cache_entry(ck, || markdown_lines(text, &md, code_bg, inner));
+                let bg = BlockKind::Assistant.bg(theme);
+                let body = cache_entry(ck, || markdown_lines(text, &md, bg, inner));
                 (BlockKind::Assistant, body)
             }
             EntryKind::Reasoning { .. } if !app.show_reasoning => continue, // hidden via /reasoning
@@ -1383,8 +1384,8 @@ fn transcript_lines(
                 // Same markdown pipeline as assistant, in the same colors —
                 // only dimmer, so thoughts read as a quieter version of output.
                 let md = theme.md_theme_dim();
-                let code_bg = theme.tool_bg;
-                let body = cache_entry(ck, || markdown_lines(text, &md, code_bg, inner));
+                let bg = BlockKind::Reasoning.bg(theme);
+                let body = cache_entry(ck, || markdown_lines(text, &md, bg, inner));
                 (BlockKind::Reasoning, body)
             }
             EntryKind::Tool {
@@ -1417,8 +1418,8 @@ fn transcript_lines(
             // — same markdown, same colors, no dimming — on their own background.
             EntryKind::System(text) | EntryKind::Notice(text) => {
                 let md = md_theme.clone();
-                let code_bg = theme.tool_bg;
-                let body = cache_entry(ck, || markdown_lines(text, &md, code_bg, inner));
+                let bg = BlockKind::Command.bg(theme);
+                let body = cache_entry(ck, || markdown_lines(text, &md, bg, inner));
                 (BlockKind::Command, body)
             }
             EntryKind::Stats(text) => {
@@ -1497,12 +1498,12 @@ fn text_lines(text: &str, style: Style) -> Vec<Line<'static>> {
 }
 
 /// Render markdown into block-body lines: prose through hjkl-markdown, fenced
-/// code blocks pulled out and syntax-highlighted on `code_bg`. Shared by the
-/// assistant and reasoning blocks (which differ only in `md`'s colors).
+/// code blocks pulled out and syntax-highlighted. `bg` is the enclosing block's
+/// background — code blocks sit on it rather than a surface of their own.
 fn markdown_lines(
     text: &str,
     md: &hjkl_markdown_tui::MdTheme,
-    code_bg: Color,
+    bg: Color,
     width: u16,
 ) -> Vec<Line<'static>> {
     let mut buf = Vec::new();
@@ -1513,7 +1514,7 @@ fn markdown_lines(
                 buf.extend(hjkl_markdown_tui::to_lines(&ev_buf, md, width.max(1)));
                 ev_buf.clear();
             }
-            buf.extend(highlight_code_block(&lang, &content, width.max(1), code_bg));
+            buf.extend(highlight_code_block(&lang, &content, width.max(1), bg));
         } else {
             ev_buf.push(ev);
         }
@@ -2083,29 +2084,36 @@ mod block_tests {
         );
     }
 
-    /// every content kind resolves its own, visually distinct background, so a
-    /// reader can see where each block starts and stops.
+    /// Backgrounds by kind: the model's voice (output + thinking) sits on the
+    /// terminal background, a tool call shares the prompt's, and the remaining
+    /// surfaces are mutually distinct so a reader can see where blocks start and
+    /// stop.
     #[test]
-    fn block_kinds_have_distinct_backgrounds() {
+    fn block_kinds_have_the_right_backgrounds() {
         let t = Theme::default();
+
+        // No override for the model's output or its thinking.
+        assert_eq!(BlockKind::Assistant.bg(&t), Color::Reset);
+        assert_eq!(BlockKind::Reasoning.bg(&t), Color::Reset);
+
+        // A tool call is part of the user's turn, so it shares that background.
+        assert_eq!(BlockKind::Tool.bg(&t), t.user_bg);
+        assert_eq!(BlockKind::Queued.bg(&t), t.user_bg);
         assert_eq!(BlockKind::User.bg(&t), t.user_bg);
-        assert_eq!(BlockKind::Tool.bg(&t), t.tool_bg);
-        assert_eq!(BlockKind::Assistant.bg(&t), t.assistant_bg);
-        // Reasoning is the assistant's voice, just quieter — same background.
-        assert_eq!(BlockKind::Reasoning.bg(&t), t.assistant_bg);
+
+        assert_eq!(BlockKind::Command.bg(&t), t.command_bg);
         assert_eq!(BlockKind::Stats.bg(&t), t.stats_bg);
         assert_eq!(BlockKind::Header.bg(&t), t.header_bg);
 
+        // The tinted surfaces differ from each other and from the terminal.
         let bgs = [
             BlockKind::Header.bg(&t),
             BlockKind::User.bg(&t),
-            BlockKind::Assistant.bg(&t),
-            BlockKind::Tool.bg(&t),
             BlockKind::Command.bg(&t),
             BlockKind::Stats.bg(&t),
         ];
         for (i, a) in bgs.iter().enumerate() {
-            assert_ne!(*a, Color::Reset, "content blocks carry their own bg");
+            assert_ne!(*a, Color::Reset, "tinted blocks carry their own bg");
             for b in &bgs[i + 1..] {
                 assert_ne!(a, b, "block backgrounds must differ: {bgs:?}");
             }
