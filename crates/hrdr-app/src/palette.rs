@@ -22,12 +22,16 @@ pub struct ChatPalette {
     pub background: Option<Rgb>,
     /// User prompt accent (the `❯` and user text).
     pub user: Option<Rgb>,
+    /// User prompt background.
+    pub user_bg: Option<Rgb>,
     /// Assistant message text.
     pub assistant: Option<Rgb>,
     /// Dimmed chrome: reasoning, system lines, stats, borders, hints.
     pub dim: Option<Rgb>,
     /// Attention color: tool names, the inference loader.
     pub warn: Option<Rgb>,
+    /// Tool-call block background.
+    pub tool_bg: Option<Rgb>,
     /// Success marks (tool ✓).
     pub success: Option<Rgb>,
     /// Error marks (tool ✗).
@@ -58,12 +62,20 @@ impl ChatPalette {
     pub fn from_hjkl(t: &HjklTheme) -> Self {
         let rgb = |c: hjkl_theme::Color| (c.r, c.g, c.b);
         let pal = |name: &str| t.palette.get(name).copied().map(rgb);
+        // The syntect code-block background is the natural tool bg fallback.
+        let panel = crate::panel_bg_rgb();
         Self {
             background: t.ui.background.map(rgb),
             user: pal("teal").or_else(|| pal("blue")),
+            user_bg: pal("bg_user")
+                .or_else(|| pal("ui_selection"))
+                .or(Some((0, 48, 60))),
             assistant: t.ui.foreground.map(rgb).or_else(|| pal("fg")),
             dim: t.ui.gutter.map(rgb).or_else(|| pal("comment")),
             warn: pal("yellow"),
+            tool_bg: pal("bg_tool")
+                .or_else(|| pal("ui_cursorline"))
+                .or(Some(panel)),
             success: pal("green"),
             error: t.ui.diagnostic_error.map(rgb).or_else(|| pal("red")),
             accent: pal("blue").or_else(|| pal("teal")),

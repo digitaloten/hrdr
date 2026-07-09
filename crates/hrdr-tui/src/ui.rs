@@ -808,17 +808,18 @@ thread_local! {
 }
 
 /// Render a fenced code block with syntect highlighting on a distinct
-/// background, padded to a solid rectangle. Cached per (lang, content, width).
-fn highlight_code_block(lang: &str, content: &str, width: u16) -> Vec<Line<'static>> {
+/// background, padded to a solid rectangle. Cached per (lang, content, width, bg).
+fn highlight_code_block(lang: &str, content: &str, width: u16, bg: Color) -> Vec<Line<'static>> {
     let mut hasher = DefaultHasher::new();
     lang.hash(&mut hasher);
     content.hash(&mut hasher);
     width.hash(&mut hasher);
+    bg.hash(&mut hasher);
     let key = hasher.finish();
     if let Some(cached) = HL_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         return cached;
     }
-    let lines = render_code_block(lang, content, width);
+    let lines = render_code_block(lang, content, width, bg);
     HL_CACHE.with(|c| {
         let mut m = c.borrow_mut();
         if m.len() > 1024 {
@@ -829,15 +830,7 @@ fn highlight_code_block(lang: &str, content: &str, width: u16) -> Vec<Line<'stat
     lines
 }
 
-/// The shared panel background for code blocks and tool output (the syntect
-/// theme's background, with a dark fallback), so both render as solid blocks.
-fn panel_bg() -> Color {
-    let (r, g, b) = hrdr_app::panel_bg_rgb();
-    Color::Rgb(r, g, b)
-}
-
-fn render_code_block(lang: &str, content: &str, width: u16) -> Vec<Line<'static>> {
-    let bg = panel_bg();
+fn render_code_block(lang: &str, content: &str, width: u16, bg: Color) -> Vec<Line<'static>> {
     let bg_only = Style::default().bg(bg);
     let w = width as usize;
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -1026,17 +1019,16 @@ fn transcript_lines(
             Entry::User(text) => {
                 msg_num += 1;
                 msg_starts.push(out.len());
-                // Timestamp meta is always rendered fresh (it changes with time).
                 meta(&mut out, i, msg_num, "you");
-                // Content lines are cached by (index, content hash, width, flags).
                 let user_color = theme.user;
+                let user_bg = theme.user_bg;
                 out.extend(cache_entry(ck, || {
                     let mut buf = Vec::new();
                     push_text(
                         &mut buf,
                         Span::styled("❯ ", Style::default().fg(user_color).bold()),
                         text,
-                        Style::default().fg(user_color),
+                        Style::default().fg(user_color).bg(user_bg),
                     );
                     buf
                 }));
@@ -1047,9 +1039,9 @@ fn transcript_lines(
             Entry::Assistant(text) => {
                 msg_num += 1;
                 msg_starts.push(out.len());
-                // Timestamp meta is always rendered fresh.
                 meta(&mut out, i, msg_num, "assistant");
                 let md_theme_c = md_theme.clone();
+                let tool_bg = theme.tool_bg;
                 out.extend(cache_entry(ck, || {
                     let mut buf = Vec::new();
                     let mut ev_buf: Vec<hjkl_markdown::Event> = Vec::new();
@@ -1063,7 +1055,12 @@ fn transcript_lines(
                                 ));
                                 ev_buf.clear();
                             }
-                            buf.extend(highlight_code_block(&lang, &content, width.max(1)));
+                            buf.extend(highlight_code_block(
+                                &lang,
+                                &content,
+                                width.max(1),
+                                tool_bg,
+                            ));
                         } else {
                             ev_buf.push(ev);
                         }
@@ -1081,6 +1078,27 @@ fn transcript_lines(
             Entry::Reasoning(_) if !app.show_reasoning => continue, // hidden via /reasoning
             Entry::Reasoning(text) => {
                 let dim = theme.dim;
+                let is_last = app
+                    .transcript
+                    .iter()
+                    .rev()
+                    .find_map(|e| match e {
+                        Entry::Reasoning(_) => Some(true),
+                        _ => None,
+                    })
+                    .is_some()
+                    && i == app.transcript.len() - 1;
+                // Live spinner header while the model is still thinking.
+                if app.running
+                    && is_last
+                    && let Some(elapsed) = app.reasoning_start.map(|t| t.elapsed())
+                {
+                    let frame = SPINNER[(elapsed.as_millis() / 120) as usize % SPINNER.len()];
+                    out.push(Line::from(Span::styled(
+                        format!(" {frame} Thinking"),
+                        Style::default().fg(dim).add_modifier(Modifier::ITALIC),
+                    )));
+                }
                 out.extend(cache_entry(ck, || {
                     let mut buf = Vec::new();
                     push_text(
@@ -1234,7 +1252,7 @@ fn push_tool(
 ) {
     // Tool blocks sit on the shared panel background (like code blocks), so each
     // line's spans carry `bg` and are padded out to the full width.
-    let bg = panel_bg();
+    let bg = theme.tool_bg;
     let dim_bg = Style::default().fg(theme.dim).bg(bg);
     let mark = if !done {
         ("…", theme.warn)

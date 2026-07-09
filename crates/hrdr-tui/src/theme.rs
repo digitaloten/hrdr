@@ -15,12 +15,16 @@ use ratatui::style::Color;
 pub struct Theme {
     /// User prompt accent (the `❯` and user text).
     pub user: Color,
+    /// User prompt background.
+    pub user_bg: Color,
     /// Assistant message text.
     pub assistant: Color,
     /// Dimmed chrome: reasoning, system lines, stats, borders, hints, scrollbar.
     pub dim: Color,
     /// Attention color: tool names, the inference loader, the follow button.
     pub warn: Color,
+    /// Tool-call block background.
+    pub tool_bg: Color,
     /// Success marks (tool ✓).
     pub success: Color,
     /// Error marks (tool ✗) and the quit-confirm banner.
@@ -46,9 +50,11 @@ impl Theme {
         };
         Self {
             user: c(p.user, Color::Cyan),
+            user_bg: c(p.user_bg, Color::Rgb(0, 48, 60)),
             assistant: c(p.assistant, Color::White),
             dim: c(p.dim, Color::DarkGray),
             warn: c(p.warn, Color::Yellow),
+            tool_bg: c(p.tool_bg, Color::Rgb(30, 32, 40)),
             success: c(p.success, Color::Green),
             error: c(p.error, Color::Red),
             accent: c(p.accent, Color::Blue),

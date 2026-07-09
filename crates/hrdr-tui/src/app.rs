@@ -30,7 +30,7 @@ use hrdr_app::config_mtime as current_config_mtime;
 use hrdr_app::{
     PanelHit, SubAgentPanel, age_completed_todos, display_dir, git_branch, is_quit_command,
 };
-use util::timestamp_now;
+use util::{format_duration, timestamp_now};
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
 pub(crate) use util::run_editor;
@@ -224,6 +224,8 @@ pub(crate) struct App {
     pub(crate) turn_started_at: Option<chrono::DateTime<chrono::Local>>,
     /// When the first output token of the turn arrived (for tok/s).
     pub(crate) first_token_at: Option<Instant>,
+    /// When the current thinking block started (for the "Thought:" footer).
+    pub(crate) reasoning_start: Option<Instant>,
     /// Streamed output deltas this turn (≈ tokens).
     pub(crate) out_tokens: usize,
     /// `(prompt_tokens, completion_tokens)` from the latest model call.
@@ -353,6 +355,7 @@ impl App {
             turn_started: None,
             turn_started_at: None,
             first_token_at: None,
+            reasoning_start: None,
             out_tokens: 0,
             last_usage: None,
             last_cached_tokens: None,
@@ -861,6 +864,7 @@ impl App {
         self.turn_started = Some(Instant::now());
         self.turn_started_at = Some(chrono::Local::now());
         self.first_token_at = None;
+        self.reasoning_start = None;
         self.out_tokens = 0;
         // Keep last_usage so the status-bar context size persists between turns;
         // it's refreshed when this turn's Usage event arrives.
@@ -923,6 +927,7 @@ impl App {
         self.turn_started = Some(Instant::now());
         self.turn_started_at = Some(chrono::Local::now());
         self.first_token_at = None;
+        self.reasoning_start = None;
         self.out_tokens = 0;
         let agent = self.agent.clone();
         let tx = self.tx.clone();
@@ -1081,7 +1086,25 @@ impl App {
         self.out_tokens += 1;
     }
 
+    /// Stamp a "Thought:" footer on the last reasoning entry when thinking ends.
+    fn finish_reasoning(&mut self) {
+        let Some(start) = self.reasoning_start.take() else {
+            return;
+        };
+        let elapsed = start.elapsed();
+        let dur_str = format_duration(elapsed);
+        if let Some(Entry::Reasoning(s)) = self.transcript.last_mut() {
+            s.push_str(&format!("\nThought: {dur_str}"));
+        }
+    }
+
     fn apply_event(&mut self, ev: AgentEvent) {
+        // Stamp a "Thought:" footer on the last reasoning block when thinking
+        // ends (the next event after Reasoning is something else).
+        let end_reasoning = !matches!(ev, AgentEvent::Reasoning(_));
+        if end_reasoning {
+            self.finish_reasoning();
+        }
         match ev {
             AgentEvent::Text(t) => {
                 self.count_token();
@@ -1092,6 +1115,9 @@ impl App {
             }
             AgentEvent::Reasoning(t) => {
                 self.count_token();
+                if self.reasoning_start.is_none() {
+                    self.reasoning_start = Some(Instant::now());
+                }
                 match self.transcript.last_mut() {
                     Some(Entry::Reasoning(s)) => s.push_str(&t),
                     _ => self.push_entry(Entry::Reasoning(t)),
