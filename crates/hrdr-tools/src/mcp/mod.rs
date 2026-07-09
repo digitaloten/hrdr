@@ -55,6 +55,9 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::sync::{Mutex, oneshot};
 
+    // Only the tests that spawn a stdio server exercise a real `Tool`, and those
+    // are `#[cfg(unix)]` — on Windows this import would be unused (`-D warnings`).
+    #[cfg(unix)]
     use crate::{Tool, ToolContext};
 
     use super::*;
