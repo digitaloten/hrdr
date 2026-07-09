@@ -64,8 +64,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the queue/scroll hints, and the draft's size; the keys moved into `/help`,
   which now lists the active input discipline's own bindings plus the mouse and
   scroll shortcuts.
-- **The "follow output" button floats two rows above the input pane**, with an
-  arrow at each end.
+- **Both banners share one render path.** The "follow output" and quit-confirm
+  messages float on the same row above the input pane, differing only in their
+  icon, text, and colors — all passed as arguments. The quit confirmation is
+  flanked by `⚠`, the follow banner by `↓`.
 - **The status bar renders through the block renderer**: two columns of padding
   either side, a blank row above and below.
 - **Thinking blocks lost their `⠋ Thinking` / `Thought: 1.2s` label.** The

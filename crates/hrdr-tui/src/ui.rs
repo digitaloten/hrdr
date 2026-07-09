@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Entry, EntryKind, StatusBarMode, TimestampStyle};
 use crate::theme::Theme;
@@ -540,34 +540,27 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
 
     app.editor.render(f, inner);
 
-    // Overlays. The quit-confirm hint sits on the pane's top padding row; the
-    // "follow output" button two rows higher, clear of the pane. The hint takes
-    // priority when both would apply.
+    // Both banners float on the same row above the pane; the quit confirmation
+    // takes the spot when both would apply. Only the follow banner is clickable.
     if app.quit_armed {
-        overlay_button(
+        banner(
             f,
             area,
-            area.y,
-            " Press Ctrl+C again to quit ",
-            Style::default()
-                .fg(Color::White)
-                .bg(app.theme.error)
-                .add_modifier(Modifier::BOLD),
+            "⚠",
+            "Press Ctrl+C again to quit",
+            Color::White,
+            app.theme.error,
         );
-        // Not clickable; and it sits over the follow button's spot.
         app.follow_button = None;
     } else if app.scroll_offset > 0 {
-        // Two rows above the pane, clear of its top padding, with an arrow at
-        // each end pointing at the output it returns to.
-        let rect = overlay_button(
+        // The arrows point at the output the banner returns to.
+        let rect = banner(
             f,
             area,
-            area.y.saturating_sub(2),
-            " ↓ Press END to follow output ↓ ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(app.theme.warn)
-                .add_modifier(Modifier::BOLD),
+            "↓",
+            "Press END to follow output",
+            Color::Black,
+            app.theme.warn,
         );
         app.follow_button = Some(crate::app::HitRect {
             x: rect.x,
@@ -580,18 +573,26 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Render a centered, single-row label at screen row `y`, horizontally centered
-/// on `area`, and return its rect (for click hit-testing).
-fn overlay_button(f: &mut Frame, area: Rect, y: u16, label: &str, style: Style) -> Rect {
-    let w = (label.chars().count() as u16).min(area.width);
-    let x = area.x + area.width.saturating_sub(w) / 2;
+/// Rows above the input pane that a banner floats on, clear of its padding.
+const BANNER_LIFT: u16 = 2;
+
+/// Render a banner over the transcript, just above the input pane: a bold,
+/// centered, single-row `label` in `fg` on `bg`, flanked by `icon` on each side.
+/// Returns its rect, for click hit-testing.
+///
+/// Both banners — "follow output" and the quit confirmation — go through here,
+/// so they sit on the same row and differ only in their icon, text, and colors.
+fn banner(f: &mut Frame, input: Rect, icon: &str, label: &str, fg: Color, bg: Color) -> Rect {
+    let text = format!(" {icon} {label} {icon} ");
+    let w = (text.width() as u16).min(input.width);
     let rect = Rect {
-        x,
-        y,
+        x: input.x + input.width.saturating_sub(w) / 2,
+        y: input.y.saturating_sub(BANNER_LIFT),
         width: w,
         height: 1,
     };
-    f.render_widget(Paragraph::new(Line::from(Span::styled(label, style))), rect);
+    let style = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+    f.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), rect);
     rect
 }
 

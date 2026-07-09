@@ -2676,3 +2676,69 @@ async fn keybindings_moved_from_the_footer_into_help() {
     assert!(help.contains("@path attaches a file"), "{help}");
     assert!(help.contains("click a tool block"), "{help}");
 }
+
+/// The "follow output" and quit-confirm banners share one render path: same row
+/// above the input pane, same bold centering — only their text and colors
+/// differ. The quit confirmation takes the row when both would apply.
+#[tokio::test]
+async fn both_banners_render_through_the_same_path() {
+    let mut h = Harness::new(vec![]).await;
+    for i in 0..30 {
+        h.app.push_entry(Entry::system(format!("filler {i}")));
+    }
+
+    let mut term = Terminal::new(TestBackend::new(50, 20)).unwrap();
+    let cell = |term: &Terminal<TestBackend>, x: u16, y: u16| {
+        let c = term.backend().buffer().cell(Position::new(x, y)).unwrap();
+        (c.fg, c.bg, c.modifier)
+    };
+    let label = |term: &Terminal<TestBackend>, rect: crate::app::HitRect| -> String {
+        let buf = term.backend().buffer();
+        (rect.x..rect.x + rect.w)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, rect.y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect()
+    };
+
+    // Scrolled up: the follow banner, in the warn colors.
+    h.app.scroll_offset = 5;
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let follow = h.app.follow_button.expect("the follow banner is drawn");
+    assert!(label(&term, follow).contains("follow output"));
+    let (fg, bg, m) = cell(&term, follow.x + 1, follow.y);
+    assert_eq!((fg, bg), (Color::Black, h.app.theme.warn));
+    assert!(m.contains(ratatui::style::Modifier::BOLD), "bold");
+
+    // Arming the quit takes the same row, in the error colors, flanked by the
+    // warning icon, and is not clickable.
+    h.app.quit_armed = true;
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(
+        h.app.follow_button.is_none(),
+        "the quit banner isn't clickable"
+    );
+    let screen = buffer_to_string(term.backend().buffer());
+    let quit_row: String = (0..50)
+        .filter_map(|x| {
+            term.backend()
+                .buffer()
+                .cell(Position::new(x, follow.y))
+                .map(|c| c.symbol().to_string())
+        })
+        .collect();
+    let at = quit_row
+        .find("Press Ctrl+C again to quit")
+        .unwrap_or_else(|| panic!("the quit banner takes the follow banner's row:\n{screen}"));
+    // The icon flanks the label on both sides.
+    assert!(
+        quit_row.contains("⚠ Press Ctrl+C again to quit ⚠"),
+        "the warning icon flanks the label: {quit_row:?}"
+    );
+    // Sample the quit banner's own cells — it is a different width, so it is
+    // centered on different columns.
+    let (fg, bg, m) = cell(&term, at as u16, follow.y);
+    assert_eq!((fg, bg), (Color::White, h.app.theme.error));
+    assert!(m.contains(ratatui::style::Modifier::BOLD), "bold");
+}
