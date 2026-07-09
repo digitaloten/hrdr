@@ -1263,6 +1263,55 @@ fn cached_line_wrap(line: &Line<'static>, width: u16) -> usize {
     })
 }
 
+/// A block whose lines are built but not yet painted. Held for one iteration so
+/// a text-less assistant turn — which has no block of its own — can append its
+/// `#N assistant` jump label to it.
+struct PendingBlock {
+    kind: BlockKind,
+    lines: Vec<Line<'static>>,
+    /// Transcript index, when this block is a tool call (for click-to-expand).
+    tool_idx: Option<usize>,
+    /// How many numbered messages start at this block. Usually 1 (or 0 for
+    /// blocks that aren't messages); a block carrying a borrowed assistant label
+    /// counts that message too.
+    msgs: usize,
+    /// Rows at the end of `lines` that close the block (its `#N …` label). Rows
+    /// borrowed by a later entry are inserted *above* them.
+    footer_len: usize,
+}
+
+impl PendingBlock {
+    /// Append rows lent by a following entry — a text-less turn's `#N` label, a
+    /// per-turn stats line — keeping the block's own closing label last.
+    fn lend(&mut self, rows: Vec<Line<'static>>) {
+        let at = self.lines.len() - self.footer_len;
+        self.lines.splice(at..at, rows);
+    }
+}
+
+/// Paint a held block, recording where its messages start and (for a tool call)
+/// the row span a click can hit.
+fn flush(
+    out: &mut Vec<Line<'static>>,
+    msg_starts: &mut Vec<usize>,
+    tool_regions: &mut Vec<(usize, usize, usize)>,
+    pending: Option<PendingBlock>,
+    width: usize,
+    theme: &Theme,
+) {
+    let Some(block) = pending else { return };
+    let start = out.len();
+    out.extend(render_block(block.lines, width, block.kind.bg(theme)));
+    for _ in 0..block.msgs {
+        msg_starts.push(start);
+    }
+    if let Some(i) = block.tool_idx {
+        tool_regions.push((start, out.len(), i));
+    }
+    // One blank row between blocks; each block carries its own top/bottom pad.
+    out.push(Line::raw(""));
+}
+
 /// Returns the rendered transcript lines, the logical-line index each 1-based
 /// user/assistant message starts at (for `/goto`), and each tool block's
 /// `(logical_start, logical_end, transcript_index)` span (for click-to-expand).
@@ -1310,6 +1359,7 @@ fn transcript_lines(
     // Block width and the width its content is laid out at (minus padding).
     let w = width as usize;
     let inner = inner_width(w);
+    let mut pending: Option<PendingBlock> = None;
     for (i, entry) in app.state.transcript.iter().enumerate() {
         // Cache key shared by all arms (Reasoning skip happens before this).
         let ck = (
@@ -1324,6 +1374,8 @@ fn transcript_lines(
         // entry paints its own chrome.
         let mut header: Vec<Line<'static>> = Vec::new();
         let mut footer: Vec<Line<'static>> = Vec::new();
+        // Numbered messages starting at the block this entry produces.
+        let mut msg_here = 0usize;
         let (kind, body) = match &entry.kind {
             // Rebuilt every frame: the logo animation advances with the wall
             // clock, and the details mirror the live model/provider.
@@ -1331,15 +1383,26 @@ fn transcript_lines(
                 BlockKind::Header,
                 header_lines(app, app.header_anchor, width),
             ),
-            // An assistant turn that produced only tool calls has no text. Don't
-            // number it, and don't paint a block containing nothing but its
-            // `#N assistant` label.
-            EntryKind::Assistant(text) if text.trim().is_empty() => continue,
-            // Likewise a thinking block with no thought in it.
+            // An assistant turn that only called tools has no text, so it gets no
+            // block of its own — but its `#N assistant` label is a `/goto` jump
+            // point, so it rides along on the previous block instead.
+            EntryKind::Assistant(text) if text.trim().is_empty() => {
+                msg_num += 1;
+                if let Some(block) = pending.as_mut() {
+                    block.lend(meta(i, msg_num, "assistant"));
+                    block.msgs += 1;
+                } else {
+                    // Nothing to append to (it opens the transcript): the label
+                    // has nowhere to live, so the message keeps no jump point.
+                    msg_starts.push(out.len());
+                }
+                continue;
+            }
+            // A thinking block with no thought in it renders nothing at all.
             EntryKind::Reasoning { text, .. } if text.trim().is_empty() => continue,
             EntryKind::User(text) => {
                 msg_num += 1;
-                msg_starts.push(out.len());
+                msg_here += 1;
                 footer.extend(meta(i, msg_num, "you"));
                 let (fg, bg) = (theme.user, BlockKind::User.bg(theme));
                 let body = cache_entry(ck, || text_lines(text, Style::default().fg(fg).bg(bg)));
@@ -1350,7 +1413,7 @@ fn transcript_lines(
             // out and syntax-highlighted with syntect on a distinct background.
             EntryKind::Assistant(text) => {
                 msg_num += 1;
-                msg_starts.push(out.len());
+                msg_here += 1;
                 footer.extend(meta(i, msg_num, "assistant"));
                 let md = md_theme.clone();
                 let bg = BlockKind::Assistant.bg(theme);
@@ -1428,10 +1491,22 @@ fn transcript_lines(
                 let body = cache_entry(ck, || markdown_lines(text, &md, bg, inner));
                 (BlockKind::Command, body)
             }
+            // The per-turn stats line belongs to the turn that just ended, so it
+            // closes that turn's block rather than opening one of its own.
             EntryKind::Stats(text) => {
                 let dim = theme.dim;
                 let body = cache_entry(ck, || text_lines(text, Style::default().fg(dim)));
-                (BlockKind::Stats, body)
+                match pending.as_mut() {
+                    Some(block) => {
+                        let mut rows = vec![Line::raw("")];
+                        rows.extend(body);
+                        block.lend(rows);
+                        continue;
+                    }
+                    // Nothing to attach to (it opens the transcript): fall back
+                    // to a block of its own.
+                    None => (BlockKind::Stats, body),
+                }
             }
             // `/diff` is slash-command output too, but with diff coloring
             // instead of markdown.
@@ -1450,16 +1525,35 @@ fn transcript_lines(
                 (BlockKind::Command, body)
             }
         };
-        let start = out.len();
+        // Flush the previous block, then hold this one: a text-less assistant
+        // turn that follows appends its label to whatever is pending.
+        flush(
+            &mut out,
+            &mut msg_starts,
+            &mut tool_regions,
+            pending.take(),
+            w,
+            theme,
+        );
         header.extend(body);
+        let footer_len = footer.len();
         header.extend(footer);
-        out.extend(render_block(header, w, kind.bg(theme)));
-        if matches!(entry.kind, EntryKind::Tool { .. }) {
-            tool_regions.push((start, out.len(), i));
-        }
-        // One blank row between blocks; each block carries its own top/bottom pad.
-        out.push(Line::raw(""));
+        pending = Some(PendingBlock {
+            kind,
+            lines: header,
+            tool_idx: matches!(entry.kind, EntryKind::Tool { .. }).then_some(i),
+            msgs: msg_here,
+            footer_len,
+        });
     }
+    flush(
+        &mut out,
+        &mut msg_starts,
+        &mut tool_regions,
+        pending.take(),
+        w,
+        theme,
+    );
 
     // Highlight the active /find query across the committed transcript.
     if let Some(needle) = app

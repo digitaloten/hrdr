@@ -1804,14 +1804,15 @@ async fn fenced_code_inherits_its_blocks_background() {
     );
 }
 
-/// A turn that thinks and calls a tool but emits no text must not paint an empty
-/// assistant block, and must not consume a message number.
+/// A turn that thinks and calls a tool but emits no text gets no block of its
+/// own — yet its `#N assistant` label survives as a `/goto` jump point, appended
+/// to the last non-empty block (here, the thinking block).
 ///
 /// Regression: `markdown_lines("")` yields no rows, so the body was empty — but
-/// the `#N assistant` meta row was appended to it, and the block rendered as a
-/// label floating over blank padding.
+/// the meta row was appended to it, and the block rendered as a label floating
+/// over blank padding.
 #[tokio::test]
-async fn an_assistant_turn_with_no_text_renders_nothing() {
+async fn a_text_less_assistant_turn_lends_its_label_to_the_previous_block() {
     let mut h = Harness::new(vec![]).await;
     h.app
         .state
@@ -1826,21 +1827,45 @@ async fn an_assistant_turn_with_no_text_renders_nothing() {
 
     let mut term = Terminal::new(TestBackend::new(40, 30)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    let screen = buffer_to_string(term.backend().buffer());
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
 
-    assert!(
-        !screen.contains("assistant"),
-        "no assistant block for a text-less turn:\n{screen}"
+    let row_of = |needle: &str| -> u16 {
+        (0..30)
+            .find(|&y| {
+                (0..39)
+                    .filter_map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol().to_string())
+                    })
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no row containing {needle:?}:\n{screen}"))
+    };
+    let bg_at = |y: u16| buf.cell(Position::new(2, y)).unwrap().bg;
+
+    // The label still exists, and still numbers the turn.
+    let label_y = row_of("#2 assistant");
+    let thought_y = row_of("thought about something");
+
+    // It closes the thinking block: same background, directly below the thought,
+    // separated by the usual blank row.
+    assert_eq!(
+        bg_at(label_y),
+        bg_at(thought_y),
+        "the label rides on the thinking block:\n{screen}"
     );
-    // The user prompt keeps message #1; nothing else claims a number.
-    assert!(screen.contains("#1 you"), "{screen}");
-    assert!(
-        !screen.contains("#2"),
-        "the empty turn took a number:\n{screen}"
+    assert_eq!(label_y, thought_y + 2, "one blank row between:\n{screen}");
+
+    // …and not on the tool block that follows.
+    let tool_y = row_of("bash");
+    assert!(label_y < tool_y, "label precedes the tool block");
+    assert_ne!(
+        bg_at(label_y),
+        bg_at(tool_y),
+        "the label is not part of the tool block"
     );
-    // The thought and the tool call still render.
-    assert!(screen.contains("thought about something"), "{screen}");
-    assert!(screen.contains("bash"), "{screen}");
 }
 
 /// A whitespace-only thinking block renders nothing either — no lone
@@ -1873,4 +1898,158 @@ async fn an_empty_text_delta_opens_no_entry() {
         before,
         "an empty delta created a transcript entry"
     );
+}
+
+/// The borrowed label is a real jump point: `/goto 2` scrolls to the block that
+/// carries it, even though the assistant turn painted no block of its own.
+#[tokio::test]
+async fn goto_finds_a_text_less_assistant_turn() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .state
+        .transcript
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::user("go"));
+    // Enough filler that the target is off-screen before the jump.
+    for i in 0..12 {
+        h.app.push_entry(Entry::system(format!("filler {i}")));
+    }
+    h.app
+        .push_entry(Entry::reasoning("thought about something"));
+    h.app.push_entry(Entry::assistant("")); // message #2
+    h.app
+        .push_entry(Entry::tool_running("c1", "bash", r#"{"command":"ls"}"#));
+
+    let mut term = Terminal::new(TestBackend::new(40, 14)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+
+    h.type_str("/goto 2");
+    h.press(KeyCode::Enter);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+
+    // The jump puts the target message's block at the top of the viewport.
+    let first_rows: String = screen.lines().take(3).collect::<Vec<_>>().join("\n");
+    assert!(
+        first_rows.contains("thought about something"),
+        "/goto 2 landed elsewhere:\n{screen}"
+    );
+}
+
+/// Clicking a tool block toggles its expansion. The click rects are derived from
+/// where each tool block lands on screen, which the deferred block flush must
+/// keep accurate.
+#[tokio::test]
+async fn clicking_a_tool_block_toggles_its_expansion() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let long_output: String = (0..30).map(|i| format!("line {i}\n")).collect();
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .state
+        .transcript
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::user("go"));
+    h.app.push_entry(Entry::reasoning("thinking"));
+    h.app.push_entry(Entry::assistant("")); // borrows its label from the thought
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "c1".into(),
+        name: "bash".into(),
+        args: r#"{"command":"ls"}"#.into(),
+        result: long_output,
+        ok: true,
+        done: true,
+        expanded: false,
+    }));
+
+    let mut term = Terminal::new(TestBackend::new(40, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+
+    // The recorded hit rect must cover the row the tool header actually renders on.
+    let buf = term.backend().buffer();
+    let header_y = (0..30)
+        .find(|&y| {
+            (0..39)
+                .filter_map(|x| {
+                    buf.cell(Position::new(x, y))
+                        .map(|c| c.symbol().to_string())
+                })
+                .collect::<String>()
+                .contains("✓ bash")
+        })
+        .expect("tool header rendered");
+    let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
+    assert!(
+        rect.contains(2, header_y),
+        "the tool hit rect misses the tool header at row {header_y}"
+    );
+
+    // Clicking it expands the block; clicking again collapses it.
+    let click = |y: u16| MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 2,
+        row: y,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    };
+    let expanded = |app: &App| {
+        app.state
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::Tool { expanded, .. } if *expanded))
+    };
+    assert!(!expanded(&h.app), "starts collapsed");
+    h.app.on_mouse(click(header_y));
+    assert!(expanded(&h.app), "the click expanded it");
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    h.app.on_mouse(click(header_y));
+    assert!(!expanded(&h.app), "the second click collapsed it");
+}
+
+/// The per-turn stats line closes the turn's block instead of opening one of its
+/// own: same background as the reply, above the `#N assistant` label.
+#[tokio::test]
+async fn the_stats_line_rides_on_the_turns_block() {
+    let mut h = Harness::new(vec![MockReply::Text("all done".into())]).await;
+    h.submit("run it").await;
+    h.app
+        .state
+        .transcript
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+
+    let mut term = Terminal::new(TestBackend::new(46, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+
+    let row_of = |needle: &str| -> u16 {
+        (0..30)
+            .find(|&y| {
+                (0..45)
+                    .filter_map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol().to_string())
+                    })
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no row containing {needle:?}:\n{screen}"))
+    };
+    let bg_at = |y: u16| buf.cell(Position::new(2, y)).unwrap().bg;
+
+    let reply_y = row_of("all done");
+    let stats_y = row_of("tok/s");
+    let label_y = row_of("#2 assistant");
+
+    // Inside the reply's block: same background, no separator between them.
+    assert_eq!(
+        bg_at(stats_y),
+        bg_at(reply_y),
+        "stats share the block:\n{screen}"
+    );
+    assert_ne!(bg_at(stats_y), h.app.theme.stats_bg, "no block of its own");
+    // Ordering: reply, stats, then the label that closes the block.
+    assert!(reply_y < stats_y, "stats follow the reply");
+    assert!(stats_y < label_y, "the label still closes the block");
+    // A user prompt block sits above, on its own background.
+    assert_ne!(bg_at(reply_y), bg_at(row_of("run it")));
 }
