@@ -209,18 +209,12 @@ mod tests {
         let mut f = std::fs::File::create(proj.join("AGENTS.md")).unwrap();
         writeln!(f, "Project-level").unwrap();
 
-        // Isolate from real global files — point XDG config and HOME at empty dirs.
-        let home = tmp.path().join("home");
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
-        }
+        // No env mutation: `gather_agent_docs` collects *all* docs (project +
+        // any global), and we only assert the project one was picked up by the
+        // cwd walk — true regardless of the machine's global files. Mutating
+        // HOME/XDG here used to race concurrent tests (`set_var` is process-wide
+        // and unsafe under any parallel getenv), a source of CI-only flakes.
         let docs = gather_agent_docs(&proj).unwrap();
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-            std::env::remove_var("HOME");
-        }
-
         assert!(docs.contains("Project-level"));
     }
 }

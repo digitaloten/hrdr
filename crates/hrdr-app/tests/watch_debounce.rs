@@ -7,7 +7,23 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Poll `cond` every 20ms until it holds or `timeout` elapses. Returns whether
+/// it became true. Filesystem-notify delivery is asynchronous and, on macOS
+/// (FSEvents) and Windows or a loaded CI runner, can lag well past a fixed
+/// sleep — so the tests below wait for the invariant rather than asserting after
+/// an arbitrary nap (the historical source of CI-only flakes).
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    cond()
+}
 
 /// Writing the config file a few times in quick succession — what an editor
 /// save looks like from the outside — coalesces into a single reload, or at
@@ -47,11 +63,17 @@ async fn a_save_burst_collapses_into_far_fewer_reloads() {
         std::fs::write(&path, format!("model = 'b{i}'\n")).unwrap();
         std::thread::sleep(Duration::from_millis(20));
     }
-    // Well past the debounce window.
+    // Wait for the burst to land at least one reload — however long the OS takes
+    // to deliver the events — then let the debouncer settle any tail before
+    // reading the final count.
+    let reloaded = wait_until(Duration::from_secs(10), || hits.load(Ordering::SeqCst) >= 1);
     std::thread::sleep(hrdr_app::CONFIG_DEBOUNCE * 4);
 
     let n = hits.load(Ordering::SeqCst);
-    assert!(n >= 1, "the burst reloaded the config at least once");
+    assert!(
+        reloaded && n >= 1,
+        "the burst reloaded the config at least once"
+    );
     assert!(
         n < WRITES,
         "{WRITES} writes inside the debounce window → {n} reloads (not coalesced)"
@@ -82,11 +104,12 @@ async fn a_save_burst_really_emits_many_raw_events() {
         std::fs::write(&path, format!("b{i}\n")).unwrap();
         std::thread::sleep(Duration::from_millis(20));
     }
-    std::thread::sleep(Duration::from_millis(200));
-
+    // Wait for the raw events to arrive rather than asserting after a fixed nap:
+    // on macOS/Windows or a loaded runner they can be delivered late.
+    let bursty = wait_until(Duration::from_secs(10), || raw.load(Ordering::SeqCst) > 1);
     let n = raw.load(Ordering::SeqCst);
     assert!(
-        n > 1,
+        bursty && n > 1,
         "8 writes should emit a burst of raw events, got {n} — \
          the debounce test would prove nothing"
     );

@@ -155,19 +155,26 @@ pub use hrdr_tools::resolve_under;
 
 /// Display form of `cwd`, with the home directory collapsed to `~`.
 pub fn display_dir(cwd: &Path) -> String {
-    let s = cwd.to_string_lossy().to_string();
-    // A prefix match alone isn't enough: `HOME=/home/mx` would strip the
-    // `/home/mx` off `/home/mxaddict/proj` too, collapsing it to the bogus
-    // `~addict/proj`. Only collapse when the match lands on a path boundary —
-    // the prefix is the whole string, or the next char is a separator.
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
-        && let Some(rest) = s.strip_prefix(&home)
+    let s = cwd.to_string_lossy();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => collapse_home(&s, &home),
+        _ => s.into_owned(),
+    }
+}
+
+/// Collapse `home` at a path boundary in `path` to `~`. A prefix match alone
+/// isn't enough: `home = /home/mx` would strip the `/home/mx` off
+/// `/home/mxaddict/proj` too, collapsing it to the bogus `~addict/proj`. Only
+/// collapse when the match lands on a path boundary — the prefix is the whole
+/// string, or the next char is a separator. Pure, so it's testable without
+/// touching the process-wide `HOME`.
+fn collapse_home(path: &str, home: &str) -> String {
+    if let Some(rest) = path.strip_prefix(home)
         && (rest.is_empty() || rest.starts_with('/'))
     {
         return format!("~{rest}");
     }
-    s
+    path.to_string()
 }
 
 /// Modified-time of the user config file, for hot-reload dedup guards.
@@ -686,32 +693,13 @@ mod tests {
         );
     }
 
-    /// Global lock so `display_dir`'s HOME-dependent tests don't race each
-    /// other (`std::env::set_var` isn't thread-safe across concurrently
-    /// running tests).
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Run `f` with `HOME` set to `home` for the duration, restoring whatever
-    /// was there before.
-    fn with_home(home: &str, f: impl FnOnce()) {
-        let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", home) };
-        f();
-        unsafe {
-            match &prev {
-                Some(p) => std::env::set_var("HOME", p),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
+    // These test the pure `collapse_home` core rather than `display_dir` so they
+    // never touch the process-wide `HOME` — no env mutation, no cross-test race.
 
     #[test]
     fn display_dir_collapses_home_at_a_path_boundary() {
-        with_home("/home/mx", || {
-            assert_eq!(display_dir(Path::new("/home/mx")), "~");
-            assert_eq!(display_dir(Path::new("/home/mx/proj")), "~/proj");
-        });
+        assert_eq!(collapse_home("/home/mx", "/home/mx"), "~");
+        assert_eq!(collapse_home("/home/mx/proj", "/home/mx"), "~/proj");
     }
 
     /// Regression: a bare prefix match turned `/home/mxaddict/proj` (a sibling
@@ -720,12 +708,10 @@ mod tests {
     /// `mxaddict`, so it must not collapse at all.
     #[test]
     fn display_dir_does_not_collapse_a_sibling_directory_sharing_a_prefix() {
-        with_home("/home/mx", || {
-            assert_eq!(
-                display_dir(Path::new("/home/mxaddict/proj")),
-                "/home/mxaddict/proj"
-            );
-        });
+        assert_eq!(
+            collapse_home("/home/mxaddict/proj", "/home/mx"),
+            "/home/mxaddict/proj"
+        );
     }
 }
 
