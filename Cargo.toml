@@ -63,6 +63,9 @@ similar = "2"
 toml = { version = "0.8", features = ["parse"] }
 toml_edit = "0.22"
 tempfile = "3"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.10"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]

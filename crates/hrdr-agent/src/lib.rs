@@ -13,6 +13,13 @@ pub use agents_dir::discover_agent_profiles;
 pub use auth::{
     auth_file_path, auth_key, auth_token, load_auth_tokens, save_auth_token, write_atomic,
 };
+mod oauth;
+pub use oauth::{
+    OAuthCreds, OPENAI_CLIENT_ID, OPENAI_ISSUER, OPENAI_OAUTH_PORT, OPENAI_REDIRECT_URI,
+    OpenAiTokens, await_oauth_code, generate_pkce, generate_state, load_oauth, oauth_file_path,
+    openai_authorize_url, openai_exchange, openai_refresh, openrouter_authorize_url,
+    openrouter_exchange, parse_account_id, save_oauth, valid_access_token,
+};
 mod paths;
 pub use paths::cwd_slug;
 mod models;
@@ -1346,7 +1353,15 @@ pub struct ResolvedProvider {
 
 /// Canonical built-in provider names, in the order the `/login` wizard offers
 /// them. Each resolves through [`builtin_provider`]; `local` needs no API key.
-pub const BUILTIN_PROVIDERS: &[&str] = &["zen", "go", "openai", "openrouter", "claude", "local"];
+pub const BUILTIN_PROVIDERS: &[&str] = &[
+    "zen",
+    "go",
+    "openai",
+    "openrouter",
+    "claude",
+    "chatgpt",
+    "local",
+];
 
 /// Resolve the API key for a provider: an inline key wins, then the provider's
 /// `key_env` variable, then a credential saved by `/login`, then (only when
@@ -1388,6 +1403,24 @@ pub fn resolve_api_key(
 /// - `openai` — OpenAI (`OPENAI_API_KEY`).
 /// - `local` / `infr` — a local OpenAI-compatible server you run yourself.
 pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
+    // ChatGPT via Codex OAuth: no `key_env` (the Bearer token comes from the
+    // OAuth store, refreshed per request), the native Codex Responses backend
+    // (selected by the base URL), and a default allow-listed model.
+    if matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "chatgpt" | "codex" | "openai-oauth"
+    ) {
+        return Some(ResolvedProvider {
+            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            key_env: None,
+            api_key: None,
+            model: Some("gpt-5.5".to_string()),
+            remote: true,
+            context_window: Some(400_000),
+            headers: HashMap::new(),
+            api_version: None,
+        });
+    }
     let (base_url, key_env, remote) = match name.trim().to_ascii_lowercase().as_str() {
         "zen" | "opencode" | "opencode-zen" => {
             ("https://opencode.ai/zen/v1", "OPENCODE_API_KEY", true)
@@ -3206,6 +3239,24 @@ impl Agent {
         }
     }
 
+    /// For an OAuth provider (currently `chatgpt`), swap in a fresh access token
+    /// before a request — refreshing via the stored refresh token when the
+    /// current one is near expiry — and set the `ChatGPT-Account-Id` header. A
+    /// no-op for every key-based provider (no OAuth creds are stored for it), so
+    /// it costs at most one fast missing-file check per request.
+    async fn refresh_oauth_if_needed(&mut self) {
+        let Some(provider) = self.provider.clone() else {
+            return;
+        };
+        if let Some((access, account_id)) = oauth::valid_access_token(&provider).await {
+            self.client.set_api_key(Some(access));
+            if let Some(id) = account_id {
+                self.client
+                    .set_headers(vec![("ChatGPT-Account-Id".to_string(), id)]);
+            }
+        }
+    }
+
     /// Open a chat stream, retrying transient network/server errors with
     /// exponential backoff and auto-compacting once on a context-length
     /// overflow. Emits `Notice` events for each recovery attempt.
@@ -3215,6 +3266,7 @@ impl Agent {
         overflow_compacted: &mut bool,
         on_event: &mut F,
     ) -> Result<ChatStream> {
+        self.refresh_oauth_if_needed().await;
         const MAX_RETRIES: usize = 4;
         let mut attempt = 0usize;
         loop {
@@ -4767,6 +4819,21 @@ mod tests {
     fn local_builtin_is_not_remote_and_unknown_is_none() {
         assert!(!builtin_provider("local").unwrap().remote);
         assert!(builtin_provider("nope").is_none());
+    }
+
+    /// The ChatGPT OAuth provider points at the Codex Responses endpoint, carries
+    /// no `key_env` (the Bearer token comes from the OAuth store), and defaults
+    /// to an allow-listed model.
+    #[test]
+    fn chatgpt_builtin_uses_the_codex_endpoint_with_no_key_env() {
+        for name in ["chatgpt", "codex", "openai-oauth", "ChatGPT"] {
+            let p = builtin_provider(name).expect("chatgpt resolves");
+            assert_eq!(p.base_url, "https://chatgpt.com/backend-api/codex");
+            assert!(p.key_env.is_none(), "OAuth provider has no key_env");
+            assert_eq!(p.model.as_deref(), Some("gpt-5.5"));
+            assert!(p.remote);
+        }
+        assert!(crate::BUILTIN_PROVIDERS.contains(&"chatgpt"));
     }
 
     #[test]

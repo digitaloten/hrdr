@@ -7,6 +7,7 @@
 mod anthropic;
 pub mod catalog;
 mod client;
+mod codex;
 pub mod sse;
 mod types;
 

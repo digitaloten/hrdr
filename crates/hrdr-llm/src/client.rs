@@ -128,12 +128,16 @@ pub(crate) fn retry_after_suffix_from(d: Option<std::time::Duration>) -> String 
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
 
 /// Which wire protocol the endpoint speaks. Auto-detected from `base_url`
-/// (Anthropic's own host → native Messages API), else the OpenAI chat-completions
-/// shape every other server uses.
+/// (Anthropic's own host → native Messages API; the ChatGPT/Codex `/codex/`
+/// endpoint → the OpenAI Responses API), else the OpenAI chat-completions shape
+/// every other server uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
     OpenAi,
     Anthropic,
+    /// OpenAI **Responses API** — the ChatGPT/Codex OAuth endpoint
+    /// (`https://chatgpt.com/backend-api/codex/responses`). See [`crate::codex`].
+    Codex,
 }
 
 /// Default `max_tokens` for the native Anthropic backend (required by the API;
@@ -214,13 +218,20 @@ pub fn url_host(base_url: &str) -> &str {
         .unwrap_or(authority)
 }
 
-/// Native Anthropic Messages API iff the endpoint host is `api.anthropic.com`.
-/// Anthropic also exposes an OpenAI-compat endpoint, but it can't cache; the
-/// native path is what unlocks prompt caching.
+/// Detect the wire protocol from `base_url`:
+/// - `api.anthropic.com` → native Anthropic Messages API (unlocks caching).
+/// - `chatgpt.com` with a `/codex/` path → the OpenAI Responses API (the
+///   ChatGPT/Codex OAuth endpoint); the client POSTs to `{base_url}/responses`,
+///   so point it at `https://chatgpt.com/backend-api/codex`.
+/// - anything else → the OpenAI chat-completions shape.
 fn detect_backend(base_url: &str) -> Backend {
     let host = url_host(base_url);
     if host == "api.anthropic.com" || host.ends_with(".anthropic.com") {
         Backend::Anthropic
+    } else if (host == "chatgpt.com" || host.ends_with(".chatgpt.com"))
+        && base_url.contains("/codex")
+    {
+        Backend::Codex
     } else {
         Backend::OpenAi
     }
@@ -379,7 +390,10 @@ impl Client {
                     .header("anthropic-version", crate::anthropic::API_VERSION),
                 // Azure OpenAI authenticates with an `api-key` header, not Bearer.
                 Backend::OpenAi if self.api_version.is_some() => req.header("api-key", key),
-                Backend::OpenAi => req.bearer_auth(key),
+                // Codex (Responses API) uses the same Bearer auth; the streaming
+                // path builds its own request (see `crate::codex::chat_stream`),
+                // this only covers the best-effort `/models` + `/props` GETs.
+                Backend::OpenAi | Backend::Codex => req.bearer_auth(key),
             };
         }
         for (k, v) in &self.extra_headers {
@@ -433,6 +447,32 @@ impl Client {
                 "request",
                 serde_json::json!({
                     "url": format!("{}/messages", self.base_url),
+                    "body": body,
+                }),
+            );
+            return Ok(stream);
+        }
+        if self.backend == Backend::Codex {
+            let (body, stream) = crate::codex::chat_stream(
+                &self.http,
+                &self.base_url,
+                self.api_key.as_deref(),
+                &self.model,
+                self.effort.as_deref(),
+                self.temperature,
+                self.params.top_p,
+                self.params.max_tokens,
+                // `ChatGPT-Account-Id` rides here (set via `set_headers`);
+                // `originator: hrdr` + `Authorization: Bearer` are added inside.
+                &self.extra_headers,
+                messages,
+                tools,
+            )
+            .await?;
+            log_wire(
+                "request",
+                serde_json::json!({
+                    "url": format!("{}/responses", self.base_url),
                     "body": body,
                 }),
             );
@@ -689,6 +729,16 @@ mod tests {
         );
         assert_eq!(detect_backend("https://api.openai.com/v1"), Backend::OpenAi);
         assert_eq!(detect_backend("http://localhost:8080/v1"), Backend::OpenAi);
+        // ChatGPT/Codex OAuth endpoint → the Responses API backend.
+        assert_eq!(
+            detect_backend("https://chatgpt.com/backend-api/codex"),
+            Backend::Codex
+        );
+        // chatgpt.com without a `/codex/` path is not the Responses backend.
+        assert_eq!(
+            detect_backend("https://chatgpt.com/backend-api"),
+            Backend::OpenAi
+        );
     }
 
     #[test]
