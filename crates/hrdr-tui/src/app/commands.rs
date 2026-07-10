@@ -268,7 +268,7 @@ impl super::App {
 /// discipline's own keys are added ahead of these, from
 /// [`hrdr_editor::EditorEngine::keybind_hint`], so vim and plain mode each
 /// advertise their own.
-const HELP_TIPS: &str = "  @path attaches a file · Up/Down recalls history\n       Ctrl+L redraws · Ctrl+C twice quits · click a tool block to expand it\n       PgUp/PgDn scrolls · Home/End jumps · END follows new output";
+const HELP_TIPS: &str = "  @path attaches a file · Up/Down recalls history\n       Ctrl+L redraws · Ctrl+C twice quits · click a tool block to expand it\n       click a sub-agent to jump to its task call\n       PgUp/PgDn scrolls · Home/End jumps · END follows new output";
 
 /// The TUI's [`hrdr_app::CommandHost`] — a thin adapter over `App` so the shared
 /// slash-command dispatcher can drive it. Commands with a richer TUI rendering

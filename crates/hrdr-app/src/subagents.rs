@@ -5,23 +5,26 @@
 //! `ToolEnd` events arrive. [`panel_items`] merges the blocking list with
 //! detached background tasks from the shared registry to produce a unified
 //! [`Vec<PanelItem>`] ready for rendering by any frontend.
+//!
+//! The panel is a *list*: one row per agent, no preview of the log and no
+//! expansion. The log already streams into the agent's `task` tool-call entry in
+//! the transcript, so a row carries that entry's id and a click jumps to it
+//! rather than duplicating its output here.
 
-use std::collections::HashSet;
 use std::sync::Mutex;
 
 use hrdr_tools::BackgroundTask;
 
 /// A running blocking `task` sub-agent, shown live in the sub-agent panel until
-/// it finishes. `log` is the full streamed progress/output; the panel shows
-/// the tail collapsed, all of it expanded.
+/// it finishes. `log` is the full streamed progress/output; the panel shows only
+/// its first line, as the row's title.
 #[derive(Default, Clone)]
 pub struct SubAgentLog {
-    /// The task tool-call id (matches the `ToolOutput`/`ToolEnd` id).
+    /// The task tool-call id (matches the `ToolOutput`/`ToolEnd` id, and the
+    /// transcript entry a click on this row jumps to).
     pub id: String,
     /// Accumulated live output (starts with the `↳ task …` header line).
     pub log: String,
-    /// Whether the panel shows this agent's full log (toggled by a click/tap).
-    pub expanded: bool,
 }
 
 /// Stateful holder for the live list of blocking sub-agents, updated by the
@@ -38,7 +41,6 @@ impl SubAgentPanel {
         self.agents.push(SubAgentLog {
             id,
             log: String::new(),
-            expanded: false,
         });
     }
 
@@ -60,106 +62,35 @@ impl SubAgentPanel {
     pub fn clear(&mut self) {
         self.agents.clear();
     }
-
-    /// Toggle the expanded state of the entry at `idx` (panel row click).
-    pub fn toggle(&mut self, idx: usize) {
-        if let Some(sa) = self.agents.get_mut(idx) {
-            sa.expanded = !sa.expanded;
-        }
-    }
 }
 
-/// What a click on a sub-agent panel row targets: a blocking sub-agent (by
-/// index in [`SubAgentPanel::agents`]) or a detached background task (by its
-/// registry id).
-#[derive(Clone, Copy)]
-pub enum PanelHit {
-    /// Index into [`SubAgentPanel::agents`].
-    Blocking(usize),
-    /// Registry id of a detached background task.
-    Background(u64),
-}
-
-/// One row in the sub-agent panel: a blocking sub-agent or a detached
-/// background task, unified for rendering.
-#[derive(Clone)]
+/// One row in the sub-agent panel: a blocking sub-agent or a detached background
+/// task, unified for rendering. Exactly one screen row.
+#[derive(Clone, Debug, PartialEq)]
 pub struct PanelItem {
-    /// First line of the log, used as the panel row title.
+    /// First line of the log, used as the row's title.
     pub title: String,
-    /// Full log text; body lines are shown tail-first when collapsed.
-    pub log: String,
-    /// Whether this row is currently expanded to show the full log.
-    pub expanded: bool,
     /// `true` for a finished background task (renders with a completion marker).
     pub done: bool,
-    /// What a click on this row targets (for toggle and hit-testing).
-    pub hit: PanelHit,
+    /// The `task` tool-call id this row came from, so a click can jump to that
+    /// entry in the transcript. `None` when the spawn had no call context.
+    pub tool_id: Option<String>,
 }
 
-/// Tail lines shown per collapsed sub-agent entry in the panel.
-pub const SUBAGENT_TAIL_LINES: usize = 4;
-
-/// Content rows one panel item occupies: a header line plus body lines (all
-/// when expanded, else the last [`SUBAGENT_TAIL_LINES`]). Kept in sync with
-/// [`panel_item_body`] without allocating the lines.
-pub fn panel_item_rows(item: &PanelItem) -> usize {
-    let rest = item.log.lines().count().saturating_sub(1);
-    let body = if item.expanded {
-        rest
-    } else {
-        rest.min(SUBAGENT_TAIL_LINES)
-    };
-    1 + body
-}
-
-/// Header line for one panel row: expansion indicator (`▸`/`▾`), completion
-/// badge (`✓ ` when done), then the title.
+/// The row's text: a completion badge (`✓ ` when done), then the title.
 pub fn panel_item_header(item: &PanelItem) -> String {
-    let indicator = if item.expanded { "▾" } else { "▸" };
     let badge = if item.done { "✓ " } else { "" };
-    format!("{indicator} {badge}{}", item.title)
-}
-
-/// Body lines for one panel row (the log minus its header line), each trimmed
-/// of trailing whitespace: all of them when expanded, else the last
-/// [`SUBAGENT_TAIL_LINES`] (matching [`panel_item_rows`]).
-pub fn panel_item_body(item: &PanelItem) -> Vec<String> {
-    let rest: Vec<&str> = item.log.lines().skip(1).collect();
-    let shown = if item.expanded {
-        &rest[..]
-    } else {
-        &rest[rest.len().saturating_sub(SUBAGENT_TAIL_LINES)..]
-    };
-    shown.iter().map(|l| l.trim_end().to_string()).collect()
-}
-
-/// Apply a click on a panel row: toggle a blocking sub-agent's expansion in
-/// `panel`, or flip a background task's id in the `background_expanded` set.
-pub fn toggle_panel_hit(
-    panel: &mut SubAgentPanel,
-    background_expanded: &mut HashSet<u64>,
-    hit: PanelHit,
-) {
-    match hit {
-        PanelHit::Blocking(idx) => panel.toggle(idx),
-        PanelHit::Background(id) => {
-            if !background_expanded.remove(&id) {
-                background_expanded.insert(id);
-            }
-        }
-    }
+    format!("{badge}{}", item.title)
 }
 
 /// Collect the panel's rows: blocking sub-agents from `agents` followed by
-/// detached background tasks from the shared registry. Background tasks that
-/// are done have their result appended to the log as `\n[result] {r}`.
+/// detached background tasks from the shared registry.
 pub fn panel_items(
     agents: &[SubAgentLog],
     background: &Mutex<Vec<BackgroundTask>>,
-    background_expanded: &HashSet<u64>,
 ) -> Vec<PanelItem> {
     let mut items = Vec::new();
-    for (i, sa) in agents.iter().enumerate() {
+    for sa in agents {
         items.push(PanelItem {
             title: sa
                 .log
@@ -168,26 +99,16 @@ pub fn panel_items(
                 .unwrap_or("sub-agent…")
                 .trim()
                 .to_string(),
-            log: sa.log.clone(),
-            expanded: sa.expanded,
             done: false,
-            hit: PanelHit::Blocking(i),
+            tool_id: Some(sa.id.clone()),
         });
     }
     if let Ok(v) = background.lock() {
         for t in v.iter() {
-            let mut log = t.log.clone();
-            if t.done
-                && let Some(r) = &t.result
-            {
-                log.push_str(&format!("\n[result] {r}"));
-            }
             items.push(PanelItem {
                 title: t.log.lines().next().unwrap_or(&t.label).trim().to_string(),
-                log,
-                expanded: background_expanded.contains(&t.id),
                 done: t.done,
-                hit: PanelHit::Background(t.id),
+                tool_id: t.tool_id.clone(),
             });
         }
     }
@@ -199,19 +120,14 @@ mod tests {
     use super::*;
     use hrdr_tools::BackgroundTask;
 
-    fn make_task(
-        id: u64,
-        label: &str,
-        log: &str,
-        done: bool,
-        result: Option<&str>,
-    ) -> BackgroundTask {
+    fn make_task(id: u64, label: &str, log: &str, done: bool) -> BackgroundTask {
         BackgroundTask {
             id,
+            tool_id: Some(format!("call-{id}")),
             label: label.to_string(),
             log: log.to_string(),
             done,
-            result: result.map(str::to_string),
+            result: None,
             delivered: false,
         }
     }
@@ -235,67 +151,54 @@ mod tests {
         assert!(panel.agents.is_empty());
     }
 
+    /// One row per agent, blocking first, each carrying the tool-call id its row
+    /// jumps to — and only the log's first line, never its body.
     #[test]
     fn panel_items_merges_blocking_and_background() {
         let mut panel = SubAgentPanel::default();
         panel.on_tool_start("block1".to_string());
         panel.on_tool_output("block1", "task: do thing\nrunning…");
 
-        let bg = Mutex::new(vec![make_task(
-            10,
-            "bg-label",
-            "bg task log",
-            true,
-            Some("done ok"),
-        )]);
-        let mut expanded = HashSet::new();
-        expanded.insert(10u64);
+        let bg = Mutex::new(vec![make_task(10, "bg-label", "bg task log\nmore", true)]);
 
-        let items = panel_items(&panel.agents, &bg, &expanded);
-        assert_eq!(items.len(), 2);
-        // Blocking item first.
-        assert_eq!(items[0].title, "task: do thing");
-        assert!(!items[0].done);
-        assert!(matches!(items[0].hit, PanelHit::Blocking(0)));
-        // Background item second: done, appended result, expanded.
-        assert!(items[1].log.contains("[result] done ok"));
-        assert!(items[1].done);
-        assert!(items[1].expanded);
-        assert!(matches!(items[1].hit, PanelHit::Background(10)));
+        let items = panel_items(&panel.agents, &bg);
+        assert_eq!(
+            items,
+            vec![
+                PanelItem {
+                    title: "task: do thing".to_string(),
+                    done: false,
+                    tool_id: Some("block1".to_string()),
+                },
+                PanelItem {
+                    title: "bg task log".to_string(),
+                    done: true,
+                    tool_id: Some("call-10".to_string()),
+                },
+            ]
+        );
     }
 
+    /// A background task spawned without a call context still renders; it just
+    /// has nothing to jump to.
     #[test]
-    fn panel_item_rows_collapsed_vs_expanded() {
-        // 6-line log: 1 header + 5 body lines.
-        let log = "line0\nline1\nline2\nline3\nline4\nline5".to_string();
-        let collapsed = PanelItem {
-            title: "head".to_string(),
-            log: log.clone(),
-            expanded: false,
-            done: false,
-            hit: PanelHit::Blocking(0),
-        };
-        // 1 header + min(5 body, SUBAGENT_TAIL_LINES=4) = 5.
-        assert_eq!(panel_item_rows(&collapsed), 5);
-
-        let expanded = PanelItem {
-            expanded: true,
-            ..collapsed
-        };
-        // 1 header + 5 body = 6.
-        assert_eq!(panel_item_rows(&expanded), 6);
+    fn a_background_task_without_a_call_id_has_no_jump_target() {
+        let mut t = make_task(1, "l", "log", false);
+        t.tool_id = None;
+        let bg = Mutex::new(vec![t]);
+        let items = panel_items(&[], &bg);
+        assert_eq!(items[0].tool_id, None);
     }
 
+    /// The badge marks a finished background task; a running one has none.
     #[test]
-    fn toggle_flips_expanded() {
-        let mut panel = SubAgentPanel::default();
-        panel.on_tool_start("x".to_string());
-        assert!(!panel.agents[0].expanded);
-        panel.toggle(0);
-        assert!(panel.agents[0].expanded);
-        panel.toggle(0);
-        assert!(!panel.agents[0].expanded);
-        // Out-of-bounds toggle is a no-op.
-        panel.toggle(99);
+    fn the_header_badges_a_finished_task() {
+        let item = |done| PanelItem {
+            title: "t".to_string(),
+            done,
+            tool_id: None,
+        };
+        assert_eq!(panel_item_header(&item(false)), "t");
+        assert_eq!(panel_item_header(&item(true)), "✓ t");
     }
 }

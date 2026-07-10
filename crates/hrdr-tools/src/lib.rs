@@ -65,6 +65,9 @@ fn default_status() -> String {
 pub struct BackgroundTask {
     /// Stable id for the run — shown to the model and used for delivery matching.
     pub id: u64,
+    /// Id of the `task` tool call that spawned it, matching its transcript
+    /// entry. `None` when the spawn had no call context (tests, `/task`).
+    pub tool_id: Option<String>,
     /// Short label (agent/description) for the panel and delivery notice.
     pub label: String,
     /// Accumulated live output (streamed answer text + tool-activity markers).
@@ -93,6 +96,10 @@ pub struct ToolContext {
     /// output here as it's produced so the UI can show progress. `None` = no
     /// streaming consumer.
     pub stream: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// The id of the tool call being executed, matching its transcript entry.
+    /// `task` records it on the [`BackgroundTask`] it spawns so the frontend can
+    /// jump from a panel row to the call that started it. `None` outside a call.
+    pub call_id: Option<String>,
     /// Optional checkpoint store: file-mutating tools record a file's pre-image
     /// here before writing, so edits can be reverted. `None` = no checkpointing.
     pub checkpoints: Option<Arc<Mutex<Checkpoints>>>,
@@ -135,6 +142,7 @@ impl ToolContext {
             max_output: DEFAULT_MAX_OUTPUT,
             max_output_lines: DEFAULT_MAX_OUTPUT_LINES,
             stream: None,
+            call_id: None,
             checkpoints: None,
             guardrails: Arc::new(default_guardrails()),
             read_files: Arc::new(Mutex::new(std::collections::HashSet::new())),

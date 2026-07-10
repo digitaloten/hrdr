@@ -105,6 +105,7 @@ fn spawn_background(
     mut cfg: AgentConfig,
     prompt: String,
     label: String,
+    tool_id: Option<String>,
     registry: &Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>>,
     handles: &BgHandles,
 ) -> String {
@@ -121,6 +122,7 @@ fn spawn_background(
     if let Ok(mut v) = registry.lock() {
         v.push(hrdr_tools::BackgroundTask {
             id,
+            tool_id,
             label: label.clone(),
             log: header,
             done: false,
@@ -476,6 +478,7 @@ impl hrdr_tools::Tool for SubagentTool {
                 cfg,
                 prompt,
                 label,
+                ctx.call_id.clone(),
                 &ctx.background_tasks,
                 &self.bg_handles,
             ));
@@ -2845,6 +2848,9 @@ impl Agent {
             });
             let mut ctx = self.ctx.clone();
             ctx.stream = Some(tx);
+            // So a `task` call can tag the background entry it spawns with the
+            // transcript entry it came from.
+            ctx.call_id = Some(call.id.clone());
             let name = call.function.name.clone();
             let raw_args = call.function.arguments.clone();
             // Cheap clone (Arc-backed registry) so the futures don't borrow
@@ -3732,6 +3738,7 @@ mod tests {
             let mut v = reg.lock().unwrap();
             v.push(hrdr_tools::BackgroundTask {
                 id: 1,
+                tool_id: None,
                 label: "explore: x".to_string(),
                 log: "…".to_string(),
                 done: true,
@@ -3740,6 +3747,7 @@ mod tests {
             });
             v.push(hrdr_tools::BackgroundTask {
                 id: 2,
+                tool_id: None,
                 label: "y".to_string(),
                 log: "…".to_string(),
                 done: false,
@@ -4026,6 +4034,7 @@ mod tests {
         let id: u64 = 99;
         registry.lock().unwrap().push(hrdr_tools::BackgroundTask {
             id,
+            tool_id: None,
             label: "panic-test".to_string(),
             log: String::new(),
             done: false,

@@ -27,9 +27,7 @@ mod util;
 use completion::CompletionKind;
 pub(crate) use completion::Completions;
 use hrdr_app::config_mtime as current_config_mtime;
-use hrdr_app::{
-    PanelHit, SubAgentPanel, age_completed_todos, display_dir, git_branch, is_quit_command,
-};
+use hrdr_app::{SubAgentPanel, age_completed_todos, display_dir, git_branch, is_quit_command};
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
 pub(crate) use util::run_editor;
@@ -156,6 +154,11 @@ pub(crate) struct App {
     /// collapsed: the row count changes under the reader, and `scroll_offset` is
     /// measured from the bottom, so the block would otherwise jump.
     pub(crate) pending_scroll_entry: Option<usize>,
+    /// A transcript index to pull to the top of the viewport at the next draw,
+    /// scrolling there if the reader is following the newest output. Set by a
+    /// click on a sub-agent panel row: unlike `pending_scroll_entry`, which only
+    /// holds a block still while its height changes, this one *moves* the view.
+    pub(crate) pending_focus_entry: Option<usize>,
     /// Last `/find` query (also drives transcript highlighting) and the message
     /// number it last landed on (for cycling).
     pub(crate) find: hrdr_app::FindState,
@@ -208,11 +211,10 @@ pub(crate) struct App {
     /// Shared registry of *detached background* sub-agents (a clone of the
     /// agent's `ctx.background_tasks`), read live for the panel.
     pub(crate) background_tasks: Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>>,
-    /// Ids of background tasks the user has expanded in the panel.
-    pub(crate) background_expanded: std::collections::HashSet<u64>,
-    /// Clickable screen rects for each sub-agent panel row → the thing it
-    /// toggles; a left click expands/collapses that row.
-    pub(crate) subagent_hits: Vec<(HitRect, PanelHit)>,
+    /// Clickable screen rect for each sub-agent panel row → the id of the `task`
+    /// call that spawned it; a left click jumps to that transcript entry. `None`
+    /// for a row with no call context, whose click is a no-op.
+    pub(crate) subagent_hits: Vec<(HitRect, Option<String>)>,
     /// Set after one idle Ctrl+C; a second consecutive Ctrl+C quits. Any other
     /// key (or a mouse action) disarms it.
     pub(crate) quit_armed: bool,
@@ -339,6 +341,7 @@ impl App {
             login: None,
             pending_goto: None,
             pending_scroll_entry: None,
+            pending_focus_entry: None,
             find: hrdr_app::FindState::default(),
             auto_compact_enabled: auto_compact,
             compaction_reserved,
@@ -358,7 +361,6 @@ impl App {
             tool_hits: Vec::new(),
             subagent_panel: SubAgentPanel::default(),
             background_tasks,
-            background_expanded: std::collections::HashSet::new(),
             subagent_hits: Vec::new(),
             quit_armed: false,
             turn_started: None,
@@ -643,18 +645,18 @@ impl App {
                     self.scroll_offset = 0;
                     return;
                 }
-                // Click a sub-agent panel row to expand/collapse its live output.
+                // Click a sub-agent panel row to jump to the `task` tool call it
+                // came from — the panel lists agents; the transcript holds their
+                // output. A row without a call context has nothing to jump to.
                 if let Some(hit) = self
                     .subagent_hits
                     .iter()
                     .find(|(r, _)| r.contains(m.column, m.row))
-                    .map(|(_, h)| *h)
+                    .map(|(_, id)| id.clone())
                 {
-                    hrdr_app::toggle_panel_hit(
-                        &mut self.subagent_panel,
-                        &mut self.background_expanded,
-                        hit,
-                    );
+                    if let Some(idx) = hit.and_then(|id| self.tool_entry_index(&id)) {
+                        self.pending_focus_entry = Some(idx);
+                    }
                     return;
                 }
                 // Click a tool block to toggle its full output (per-entry /expand).
@@ -675,6 +677,16 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Index of the transcript entry for tool call `id`, if it is still there.
+    /// A sub-agent panel row jumps to it; the call may have been cleared by
+    /// `/clear` or scrolled out of a compacted transcript, hence the `Option`.
+    pub(crate) fn tool_entry_index(&self, id: &str) -> Option<usize> {
+        self.state
+            .transcript
+            .iter()
+            .position(|e| matches!(&e.kind, EntryKind::Tool { id: tid, .. } if tid == id))
     }
 
     /// Show a transient status line: a command's output, a usage hint, a busy

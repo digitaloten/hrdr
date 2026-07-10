@@ -16,27 +16,29 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Entry, EntryKind, StatusBarMode, TimestampStyle};
 use crate::theme::Theme;
-use hrdr_app::{
-    PanelHit, PanelItem, panel_item_body, panel_item_header, panel_item_rows, panel_items,
-    relative_time,
-};
+use hrdr_app::{PanelItem, panel_item_header, panel_items, relative_time};
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 8;
 /// Diff results (edit/write) get a larger preview since the diff is the point.
 const DIFF_PREVIEW_LINES: usize = 40;
 /// Max lines shown in the TODO panel (plus 2 for borders).
 const TODO_PANEL_MAX_ITEMS: u16 = 6;
-/// Max content rows the sub-agent panel occupies (plus 2 for borders); beyond
-/// this the panel scrolls its content off the top (newest at the bottom).
+/// Max rows (one per agent) the sub-agent panel lists; beyond this the panel
+/// scrolls its rows off the top (newest at the bottom).
 const SUBAGENT_PANEL_MAX_ROWS: u16 = 18;
 
-/// Outer height (with borders) of the sub-agent panel; 0 when nothing is shown.
+/// Outer height (with padding) of the sub-agent panel; 0 when nothing is shown.
 fn subagent_panel_height(items: &[PanelItem]) -> u16 {
     if items.is_empty() {
         return 0;
     }
-    let content: usize = items.iter().map(panel_item_rows).sum();
-    (content as u16).min(SUBAGENT_PANEL_MAX_ROWS) + 2
+    (items.len() as u16).min(SUBAGENT_PANEL_MAX_ROWS) + 2
+}
+
+/// Rows clipped from the top so the newest agent sits at the bottom of a panel
+/// `height` rows tall. Pure, so the scroll math is testable without rendering.
+fn subagent_scroll(items: usize, height: u16) -> u16 {
+    (items as u16).saturating_sub(height)
 }
 
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
@@ -65,11 +67,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 
     // Built once per frame; both the layout height and the renderer use it
     // (each sub-agent's log is cloned into the items, so don't recompute).
-    let subagent_items = panel_items(
-        &app.subagent_panel.agents,
-        &app.background_tasks,
-        &app.background_expanded,
-    );
+    let subagent_items = panel_items(&app.subagent_panel.agents, &app.background_tasks);
     let subagent_height = subagent_panel_height(&subagent_items);
 
     // Build the row stack dynamically, remembering each section's index. Every
@@ -224,7 +222,13 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
         let (start, ..) = tool_regions.iter().find(|(.., i)| *i == idx)?;
         (app.scroll_offset > 0).then(|| cum[(*start).min(lines.len())] as u16)
     });
-    let goto_top = goto_top.or(entry_top);
+    // A click on a sub-agent row focuses that `task` call: unlike the collapse
+    // case above, it moves the view even while following the newest output.
+    let focus_top: Option<u16> = app.pending_focus_entry.take().and_then(|idx| {
+        let (start, ..) = tool_regions.iter().find(|(.., i)| *i == idx)?;
+        Some(cum[(*start).min(lines.len())] as u16)
+    });
+    let goto_top = goto_top.or(focus_top).or(entry_top);
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     // Total wrapped rows at this width — from cum, not para.line_count().
     let total = *cum.last().unwrap_or(&0) as u16;
@@ -333,33 +337,6 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect, todos: &[hrdr_agent::Todo]) 
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Pure helper: given the `(row_start, row_end)` spans of each panel item and
-/// the inner panel height, compute the scroll offset (rows clipped from the top
-/// so the newest content sits at the bottom) and, for each item, the visible
-/// screen row range `(start_from_panel_top, end_from_panel_top)` — `None` for
-/// items fully scrolled off. Extracted as a pure function so the scroll math is unit-testable
-/// independent of ratatui rendering.
-fn subagent_scroll(
-    item_spans: &[(usize, usize)],
-    inner_height: u16,
-) -> (u16, Vec<Option<(u16, u16)>>) {
-    let total = item_spans.last().map(|&(_, end)| end).unwrap_or(0);
-    let scroll = total.saturating_sub(inner_height as usize) as u16;
-    let vis = item_spans
-        .iter()
-        .map(|&(start, end)| {
-            let vis_start = (start as u16).max(scroll);
-            let vis_end = (end as u16).min(scroll.saturating_add(inner_height));
-            if vis_end > vis_start {
-                Some((vis_start - scroll, vis_end - scroll))
-            } else {
-                None
-            }
-        })
-        .collect();
-    (scroll, vis)
-}
-
 /// The live sub-agent panel: one block per running `task`, each showing a header
 /// (its `↳ task …` line) plus the tail of its output (collapsed) or the whole
 /// log (expanded). A left click on a row toggles that agent's expansion; the
@@ -368,62 +345,45 @@ fn subagent_scroll(
 /// When the total content rows exceed `SUBAGENT_PANEL_MAX_ROWS`, the panel
 /// scrolls so the newest agents/logs stay visible at the bottom.
 fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect, items: &[PanelItem]) {
-    let (accent, dim, success) = (app.theme.accent, app.theme.dim, app.theme.success);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" sub-agents ({}) ", items.len()))
-        .border_style(Style::default().fg(dim));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let (accent, success) = (app.theme.accent, app.theme.success);
+    // The input pane's chrome, with the accent rule a running agent wears — the
+    // todo panel's is green.
+    let bg = app.theme.user_bg;
+    let inner = draw_pane(f, &app.theme, area, accent);
 
-    // First pass: build all lines and track each item's row span.
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut item_spans: Vec<(usize, usize)> = Vec::new(); // (row_start, row_end) per item
-    let mut item_hits: Vec<PanelHit> = Vec::new();
-    for item in items {
-        let start = lines.len();
-        let header_color = if item.done { success } else { accent };
-        lines.push(Line::from(Span::styled(
-            panel_item_header(item),
-            Style::default()
-                .fg(header_color)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for l in panel_item_body(item) {
-            lines.push(Line::from(Span::styled(
-                format!("  {l}"),
-                Style::default().fg(dim),
-            )));
-        }
-        item_spans.push((start, lines.len()));
-        item_hits.push(item.hit);
-    }
+    // One row per agent, newest pinned to the bottom when they overflow.
+    let scroll = subagent_scroll(items.len(), inner.height);
+    let lines: Vec<Line<'static>> = items
+        .iter()
+        .map(|item| {
+            let fg = if item.done { success } else { accent };
+            Line::from(Span::styled(
+                panel_item_header(item),
+                Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect();
 
-    // Compute scroll offset so the newest rows stay visible at the bottom,
-    // and derive each item's visible screen-row range.
-    let (scroll, vis_ranges) = subagent_scroll(&item_spans, inner.height);
-
-    // Build hit rects for rows that are at least partially visible.
-    let hits: Vec<(crate::app::HitRect, PanelHit)> = vis_ranges
-        .into_iter()
-        .zip(item_hits)
-        .filter_map(|(vis, hit)| {
-            vis.map(|(y_start, y_end)| {
-                (
-                    crate::app::HitRect {
-                        x: inner.x,
-                        y: inner.y + y_start,
-                        w: inner.width,
-                        h: y_end - y_start,
-                    },
-                    hit,
-                )
-            })
+    // A click on a visible row jumps to the `task` call that spawned it.
+    app.subagent_hits = items
+        .iter()
+        .enumerate()
+        .skip(scroll as usize)
+        .take(inner.height as usize)
+        .map(|(i, item)| {
+            (
+                crate::app::HitRect {
+                    x: inner.x,
+                    y: inner.y + (i as u16 - scroll),
+                    w: inner.width,
+                    h: 1,
+                },
+                item.tool_id.clone(),
+            )
         })
         .collect();
 
     f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
-    app.subagent_hits = hits;
 }
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1772,70 +1732,39 @@ fn diff_line_color(line: &str, theme: &Theme) -> Color {
 
 #[cfg(test)]
 mod subagent_tests {
-    use super::subagent_scroll;
-    use hrdr_app::{PanelHit, PanelItem, SUBAGENT_TAIL_LINES, panel_item_rows};
+    use super::{SUBAGENT_PANEL_MAX_ROWS, subagent_panel_height, subagent_scroll};
+    use hrdr_app::PanelItem;
 
-    fn item(log: &str, expanded: bool) -> PanelItem {
-        PanelItem {
-            title: log.lines().next().unwrap_or("").to_string(),
-            log: log.to_string(),
-            expanded,
-            done: false,
-            hit: PanelHit::Blocking(0),
-        }
+    fn items(n: usize) -> Vec<PanelItem> {
+        (0..n)
+            .map(|i| PanelItem {
+                title: format!("agent {i}"),
+                done: false,
+                tool_id: Some(format!("call-{i}")),
+            })
+            .collect()
     }
 
+    /// One row per agent plus the pane's two padding rows, capped — the panel is
+    /// a list now, so an agent's log length can't grow it.
     #[test]
-    fn item_rows_collapsed_caps_the_tail_expanded_shows_all() {
-        // header + 6 body lines
-        let log = "↳ task: x\na\nb\nc\nd\ne\nf";
-        // Collapsed = header + last SUBAGENT_TAIL_LINES.
-        assert_eq!(panel_item_rows(&item(log, false)), 1 + SUBAGENT_TAIL_LINES);
-        // Expanded = header + all 6.
-        assert_eq!(panel_item_rows(&item(log, true)), 1 + 6);
-        // A just-started agent (no output yet) is one header row.
-        assert_eq!(panel_item_rows(&item("", false)), 1);
+    fn the_panel_is_one_row_per_agent_plus_padding() {
+        assert_eq!(subagent_panel_height(&items(0)), 0, "hidden when empty");
+        assert_eq!(subagent_panel_height(&items(1)), 3);
+        assert_eq!(subagent_panel_height(&items(4)), 6);
+        assert_eq!(
+            subagent_panel_height(&items(SUBAGENT_PANEL_MAX_ROWS as usize + 5)),
+            SUBAGENT_PANEL_MAX_ROWS + 2,
+            "capped"
+        );
     }
 
-    /// 3 items × 2 rows each = 6 total rows, panel height = 4.
-    /// scroll = 2: items 0 (rows 0-2) scrolled off, items 1-2 visible.
+    /// Rows past the panel's height scroll off the top, newest at the bottom.
     #[test]
-    fn scroll_pins_newest_to_bottom() {
-        let spans = &[(0usize, 2usize), (2, 4), (4, 6)];
-        let (scroll, vis) = subagent_scroll(spans, 4);
-        assert_eq!(scroll, 2);
-        assert_eq!(vis[0], None, "item 0 fully scrolled off");
-        assert_eq!(vis[1], Some((0, 2)), "item 1 at top of viewport");
-        assert_eq!(vis[2], Some((2, 4)), "item 2 at bottom of viewport");
-    }
-
-    /// Content fits without scrolling: scroll = 0, all items fully visible.
-    #[test]
-    fn no_scroll_when_content_fits() {
-        let spans = &[(0, 2), (2, 4)];
-        let (scroll, vis) = subagent_scroll(spans, 10);
-        assert_eq!(scroll, 0);
-        assert_eq!(vis[0], Some((0, 2)));
-        assert_eq!(vis[1], Some((2, 4)));
-    }
-
-    /// Empty panel: no items, no scroll.
-    #[test]
-    fn empty_panel_no_scroll() {
-        let (scroll, vis) = subagent_scroll(&[], 10);
-        assert_eq!(scroll, 0);
-        assert!(vis.is_empty());
-    }
-
-    /// Partially visible item at the scroll boundary.
-    #[test]
-    fn partial_visibility_at_boundary() {
-        // 1 item of 6 rows, panel height = 4 → scroll = 2.
-        // Item spans rows 0-6; vis: start = max(0,2)=2, end = min(6,2+4)=6 → (0,4).
-        let spans = &[(0usize, 6usize)];
-        let (scroll, vis) = subagent_scroll(spans, 4);
-        assert_eq!(scroll, 2);
-        assert_eq!(vis[0], Some((0, 4)));
+    fn scroll_pins_the_newest_agent_to_the_bottom() {
+        assert_eq!(subagent_scroll(2, 4), 0, "content fits");
+        assert_eq!(subagent_scroll(0, 4), 0, "empty");
+        assert_eq!(subagent_scroll(6, 4), 2, "two oldest scrolled off");
     }
 }
 
