@@ -318,12 +318,9 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect, todos: &[hrdr_agent::Todo]) 
         return;
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" todos ")
-        .border_style(Style::default().fg(app.theme.dim));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    // The input pane's chrome, with a green rule instead of the prompt's.
+    let bg = app.theme.user_bg;
+    let inner = draw_pane(f, &app.theme, area, app.theme.success);
 
     let lines: Vec<Line<'static>> = todos
         .iter()
@@ -335,7 +332,7 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect, todos: &[hrdr_agent::Todo]) 
             };
             Line::from(Span::styled(
                 format!("[{mark}] {}", t.content),
-                Style::default().fg(color),
+                Style::default().fg(color).bg(bg),
             ))
         })
         .collect();
@@ -512,28 +509,30 @@ fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
-    // The input is the user's own surface, so it wears the prompt's background
-    // and the same padding as a transcript block: two columns either side, one
-    // blank row above and below.
-    let bg = app.theme.user_bg;
+/// Paint a pane wearing the chrome of the user's own surfaces: the prompt's
+/// background, a transcript block's padding (two columns either side, one blank
+/// row above and below), and a `bar`-colored rule down the left edge. Returns
+/// the inner rect for the caller's content.
+///
+/// The input pane and the todo list share this so they can't drift apart; the
+/// bar's color is all that tells them apart.
+fn draw_pane(f: &mut Frame, theme: &Theme, area: Rect, bar: Color) -> Rect {
+    let bg = theme.user_bg;
     let block = Block::default()
         .style(Style::default().bg(bg))
         .padding(Padding::new(INPUT_PAD_X as u16, INPUT_PAD_X as u16, 1, 1));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // The same bar the user's prompt blocks wear, down the pane's left edge.
-    let bar: Vec<Line> = (0..area.height)
-        .map(|_| {
-            Line::from(Span::styled(
-                BORDER_BAR,
-                Style::default().fg(app.theme.prompt_border).bg(bg),
-            ))
-        })
+    let rule: Vec<Line> = (0..area.height)
+        .map(|_| Line::from(Span::styled(BORDER_BAR, Style::default().fg(bar).bg(bg))))
         .collect();
-    f.render_widget(Paragraph::new(bar), Rect { width: 1, ..area });
+    f.render_widget(Paragraph::new(rule), Rect { width: 1, ..area });
+    inner
+}
 
+fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
+    let inner = draw_pane(f, &app.theme, area, app.theme.prompt_border);
     app.editor.render(f, inner);
 
     // Both banners float on the same row above the pane; the quit confirmation

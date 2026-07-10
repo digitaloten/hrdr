@@ -2482,6 +2482,74 @@ async fn the_input_pane_matches_the_user_prompt_block() {
     assert!(!screen.contains("11 ch"), "no draft-size footer:\n{screen}");
 }
 
+/// The todo panel wears the input pane's chrome — no border, the prompt's
+/// background, two columns of padding either side and a blank row above and
+/// below — differing only in the color of its left rule, which is green.
+#[tokio::test]
+async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
+    let mut h = Harness::new(vec![]).await;
+    *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
+        content: "ship it".to_string(),
+        status: "in_progress".to_string(),
+    }];
+
+    let mut term = Terminal::new(TestBackend::new(50, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen = buffer_to_string(buf);
+    let row = |y: u16| -> String {
+        (0..50)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect()
+    };
+    let cell = |x: u16, y: u16| buf.cell(Position::new(x, y)).unwrap().clone();
+
+    let text_y = (0..24)
+        .find(|&y| row(y).contains("ship it"))
+        .expect("the todo renders");
+
+    // No border glyphs, and no title, anywhere on the panel.
+    for y in text_y - 1..=text_y + 1 {
+        let r = row(y);
+        for ch in ['┌', '┐', '└', '┘', '│', '─'] {
+            assert!(!r.contains(ch), "border glyph {ch:?} on row {y}:\n{screen}");
+        }
+    }
+    assert!(!screen.contains("todos"), "no title:\n{screen}");
+
+    // The prompt's background across the full width, on the padding rows too.
+    for x in [0, 2, 49] {
+        for y in [text_y - 1, text_y, text_y + 1] {
+            assert_eq!(cell(x, y).bg, h.app.theme.user_bg, "({x},{y}):\n{screen}");
+        }
+    }
+    // One blank row above and below the content.
+    assert_eq!(without_bar(&row(text_y - 1)), "", "top padding:\n{screen}");
+    assert_eq!(
+        without_bar(&row(text_y + 1)),
+        "",
+        "bottom padding:\n{screen}"
+    );
+
+    // The rule, then the rest of the left padding, then the content.
+    assert!(
+        row(text_y).starts_with(&format!("{} [~] ship it", crate::ui::BORDER_BAR)),
+        "{screen}"
+    );
+    // Green, where the input pane's is the prompt's mauve.
+    for y in text_y - 1..=text_y + 1 {
+        assert_eq!(cell(0, y).symbol(), crate::ui::BORDER_BAR, "{screen}");
+        assert_eq!(cell(0, y).fg, h.app.theme.success, "green rule:\n{screen}");
+    }
+    assert_ne!(
+        h.app.theme.success, h.app.theme.prompt_border,
+        "the two rules are told apart by color"
+    );
+}
+
 /// Exactly one untinted row separates the scrollback from the input pane, even
 /// when a tinted block (a user prompt) runs right up to the bottom of it.
 ///
