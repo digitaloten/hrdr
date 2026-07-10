@@ -108,6 +108,20 @@ fn bg_handles() -> BgHandles {
 /// `done = true` with an error message rather than leaving the registry entry
 /// live forever. The outer [`JoinHandle`](tokio::task::JoinHandle) is stored in
 /// `handles` so [`Agent::clear`] can abort running tasks on session reset.
+/// Whether a `task` call runs detached.
+///
+/// Detached by default: a sub-agent must not block the main conversation. An
+/// explicit `background` in the args wins — the model passes `false` when it
+/// needs the answer before its next step. An isolated (worktree) sub-agent can't
+/// detach yet, so it stays blocking unless the model asked for both, which
+/// `TaskTool` rejects.
+fn wants_background(args: &serde_json::Value, isolated: bool) -> bool {
+    match args.get("background").and_then(|v| v.as_bool()) {
+        Some(explicit) => explicit,
+        None => !isolated,
+    }
+}
+
 fn spawn_background(
     mut cfg: AgentConfig,
     prompt: String,
@@ -389,7 +403,7 @@ impl hrdr_tools::Tool for SubagentTool {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run detached: return immediately with a task id and keep working; its result is delivered to you automatically when it finishes. Use for independent work you don't need before continuing. Default false (block until done)."
+                "description": "Default true: the sub-agent runs detached, this call returns immediately with a task id, and its result is delivered to you automatically when it finishes — so keep working, or end your turn. Pass false to block until it finishes and get its result inline, when you need the answer before your next step. Ignored (always false) when the sub-agent runs in an isolated worktree."
             }
         });
         if !self.profiles.is_empty() {
@@ -471,13 +485,14 @@ impl hrdr_tools::Tool for SubagentTool {
             .unwrap_or("sub-task")
             .to_string();
 
-        // Detached background mode: spawn and return immediately; the run loop
-        // delivers the result when it lands (the frontend shows live progress).
-        if args
-            .get("background")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
+        // Detached by default: spawn and return immediately so the sub-agent never
+        // blocks the main conversation. The run loop delivers its result when it
+        // lands (the frontend shows live progress). `background: false` opts back
+        // into waiting, for when the model needs the answer to continue.
+        //
+        // An isolated (worktree) sub-agent can't detach yet, so it stays blocking
+        // unless the model explicitly asks for both — which is an error.
+        if wants_background(&args, isolation.is_some()) {
             if isolation.is_some() {
                 bail!("a background task can't also use `isolation` (worktree) yet");
             }
@@ -3367,6 +3382,7 @@ mod tests {
         compaction_tail_start, elide_tool_results, estimate_tokens, estimate_tokens_in_messages,
         in_git_repo, is_context_overflow, is_transient, parse_env_bool, prune_tool_messages,
         repair_dangling_tool_calls, retry_after_hint, steering_queue, tail_window,
+        wants_background,
     };
     use crate::cwd_slug;
     use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
@@ -3746,6 +3762,33 @@ mod tests {
         // Sub-agent mode: applied onto the bounded base → no delegation.
         let delegated = config_for_agent_profile(&subagent_base_config(&base), &general).unwrap();
         assert!(!delegated.subagents, "a delegated sub-agent can't nest");
+    }
+
+    /// A `task` runs detached unless the model says otherwise — a sub-agent must
+    /// never block the main conversation.
+    ///
+    /// Regression: `background` defaulted to false, so every ordinary `task` call
+    /// held the turn open until the sub-agent finished, and anything the user
+    /// typed meanwhile could not reach the model.
+    #[test]
+    fn a_task_is_detached_unless_told_otherwise() {
+        use serde_json::json;
+        let plain = json!({"description": "map the crate"});
+        assert!(wants_background(&plain, false), "detached by default");
+
+        // The model can still wait for the answer when it needs it.
+        assert!(!wants_background(&json!({"background": false}), false));
+        assert!(wants_background(&json!({"background": true}), false));
+
+        // A worktree sub-agent can't detach, so it defaults to blocking…
+        assert!(!wants_background(&plain, true));
+        // …but asking for both is caught by the caller, not silently ignored.
+        assert!(wants_background(&json!({"background": true}), true));
+
+        // A non-boolean `background` is not a request to detach or to block: it
+        // falls back to the default rather than being coerced.
+        assert!(wants_background(&json!({"background": "yes"}), false));
+        assert!(!wants_background(&json!({"background": "yes"}), true));
     }
 
     #[test]

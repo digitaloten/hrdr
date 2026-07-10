@@ -61,6 +61,9 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
     let mut cursor_insert: Option<bool> = None;
 
     loop {
+        // A detached sub-agent that finished while the agent was idle wakes it,
+        // so its result reaches the model without waiting for the user to type.
+        app.maybe_deliver_background();
         terminal.draw(|f| ui::draw(f, app))?;
         sync_cursor(
             terminal.backend_mut(),

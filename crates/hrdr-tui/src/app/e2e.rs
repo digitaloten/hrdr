@@ -2695,6 +2695,52 @@ async fn a_sub_agent_row_lists_the_agent_and_jumps_to_its_tool_call() {
     assert_eq!(h.app.pending_focus_entry, None, "the focus was consumed");
 }
 
+/// A detached sub-agent that finishes while nothing is running wakes the model:
+/// an empty turn spawns, and `Agent::run` folds the result into the conversation
+/// before its first request. The user never has to type to collect it.
+#[tokio::test]
+async fn a_finished_background_task_wakes_an_idle_model() {
+    let mut h = Harness::new(vec![]).await;
+    let task = |done: bool, delivered: bool| hrdr_tools::BackgroundTask {
+        id: 1,
+        tool_id: Some("call-1".into()),
+        label: "explore".into(),
+        log: "↳ task#1".into(),
+        done,
+        result: done.then(|| "found it".to_string()),
+        delivered,
+    };
+
+    // Still running: nothing to deliver.
+    *h.app.background_tasks.lock().unwrap() = vec![task(false, false)];
+    h.app.maybe_deliver_background();
+    assert!(!h.app.running, "an unfinished task doesn't wake anything");
+
+    // Finished, but a turn is already in flight — it will drain at its next
+    // request, so don't spawn a second turn on top of it.
+    *h.app.background_tasks.lock().unwrap() = vec![task(true, false)];
+    h.app.running = true;
+    h.app.maybe_deliver_background();
+    h.app.running = false;
+
+    // Already delivered: nothing to do (and no wake-up loop).
+    *h.app.background_tasks.lock().unwrap() = vec![task(true, true)];
+    h.app.maybe_deliver_background();
+    assert!(!h.app.running, "a delivered result doesn't wake anything");
+
+    // Finished, undelivered, idle: the model is woken with an empty turn — no
+    // user message of its own is added to the transcript.
+    *h.app.background_tasks.lock().unwrap() = vec![task(true, false)];
+    let before = h.app.state.transcript.len();
+    h.app.maybe_deliver_background();
+    assert!(h.app.running, "the model was woken");
+    assert_eq!(
+        h.app.state.transcript.len(),
+        before,
+        "the wake-up turn adds no user message"
+    );
+}
+
 /// A pending message renders as a tinted block, with a blank row between its
 /// text and the `Queued` badge that closes it.
 #[tokio::test]

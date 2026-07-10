@@ -1189,6 +1189,28 @@ impl App {
                 .unwrap_or(Duration::ZERO)
     }
 
+    /// A detached sub-agent finished while nothing was running: wake the model so
+    /// it reacts to the result instead of sitting on it until the user's next
+    /// message.
+    ///
+    /// `Agent::run` folds finished background tasks into the conversation before
+    /// each request, so an empty turn is enough to deliver them — it pushes no
+    /// user message of its own. Only fires when idle: a running turn already
+    /// drains them at its next request, and a compaction is about to.
+    pub(crate) fn maybe_deliver_background(&mut self) {
+        if self.running || self.compacting {
+            return;
+        }
+        let ready = self
+            .background_tasks
+            .lock()
+            .map(|v| v.iter().any(|t| t.done && !t.delivered))
+            .unwrap_or(false);
+        if ready {
+            self.launch_turn(String::new());
+        }
+    }
+
     /// Messages handed to the running turn but not yet delivered.
     #[cfg(test)]
     pub(crate) fn steering_len_for_test(&self) -> usize {

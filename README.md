@@ -405,11 +405,17 @@ explore several areas of the codebase at once. While they run, the TUI shows a
 output streams. Finished sub-agents drop from the panel and their result lands
 in the transcript.
 
-For work you don't need before continuing, set **`background: true`** on a
-`task` call: it runs **detached** — the tool returns immediately and the main
-agent keeps going, while the sub-agent's result is **delivered back into the
-conversation automatically** when it finishes. Background sub-agents show live
-in the same panel (with a ✓ on completion).
+Sub-agents run **detached by default**: the `task` call returns immediately with
+a task id, so a sub-agent never blocks the main conversation — the model keeps
+working, and you keep talking to it. The sub-agent's result is **delivered back
+into the conversation automatically** when it finishes; if the agent is idle at
+that moment, the result wakes it so it reacts without you typing anything.
+Detached sub-agents show live in the same panel (with a ✓ on completion).
+
+Pass **`background: false`** when the model needs the sub-agent's answer before
+its next step — the call then blocks and the result comes back inline.
+Sub-agents running in an isolated worktree (`isolation = "worktree"`) always
+block; they can't detach yet.
 
 Four **built-in agents** ship out of the box, selected with the `task` tool's
 `agent` argument:
