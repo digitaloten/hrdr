@@ -475,6 +475,72 @@ mod tests {
         );
     }
 
+    /// `move` and `copy` create the destination's missing parent directories,
+    /// however deep — for a file source and for a directory source alike. A
+    /// model shouldn't have to `mkdir -p` first (and, having no shell, `plan`
+    /// couldn't).
+    #[tokio::test]
+    async fn move_and_copy_create_nested_destination_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path());
+
+        // copy: file into a path whose parents don't exist.
+        write(&dir.path().join("a.txt"), "a").await;
+        CopyTool
+            .execute(json!({"from": "a.txt", "to": "x/y/z/a.txt"}), &c)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("x/y/z/a.txt"))
+                .await
+                .unwrap(),
+            "a"
+        );
+
+        // move: file into a different deep path.
+        c.mark_read(&dir.path().join("a.txt"));
+        MoveTool
+            .execute(json!({"from": "a.txt", "to": "p/q/r/b.txt"}), &c)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("p/q/r/b.txt"))
+                .await
+                .unwrap(),
+            "a"
+        );
+        assert!(!dir.path().join("a.txt").exists());
+
+        // copy: a directory into a deep path, nested contents intact.
+        write(&dir.path().join("tree/deep/x.txt"), "x").await;
+        CopyTool
+            .execute(json!({"from": "tree", "to": "one/two/tree"}), &c)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("one/two/tree/deep/x.txt"))
+                .await
+                .unwrap(),
+            "x"
+        );
+
+        // move: a directory into a deep path (rename needs the parent to exist).
+        MoveTool
+            .execute(json!({"from": "tree", "to": "three/four/tree"}), &c)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("three/four/tree/deep/x.txt"))
+                .await
+                .unwrap(),
+            "x"
+        );
+        assert!(
+            !dir.path().join("tree").exists(),
+            "source moved, not copied"
+        );
+    }
+
     #[tokio::test]
     async fn copy_duplicates_a_file_and_a_tree_without_touching_the_source() {
         let dir = tempfile::tempdir().unwrap();
