@@ -2758,60 +2758,55 @@ async fn the_follow_button_floats_above_the_input_and_is_clickable() {
     assert_eq!(h.app.scroll_offset, 0, "the click resumed following");
 }
 
-/// While a turn runs, the loader takes the blank row that otherwise separates
-/// the scrollback from the input pane — it doesn't stack an extra row above it.
+/// The loader heads the input area while a turn runs: above every panel, with a
+/// blank row on each side. Those blanks are the shared per-section spacer — the
+/// loader's own above it, the next section's below it.
 #[tokio::test]
-async fn the_generating_line_replaces_the_blank_row_above_the_input() {
+async fn the_generating_line_heads_the_input_area_with_a_blank_row_each_side() {
     let mut h = Harness::new(vec![]).await;
     h.type_str("draft");
-
-    let mut term = Terminal::new(TestBackend::new(56, 24)).unwrap();
-    let render = |h: &mut Harness, term: &mut Terminal<TestBackend>| -> (u16, u16) {
-        term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-        let buf = term.backend().buffer();
-        let row = |y: u16| -> String {
-            (0..56)
-                .filter_map(|x| {
-                    buf.cell(Position::new(x, y))
-                        .map(|c| c.symbol().to_string())
-                })
-                .collect()
-        };
-        let draft_y = (0..24).find(|&y| row(y).contains("draft")).expect("draft");
-        // The input pane's tinted top pad sits directly above the draft; the row
-        // above *that* is the one under test.
-        (draft_y - 2, draft_y - 1)
-    };
-
-    // Idle: that row is blank, on the terminal background.
-    let (slot_y, pad_y) = render(&mut h, &mut term);
-    let buf = term.backend().buffer();
-    let screen = buffer_to_string(buf);
-    let cell = |y: u16| buf.cell(Position::new(2, y)).unwrap().clone();
-    assert_eq!(
-        cell(pad_y).bg,
-        h.app.theme.user_bg,
-        "input top pad:\n{screen}"
-    );
-    assert_eq!(cell(slot_y).bg, Color::Reset, "idle: untinted:\n{screen}");
-    assert_eq!(cell(slot_y).symbol(), " ", "idle: blank:\n{screen}");
-
-    // Running: the loader occupies the same row — the layout grew by nothing.
+    // A panel between the loader and the input, so "top-most" is a real claim.
+    *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
+        content: "ship it".to_string(),
+        status: "in_progress".to_string(),
+    }];
     h.app.running = true;
     h.app.turn_started = Some(std::time::Instant::now());
-    let (slot_y2, _) = render(&mut h, &mut term);
-    assert_eq!(slot_y2, slot_y, "the input pane did not move");
+
+    let mut term = Terminal::new(TestBackend::new(56, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let buf = term.backend().buffer();
     let screen = buffer_to_string(buf);
-    let loader_row: String = (0..56)
-        .filter_map(|x| {
-            buf.cell(Position::new(x, slot_y))
-                .map(|c| c.symbol().to_string())
-        })
-        .collect();
-    assert!(
-        loader_row.contains("inferring"),
-        "the loader took the blank row:\n{screen}"
+    let row = |y: u16| -> String {
+        (0..56)
+            .filter_map(|x| {
+                buf.cell(Position::new(x, y))
+                    .map(|c| c.symbol().to_string())
+            })
+            .collect()
+    };
+    let cell = |y: u16| buf.cell(Position::new(2, y)).unwrap().clone();
+    let find = |needle: &str| {
+        (0..24)
+            .find(|&y| row(y).contains(needle))
+            .unwrap_or_else(|| panic!("no {needle} row:\n{screen}"))
+    };
+
+    let loader_y = find("inferring");
+    // Top-most: the todo panel and the input pane both sit below it.
+    assert!(loader_y < find("ship it"), "above the todos:\n{screen}");
+    assert!(loader_y < find("draft"), "above the input:\n{screen}");
+
+    // A blank, untinted row on each side of it.
+    for y in [loader_y - 1, loader_y + 1] {
+        assert_eq!(row(y).trim(), "", "blank row at {y}:\n{screen}");
+        assert_eq!(cell(y).bg, Color::Reset, "untinted row at {y}:\n{screen}");
+    }
+    // And exactly one below: the todo panel's tinted top pad follows it.
+    assert_eq!(
+        cell(loader_y + 2).bg,
+        h.app.theme.user_bg,
+        "the next section starts one row below:\n{screen}"
     );
 }
 

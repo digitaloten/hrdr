@@ -51,8 +51,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         (todos.len() as u16).min(TODO_PANEL_MAX_ITEMS) + 2
     };
 
-    // The inference loader sits just above the input while a turn runs, in place
-    // of the blank row that otherwise separates the input from the scrollback.
+    // While a turn runs the loader heads the input section, above any panel.
     let loader_height: u16 = if app.running { 1 } else { 0 };
 
     // Input pane auto-grows 1..=INPUT_MAX_ROWS text rows with the content.
@@ -73,33 +72,23 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     );
     let subagent_height = subagent_panel_height(&subagent_items);
 
-    // Build the row stack dynamically, remembering each section's index. Each
-    // panel above the input carries a blank row of its own, so it never butts up
-    // against the panel (or the scrollback) above it — and costs nothing when it
-    // isn't rendered.
+    // Build the row stack dynamically, remembering each section's index. Every
+    // section of the input area carries a blank row above itself, so none butts
+    // up against the one above it (the scrollback's last block no longer trails
+    // a separator of its own) — and that row costs nothing when the section
+    // isn't rendered. Each section's own blank is the previous one's blank below.
     let mut constraints = vec![Constraint::Min(3)];
-    let panel = |constraints: &mut Vec<Constraint>, height: u16| {
+    let section = |constraints: &mut Vec<Constraint>, height: u16| {
         (height > 0).then(|| {
             constraints.push(Constraint::Length(1));
             constraints.push(Constraint::Length(height));
             constraints.len() - 1
         })
     };
-    let subagent_idx = panel(&mut constraints, subagent_height);
-    let todo_idx = panel(&mut constraints, todo_height);
-    let loader_idx = (loader_height > 0).then(|| {
-        constraints.push(Constraint::Length(loader_height));
-        constraints.len() - 1
-    });
-    // A blank row between the scrollback (or whatever panel is above) and the
-    // tinted input pane, so the two never butt up against each other. It is the
-    // only separator: transcript blocks no longer trail one of their own. While
-    // a turn runs the loader takes that row instead of stacking below it.
-    if loader_idx.is_none() {
-        constraints.push(Constraint::Length(1));
-    }
-    constraints.push(Constraint::Length(input_height));
-    let input_idx = constraints.len() - 1;
+    let loader_idx = section(&mut constraints, loader_height);
+    let subagent_idx = section(&mut constraints, subagent_height);
+    let todo_idx = section(&mut constraints, todo_height);
+    let input_idx = section(&mut constraints, input_height).expect("the input pane always renders");
     // Status bar: hidden (0 rows), one row (truncate), or wrapped (≤4 rows). It
     // renders as a block, so it carries the same padding as the transcript's —
     // two columns either side, and a blank row above and below. That top row is
