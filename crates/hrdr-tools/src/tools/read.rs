@@ -5,7 +5,7 @@ use serde_json::json;
 
 use crate::{Tool, ToolContext, truncate};
 
-use super::{DEFAULT_READ_LIMIT, MAX_LINE};
+use super::{DEFAULT_READ_LIMIT, MAX_LINE, MAX_READ_BYTES};
 
 // ---- read ----
 
@@ -48,6 +48,17 @@ impl Tool for ReadTool {
         let a: ReadArgs = crate::tool_args("read", args)?;
         let path = ctx.resolve(&a.path);
         crate::guard_secret_read(&path)?;
+        if let Ok(meta) = tokio::fs::metadata(&path).await
+            && meta.len() > MAX_READ_BYTES
+        {
+            bail!(
+                "{} is {} bytes, over this tool's {MAX_READ_BYTES}-byte cap — it's too large to \
+                 load whole; use `grep` to search it or `bash` (`sed`/`head`/`tail`) to slice out \
+                 the range you need",
+                path.display(),
+                meta.len()
+            );
+        }
         let text = match tokio::fs::read_to_string(&path).await {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {

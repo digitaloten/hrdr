@@ -1210,6 +1210,7 @@ dependencies = [
  "hjkl-engine-tui",
  "hjkl-vim",
  "ratatui",
+ "unicode-width",
 ]
 
 [[package]]

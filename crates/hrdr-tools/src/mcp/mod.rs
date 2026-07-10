@@ -34,6 +34,17 @@ use std::time::Duration;
 pub(crate) const PROTOCOL_VERSION: &str = "2025-06-18";
 pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard cap on a single JSON-RPC message read from a server — an HTTP
+/// response body (Streamable HTTP) or one stdio line — so a misbehaving or
+/// hostile MCP server streaming unbounded data can't grow this process's
+/// memory without limit. MCP messages are small JSON-RPC envelopes; this is
+/// generous headroom for a large tool result.
+pub(crate) const MAX_MCP_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+/// Wall-clock cap on reading one HTTP response body, independent of the
+/// request's own `timeout` — guards a connection that opens promptly (so the
+/// request timeout's `send()` phase is satisfied) but then trickles bytes
+/// forever without ever completing the body.
+pub(crate) const MAX_BODY_READ_TIME: Duration = Duration::from_secs(60);
 
 pub use types::McpClient;
 

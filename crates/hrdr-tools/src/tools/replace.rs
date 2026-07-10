@@ -105,7 +105,9 @@ impl Tool for ReplaceTool {
 
         // Phase 1 — plan. Every file the sweep would rewrite is checked before
         // any of them is written, so a file this agent may not touch aborts the
-        // whole sweep rather than leaving it half applied.
+        // whole sweep rather than leaving it half applied. `MAX_FILES` bounds
+        // the files that actually *match* — not every candidate the walk
+        // turns up — so a large repo with few hits still succeeds.
         let mut planned = Vec::new();
         let mut diffs = String::new();
         let mut total = 0usize;
@@ -116,6 +118,13 @@ impl Tool for ReplaceTool {
             let hits = re.find_iter(&before).count();
             if hits == 0 {
                 continue;
+            }
+            if planned.len() >= MAX_FILES {
+                bail!(
+                    "more than {MAX_FILES} files contain {:?} — narrow the sweep with `glob` \
+                     or `path`",
+                    a.find
+                );
             }
             // Only now is the file a mutation target, so only now must it satisfy
             // this agent's extension allow-list.
@@ -169,9 +178,12 @@ impl Tool for ReplaceTool {
     }
 }
 
-/// Every text-sized file under `root` that `pattern` admits, honouring
-/// `.gitignore` — the same walker `find` uses, so the two agree on what "the
-/// project" is. Errors past [`MAX_FILES`] rather than sweeping blindly.
+/// Every text-sized, non-secret file under `root` that `pattern` admits,
+/// honouring `.gitignore` — the same walker `find` uses, so the two agree on
+/// what "the project" is. This is the sweep's *candidate* set, before any
+/// content is inspected — [`MAX_FILES`] is enforced against files that
+/// actually match `find` (see the caller), not against how many candidates
+/// this turns up, so a large repo with few hits still succeeds.
 fn collect_files(
     root: &std::path::Path,
     pattern: Option<&glob::Pattern>,
@@ -184,6 +196,11 @@ fn collect_files(
             continue;
         }
         let path = entry.into_path();
+        // Never a rewrite (or diff-disclosure) target: mirrors the `read`/
+        // `grep` deny-list so a broad `replace` can't touch a `.env` etc.
+        if crate::secret_file_reason(&crate::canonicalize_nearest(&path)).is_some() {
+            continue;
+        }
         if let Some(p) = pattern {
             // Match the project-relative path, so `src/**/*.rs` means what it
             // looks like rather than depending on the absolute prefix.
@@ -196,9 +213,6 @@ fn collect_files(
             continue;
         }
         out.push(path);
-        if out.len() > MAX_FILES {
-            bail!("more than {MAX_FILES} files match — narrow the sweep with `glob` or `path`");
-        }
     }
     out.sort();
     Ok(out)
@@ -396,5 +410,53 @@ mod tests {
             .await
             .unwrap();
         assert!(out.starts_with("No file contains"), "{out}");
+    }
+
+    /// A `.env` (or other secret file) is never rewritten, even when it
+    /// contains the search string — and its content never appears in the
+    /// diff/summary either, mirroring the `read`/`grep` deny-list.
+    #[tokio::test]
+    async fn secret_files_are_never_rewritten_or_disclosed() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join(".env"), "API_KEY=old_name\n").await;
+        write(&dir.path().join("a.txt"), "old_name\n").await;
+        let ctx = ToolContext::new(dir.path());
+
+        let out = ReplaceTool
+            .execute(json!({"find": "old_name", "replace": "new_name"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(out.contains("across 1 file"), "{out}");
+        assert!(!out.contains("API_KEY"), "secret content leaked:\n{out}");
+        assert!(!out.contains(".env"), "secret path named:\n{out}");
+        assert_eq!(
+            read(&dir.path().join(".env")).await,
+            "API_KEY=old_name\n",
+            "the secret file must be untouched"
+        );
+        assert_eq!(read(&dir.path().join("a.txt")).await, "new_name\n");
+    }
+
+    /// `MAX_FILES` bounds the files that actually *match* `find`, not every
+    /// candidate the walk turns up — a repo with far more than `MAX_FILES`
+    /// files but only a few hits must still succeed.
+    #[tokio::test]
+    async fn max_files_counts_matches_not_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        // Many more candidate files than MAX_FILES, none containing `find`.
+        for i in 0..(MAX_FILES + 50) {
+            write(&dir.path().join(format!("f{i}.txt")), "nothing here\n").await;
+        }
+        // A single file that actually matches.
+        write(&dir.path().join("hit.txt"), "needle\n").await;
+        let ctx = ToolContext::new(dir.path());
+
+        let out = ReplaceTool
+            .execute(json!({"find": "needle", "replace": "found"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("across 1 file"), "{out}");
+        assert_eq!(read(&dir.path().join("hit.txt")).await, "found\n");
     }
 }

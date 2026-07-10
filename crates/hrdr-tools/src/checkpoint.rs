@@ -161,7 +161,24 @@ impl Checkpoints {
                 Ok(hash) => Some(hash),
                 Err(_) => return, // couldn't store — don't record a bad checkpoint
             },
-            Err(_) => None, // file didn't exist before
+            // The file genuinely didn't exist before this turn's write — a
+            // revert should delete it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            // Some other read failure (permissions, I/O error, …): the file
+            // may well exist. Recording `pre = None` here would make a later
+            // revert *delete* a file that was never actually new — worse than
+            // doing nothing. Log and skip the checkpoint for this touch
+            // instead of recording a bad one; `touched` stays unmarked so a
+            // later successful read this turn can still record it.
+            Err(e) => {
+                self.touched.remove(&key);
+                eprintln!(
+                    "hrdr: checkpoint: couldn't read {} before recording a change ({e}) — \
+                     this file won't be revertible for this turn",
+                    path.display()
+                );
+                return;
+            }
         };
         let rec = ChangeRecord {
             turn: self.turn,
@@ -437,6 +454,53 @@ mod tests {
         assert_eq!(
             blob_count, 1,
             "identical content should produce exactly one blob file"
+        );
+    }
+
+    /// A read failure other than "file doesn't exist" (here: permission
+    /// denied) must not be recorded as `pre = None` — that would make
+    /// `revert_to` *delete* a file that actually existed. No record at all is
+    /// recorded instead: the change simply isn't revertible for this turn,
+    /// which is honest, whereas a phantom "didn't exist" record is actively
+    /// wrong. Unix-only: relies on real permission enforcement.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_existing_file_is_not_recorded_as_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("locked.txt");
+        std::fs::write(&f, "secret content").unwrap();
+        // Remove all permissions so std::fs::read fails with something other
+        // than NotFound.
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Skip if running as root (root ignores permission bits, so the
+        // premise of this test — a non-NotFound read failure — wouldn't hold).
+        if std::fs::read(&f).is_ok() {
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+
+        let mut cp = Checkpoints::open(dir.path().join("cp")).unwrap();
+        cp.begin_turn();
+        cp.record_pre(&f);
+
+        // Restore permissions so cleanup (and the revert below) can proceed.
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // No record was written for this file — nothing to revert, and in
+        // particular no revert will delete the still-existing file.
+        assert!(
+            cp.list().is_empty(),
+            "no checkpoint should have been recorded"
+        );
+        assert!(f.exists(), "the file must still exist");
+        let restored = cp.revert_last().unwrap();
+        assert!(restored.is_empty());
+        assert!(
+            f.exists(),
+            "revert must not delete a file that was never new"
         );
     }
 

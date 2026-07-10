@@ -16,6 +16,7 @@ use hjkl_engine::{CoarseMode, Editor, Host, Options};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
+use unicode_width::UnicodeWidthChar;
 
 pub use host::HrdrHost;
 pub use plain::PlainEngine;
@@ -100,13 +101,38 @@ pub trait TuiRender {
 pub trait TuiEditorEngine: EditorEngine + TuiRender {}
 impl<T: EditorEngine + TuiRender> TuiEditorEngine for T {}
 
-/// Number of display rows `text` occupies when hard-wrapped at `width` columns.
+/// Display width of one char, terminal-cell accounting: a zero-width
+/// combining mark contributes 0 (it rides on the previous cell), most glyphs
+/// 1, and wide glyphs (CJK, many emoji) 2. Shared by [`wrapped_row_count`] and
+/// [`plain::PlainEngine`]'s renderer so wrap math and cursor placement agree
+/// with what the terminal actually draws — counting chars instead of columns
+/// overflows the input box on wide glyphs and misplaces the cursor.
+pub(crate) fn char_width(c: char) -> usize {
+    c.width().unwrap_or(0)
+}
+
+/// Number of display rows `text` occupies when hard-wrapped at `width` display
+/// columns (not chars). A wide glyph that would straddle the boundary wraps
+/// whole onto the next row, matching the terminal's own behavior, and
+/// zero-width marks never trigger a wrap.
 pub(crate) fn wrapped_row_count(text: &str, width: u16) -> usize {
     let w = width.max(1) as usize;
     text.split('\n')
         .map(|line| {
-            let cells = line.chars().count();
-            if cells == 0 { 1 } else { cells.div_ceil(w) }
+            let mut rows = 1usize;
+            let mut col = 0usize;
+            for c in line.chars() {
+                let cw = char_width(c);
+                if cw == 0 {
+                    continue;
+                }
+                if col + cw > w {
+                    rows += 1;
+                    col = 0;
+                }
+                col += cw;
+            }
+            rows
         })
         .sum::<usize>()
         .max(1)
@@ -284,5 +310,47 @@ impl TuiRender for VimEngine {
         if sx < area.x + area.width && sy < area.y + area.height {
             frame.set_cursor_position((sx, sy));
         }
+    }
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::wrapped_row_count;
+
+    /// Plain ASCII: unchanged behavior from the char-counting version — one
+    /// row exactly at the boundary, two rows one char past it.
+    #[test]
+    fn ascii_wraps_at_the_column_boundary() {
+        assert_eq!(wrapped_row_count("0123456789", 10), 1);
+        assert_eq!(wrapped_row_count("01234567890", 10), 2);
+    }
+
+    /// Wide glyphs (CJK, width 2) count as 2 columns each, so half as many fit
+    /// per row as ASCII — the char-counting bug undercounted rows by 2x here.
+    #[test]
+    fn wide_glyphs_count_as_two_columns() {
+        // 6 wide chars = 12 columns; at width 10 that's 2 rows (a 7th char
+        // would overflow the 5th slot, so only 5 fit on the first row).
+        let line: String = std::iter::repeat_n('国', 6).collect();
+        assert_eq!(wrapped_row_count(&line, 10), 2);
+    }
+
+    /// A wide glyph that would straddle the boundary wraps whole onto the next
+    /// row rather than splitting across it.
+    #[test]
+    fn a_wide_glyph_does_not_split_across_the_boundary() {
+        // 9 narrow chars fill columns 0..9, leaving 1 free column — too
+        // narrow for the wide glyph that follows, so it wraps whole.
+        let line = format!("{}{}", "a".repeat(9), '国');
+        assert_eq!(wrapped_row_count(&line, 10), 2);
+    }
+
+    /// Zero-width combining marks ride on the previous cell — they never
+    /// advance the column count or trigger a wrap.
+    #[test]
+    fn zero_width_combining_marks_are_free() {
+        // "e" + combining acute accent (U+0301), repeated to fill a row.
+        let line: String = std::iter::repeat_n("e\u{0301}", 10).collect();
+        assert_eq!(wrapped_row_count(&line, 10), 1);
     }
 }

@@ -143,16 +143,23 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 
 fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &crate::app::Completions) {
     let theme = &app.theme;
-    let height = comp.items.len() as u16 + 2;
+    // Clamped to the frame itself, not just the input pane: on a very short
+    // or narrow terminal, an unclamped popup could ask for more rows/columns
+    // than exist, leaving its border/top items rendered outside the visible
+    // area (ratatui clips silently — no panic, but nothing there to click).
+    let frame_area = f.area();
+    let height = (comp.items.len() as u16 + 2).min(frame_area.height.max(1));
     let widest = comp
         .items
         .iter()
         .map(|(n, d)| n.chars().count() + d.chars().count() + 5)
         .max()
         .unwrap_or(24);
-    let width = (widest as u16).clamp(20, input_area.width.max(20));
+    let width = (widest as u16)
+        .clamp(20, input_area.width.max(20))
+        .min(frame_area.width.max(1));
     let rect = Rect {
-        x: input_area.x,
+        x: input_area.x.min(frame_area.width.saturating_sub(width)),
         y: input_area.y.saturating_sub(height),
         width,
         height,
@@ -187,6 +194,15 @@ fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &crate::app
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Saturate a `usize` row/column count down to `u16`, for the handful of
+/// places a `usize` accumulator (kept wide to avoid overflow on a long
+/// transcript) finally has to cross into ratatui's `u16`-only APIs
+/// (`Paragraph::scroll`, `Rect` fields). A raw `as u16` truncates instead of
+/// saturating, wrapping a >65535-row transcript's offset back down near 0.
+fn clamp_u16(n: usize) -> u16 {
+    n.min(u16::MAX as usize) as u16
+}
+
 fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // Publish the height so key handlers can compute half-page offsets.
     app.transcript_height = area.height;
@@ -217,7 +233,7 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // (avoids another Paragraph::line_count allocation + re-wrap).
     let goto_top: Option<u16> = app.pending_goto.take().and_then(|num| {
         let start = (*msg_starts.get(num.checked_sub(1)?)?).min(lines.len());
-        Some(cum[start] as u16)
+        Some(clamp_u16(cum[start]))
     });
     // A tool block that was just expanded or collapsed changed height. While the
     // reader is scrolled up, pull its top to the top of the viewport: the offset
@@ -226,18 +242,21 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // the bottom is already pinned.
     let entry_top: Option<u16> = app.pending_scroll_entry.take().and_then(|idx| {
         let (start, ..) = tool_regions.iter().find(|(.., i)| *i == idx)?;
-        (app.scroll_offset > 0).then(|| cum[(*start).min(lines.len())] as u16)
+        (app.scroll_offset > 0).then(|| clamp_u16(cum[(*start).min(lines.len())]))
     });
     // A click on a sub-agent row focuses that `task` call: unlike the collapse
     // case above, it moves the view even while following the newest output.
     let focus_top: Option<u16> = app.pending_focus_entry.take().and_then(|idx| {
         let (start, ..) = tool_regions.iter().find(|(.., i)| *i == idx)?;
-        Some(cum[(*start).min(lines.len())] as u16)
+        Some(clamp_u16(cum[(*start).min(lines.len())]))
     });
     let goto_top = goto_top.or(focus_top).or(entry_top);
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     // Total wrapped rows at this width — from cum, not para.line_count().
-    let total = *cum.last().unwrap_or(&0) as u16;
+    // Clamped (not truncated) to u16::MAX: ratatui's `Paragraph::scroll` only
+    // takes a u16, and a long enough transcript would otherwise wrap the raw
+    // `as u16` cast past 65535 back down near 0, snapping the view to the top.
+    let total = clamp_u16(*cum.last().unwrap_or(&0));
     let max_scroll = total.saturating_sub(area.height);
     // Pin the view to the same content while scrolled up. `scroll_offset` is
     // measured from the bottom, so as streaming appends rows `max_scroll` grows
@@ -247,7 +266,7 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // (following the newest output) is left untouched — it stays pinned to the
     // bottom by design.
     if app.scroll_offset > 0 {
-        let grown = max_scroll.saturating_sub(app.max_scroll as u16);
+        let grown = max_scroll.saturating_sub(clamp_u16(app.max_scroll));
         app.scroll_offset = app.scroll_offset.saturating_add(grown as usize);
     }
     // A /goto puts the target message at the top of the viewport.
@@ -257,7 +276,7 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // scroll_offset is rows scrolled UP from the bottom; 0 == follow newest.
     // Clamp and write back so "scrolled up" state (and the follow button) is
     // accurate even after the content shrinks.
-    let offset = (app.scroll_offset as u16).min(max_scroll);
+    let offset = clamp_u16(app.scroll_offset).min(max_scroll);
     app.scroll_offset = offset as usize;
     app.max_scroll = max_scroll as usize;
     let scroll = max_scroll.saturating_sub(offset);
@@ -491,7 +510,11 @@ fn draw_pane(f: &mut Frame, theme: &Theme, area: Rect, bar: Color) -> Rect {
 
 fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = draw_pane(f, &app.theme, area, app.theme.prompt_border);
-    app.editor.render(f, inner);
+    if app.masks_input() {
+        draw_masked_input(f, app, inner);
+    } else {
+        app.editor.render(f, inner);
+    }
 
     // Both banners float on the same row above the pane; the quit confirmation
     // takes the spot when both would apply. Only the follow banner is clickable.
@@ -527,6 +550,37 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         app.follow_button = None;
     }
+}
+
+/// Render the input pane with every character replaced by `•`, for the
+/// `/login` API-key prompt. The key is already kept out of history, the
+/// transcript, and the session file (see `LoginWizard::enter_key`); this
+/// keeps it off the screen too, while the editor still holds — and `/login`
+/// still reads — the real text underneath.
+///
+/// Cursor placement assumes the common case of typing/pasting straight
+/// through to the end (true for every key-entry path today); editing back
+/// into the middle of a masked value would place the cursor by count alone,
+/// same as the wrap below.
+fn draw_masked_input(f: &mut Frame, app: &App, area: Rect) {
+    let count = app.editor.content().chars().count();
+    let width = (area.width.max(1)) as usize;
+    let bullets: Vec<char> = std::iter::repeat_n('•', count).collect();
+    let lines: Vec<Line> = if bullets.is_empty() {
+        vec![Line::from("")]
+    } else {
+        bullets
+            .chunks(width)
+            .map(|c| Line::from(c.iter().collect::<String>()))
+            .collect()
+    };
+    f.render_widget(Paragraph::new(lines), area);
+
+    let row = (count / width) as u16;
+    let col = (count % width) as u16;
+    let sy = area.y + row.min(area.height.saturating_sub(1));
+    let sx = area.x + col.min(area.width.saturating_sub(1));
+    f.set_cursor_position((sx, sy));
 }
 
 /// Rows above the input pane that a banner floats on, clear of its padding.
@@ -1766,6 +1820,28 @@ fn diff_line_color(line: &str, theme: &Theme) -> Color {
         hrdr_app::diff_kind_slot(hrdr_app::classify_diff_line(line)),
         theme,
     )
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::clamp_u16;
+
+    /// The transcript's cumulative wrapped-row count is kept in `usize` to
+    /// avoid overflow, but the handful of places it crosses into ratatui's
+    /// `u16`-only scroll APIs must saturate at `u16::MAX`, not truncate — a
+    /// raw `as u16` on a session taller than 65535 rows wraps back down
+    /// (mod 65536) to a small, unrelated number, which would snap the
+    /// scrollbar/offset math to somewhere near the top instead of the bottom.
+    #[test]
+    fn clamp_u16_saturates_instead_of_wrapping() {
+        assert_eq!(clamp_u16(0), 0);
+        assert_eq!(clamp_u16(65_535), u16::MAX);
+        assert_eq!(clamp_u16(65_536), u16::MAX, "one past the max still clamps");
+        assert_eq!(clamp_u16(100_000), u16::MAX);
+        // What the bug actually did: `100_000 as u16` truncates to
+        // `100_000 % 65_536 = 34_464` — nowhere near u16::MAX.
+        assert_ne!(clamp_u16(100_000), (100_000usize % 65_536) as u16);
+    }
 }
 
 #[cfg(test)]

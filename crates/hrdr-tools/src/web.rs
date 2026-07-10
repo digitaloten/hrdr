@@ -2,6 +2,7 @@
 //! results). `search` uses a zero-config DuckDuckGo HTML backend by default,
 //! or a SearXNG instance when `SEARXNG_URL` is set (a JSON API — more robust).
 
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -25,15 +26,39 @@ const FETCH_BODY_MULTIPLIER: usize = 8;
 /// normal page through.
 const FETCH_BODY_FLOOR: usize = 256 * 1024;
 
+/// Redirect hops a single `fetch` will follow before giving up — generous
+/// enough for normal link-shorteners/CDNs, small enough to bound the SSRF
+/// re-check work and stop a redirect loop.
+const MAX_REDIRECTS: usize = 10;
+
 /// Lazily-initialised, shared HTTP client with a browser-ish UA and a sane
 /// timeout. Built once and reused for every web tool call so connection pools
 /// and DNS results are shared. A build failure (TLS-backend misconfiguration)
 /// is stored as an error string and surfaced per call via [`http_client`], so a
 /// broken environment yields a recoverable tool error rather than a panic.
+///
+/// The SSRF guard on the *initial* URL (see [`is_blocked_host`]) is worthless
+/// on its own: a server can 302 to `http://169.254.169.254/` and reqwest would
+/// follow by default with no re-check. The custom redirect policy re-runs the
+/// same host/IP check on every hop's URL (and caps the hop count), so a
+/// redirect to an internal target is refused just like a direct request would
+/// be.
 static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                return attempt.error("too many redirects");
+            }
+            if is_blocked_url(attempt.url()) {
+                let url = attempt.url().clone();
+                return attempt.error(format!(
+                    "refusing to follow redirect to {url}: internal/loopback host is blocked"
+                ));
+            }
+            attempt.follow()
+        }))
         .build()
         .map_err(|e| format!("building HTTP client (TLS backend missing or misconfigured): {e}"))
 });
@@ -330,28 +355,76 @@ fn push_capped(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
 }
 
 /// Whether `url`'s host is an internal/loopback target `fetch` should refuse
-/// (SSRF guard): localhost, loopback IPs, `0.0.0.0`, and the link-local cloud
-/// metadata endpoint. A URL that doesn't parse is not blocked here (the caller
-/// already enforced an `http(s)` scheme).
+/// (SSRF guard): localhost, loopback/private/link-local/unique-local IPs
+/// (literal or resolved via DNS), and the link-local cloud metadata endpoint.
+/// A URL that doesn't parse is not blocked here (the caller already enforced
+/// an `http(s)` scheme).
 fn is_blocked_host(url: &str) -> bool {
     match reqwest::Url::parse(url) {
-        Ok(u) => u.host_str().is_some_and(is_internal_host),
+        Ok(u) => is_blocked_url(&u),
         Err(_) => false,
     }
 }
 
-/// The host-name test behind [`is_blocked_host`], split out for unit tests.
+/// [`is_blocked_host`] on an already-parsed URL — used by the redirect policy,
+/// which hands us a [`reqwest::Url`] for each hop.
+fn is_blocked_url(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(is_internal_host)
+}
+
+/// The host-name test behind [`is_blocked_host`]: refuses well-known internal
+/// names outright, then resolves the host to concrete IP addresses (a literal
+/// IP parses directly; a hostname goes through DNS via `to_socket_addrs`) and
+/// blocks if *any* resolved address is internal — so a hostile DNS answer or
+/// an alternate encoding of a loopback/private address doesn't slip past a
+/// string-only check.
 fn is_internal_host(host: &str) -> bool {
     let h = host
         .trim_start_matches('[')
         .trim_end_matches(']')
         .to_ascii_lowercase();
-    h == "localhost"
-        || h.ends_with(".localhost")
-        || h == "0.0.0.0"
-        || h == "::1"
-        || h == "169.254.169.254" // cloud instance metadata
-        || h.starts_with("127.")
+    if h == "localhost" || h.ends_with(".localhost") {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<IpAddr>() {
+        return is_blocked_ip(ip);
+    }
+    // Not a literal IP: resolve via DNS and check every address it comes back
+    // with. `to_socket_addrs` needs a port; 0 is never dialed here — the
+    // lookup is resolution-only, the real request goes through reqwest.
+    match (h.as_str(), 0u16).to_socket_addrs() {
+        Ok(addrs) => addrs.map(|a| a.ip()).any(is_blocked_ip),
+        // Unresolvable: not blocked here — the real request will fail with
+        // its own (clearer) DNS error.
+        Err(_) => false,
+    }
+}
+
+/// Whether `ip` is a loopback/private/link-local/unique-local address —
+/// covers 127.0.0.0/8, 10/8, 172.16/12, 192.168/16, 169.254/16 (incl. the
+/// cloud metadata endpoint 169.254.169.254), `::1`, `fc00::/7`, `fe80::/10`,
+/// and an IPv4-mapped IPv6 address whose embedded v4 address is any of the
+/// above.
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_blocked_ipv4(mapped);
+            }
+            v6.is_loopback() // ::1
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 (unique local)
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 (link-local)
+        }
+    }
+}
+
+/// The IPv4 half of [`is_blocked_ip`].
+fn is_blocked_ipv4(v4: Ipv4Addr) -> bool {
+    v4.is_loopback() // 127.0.0.0/8
+        || v4.is_private() // 10/8, 172.16/12, 192.168/16
+        || v4.is_link_local() // 169.254/16, incl. 169.254.169.254 (cloud metadata)
+        || v4.is_unspecified() // 0.0.0.0
 }
 
 // ---- small HTML helpers (no extra dependencies) ----
@@ -598,6 +671,38 @@ mod tests {
         assert!(is_blocked_host("http://app.localhost/x"));
         assert!(!is_blocked_host("https://example.com/x"));
         assert!(!is_blocked_host("https://8.8.8.8/x"));
+    }
+
+    /// A blocked literal IP (loopback) is refused regardless of the scheme.
+    #[test]
+    fn blocks_a_blocked_literal_ip() {
+        assert!(is_blocked_host("http://127.0.0.1:9999/x"));
+        assert!(is_blocked_host("https://127.0.0.1/x"));
+    }
+
+    /// Every private RFC1918 range is refused, not just loopback.
+    #[test]
+    fn blocks_private_range_ips() {
+        assert!(is_blocked_host("http://10.0.0.1/x"));
+        assert!(is_blocked_host("http://172.16.0.5/x"));
+        assert!(is_blocked_host("http://172.31.255.254/x"));
+        assert!(is_blocked_host("http://192.168.1.1/x"));
+        // 172.32.x is outside the private /12 range — not blocked.
+        assert!(!is_blocked_host("http://172.32.0.1/x"));
+    }
+
+    /// The IP-level helper itself flags the cloud metadata address, an
+    /// IPv4-mapped IPv6 form of it, and IPv6 unique-local/link-local ranges —
+    /// independent of the URL-parsing layer above it.
+    #[test]
+    fn is_blocked_ip_flags_metadata_and_ipv6_ranges() {
+        assert!(is_blocked_ip("169.254.169.254".parse().unwrap()));
+        assert!(is_blocked_ip("::ffff:169.254.169.254".parse().unwrap()));
+        assert!(is_blocked_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("fc00::1".parse().unwrap()));
+        assert!(is_blocked_ip("fe80::1".parse().unwrap()));
+        assert!(!is_blocked_ip("8.8.8.8".parse().unwrap()));
+        assert!(!is_blocked_ip("2001:4860:4860::8888".parse().unwrap())); // public v6
     }
 
     #[test]

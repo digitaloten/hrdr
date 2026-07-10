@@ -119,8 +119,12 @@ impl Tool for PatchTool {
                 }
                 FileOp::Delete { path } => {
                     ctx.checkpoint(&path);
-                    tokio::fs::remove_file(&path).await.ok();
-                    summary.push(format!("deleted {}", rel(&path, ctx)));
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => summary.push(format!("deleted {}", rel(&path, ctx))),
+                        Err(e) => {
+                            summary.push(format!("FAILED to delete {}: {e}", rel(&path, ctx)))
+                        }
+                    }
                 }
             }
         }
@@ -360,5 +364,32 @@ diff --git a/bar.txt b/bar.txt
         // Neither file changed.
         assert_eq!(tokio::fs::read_to_string(&a).await.unwrap(), "one\n");
         assert_eq!(tokio::fs::read_to_string(&b).await.unwrap(), "keep\n");
+    }
+
+    /// A deletion that fails at the filesystem level (here: the "file" is
+    /// actually a directory, so `remove_file` errors) must be reported as a
+    /// failure, not silently claimed as "deleted".
+    #[tokio::test]
+    async fn a_failed_deletion_is_reported_not_claimed_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("adir");
+        tokio::fs::create_dir(&sub).await.unwrap();
+
+        let mut ctx = ToolContext::new(dir.path());
+        ctx.restrict_to_cwd = false;
+        ctx.mark_read(&sub);
+
+        let patch = "\
+--- a/adir
++++ /dev/null
+@@ -1 +0,0 @@
+-x
+";
+        let out = PatchTool
+            .execute(json!({ "patch": patch }), &ctx)
+            .await
+            .expect("plan succeeds; the failure is reported in the summary");
+        assert!(out.contains("FAILED to delete"), "{out}");
+        assert!(sub.exists(), "the directory must still be there");
     }
 }

@@ -39,6 +39,13 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         "model" => {
             if arg.is_empty() {
                 host.info(format!("model: {}", host.model()));
+            } else if host.is_busy() {
+                // `switch_model` updates the displayed model immediately but
+                // the actual `agent.set_model` waits on the turn's mutex —
+                // switching mid-turn would show the new model before it
+                // actually takes effect. Reject it instead, consistent with
+                // `/cwd` and the other mutating commands above.
+                host.info(busy_generic());
             } else {
                 switch_model(host, arg.clone());
                 host.info(format!("model → {arg}"));
@@ -309,6 +316,25 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 return true;
             }
             let path = crate::resolve_under(&host.cwd(), &arg);
+            // `expand_mentions` (`@file`) caps attached content at
+            // `MAX_ATTACH_BYTES` and truncates; `/add` names one file
+            // explicitly, so silently truncating it would be more confusing
+            // than useful — reject it with a clear error instead.
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.len() as usize > crate::MAX_ATTACH_BYTES => {
+                    host.info(format!(
+                        "{arg} is {} KiB, over the {} KiB /add limit — too large to attach",
+                        meta.len() / 1024,
+                        crate::MAX_ATTACH_BYTES / 1024,
+                    ));
+                    return true;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    host.info(format!("can't read {arg}: {e}"));
+                    return true;
+                }
+            }
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     let n = content.lines().count();
@@ -697,3 +723,189 @@ Do this:
 
 Prefer real commands, paths, and specifics over generic advice. Keep it tight. \
 When finished, give a one-line summary of what you wrote.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Session;
+    use crate::commands::types::LineKind;
+    use hrdr_agent::{Agent, AgentConfig};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// Minimal `CommandHost` mock. Only the handful of methods the commands
+    /// under test actually touch are meaningfully implemented; everything
+    /// else is a harmless stub — proving (by never being hit) that these
+    /// tests don't accidentally exercise more than they mean to.
+    struct TestHost {
+        cwd: std::path::PathBuf,
+        agent: Arc<Mutex<Agent>>,
+        info_log: Vec<String>,
+        busy: bool,
+        model: String,
+        input: String,
+    }
+
+    impl TestHost {
+        fn new(cwd: std::path::PathBuf) -> Self {
+            let agent = Agent::new(AgentConfig {
+                cwd: cwd.clone(),
+                model: "test-model".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            Self {
+                cwd,
+                agent: Arc::new(Mutex::new(agent)),
+                info_log: Vec::new(),
+                busy: false,
+                model: "test-model".to_string(),
+                input: String::new(),
+            }
+        }
+    }
+
+    impl CommandHost for TestHost {
+        fn info(&mut self, line: String) {
+            self.info_log.push(line);
+        }
+        fn agent(&self) -> Arc<Mutex<Agent>> {
+            self.agent.clone()
+        }
+        fn cwd(&self) -> std::path::PathBuf {
+            self.cwd.clone()
+        }
+        fn base_url(&self) -> String {
+            "http://test.invalid".to_string()
+        }
+        fn model(&self) -> String {
+            self.model.clone()
+        }
+        fn set_model(&mut self, model: String) {
+            self.model = model;
+        }
+        fn show_thinking(&self) -> bool {
+            false
+        }
+        fn set_show_thinking(&mut self, _on: bool) {}
+        fn clear_conversation(&mut self) {}
+        fn session_id(&self) -> Option<String> {
+            None
+        }
+        fn set_session_label(&mut self, _name: String) {}
+        fn autosave(&mut self) {}
+        fn resume(&mut self, _id: String, _session: Session) {}
+        fn copy_to_clipboard(&mut self, _text: &str, _label: &str) -> String {
+            String::new()
+        }
+        fn last_reply(&self) -> Option<String> {
+            None
+        }
+        fn transcript_text(&self) -> String {
+            String::new()
+        }
+        fn nth_message_text(&self, _n: usize) -> Option<String> {
+            None
+        }
+        fn line_poster(&self) -> Box<dyn Fn(LineKind, String) + Send> {
+            Box::new(|_, _| {})
+        }
+        fn is_busy(&self) -> bool {
+            self.busy
+        }
+        fn send_prompt(&mut self, _prompt: String, _show_as_user: bool) {}
+        fn set_input(&mut self, text: String) {
+            self.input = text;
+        }
+        fn prepend_input(&mut self, text: String) {
+            self.input = format!("{text}{}", self.input);
+        }
+        fn insert_input(&mut self, text: String) {
+            self.input.push_str(&text);
+        }
+        fn set_tool_expansion(&mut self, _mode: ExpandMode) -> String {
+            String::new()
+        }
+        fn rewind_last_turn(&mut self) -> Option<String> {
+            None
+        }
+        fn start_compaction(&mut self, _instructions: Option<String>) {}
+    }
+
+    /// `/add` applies the same attach-size cap as `@file` mentions
+    /// (`MAX_ATTACH_BYTES`), but errors clearly instead of silently
+    /// truncating — the user named this one file explicitly.
+    #[tokio::test]
+    async fn add_rejects_a_file_over_the_attach_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("huge.txt"),
+            "x".repeat(crate::MAX_ATTACH_BYTES + 1),
+        )
+        .unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+
+        assert!(dispatch(&mut host, "/add huge.txt"));
+        assert!(
+            host.info_log.iter().any(|l| l.contains("too large")),
+            "{:?}",
+            host.info_log
+        );
+        assert!(
+            host.input.is_empty(),
+            "the oversized file must not be attached"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_attaches_a_file_within_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.txt"), "hello from small").unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+
+        assert!(dispatch(&mut host, "/add small.txt"));
+        assert!(host.input.contains("hello from small"), "{:?}", host.input);
+    }
+
+    /// `/model` must not switch mid-turn: `switch_model` updates the
+    /// displayed model immediately, but the real `agent.set_model` waits on
+    /// the turn's mutex — switching while busy would show the new model
+    /// before it actually takes effect. Rejected instead, consistent with
+    /// `/cwd`.
+    #[tokio::test]
+    async fn model_switch_is_rejected_while_a_turn_is_running() {
+        let mut host = TestHost::new(std::env::temp_dir());
+        host.busy = true;
+
+        assert!(dispatch(&mut host, "/model other-model"));
+        assert_eq!(
+            host.model, "test-model",
+            "the displayed model must not change mid-turn"
+        );
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.to_lowercase().contains("busy")),
+            "{:?}",
+            host.info_log
+        );
+    }
+
+    /// Idle, `/model` switches immediately (the displayed half is
+    /// synchronous; the real agent switch happens on a background task).
+    #[tokio::test]
+    async fn model_switch_applies_when_idle() {
+        let mut host = TestHost::new(std::env::temp_dir());
+
+        assert!(dispatch(&mut host, "/model other-model"));
+        assert_eq!(host.model, "other-model");
+        assert!(
+            !host
+                .info_log
+                .iter()
+                .any(|l| l.to_lowercase().contains("busy")),
+            "{:?}",
+            host.info_log
+        );
+    }
+}

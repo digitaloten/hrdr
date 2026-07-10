@@ -71,6 +71,15 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
             &mut cursor_insert,
         )?;
         if app.should_quit {
+            // Reap a turn cancelled on the quit path first: awaiting the aborted
+            // task drops its future and releases the agent lock, so the save
+            // below can't lose the race and skip. Then the final save — a
+            // backstop for the idle-quit paths too, with no "next autosave" to
+            // catch it since the app is exiting. `save_session`'s own
+            // is-there-anything-to-save guard keeps this a no-op when there's
+            // nothing new, so it never double-writes.
+            app.reap_cancelled_turn().await;
+            app.autosave();
             break;
         }
 

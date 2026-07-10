@@ -365,18 +365,61 @@ pub(crate) fn guard_secret_read(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether a search-output line (`path:NN:…` or `path-NN-…`) names a secret
-/// file, so the grep backends can drop it before returning. `cwd` anchors a
-/// relative path token. Best-effort: only the `:`-delimited leading token is
-/// inspected (covers the common no-context `grep`/`rg` match line).
+/// Whether a search-output line (`path:NN:…`, a match, or `path-NN-…`, `-C`
+/// context) names a secret file, so the grep backends can drop it before
+/// returning. `cwd` anchors a relative path token.
+///
+/// Context lines matter as much as match lines here: with `context > 0`, a
+/// `.env` line adjacent to a match is emitted as `path-NN-SECRET=value` —
+/// the `-`-delimited form — and a filter that only recognised `path:NN:…`
+/// would let that content straight through even though the *match* line for
+/// the same file was dropped. [`line_path_token`] recognises either
+/// delimiter, so both shapes are caught.
 pub(crate) fn grep_line_is_secret(line: &str, cwd: &std::path::Path) -> bool {
-    let Some((tok, _)) = line.split_once(':') else {
-        return false; // `--` separators and colon-less context lines ride along
+    let Some(tok) = line_path_token(line) else {
+        return false; // `--` group separators and unrecognized lines ride along
     };
-    if tok.is_empty() || tok == "--" {
+    if tok.is_empty() {
         return false;
     }
     secret_file_reason(&canonicalize_nearest(&cwd.join(tok))).is_some()
+}
+
+/// Extract the leading path token from a ripgrep/POSIX-`grep` `-C`-style
+/// search-output line: `path:NN:content` (a match) or `path-NN-content`
+/// (context), where `NN` is the line number. Tries the `:` form first, then
+/// the `-` form, since a match line's path could itself contain `-`. Returns
+/// `None` for a `--` group separator or any line that doesn't fit either
+/// shape (so it's left alone rather than misparsed).
+fn line_path_token(line: &str) -> Option<&str> {
+    if line == "--" {
+        return None;
+    }
+    for sep in [':', '-'] {
+        if let Some(tok) = path_token_with_sep(line, sep) {
+            return Some(tok);
+        }
+    }
+    None
+}
+
+/// [`line_path_token`] for one candidate separator: scans for the first
+/// `sep<digits>sep` run and returns everything before it.
+fn path_token_with_sep(line: &str, sep: char) -> Option<&str> {
+    let mut i = 0;
+    while let Some(rel) = line[i..].find(sep) {
+        let pos = i + rel;
+        let after = pos + sep.len_utf8();
+        let digits_end = line[after..]
+            .find(|c: char| !c.is_ascii_digit())
+            .map(|d| after + d)
+            .unwrap_or(line.len());
+        if digits_end > after && line[digits_end..].starts_with(sep) {
+            return Some(&line[..pos]);
+        }
+        i = pos + sep.len_utf8();
+    }
+    None
 }
 
 /// A model-callable tool.
@@ -643,11 +686,57 @@ pub enum TruncateSide {
     Middle,
 }
 
-/// Directory holding full copies of truncated tool output. Under the system
-/// temp dir on purpose: it's already read-whitelisted for the cwd-confined
-/// `read`/`grep` tools, so the model can retrieve the overflow.
+/// Directory holding full copies of truncated tool output. Overflow files can
+/// contain anything a command touched — full shell output, grep hits across
+/// the tree — so this must not be a single world-readable path shared by
+/// every local user under the default umask.
+///
+/// Prefers `$XDG_RUNTIME_DIR` when set: on Linux that's already a per-user
+/// directory (typically `/run/user/<uid>`, mode `0700`) provisioned by the
+/// login session, so nesting under it inherits that isolation for free.
+/// Otherwise falls back to a login-name-suffixed subdirectory of the system
+/// temp dir, created with `0700` permissions on unix (belt-and-suspenders:
+/// even if two users' names somehow collided, the directory the first one
+/// created is unreadable to the second by mode alone).
+///
+/// Still under a well-known temp root on purpose: it's within the
+/// cwd-confinement escape hatch `read`/`grep` already grant for scratch
+/// space, so the model can retrieve the overflow.
 pub fn tool_output_dir() -> PathBuf {
-    std::env::temp_dir().join("hrdr-tool-output")
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        Some(runtime) => PathBuf::from(runtime).join("hrdr-tool-output"),
+        None => std::env::temp_dir().join(format!("hrdr-tool-output-{}", user_scope())),
+    };
+    ensure_private_dir(&dir);
+    dir
+}
+
+/// A best-effort per-user scope string for the temp-dir fallback path: the
+/// login name, so two local users sharing a temp dir land on different
+/// directories instead of fighting over (or being blocked by) one owned by
+/// whoever created it first.
+fn user_scope() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "shared".to_string())
+}
+
+/// Create `dir` if needed and, on unix, restrict it to the owner (`0700`) —
+/// re-applied on every call (cheap: one syscall) so a directory left behind
+/// with looser permissions by an older version is tightened rather than
+/// trusted.
+#[cfg(unix)]
+fn ensure_private_dir(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::create_dir_all(dir).is_ok() {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// Non-unix: no portable permission-bits equivalent, so just ensure it exists.
+#[cfg(not(unix))]
+fn ensure_private_dir(dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(dir);
 }
 
 /// Truncate `text` to `max_bytes` **and** `max_lines` (whichever is hit first,
@@ -896,6 +985,46 @@ mod tests {
         assert!(secret_file_reason(Path::new("/srv/app/.env.example")).is_none());
         assert!(secret_file_reason(Path::new("/srv/app/.env.sample")).is_none());
         assert!(secret_file_reason(Path::new("/srv/app/.env.template")).is_none());
+    }
+
+    // ---- tool_output_dir private permissions ----
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_sets_0700_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("scoped-output");
+        ensure_private_dir(&target);
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "overflow dir must not be group/world accessible"
+        );
+        // Idempotent: calling again on an already-existing dir still holds.
+        ensure_private_dir(&target);
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    // ---- grep secret-line filter ----
+
+    #[test]
+    fn grep_line_is_secret_catches_match_and_context_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "KEY=xyz\n").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        // The `:`-delimited match-line form.
+        assert!(grep_line_is_secret(".env:1:KEY=xyz", dir.path()));
+        // The `-`-delimited `-C` context-line form — the leak this guards.
+        assert!(grep_line_is_secret(".env-1-KEY=xyz", dir.path()));
+        // A non-secret file's lines pass through either way.
+        assert!(!grep_line_is_secret("main.rs:1:fn main() {}", dir.path()));
+        assert!(!grep_line_is_secret("main.rs-1-fn main() {}", dir.path()));
+        // The `-C` group separator between disjoint windows isn't mistaken for
+        // a path.
+        assert!(!grep_line_is_secret("--", dir.path()));
     }
 
     // ---- concurrency defaults ----
