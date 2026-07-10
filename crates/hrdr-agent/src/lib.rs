@@ -1967,14 +1967,27 @@ impl Worktree {
         }
         // Best-effort prune of any stale worktrees from previously aborted runs.
         prune_stale_worktrees(repo).await;
+        // A unique name per worktree: the timestamp alone collides when two are
+        // created within the clock's resolution (macOS `SystemTime` is only
+        // ~microsecond-grained), so a same-instant pair — parallel `task` calls,
+        // or parallel tests — both tried `git worktree add hrdr/task-<same>` and
+        // one failed. The process id plus a monotonic counter make it
+        // collision-free within and across processes.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let branch = format!("hrdr/task-{stamp}");
+        let uniq = format!(
+            "{stamp}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let branch = format!("hrdr/task-{uniq}");
         let path = std::env::temp_dir()
             .join("hrdr-worktrees")
-            .join(format!("wt-{stamp}"));
+            .join(format!("wt-{uniq}"));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
