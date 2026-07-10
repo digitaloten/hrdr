@@ -26,17 +26,35 @@ pub fn load_auth_tokens() -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-/// The stored API key for `provider`, if any.
-pub fn auth_token(provider: &str) -> Option<String> {
-    load_auth_tokens().remove(provider)
+/// The credential-store key for `provider`. OpenCode's endpoints — `zen`, `go`,
+/// and their `opencode*` aliases — all authenticate against the same OpenCode
+/// account (the same `OPENCODE_API_KEY`), so they share one stored entry
+/// (`opencode`): logging in to any of them covers them all. Every other provider
+/// keys on its own name.
+pub fn auth_key(provider: &str) -> &str {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "zen" | "go" | "opencode" | "opencode-zen" | "opencode-go" => "opencode",
+        _ => provider,
+    }
 }
 
-/// Store `provider = "token"` in the credential file (creating it, `0600` on
-/// unix), preserving any other entries. Returns the file path.
+/// The stored API key for `provider`, if any. Looks under the shared
+/// [`auth_key`] first, then (for pre-unification stores) the raw provider name.
+pub fn auth_token(provider: &str) -> Option<String> {
+    let tokens = load_auth_tokens();
+    tokens
+        .get(auth_key(provider))
+        .or_else(|| tokens.get(provider))
+        .cloned()
+}
+
+/// Store `provider`'s `token` in the credential file (creating it, `0600` on
+/// unix), preserving any other entries. Saved under the shared [`auth_key`], so
+/// the OpenCode endpoints write one entry between them. Returns the file path.
 pub fn save_auth_token(provider: &str, token: &str) -> Result<PathBuf> {
     let path =
         auth_file_path().ok_or_else(|| anyhow::anyhow!("no HOME to locate the auth file"))?;
-    save_token_at(&path, provider, token)?;
+    save_token_at(&path, auth_key(provider), token)?;
     Ok(path)
 }
 
@@ -162,6 +180,35 @@ mod tests {
         let tokens = load_tokens_at(&path);
         assert_eq!(tokens.get("zen").map(String::as_str), Some("sk-zen-3"));
         assert_eq!(tokens.get("openai").map(String::as_str), Some("sk-oai-2"));
+    }
+
+    #[test]
+    fn opencode_endpoints_share_one_credential_entry() {
+        // All the OpenCode aliases collapse to a single store key…
+        for name in [
+            "zen",
+            "go",
+            "opencode",
+            "opencode-zen",
+            "opencode-go",
+            "ZEN",
+        ] {
+            assert_eq!(auth_key(name), "opencode", "{name} → opencode");
+        }
+        // …while other providers keep their own name.
+        assert_eq!(auth_key("openai"), "openai");
+        assert_eq!(auth_key("mycustom"), "mycustom");
+
+        // A key saved while on `zen` resolves when the session is on `go`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        save_token_at(&path, auth_key("zen"), "sk-opencode").unwrap();
+        let tokens = load_tokens_at(&path);
+        assert_eq!(
+            tokens.get(auth_key("go")).map(String::as_str),
+            Some("sk-opencode"),
+            "go finds the credential saved under zen"
+        );
     }
 
     #[test]

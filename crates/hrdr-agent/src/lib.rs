@@ -10,7 +10,9 @@ mod prompt;
 
 pub use agents_dir::discover_agent_profiles;
 
-pub use auth::{auth_file_path, auth_token, load_auth_tokens, save_auth_token, write_atomic};
+pub use auth::{
+    auth_file_path, auth_key, auth_token, load_auth_tokens, save_auth_token, write_atomic,
+};
 mod paths;
 pub use paths::cwd_slug;
 mod models;
