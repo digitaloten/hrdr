@@ -201,6 +201,10 @@ pub enum ToolBody {
     /// `read`: the result's *tail* is the interesting part (the file content,
     /// not the preamble).
     Read,
+    /// Any other call (`task`, `todo`, an MCP tool): its arguments as
+    /// `key: value` rows below the tool's name, rather than raw JSON beside it.
+    /// Values are single-line; the caller decides how far to truncate them.
+    Details(Vec<(String, String)>),
     Text,
 }
 
@@ -269,8 +273,69 @@ pub fn tool_display(name: &str, args: &str) -> ToolDisplay {
             plain(s)
         }
         "ls" | "tree" => plain(arg_str(&v, "path").unwrap_or_else(|| ".".into())),
-        _ => plain(hrdr_tools::truncate_inline(args, crate::TOOL_ARGS_PREVIEW)),
+        "todo" => ToolDisplay {
+            headline: String::new(),
+            body: ToolBody::Details(todo_details(&v)),
+        },
+        // `task` and every MCP tool: their arguments, one per row.
+        _ => ToolDisplay {
+            headline: String::new(),
+            body: ToolBody::Details(arg_details(&v)),
+        },
     }
+}
+
+/// A JSON value as one display line: strings bare, everything else compact JSON.
+/// Newlines and tabs collapse to spaces so a row stays a row.
+fn detail_value(v: &serde_json::Value) -> String {
+    let raw = match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let flat: String = raw
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    flat.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A tool call's arguments as `(key, value)` rows, sorted by key — `serde_json`
+/// deserializes an object into a `BTreeMap` unless `preserve_order` is on, so
+/// the model's key order isn't available here. A non-object argument (rare, but
+/// a tool may take a bare string or array) becomes a single unlabelled row.
+fn arg_details(v: &serde_json::Value) -> Vec<(String, String)> {
+    match v {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, val)| (k.clone(), detail_value(val)))
+            .collect(),
+        serde_json::Value::Null => Vec::new(),
+        other => vec![(String::new(), detail_value(other))],
+    }
+}
+
+/// `todo`'s argument is a list of items; show each as its own checkbox row
+/// rather than one enormous `todos: [{…}]` line.
+fn todo_details(v: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(items) = v.get("todos").and_then(|t| t.as_array()) else {
+        return arg_details(v);
+    };
+    items
+        .iter()
+        .map(|t| {
+            let content = t
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let mark = match t.get("status").and_then(|s| s.as_str()) {
+                Some("completed") => "[x]",
+                Some("in_progress") => "[~]",
+                _ => "[ ]",
+            };
+            (mark.to_string(), content)
+        })
+        .collect()
 }
 
 /// Compact summary of `read` args: `path  (offset: N, limit: M)`.
@@ -704,13 +769,79 @@ mod tool_display_tests {
         assert_eq!(d.body, ToolBody::Text);
     }
 
-    /// Unknown tools (including MCP ones) fall back to a truncated args preview.
+    /// Every other tool — `task`, MCP calls — shows its arguments as `key: value`
+    /// rows below the name, never raw JSON beside it.
     #[test]
-    fn unknown_tool_falls_back_to_an_args_preview() {
-        let d = tool_display("mcp__x__y", r#"{"a":1}"#);
-        assert_eq!(d.headline, r#"{"a":1}"#);
-        assert_eq!(d.body, ToolBody::Text);
-        // Malformed args must not panic.
+    fn other_tools_show_their_args_as_detail_rows() {
+        let d = tool_display(
+            "task",
+            r#"{"agent":"explore","description":"Explore the crate","prompt":"You are\n  an agent"}"#,
+        );
+        assert_eq!(d.headline, "", "nothing beside the tool name");
+        assert_eq!(
+            d.body,
+            // Sorted by key: serde_json's Map is a BTreeMap here.
+            ToolBody::Details(vec![
+                ("agent".into(), "explore".into()),
+                ("description".into(), "Explore the crate".into()),
+                // Newlines and runs of spaces collapse: a row stays one row.
+                ("prompt".into(), "You are an agent".into()),
+            ])
+        );
+
+        // Non-string values render as compact JSON, not as Rust debug output.
+        let d = tool_display("mcp__x__y", r#"{"a":1,"b":true,"c":[1,2],"d":null}"#);
+        assert_eq!(
+            d.body,
+            ToolBody::Details(vec![
+                ("a".into(), "1".into()),
+                ("b".into(), "true".into()),
+                ("c".into(), "[1,2]".into()),
+                ("d".into(), "null".into()),
+            ])
+        );
+
+        // No args at all: no rows, and nothing beside the name.
+        let d = tool_display("mcp__x__y", "{}");
+        assert_eq!(d.body, ToolBody::Details(vec![]));
+
+        // A bare (non-object) argument becomes one unlabelled row.
+        let d = tool_display("mcp__x__y", r#""just a string""#);
+        assert_eq!(
+            d.body,
+            ToolBody::Details(vec![(String::new(), "just a string".into())])
+        );
+
+        // Malformed args must not panic: they parse as null, so no rows.
+        assert_eq!(
+            tool_display("mcp__x__y", "not json").body,
+            ToolBody::Details(vec![])
+        );
         assert_eq!(tool_display("write", "not json").headline, "?");
+    }
+
+    /// `todo` lists its items as checkbox rows rather than one giant JSON blob.
+    #[test]
+    fn todo_shows_one_checkbox_row_per_item() {
+        let d = tool_display(
+            "todo",
+            r#"{"todos":[{"content":"first","status":"completed"},
+                        {"content":"second","status":"in_progress"},
+                        {"content":"third","status":"pending"}]}"#,
+        );
+        assert_eq!(d.headline, "");
+        assert_eq!(
+            d.body,
+            ToolBody::Details(vec![
+                ("[x]".into(), "first".into()),
+                ("[~]".into(), "second".into()),
+                ("[ ]".into(), "third".into()),
+            ])
+        );
+        // Without a `todos` array it degrades to the generic arg rows.
+        assert_eq!(
+            tool_display("todo", r#"{"x":"y"}"#).body,
+            ToolBody::Details(vec![("x".into(), "y".into())])
+        );
     }
 }

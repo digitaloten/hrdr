@@ -820,6 +820,8 @@ const HEADER_GAP: usize = 4;
 /// Width of the details column's key field; values start after it, so they all
 /// line up regardless of key length.
 const DETAIL_KEY_W: usize = 9;
+/// Width a tool-call detail value is clipped to while its block is collapsed.
+const DETAIL_VALUE_W: usize = 100;
 
 /// The cursor path the splash animation traces through `art`: every glyph cell,
 /// column by column, so the highlight sweeps left-to-right across the letters.
@@ -1658,6 +1660,34 @@ fn tool_lines(
         }
     }
 
+    // Everything else with structured args (`task`, `todo`, MCP tools): one
+    // `key  value` row per argument, below the name — never raw JSON beside it.
+    // Keys are padded to a common width so the values line up.
+    if let hrdr_app::ToolBody::Details(rows) = &disp.body {
+        let key_w = rows.iter().map(|(k, _)| k.width()).max().unwrap_or(0);
+        for (key, value) in rows {
+            let mut spans = Vec::new();
+            if !key.is_empty() {
+                spans.push(Span::styled(
+                    format!("{key}{}  ", " ".repeat(key_w - key.width())),
+                    dim_bg,
+                ));
+            }
+            // A long value (a `task` prompt) is clipped until the block is
+            // expanded, when it wraps in full like any other block content.
+            let text = if expanded {
+                value.clone()
+            } else {
+                hrdr_tools::truncate_inline(value, DETAIL_VALUE_W)
+            };
+            spans.push(Span::styled(
+                text,
+                Style::default().fg(theme.assistant).bg(bg),
+            ));
+            out.push(Line::from(spans));
+        }
+    }
+
     if result.is_empty() {
         return out;
     }
@@ -2369,6 +2399,41 @@ mod block_tests {
         assert_eq!(rows[1], "fn main() {");
         assert_eq!(rows[2], "    let x = 1;", "4 spaces, not 5 or 6");
         assert_eq!(rows[3], "}");
+    }
+
+    /// `task` (and any MCP tool) renders its args as aligned `key  value` rows
+    /// under the tool's name — the header carries no JSON.
+    ///
+    /// Regression: the header line was `✓ task {"agent": "explore", …}`.
+    #[test]
+    fn a_task_call_shows_aligned_detail_rows_under_its_name() {
+        let t = Theme::default();
+        let args = r#"{"agent":"explore","description":"Explore hrdr-editor","prompt":"line one\nline two"}"#;
+        let rows: Vec<String> = tool_lines(&t, "task", args, "", true, true, false)
+            .iter()
+            .map(text)
+            .collect();
+
+        assert_eq!(rows[0], "✓ task", "no args on the header line");
+        // Keys padded to the widest ("description"), values aligned after it.
+        assert_eq!(rows[1], "agent        explore");
+        assert_eq!(rows[2], "description  Explore hrdr-editor");
+        assert_eq!(rows[3], "prompt       line one line two", "one row per arg");
+        assert_eq!(rows.len(), 4);
+    }
+
+    /// A long detail value is clipped while collapsed and shown whole when the
+    /// block is expanded.
+    #[test]
+    fn a_long_detail_value_is_clipped_until_expanded() {
+        let t = Theme::default();
+        let prompt = "x".repeat(DETAIL_VALUE_W + 50);
+        let args = format!(r#"{{"prompt":"{prompt}"}}"#);
+        let row = |expanded| text(&tool_lines(&t, "task", &args, "", true, true, expanded)[1]);
+
+        let collapsed = row(false);
+        assert!(collapsed.len() < prompt.len(), "clipped: {collapsed}");
+        assert!(row(true).contains(&prompt), "expanded shows it whole");
     }
 
     /// A failed `write` still surfaces the error the tool returned.

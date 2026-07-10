@@ -440,9 +440,21 @@ async fn parallel_tool_calls_in_one_turn_all_run() {
     ])
     .await;
     h.submit("do two things").await;
+    // Both calls landed in the transcript. (Asserted there, not on the screen:
+    // the tool blocks scroll off the top of a 30-row terminal.)
+    let tools: Vec<String> = h
+        .app
+        .state
+        .transcript
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntryKind::Tool { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tools, ["todo", "glob"], "both tools ran, in order");
+
     let screen = h.render();
-    assert!(screen.contains("todo"), "first tool missing:\n{screen}");
-    assert!(screen.contains("glob"), "second tool missing:\n{screen}");
     assert!(
         screen.contains("Both ran."),
         "final reply missing:\n{screen}"
