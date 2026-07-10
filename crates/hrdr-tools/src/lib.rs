@@ -29,8 +29,8 @@ pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use patch::PatchTool;
 pub use tools::{
-    BashTool, EditTool, FindTool, GrepTool, LsTool, PowerShellTool, ReadTool, TodoTool, TreeTool,
-    WriteTool, available_shell_tools,
+    BashTool, CopyTool, DeleteTool, EditTool, FindTool, GitTool, GrepTool, LsTool, MoveTool,
+    PowerShellTool, ReadTool, ReplaceTool, TodoTool, TreeTool, WriteTool, available_shell_tools,
 };
 pub use web::{WebFetchTool, WebSearchTool};
 
@@ -194,6 +194,13 @@ impl ToolContext {
     /// resolve too) — `../` tricks don't slip through.
     pub fn ensure_within_cwd(&self, path: &std::path::Path) -> Result<()> {
         self.ensure_writable_ext(path)?;
+        self.ensure_inside_cwd(path)
+    }
+
+    /// Confinement only, without the [`write_allow_ext`](Self::write_allow_ext)
+    /// gate: for paths that are read or searched rather than written (a search
+    /// root has no extension to allow).
+    pub fn ensure_inside_cwd(&self, path: &std::path::Path) -> Result<()> {
         if !self.restrict_to_cwd {
             return Ok(());
         }
@@ -427,6 +434,11 @@ impl ToolRegistry {
         r.register(Arc::new(WriteTool));
         r.register(Arc::new(EditTool));
         r.register(Arc::new(patch::PatchTool));
+        r.register(Arc::new(MoveTool));
+        r.register(Arc::new(DeleteTool));
+        r.register(Arc::new(CopyTool));
+        r.register(Arc::new(ReplaceTool));
+        r.register(Arc::new(GitTool));
         // Shell tools are presence-gated so the model is only offered a shell it
         // can actually use (bash on unix; PowerShell where installed, incl. Linux).
         for shell in available_shell_tools() {

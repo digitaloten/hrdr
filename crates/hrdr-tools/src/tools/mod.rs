@@ -1,11 +1,14 @@
 //! The built-in tool set (read, write, edit, patch, shell, grep, find, ls, todo, fetch, search).
 
 pub(crate) mod edit;
+pub(crate) mod fileops;
 pub(crate) mod find;
+pub(crate) mod git;
 pub(crate) mod grep;
 pub(crate) mod ls;
 mod mutation;
 pub(crate) mod read;
+pub(crate) mod replace;
 pub(crate) mod shell;
 pub(crate) mod todo;
 pub(crate) mod tree;
@@ -20,10 +23,13 @@ pub(crate) const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 pub(crate) const BASH_LINE_CAP: usize = 8_192;
 
 pub use edit::EditTool;
+pub use fileops::{CopyTool, DeleteTool, MoveTool};
 pub use find::FindTool;
+pub use git::GitTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use read::ReadTool;
+pub use replace::ReplaceTool;
 pub use shell::{BashTool, PowerShellTool, available_shell_tools};
 pub use todo::TodoTool;
 pub use tree::TreeTool;

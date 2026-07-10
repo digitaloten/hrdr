@@ -51,14 +51,18 @@ sudo rpm -i hrdr-*.rpm
   The server owns chat-template application; hrdr only ever sends structured
   `messages[]` + `tools[]`.
 - **Efficient, adaptive tool set.** `read`, `write`, `edit`, `patch` (multi-file
-  unified-diff), `find`, `ls`, `grep`, `todo`, `fetch`, `search`, a shell, and
-  any MCP-server tools. Token-bounded outputs and line-numbered reads for
-  precise edits — and when `bash`/`grep` output overflows, the **full** result
-  is saved to a temp file and the model is pointed at it (`read`/`grep`) instead
-  of losing the overflow. Tools that shell out are **presence-aware**: the shell
-  tool is `bash` and/or `powershell` depending on what's installed, and `grep`
-  uses ripgrep → POSIX grep → a built-in walker — so the model is only ever
-  offered tools it can actually run.
+  unified-diff), `replace` (project-wide substitution with a diff and a
+  `dry_run`), `move`, `copy`, `delete`, `find`, `ls`, `tree`, `grep`, `git`
+  (read-only: status/diff/log/show/blame/…), `todo`, `fetch`, `search`, a shell,
+  and any MCP-server tools. The file-mutating tools are **checkpointed** (so
+  `/undo` reverts them) and **confined** to the project — unlike the same edit
+  made through the shell, which is neither. Token-bounded outputs and
+  line-numbered reads for precise edits — and when `bash`/`grep` output
+  overflows, the **full** result is saved to a temp file and the model is
+  pointed at it (`read`/`grep`) instead of losing the overflow. Tools that shell
+  out are **presence-aware**: the shell tool is `bash` and/or `powershell`
+  depending on what's installed, and `grep` uses ripgrep → POSIX grep → a
+  built-in walker — so the model is only ever offered tools it can actually run.
 - **Pluggable input discipline.** Default is a plain, claude-style input (always
   typing; `Enter` sends, `Shift+Enter` / `\`+`Enter` insert a newline, `Ctrl+G`
   opens `$EDITOR`, readline-ish `Ctrl+A`/`Ctrl+E`/`Ctrl+W`). `--vim` swaps in a

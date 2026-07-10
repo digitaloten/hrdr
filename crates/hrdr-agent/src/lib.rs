@@ -2211,7 +2211,14 @@ impl Agent {
             tools.retain_only(allow);
         } else if config.write_ext.is_some() {
             let mut allow = tools.read_only_names();
-            allow.extend(["write", "edit", "patch"].map(String::from));
+            // The mutating tools, all of which gate on `ensure_within_cwd` and so
+            // inherit the extension allow-list. No shell: that would bypass both.
+            allow.extend(
+                [
+                    "write", "edit", "patch", "move", "delete", "copy", "replace",
+                ]
+                .map(String::from),
+            );
             tools.retain_only(&allow);
         } else if config.read_only {
             let ro = tools.read_only_names();
@@ -3918,22 +3925,30 @@ mod tests {
 
         // Read-only: no writer, no shell, no delegation. `fetch`/`search` are in
         // the set — read-only means "does not mutate the working tree", not
-        // "no network".
-        let readers = ["fetch", "find", "grep", "ls", "read", "search", "tree"];
+        // "no network". `git` is here too: its subcommands are an allow-list of
+        // read-only ones.
+        let readers = [
+            "fetch", "find", "git", "grep", "ls", "read", "search", "tree",
+        ];
         assert_eq!(tools("explore"), readers);
         assert_eq!(tools("review"), readers);
 
-        // `plan` adds the three writers — still no shell. Each of them gates on
+        // `plan` adds the mutating tools — still no shell. Each gates on
         // `ensure_within_cwd`, which enforces `write_ext`, so its writes are
-        // confined to markdown (patch validates before it writes anything).
+        // confined to markdown (patch validates before it writes anything, and
+        // move/delete guard both the source and the destination).
         let mut planner = readers.to_vec();
-        planner.extend(["edit", "patch", "write"]);
+        planner.extend([
+            "copy", "delete", "edit", "move", "patch", "replace", "write",
+        ]);
         planner.sort();
         assert_eq!(tools("plan"), planner);
 
         // A general sub-agent has the full set, shell included…
         let general = tools("general");
-        for t in ["bash", "edit", "write", "read", "grep", "todo"] {
+        for t in [
+            "bash", "edit", "write", "read", "grep", "todo", "move", "delete", "copy",
+        ] {
             assert!(general.contains(&t.to_string()), "general should have {t}");
         }
         // …but still cannot delegate further: sub-agents don't nest.
