@@ -2436,6 +2436,78 @@ async fn the_input_pane_matches_the_user_prompt_block() {
     assert!(!screen.contains("11 ch"), "no draft-size footer:\n{screen}");
 }
 
+/// Exactly one untinted row separates the scrollback from the input pane, even
+/// when a tinted block (a user prompt) runs right up to the bottom of it.
+///
+/// The blank belongs to the layout, not to the block: `flush` no longer trails a
+/// separator after the last block, so two tinted surfaces can't merge into one
+/// slab and an untinted one can't leave a two-row hole.
+#[tokio::test]
+async fn one_blank_row_separates_the_scrollback_from_the_input() {
+    for last_is_tinted in [true, false] {
+        let mut h = Harness::new(vec![]).await;
+        // Overflow the transcript so its final block reaches the input pane.
+        for i in 0..40 {
+            h.app.push_entry(Entry::system(format!("filler {i}")));
+        }
+        if last_is_tinted {
+            h.app.push_entry(Entry::user("prompt"));
+        } else {
+            h.app.push_entry(Entry::assistant("output"));
+        }
+        h.type_str("draft");
+
+        let mut term = Terminal::new(TestBackend::new(50, 20)).unwrap();
+        term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+        let buf = term.backend().buffer();
+        let screen = buffer_to_string(buf);
+        let row = |y: u16| -> String {
+            (0..50)
+                .filter_map(|x| {
+                    buf.cell(Position::new(x, y))
+                        .map(|c| c.symbol().to_string())
+                })
+                .collect()
+        };
+        // Column 2 is inside every block's padding, past the `┃` bar at column 0.
+        let bg_at = |y: u16| buf.cell(Position::new(2, y)).unwrap().bg;
+
+        let draft_y = (0..20)
+            .find(|&y| row(y).contains("draft"))
+            .expect("the draft renders");
+        // The pane's own top pad is tinted; above it must sit exactly one blank,
+        // untinted row, and above that the transcript's last row.
+        let gap_y = draft_y - 2;
+        assert_eq!(
+            bg_at(draft_y - 1),
+            h.app.theme.user_bg,
+            "the input's top pad ({last_is_tinted}):\n{screen}"
+        );
+        assert_eq!(
+            row(gap_y).trim(),
+            "",
+            "the gap row is blank ({last_is_tinted}):\n{screen}"
+        );
+        assert_eq!(
+            bg_at(gap_y),
+            Color::Reset,
+            "the gap row is untinted ({last_is_tinted}):\n{screen}"
+        );
+        // And it is the *only* one: the transcript's last row is the block's own
+        // bottom pad, tinted when the block is.
+        let want = if last_is_tinted {
+            h.app.theme.user_bg
+        } else {
+            Color::Reset
+        };
+        assert_eq!(
+            bg_at(gap_y - 1),
+            want,
+            "the transcript's last row is the block's bottom pad ({last_is_tinted}):\n{screen}"
+        );
+    }
+}
+
 /// The "follow output" button floats two rows above the input pane, with an
 /// arrow at each end, and clicking it returns to following the newest output.
 #[tokio::test]

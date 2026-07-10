@@ -372,6 +372,11 @@ mod tests {
 
         let c = ToolContext::new(dir.path().to_path_buf());
 
+        // The first line is the root's absolute path, and tempdir names are
+        // random: one ending in `b` would satisfy `contains("b/")` on its own.
+        // Assert against the tree body instead.
+        let body = |out: &str| out.split_once('\n').map(|(_, b)| b.to_string()).unwrap();
+
         // depth 1: only shows a/
         let out1 = TreeTool
             .execute(
@@ -380,6 +385,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let out1 = body(&out1);
         assert!(out1.contains("a/"), "depth 1: {out1}");
         assert!(!out1.contains("b/"), "depth 1 must not show b/: {out1}");
         assert!(
@@ -395,6 +401,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let out3 = body(&out3);
         assert!(out3.contains("c/"), "depth 3: {out3}");
         assert!(!out3.contains("d/"), "depth 3 must not show d/: {out3}");
     }

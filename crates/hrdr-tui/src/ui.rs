@@ -51,9 +51,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         (todos.len() as u16).min(TODO_PANEL_MAX_ITEMS) + 2
     };
 
-    // The inference loader sits just above the input while a turn runs.
-    // One row for the loader itself, one blank row below it.
-    let loader_height: u16 = if app.running { 2 } else { 0 };
+    // The inference loader sits just above the input while a turn runs. One row:
+    // the blank below it is the input pane's own gap row.
+    let loader_height: u16 = if app.running { 1 } else { 0 };
 
     // Input pane auto-grows 1..=INPUT_MAX_ROWS text rows with the content.
     // Inner width = full width minus the horizontal padding on both sides; the
@@ -87,6 +87,10 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         constraints.push(Constraint::Length(loader_height));
         constraints.len() - 1
     });
+    // A blank row between the scrollback (or whatever panel is above) and the
+    // tinted input pane, so the two never butt up against each other. It is the
+    // only separator: transcript blocks no longer trail one of their own.
+    constraints.push(Constraint::Length(1));
     constraints.push(Constraint::Length(input_height));
     let input_idx = constraints.len() - 1;
     // Status bar: hidden (0 rows), one row (truncate), or wrapped (≤4 rows). It
@@ -123,15 +127,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         draw_todos(f, app, chunks[i], &todos);
     }
     if let Some(i) = loader_idx {
-        // Only the first row; the second is the blank line below it.
-        draw_loader(
-            f,
-            app,
-            Rect {
-                height: 1,
-                ..chunks[i]
-            },
-        );
+        draw_loader(f, app, chunks[i]);
     }
     draw_input(f, app, chunks[input_idx]);
     if let Some(i) = statusbar_idx {
@@ -1305,9 +1301,8 @@ impl PendingBlock {
 /// * **untinted → untinted** — both pads are plain blank rows, and two of them
 ///   is one too many between the model's thought and its output. One is dropped.
 /// * **mixed** — the two pads already read as a single gap. Left alone.
-/// * **tinted → nothing** — the last block in the scrollback gets the same blank
-///   row it would get before another tinted block, so it doesn't butt up against
-///   whatever sits below the transcript.
+/// * **anything → nothing** — the last block gets no separator of its own; the
+///   layout keeps a blank row between the transcript and the input pane below.
 fn flush(
     out: &mut Vec<Line<'static>>,
     msg_starts: &mut Vec<usize>,
@@ -1333,7 +1328,7 @@ fn flush(
         tool_regions.push((start, out.len(), i));
     }
     match (bg == Color::Reset, next_bg.map(|n| n == Color::Reset)) {
-        (false, Some(false) | None) => out.push(Line::raw("")),
+        (false, Some(false)) => out.push(Line::raw("")),
         // Drop this block's bottom pad; the next block's top pad is the gap.
         (true, Some(true)) => {
             out.pop();
@@ -2317,8 +2312,9 @@ mod block_tests {
         assert_eq!(gap(tinted, Some(plain)), 2, "tinted → untinted");
         assert_eq!(gap(plain, Some(tinted)), 2, "untinted → tinted");
 
-        // Nothing follows: a tinted block still gets its blank row (so it doesn't
-        // butt up against the input pane); an untinted one just keeps its pad.
+        // Nothing follows: neither kind trails a separator of its own. The blank
+        // row between the transcript and the input pane is the layout's, not the
+        // last block's — so a tinted block ends flush with its own bottom pad.
         let trailing = |kind: BlockKind| -> usize {
             let mut out = Vec::new();
             let (mut starts, mut regions) = (Vec::new(), Vec::new());
@@ -2339,7 +2335,7 @@ mod block_tests {
             );
             out.len() - 2 // minus the content row and the top pad
         };
-        assert_eq!(trailing(tinted), 2, "bottom pad + a blank row");
+        assert_eq!(trailing(tinted), 1, "bottom pad only");
         assert_eq!(trailing(plain), 1, "bottom pad only");
     }
 
