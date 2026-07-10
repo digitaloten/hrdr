@@ -256,13 +256,30 @@ api_version = "2024-10-21"
 model = "<deployment>"
 ```
 
-`context_window` is optional: if you omit it, hrdr probes the endpoint and uses
-what it advertises (vLLM's `max_model_len`, llama.cpp's `/props` `n_ctx`, etc.)
-— at startup **and** again after a `/model` or `/provider` switch, so the
-compaction threshold always tracks the current model's real max. Set it
-explicitly to override detection — the OpenAI API doesn't expose context length,
-and some servers (including infr today) don't advertise it. It drives the status
-bar's "X of Y" and the auto-compaction threshold.
+`context_window` is optional: if you omit it, hrdr detects one — at startup
+**and** again after a `/model` or `/provider` switch, so the compaction
+threshold always tracks the current model's real max. Detection tries, in order:
+
+1. **What the endpoint advertises** — vLLM's `max_model_len`, LM Studio's
+   `max_context_length`, llama.cpp's `/props` `n_ctx`, and similar.
+2. **The [models.dev](https://models.dev) catalog**, keyed `provider/model`.
+   Most OpenAI-compatible APIs — OpenAI itself, opencode zen — publish nothing
+   on the wire, so without this the status bar has no "of Y" and auto-compaction
+   has no threshold. hrdr downloads `https://models.dev/api.json` (a public,
+   unauthenticated static file — the request carries no key, model name or
+   prompt), caches it at `$XDG_CACHE_HOME/hrdr/models.json`, and refetches only
+   when that copy is over a day old. A failed fetch reuses the stale cache.
+
+   When no provider is configured, the **smallest** window any provider lists
+   for that model id is used: compacting early is recoverable, overflowing the
+   model's real context isn't.
+
+   Three env vars control it: `HRDR_DISABLE_MODELS_FETCH` (never fetch; use the
+   cache if present), `HRDR_MODELS_PATH` (read this file instead, never fetch),
+   `HRDR_MODELS_URL` (fetch from your own mirror).
+
+Set `context_window` explicitly to override detection entirely. It drives the
+status bar's "X of Y" and the auto-compaction threshold.
 
 ### Context management
 

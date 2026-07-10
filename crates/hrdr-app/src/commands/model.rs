@@ -45,6 +45,8 @@ pub fn apply_provider(
     let key = key.or_else(|| hrdr_agent::resolve_api_key(name, &p, None));
     let agent = host.agent();
     let (url, model) = (p.base_url.clone(), p.model.clone());
+    // The catalog fallback in `probe_context_window` is keyed `provider/model`.
+    let provider = name.to_string();
     let headers: Vec<(String, String)> = p.headers.clone().into_iter().collect();
     let api_version = p.api_version.clone();
     // Probe the new endpoint for its advertised context window unless the
@@ -56,6 +58,7 @@ pub fn apply_provider(
         a.set_endpoint(url, key);
         a.set_headers(headers);
         a.set_api_version(api_version);
+        a.set_provider(Some(provider));
         if let Some(m) = model {
             a.set_model(m);
         }

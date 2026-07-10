@@ -1219,9 +1219,12 @@ dependencies = [
  "anyhow",
  "async-stream",
  "futures-util",
+ "hjkl-xdg",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -1864,6 +1864,10 @@ summary.";
 /// A running agent: model client + tools + conversation state.
 pub struct Agent {
     client: Client,
+    /// Configured provider name, when there is one. The models.dev catalog is
+    /// keyed `provider/model`, so the fallback probe needs it to disambiguate a
+    /// model several providers serve with different context windows.
+    provider: Option<String>,
     tools: ToolRegistry,
     ctx: ToolContext,
     messages: Vec<ChatMessage>,
@@ -2165,6 +2169,7 @@ impl Agent {
 
         Ok(Self {
             client,
+            provider: config.provider.clone(),
             prompt_cache: config.prompt_cache,
             tools,
             ctx,
@@ -2366,17 +2371,28 @@ impl Agent {
         self.client.model = model.into();
     }
 
+    /// Repoint the agent at a named provider (for the catalog lookup; the
+    /// endpoint itself is set by [`Self::set_endpoint`]).
+    pub fn set_provider(&mut self, provider: Option<String>) {
+        self.provider = provider;
+    }
+
     /// A clone of the model client (for out-of-band calls like `/models`).
     pub fn client(&self) -> Client {
         self.client.clone()
     }
 
-    /// Probe the current endpoint for the model's advertised context window (the
-    /// max context size the API reports — vLLM's `max_model_len`, llama.cpp's
-    /// `n_ctx`, etc.). `None` when the server advertises nothing. Used to honor
-    /// the API's real limit after a model/provider switch.
+    /// The model's context window: whatever the endpoint advertises (vLLM's
+    /// `max_model_len`, llama.cpp's `n_ctx`, …), else the models.dev catalog.
+    ///
+    /// Most OpenAI-compatible endpoints — opencode zen and OpenAI itself among
+    /// them — publish nothing, so without the catalog the status bar's gauge has
+    /// no "of Y" and auto-compaction has no threshold. `None` when neither knows.
     pub async fn probe_context_window(&self) -> Option<u32> {
-        self.client.context_window().await
+        if let Some(n) = self.client.context_window().await {
+            return Some(n);
+        }
+        hrdr_llm::catalog::context_window(self.provider.as_deref(), &self.client.model).await
     }
 
     /// Working directory the tools operate in.

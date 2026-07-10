@@ -5,6 +5,7 @@
 //! streaming with tool-call reassembly via [`Accumulator`].
 
 mod anthropic;
+pub mod catalog;
 mod client;
 pub mod sse;
 mod types;
