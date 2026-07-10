@@ -2907,6 +2907,67 @@ async fn the_follow_button_floats_above_the_input_and_is_clickable() {
     assert_eq!(h.app.scroll_offset, 0, "the click resumed following");
 }
 
+/// The loader tracks the *model*, not the turn: it hides while the model's tool
+/// calls run, because the model is idle then — and its clock stops with it, so a
+/// slow tool doesn't inflate the turn's reported inference time.
+#[tokio::test]
+async fn the_loader_stops_while_the_models_tools_run() {
+    use hrdr_agent::AgentEvent;
+
+    let mut h = Harness::new(vec![]).await;
+    h.app.running = true;
+    h.app.turn_started = Some(std::time::Instant::now());
+    h.app.resume_inference_for_test();
+    assert!(h.app.inferring, "the model works as the turn opens");
+
+    // A tool round opens: the model handed off and is now idle.
+    h.app.on_turn_msg(TurnMsg::Event(AgentEvent::ToolStart {
+        id: "a".into(),
+        name: "bash".into(),
+        args: "{}".into(),
+    }));
+    h.app.on_turn_msg(TurnMsg::Event(AgentEvent::ToolStart {
+        id: "b".into(),
+        name: "bash".into(),
+        args: "{}".into(),
+    }));
+    assert!(!h.app.inferring, "idle while its tools run");
+    let frozen = h.app.infer_elapsed();
+
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        !screen.contains("inferring") && !screen.contains("generating"),
+        "no loader while tools run:\n{screen}"
+    );
+    // The clock is frozen: the banked time doesn't advance across a pause.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert_eq!(h.app.infer_elapsed(), frozen, "the clock stopped");
+
+    // One of two tools returning is not enough — the model is still waiting.
+    let end = |id: &str| {
+        TurnMsg::Event(AgentEvent::ToolEnd {
+            id: id.into(),
+            name: "bash".into(),
+            result: "ok".into(),
+            ok: true,
+        })
+    };
+    h.app.on_turn_msg(end("a"));
+    assert!(!h.app.inferring, "one tool of two is still outstanding");
+
+    // The last one hands control back: the model works again, and the clock runs.
+    h.app.on_turn_msg(end("b"));
+    assert!(h.app.inferring, "the model resumed");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(h.app.infer_elapsed() > frozen, "the clock restarted");
+
+    // The turn ends: the model stops, whatever was in flight.
+    h.app.on_turn_msg(TurnMsg::Done(None));
+    assert!(!h.app.inferring, "the turn is over");
+}
+
 /// The loader heads the input area while a turn runs: above every panel, with a
 /// blank row on each side. Those blanks are the shared per-section spacer — the
 /// loader's own above it, the next section's below it.
@@ -2920,6 +2981,8 @@ async fn the_generating_line_heads_the_input_area_with_a_blank_row_each_side() {
         status: "in_progress".to_string(),
     }];
     h.app.running = true;
+    // The loader tracks the *model* working, not merely a turn being in flight.
+    h.app.inferring = true;
     h.app.turn_started = Some(std::time::Instant::now());
 
     let mut term = Terminal::new(TestBackend::new(56, 24)).unwrap();

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -220,6 +220,19 @@ pub(crate) struct App {
     // ---- live inference stats (for the loader above the input) ----
     /// When the current turn started (for elapsed time + spinner).
     pub(crate) turn_started: Option<Instant>,
+    /// Whether the *model* is working right now: streaming, or awaited before it
+    /// starts. `false` while its tool calls run — the model is idle then, so the
+    /// loader hides and its clock stops. Distinct from [`Self::running`], which
+    /// stays `true` for the whole turn.
+    pub(crate) inferring: bool,
+    /// Tool calls in flight this round. Inference resumes when it returns to 0:
+    /// a turn can issue several tools at once, and only the last one finishing
+    /// hands control back to the model.
+    tools_running: usize,
+    /// Inference time banked from earlier rounds of this turn.
+    infer_banked: Duration,
+    /// When the current inference stretch began; `None` while paused.
+    infer_started: Option<Instant>,
     /// Wall-clock start of the current turn (for the loader's "started …").
     pub(crate) turn_started_at: Option<chrono::DateTime<chrono::Local>>,
     /// When the first output token of the turn arrived (for tok/s).
@@ -355,6 +368,10 @@ impl App {
             todo_completed_at: HashMap::new(),
             todo_ttl,
             queue: VecDeque::new(),
+            inferring: false,
+            tools_running: 0,
+            infer_banked: Duration::ZERO,
+            infer_started: None,
             follow_button: None,
             tool_hits: Vec::new(),
             subagent_panel: SubAgentPanel::default(),
@@ -877,6 +894,8 @@ impl App {
         self.running = false;
         self.pending_init = false;
         self.compacting = false;
+        self.pause_inference();
+        self.tools_running = 0;
         let dropped = self.queue.len();
         self.queue.clear();
         self.push_entry(Entry::system(hrdr_app::cancel_message(dropped)));
@@ -901,6 +920,10 @@ impl App {
         self.first_token_at = None;
         self.reasoning_start = None;
         self.out_tokens = 0;
+        self.tools_running = 0;
+        self.infer_banked = Duration::ZERO;
+        self.infer_started = None;
+        self.resume_inference();
         // Keep last_usage so the status-bar context size persists between turns;
         // it's refreshed when this turn's Usage event arrives.
         let agent = self.agent.clone();
@@ -966,6 +989,11 @@ impl App {
         self.first_token_at = None;
         self.reasoning_start = None;
         self.out_tokens = 0;
+        // Summarizing is the model working: its own clock, no tools.
+        self.tools_running = 0;
+        self.infer_banked = Duration::ZERO;
+        self.infer_started = None;
+        self.resume_inference();
         let agent = self.agent.clone();
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
@@ -1021,6 +1049,8 @@ impl App {
                 }
                 self.turn_handle = None;
                 self.running = false;
+                self.pause_inference();
+                self.tools_running = 0;
                 // The turn is over — clear any sub-agents still in the live panel
                 // (an interrupted turn may not have delivered their ToolEnd).
                 self.subagent_panel.clear();
@@ -1073,6 +1103,7 @@ impl App {
                 self.turn_handle = None;
                 self.running = false;
                 self.compacting = false;
+                self.pause_inference();
                 // Context shrank; drop stale usage so the status bar refreshes
                 // on the next turn (and we don't immediately re-trigger).
                 self.state.usage.set_last(None);
@@ -1096,7 +1127,8 @@ impl App {
     fn turn_stats(&self) -> Option<String> {
         let started = self.turn_started?;
         hrdr_app::turn_stats_line(
-            started.elapsed().as_secs_f64(),
+            // The model's working time, excluding the tool calls it waited on.
+            self.infer_elapsed().as_secs_f64(),
             self.first_token_at
                 .map(|t0| t0.duration_since(started).as_secs_f64()),
             self.out_tokens,
@@ -1104,6 +1136,38 @@ impl App {
             self.last_cached_tokens,
             self.last_reasoning_tokens,
         )
+    }
+
+    /// The model went idle: bank the inference time and hide the loader. Called
+    /// when the first tool of a round starts, and when a turn ends.
+    fn pause_inference(&mut self) {
+        if let Some(t) = self.infer_started.take() {
+            self.infer_banked += t.elapsed();
+        }
+        self.inferring = false;
+    }
+
+    /// The model is working again: the turn just began, or its last tool call
+    /// returned and the agent is about to request the next response.
+    fn resume_inference(&mut self) {
+        self.infer_started.get_or_insert_with(Instant::now);
+        self.inferring = true;
+    }
+
+    /// How long the model has actually worked this turn: banked stretches plus
+    /// the one in progress. Excludes time spent waiting on tool calls.
+    pub(crate) fn infer_elapsed(&self) -> Duration {
+        self.infer_banked
+            + self
+                .infer_started
+                .map(|t| t.elapsed())
+                .unwrap_or(Duration::ZERO)
+    }
+
+    /// Start the inference clock from a test, without spawning a real turn.
+    #[cfg(test)]
+    pub(crate) fn resume_inference_for_test(&mut self) {
+        self.resume_inference();
     }
 
     /// Count a streamed delta toward the live tok/s stats.
@@ -1173,6 +1237,12 @@ impl App {
                 self.last_reasoning_tokens = reasoning_tokens;
             }
             AgentEvent::ToolStart { id, name, args } => {
+                // The model has handed off: it is idle until every tool of this
+                // round returns. Stop its clock and hide the loader.
+                self.tools_running += 1;
+                if self.tools_running == 1 {
+                    self.pause_inference();
+                }
                 // A `task` call opens a live entry in the sub-agent panel.
                 if name == "task" {
                     self.subagent_panel.on_tool_start(id.clone());
@@ -1225,6 +1295,12 @@ impl App {
                 // The sub-agent finished — its result is now in the transcript;
                 // drop it from the live panel.
                 self.subagent_panel.on_tool_end(&id);
+                // The last tool of the round returned: the agent is about to ask
+                // the model again, so it is working from here.
+                self.tools_running = self.tools_running.saturating_sub(1);
+                if self.tools_running == 0 && self.running {
+                    self.resume_inference();
+                }
             }
             AgentEvent::Notice(text) => {
                 self.push_entry(Entry::system(text));

@@ -53,8 +53,14 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         (todos.len() as u16).min(TODO_PANEL_MAX_ITEMS) + 2
     };
 
-    // While a turn runs the loader heads the input section, above any panel.
-    let loader_height: u16 = if app.running { 1 } else { 0 };
+    // The loader heads the input section while the *model* works. It hides while
+    // its tool calls run: the model is idle then, and a spinner would claim
+    // otherwise. The running tool's own block carries the `…` mark.
+    let loader_height: u16 = if app.inferring || app.compacting {
+        1
+    } else {
+        0
+    };
 
     // Input pane auto-grows 1..=INPUT_MAX_ROWS text rows with the content.
     // Inner width = full width minus the horizontal padding on both sides; the
@@ -391,20 +397,19 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// The inference loader: spinner + live stats (context size, in/out ratio,
 /// token throughput) shown above the input while a turn runs.
 fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
-    let elapsed = app.turn_started.map(|t| t.elapsed()).unwrap_or_default();
+    // The model's own working time: the tool calls it waited on don't count, so
+    // the clock freezes while they run rather than inflating the turn.
+    let elapsed = app.infer_elapsed();
     let frame = SPINNER[(elapsed.as_millis() / 120) as usize % SPINNER.len()];
 
-    // Live throughput since the first token arrived.
-    let speed = match app.first_token_at {
-        Some(t0) if app.out_tokens > 0 => {
-            let secs = t0.elapsed().as_secs_f64();
-            if secs > 0.0 {
-                app.out_tokens as f64 / secs
-            } else {
-                0.0
-            }
+    // Live throughput over that same working time — tokens per second of
+    // inference, not per second of wall clock.
+    let speed = match app.out_tokens {
+        0 => 0.0,
+        n => {
+            let secs = elapsed.as_secs_f64();
+            if secs > 0.0 { n as f64 / secs } else { 0.0 }
         }
-        _ => 0.0,
     };
 
     let ctx = match app.state.usage.last() {
