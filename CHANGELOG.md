@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-07-11
+
 ### Removed
 
 - **`hrdr-gui` (the floem desktop frontend).** hrdr is TUI-only going forward.
@@ -26,6 +28,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/diff` output — plus the status-bar token counters and context window. A
   resume restores what was on screen rather than rebuilding a lossy
   approximation from the chat messages.
+- **New file tools** — `move`, `copy`, `delete`, and `replace` (project-wide
+  substring substitution with a unified diff and a `dry_run`), plus a
+  **read-only `git`** tool (status/diff/log/show/blame/…). All are checkpointed
+  and confined to the working directory like the other file-mutating tools.
+- **Sub-agents run detached by default**: a `task` call returns immediately with
+  a task id, the sub-agent's result is delivered back into the conversation when
+  it finishes, and an idle main agent is woken to react. Concurrency is capped
+  **by capability** — read-only vs write-capable — since write sub-agents share
+  the working tree; a `task` past the cap is refused with guidance to wait.
+- **Context-window fallback to the [models.dev](https://models.dev) catalog**
+  when the endpoint advertises no window, so the status-bar gauge and the
+  auto-compaction threshold work against APIs that publish nothing on the wire.
 
 ### Changed
 
@@ -90,6 +104,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`model` / `provider` precedence is `flag > env > session > config`**,
   honored by `/resume` as well as startup auto-resume. A session never overrides
   a pinned model, and never supplies the endpoint.
+- **The system prompt adapts to the tool set.** The edit and git guidance is
+  gated on whether the agent actually has write tools, so a read-only sub-agent
+  (`explore`/`review`) no longer receives editing/staging instructions that
+  contradict its persona; the Safety section now also states that reads and
+  searches are confined to the working directory.
 
 ### Fixed
 
@@ -133,6 +152,58 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already claimed.
 - Long lines wrap inside their block instead of breaking out to column 0.
 - The per-turn stats line renders as a block (and lost its `└` prefix).
+- **Mid-stream error objects are surfaced, not swallowed.** A
+  `data: {"error":{…}}` frame on the OpenAI streaming path used to deserialize
+  to an empty chunk and end as a phantom "incomplete stream" that was retried;
+  it now raises a terminal error carrying the server's message.
+- **Quitting or cancelling mid-turn autosaves.** The visible user message and
+  the partial reply survived only if the turn had finished; a genuine mid-stream
+  `Ctrl+Q`/cancel could drop them because the save raced the aborted task
+  releasing the agent lock. The event loop now reaps the cancelled turn before
+  the final save.
+- **The default plain input wraps and positions the cursor by display width**,
+  so a line of CJK/emoji (2 columns each) no longer overflows the input pane or
+  drifts the terminal cursor.
+- **Transcript scroll math saturates instead of wrapping** past `u16::MAX` rows
+  on very long transcripts, and `prune_scrollback` keeps the intro banner (it
+  checked the wrong entry kind and evicted it first).
+- **Smaller correctness fixes**: `edit` rejects an empty `old_string`; `read`
+  fails fast over a size cap rather than loading a huge/special file whole; the
+  `git` diff/blame path guard resolves paths cross-platform (Windows included);
+  malformed streamed tool-call arguments are preserved rather than emptied;
+  dangling tool calls are repaired across every turn, not just the latest; and
+  compaction summarization retries a transient error instead of aborting.
+
+### Security
+
+- **Reads and searches are confined to the working directory.** `read`, `grep`,
+  `ls`, and `tree` now refuse paths outside the project (resolving `..` and
+  symlinks first), matching the existing write confinement; `allow_outside_cwd`
+  lifts it. Previously only file _changes_ were confined.
+- **The read tools refuse credential/secret files**, with a much broader
+  deny-list: SSH and other private keys (by name, outside `~/.ssh` too), `.env`,
+  cloud credentials (AWS/GCP/kube/Docker, gcloud ADC), `.netrc` / `.npmrc` /
+  `.pypirc` / `.pgpass` / `.git-credentials` / `.terraformrc`,
+  `.gnupg`/`.password-store`, keystores (`.p12`/`.pfx`/`.jks`/…), `/etc/shadow`,
+  and more — so prompt-injected content can't have the agent read them out.
+- **`fetch` is hardened against SSRF, including DNS rebinding.** A custom DNS
+  resolver drops loopback/private/link-local (incl. the cloud-metadata address)
+  IPs from every resolution and connects only to what it validated, so a
+  rebinding answer can't be reached; the check also re-runs on every redirect
+  hop.
+- **The read-only `git` tool is genuinely read-only.** It rejects the mutating /
+  networking `remote` forms, bundled short flags (e.g. `-fD`), branch mutation,
+  and arbitrary-file reads via `--no-index` / `--contents` / absolute or
+  `..`-escaping path arguments.
+- **Sub-agent API keys no longer cross providers.** The parent agent's key is
+  reused only when the sub-agent's endpoint matches; a sub-agent on a different
+  provider without its own key now fails cleanly instead of leaking the key.
+- **Repo-local agent files can't override the built-ins.** A discovered
+  `.claude`/`.opencode`/`.hrdr` agent profile can no longer overlay
+  `explore`/`review`/`plan`/`general` or claim `proactive`.
+- **Tool-output overflow files are per-user `0700`** (previously a shared,
+  world-readable `/tmp` path) and are written only when output actually
+  overflows the caps.
 
 ## [0.2.8] - 2026-07-05
 
