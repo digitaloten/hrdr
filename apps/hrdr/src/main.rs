@@ -82,6 +82,15 @@ struct Cli {
     #[arg(long, global = true)]
     compaction_reserved: Option<u32>,
 
+    /// Most read-only sub-agents that may run at once (default 5).
+    #[arg(long, global = true, value_name = "N")]
+    max_readonly_subagents: Option<usize>,
+
+    /// Most write-capable sub-agents that may run at once (default 2) — they
+    /// share the working tree, so interleaved edits race.
+    #[arg(long, global = true, value_name = "N")]
+    max_write_subagents: Option<usize>,
+
     /// Prune old tool output from the model context before each request (on|off; default on).
     #[arg(long = "auto-prune", global = true, value_name = "on|off")]
     auto_prune: Option<String>,
@@ -306,6 +315,12 @@ async fn main() -> Result<()> {
     }
     if let Some(n) = cli.compaction_reserved {
         config.compaction_reserved = n;
+    }
+    if let Some(n) = cli.max_readonly_subagents {
+        config.max_readonly_subagents = n;
+    }
+    if let Some(n) = cli.max_write_subagents {
+        config.max_write_subagents = n;
     }
     if let Some(v) = cli
         .auto_prune

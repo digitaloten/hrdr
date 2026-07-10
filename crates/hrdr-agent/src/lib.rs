@@ -91,6 +91,67 @@ static BG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// Shared list of background-task `JoinHandle`s, keyed by task id.
 type BgHandles = Arc<Mutex<Vec<(u64, tokio::task::JoinHandle<()>)>>>;
 
+/// Default cap on concurrently running read-only sub-agents.
+pub const DEFAULT_MAX_READONLY_SUBAGENTS: usize = 5;
+/// Default cap on concurrently running write-capable sub-agents. Lower: they
+/// share the main agent's working tree, so interleaved edits are a real race.
+pub const DEFAULT_MAX_WRITE_SUBAGENTS: usize = 2;
+
+/// Live sub-agent slots, by capability. Acquired before a `task` spawns and
+/// released when it finishes, so the caps bound *concurrent* sub-agents rather
+/// than how many a turn may issue in total.
+#[derive(Debug, Default)]
+struct SubagentSlots {
+    read_only: std::sync::atomic::AtomicUsize,
+    write: std::sync::atomic::AtomicUsize,
+}
+
+impl SubagentSlots {
+    /// Take a slot, or `None` when `max` are already running. The compare-and-set
+    /// loop matters: several `task` calls in one turn run concurrently, so a
+    /// load-then-store would let them all pass a cap of 1.
+    fn acquire(self: &Arc<Self>, write: bool, max: usize) -> Option<SubagentSlot> {
+        use std::sync::atomic::Ordering;
+        let counter = if write { &self.write } else { &self.read_only };
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .ok()?;
+        Some(SubagentSlot {
+            slots: Arc::clone(self),
+            write,
+        })
+    }
+
+    fn live(&self, write: bool) -> usize {
+        use std::sync::atomic::Ordering;
+        let counter = if write { &self.write } else { &self.read_only };
+        counter.load(Ordering::SeqCst)
+    }
+}
+
+/// A held sub-agent slot; releases on drop, so a panicking or aborted sub-agent
+/// can't leak one.
+struct SubagentSlot {
+    slots: Arc<SubagentSlots>,
+    write: bool,
+}
+
+impl Drop for SubagentSlot {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let counter = if self.write {
+            &self.slots.write
+        } else {
+            &self.slots.read_only
+        };
+        let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            Some(n.saturating_sub(1))
+        });
+    }
+}
+
 /// Create an empty [`BgHandles`] store.
 fn bg_handles() -> BgHandles {
     Arc::new(Mutex::new(Vec::new()))
@@ -123,20 +184,14 @@ fn wants_background(args: &serde_json::Value, isolated: bool) -> bool {
 }
 
 fn spawn_background(
-    mut cfg: AgentConfig,
+    cfg: AgentConfig,
     prompt: String,
     label: String,
     tool_id: Option<String>,
+    slot: SubagentSlot,
     registry: &Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>>,
     handles: &BgHandles,
 ) -> String {
-    // Background tasks default to read-only: they share the main agent's cwd
-    // and there's no isolation, so interleaved file writes are a race. An
-    // explicit `allowed_tools` from a pre-scoped profile takes precedence.
-    if cfg.allowed_tools.is_none() {
-        cfg.read_only = true;
-        cfg.write_ext = None;
-    }
     use std::sync::atomic::Ordering;
     let id = BG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     let header = format!("↳ task#{id} ({}): {label}", cfg.model);
@@ -156,6 +211,9 @@ fn spawn_background(
     // The inner task does the actual work; the outer task is the panic guard:
     // it always sets `done = true` + a result, even on panic.
     let handle = tokio::spawn(async move {
+        // The slot is released when this task ends — including on panic, since
+        // the guard is dropped as the future is.
+        let _slot = slot;
         // Run the body in a nested spawn so a panic propagates as a JoinError
         // (non-panicking error path: Result::Err) rather than crashing the
         // outer task and leaving the registry entry live forever.
@@ -317,10 +375,15 @@ struct SubagentTool {
     /// Registry of background-task `JoinHandle`s, shared with the owning
     /// [`Agent`] so it can abort live tasks on `clear()` / session reset.
     bg_handles: BgHandles,
+    /// Concurrency caps: `(read-only, write-capable)`.
+    caps: (usize, usize),
+    /// Slots held by the sub-agents running right now.
+    slots: Arc<SubagentSlots>,
 }
 
 impl SubagentTool {
     fn new(base: AgentConfig, profiles: Vec<SubagentProfile>, bg_handles: BgHandles) -> Self {
+        let caps = (base.max_readonly_subagents, base.max_write_subagents);
         let mut desc = String::from(
             "Delegate a self-contained sub-task to a fresh sub-agent with its own context \
              (it can't see this conversation, so make `prompt` complete and standalone). Use \
@@ -373,6 +436,8 @@ impl SubagentTool {
             profiles,
             description: Box::leak(desc.into_boxed_str()),
             bg_handles,
+            caps,
+            slots: Arc::new(SubagentSlots::default()),
         }
     }
 }
@@ -492,6 +557,31 @@ impl hrdr_tools::Tool for SubagentTool {
         //
         // An isolated (worktree) sub-agent can't detach yet, so it stays blocking
         // unless the model explicitly asks for both — which is an error.
+        // Bound how many sub-agents run at once. Write-capable ones are capped
+        // lower: they share the main agent's working tree, so interleaved edits
+        // race. Refusing is better than queueing — the model gets told, and can
+        // do something else or wait.
+        let write_capable = !cfg.read_only;
+        let (max_readonly, max_write) = self.caps;
+        let cap = if write_capable {
+            max_write
+        } else {
+            max_readonly
+        };
+        let kind = if write_capable {
+            "write-capable"
+        } else {
+            "read-only"
+        };
+        let Some(slot) = self.slots.acquire(write_capable, cap) else {
+            bail!(
+                "too many sub-agents: {} {kind} already running (limit {cap}). Wait for one to \
+                 finish — its result is delivered to you automatically — then try again, or run \
+                 this work yourself.",
+                self.slots.live(write_capable),
+            );
+        };
+
         if wants_background(&args, isolation.is_some()) {
             if isolation.is_some() {
                 bail!("a background task can't also use `isolation` (worktree) yet");
@@ -501,10 +591,13 @@ impl hrdr_tools::Tool for SubagentTool {
                 prompt,
                 label,
                 ctx.call_id.clone(),
+                slot,
                 &ctx.background_tasks,
                 &self.bg_handles,
             ));
         }
+        // Blocking: hold the slot until this call returns.
+        let _slot = slot;
 
         // `isolation = "worktree"`: run the sub-agent in a fresh git worktree so
         // its edits don't touch the working tree until reviewed.
@@ -622,6 +715,15 @@ pub struct AgentConfig {
     /// usage reaches `context_window − compaction_reserved` (opencode's reserved
     /// model). Default [`DEFAULT_COMPACTION_RESERVED`].
     pub compaction_reserved: u32,
+    /// Most read-only sub-agents that may run at once (`max_readonly_subagents`,
+    /// `HRDR_MAX_READONLY_SUBAGENTS`, `--max-readonly-subagents`). A `task` beyond
+    /// the cap is refused with a message telling the model to wait.
+    pub max_readonly_subagents: usize,
+    /// Most write-capable sub-agents that may run at once
+    /// (`max_write_subagents`, `HRDR_MAX_WRITE_SUBAGENTS`,
+    /// `--max-write-subagents`). Lower than the read-only cap: they share the
+    /// main agent's working tree.
+    pub max_write_subagents: usize,
     /// Prune old tool-call *output* from the model history before each request:
     /// bodies older than the recent protected window are replaced with a short
     /// placeholder (the tool call + args stay). Cheap, no model call — the first
@@ -1018,6 +1120,8 @@ impl Default for AgentConfig {
             effort: None,
             auto_compact: DEFAULT_AUTO_COMPACT,
             compaction_reserved: DEFAULT_COMPACTION_RESERVED,
+            max_readonly_subagents: DEFAULT_MAX_READONLY_SUBAGENTS,
+            max_write_subagents: DEFAULT_MAX_WRITE_SUBAGENTS,
             auto_prune: true,
             checkpoints: None,
             providers: HashMap::new(),
@@ -1277,6 +1381,8 @@ struct FileConfig {
     #[serde(default, deserialize_with = "de_bool_or_num")]
     auto_compact: Option<bool>,
     compaction_reserved: Option<u32>,
+    max_readonly_subagents: Option<usize>,
+    max_write_subagents: Option<usize>,
     auto_prune: Option<bool>,
     checkpoints: Option<String>,
     #[serde(default)]
@@ -1410,6 +1516,12 @@ impl AgentConfig {
         if let Some(v) = fc.compaction_reserved {
             self.compaction_reserved = v;
         }
+        if let Some(v) = fc.max_readonly_subagents {
+            self.max_readonly_subagents = v;
+        }
+        if let Some(v) = fc.max_write_subagents {
+            self.max_write_subagents = v;
+        }
         if let Some(v) = fc.auto_prune {
             self.auto_prune = v;
         }
@@ -1532,6 +1644,16 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     ("HRDR_AUTO_COMPACT", |c, v| {
         if let Some(b) = parse_toggle_or_num(&v) {
             c.auto_compact = b;
+        }
+    }),
+    ("HRDR_MAX_READONLY_SUBAGENTS", |c, v| {
+        if let Ok(n) = v.parse() {
+            c.max_readonly_subagents = n;
+        }
+    }),
+    ("HRDR_MAX_WRITE_SUBAGENTS", |c, v| {
+        if let Ok(n) = v.parse() {
+            c.max_write_subagents = n;
         }
     }),
     ("HRDR_COMPACTION_RESERVED", |c, v| {
@@ -3376,9 +3498,12 @@ fn estimate_tokens_in_messages(messages: &[ChatMessage]) -> u32 {
 mod tests {
     use std::collections::HashMap;
 
+    use std::sync::Arc;
+
     use super::{
-        Agent, AgentConfig, AgentEvent, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig,
-        PRUNE_PLACEHOLDER, ProviderConfig, ToolOutputConfig, builtin_provider,
+        Agent, AgentConfig, AgentEvent, DEFAULT_MAX_READONLY_SUBAGENTS,
+        DEFAULT_MAX_WRITE_SUBAGENTS, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig,
+        PRUNE_PLACEHOLDER, ProviderConfig, SubagentSlots, ToolOutputConfig, builtin_provider,
         compaction_tail_start, elide_tool_results, estimate_tokens, estimate_tokens_in_messages,
         in_git_repo, is_context_overflow, is_transient, parse_env_bool, prune_tool_messages,
         repair_dangling_tool_calls, retry_after_hint, steering_queue, tail_window,
@@ -3762,6 +3887,98 @@ mod tests {
         // Sub-agent mode: applied onto the bounded base → no delegation.
         let delegated = config_for_agent_profile(&subagent_base_config(&base), &general).unwrap();
         assert!(!delegated.subagents, "a delegated sub-agent can't nest");
+    }
+
+    /// Sub-agent slots cap how many run *at once*, per capability, and are
+    /// released when each finishes — including on panic, via the guard's `Drop`.
+    #[test]
+    fn subagent_slots_cap_concurrency_per_capability() {
+        let slots = Arc::new(SubagentSlots::default());
+        let (max_ro, max_w) = (2usize, 1usize);
+
+        let a = slots.acquire(false, max_ro).expect("1st read-only");
+        let b = slots.acquire(false, max_ro).expect("2nd read-only");
+        assert!(
+            slots.acquire(false, max_ro).is_none(),
+            "read-only cap holds"
+        );
+        assert_eq!(slots.live(false), 2);
+
+        // The write cap is counted separately — a full read-only pool doesn't
+        // block a writer.
+        let w = slots
+            .acquire(true, max_w)
+            .expect("a writer may still start");
+        assert!(slots.acquire(true, max_w).is_none(), "write cap holds");
+        assert_eq!(slots.live(true), 1);
+
+        // Finishing frees a slot for the next one.
+        drop(a);
+        assert_eq!(slots.live(false), 1);
+        let _c = slots.acquire(false, max_ro).expect("a slot came free");
+        assert!(slots.acquire(false, max_ro).is_none(), "and only one");
+
+        drop(w);
+        assert_eq!(slots.live(true), 0, "the writer's slot came back");
+        drop(b);
+
+        // A cap of zero refuses everything rather than wrapping around.
+        assert!(slots.acquire(false, 0).is_none());
+        assert!(slots.acquire(true, 0).is_none());
+    }
+
+    /// A slot survives a panicking sub-agent: the guard is dropped as its stack
+    /// unwinds, so the cap doesn't leak a slot per crash.
+    #[test]
+    fn a_panicking_subagent_releases_its_slot() {
+        let slots = Arc::new(SubagentSlots::default());
+        let held = Arc::clone(&slots);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _slot = held.acquire(true, 1).expect("acquired");
+            panic!("sub-agent exploded");
+        }));
+        assert_eq!(slots.live(true), 0, "the slot came back");
+        assert!(slots.acquire(true, 1).is_some(), "and can be taken again");
+    }
+
+    /// The caps follow the standard precedence: flag > env > config file >
+    /// default. (The flag is applied by the binary, after this.)
+    #[test]
+    fn subagent_caps_read_from_config_and_env() {
+        // Defaults.
+        let cfg = AgentConfig::default();
+        assert_eq!(cfg.max_readonly_subagents, DEFAULT_MAX_READONLY_SUBAGENTS);
+        assert_eq!(cfg.max_write_subagents, DEFAULT_MAX_WRITE_SUBAGENTS);
+
+        // Config file.
+        let mut cfg = AgentConfig::default();
+        cfg.apply_file(FileConfig {
+            max_readonly_subagents: Some(9),
+            max_write_subagents: Some(3),
+            ..Default::default()
+        });
+        assert_eq!(cfg.max_readonly_subagents, 9);
+        assert_eq!(cfg.max_write_subagents, 3);
+
+        // Env overrides the file: both vars are in ENV_SETTERS.
+        let setter = |name: &str| {
+            ENV_SETTERS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, f)| *f)
+                .unwrap_or_else(|| panic!("{name} is not wired into ENV_SETTERS"))
+        };
+        setter("HRDR_MAX_READONLY_SUBAGENTS")(&mut cfg, "7".to_string());
+        setter("HRDR_MAX_WRITE_SUBAGENTS")(&mut cfg, "1".to_string());
+        assert_eq!(cfg.max_readonly_subagents, 7);
+        assert_eq!(cfg.max_write_subagents, 1);
+
+        // Junk is ignored rather than zeroing the cap.
+        setter("HRDR_MAX_WRITE_SUBAGENTS")(&mut cfg, "lots".to_string());
+        assert_eq!(
+            cfg.max_write_subagents, 1,
+            "unparseable value left it alone"
+        );
     }
 
     /// A `task` runs detached unless the model says otherwise — a sub-agent must
@@ -4269,6 +4486,8 @@ mod tests {
     fn apply_file_sets_all_fields() {
         let mut cfg = AgentConfig::default();
         cfg.apply_file(FileConfig {
+            max_readonly_subagents: None,
+            max_write_subagents: None,
             base_url: Some("http://custom/v1".to_string()),
             api_key: Some("key123".to_string()),
             model: Some("gpt-4".to_string()),

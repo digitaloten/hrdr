@@ -302,6 +302,12 @@ auto_compact = true            # on/off toggle (legacy 0<x≤1 still enables; 0 
 compaction_reserved = 16384    # fire at context_window − this many tokens
 compaction_tail_turns = 2      # recent turns kept verbatim through a compaction
 preserve_recent_tokens = 8000  # …bounded by this token budget
+
+# Sub-agents: how many may run at once. Write-capable ones are capped lower —
+# they share the main agent's working tree, so interleaved edits race. A `task`
+# beyond the cap is refused, and the model is told to wait or do the work itself.
+max_readonly_subagents = 5     # HRDR_MAX_READONLY_SUBAGENTS, --max-readonly-subagents
+max_write_subagents = 2        # HRDR_MAX_WRITE_SUBAGENTS, --max-write-subagents
 ```
 
 `auto_prune` also honors `$HRDR_AUTO_PRUNE` / `--auto-prune on|off`.
