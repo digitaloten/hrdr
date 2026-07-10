@@ -116,34 +116,45 @@ fn forbidden_flag<'a>(sub: &str, args: &'a [String]) -> Option<&'a str> {
     })
 }
 
-/// A path argument (to `diff`/`blame`) that reads outside the workspace: an
-/// absolute path, or one whose components escape the cwd via `..`. Flags
-/// (`-`-prefixed) are not paths and are skipped by the caller.
-fn escapes_workspace(arg: &str) -> bool {
-    // `Path::is_absolute` is platform-specific: on Windows a Unix path like
-    // `/etc/passwd` is *not* absolute, so the guard would miss it there. Treat a
-    // leading `/` or `\` as absolute on every platform, in addition to the
-    // native check and any `..`-escape.
-    if arg.starts_with('/') || arg.starts_with('\\') {
+/// Whether a `diff`/`blame` path argument reads outside the workspace, resolved
+/// the same way every other tool confines paths: turn it into a full path and
+/// check it still sits under `cwd`.
+///
+/// Two steps, because neither alone is enough:
+/// 1. A lexical `..` check catches an out-of-tree target even when it doesn't
+///    exist (so it behaves identically on every OS / CI runner, where e.g.
+///    `/etc/passwd` is absent). `Path::components` normalises `/` and `\`.
+/// 2. Otherwise resolve the arg against `cwd` ([`resolve_under`] handles both
+///    Unix- and Windows-absolute spellings) and canonicalize both sides
+///    ([`canonicalize_nearest`] resolves symlinks and the nearest existing
+///    ancestor), then require the result to stay under `cwd`.
+///
+/// This replaces a hand-rolled `is_absolute` heuristic that missed Unix paths
+/// on Windows, and it additionally catches symlink escapes. A git revision or
+/// ref (`HEAD`, `main`, `a..b`) resolves to a non-existent path *inside* `cwd`,
+/// so it passes untouched. Flags (`-`-prefixed) are skipped by the caller.
+fn escapes_workspace(arg: &str, cwd: &std::path::Path) -> bool {
+    use std::path::Component;
+    if std::path::Path::new(arg)
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
         return true;
     }
-    let p = std::path::Path::new(arg);
-    p.is_absolute()
-        || p.components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
+    let resolved = crate::canonicalize_nearest(&crate::resolve_under(cwd, arg));
+    !resolved.starts_with(crate::canonicalize_nearest(cwd))
 }
 
-/// For `diff`/`blame`: reject any non-flag argument that is an absolute path
-/// or escapes the workspace via `..` — combined with the `--no-index`/
-/// `--contents` flag bans, this keeps both subcommands reading only tracked
-/// repository content under the cwd.
-fn escaping_path_arg<'a>(sub: &str, args: &'a [String]) -> Option<&'a str> {
+/// For `diff`/`blame`: reject any non-flag argument that resolves outside the
+/// workspace — combined with the `--no-index`/`--contents` flag bans, this keeps
+/// both subcommands reading only content under the cwd.
+fn escaping_path_arg<'a>(sub: &str, args: &'a [String], cwd: &std::path::Path) -> Option<&'a str> {
     if sub != "diff" && sub != "blame" {
         return None;
     }
     args.iter()
         .map(String::as_str)
-        .find(|arg| !arg.starts_with('-') && escapes_workspace(arg))
+        .find(|arg| !arg.starts_with('-') && escapes_workspace(arg, cwd))
 }
 
 /// For `remote`: only the read-only forms are allowed — bare `git remote`
@@ -232,7 +243,7 @@ impl Tool for GitTool {
         if let Some(bad) = forbidden_flag(sub, &a.args) {
             bail!("`{bad}` is not allowed: it can modify the repository or run a program");
         }
-        if let Some(bad) = escaping_path_arg(sub, &a.args) {
+        if let Some(bad) = escaping_path_arg(sub, &a.args, &ctx.cwd) {
             bail!(
                 "`{bad}` is not allowed: `git {sub}` only reads paths inside the workspace \
                  (no absolute paths, no `..` escapes)"
@@ -440,6 +451,21 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
+    /// The resolve-then-prefix guard rejects real escapes (absolute paths, `..`)
+    /// but leaves in-tree paths *and* git revisions/refs — which resolve to
+    /// non-existent paths under cwd — untouched.
+    #[test]
+    fn escapes_workspace_allows_in_tree_and_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        assert!(!escapes_workspace("src/main.rs", cwd));
+        assert!(!escapes_workspace("HEAD", cwd));
+        assert!(!escapes_workspace("main..feature", cwd)); // a range, not a `..` path
+        assert!(!escapes_workspace("v1.0", cwd));
+        assert!(escapes_workspace("../secret", cwd));
+        assert!(escapes_workspace("/etc/passwd", cwd));
     }
 
     /// `diff`/`blame` args that are absolute paths or escape the workspace via
