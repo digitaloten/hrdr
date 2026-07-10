@@ -10,11 +10,12 @@ tasks in a terminal. It is provider-agnostic: point it at any
 OpenAI, llama.cpp, OpenRouter — and it streams tokens and runs tools until the
 job is done.
 
-> Active development, released as **v0.1.x**. The agent loop, adaptive tool set,
-> sessions, file checkpoints, config hot-reload, and a rich TUI are in place.
-> hrdr connects to any running OpenAI-compatible endpoint — a hosted provider or
-> a server you run yourself ([`infr`](https://github.com/kryptic-sh/infr),
-> llama.cpp, vLLM, …). See the roadmap for what's next.
+> Active development, released as **v0.2.x**. The agent loop, adaptive tool set,
+> sub-agents, sessions, file checkpoints, config hot-reload, and a rich TUI are
+> in place. hrdr connects to any running OpenAI-compatible endpoint — a hosted
+> provider or a server you run yourself
+> ([`infr`](https://github.com/kryptic-sh/infr), llama.cpp, vLLM, …). See the
+> roadmap for what's next.
 
 ## Install
 
@@ -56,8 +57,10 @@ sudo rpm -i hrdr-*.rpm
   `dry_run`), `move`, `copy`, `delete`, `find`, `ls`, `tree`, `grep`, `git`
   (read-only: status/diff/log/show/blame/…), `todo`, `fetch`, `search`, a shell,
   and any MCP-server tools. The file-mutating tools are **checkpointed** (so
-  `/undo` reverts them) and **confined** to the project — unlike the same edit
-  made through the shell, which is neither. Token-bounded outputs and
+  `/undo` reverts them), and every file tool — read, search, and write alike —
+  is **confined** to the project (paths outside it are refused), with
+  credential/secret files off-limits to the read tools — unlike the same access
+  through the shell, which has neither guard. Token-bounded outputs and
   line-numbered reads for precise edits — and when `bash`/`grep` output
   overflows, the **full** result is saved to a temp file and the model is
   pointed at it (`read`/`grep`) instead of losing the overflow. Tools that shell
@@ -612,9 +615,16 @@ more reliable than a prompt rule alone. `sudo` itself is allowed — installing
 system packages at the user's request is the user's call — but it can't launder
 an otherwise-blocked command.
 
-File mutations (`write`/`edit`) are confined to the working directory (the
-system temp dir is always allowed for scratch); set `allow_outside_cwd = true`
-in config (or `$HRDR_ALLOW_OUTSIDE_CWD`) to lift that.
+Every file tool is confined to the working directory. `read`, `grep`, `ls`, and
+`tree` refuse paths outside it, and `write`/`edit` are limited to it too (writes
+may also use the system temp dir for scratch); set `allow_outside_cwd = true` in
+config (or `$HRDR_ALLOW_OUTSIDE_CWD`) to lift the confinement. On top of that,
+the read tools refuse known **credential/secret files** — SSH and other private
+keys, `.env`, cloud credentials (AWS/GCP/kube/Docker), `.netrc`/`.npmrc`/
+`.pypirc`/`.git-credentials`, keystores, and the like — so prompt-injected
+content can't have the agent read them out. And `fetch` blocks
+internal/loopback/private and cloud-metadata hosts (SSRF), re-checking on every
+redirect hop and at connect time so a DNS rebind can't slip through.
 
 Add project- or workflow-specific rules in config; they apply on top of the
 built-ins:
