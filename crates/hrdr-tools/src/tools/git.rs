@@ -120,6 +120,13 @@ fn forbidden_flag<'a>(sub: &str, args: &'a [String]) -> Option<&'a str> {
 /// absolute path, or one whose components escape the cwd via `..`. Flags
 /// (`-`-prefixed) are not paths and are skipped by the caller.
 fn escapes_workspace(arg: &str) -> bool {
+    // `Path::is_absolute` is platform-specific: on Windows a Unix path like
+    // `/etc/passwd` is *not* absolute, so the guard would miss it there. Treat a
+    // leading `/` or `\` as absolute on every platform, in addition to the
+    // native check and any `..`-escape.
+    if arg.starts_with('/') || arg.starts_with('\\') {
+        return true;
+    }
     let p = std::path::Path::new(arg);
     p.is_absolute()
         || p.components()
