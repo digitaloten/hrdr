@@ -62,6 +62,15 @@ fn auth_location() -> String {
 }
 
 impl LoginWizard {
+    /// Whether the wizard is currently waiting for the API key line: the
+    /// frontend should mask the input pane while this is `true` (the key
+    /// itself is already kept out of history/transcript/session — see
+    /// [`Self::enter_key`] — but it was still fully visible on screen as
+    /// typed).
+    pub fn wants_secret_input(&self) -> bool {
+        matches!(self.step, Step::Key { .. })
+    }
+
     /// Begin the wizard: emit the provider picker and return the initial state.
     pub fn start(host: &mut dyn CommandHost) -> Self {
         host.info(provider_prompt());
@@ -174,6 +183,24 @@ mod tests {
         // Out-of-range numbers are treated as a literal name (not an index).
         assert_eq!(parse_provider_pick("0", b), "0");
         assert_eq!(parse_provider_pick("9", b), "9");
+    }
+
+    /// The frontend masks the input pane only while the wizard is waiting for
+    /// the actual API key — not during the provider pick, which is never
+    /// secret.
+    #[test]
+    fn wants_secret_input_only_during_the_key_step() {
+        let picking = LoginWizard {
+            step: Step::Provider,
+        };
+        assert!(!picking.wants_secret_input());
+
+        let entering_key = LoginWizard {
+            step: Step::Key {
+                name: "openai".to_string(),
+            },
+        };
+        assert!(entering_key.wants_secret_input());
     }
 
     #[test]

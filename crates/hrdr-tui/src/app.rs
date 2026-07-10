@@ -27,7 +27,9 @@ mod util;
 use completion::CompletionKind;
 pub(crate) use completion::Completions;
 use hrdr_app::config_mtime as current_config_mtime;
-use hrdr_app::{SubAgentPanel, age_completed_todos, display_dir, git_branch, is_quit_command};
+use hrdr_app::{
+    SubAgentPanel, age_completed_todos, display_dir, git_branch, is_known_command, is_quit_command,
+};
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
 pub(crate) use util::run_editor;
@@ -171,6 +173,12 @@ pub(crate) struct App {
     bell: bool,
     /// Handle to the in-flight turn task; `abort()` cancels it.
     turn_handle: Option<JoinHandle<()>>,
+    /// A turn task aborted on the quit path, kept so the event loop can `await`
+    /// its termination — which drops the task's future and releases the agent
+    /// lock — *before* the final autosave. Without this, that save races the
+    /// runtime's async teardown of the aborted task: `autosave`'s `try_lock`
+    /// can still see the lock held and skip, dropping the in-progress turn.
+    quit_reap: Option<JoinHandle<()>>,
     /// Messages submitted while a turn runs, delivered mid-turn ("steering").
     /// Shared with the running `Agent::run`, which drains it between rounds.
     /// Transcript scroll offset in raw lines from the natural bottom.
@@ -366,6 +374,7 @@ impl App {
             compaction_reserved,
             bell,
             turn_handle: None,
+            quit_reap: None,
             scroll_offset: 0,
             transcript_height: 24,
             scrollback,
@@ -507,7 +516,7 @@ impl App {
                 // First idle Ctrl+C arms; a second consecutive one quits.
                 KeyCode::Char('c') => {
                     if self.quit_armed {
-                        self.should_quit = true;
+                        self.request_quit();
                     } else {
                         self.quit_armed = true;
                     }
@@ -515,13 +524,24 @@ impl App {
                 }
                 // Ctrl+Q is an immediate, deliberate quit.
                 KeyCode::Char('q') => {
-                    self.should_quit = true;
+                    self.request_quit();
                     return Action::None;
                 }
                 // Ctrl+L clears + repaints the screen (fix terminal corruption).
                 KeyCode::Char('l') => return Action::Redraw,
                 // Ctrl+G: hand the buffer off to $EDITOR (only when idle).
                 KeyCode::Char('g') if !self.running => return Action::OpenEditor,
+                // Ctrl+D on an empty input quits (shell-style EOF) — checked
+                // before the vim Normal-mode scroll arm below so it fires even
+                // in Normal mode, matching the welcome banner's advertised
+                // "Ctrl+D on an empty line" behavior. `.trim()` (not just
+                // `.is_empty()`) because the vim engine's `content()` always
+                // carries a trailing newline, even on a freshly-opened,
+                // never-typed-in buffer.
+                KeyCode::Char('d') if self.editor.content().trim().is_empty() => {
+                    self.request_quit();
+                    return Action::None;
+                }
                 // Transcript scroll — Ctrl+U/Ctrl+D in vim Normal mode only
                 // (plain mode uses these for line editing; PageUp/Down scroll).
                 KeyCode::Char('u') if self.editor.mode_label() == "NORMAL" => {
@@ -532,11 +552,6 @@ impl App {
                 KeyCode::Char('d') if self.editor.mode_label() == "NORMAL" => {
                     let half = (self.transcript_height / 2).max(1) as usize;
                     self.scroll_offset = self.scroll_offset.saturating_sub(half);
-                    return Action::None;
-                }
-                // Ctrl+D on an empty input quits (shell-style EOF).
-                KeyCode::Char('d') if self.editor.content().is_empty() => {
-                    self.should_quit = true;
                     return Action::None;
                 }
                 _ => {}
@@ -613,7 +628,7 @@ impl App {
             self.record_history(&input);
             // Common quit commands exit the session instead of being sent.
             if is_quit_command(input.trim()) {
-                self.should_quit = true;
+                self.request_quit();
                 return Action::None;
             }
             // Slash commands are handled locally, not sent to the model.
@@ -623,6 +638,28 @@ impl App {
                 if let Some(path) = self.pending_edit.take() {
                     return Action::OpenFile(path);
                 }
+                return Action::None;
+            }
+            // `handle_slash` returned false: not a recognized command. If the
+            // input still *looks* like an attempted slash command — a single
+            // leading `/word` token, command-name-shaped (letters/digits/
+            // hyphens only, no further `/` or `.`) — a typo (`/exprot`) would
+            // otherwise become a full model turn instead of an error. A real
+            // path-like message (`/etc/hosts looks wrong`) falls outside this
+            // shape (it has another `/` or a `.`) and is sent as usual.
+            if let Some(first) = input.split_whitespace().next()
+                && first.len() > 1
+                && first.starts_with('/')
+                && first[1..]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !is_known_command(first)
+            {
+                self.editor.set_content("");
+                self.scroll_offset = 0;
+                self.system(format!(
+                    "unknown command: {first} (see /help — or drop the leading '/' to send it as a message)"
+                ));
                 return Action::None;
             }
             self.editor.set_content("");
@@ -714,6 +751,15 @@ impl App {
             .position(|e| matches!(&e.kind, EntryKind::Tool { id: tid, .. } if tid == id))
     }
 
+    /// Whether the input pane should render masked (every char hidden) —
+    /// while the `/login` wizard is waiting for the actual API key. The real
+    /// value stays in the editor buffer untouched (`/login` reads it via
+    /// `self.editor.content()` as usual); only the on-screen rendering
+    /// changes, so the key isn't fully visible on screen as it's typed.
+    pub(crate) fn masks_input(&self) -> bool {
+        self.login.as_ref().is_some_and(|w| w.wants_secret_input())
+    }
+
     /// Show a transient status line: a command's output, a usage hint, a busy
     /// guard, a reload notice. These are chrome — regenerated on demand and
     /// never persisted (see [`hrdr_app::EntryKind::Notice`]).
@@ -751,19 +797,25 @@ impl App {
     }
 
     /// Evict oldest entries from the transcript front when the scrollback cap
-    /// is exceeded. The window of `System` startup entries (welcome + config
-    /// warning) is always kept so the user never loses the intro banner.
+    /// is exceeded. The window of intro entries (the header banner + the
+    /// welcome/config/project-docs notices — see `App::new`) is always kept
+    /// so the user never loses the intro banner.
     fn prune_scrollback(&mut self) {
         if self.state.transcript.len() <= self.scrollback {
             return;
         }
-        // Count leading `System` entries: they form the intro block and should
-        // never be evicted.  Everything else past them is fair game.
+        // Count leading `Header`/`Notice` entries: they form the intro block
+        // (`Entry::header()` + one or more `Entry::notice(...)`s) and should
+        // never be evicted. Everything else past them is fair game.
+        //
+        // Regression: this counted leading `EntryKind::System` entries, but
+        // the intro is Header + Notice — so `head` was always 0 and the
+        // welcome banner was the very first thing evicted.
         let head = self
             .state
             .transcript
             .iter()
-            .take_while(|e| matches!(e.kind, EntryKind::System(_)))
+            .take_while(|e| matches!(e.kind, EntryKind::Header | EntryKind::Notice(_)))
             .count();
         let excess = self.state.transcript.len().saturating_sub(self.scrollback);
         // Ensure we always keep at least `head` entries.
@@ -907,6 +959,11 @@ impl App {
     fn cancel_turn(&mut self) {
         if let Some(handle) = self.turn_handle.take() {
             handle.abort();
+            // Keep the aborted handle so the quit path can await it (releasing
+            // the agent lock) before the final save. In the stay-in-app cancel
+            // case it's simply reaped by the next quit or overwritten by the
+            // next turn — harmless either way.
+            self.quit_reap = Some(handle);
         }
         self.running = false;
         self.pending_init = false;
@@ -920,6 +977,33 @@ impl App {
             q.clear();
         }
         self.push_entry(Entry::system(hrdr_app::cancel_message(dropped)));
+        // The turn never reached `Done`, so nothing has autosaved the visible
+        // user message + whatever partial reply streamed in before the
+        // cancel. Persist it now — the same best-effort save every other
+        // checkpoint uses (skips if the agent lock is still busy; a later
+        // save, or the one on quit, catches up).
+        self.autosave();
+    }
+
+    /// Quit the session. If a turn is running, cancel it first — which
+    /// autosaves the in-progress transcript — so quitting mid-turn (Ctrl+Q,
+    /// double Ctrl+C, Ctrl+D on empty input, `/exit`) never drops the visible
+    /// user message or a partial reply.
+    fn request_quit(&mut self) {
+        if self.running {
+            self.cancel_turn();
+        }
+        self.should_quit = true;
+    }
+
+    /// Await a turn task aborted on the quit path so its future is dropped and
+    /// the agent lock released, making the subsequent final autosave's
+    /// `try_lock` reliably succeed. A no-op when nothing was cancelled; awaiting
+    /// an already-terminated handle returns immediately.
+    pub(crate) async fn reap_cancelled_turn(&mut self) {
+        if let Some(handle) = self.quit_reap.take() {
+            let _ = handle.await;
+        }
     }
 
     fn spawn_turn(&mut self, input: String) {

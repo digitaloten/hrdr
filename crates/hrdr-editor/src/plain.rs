@@ -213,11 +213,14 @@ impl EditorEngine for PlainEngine {
 
 impl crate::TuiRender for PlainEngine {
     fn render(&mut self, frame: &mut Frame, area: Rect) {
-        // Hard-wrap at the inner width, tracking the cursor's wrapped position,
-        // so render and `desired_rows` agree and the cursor stays correct.
+        // Hard-wrap at the inner width in *display columns*, tracking the
+        // cursor's wrapped position the same way, so render and
+        // `desired_rows` (both driven by `wrapped_row_count`'s column math)
+        // agree and the terminal cursor lands on the right cell even with
+        // wide (CJK/emoji) or zero-width (combining-mark) glyphs.
         let width = area.width.max(1) as usize;
         let mut lines: Vec<String> = vec![String::new()];
-        let mut col = 0usize;
+        let mut col = 0usize; // display column within the current wrapped line
         let (mut crow, mut ccol) = (0usize, 0usize);
         for i in 0..=self.chars.len() {
             if i == self.cursor {
@@ -233,12 +236,15 @@ impl crate::TuiRender for PlainEngine {
                     col = 0;
                 }
                 c => {
-                    if col == width {
+                    let cw = crate::char_width(c);
+                    // A zero-width mark rides on the previous cell: it never
+                    // advances `col` and never triggers a wrap on its own.
+                    if cw > 0 && col + cw > width {
                         lines.push(String::new());
                         col = 0;
                     }
                     lines.last_mut().unwrap().push(c);
-                    col += 1;
+                    col += cw;
                 }
             }
         }
@@ -347,5 +353,45 @@ mod tests {
         type_str(&mut e, "foo bar");
         e.feed_key(ctrl('w'));
         assert_eq!(e.content(), "foo ");
+    }
+
+    /// Wide (CJK) glyphs are 2 display columns each: wrapping and cursor
+    /// placement must follow columns, not chars, or the box overflows and the
+    /// terminal cursor lands on the wrong cell.
+    ///
+    /// Regression: both `desired_rows` and `render` counted `chars().count()`,
+    /// so 6 double-width glyphs (12 columns) were treated as fitting a
+    /// 10-column line with room to spare.
+    #[test]
+    fn wide_glyphs_wrap_by_display_width_and_place_the_cursor_on_the_right_cell() {
+        use crate::TuiRender;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::{Position, Rect};
+
+        let mut e = PlainEngine::new();
+        // Six wide glyphs = 12 display columns. At width 10, 5 fit the first
+        // row (10 columns exactly) and the 6th wraps — not "6 chars fit in
+        // 10", which the old char-counting wrap would have concluded.
+        type_str(&mut e, "国国国国国国");
+        assert_eq!(
+            e.desired_rows(10, 5),
+            2,
+            "5 glyphs (10 cols) fit the first row; the 6th wraps to a second"
+        );
+
+        let area = Rect::new(0, 0, 10, 5);
+        let mut term = Terminal::new(TestBackend::new(10, 5)).unwrap();
+        term.draw(|f| e.render(f, area)).unwrap();
+
+        // Cursor sits right after the 6th glyph: row 1 (the wrapped row),
+        // column 2 (past the one wide glyph that landed there). Counting
+        // chars instead of columns would place it at row 0, column 6 —
+        // inside the first row, and on the wrong cell entirely.
+        assert_eq!(
+            term.get_cursor_position().unwrap(),
+            Position::new(2, 1),
+            "cursor should land on the wrapped row, 2 columns in"
+        );
     }
 }

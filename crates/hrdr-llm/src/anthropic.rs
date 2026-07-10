@@ -37,12 +37,19 @@ pub(crate) const API_VERSION: &str = "2023-06-01";
 /// history. When `cache == Ephemeral`, `cache_control` breakpoints are placed on
 /// the last system block, the last tool, and the last content block of the last
 /// message (Anthropic allows ≤4; we use ≤3).
+///
+/// `top_p` and `stop` map the corresponding [`crate::RequestParams`] fields onto
+/// the Messages API's `top_p` / `stop_sequences`. `seed` has no equivalent on
+/// this endpoint (the Messages API doesn't support a determinism seed at all)
+/// and is intentionally not threaded through here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_body(
     model: &str,
     max_tokens: u32,
     effort: Option<&str>,
     temperature: Option<f32>,
+    top_p: Option<f32>,
+    stop: &[String],
     cache: CacheMode,
     ttl_1h: bool,
     messages: &[ChatMessage],
@@ -60,7 +67,8 @@ pub(crate) fn build_body(
 
     // Extended thinking: an effort level turns on a thinking budget (which fits
     // inside `max_tokens`). Anthropic requires the temperature to default to 1
-    // while thinking, so `temperature` is only sent when thinking is off.
+    // and forbids `top_p` while thinking, so both are only sent when thinking
+    // is off.
     match thinking_budget(effort, max_tokens) {
         Some(budget) => {
             body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
@@ -69,7 +77,14 @@ pub(crate) fn build_body(
             if let Some(t) = temperature {
                 body["temperature"] = json!(t);
             }
+            if let Some(p) = top_p {
+                body["top_p"] = json!(p);
+            }
         }
+    }
+
+    if !stop.is_empty() {
+        body["stop_sequences"] = json!(stop);
     }
 
     if !system.is_empty() {
@@ -202,8 +217,17 @@ fn assistant_blocks(m: &ChatMessage) -> Vec<Value> {
         blocks.push(json!({ "type": "text", "text": t }));
     }
     for call in m.tool_calls.iter().flatten() {
-        let input: Value =
-            serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| json!({}));
+        // Normally `arguments` is JSON produced by a prior tool_use block (ours
+        // or a round-tripped OpenAI-backend call), so this parses cleanly. If it
+        // doesn't — a malformed/non-JSON args string — silently rewriting the
+        // call to `{}` would erase the model's original (if broken) intent from
+        // history and could look like the tool was called with no arguments at
+        // all. Preserve the original text instead, as a JSON *string* value:
+        // Anthropic's schema expects `input` to be an object, so this will
+        // likely still fail validation on resend, but that failure is honest
+        // and visible rather than a silent, confusing rewrite.
+        let input: Value = serde_json::from_str(&call.function.arguments)
+            .unwrap_or_else(|_| json!(call.function.arguments));
         blocks.push(json!({
             "type": "tool_use",
             "id": call.id,
@@ -239,6 +263,8 @@ pub(crate) async fn chat_stream(
     max_tokens: u32,
     effort: Option<&str>,
     temperature: Option<f32>,
+    top_p: Option<f32>,
+    stop: &[String],
     cache: CacheMode,
     ttl_1h: bool,
     extra_headers: &[(String, String)],
@@ -250,6 +276,8 @@ pub(crate) async fn chat_stream(
         max_tokens,
         effort,
         temperature,
+        top_p,
+        stop,
         cache,
         ttl_1h,
         messages,
@@ -462,13 +490,19 @@ fn map_event(
                         .and_then(|d| d.get("partial_json"))
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    let slot = tool_slot.get(&idx).copied().unwrap_or(0);
-                    Ok(Some(tool_call_chunk(
-                        slot,
-                        None,
-                        None,
-                        Some(frag.to_string()),
-                    )))
+                    // An unknown block index (no matching `content_block_start`
+                    // recorded it) must not silently default to tool slot 0 —
+                    // that would corrupt tool 0's arguments with a stray
+                    // fragment belonging to a different block. Ignore the delta.
+                    match tool_slot.get(&idx).copied() {
+                        Some(slot) => Ok(Some(tool_call_chunk(
+                            slot,
+                            None,
+                            None,
+                            Some(frag.to_string()),
+                        ))),
+                        None => Ok(None),
+                    }
                 }
                 _ => Ok(None),
             }
@@ -621,6 +655,8 @@ mod tests {
             1024,
             None,
             None,
+            None,
+            &[],
             CacheMode::Off,
             false,
             &msgs,
@@ -661,6 +697,8 @@ mod tests {
             512,
             None,
             None,
+            None,
+            &[],
             CacheMode::Off,
             false,
             &[user("go"), assistant, result],
@@ -686,7 +724,18 @@ mod tests {
             ChatMessage::tool_result("t1", "one"),
             ChatMessage::tool_result("t2", "two"),
         ];
-        let body = build_body("claude", 256, None, None, CacheMode::Off, false, &msgs, &[]);
+        let body = build_body(
+            "claude",
+            256,
+            None,
+            None,
+            None,
+            &[],
+            CacheMode::Off,
+            false,
+            &msgs,
+            &[],
+        );
         let m = body["messages"].as_array().unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0]["content"].as_array().unwrap().len(), 2);
@@ -704,6 +753,8 @@ mod tests {
             256,
             None,
             None,
+            None,
+            &[],
             CacheMode::Off,
             false,
             &[user("go")],
@@ -724,6 +775,8 @@ mod tests {
             256,
             None,
             None,
+            None,
+            &[],
             CacheMode::Ephemeral,
             false,
             &[sys("s"), user("hi")],
@@ -744,6 +797,8 @@ mod tests {
             256,
             None,
             None,
+            None,
+            &[],
             CacheMode::Off,
             false,
             &[sys("s"), user("hi")],
@@ -765,6 +820,8 @@ mod tests {
             8192,
             None,
             Some(0.3),
+            None,
+            &[],
             CacheMode::Off,
             false,
             &[user("hi")],
@@ -780,6 +837,8 @@ mod tests {
             8192,
             Some("high"),
             Some(0.3),
+            None,
+            &[],
             CacheMode::Off,
             false,
             &[user("hi")],
@@ -789,6 +848,113 @@ mod tests {
         let budget = think["thinking"]["budget_tokens"].as_u64().unwrap() as u32;
         assert!((1024..8192).contains(&budget), "budget {budget}");
         assert!(think.get("temperature").is_none());
+    }
+
+    #[test]
+    fn top_p_and_stop_sequences_map_onto_messages_api() {
+        // top_p is sent when thinking is off (temperature path).
+        let body = build_body(
+            "claude",
+            8192,
+            None,
+            None,
+            Some(0.5),
+            &["STOP".to_string(), "END".to_string()],
+            CacheMode::Off,
+            false,
+            &[user("hi")],
+            &[],
+        );
+        let p = body["top_p"].as_f64().unwrap();
+        assert!((p - 0.5).abs() < 1e-6, "top_p {p}");
+        assert_eq!(body["stop_sequences"], json!(["STOP", "END"]));
+
+        // top_p is withheld while extended thinking is enabled (Anthropic
+        // forbids setting it alongside `thinking`), same as temperature.
+        let thinking_body = build_body(
+            "claude",
+            8192,
+            Some("high"),
+            None,
+            Some(0.5),
+            &[],
+            CacheMode::Off,
+            false,
+            &[user("hi")],
+            &[],
+        );
+        assert!(thinking_body.get("top_p").is_none());
+
+        // No stop sequences configured → key omitted entirely.
+        let no_stop = build_body(
+            "claude",
+            256,
+            None,
+            None,
+            None,
+            &[],
+            CacheMode::Off,
+            false,
+            &[user("hi")],
+            &[],
+        );
+        assert!(no_stop.get("stop_sequences").is_none());
+    }
+
+    #[test]
+    fn malformed_tool_call_arguments_preserved_as_string_not_emptied() {
+        // A non-JSON `arguments` string must not be silently rewritten to `{}`
+        // (which would erase the model's original intent from history); it is
+        // preserved as a JSON string value instead.
+        let assistant = ChatMessage {
+            role: Role::Assistant,
+            content: None,
+            reasoning_content: None,
+            anthropic_thinking_blocks: vec![],
+            tool_calls: Some(vec![ToolCall {
+                id: "toolu_bad".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: "not valid json".into(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        };
+        let blocks = assistant_blocks(&assistant);
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["input"], json!("not valid json"));
+    }
+
+    #[test]
+    fn input_json_delta_for_unknown_block_index_is_ignored() {
+        // A content_block_delta arriving for an index that never got a
+        // content_block_start (so `tool_slot` has no entry) must be dropped,
+        // not routed to tool slot 0 (which would corrupt an unrelated tool's
+        // arguments with a stray fragment).
+        let mut slot = std::collections::HashMap::new();
+        let mut next = 0usize;
+        let mut thinking: std::collections::HashMap<u64, (String, String)> =
+            std::collections::HashMap::new();
+        let mut redacted: Vec<(u64, Value)> = vec![];
+        let mut stop_seen = false;
+
+        // No content_block_start recorded for index 5.
+        let ev = json!({"type":"content_block_delta","index":5,"delta":{"type":"input_json_delta","partial_json":"{\"x\""}});
+        let out = map_event(
+            &ev,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut stop_seen,
+        )
+        .unwrap();
+        assert!(
+            out.is_none(),
+            "unknown block index must be dropped, not routed to slot 0"
+        );
     }
 
     #[test]
@@ -1066,6 +1232,8 @@ mod tests {
             4096,
             None,
             None,
+            None,
+            &[],
             CacheMode::Off,
             false,
             &history,

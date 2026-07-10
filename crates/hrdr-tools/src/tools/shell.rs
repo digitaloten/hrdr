@@ -97,8 +97,14 @@ async fn run_streamed_command(
     let mut total_bytes: usize = 0;
     let mut total_lines: usize = 0;
 
-    // Overflow file: opened lazily once output starts. Written line-by-line so
-    // the full output is on disk even for huge commands.
+    // Overflow file: created only once output actually exceeds the display
+    // caps — most commands never touch it. Until that point every ingested
+    // line lives verbatim in `head` (it only starts spilling into the `tail`
+    // ring once `head` reaches `head_budget`, which is sized to exactly
+    // `ctx.max_output` — the same threshold that trips the byte cap below), so
+    // the moment we first cross a cap, `head` already holds the complete
+    // output so far and can be dumped in one write with nothing missing.
+    // Every line after that point is appended as it arrives, same as before.
     let overflow_dir = crate::tool_output_dir();
     let mut overflow_path: Option<std::path::PathBuf> = None;
     let mut overflow_file: Option<std::fs::File> = None;
@@ -108,31 +114,6 @@ async fn run_streamed_command(
             let line: &str = $line;
             // Stream to the UI (unchanged from current behaviour).
             ctx.emit(format!("{line}\n"));
-
-            // Write to overflow file (opened lazily on first line).
-            if overflow_file.is_none() {
-                let _ = std::fs::create_dir_all(&overflow_dir);
-                let stamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let p = overflow_dir.join(format!("bash-{stamp}-{seq}.txt"));
-                if let Ok(f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .open(&p)
-                {
-                    overflow_path = Some(p);
-                    overflow_file = Some(f);
-                }
-            }
-            if let Some(f) = &mut overflow_file {
-                use std::io::Write as _;
-                let _ = f.write_all(line.as_bytes());
-                let _ = f.write_all(b"\n");
-            }
 
             total_lines += 1;
             total_bytes += line.len() + 1; // +1 for the newline
@@ -153,6 +134,42 @@ async fn run_streamed_command(
                         break;
                     }
                 }
+            }
+
+            let over_cap = total_bytes > ctx.max_output || total_lines > ctx.max_output_lines;
+            if overflow_file.is_none() {
+                if over_cap {
+                    // First time over a cap: open the file and seed it with
+                    // everything ingested so far (verbatim in `head`) in one
+                    // write, rather than having written every line from the
+                    // start regardless of whether it would ever be needed.
+                    let _ = std::fs::create_dir_all(&overflow_dir);
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    static COUNTER: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let p = overflow_dir.join(format!("bash-{stamp}-{seq}.txt"));
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .open(&p)
+                    {
+                        use std::io::Write as _;
+                        let _ = f.write_all(head.as_bytes());
+                        overflow_path = Some(p);
+                        overflow_file = Some(f);
+                    }
+                }
+            } else if let Some(f) = &mut overflow_file {
+                // Already over the cap and the file is open: keep it in sync
+                // one line at a time (it was already seeded with everything
+                // up to the line that tripped `over_cap` above).
+                use std::io::Write as _;
+                let _ = f.write_all(line.as_bytes());
+                let _ = f.write_all(b"\n");
             }
         }};
     }

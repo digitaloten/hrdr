@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -85,7 +86,7 @@ pub(crate) async fn http_request(
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|c| c.contains("text/event-stream"));
-    let body = resp.text().await.context("reading response")?;
+    let body = read_body_capped(resp).await?;
     if !status.is_success() {
         bail!("HTTP {status}: {}", truncate(body.trim(), 500));
     }
@@ -94,6 +95,40 @@ pub(crate) async fn http_request(
     } else {
         serde_json::from_str(&body).with_context(|| format!("decoding response: {body}"))
     }
+}
+
+/// Read an HTTP response body under both a size cap
+/// ([`super::MAX_MCP_MESSAGE_BYTES`]) and a wall-clock cap
+/// ([`super::MAX_BODY_READ_TIME`]) — `resp.text().await` alone has neither, so
+/// a hostile or hung MCP server could stream unbounded data, or a connection
+/// that never finishes, into this process. MCP responses are small JSON-RPC
+/// envelopes, so both limits are generous.
+async fn read_body_capped(resp: reqwest::Response) -> Result<String> {
+    let cap = super::MAX_MCP_MESSAGE_BYTES;
+    let read = async move {
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("reading response body")?;
+            push_capped_or_err(&mut buf, &chunk, cap)?;
+        }
+        Ok::<String, anyhow::Error>(String::from_utf8_lossy(&buf).into_owned())
+    };
+    match tokio::time::timeout(super::MAX_BODY_READ_TIME, read).await {
+        Ok(result) => result,
+        Err(_) => bail!("timed out reading response body"),
+    }
+}
+
+/// Append `chunk` to `buf`, refusing once the total would exceed `cap` — the
+/// size-cap logic behind [`read_body_capped`], split out so it's unit-testable
+/// without a live connection.
+fn push_capped_or_err(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) -> Result<()> {
+    if buf.len() + chunk.len() > cap {
+        bail!("response body exceeded the {cap}-byte cap");
+    }
+    buf.extend_from_slice(chunk);
+    Ok(())
 }
 
 /// Fire-and-forget HTTP POST (for notifications).
@@ -179,4 +214,24 @@ pub(crate) fn parse_sse_for_id(body: &str, id: u64) -> Result<Value> {
         }
     }
     bail!("no response for request {id} in the SSE stream")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The size-cap guard behind an MCP HTTP response read: within the cap,
+    /// chunks accumulate; the chunk that would push the total past `cap` is
+    /// refused with a clear error rather than silently buffered.
+    #[test]
+    fn push_capped_or_err_bounds_response_body_size() {
+        let mut buf = Vec::new();
+        assert!(push_capped_or_err(&mut buf, b"hello", 10).is_ok());
+        assert!(push_capped_or_err(&mut buf, b"world", 10).is_ok());
+        assert_eq!(buf, b"helloworld");
+        let err = push_capped_or_err(&mut buf, b"!", 10).unwrap_err();
+        assert!(err.to_string().contains("exceeded"), "{err}");
+        // The buffer isn't left half-mutated by the refused push.
+        assert_eq!(buf, b"helloworld");
+    }
 }

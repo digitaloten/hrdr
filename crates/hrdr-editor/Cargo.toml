@@ -16,3 +16,4 @@ hjkl-engine-tui.workspace = true
 hjkl-clipboard.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+unicode-width.workspace = true

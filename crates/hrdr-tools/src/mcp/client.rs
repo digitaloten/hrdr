@@ -65,17 +65,36 @@ impl McpClient {
         {
             let pending = pending.clone();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-                        continue; // skip non-JSON (some servers emit banners)
-                    };
-                    if let Some(id) = msg.get("id").and_then(Value::as_u64)
-                        && let Some(tx) = pending.lock().await.remove(&id)
-                    {
-                        let _ = tx.send(msg);
+                let mut reader = BufReader::new(stdout);
+                let mut buf: Vec<u8> = Vec::new();
+                loop {
+                    buf.clear();
+                    match reader.read_until(b'\n', &mut buf).await {
+                        Ok(0) => break, // EOF
+                        Err(_) => break,
+                        Ok(_) => {
+                            // Bound how large a single line we'll hand to
+                            // `serde_json` — a misbehaving/hostile server with
+                            // no valid JSON-RPC framing must not grow this
+                            // process's memory without limit. Oversized lines
+                            // are dropped rather than parsed.
+                            if buf.len() > super::MAX_MCP_MESSAGE_BYTES {
+                                continue;
+                            }
+                            let Ok(line) = std::str::from_utf8(&buf) else {
+                                continue; // not valid UTF-8: not JSON either
+                            };
+                            let Ok(msg) = serde_json::from_str::<Value>(line.trim_end()) else {
+                                continue; // skip non-JSON (some servers emit banners)
+                            };
+                            if let Some(id) = msg.get("id").and_then(Value::as_u64)
+                                && let Some(tx) = pending.lock().await.remove(&id)
+                            {
+                                let _ = tx.send(msg);
+                            }
+                            // notifications + server-initiated requests are ignored (v1).
+                        }
                     }
-                    // notifications + server-initiated requests are ignored (v1).
                 }
                 pending.lock().await.clear(); // closing drops senders → callers error
             });

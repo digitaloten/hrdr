@@ -95,8 +95,14 @@ pub fn agent_mention_message(agent: &str, body: &str) -> String {
     )
 }
 
+/// Size cap applied to file contents attached to an outgoing message —
+/// `@file` mentions (truncated past this) and `/add` (rejected past this).
+/// Keeps a single stray `@huge.log` or `/add huge.log` from blowing the
+/// context window (or, for `/add`, silently ballooning the input past what
+/// the user can see they're about to send).
+pub const MAX_ATTACH_BYTES: usize = 100 * 1024;
+
 pub fn expand_mentions(input: &str, cwd: &Path) -> String {
-    const MAX_BYTES: usize = 100 * 1024;
     let mut attached: Vec<(String, String)> = Vec::new();
     for raw in input.split_whitespace() {
         let Some(rel) = raw.strip_prefix('@') else {
@@ -108,8 +114,8 @@ pub fn expand_mentions(input: &str, cwd: &Path) -> String {
         }
         let path = cwd.join(rel);
         if let Ok(text) = std::fs::read_to_string(&path) {
-            let text = if text.len() > MAX_BYTES {
-                let end = floor_char_boundary(&text, MAX_BYTES);
+            let text = if text.len() > MAX_ATTACH_BYTES {
+                let end = floor_char_boundary(&text, MAX_ATTACH_BYTES);
                 format!("{}\n…[truncated]", &text[..end])
             } else {
                 text
@@ -150,8 +156,14 @@ pub use hrdr_tools::resolve_under;
 /// Display form of `cwd`, with the home directory collapsed to `~`.
 pub fn display_dir(cwd: &Path) -> String {
     let s = cwd.to_string_lossy().to_string();
+    // A prefix match alone isn't enough: `HOME=/home/mx` would strip the
+    // `/home/mx` off `/home/mxaddict/proj` too, collapsing it to the bogus
+    // `~addict/proj`. Only collapse when the match lands on a path boundary —
+    // the prefix is the whole string, or the next char is a separator.
     if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
         && let Some(rest) = s.strip_prefix(&home)
+        && (rest.is_empty() || rest.starts_with('/'))
     {
         return format!("~{rest}");
     }
@@ -672,6 +684,48 @@ mod tests {
             !files.iter().any(|f| f == "sub/ignored.txt"),
             "nested sub/.gitignore not honored: {files:?}"
         );
+    }
+
+    /// Global lock so `display_dir`'s HOME-dependent tests don't race each
+    /// other (`std::env::set_var` isn't thread-safe across concurrently
+    /// running tests).
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with `HOME` set to `home` for the duration, restoring whatever
+    /// was there before.
+    fn with_home(home: &str, f: impl FnOnce()) {
+        let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", home) };
+        f();
+        unsafe {
+            match &prev {
+                Some(p) => std::env::set_var("HOME", p),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn display_dir_collapses_home_at_a_path_boundary() {
+        with_home("/home/mx", || {
+            assert_eq!(display_dir(Path::new("/home/mx")), "~");
+            assert_eq!(display_dir(Path::new("/home/mx/proj")), "~/proj");
+        });
+    }
+
+    /// Regression: a bare prefix match turned `/home/mxaddict/proj` (a sibling
+    /// directory that merely starts with the same characters as HOME) into
+    /// the bogus `~addict/proj` — `mx` is not a path component of
+    /// `mxaddict`, so it must not collapse at all.
+    #[test]
+    fn display_dir_does_not_collapse_a_sibling_directory_sharing_a_prefix() {
+        with_home("/home/mx", || {
+            assert_eq!(
+                display_dir(Path::new("/home/mxaddict/proj")),
+                "/home/mxaddict/proj"
+            );
+        });
     }
 }
 

@@ -46,6 +46,12 @@ impl Tool for EditTool {
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: EditArgs = crate::tool_args("edit", args)?;
+        if a.old_string.is_empty() {
+            bail!(
+                "`old_string` is empty — that matches at every position in the file, and with \
+                 `replace_all` would corrupt it; pass the exact text to replace"
+            );
+        }
         let path = ctx.resolve(&a.path);
         ctx.ensure_within_cwd(&path)?;
         if !ctx.was_read(&path) {

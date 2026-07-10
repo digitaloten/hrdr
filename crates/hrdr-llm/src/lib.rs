@@ -10,7 +10,7 @@ mod client;
 pub mod sse;
 mod types;
 
-pub use client::{ChatError, ChatErrorKind, ChatStream, Client};
+pub use client::{ChatError, ChatErrorKind, ChatStream, Client, url_host};
 pub use sse::{SseDecoder, SseEvent};
 pub use types::{
     Accumulator, CacheMode, ChatChunk, ChatMessage, ChatRequest, ChunkChoice, Delta, FunctionCall,

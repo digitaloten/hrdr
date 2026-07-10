@@ -17,6 +17,12 @@ pub(crate) mod write;
 /// Hard cap on a rendered source line, so one minified file can't blow context.
 pub(crate) const MAX_LINE: usize = 2_000;
 pub(crate) const DEFAULT_READ_LIMIT: usize = 2_000;
+/// Hard cap on the file size `read` will load into memory. Past this, even
+/// `offset`/`limit` paging isn't worth it — `read_to_string` would buffer the
+/// whole file first regardless of how few lines are requested, so a
+/// multi-gigabyte (or special/device) file would stall or OOM the process
+/// before a single line comes back. Generous enough for any real source file.
+pub(crate) const MAX_READ_BYTES: u64 = 50 * 1024 * 1024;
 pub(crate) const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 /// Hard cap on a single output line accumulated from bash/powershell; prevents
 /// a minified-file line from blowing the per-turn context.
@@ -268,6 +274,44 @@ mod tests {
         assert!(out.contains("     2\t2"), "line 2 missing: {out}");
         assert!(out.contains("     3\t3"), "line 3 missing: {out}");
         assert!(!out.contains("     4\t"), "line 4 should be skipped");
+    }
+
+    /// A file over the size cap is refused via a fast `metadata` stat, before
+    /// `read_to_string` would load it whole. Uses a sparse file (`set_len`,
+    /// no actual disk written) to hit the cap without allocating 50+ MiB in
+    /// the test itself.
+    #[tokio::test]
+    async fn read_refuses_a_file_over_the_size_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.bin");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_READ_BYTES + 1).unwrap(); // sparse: no real bytes written
+        drop(f);
+        let c = ctx(dir.path().to_path_buf());
+        let err = ReadTool
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}), &c)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    /// A file comfortably under the cap is unaffected by the new pre-check.
+    #[tokio::test]
+    async fn read_allows_files_well_under_the_size_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big_ish.txt");
+        // A few MB — nowhere near the 50 MiB cap, but big enough to prove the
+        // new metadata pre-check doesn't interfere with normal reads.
+        std::fs::write(&path, "x".repeat(2 * 1024 * 1024)).unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let out = ReadTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "limit": 1}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains('x'), "{out}");
     }
 
     // ---- write ----
@@ -544,6 +588,28 @@ mod tests {
         assert!(result.is_err(), "expected error for not-found old_string");
     }
 
+    /// An empty `old_string` would match at every position — with
+    /// `replace_all` that corrupts the file (every gap gets `new_string`
+    /// inserted). Refused up front instead.
+    #[tokio::test]
+    async fn edit_rejects_empty_old_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "abc").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        c.mark_read(&path);
+        let err = EditTool
+            .execute(
+                serde_json::json!({"path": path.to_str().unwrap(), "old_string": "", "new_string": "X", "replace_all": true}),
+                &c,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
+        // The file must be untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "abc");
+    }
+
     #[tokio::test]
     async fn edit_non_unique_without_replace_all_returns_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -758,6 +824,25 @@ mod tests {
             .unwrap();
         assert!(out.contains("early"), "partial output missing: {out}");
         assert!(out.contains("timed out"), "timeout marker missing: {out}");
+    }
+
+    /// Small output that never crosses either cap must not mention (or need)
+    /// an overflow file at all — the overflow file is created only once
+    /// output actually exceeds the caps, not eagerly on the first line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_small_output_has_no_overflow_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let out = BashTool
+            .execute(serde_json::json!({"command": "echo tiny"}), &c)
+            .await
+            .unwrap();
+        assert!(out.contains("tiny"));
+        assert!(
+            !out.contains("full output") && !out.contains("saved to"),
+            "small output should not reference an overflow file: {out}"
+        );
     }
 
     /// Verify that run_streamed_command caps in-memory usage and produces a

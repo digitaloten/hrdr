@@ -3403,3 +3403,332 @@ async fn both_banners_render_through_the_same_path() {
     assert_eq!((fg, bg), (Color::White, h.app.theme.error));
     assert!(m.contains(ratatui::style::Modifier::BOLD), "bold");
 }
+
+// ---------------------------------------------------------------------------
+// Autosave on quit/cancel mid-turn
+// ---------------------------------------------------------------------------
+
+/// Pump the turn channel until a streamed chunk of assistant text has landed
+/// in the transcript, then stop — proof that the agent already pushed the
+/// user message into its own history (that happens synchronously, before any
+/// network I/O) and that a partial reply is now visible, without waiting for
+/// the turn to actually finish.
+async fn pump_until_partial_reply(h: &mut Harness) {
+    loop {
+        let msg = h.rx.recv().await.expect("the mock server always replies");
+        h.app.on_turn_msg(msg);
+        if h.app
+            .state
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::Assistant(t) if t.contains("partial")))
+        {
+            return;
+        }
+    }
+}
+
+/// Cancelling a running turn (Ctrl+C, Esc) autosaves immediately: the user's
+/// message and whatever partial reply had streamed in before the cancel must
+/// reach disk, since no `Done` will ever arrive to trigger the usual
+/// end-of-turn autosave.
+///
+/// Regression: `cancel_turn` cleared the turn state and dropped the queue but
+/// never called `autosave` — a turn cancelled mid-stream vanished from the
+/// session file entirely.
+#[tokio::test]
+async fn cancelling_a_turn_autosaves_the_in_progress_transcript() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![MockReply::MultiChunk(vec![
+        "partial ".into(),
+        "reply".into(),
+    ])])
+    .await;
+
+    h.type_str("investigate the bug");
+    h.press(KeyCode::Enter);
+    assert!(h.app.running, "the turn is in flight");
+    pump_until_partial_reply(&mut h).await;
+
+    h.app.cancel_turn();
+    assert!(!h.app.running, "cancelled");
+
+    let id = h
+        .app
+        .state
+        .id
+        .clone()
+        .expect("cancel_turn autosaved and assigned a session id");
+    let loaded = hrdr_app::Session::load(&h.app.current_cwd(), &id).expect("session file written");
+    assert!(
+        loaded
+            .state
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::User(t) if t == "investigate the bug")),
+        "the user's message survives the cancel"
+    );
+    assert!(
+        loaded
+            .state
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::Assistant(t) if t.contains("partial"))),
+        "the partial reply survives the cancel"
+    );
+}
+
+/// Quitting mid-turn (Ctrl+Q, double Ctrl+C, Ctrl+D on empty input, `/exit`)
+/// must not lose the in-progress transcript either: `App::request_quit`
+/// cancels the running turn first (which autosaves) before arming
+/// `should_quit`.
+///
+/// Regression: every quit path set `should_quit` directly, so the running
+/// turn's background task — and the visible message + partial reply it
+/// carried — was simply abandoned, and nothing ever autosaved it.
+#[tokio::test]
+async fn quitting_mid_turn_autosaves_the_in_progress_transcript() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![MockReply::MultiChunk(vec![
+        "partial ".into(),
+        "reply".into(),
+    ])])
+    .await;
+
+    h.type_str("investigate the bug");
+    h.press(KeyCode::Enter);
+    pump_until_partial_reply(&mut h).await;
+
+    // Ctrl+Q: an immediate, deliberate quit while a turn is running.
+    h.app
+        .on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+    assert!(h.app.should_quit, "Ctrl+Q arms the quit");
+    assert!(!h.app.running, "the in-flight turn was cancelled first");
+
+    let id = h
+        .app
+        .state
+        .id
+        .clone()
+        .expect("quitting mid-turn autosaved and assigned a session id");
+    let loaded = hrdr_app::Session::load(&h.app.current_cwd(), &id).expect("session file written");
+    assert!(
+        loaded
+            .state
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::User(t) if t == "investigate the bug")),
+        "the user's message survives the quit"
+    );
+    assert!(
+        loaded
+            .state
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::Assistant(t) if t.contains("partial"))),
+        "the partial reply survives the quit"
+    );
+}
+
+/// The scrollback cap evicts the oldest *conversation* entries but must never
+/// touch the intro block (`Entry::header()` + the welcome/config `Notice`s
+/// pushed in `App::new`) — that banner should survive no matter how long the
+/// session runs.
+///
+/// Regression: `prune_scrollback` counted leading `EntryKind::System`
+/// entries as the protected head, but the intro is `Header` + `Notice`, so
+/// `head` was always 0 and the welcome banner was the very first thing
+/// evicted once the transcript grew past the cap.
+#[tokio::test]
+async fn pruning_keeps_the_header_banner_not_a_leading_system_entry() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.scrollback = 5;
+    assert!(
+        matches!(h.app.state.transcript[0].kind, EntryKind::Header),
+        "the header opens every session"
+    );
+
+    for i in 0..20 {
+        h.app.push_entry(Entry::system(format!("entry {i}")));
+    }
+
+    assert!(
+        matches!(h.app.state.transcript[0].kind, EntryKind::Header),
+        "the header banner must survive pruning: {:?}",
+        h.app.state.transcript[0].kind
+    );
+    assert!(
+        h.app.state.transcript.len() <= 5,
+        "the scrollback cap is enforced"
+    );
+    assert!(
+        !h.app
+            .state
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::System(s) if s == "entry 0")),
+        "the oldest conversation entry was evicted"
+    );
+    assert!(
+        h.app
+            .state
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::System(s) if s == "entry 19")),
+        "the newest conversation entry is kept"
+    );
+}
+
+/// In vim mode, Ctrl+D on an empty input line quits — as the welcome banner
+/// advertises ("Ctrl+D on an empty line") — even in Normal mode, where Ctrl+D
+/// would otherwise scroll the transcript half a page. With a non-empty draft,
+/// Normal-mode Ctrl+D still scrolls as before.
+///
+/// Regression: the Normal-mode scroll arm for Ctrl+D was checked before the
+/// empty-input quit arm, so Normal mode always won and the advertised
+/// "Ctrl+D on an empty line" quit never fired there.
+#[tokio::test]
+async fn vim_normal_mode_ctrl_d_quits_only_on_empty_input() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.editor = Box::new(hrdr_editor::VimEngine::new());
+    assert_eq!(
+        h.app.editor.mode_label(),
+        "NORMAL",
+        "vim starts in Normal mode"
+    );
+
+    // Non-empty draft: Normal-mode Ctrl+D scrolls (down — it *decreases* the
+    // from-bottom offset), same as always. Start scrolled up so the decrease
+    // is observable.
+    h.app.editor.set_content("a draft in progress");
+    h.app.transcript_height = 20;
+    h.app.scroll_offset = 10;
+    h.app
+        .on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert!(!h.app.should_quit, "a non-empty draft must not quit");
+    assert!(h.app.scroll_offset < 10, "Normal-mode Ctrl+D still scrolls");
+
+    // Empty input: Ctrl+D quits, matching the welcome banner.
+    h.app.editor.set_content("");
+    h.app.scroll_offset = 0;
+    h.app
+        .on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert!(
+        h.app.should_quit,
+        "Ctrl+D on an empty line must quit even in Normal mode"
+    );
+}
+
+/// A mistyped slash command (`/exprot`) is caught and reported instead of
+/// silently becoming a full model turn — it's shaped like an attempted
+/// command (a single leading `/word` token, letters/digits/hyphens only),
+/// just not a registered one.
+///
+/// Regression: `handle_slash` returning `false` for an unrecognized command
+/// fell straight through to `spawn_turn`, so a typo silently became a chat
+/// message sent to the model.
+#[tokio::test]
+async fn an_unrecognized_slash_command_is_reported_not_sent_to_the_model() {
+    let mut h = Harness::new(vec![]).await;
+
+    h.type_str("/exprot");
+    h.press(KeyCode::Enter);
+
+    assert!(!h.app.running, "no turn should have been spawned");
+    assert!(
+        !h.app
+            .state
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::User(_))),
+        "the typo must not enter the conversation as a user message"
+    );
+    let screen = h.render();
+    assert!(
+        screen.contains("unknown command"),
+        "should report the typo:\n{screen}"
+    );
+}
+
+/// A message that merely starts with `/` but isn't command-shaped (a real
+/// path, with a further `/` in it) still goes to the model as usual — the
+/// unknown-command guard must not swallow legitimate messages.
+#[tokio::test]
+async fn a_path_like_message_starting_with_slash_still_sends() {
+    let mut h = Harness::new(vec![MockReply::Text("looks fine to me".into())]).await;
+    h.submit("/etc/hosts looks wrong, can you check?").await;
+
+    assert!(
+        h.app
+            .state
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::User(t) if t.starts_with("/etc/hosts"))),
+        "a path-shaped message should be sent as a normal chat message"
+    );
+}
+
+/// The `/login` wizard's API-key prompt renders the input pane masked — every
+/// char hidden behind `•` — even though the editor buffer (and the wizard)
+/// still hold the real text. The provider-pick step, which isn't secret,
+/// renders normally.
+///
+/// Regression: the key was already kept out of history/transcript/session,
+/// but was fully visible on screen as it was typed.
+#[tokio::test]
+async fn login_key_entry_masks_the_input_pane() {
+    let mut h = Harness::new(vec![]).await;
+
+    h.type_str("/login");
+    h.press(KeyCode::Enter);
+    assert!(
+        !h.app.masks_input(),
+        "the provider pick isn't secret, so it must render normally"
+    );
+
+    // "openai" is a built-in remote provider, so this advances to the key
+    // prompt rather than finishing the wizard outright.
+    h.type_str("openai");
+    h.press(KeyCode::Enter);
+    assert!(h.app.masks_input(), "the key prompt must mask the input");
+
+    h.type_str("sk-super-secret-value");
+    let screen = h.render();
+    assert!(
+        !screen.contains("sk-super-secret"),
+        "the raw key must never render:\n{screen}"
+    );
+    assert!(
+        screen.contains('•'),
+        "masked bullets should render in its place:\n{screen}"
+    );
+}
+
+/// A transcript whose cumulative wrapped-row count exceeds `u16::MAX` must not
+/// have its scroll math wrap around: `draw_transcript` keeps that accumulator
+/// in `usize` to avoid overflow, but the cast down to ratatui's `u16`-only
+/// scroll type has to saturate, not truncate.
+///
+/// Regression: `let total = *cum.last().unwrap_or(&0) as u16;` (and the other
+/// cast sites) truncated instead of clamping, so a transcript taller than
+/// 65535 rows wrapped `max_scroll` back down to a small, unrelated number —
+/// snapping the scrollbar near the top of a long session instead of pinning
+/// it near the bottom.
+#[tokio::test]
+async fn a_transcript_taller_than_u16_max_rows_does_not_wrap_the_scroll_math() {
+    let mut h = Harness::new(vec![]).await;
+    // A high cap so the transcript really does grow past 65535 rows instead
+    // of being pruned back down.
+    h.app.scrollback = 1_000_000;
+    for i in 0..40_000 {
+        h.app.push_entry(Entry::system(format!("line {i}")));
+    }
+
+    h.render(); // drives draw_transcript, which recomputes app.max_scroll
+
+    assert!(
+        h.app.max_scroll > 60_000,
+        "max_scroll should saturate near u16::MAX for a transcript this tall, got {}",
+        h.app.max_scroll
+    );
+}

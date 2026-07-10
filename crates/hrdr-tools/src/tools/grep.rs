@@ -324,3 +324,59 @@ fn emit_context_windows(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With `context > 0`, a `.env` line adjacent to a match must not leak via
+    /// a `-C` context line (`path-NN-content`) — the secret filter used to
+    /// only recognise `path:NN:` match lines, so the context form rode along
+    /// unfiltered. Exercises the real POSIX-`grep` backend, not just the
+    /// builtin walker (which drops secret files entirely at the walk level).
+    #[tokio::test]
+    async fn context_lines_do_not_leak_env_secrets_via_posix_grep() {
+        if which::which("grep").is_err() {
+            return; // best-effort: exercise the real backend when available
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "BEFORE=1\nAPI_KEY=supersecret\nAFTER=1\n",
+        )
+        .unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let a = GrepArgs {
+            pattern: "API_KEY".to_string(),
+            path: None,
+            glob: None,
+            context: Some(2),
+        };
+        let out = grep_posix(&a, &ctx).await.unwrap();
+        assert!(!out.contains("supersecret"), "{out}");
+        assert!(!out.contains(".env"), "{out}");
+    }
+
+    /// Same guarantee for the pure-Rust builtin fallback (used when neither
+    /// `rg` nor `grep` is installed): it already skips secret files at the
+    /// walk level, but pin it here too so a refactor can't silently regress.
+    #[test]
+    fn context_lines_do_not_leak_env_secrets_via_builtin() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "BEFORE=1\nAPI_KEY=supersecret\nAFTER=1\n",
+        )
+        .unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let a = GrepArgs {
+            pattern: "API_KEY".to_string(),
+            path: None,
+            glob: None,
+            context: Some(2),
+        };
+        let out = grep_builtin(&a, &ctx).unwrap();
+        assert!(!out.contains("supersecret"), "{out}");
+        assert_eq!(out, "(no matches)");
+    }
+}

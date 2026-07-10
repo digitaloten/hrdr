@@ -185,11 +185,15 @@ fn uses_max_completion_tokens(model: &str) -> bool {
         || m.starts_with("gpt-5")
 }
 
-/// Native Anthropic Messages API iff the endpoint host is `api.anthropic.com`.
-/// Anthropic also exposes an OpenAI-compat endpoint, but it can't cache; the
-/// native path is what unlocks prompt caching.
-fn detect_backend(base_url: &str) -> Backend {
-    let host = base_url
+/// The host portion of `base_url` (scheme, userinfo, port, and path stripped).
+///
+/// Handles bracketed IPv6 literals (`http://[::1]:8080/v1` → `::1`): a naive
+/// `rsplit_once(':')` would chop an IPv6 address's internal colons instead of
+/// just the trailing port, mangling the host. This helper is duplicated in
+/// hrdr-agent's `resolve_cache_mode` helpers — keep both in sync (or, better,
+/// have hrdr-agent call this one).
+pub fn url_host(base_url: &str) -> &str {
+    let authority = base_url
         .split("://")
         .nth(1)
         .unwrap_or(base_url)
@@ -199,7 +203,22 @@ fn detect_backend(base_url: &str) -> Backend {
         .rsplit('@')
         .next()
         .unwrap_or("");
-    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    if let Some(rest) = authority.strip_prefix('[') {
+        // Bracketed IPv6 literal: host is everything up to the closing `]`;
+        // a trailing `:port` after the bracket is discarded.
+        return rest.split(']').next().unwrap_or(authority);
+    }
+    authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority)
+}
+
+/// Native Anthropic Messages API iff the endpoint host is `api.anthropic.com`.
+/// Anthropic also exposes an OpenAI-compat endpoint, but it can't cache; the
+/// native path is what unlocks prompt caching.
+fn detect_backend(base_url: &str) -> Backend {
+    let host = url_host(base_url);
     if host == "api.anthropic.com" || host.ends_with(".anthropic.com") {
         Backend::Anthropic
     } else {
@@ -399,6 +418,10 @@ impl Client {
                 self.params.max_tokens.unwrap_or(ANTHROPIC_MAX_TOKENS),
                 self.effort.as_deref(),
                 self.temperature,
+                self.params.top_p,
+                &self.params.stop,
+                // `self.params.seed` is intentionally not passed: the native
+                // Messages API has no determinism-seed equivalent.
                 self.cache,
                 self.cache_1h,
                 &self.extra_headers,
@@ -476,7 +499,29 @@ impl Client {
                     if data == "[DONE]" {
                         return;
                     }
-                    let parsed: ChatChunk = serde_json::from_str(data)
+                    let value: serde_json::Value = serde_json::from_str(data)
+                        .with_context(|| format!("decoding stream event: {data}"))?;
+                    // A mid-stream error object (`{"error":{"message":"..."}}`) would
+                    // otherwise deserialize as an empty `ChatChunk` (every field is
+                    // `#[serde(default)]`), silently swallowing the server's real
+                    // error and letting the stream fall through to the generic
+                    // "incomplete stream" retryable classification below. Surface it
+                    // here instead, as a terminal (non-retryable) error carrying the
+                    // server's message — mirrors the native Anthropic `"error"` event
+                    // handling in `anthropic::map_event`.
+                    if let Some(err_obj) = value.get("error") {
+                        let msg = err_obj
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown error");
+                        Err(ChatError {
+                            status: None,
+                            retry_after: None,
+                            kind: ChatErrorKind::Other,
+                            message: format!("mid-stream error: {msg}"),
+                        })?;
+                    }
+                    let parsed: ChatChunk = serde_json::from_value(value)
                         .with_context(|| format!("decoding stream event: {data}"))?;
                     yield parsed;
                 }
@@ -644,6 +689,110 @@ mod tests {
         );
         assert_eq!(detect_backend("https://api.openai.com/v1"), Backend::OpenAi);
         assert_eq!(detect_backend("http://localhost:8080/v1"), Backend::OpenAi);
+    }
+
+    #[test]
+    fn url_host_handles_bracketed_ipv6_literal() {
+        // A naive `rsplit_once(':')` would chop this into `[:` / `:1]:8080`,
+        // mangling the address. The bracket-aware parse must return the bare
+        // address with the port stripped.
+        assert_eq!(url_host("http://[::1]:8080/v1"), "::1");
+        assert_eq!(url_host("https://[2001:db8::1]/v1"), "2001:db8::1");
+        // Plain hostname + port still works.
+        assert_eq!(url_host("http://localhost:8080/v1"), "localhost");
+        // Anthropic detection must still work through the shared helper.
+        assert_eq!(
+            detect_backend("http://[::1]:8080/v1"),
+            Backend::OpenAi,
+            "an IPv6-literal endpoint must not mis-detect as Anthropic"
+        );
+    }
+
+    /// Minimal in-process HTTP server used only to exercise the SSE decoding
+    /// path in `chat_stream` (mirrors the mock server in hrdr-agent's test
+    /// module, trimmed to a single canned response).
+    async fn serve_once(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            // Read (and discard) the request headers + body; we don't care
+            // about the request shape for this test.
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let headers_end = loop {
+                match stream.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break p + 4;
+                        }
+                    }
+                }
+            };
+            let hdrs = String::from_utf8_lossy(&buf[..headers_end]);
+            let content_len: usize = hdrs
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            let body_so_far = buf.len().saturating_sub(headers_end);
+            let remaining = content_len.saturating_sub(body_so_far);
+            if remaining > 0 {
+                let mut body_buf = vec![0u8; remaining];
+                let _ = stream.read_exact(&mut body_buf).await;
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/event-stream\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {body}"
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+        });
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    #[tokio::test]
+    async fn mid_stream_error_object_is_terminal_not_transient() {
+        // A server that sends a well-formed error object mid-stream, with no
+        // [DONE] sentinel. Before the fix this deserialized as an empty
+        // `ChatChunk` (every field `#[serde(default)]`) and the stream fell
+        // through to the generic "incomplete stream" transient error,
+        // swallowing the real message.
+        let body = "data: {\"error\":{\"message\":\"rate limited by upstream\"}}\n\n";
+        let base_url = serve_once(body).await;
+
+        let client = Client::new(base_url, None, "test-model");
+        let mut stream = client.chat_stream(&[], &[]).await.unwrap();
+        let first = stream
+            .next()
+            .await
+            .expect("stream must yield the error, not end silently");
+        let err = first.expect_err("mid-stream error object must surface as Err");
+        let chat_err = err
+            .downcast_ref::<ChatError>()
+            .expect("error must be a typed ChatError");
+        assert_eq!(
+            chat_err.kind,
+            ChatErrorKind::Other,
+            "a server-reported mid-stream error must not be classified transient"
+        );
+        assert!(
+            chat_err.message.contains("rate limited by upstream"),
+            "message must carry the server's text: {}",
+            chat_err.message
+        );
     }
 
     #[test]
