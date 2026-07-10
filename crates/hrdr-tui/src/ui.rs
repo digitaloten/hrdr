@@ -483,14 +483,17 @@ fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect, items: &[PanelItem])
     let bg = app.theme.user_bg;
     let inner = draw_pane(f, &app.theme, area, accent);
 
-    // One row per agent, newest pinned to the bottom when they overflow.
+    // One row per agent, newest pinned to the bottom when they overflow. A
+    // running row leads with the same animated spinner as the inference loader
+    // (driven off the free-running header clock so it ticks even while idle).
     let scroll = subagent_scroll(items.len(), inner.height);
+    let frame = SPINNER[(app.header_anchor.elapsed().as_millis() / 120) as usize % SPINNER.len()];
     let lines: Vec<Line<'static>> = items
         .iter()
         .map(|item| {
             let fg = if item.done { success } else { accent };
             Line::from(Span::styled(
-                panel_item_header(item),
+                panel_item_header(item, frame),
                 Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
             ))
         })

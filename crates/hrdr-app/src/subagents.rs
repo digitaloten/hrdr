@@ -77,10 +77,14 @@ pub struct PanelItem {
     pub tool_id: Option<String>,
 }
 
-/// The row's text: a completion badge (`✓ ` when done), then the title.
-pub fn panel_item_header(item: &PanelItem) -> String {
-    let badge = if item.done { "✓ " } else { "" };
-    format!("{badge}{}", item.title)
+/// The row's text: a status marker then the title. The marker is `✓` for a
+/// finished task, else `running_marker` (the frontend passes its animated
+/// spinner frame). The log line's leading `↳` is stripped — the marker replaces
+/// it — so a running row animates in place instead of showing a static arrow.
+pub fn panel_item_header(item: &PanelItem, running_marker: &str) -> String {
+    let title = item.title.trim_start_matches('↳').trim_start();
+    let marker = if item.done { "✓" } else { running_marker };
+    format!("{marker} {title}")
 }
 
 /// Collect the panel's rows: blocking sub-agents from `agents` followed by
@@ -190,15 +194,23 @@ mod tests {
         assert_eq!(items[0].tool_id, None);
     }
 
-    /// The badge marks a finished background task; a running one has none.
+    /// A finished task shows `✓`; a running one shows the frontend's animated
+    /// marker in place of the log line's leading `↳`.
     #[test]
-    fn the_header_badges_a_finished_task() {
+    fn the_header_marks_running_and_finished_tasks() {
         let item = |done| PanelItem {
-            title: "t".to_string(),
+            title: "↳ task#1".to_string(),
             done,
             tool_id: None,
         };
-        assert_eq!(panel_item_header(&item(false)), "t");
-        assert_eq!(panel_item_header(&item(true)), "✓ t");
+        assert_eq!(panel_item_header(&item(false), "⠋"), "⠋ task#1");
+        assert_eq!(panel_item_header(&item(true), "⠋"), "✓ task#1");
+        // A title without the arrow just gets the marker prepended.
+        let plain = PanelItem {
+            title: "task#2".to_string(),
+            done: false,
+            tool_id: None,
+        };
+        assert_eq!(panel_item_header(&plain, "⠙"), "⠙ task#2");
     }
 }
