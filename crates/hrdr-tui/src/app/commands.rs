@@ -61,6 +61,9 @@ impl super::App {
         // `/clear` starts a new session, so it opens with the banner again.
         self.push_entry(Entry::header());
         self.queue.clear();
+        if let Ok(mut q) = self.steering.lock() {
+            q.clear();
+        }
         if let Ok(mut todos) = self.todos.lock() {
             todos.clear();
         }

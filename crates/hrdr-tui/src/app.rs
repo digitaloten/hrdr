@@ -195,8 +195,15 @@ pub(crate) struct App {
     todo_completed_at: HashMap<String, u64>,
     /// Turns a completed TODO stays visible before pruning (config `todo_ttl`).
     todo_ttl: u64,
-    /// Messages submitted while a turn is running, processed FIFO once it ends.
+    /// Messages submitted while a turn is running, still waiting to reach the
+    /// model. Shown as pending blocks below the transcript. Each also sits in
+    /// [`Self::steering`] as its prepared (`@file`-expanded) text; whichever
+    /// side consumes it first pops from both.
     pub(crate) queue: VecDeque<String>,
+    /// The running turn's steering queue. `Agent::run` drains it before each
+    /// request — i.e. right after a round's tool results — so a queued message
+    /// rides in with them. Empty when no turn is running.
+    steering: hrdr_agent::SteeringQueue,
     /// Screen rect of the "follow output" button, set during draw while scrolled
     /// up so mouse clicks can hit-test against it. `None` when following.
     pub(crate) follow_button: Option<HitRect>,
@@ -368,6 +375,7 @@ impl App {
             todo_completed_at: HashMap::new(),
             todo_ttl,
             queue: VecDeque::new(),
+            steering: hrdr_agent::steering_queue(),
             inferring: false,
             tools_running: 0,
             infer_banked: Duration::ZERO,
@@ -619,11 +627,20 @@ impl App {
             }
             self.editor.set_content("");
             self.scroll_offset = 0; // auto-follow on new submission
-            if self.running || self.compacting {
-                // A turn (or a compaction) is in flight. Never interrupt it: the
-                // message waits its turn, shown as a pending block below the
-                // transcript, and is sent when the model finishes. Processed
-                // FIFO by the `Done`/`Compacted` handlers.
+            if self.running {
+                // A turn is in flight. The message is never injected mid-stream:
+                // it waits as a pending block, and `Agent::run` picks it up
+                // before its next request — which only happens after a round's
+                // tool results, so the model reads them together. If the model
+                // instead ends the turn, nothing drains it and `Done` re-sends it
+                // as a turn of its own.
+                self.queue.push_back(input.clone());
+                let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input);
+                if let Ok(mut q) = self.steering.lock() {
+                    q.push_back(sent);
+                }
+            } else if self.compacting {
+                // Summarizing, not in `run()` — nothing is draining steering.
                 self.queue.push_back(input);
             } else {
                 self.spawn_turn(input);
@@ -898,6 +915,10 @@ impl App {
         self.tools_running = 0;
         let dropped = self.queue.len();
         self.queue.clear();
+        // Undelivered steering would otherwise leak into the next turn.
+        if let Ok(mut q) = self.steering.lock() {
+            q.clear();
+        }
         self.push_entry(Entry::system(hrdr_app::cancel_message(dropped)));
     }
 
@@ -927,9 +948,7 @@ impl App {
         // Keep last_usage so the status-bar context size persists between turns;
         // it's refreshed when this turn's Usage event arrives.
         let agent = self.agent.clone();
-        // Nothing steers a running turn any more: a message submitted mid-turn
-        // waits in `queue` and is sent as its own turn once this one finishes.
-        let steering = hrdr_agent::steering_queue();
+        let steering = self.steering.clone();
         let tx = self.tx.clone();
         let tx_events = tx.clone();
         let handle = tokio::spawn(async move {
@@ -1083,7 +1102,13 @@ impl App {
                     self.spawn_compaction(None);
                     return;
                 }
-                // Start the next queued message, if any (FIFO).
+                // The turn ended without draining what was queued (the model
+                // answered instead of calling a tool). Drop the agent's prepared
+                // copies — `spawn_turn` re-prepares — and send the oldest as a
+                // turn of its own. The rest wait for that turn to finish.
+                if let Ok(mut q) = self.steering.lock() {
+                    q.clear();
+                }
                 if let Some(next) = self.queue.pop_front() {
                     self.spawn_turn(next);
                 }
@@ -1162,6 +1187,12 @@ impl App {
                 .infer_started
                 .map(|t| t.elapsed())
                 .unwrap_or(Duration::ZERO)
+    }
+
+    /// Messages handed to the running turn but not yet delivered.
+    #[cfg(test)]
+    pub(crate) fn steering_len_for_test(&self) -> usize {
+        self.steering.lock().map(|q| q.len()).unwrap_or(0)
     }
 
     /// Start the inference clock from a test, without spawning a real turn.
@@ -1309,8 +1340,14 @@ impl App {
                 // the user is scrolled up, the new line appends without moving
                 // their view. When already following (offset == 0) it stays 0.
             }
-            // Delivery signal only; the message was already shown at submit time.
-            AgentEvent::Steered(_) => {}
+            AgentEvent::Steered(sent) => {
+                // It just entered the conversation, after the tool results of the
+                // round that carried it. Display it at *this* point so the
+                // transcript's order matches the model's view — and show what the
+                // user typed, not its `@file`-expanded form.
+                let shown = self.queue.pop_front().unwrap_or(sent);
+                self.push_entry(Entry::user(shown));
+            }
             AgentEvent::TurnDone => {}
         }
     }

@@ -1147,15 +1147,14 @@ async fn slash_command_output_renders_as_markdown_on_the_command_background() {
 /// with the block's one-column left padding. The only bare rows are the blank
 /// separators between blocks.
 ///
-/// A message submitted while a turn runs never interrupts it: it waits in the
-/// queue, unsent and absent from the conversation, and is spawned as its own
-/// turn once the model finishes.
+/// A message submitted while a turn runs is never injected mid-stream. When the
+/// model ends the turn by answering — no tool call to ride in on — the message
+/// waits and is sent as a turn of its own.
 ///
-/// Regression: a mid-turn submit *steered* the running turn — the text was
-/// pushed straight into the transcript and handed to the live `Agent::run`,
-/// which delivered it to the model between tool rounds.
+/// Regression: the text was pushed straight into the transcript at submit time
+/// and the agent continued the finished turn to deliver it.
 #[tokio::test]
-async fn a_mid_turn_submit_waits_for_the_turn_to_finish() {
+async fn a_mid_turn_submit_waits_when_the_model_just_answers() {
     let mut h = Harness::new(vec![MockReply::Text("first reply".into())]).await;
 
     // A turn is in flight.
@@ -1191,6 +1190,71 @@ async fn a_mid_turn_submit_waits_for_the_turn_to_finish() {
         "the queued message was sent after the turn"
     );
     assert!(h.app.running, "as a turn of its own");
+}
+
+/// The steering path: a message queued while the model is working rides in with
+/// the next round's tool results, so the model reads its tool output and the
+/// correction together and can change course. It enters the transcript at
+/// delivery — not at submit — so display order matches the model's view.
+#[tokio::test]
+async fn a_queued_message_rides_in_with_the_tool_results() {
+    use hrdr_agent::AgentEvent;
+
+    let mut h = Harness::new(vec![]).await;
+    h.app.running = true;
+
+    // Submitted while the model works.
+    h.type_str("actually, use ripgrep");
+    h.press(KeyCode::Enter);
+    let user_entries = |h: &Harness| -> Vec<String> {
+        h.app
+            .state
+            .transcript
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::User(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(
+        user_entries(&h).is_empty(),
+        "not in the conversation until the model sees it"
+    );
+    // It is handed to the running turn, which drains it before its next request.
+    assert_eq!(h.app.steering_len_for_test(), 1);
+    assert_eq!(h.app.queue.len(), 1, "and shown as pending meanwhile");
+
+    // `Agent::run` drains it after the round's tool results and says so.
+    h.app.on_turn_msg(TurnMsg::Event(AgentEvent::Steered(
+        "actually, use ripgrep".into(),
+    )));
+    assert_eq!(
+        user_entries(&h),
+        ["actually, use ripgrep"],
+        "displayed at delivery"
+    );
+    assert!(h.app.queue.is_empty(), "no longer pending");
+
+    // The turn continues; nothing is re-sent when it ends.
+    h.app.on_turn_msg(TurnMsg::Done(None));
+    assert_eq!(user_entries(&h), ["actually, use ripgrep"], "sent once");
+    assert!(!h.app.running, "no follow-up turn was spawned");
+}
+
+/// A cancelled turn drops the message it was carrying rather than leaking it
+/// into the next one.
+#[tokio::test]
+async fn cancelling_drops_an_undelivered_steer() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.running = true;
+    h.type_str("never mind");
+    h.press(KeyCode::Enter);
+    assert_eq!(h.app.steering_len_for_test(), 1);
+
+    h.app.cancel_turn();
+    assert!(h.app.queue.is_empty());
+    assert_eq!(h.app.steering_len_for_test(), 0, "the agent's copy too");
 }
 
 /// Several mid-turn submits queue up and are sent one per completed turn, in the

@@ -68,9 +68,16 @@ pub enum AgentEvent {
 }
 
 /// A shared FIFO of user messages submitted *during* a running turn ("steering").
+///
 /// The frontend pushes to it while a turn runs; [`Agent::run`] drains it before
-/// each model request, so a correction reaches the model after the current tool
-/// round instead of only after the whole turn finishes.
+/// each model request. Since a request is only issued after the previous round's
+/// tool results were appended, a steering message lands **immediately after
+/// those results** — the model reads its tool output and the correction in the
+/// same context, and can change course.
+///
+/// A message still pending when the model answers without calling a tool is
+/// *not* delivered: that turn is over, and the frontend re-sends it as a turn of
+/// its own. Whatever it leaves behind is the frontend's to clear.
 pub type SteeringQueue = Arc<Mutex<std::collections::VecDeque<String>>>;
 
 /// Create an empty [`SteeringQueue`].
@@ -2608,6 +2615,7 @@ impl Agent {
     }
 
     /// Whether the steering queue has any undelivered messages.
+    #[cfg(test)]
     fn has_steering(steering: &SteeringQueue) -> bool {
         steering.lock().map(|q| !q.is_empty()).unwrap_or(false)
     }
@@ -2739,12 +2747,11 @@ impl Agent {
             self.messages.push(assistant);
 
             if tool_calls.is_empty() {
-                // A steering message that arrived during this response continues
-                // the turn (deliver it) rather than ending — the next iteration
-                // drains it before the request.
-                if Self::has_steering(&steering) {
-                    continue;
-                }
+                // The model answered without calling a tool: the turn is over,
+                // even if a steering message is pending. It has no tool result to
+                // ride in on, so the frontend sends it as a turn of its own —
+                // steering redirects work in progress, it doesn't extend a turn
+                // the model already finished.
                 on_event(AgentEvent::TurnDone);
                 return Ok(());
             }
@@ -5206,6 +5213,143 @@ mod tests {
                 "final answer text must contain 'Done', got: {final_text:?}"
             );
             assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
+        /// A steering message pushed while the model is calling tools is drained
+        /// into the conversation on the next request — i.e. **after** that
+        /// round's tool result — so the model sees the result and the correction
+        /// together. A `Steered` event marks the delivery point.
+        #[tokio::test]
+        async fn steering_lands_after_the_tool_result() {
+            let dir = tempfile::tempdir().unwrap();
+            let test_file = dir.path().join("data.txt");
+            std::fs::write(&test_file, "file content").unwrap();
+            let args_json =
+                serde_json::to_string(&json!({"path": test_file.to_string_lossy()})).unwrap();
+
+            let server = MockServer::start(vec![
+                MockResp::Sse(vec![
+                    tool_start_chunk("c1", "call_abc", "read"),
+                    tool_args_chunk("c1", &args_json),
+                    tool_calls_stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                MockResp::Sse(vec![
+                    text_chunk("c2", "ok"),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let steering = steering_queue();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            // Queued "while the tool runs": the first request is already in
+            // flight by the time `run` drains again, before request 2.
+            // Submitted *while the tool runs*: the drain before request 1 has
+            // already happened, so the next request is what carries it.
+            let mut events: Vec<AgentEvent> = Vec::new();
+            {
+                let q = steering.clone();
+                agent
+                    .run("read the file", steering.clone(), |ev| {
+                        if matches!(&ev, AgentEvent::ToolStart { .. }) {
+                            q.lock().unwrap().push_back("use ripgrep".to_string());
+                        }
+                        events.push(ev);
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            // Delivered exactly once, and announced.
+            let steered: Vec<&str> = events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Steered(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(steered, ["use ripgrep"], "delivered once");
+            assert!(steering.lock().unwrap().is_empty(), "drained");
+
+            // In the conversation it sits after the tool result, not before it.
+            let msgs = agent.messages();
+            let tool_at = msgs
+                .iter()
+                .position(|m| m.role == hrdr_llm::Role::Tool)
+                .unwrap();
+            let steer_at = msgs
+                .iter()
+                .position(|m| {
+                    m.role == hrdr_llm::Role::User && m.content.as_deref() == Some("use ripgrep")
+                })
+                .unwrap();
+            assert!(
+                steer_at > tool_at,
+                "the correction rides in with the tool result, not ahead of it"
+            );
+        }
+
+        /// A steering message pending when the model answers **without** calling a
+        /// tool is not delivered: the turn ends and the frontend re-sends it as a
+        /// turn of its own.
+        ///
+        /// Regression: `run` saw the pending steer and continued the finished
+        /// turn to deliver it, so the message was folded into a turn the model
+        /// had already completed.
+        #[tokio::test]
+        async fn a_text_only_answer_ends_the_turn_with_steering_pending() {
+            let dir = tempfile::tempdir().unwrap();
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "here you go"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+
+            let steering = steering_queue();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            // Submitted while the answer streams: the only drain point left is a
+            // request that never comes, because the model called no tool.
+            let mut events: Vec<AgentEvent> = Vec::new();
+            {
+                let q = steering.clone();
+                let mut submitted = false;
+                agent
+                    .run("a question", steering.clone(), |ev| {
+                        // Once, on the first streamed chunk — the answer may
+                        // arrive as several.
+                        if matches!(&ev, AgentEvent::Text(_)) && !submitted {
+                            submitted = true;
+                            q.lock().unwrap().push_back("and also this".to_string());
+                        }
+                        events.push(ev);
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            assert!(
+                events.iter().any(|e| matches!(e, AgentEvent::TurnDone)),
+                "the turn ended"
+            );
+            assert!(
+                !events.iter().any(|e| matches!(e, AgentEvent::Steered(_))),
+                "nothing was delivered"
+            );
+            assert_eq!(
+                steering.lock().unwrap().len(),
+                1,
+                "still pending, for the frontend to re-send as its own turn"
+            );
+            assert!(
+                !agent
+                    .messages()
+                    .iter()
+                    .any(|m| m.content.as_deref() == Some("and also this")),
+                "it never entered the conversation"
+            );
         }
 
         // ── (c) 429 then 200 retry ────────────────────────────────────────────
