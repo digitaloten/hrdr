@@ -116,7 +116,10 @@ In the TUI, type a message and press `Enter` to send. `@` completes sub-agent
 names (routing the message to that agent) and file paths (attaching the file),
 typing `/` opens a slash-command menu, and `:` invokes a custom skill. All share
 one popup: at most five rows (scroll for more), anchored above the token being
-completed.
+completed. After a command name + space the popup completes the **argument** too
+— enum values (`/effort high`, `/timestamps relative`), theme names, session ids
+for `/resume`, file paths for `/edit`/`/add`, and a skill's declared `args:`
+values.
 
 ### Skills
 
@@ -127,9 +130,10 @@ line), and the template's own `@file` / `@agent` mentions expand as usual. Files
 are discovered from `.hrdr/skills/`, `.claude/commands/`, and
 `.opencode/command/` in the project, then `~/.config/hrdr/skills/`,
 `~/.claude/commands/`, and `~/.config/opencode/command/` — first match by name
-wins. Optional `name:` / `description:` frontmatter; the file stem names it
-otherwise. `/skills` lists what's loaded; the transcript shows the raw
-`:name args` you typed while the model receives the expanded prompt.
+wins. Optional `name:` / `description:` frontmatter (plus `args: [a, b]` —
+candidate argument values the completion popup offers after `:name `); the file
+stem names it otherwise. `/skills` lists what's loaded; the transcript shows the
+raw `:name args` you typed while the model receives the expanded prompt.
 
 ```markdown
 ## <!-- .hrdr/skills/review.md -->

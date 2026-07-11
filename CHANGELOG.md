@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Argument completion.** The completion popup no longer dies at the first
+  space: it completes command arguments — enum values (`/effort`, `/thinking`,
+  `/timestamps`, `/statusbar`, `/expand`, `/goto`, `/copy`, `/find`), theme
+  names (+ `reset`) for `/theme`, session ids for `/resume`, file paths for
+  `/edit`/`/add`, and a skill's frontmatter-declared `args:` values after
+  `:name `. Anchored at the argument column; Tab fills just the argument.
 - **Custom skills (`:name`).** Reusable Markdown prompt templates invoked with a
   `:` prefix (`:review error paths`): `$ARGUMENTS` substitution, discovery from
   `.hrdr/skills/` + `.claude/commands/` + `.opencode/command/` (project then
