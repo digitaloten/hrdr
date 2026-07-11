@@ -39,6 +39,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Current ChatGPT model catalog and startup diagnostics.** The authenticated
+  catalog now advertises the current Codex compatibility version so entitled
+  GPT-5.6 models appear, while startup skips the incompatible generic `/models`
+  probe that produced a false 401 for ChatGPT OAuth. Genuine endpoint warnings
+  render in their own bordered block instead of merging with startup guidance.
+- **Visible browser-login URL.** The authorization modal keeps the complete URL
+  visible while retaining the byte-exact empty-input `c` copy shortcut.
 - **ChatGPT OAuth readiness and provider isolation.** Saved subscription tokens
   now make ChatGPT selectable without an API key, refresh safely across
   concurrent response/model requests, and cannot be injected into custom

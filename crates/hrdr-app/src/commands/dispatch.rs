@@ -614,6 +614,13 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             let agent = host.agent();
             let model = host.model();
             let base_url = host.base_url();
+            let provider_kind = host
+                .provider()
+                .as_deref()
+                .and_then(|name| host.resolve_provider(name))
+                .map_or(hrdr_agent::ResolvedProviderKind::Unresolved, |provider| {
+                    provider.kind
+                });
             let cwd = host.cwd();
             let ctx_win = host.context_window();
             let in_git = hrdr_agent::in_git_repo(&cwd);
@@ -640,7 +647,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 in_git = if in_git { "git repo" } else { "not a git repo" },
             ));
             host.spawn_line(Box::pin(async move {
-                let ep = endpoint_health_warning(agent, model, base_url).await;
+                let ep = endpoint_health_warning(agent, model, base_url, provider_kind).await;
                 match ep {
                     Some(w) => w,
                     None => "✓ endpoint healthy".to_string(),

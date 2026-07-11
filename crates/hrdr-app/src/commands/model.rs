@@ -167,7 +167,14 @@ pub async fn endpoint_health_warning(
     agent: Arc<Mutex<Agent>>,
     model: String,
     base_url: String,
+    provider_kind: hrdr_agent::ResolvedProviderKind,
 ) -> Option<String> {
+    // ChatGPT's Codex backend does not expose the generic unauthenticated
+    // `/models` shape. Its authenticated catalog has its own health/fallback
+    // path, so probing here only produces a false 401 warning.
+    if provider_kind == hrdr_agent::ResolvedProviderKind::ChatGptOAuth {
+        return None;
+    }
     let client = agent.lock().await.client();
     match client.list_models().await {
         Err(e) => Some(unreachable_guidance(&base_url, &e.to_string())),

@@ -185,8 +185,12 @@ impl SessionState {
     /// resume, forever.
     pub fn persisted(&self) -> SessionState {
         let mut out = self.clone();
-        out.transcript
-            .retain(|e| !matches!(e.kind, crate::EntryKind::Notice(_)));
+        out.transcript.retain(|e| {
+            !matches!(
+                e.kind,
+                crate::EntryKind::Notice(_) | crate::EntryKind::Warning(_)
+            )
+        });
         out
     }
 

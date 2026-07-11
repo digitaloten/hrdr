@@ -3837,7 +3837,7 @@ async fn model_selector_renders_columns_filters_and_closes() {
 }
 
 #[tokio::test]
-async fn browser_login_banner_keeps_url_out_of_transcript_and_cancels() {
+async fn browser_login_banner_shows_url_but_keeps_it_out_of_session() {
     let mut h = Harness::new(vec![]).await;
     let url = "https://auth.example/authorize?secret=query".to_string();
     let task =
@@ -3854,12 +3854,25 @@ async fn browser_login_banner_keeps_url_out_of_transcript_and_cancels() {
     let screen = h.render();
     assert!(screen.contains("Authorizing chatgpt"));
     assert!(screen.contains("c copy login URL"));
-    assert!(!screen.contains(&url));
+    assert!(screen.contains(&url), "login URL remains visible: {screen}");
     assert!(!serde_json::to_string(&h.app.state).unwrap().contains(&url));
 
     h.app.cancel_pending_browser_login();
     assert!(h.app.pending_browser_login.is_none());
     assert!(!serde_json::to_string(&h.app.state).unwrap().contains(&url));
+}
+
+#[tokio::test]
+async fn asynchronous_warning_uses_a_standalone_warning_entry() {
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .on_turn_msg(TurnMsg::Warning("endpoint failed".to_string()));
+    assert!(matches!(
+        h.app.state.transcript.last().map(|entry| &entry.kind),
+        Some(EntryKind::Warning(text)) if text == "endpoint failed"
+    ));
+    let screen = h.render();
+    assert!(screen.contains("endpoint failed"));
 }
 
 #[tokio::test]

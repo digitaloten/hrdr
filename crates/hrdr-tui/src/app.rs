@@ -85,6 +85,8 @@ pub(crate) enum TurnMsg {
     Done(Option<String>),
     /// Out-of-band system line (e.g. async `/models` result).
     System(String),
+    /// Standalone asynchronous warning/error block.
+    Warning(String),
     /// Out-of-band diff block (e.g. async `/diff` result).
     Diff(String),
     /// Compaction finished: `Ok((before, after))` message counts, or an error.
@@ -695,10 +697,20 @@ impl App {
         let agent = self.agent.clone();
         let model = self.state.model.clone();
         let base_url = self.state.base_url.clone();
+        let provider_kind = self
+            .state
+            .provider
+            .as_deref()
+            .and_then(|name| self.cfg.resolve_provider(name))
+            .map_or(hrdr_agent::ResolvedProviderKind::Unresolved, |provider| {
+                provider.kind
+            });
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            if let Some(warning) = hrdr_app::endpoint_health_warning(agent, model, base_url).await {
-                let _ = tx.send(TurnMsg::System(warning));
+            if let Some(warning) =
+                hrdr_app::endpoint_health_warning(agent, model, base_url, provider_kind).await
+            {
+                let _ = tx.send(TurnMsg::Warning(warning));
             }
         });
     }
@@ -1199,7 +1211,12 @@ impl App {
             .state
             .transcript
             .iter()
-            .take_while(|e| matches!(e.kind, EntryKind::Header | EntryKind::Notice(_)))
+            .take_while(|e| {
+                matches!(
+                    e.kind,
+                    EntryKind::Header | EntryKind::Notice(_) | EntryKind::Warning(_)
+                )
+            })
             .count();
         let excess = self.state.transcript.len().saturating_sub(self.scrollback);
         // Ensure we always keep at least `head` entries.
@@ -1525,6 +1542,9 @@ impl App {
                 // (e.g. a late `/models` result). Resetting would yank the user's
                 // view when they are scrolled up reading back-scroll. When the
                 // user is already following (offset == 0), it stays 0 unchanged.
+            }
+            TurnMsg::Warning(text) => {
+                self.push_entry(Entry::warning(text));
             }
             TurnMsg::Diff(text) => {
                 self.push_entry(Entry::diff(text));

@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{OAuthAccess, valid_access_token_result, write_atomic};
 
-pub const CODEX_CATALOG_COMPAT_VERSION: &str = "0.124.0";
+pub const CODEX_CATALOG_COMPAT_VERSION: &str = "0.144.1";
 const CACHE_SCHEMA: u32 = 1;
 const FRESH_TTL_MS: u64 = 5 * 60 * 1000;
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -274,6 +274,11 @@ fn append_warning(current: Option<String>, next: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_uses_current_codex_compatibility_version() {
+        assert_eq!(CODEX_CATALOG_COMPAT_VERSION, "0.144.1");
+    }
 
     #[test]
     fn catalog_keeps_only_list_visible_nonempty_slugs() {

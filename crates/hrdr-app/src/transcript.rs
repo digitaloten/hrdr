@@ -63,6 +63,8 @@ pub enum EntryKind {
     /// but **never persisted** — every launch and every resume regenerates its
     /// own, so saving them would accrete a fresh copy per resume.
     Notice(String),
+    /// Ephemeral warning/error chrome, rendered as a standalone bordered block.
+    Warning(String),
     /// Final per-turn stats line, appended below the last output.
     Stats(String),
     /// A unified diff (e.g. `/diff`), rendered with diff coloring.
@@ -106,6 +108,9 @@ impl Entry {
     /// Ephemeral session chrome — see [`EntryKind::Notice`].
     pub fn notice(text: impl Into<String>) -> Self {
         Self::now(EntryKind::Notice(text.into()))
+    }
+    pub fn warning(text: impl Into<String>) -> Self {
+        Self::now(EntryKind::Warning(text.into()))
     }
     pub fn stats(text: impl Into<String>) -> Self {
         Self::now(EntryKind::Stats(text.into()))
@@ -568,7 +573,10 @@ pub fn transcript_to_text(entries: &[Entry]) -> String {
             EntryKind::Diff(s) => out.push_str(&format!("{s}\n\n")),
             EntryKind::Tool { name, .. } => out.push_str(&format!("[tool: {name}]\n\n")),
             EntryKind::Notice(s) => out.push_str(&format!("[{s}]\n\n")),
-            EntryKind::Reasoning { .. } | EntryKind::Stats(_) | EntryKind::Header => {}
+            EntryKind::Warning(_)
+            | EntryKind::Reasoning { .. }
+            | EntryKind::Stats(_)
+            | EntryKind::Header => {}
         }
     }
     out.trim_end().to_string()

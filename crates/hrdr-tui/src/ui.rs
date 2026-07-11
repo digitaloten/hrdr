@@ -159,12 +159,23 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 
 fn draw_browser_login(f: &mut Frame, theme: &Theme, pending: &crate::app::PendingBrowserLogin) {
     let area = f.area();
-    let width = area.width.saturating_sub(4).clamp(1, 72);
+    let width = area.width.saturating_sub(4).clamp(1, 92);
+    let authorization_url = match &pending.phase {
+        crate::app::PendingBrowserLoginPhase::Authorizing {
+            authorization_url, ..
+        } => Some(authorization_url.as_str()),
+        crate::app::PendingBrowserLoginPhase::Switching { .. } => None,
+    };
+    let inner_width = width.saturating_sub(4).max(1) as usize;
+    let url_rows = authorization_url
+        .map(|url| url.chars().count().div_ceil(inner_width))
+        .unwrap_or(0) as u16;
+    let height = (7 + url_rows).min(area.height.saturating_sub(2)).max(1);
     let rect = Rect {
         x: (area.width.saturating_sub(width)) / 2,
-        y: area.height.saturating_sub(7) / 2,
+        y: area.height.saturating_sub(height) / 2,
         width,
-        height: 7.min(area.height),
+        height,
     };
     f.render_widget(Clear, rect);
     let block = Block::default()
@@ -172,7 +183,7 @@ fn draw_browser_login(f: &mut Frame, theme: &Theme, pending: &crate::app::Pendin
         .padding(Padding::new(2, 2, 1, 1));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
-    let text = Text::from(vec![
+    let mut lines = vec![
         Line::styled(
             format!(
                 "{} {}…",
@@ -200,8 +211,15 @@ fn draw_browser_login(f: &mut Frame, theme: &Theme, pending: &crate::app::Pendin
             },
             Style::default().fg(theme.dim),
         ),
-    ]);
-    f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
+    ];
+    if let Some(url) = authorization_url {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(url, Style::default().fg(theme.accent)));
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 /// The `/model` selector modal: a search line, a hint, and a two-column list
@@ -1574,6 +1592,8 @@ enum BlockKind {
     Tool,
     /// Slash-command output and system notices (`/diff`, `/sessions`, …).
     Command,
+    /// Standalone warning/error surface.
+    Warning,
     /// The per-turn stats line.
     Stats,
     /// A queued user message, awaiting its turn.
@@ -1584,7 +1604,11 @@ impl BlockKind {
     /// The bar drawn down the block's left edge, if any. Marks the surfaces that
     /// are the user's own: the prompt, and a prompt still queued.
     fn border(self, theme: &Theme) -> Option<Color> {
-        matches!(self, BlockKind::User | BlockKind::Queued).then_some(theme.prompt_border)
+        match self {
+            BlockKind::User | BlockKind::Queued => Some(theme.prompt_border),
+            BlockKind::Warning => Some(theme.warn),
+            _ => None,
+        }
     }
 
     /// The block's background. This is the override point: give a kind its own
@@ -1594,7 +1618,7 @@ impl BlockKind {
             // A tool call is something the user's turn set in motion, so it
             // sits on the prompt's background rather than a surface of its own.
             BlockKind::User | BlockKind::Queued | BlockKind::Tool => theme.user_bg,
-            BlockKind::Command => theme.command_bg,
+            BlockKind::Command | BlockKind::Warning => theme.command_bg,
             // The banner, the model's output, and its thinking sit on the
             // terminal's own background — no override, so they read as the page.
             BlockKind::Header | BlockKind::Assistant | BlockKind::Reasoning => Color::Reset,
@@ -1744,6 +1768,7 @@ fn entry_content_hash(entry: &Entry, expand_all: bool) -> u64 {
         | EntryKind::Assistant(t)
         | EntryKind::System(t)
         | EntryKind::Notice(t)
+        | EntryKind::Warning(t)
         | EntryKind::Stats(t)
         | EntryKind::Diff(t) => t.hash(&mut h),
         EntryKind::Tool {
@@ -2052,6 +2077,12 @@ fn transcript_lines(
                 let bg = BlockKind::Command.bg(theme);
                 let body = cache_entry(ck, || markdown_lines(text, &md, bg, inner));
                 (BlockKind::Command, body)
+            }
+            EntryKind::Warning(text) => {
+                let md = md_theme.clone();
+                let bg = BlockKind::Warning.bg(theme);
+                let body = cache_entry(ck, || markdown_lines(text, &md, bg, inner));
+                (BlockKind::Warning, body)
             }
             // The per-turn stats line belongs to the turn that just ended, so it
             // closes that turn's block rather than opening one of its own.

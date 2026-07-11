@@ -45,6 +45,21 @@ mod tests {
         assert!(msg.contains("/login"));
     }
 
+    #[tokio::test]
+    async fn chatgpt_oauth_skips_generic_models_health_probe() {
+        let agent = std::sync::Arc::new(tokio::sync::Mutex::new(
+            hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap(),
+        ));
+        let warning = endpoint_health_warning(
+            agent,
+            "gpt-5.6".to_string(),
+            "https://chatgpt.com/backend-api/codex".to_string(),
+            hrdr_agent::ResolvedProviderKind::ChatGptOAuth,
+        )
+        .await;
+        assert_eq!(warning, None);
+    }
+
     #[test]
     fn auto_compact_threshold_and_messages() {
         // Reserved 200 → fires at window − reserved = 800. Below/at/over,
