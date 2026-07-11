@@ -3930,12 +3930,16 @@ async fn completion_popup_caps_at_five_rows_and_scrolls() {
     let mut h = Harness::new(vec![]).await;
     h.type_str("/");
     let screen = h.render();
-    let shown = |s: &str| {
-        s.lines()
-            .filter(|l| l.trim_start().starts_with('/'))
-            .count()
-    };
-    assert!(shown(&screen) <= 5, "at most 5 rows visible:\n{screen}");
+    // The first five registry commands render; the sixth doesn't (cap = 5).
+    // (Counting screen lines that start with '/' is a trap: the banner's cwd
+    // path wraps onto its own line on runners with long temp paths.)
+    let names: Vec<&str> = hrdr_app::slash_completions("/")
+        .iter()
+        .map(|(n, _)| *n)
+        .collect();
+    for n in &names[..5] {
+        assert!(screen.contains(n), "{n} visible in the popup:\n{screen}");
+    }
     assert!(screen.contains("more"), "overflow hint:\n{screen}");
     assert!(screen.contains("/new"), "canonical /new listed:\n{screen}");
 

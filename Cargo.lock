@@ -1269,7 +1269,6 @@ dependencies = [
  "hjkl-markdown",
  "hjkl-markdown-tui",
  "hjkl-splash",
- "hjkl-theme",
  "hrdr-agent",
  "hrdr-app",
  "hrdr-editor",
