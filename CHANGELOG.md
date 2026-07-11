@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-07-12
+
 ### Added
 
 - **LSP navigation tools.** The warm language servers now back three model
