@@ -3769,12 +3769,16 @@ async fn login_modal_flow_masks_the_key_entry() {
 }
 
 /// `!command` runs the shell directly: the output streams into a transcript
-/// tool block, and the command + output are recorded into the model's history
-/// as a user note — no model turn is spawned. Unix-only: the Windows runners'
-/// `bash`/`pwsh` mix isn't predictable enough to assert output verbatim.
+/// tool block, and on ToolEnd the command + output are committed through the
+/// same plumbing as a finished turn — the user note enters the agent's
+/// history synchronously and an autosave writes the session, so nothing rides
+/// a later turn's save. No model turn is spawned. Unix-only: the Windows
+/// runners' `bash`/`pwsh` mix isn't predictable enough to assert output
+/// verbatim.
 #[cfg(unix)]
 #[tokio::test]
 async fn bang_runs_a_user_shell_command_and_records_it() {
+    let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
     h.type_str("!echo hello-from-shell");
     h.press(KeyCode::Enter);
@@ -3819,33 +3823,50 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
         "output in the transcript:\n{screen}"
     );
 
-    // The history note lands right after ToolEnd (a separate lock push) —
-    // poll briefly rather than racing it.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let noted = h.app.agent.try_lock().is_ok_and(|a| {
-            a.messages_owned().iter().any(|m| {
-                m.content
-                    .as_deref()
-                    .is_some_and(|c| c.contains("hello-from-shell") && c.contains("I ran"))
-            })
-        });
-        if noted {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the history note never landed"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    // ToolEnd committed the note synchronously — same plumbing as a turn.
+    let noted = h.app.agent.try_lock().is_ok_and(|a| {
+        a.messages_owned().iter().any(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|c| c.contains("hello-from-shell") && c.contains("I ran"))
+        })
+    });
+    assert!(noted, "the history note landed with ToolEnd");
+
+    // …and autosaved: the session file already carries the note and the
+    // closed tool block, not "whenever the next turn saves".
+    let id = h
+        .app
+        .state
+        .id
+        .clone()
+        .expect("the !command's autosave assigned a session id");
+    let loaded = hrdr_app::Session::load(&h.app.current_cwd(), &id)
+        .expect("session file written on ToolEnd");
+    assert!(
+        loaded.state.messages.iter().any(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|c| c.contains("hello-from-shell") && c.contains("I ran"))
+        }),
+        "the note persisted"
+    );
+    assert!(
+        loaded.state.transcript.iter().any(|e| {
+            matches!(&e.kind, EntryKind::Tool { done: true, result, .. }
+                if result.contains("hello-from-shell"))
+        }),
+        "the tool block persisted"
+    );
 }
 
 /// Esc cancels a running `!command`: the child is killed, the tool block
-/// closes as "(cancelled)", and the slot frees for the next command.
+/// closes as "(cancelled)", the cancellation note commits to history + disk
+/// like any other transcript entry, and the slot frees for the next command.
 #[cfg(unix)]
 #[tokio::test]
 async fn esc_cancels_a_running_user_shell_command() {
+    let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
     h.type_str("!sleep 30");
     h.press(KeyCode::Enter);
@@ -3853,6 +3874,15 @@ async fn esc_cancels_a_running_user_shell_command() {
 
     h.press(KeyCode::Esc);
     assert!(h.app.user_shell.is_none(), "Esc cleared the slot");
+    let noted = h.app.agent.try_lock().is_ok_and(|a| {
+        a.messages_owned().iter().any(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|c| c.contains("cancelled"))
+        })
+    });
+    assert!(noted, "the cancellation note landed with the cancel");
+    assert!(h.app.state.id.is_some(), "the cancel autosaved the session");
     let cancelled = h.app.state.transcript.iter().any(|e| {
         matches!(&e.kind, EntryKind::Tool { done: true, ok: false, result, .. }
             if result.contains("cancelled"))

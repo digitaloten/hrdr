@@ -15,7 +15,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ran. User-initiated, so guardrails don't apply; rejected while a turn is
   running. Pasting works; no model call is made. **Esc cancels** a running
   `!command`: the child is killed, the block closes as "(cancelled)", and a
-  history note tells the model it didn't finish.
+  history note tells the model it didn't finish. On completion (or cancel) the
+  note commits to the agent's history and the session **autosaves immediately**
+  — the same end-of-work plumbing as a finished turn, so a `!command` survives a
+  quit or crash instead of riding the next turn's save.
 - **`/skills` picker.** `/skills` now opens a fuzzy picker over the discovered
   skills (name · description · source); Enter inserts `:name ` into the input,
   ready for arguments.

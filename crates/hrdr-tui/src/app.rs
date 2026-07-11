@@ -111,8 +111,10 @@ pub(crate) enum TurnMsg {
     Event(AgentEvent),
     /// A user-initiated `!command` shell event. Separate from [`TurnMsg::Event`]
     /// so it bypasses the "ignore buffered events after cancellation" guard —
-    /// these aren't turn events and arrive while no turn is running.
-    UserShell(AgentEvent),
+    /// these aren't turn events and arrive while no turn is running. The
+    /// `ToolEnd` carries the history note (command + bounded output) so the
+    /// UI loop can commit it through the same plumbing as a finished turn.
+    UserShell(AgentEvent, Option<String>),
     /// Turn finished; `Some` carries an error string.
     Done(Option<String>),
     /// Out-of-band system line (e.g. async `/models` result).
@@ -808,8 +810,9 @@ impl App {
 
     /// Run a user-typed `!command`: spawn the shell in the agent's cwd,
     /// stream its output through the normal tool-event pipeline (so it renders
-    /// as a live tool block), and, when it finishes, append the command +
-    /// (bounded) output to the model's history so the next turn sees it.
+    /// as a live tool block), and, when it finishes, commit the command +
+    /// (bounded) output to the model's history and autosave — the same
+    /// end-of-work plumbing a turn gets (see [`Self::finish_user_shell`]).
     /// User-initiated, so hrdr's shell guardrails don't apply — this is the
     /// user's own shell. Rejected while a turn is running: its tool blocks
     /// would interleave with the model's.
@@ -855,7 +858,6 @@ impl App {
         }
         let cwd = hrdr_app::agent_cwd(&self.agent);
         let tx = self.tx.clone();
-        let agent = self.agent.clone();
         args.push(command.clone());
         let task_command = command.clone();
         let handle = tokio::spawn(async move {
@@ -871,12 +873,15 @@ impl App {
             let mut child = match child.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(TurnMsg::UserShell(AgentEvent::ToolEnd {
-                        id: task_id,
-                        name: shell_name.to_string(),
-                        result: format!("couldn't run {program}: {e}"),
-                        ok: false,
-                    }));
+                    let _ = tx.send(TurnMsg::UserShell(
+                        AgentEvent::ToolEnd {
+                            id: task_id,
+                            name: shell_name.to_string(),
+                            result: format!("couldn't run {program}: {e}"),
+                            ok: false,
+                        },
+                        None,
+                    ));
                     return;
                 }
             };
@@ -897,10 +902,13 @@ impl App {
                             Ok(n) => {
                                 let chunk = String::from_utf8_lossy(&buf_out[..n]).into_owned();
                                 out.push_str(&chunk);
-                                let _ = tx.send(TurnMsg::UserShell(AgentEvent::ToolOutput {
-                                    id: task_id.clone(),
-                                    chunk,
-                                }));
+                                let _ = tx.send(TurnMsg::UserShell(
+                                    AgentEvent::ToolOutput {
+                                        id: task_id.clone(),
+                                        chunk,
+                                    },
+                                    None,
+                                ));
                             }
                         }
                     }
@@ -910,10 +918,13 @@ impl App {
                             Ok(n) => {
                                 let chunk = String::from_utf8_lossy(&buf_err[..n]).into_owned();
                                 out.push_str(&chunk);
-                                let _ = tx.send(TurnMsg::UserShell(AgentEvent::ToolOutput {
-                                    id: task_id.clone(),
-                                    chunk,
-                                }));
+                                let _ = tx.send(TurnMsg::UserShell(
+                                    AgentEvent::ToolOutput {
+                                        id: task_id.clone(),
+                                        chunk,
+                                    },
+                                    None,
+                                ));
                             }
                         }
                     }
@@ -932,14 +943,9 @@ impl App {
             } else {
                 bounded.clone()
             };
-            let _ = tx.send(TurnMsg::UserShell(AgentEvent::ToolEnd {
-                id: task_id,
-                name: shell_name.to_string(),
-                result,
-                ok,
-            }));
-            // Record it for the model: the next request carries what the user
-            // ran and saw. (Waits on the agent lock if a turn started since.)
+            // The note for the model: the next request carries what the user
+            // ran and saw. It rides the ToolEnd so the UI loop commits it
+            // through the normal history + autosave plumbing.
             let exit = match &status {
                 Ok(st) => st.code().map_or_else(|| "?".to_string(), |c| c.to_string()),
                 Err(e) => format!("spawn error: {e}"),
@@ -951,7 +957,15 @@ impl App {
 ```",
                 bounded.trim_end()
             );
-            agent.lock().await.push_user_note(note);
+            let _ = tx.send(TurnMsg::UserShell(
+                AgentEvent::ToolEnd {
+                    id: task_id,
+                    name: shell_name.to_string(),
+                    result,
+                    ok,
+                },
+                Some(note),
+            ));
         });
         self.user_shell = Some(UserShell {
             id,
@@ -982,10 +996,31 @@ impl App {
             "I ran `{}` in the shell but cancelled it before it finished.",
             shell.command
         );
-        let agent = self.agent.clone();
-        tokio::spawn(async move {
-            agent.lock().await.push_user_note(note);
-        });
+        self.finish_user_shell(Some(note));
+    }
+
+    /// End-of-`!command` plumbing, mirroring what [`TurnMsg::Done`] does for a
+    /// turn: the history note enters the agent's history and the session
+    /// autosaves, so the shell block + note survive a quit or crash like any
+    /// other transcript entry — instead of riding whenever the next turn's
+    /// autosave happens to run.
+    fn finish_user_shell(&mut self, note: Option<String>) {
+        if let Some(note) = note {
+            match self.agent.try_lock() {
+                Ok(mut a) => a.push_user_note(note),
+                Err(_) => {
+                    // A turn started while the shell ran and holds the agent.
+                    // The note waits for the lock, landing after that turn's
+                    // messages — and its Done autosave persists it.
+                    let agent = self.agent.clone();
+                    tokio::spawn(async move {
+                        agent.lock().await.push_user_note(note);
+                    });
+                    return;
+                }
+            }
+        }
+        self.autosave();
     }
 
     /// Route pasted text: the `/login` key field takes it whole (an API key
@@ -1496,11 +1531,15 @@ impl App {
                     self.apply_event(ev);
                 }
             }
-            TurnMsg::UserShell(ev) => {
-                if matches!(ev, AgentEvent::ToolEnd { .. }) {
+            TurnMsg::UserShell(ev, note) => {
+                let ended = matches!(ev, AgentEvent::ToolEnd { .. });
+                if ended {
                     self.user_shell = None;
                 }
                 self.apply_event(ev);
+                if ended {
+                    self.finish_user_shell(note);
+                }
             }
             TurnMsg::System(text) => {
                 self.push_entry(Entry::notice(text));
