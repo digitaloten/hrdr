@@ -2,7 +2,8 @@
 //! sharing one popup.
 
 use hrdr_app::{
-    active_file_token, rank_agent_matches, rank_file_matches, skill_completions, slash_completions,
+    active_file_token, arg_completions, rank_agent_matches, rank_file_matches, resolve_alias,
+    skill_completions, slash_completions,
 };
 
 impl super::App {
@@ -30,6 +31,26 @@ impl super::App {
                 anchor_col: 0,
                 items: skills,
             });
+        }
+        // Argument completion: "/cmd partial" / ":skill partial" — enum
+        // values, theme names, session ids, or a skill's declared `args:`.
+        if let Some((start, items)) = arg_completions(&content, &self.skills) {
+            return Some(Completions {
+                kind: CompletionKind::Arg { token_start: start },
+                anchor_col: content[..start].chars().count(),
+                items,
+            });
+        }
+        // File-path arguments for the commands that take one.
+        if let Some((start, query)) = file_arg_token(&content) {
+            let items = self.file_completion_items(&query);
+            if !items.is_empty() {
+                return Some(Completions {
+                    kind: CompletionKind::Arg { token_start: start },
+                    anchor_col: content[..start].chars().count(),
+                    items,
+                });
+            }
         }
         if let Some((start, query)) = active_file_token(&content) {
             // Sub-agents first (an accepted `@name` routes the message to that
@@ -73,6 +94,15 @@ impl super::App {
                     self.editor.set_content(chosen);
                 }
             }
+            CompletionKind::Arg { token_start } => {
+                let content = self.editor.content();
+                let prefix = content.get(..token_start).unwrap_or("");
+                if trailing_space {
+                    self.editor.set_content(&format!("{prefix}{chosen} "));
+                } else {
+                    self.editor.set_content(&format!("{prefix}{chosen}"));
+                }
+            }
             CompletionKind::Mention { token_start } => {
                 let content = self.editor.content();
                 // Replace the partial `@…` token with `@<path> ` (always a space
@@ -110,6 +140,26 @@ impl super::App {
     }
 }
 
+/// If `input` is a slash command whose argument is a file path (`/edit`,
+/// `/add`) with the argument being typed, return the byte offset where the
+/// argument starts and the partial path. Mirrors [`arg_completions`]'s
+/// offset semantics; the candidate list comes from the frontend's file index.
+fn file_arg_token(input: &str) -> Option<(usize, String)> {
+    let rest = input.strip_prefix('/')?;
+    let ws = rest.find(char::is_whitespace)?;
+    if !matches!(resolve_alias(&rest[..ws]), "edit" | "add") {
+        return None;
+    }
+    let after = &rest[ws..];
+    let arg_start = 1 + ws + (after.len() - after.trim_start().len());
+    let partial = &input[arg_start..];
+    // A path argument has no spaces; once one appears, stand down.
+    if partial.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some((arg_start, partial.to_string()))
+}
+
 /// The active completion popup's contents and kind.
 pub(crate) struct Completions {
     pub(crate) kind: CompletionKind,
@@ -125,6 +175,10 @@ pub(crate) enum CompletionKind {
     Slash,
     /// Replace the whole input with the chosen `:skill` invocation.
     Skill,
+    /// Replace the argument (everything from this byte offset on) with the
+    /// chosen value — enum settings, theme names, session ids, skill `args:`,
+    /// and `/edit`/`/add` file paths.
+    Arg { token_start: usize },
     /// Replace the `@…` token starting at this byte offset with `@<label> `
     /// (a sub-agent name or a file path — both insert the same way).
     Mention { token_start: usize },

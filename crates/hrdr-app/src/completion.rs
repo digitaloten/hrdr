@@ -129,6 +129,113 @@ pub fn rank_file_matches(files: &[String], query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Argument completion for a slash (`/cmd partial…`) or skill
+/// (`:name partial…`) input: candidates for the argument being typed, matched
+/// against everything after the command name (so multi-word values like
+/// session names still complete). Returns the byte offset where the argument
+/// starts plus `(value, description)` rows ranked name-prefix → substring →
+/// description-substring; `None` when the input has no argument yet, the
+/// command takes no completable argument, or nothing matches.
+pub fn arg_completions(
+    input: &str,
+    skills: &[crate::Skill],
+) -> Option<(usize, Vec<(String, String)>)> {
+    let (sigil, rest) = match input.chars().next()? {
+        c @ ('/' | ':') => (c, &input[1..]),
+        _ => return None,
+    };
+    // Split "cmd" from the argument: the first whitespace run ends the name.
+    let ws = rest.find(char::is_whitespace)?;
+    let cmd = &rest[..ws];
+    let after = &rest[ws..];
+    let arg_offset = after.len() - after.trim_start().len();
+    let arg_start = 1 + ws + arg_offset;
+    let partial = &input[arg_start..];
+
+    let set = |vals: &[(&str, &str)]| -> Vec<(String, String)> {
+        vals.iter()
+            .map(|(v, d)| ((*v).to_string(), (*d).to_string()))
+            .collect()
+    };
+    let candidates: Vec<(String, String)> = if sigil == ':' {
+        // A skill's frontmatter-declared argument values.
+        skills
+            .iter()
+            .find(|sk| sk.name.eq_ignore_ascii_case(cmd))?
+            .args
+            .iter()
+            .map(|a| (a.clone(), String::new()))
+            .collect()
+    } else {
+        match resolve_alias(cmd) {
+            "effort" => set(&[
+                ("minimal", "fastest, least reasoning"),
+                ("low", ""),
+                ("medium", ""),
+                ("high", "most reasoning"),
+            ]),
+            "thinking" | "reasoning" | "think" => {
+                set(&[("on", "show model reasoning"), ("off", "hide it")])
+            }
+            "timestamps" | "ts" => set(&[
+                ("none", "no timestamps"),
+                ("relative", "5m ago"),
+                ("exact", "HH:MM"),
+            ]),
+            "statusbar" => set(&[
+                ("none", "hide the status bar"),
+                ("truncate", "one line"),
+                ("wrap", "as many lines as needed"),
+            ]),
+            "expand" => set(&[("all", "expand every tool block"), ("off", "collapse them")]),
+            "goto" => set(&[("top", "first message"), ("end", "follow the newest")]),
+            "find" => set(&[("clear", "drop the search")]),
+            "copy" => set(&[
+                ("reply", "the last reply"),
+                ("code", "the last code block"),
+                ("all", "the whole transcript"),
+                ("msg", "msg N or N-M"),
+            ]),
+            "theme" => {
+                let mut rows: Vec<(String, String)> = crate::theme_choices()
+                    .into_iter()
+                    .map(|c| (c.name, c.source))
+                    .collect();
+                rows.push(("reset".to_string(), "back to the default".to_string()));
+                rows
+            }
+            "resume" => crate::list_sessions()
+                .into_iter()
+                .map(|m| (m.id, m.name))
+                .collect(),
+            _ => return None,
+        }
+    };
+
+    let q = partial.to_ascii_lowercase();
+    let mut scored: Vec<(u8, (String, String))> = candidates
+        .into_iter()
+        .filter_map(|(v, d)| {
+            let vl = v.to_ascii_lowercase();
+            let rank = if q.is_empty() || vl.starts_with(&q) {
+                0
+            } else if vl.contains(&q) {
+                1
+            } else if d.to_ascii_lowercase().contains(&q) {
+                2
+            } else {
+                return None;
+            };
+            Some((rank, (v, d)))
+        })
+        .collect();
+    if scored.is_empty() {
+        return None;
+    }
+    scored.sort_by_key(|(r, _)| *r); // stable: keeps candidate order within a rank
+    Some((arg_start, scored.into_iter().map(|(_, c)| c).collect()))
+}
+
 /// Rank sub-agent names against an `@…` `query`: name-prefix matches first,
 /// then anywhere-substring, ties broken lexicographically. Case-insensitive;
 /// an empty query keeps input order. The mention popup lists these above the
@@ -224,6 +331,42 @@ mod tests {
         assert_eq!(active_file_token("me@host"), None); // not a token boundary
         assert_eq!(active_file_token("@src/main.rs and"), None); // completed
         assert_eq!(active_file_token("hello world"), None); // no @
+    }
+
+    #[test]
+    fn arg_completions_complete_enum_theme_and_skill_arguments() {
+        let skills = vec![crate::Skill {
+            name: "deploy".to_string(),
+            description: String::new(),
+            body: "…".to_string(),
+            source: "test".to_string(),
+            args: vec!["staging".to_string(), "production".to_string()],
+        }];
+        let vals = |i: &str| {
+            arg_completions(i, &skills)
+                .map(|(_, rows)| rows.into_iter().map(|(v, _)| v).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        // Enum arguments: prefix match, and the empty partial lists all.
+        assert_eq!(vals("/effort h"), vec!["high"]);
+        assert_eq!(vals("/timestamps ").len(), 3);
+        // Dispatch-level alt names and registry aliases both resolve.
+        assert_eq!(vals("/ts ex"), vec!["exact"]);
+        assert_eq!(vals("/reasoning o").len(), 2); // on, off
+        // Theme names come from the registry (built-ins are always there).
+        assert!(vals("/theme dra").contains(&"dracula".to_string()));
+        assert!(vals("/theme re").contains(&"reset".to_string()));
+        // Skill arguments come from the frontmatter `args:` list.
+        assert_eq!(vals(":deploy st"), vec!["staging"]);
+        assert_eq!(vals(":deploy ").len(), 2);
+        // No argument yet, unknown command, or no match → nothing.
+        assert!(arg_completions("/effort", &skills).is_none());
+        assert!(arg_completions("/help x", &skills).is_none());
+        assert!(arg_completions("/effort zz", &skills).is_none());
+        assert!(arg_completions("hello there", &skills).is_none());
+        // The offset points at the argument, past the whitespace run.
+        let (start, _) = arg_completions("/effort   hi", &skills).unwrap();
+        assert_eq!(&"/effort   hi"[start..], "hi");
     }
 
     #[test]

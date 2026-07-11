@@ -22,6 +22,9 @@ pub struct Skill {
     pub body: String,
     /// Where it came from, for the `/skills` listing (home-shortened dir).
     pub source: String,
+    /// Candidate argument values (frontmatter `args:`, comma-separated or
+    /// `[a, b]`), offered by the completion popup after `:name `.
+    pub args: Vec<String>,
 }
 
 /// The skill directories to scan, in precedence order (highest first).
@@ -85,7 +88,7 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
 /// is empty.
 pub fn parse_skill_file(text: &str, filename_stem: &str, source: &str) -> Option<Skill> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let (name, description, body) = match fenced_frontmatter(text) {
+    let (name, description, args, body) = match fenced_frontmatter(text) {
         Some((fm, body)) => {
             let field = |key: &str| {
                 fm.lines().find_map(|l| {
@@ -95,9 +98,20 @@ pub fn parse_skill_file(text: &str, filename_stem: &str, source: &str) -> Option
                         .filter(|v| !v.is_empty())
                 })
             };
-            (field("name"), field("description"), body)
+            // `args: staging, production` or `args: [staging, production]` —
+            // candidate values the completion popup offers after `:name `.
+            let args = field("args")
+                .map(|v| {
+                    v.trim_matches(['[', ']'])
+                        .split(',')
+                        .map(|a| a.trim().trim_matches(['"', '\'']).to_string())
+                        .filter(|a| !a.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            (field("name"), field("description"), args, body)
         }
-        None => (None, None, text),
+        None => (None, None, Vec::new(), text),
     };
     let body = body.trim();
     if body.is_empty() {
@@ -108,6 +122,7 @@ pub fn parse_skill_file(text: &str, filename_stem: &str, source: &str) -> Option
         description: description.unwrap_or_default(),
         body: body.to_string(),
         source: source.to_string(),
+        args,
     })
 }
 
@@ -184,6 +199,7 @@ mod tests {
             description: desc.to_string(),
             body: body.to_string(),
             source: "test".to_string(),
+            args: Vec::new(),
         }
     }
 
@@ -206,6 +222,15 @@ mod tests {
 
         // Empty body → not a skill.
         assert!(parse_skill_file("---\nname: x\n---\n  \n", "x", "src").is_none());
+
+        // `args:` declares completion candidates (bracketed or bare list).
+        let s = parse_skill_file(
+            "---\nargs: [staging, production]\n---\nDeploy $ARGUMENTS",
+            "deploy",
+            "src",
+        )
+        .unwrap();
+        assert_eq!(s.args, vec!["staging", "production"]);
     }
 
     #[test]

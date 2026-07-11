@@ -3972,6 +3972,30 @@ Run the release checklist for $ARGUMENTS",
     assert_eq!(user, "Run the release checklist for v0.3");
 }
 
+/// Argument completion: after a command name + space, the popup offers the
+/// argument's candidate values, anchored at the argument column, and Tab
+/// completes just the argument.
+#[tokio::test]
+async fn argument_completion_offers_values_and_tab_fills_the_argument() {
+    let mut h = Harness::new(vec![]).await;
+    h.type_str("/effort h");
+    let screen = h.render();
+    assert!(screen.contains("high"), "candidate offered:\n{screen}");
+    assert!(
+        !screen.contains("/effort  "),
+        "popup shows values, not command rows"
+    );
+    h.press(KeyCode::Tab);
+    assert_eq!(h.app.editor.content(), "/effort high ");
+
+    // Theme names complete too (built-ins are always registered).
+    h.app.editor.set_content("");
+    h.type_str("/theme dra");
+    assert!(h.render().contains("dracula"), "theme name offered");
+    h.press(KeyCode::Tab);
+    assert_eq!(h.app.editor.content(), "/theme dracula ");
+}
+
 /// The completion popup shows at most 5 rows plus a "… N more" hint, and
 /// slides its window to keep the selection visible.
 #[tokio::test]
