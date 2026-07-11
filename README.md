@@ -751,6 +751,32 @@ run = "notify-send hrdr 'turn done'"
 Sub-agents inherit the same hooks, so a `pre_tool` policy also governs delegated
 work.
 
+### LSP diagnostics
+
+After `edit`/`write`/`patch`/`replace` mutate a file, its language server checks
+the result and any **errors** ride back to the model appended to the tool result
+— a wrong edit is caught in the same round it was made, not at the next build.
+Warnings and hints are dropped (signal over lint noise).
+
+It's presence-aware, like the rest of the tool set: a server only spawns if its
+binary is on PATH, then stays warm for the session (shared with delegated
+sub-agents). Built-ins: `rust-analyzer` (.rs), `typescript-language-server`
+(.ts/.tsx/.js/…), `pyright-langserver` (.py), `gopls` (.go), `clangd`
+(.c/.cpp/…). Diagnostics run on what's actually on disk — after any formatter
+hooks. Each edit waits at most `wait_ms` (default 2000 ms) for the server; a
+slow or dead server degrades to "no diagnostics", never to a failed edit.
+
+```toml
+[lsp]
+enabled = true   # default; `false` (or HRDR_LSP=0) turns it off
+wait_ms = 2000   # per-edit diagnostics wait
+
+# Custom servers are consulted before the built-ins:
+[[lsp.servers]]
+command = "zls"
+extensions = ["zig"]
+```
+
 ### Theme
 
 The TUI colors come from an [hjkl](https://github.com/kryptic-sh/hjkl) theme.

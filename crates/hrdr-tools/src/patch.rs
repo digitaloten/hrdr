@@ -108,8 +108,18 @@ impl Tool for PatchTool {
                     tokio::fs::write(&path, &content)
                         .await
                         .with_context(|| format!("writing {}", path.display()))?;
-                    let notes = crate::run_file_hooks(&ctx.hooks, "patch", &path, &ctx.cwd).await;
+                    let mut notes =
+                        crate::run_file_hooks(&ctx.hooks, "patch", &path, &ctx.cwd).await;
                     ctx.mark_read(&path);
+                    // Diagnostics on what's on disk (hooks may have reformatted).
+                    if let Some(lsp) = &ctx.lsp {
+                        let on_disk = tokio::fs::read_to_string(&path)
+                            .await
+                            .unwrap_or_else(|_| content.clone());
+                        if let Some(note) = lsp.diagnostics_note(&path, &on_disk).await {
+                            notes.push(note);
+                        }
+                    }
                     let verb = if existed { "patched" } else { "created" };
                     let mut line = format!("{verb} {} ({bytes} bytes)", rel(&path, ctx));
                     if !notes.is_empty() {

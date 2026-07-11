@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **LSP diagnostics after edits.** After `edit`/`write`/`patch`/`replace` mutate
+  a file, its language server checks the on-disk result (post-formatter hooks)
+  and any **errors** ride back to the model appended to the tool result — wrong
+  edits are caught in the same round. A built-in LSP client spawns servers
+  lazily and presence-aware (`rust-analyzer`, `typescript-language-server`,
+  `pyright-langserver`, `gopls`, `clangd` — only if installed), keeps them warm
+  for the session, and shares them with delegated sub-agents. Warnings/hints are
+  dropped; each edit waits at most `[lsp] wait_ms` (default 2000 ms); failures
+  degrade to "no diagnostics", never a failed edit. Configure via `[lsp]`
+  (`enabled`, `wait_ms`, custom `[[lsp.servers]]` with
+  `command`/`args`/`extensions`) or `$HRDR_LSP=0`.
 - **Lifecycle hooks.** A `[[hooks]]` config entry with an `event` runs on agent
   lifecycle events: `pre_tool` (exit 2 **vetoes the tool call**, stderr becomes
   the error the model sees; `on` filters by tool name), `post_tool` (failures

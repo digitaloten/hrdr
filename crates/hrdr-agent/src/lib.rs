@@ -235,6 +235,7 @@ fn spawn_background(
     registry: &Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>>,
     handles: &BgHandles,
     cost_total: Arc<std::sync::Mutex<f64>>,
+    lsp: Option<Arc<hrdr_tools::LspRegistry>>,
 ) -> String {
     use std::sync::atomic::Ordering;
     let id = BG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
@@ -266,6 +267,9 @@ fn spawn_background(
             let result: anyhow::Result<()> = async {
                 let mut sub = Agent::new(cfg)?;
                 sub.cost_total = cost_total;
+                // Share the parent's language servers (its config disabled
+                // building an own registry) — one warm set for the session.
+                sub.ctx.lsp = lsp;
                 sub.run(prompt, steering_queue(), |ev| {
                     let chunk = match ev {
                         AgentEvent::Text(t) => {
@@ -337,6 +341,9 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     let mut base = config.clone();
     base.subagents = false;
     base.mcp = Vec::new();
+    // Sub-agents share the parent's language servers (`SubagentTool` hands
+    // them its registry Arc) instead of spawning their own set.
+    base.lsp = false;
     // The unnamed default sub-agent runs the main prompt with the full tool set;
     // profiles opt into a persona / read-only scope via `config_for_agent_profile`.
     base.agent_prompt = None;
@@ -433,6 +440,9 @@ struct SubagentTool {
     /// adds its spend to it, so `/cost` and the `max_cost` budget see the
     /// whole tree, not just the main loop.
     cost_total: Arc<std::sync::Mutex<f64>>,
+    /// The owning agent's language servers, shared with every sub-agent (the
+    /// base config has `lsp = false`, so none builds a registry of its own).
+    lsp: Option<Arc<hrdr_tools::LspRegistry>>,
 }
 
 impl SubagentTool {
@@ -441,6 +451,7 @@ impl SubagentTool {
         profiles: Vec<SubagentProfile>,
         bg_handles: BgHandles,
         cost_total: Arc<std::sync::Mutex<f64>>,
+        lsp: Option<Arc<hrdr_tools::LspRegistry>>,
     ) -> Self {
         let caps = (base.max_readonly_subagents, base.max_write_subagents);
         let mut desc = String::from(
@@ -498,6 +509,7 @@ impl SubagentTool {
             caps,
             slots: Arc::new(SubagentSlots::default()),
             cost_total,
+            lsp,
         }
     }
 }
@@ -655,6 +667,7 @@ impl hrdr_tools::Tool for SubagentTool {
                 &ctx.background_tasks,
                 &self.bg_handles,
                 Arc::clone(&self.cost_total),
+                self.lsp.clone(),
             ));
         }
         // Blocking: hold the slot until this call returns.
@@ -679,6 +692,8 @@ impl hrdr_tools::Tool for SubagentTool {
         let mut sub =
             Agent::new(cfg).with_context(|| format!("creating sub-agent (model={model})"))?;
         sub.cost_total = Arc::clone(&self.cost_total);
+        // Share the parent's language servers (base config has `lsp = false`).
+        sub.ctx.lsp = self.lsp.clone();
         let mut output = String::new();
         let steering = steering_queue();
         let run = sub
@@ -811,6 +826,15 @@ pub struct AgentConfig {
     pub allow_outside_cwd: bool,
     /// Post-edit hooks from `[[hooks]]` in config (formatters, mostly).
     pub hooks: Vec<HookConfig>,
+    /// Post-edit LSP diagnostics (default `true`): after a mutating tool
+    /// writes a file, its language server (spawned lazily, only when
+    /// installed) checks it and any errors ride back with the tool result.
+    /// `[lsp] enabled = false` / `$HRDR_LSP=0` turns it off.
+    pub lsp: bool,
+    /// Per-edit diagnostics wait in ms (`[lsp] wait_ms`; default 2000).
+    pub lsp_wait_ms: Option<u64>,
+    /// Custom `[[lsp.servers]]`, consulted before the built-in registry.
+    pub lsp_servers: Vec<LspServerEntry>,
     /// Per-tool output byte cap before truncation (`[tool_output] max_bytes`).
     /// Larger `bash`/`grep` output is truncated and the full text saved to disk.
     pub tool_max_bytes: usize,
@@ -1241,6 +1265,9 @@ impl Default for AgentConfig {
             allowed_tools: None,
             read_only: false,
             write_ext: None,
+            lsp: true,
+            lsp_wait_ms: None,
+            lsp_servers: Vec::new(),
         }
     }
 }
@@ -1383,6 +1410,30 @@ pub struct HookConfig {
 
 fn default_hook_on() -> String {
     "*".to_string()
+}
+
+/// The `[lsp]` config table: post-edit diagnostics from language servers.
+#[derive(Debug, Clone, Default, serde::Deserialize, PartialEq)]
+pub struct LspFileConfig {
+    /// Master switch (default on; servers only spawn when installed anyway).
+    pub enabled: Option<bool>,
+    /// Per-edit wait for diagnostics, ms (default 2000).
+    pub wait_ms: Option<u64>,
+    /// Custom servers (`[[lsp.servers]]`), consulted before the built-ins so
+    /// they win for their extensions.
+    #[serde(default)]
+    pub servers: Vec<LspServerEntry>,
+}
+
+/// One custom language server from `[[lsp.servers]]`.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+pub struct LspServerEntry {
+    /// Executable on PATH.
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// File extensions (no dot) routed to it.
+    pub extensions: Vec<String>,
 }
 
 /// A fully-resolved provider preset.
@@ -1553,6 +1604,7 @@ struct FileConfig {
     #[serde(default)]
     mcp: Vec<McpServerConfig>,
     prompt_cache: Option<String>,
+    lsp: Option<LspFileConfig>,
 }
 
 /// `hrdr`'s config directory — `$XDG_CONFIG_HOME/hrdr`, default
@@ -1718,6 +1770,17 @@ impl AgentConfig {
         if let Some(v) = fc.prompt_cache {
             self.prompt_cache = Some(v);
         }
+        if let Some(l) = fc.lsp {
+            if let Some(e) = l.enabled {
+                self.lsp = e;
+            }
+            if l.wait_ms.is_some() {
+                self.lsp_wait_ms = l.wait_ms;
+            }
+            if !l.servers.is_empty() {
+                self.lsp_servers = l.servers;
+            }
+        }
     }
 
     /// Layer environment variables over the current config. Every knob is one
@@ -1822,6 +1885,11 @@ const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     ("HRDR_AUTO_PRUNE", |c, v| {
         if let Some(b) = parse_env_bool(&v) {
             c.auto_prune = b;
+        }
+    }),
+    ("HRDR_LSP", |c, v| {
+        if let Some(b) = parse_env_bool(&v) {
+            c.lsp = b;
         }
     }),
     ("HRDR_PROMPT_CACHE", |c, v| c.prompt_cache = Some(v)),
@@ -2372,6 +2440,27 @@ impl Agent {
         let mut agent_names: Vec<String> = Vec::new();
         let bg_handles: BgHandles = bg_handles();
         let cost_total: Arc<std::sync::Mutex<f64>> = Arc::new(std::sync::Mutex::new(0.0));
+        // Post-edit diagnostics: the session's language servers. Custom
+        // `[[lsp.servers]]` are consulted before the built-ins so they win for
+        // their extensions. Built before the `task` tool so sub-agents share
+        // the same warm set instead of spawning their own.
+        let lsp: Option<Arc<hrdr_tools::LspRegistry>> = config.lsp.then(|| {
+            let mut servers: Vec<hrdr_tools::LspServerConfig> = config
+                .lsp_servers
+                .iter()
+                .map(|s| hrdr_tools::LspServerConfig {
+                    command: s.command.clone(),
+                    args: s.args.clone(),
+                    extensions: s.extensions.iter().map(|e| e.to_lowercase()).collect(),
+                })
+                .collect();
+            servers.extend(hrdr_tools::default_lsp_servers());
+            Arc::new(hrdr_tools::LspRegistry::new(
+                config.cwd.clone(),
+                servers,
+                config.lsp_wait_ms,
+            ))
+        });
         if config.subagents {
             let profiles = resolve_agent_profiles(&config);
             agent_names = profiles.iter().map(|p| p.name.clone()).collect();
@@ -2380,6 +2469,7 @@ impl Agent {
                 profiles,
                 Arc::clone(&bg_handles),
                 Arc::clone(&cost_total),
+                lsp.clone(),
             )));
         }
         // Memory: expose the `memory` tool (registered before scoping so a
@@ -2413,6 +2503,7 @@ impl Agent {
             tools.retain_only(&ro);
         }
         let mut ctx = ToolContext::new(config.cwd.clone());
+        ctx.lsp = lsp;
         ctx.restrict_to_cwd = !config.allow_outside_cwd;
         ctx.max_output = config.tool_max_bytes;
         ctx.max_output_lines = config.tool_max_lines;
@@ -4010,11 +4101,11 @@ mod tests {
     use super::{
         Agent, AgentConfig, AgentEvent, DEFAULT_MAX_READONLY_SUBAGENTS,
         DEFAULT_MAX_WRITE_SUBAGENTS, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS, FileConfig,
-        PRUNE_PLACEHOLDER, ProviderConfig, SubagentSlots, ToolOutputConfig, builtin_provider,
-        compaction_tail_start, elide_tool_results, estimate_tokens, estimate_tokens_in_messages,
-        in_git_repo, is_context_overflow, is_transient, parse_env_bool, prune_tool_messages,
-        repair_dangling_tool_calls, retry_after_hint, steering_queue, tail_window,
-        wants_background,
+        LspFileConfig, LspServerEntry, PRUNE_PLACEHOLDER, ProviderConfig, SubagentSlots,
+        ToolOutputConfig, builtin_provider, compaction_tail_start, elide_tool_results,
+        estimate_tokens, estimate_tokens_in_messages, in_git_repo, is_context_overflow,
+        is_transient, parse_env_bool, prune_tool_messages, repair_dangling_tool_calls,
+        retry_after_hint, steering_queue, tail_window, wants_background,
     };
     use crate::cwd_slug;
     use hrdr_llm::{ChatMessage, FunctionCall, Role, ToolCall};
@@ -5309,8 +5400,21 @@ mod tests {
             preserve_recent_tokens: Some(12_000),
             mcp: vec![],
             prompt_cache: Some("on".to_string()),
+            lsp: Some(LspFileConfig {
+                enabled: Some(false),
+                wait_ms: Some(500),
+                servers: vec![LspServerEntry {
+                    command: "zls".to_string(),
+                    args: vec![],
+                    extensions: vec!["zig".to_string()],
+                }],
+            }),
         });
         assert_eq!(cfg.prompt_cache.as_deref(), Some("on"));
+        assert!(!cfg.lsp);
+        assert_eq!(cfg.lsp_wait_ms, Some(500));
+        assert_eq!(cfg.lsp_servers.len(), 1);
+        assert_eq!(cfg.lsp_servers[0].command, "zls");
         assert_eq!(cfg.tool_max_lines, 500);
         assert_eq!(cfg.tool_max_bytes, 20_000);
         assert_eq!(cfg.compaction_tail_turns, 4);

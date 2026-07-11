@@ -16,6 +16,7 @@ use hrdr_llm::ToolDef;
 mod checkpoint;
 mod guardrails;
 mod hooks;
+mod lsp;
 mod mcp;
 mod memory;
 mod patch;
@@ -28,6 +29,7 @@ pub use hooks::{
     DEFAULT_HOOK_TIMEOUT_MS, EventHook, Hook, HookEvent, HookOutcome, run_event_hooks,
     run_file_hooks,
 };
+pub use lsp::{DEFAULT_LSP_WAIT_MS, LspRegistry, LspServerConfig, default_lsp_servers};
 pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use patch::PatchTool;
@@ -136,6 +138,10 @@ pub struct ToolContext {
     /// Post-edit hooks from `[[hooks]]` config (formatters, mostly), run by
     /// `edit`/`write` after a successful mutation.
     pub hooks: Arc<Vec<Hook>>,
+    /// Post-edit LSP diagnostics: the session's language servers, consulted by
+    /// the file-mutating tools after a write so build-breaking errors ride
+    /// back with the tool result. `None` = disabled (`lsp = false` in config).
+    pub lsp: Option<Arc<LspRegistry>>,
 }
 
 impl ToolContext {
@@ -156,6 +162,7 @@ impl ToolContext {
             memory_global: None,
             background_tasks: Arc::new(Mutex::new(Vec::new())),
             hooks: Arc::new(Vec::new()),
+            lsp: None,
         }
     }
 
