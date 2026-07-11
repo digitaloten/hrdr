@@ -351,6 +351,7 @@ mod tests {
         assert!(notes[0].contains("timed out"), "{}", notes[0]);
     }
 
+    #[cfg(unix)] // only the unix-gated integration test below builds these
     fn event_hook(event: HookEvent, on: &str, run: &str) -> EventHook {
         EventHook {
             event,

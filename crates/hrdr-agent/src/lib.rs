@@ -6478,6 +6478,7 @@ mod tests {
         }
 
         /// One `[[hooks]]` entry with an `event`, for the lifecycle tests.
+        #[cfg(unix)] // the lifecycle tests are unix-gated (they shell out)
         fn event_hook_cfg(event: &str, on: &str, run: &str) -> crate::HookConfig {
             crate::HookConfig {
                 event: Some(event.to_string()),

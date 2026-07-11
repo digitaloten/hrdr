@@ -589,6 +589,7 @@ mod tests {
     /// A minimal, protocol-correct LSP server: answers `initialize`, and on
     /// `didOpen`/`didChange` publishes one error per line containing "boom"
     /// (with the document's version, exercising the stale-publish guard).
+    #[cfg(unix)] // used only by the unix-gated integration test above
     const FAKE_LSP_PY: &str = r#"
 import json, sys
 
