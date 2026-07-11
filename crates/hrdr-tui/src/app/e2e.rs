@@ -3770,7 +3770,9 @@ async fn login_modal_flow_masks_the_key_entry() {
 
 /// `!command` runs the shell directly: the output streams into a transcript
 /// tool block, and the command + output are recorded into the model's history
-/// as a user note — no model turn is spawned.
+/// as a user note — no model turn is spawned. Unix-only: the Windows runners'
+/// `bash`/`pwsh` mix isn't predictable enough to assert output verbatim.
+#[cfg(unix)]
 #[tokio::test]
 async fn bang_runs_a_user_shell_command_and_records_it() {
     let mut h = Harness::new(vec![]).await;

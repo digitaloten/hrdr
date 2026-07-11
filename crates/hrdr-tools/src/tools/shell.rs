@@ -290,23 +290,33 @@ pub fn available_shell_tools() -> Vec<std::sync::Arc<dyn Tool>> {
 }
 
 /// The interpreter for a *user-typed* `!command` (the TUI's shell escape):
-/// `(program, leading args)` — `bash -c` when bash is on `PATH`, else
-/// PowerShell (`-NoProfile -NonInteractive -Command`). `None` when neither
-/// interpreter exists. The command string is appended as the final argument.
+/// `(program, leading args)`. Unix prefers `bash -c`; Windows prefers
+/// PowerShell (the `bash` on a Windows PATH is often the WSL stub, which
+/// fails without an installed distribution). `None` when no interpreter
+/// exists. The command string is appended as the final argument.
 pub fn user_shell() -> Option<(String, Vec<String>)> {
-    if which::which("bash").is_ok() {
-        return Some(("bash".to_string(), vec!["-c".to_string()]));
+    let powershell = || {
+        detect_powershell().map(|p| {
+            (
+                p,
+                vec![
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                ],
+            )
+        })
+    };
+    let bash = || {
+        which::which("bash")
+            .ok()
+            .map(|_| ("bash".to_string(), vec!["-c".to_string()]))
+    };
+    if cfg!(windows) {
+        powershell().or_else(bash)
+    } else {
+        bash().or_else(powershell)
     }
-    detect_powershell().map(|p| {
-        (
-            p,
-            vec![
-                "-NoProfile".to_string(),
-                "-NonInteractive".to_string(),
-                "-Command".to_string(),
-            ],
-        )
-    })
 }
 
 /// Locate a PowerShell interpreter: prefer `pwsh` (PowerShell 7+, cross-platform)
