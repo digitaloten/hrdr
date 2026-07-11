@@ -286,6 +286,31 @@ pub trait CommandHost {
         self.info(crate::session_list_text());
     }
 
+    /// Open the interactive `/skills` picker — the discovered `:skill`
+    /// templates; picking one inserts `:name ` into the input. The default
+    /// lists them as text.
+    fn begin_skill_selector(&mut self) {
+        let skills = crate::discover_skills(&self.cwd());
+        if skills.is_empty() {
+            self.info(
+                "no skills yet — put Markdown prompt templates in .hrdr/skills/ (or \
+                 .claude/commands/, ~/.config/hrdr/skills/), then invoke one with \
+                 :name [arguments]"
+                    .to_string(),
+            );
+            return;
+        }
+        let mut s = format!("{} skills (invoke with :name [arguments]):", skills.len());
+        for sk in skills {
+            s.push_str(&format!("\n  :{}", sk.name));
+            if !sk.description.is_empty() {
+                s.push_str(&format!(" — {}", sk.description));
+            }
+            s.push_str(&format!("  [{}]", sk.source));
+        }
+        self.info(s);
+    }
+
     /// Open the interactive `/effort` picker — the reasoning levels the
     /// current model accepts (models.dev catalog), highest first, "Default"
     /// on top. A frontend that supports it stashes the selector in a modal

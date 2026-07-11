@@ -3713,29 +3713,40 @@ async fn a_path_like_message_starting_with_slash_still_sends() {
     );
 }
 
-/// The `/login` wizard's API-key prompt renders the input pane masked — every
-/// char hidden behind `•` — even though the editor buffer (and the wizard)
-/// still hold the real text. The provider-pick step, which isn't secret,
-/// renders normally.
-///
-/// Regression: the key was already kept out of history/transcript/session,
-/// but was fully visible on screen as it was typed.
+/// The `/login` modal drives the whole flow: a provider picker first (same
+/// chrome as the other pickers), then a masked key field for a key-based
+/// provider. The raw key never renders and never touches the input editor,
+/// and Esc cancels without saving.
 #[tokio::test]
-async fn login_key_entry_masks_the_input_pane() {
+async fn login_modal_flow_masks_the_key_entry() {
     let mut h = Harness::new(vec![]).await;
-
-    h.type_str("/login");
-    h.press(KeyCode::Enter);
+    h.submit("/login").await;
     assert!(
-        !h.app.masks_input(),
-        "the provider pick isn't secret, so it must render normally"
+        matches!(
+            h.app.login_modal,
+            Some(crate::app::LoginModal::Providers(_))
+        ),
+        "/login opens the provider picker"
+    );
+    let screen = h.render();
+    assert!(screen.contains("OpenAI"), "providers listed:\n{screen}");
+    assert!(
+        screen.contains("browser login"),
+        "auth-method column:\n{screen}"
     );
 
-    // "openai" is a built-in remote provider, so this advances to the key
-    // prompt rather than finishing the wizard outright.
+    // Narrow to OpenAI (remote, key-based) and continue → the key phase.
     h.type_str("openai");
     h.press(KeyCode::Enter);
-    assert!(h.app.masks_input(), "the key prompt must mask the input");
+    assert!(
+        matches!(h.app.login_modal, Some(crate::app::LoginModal::Key { .. })),
+        "a key-based provider advances to the key field"
+    );
+    let screen = h.render();
+    assert!(
+        screen.contains("PLAINTEXT"),
+        "the storage warning shows:\n{screen}"
+    );
 
     h.type_str("sk-super-secret-value");
     let screen = h.render();
@@ -3745,7 +3756,46 @@ async fn login_key_entry_masks_the_input_pane() {
     );
     assert!(
         screen.contains('•'),
-        "masked bullets should render in its place:\n{screen}"
+        "masked bullets render in its place:\n{screen}"
+    );
+    assert!(
+        h.app.editor.content().is_empty(),
+        "the key bypasses the input editor entirely"
+    );
+
+    // Esc cancels without saving anything.
+    h.press(KeyCode::Esc);
+    assert!(h.app.login_modal.is_none(), "Esc closes the modal");
+}
+
+/// `/skills` opens a picker of the discovered skills; Enter inserts the
+/// `:name ` invocation into the input and hands the cursor back.
+#[tokio::test]
+async fn skills_picker_inserts_the_invocation() {
+    let mut h = Harness::new(vec![]).await;
+    let dir = std::path::PathBuf::from(h.app.current_cwd()).join(".hrdr/skills");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("ship.md"),
+        "---\ndescription: release checklist\n---\nGo.",
+    )
+    .unwrap();
+
+    h.submit("/skills").await;
+    assert!(h.app.skill_selector.is_some(), "/skills opens the picker");
+    let screen = h.render();
+    assert!(screen.contains(":ship"), "skill listed:\n{screen}");
+    assert!(
+        screen.contains("release checklist"),
+        "description column:\n{screen}"
+    );
+
+    h.press(KeyCode::Enter);
+    assert!(h.app.skill_selector.is_none(), "Enter closes the picker");
+    assert_eq!(
+        h.app.editor.content(),
+        ":ship ",
+        "the invocation lands in the input, ready for arguments"
     );
 }
 
@@ -3797,7 +3847,7 @@ async fn model_selector_renders_columns_filters_and_closes() {
             model_label: "DeepSeek V4 Pro".into(),
         },
     ];
-    h.app.model_selector = Some(crate::app::ModelSelector::new(choices));
+    h.app.model_selector = Some(crate::app::model_selector(choices));
 
     let screen = h.render();
     assert!(screen.contains("Search"), "search line missing: {screen}");
@@ -3850,7 +3900,7 @@ async fn session_selector_renders_columns_filters_and_closes() {
         updated: two_min_ago,
         path: std::path::PathBuf::from(format!("/tmp/{id}.json")),
     };
-    h.app.session_selector = Some(crate::app::SessionSelector::new(vec![
+    h.app.session_selector = Some(crate::app::session_selector(vec![
         meta("fix-auth", "Fix the auth bug", "/home/u/api"),
         meta("tui-polish", "TUI polish pass", "/home/u/hrdr"),
     ]));

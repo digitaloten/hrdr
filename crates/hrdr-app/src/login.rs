@@ -59,6 +59,133 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// One provider the login flow offers (the modal picker's rows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginProviderChoice {
+    /// The name `login_pick_provider` accepts.
+    pub name: String,
+    /// Friendly label ("OpenCode Zen", …).
+    pub label: String,
+    /// How it authenticates: "browser login", "API key", or "no key needed".
+    pub detail: String,
+}
+
+/// The built-in providers as login choices, in registry order.
+pub fn login_provider_choices() -> Vec<LoginProviderChoice> {
+    hrdr_agent::BUILTIN_PROVIDERS
+        .iter()
+        .map(|name| {
+            let detail = if is_oauth_login(name) {
+                "browser login"
+            } else if hrdr_agent::builtin_provider(name).is_some_and(|p| !p.remote) {
+                "no key needed"
+            } else {
+                "API key"
+            };
+            LoginProviderChoice {
+                name: (*name).to_string(),
+                label: provider_label(name)
+                    .trim_end_matches(" (browser login)")
+                    .to_string(),
+                detail: detail.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Case-insensitive fuzzy filter over login choices (name + label + detail).
+pub fn filter_login_providers(choices: &[LoginProviderChoice], query: &str) -> Vec<usize> {
+    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
+    if q.is_empty() {
+        return (0..choices.len()).collect();
+    }
+    choices
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let hay = format!("{} {} {}", c.name, c.label, c.detail).to_lowercase();
+            crate::is_subsequence(&q, &hay).then_some(i)
+        })
+        .collect()
+}
+
+/// Outcome of picking a provider in the login flow.
+pub enum LoginPick {
+    /// The flow finished (keyless endpoint applied, OAuth flow launched, or
+    /// the pick failed with a message already shown).
+    Done,
+    /// A remote key-based provider: prompt for its API key next.
+    NeedsKey { name: String },
+}
+
+/// Act on a provider pick: launch the OAuth flow, apply a keyless endpoint,
+/// or report that an API key is needed next. Shared by the wizard (text
+/// frontends) and the TUI's login modal.
+pub fn login_pick_provider(name: &str, host: &mut dyn CommandHost) -> LoginPick {
+    let name = name.to_ascii_lowercase();
+    let Some(p) = host.resolve_provider(&name) else {
+        host.info(format!(
+            "unknown provider '{name}' — pick a built-in or configured name."
+        ));
+        return LoginPick::Done;
+    };
+    // OAuth providers log in through the browser, not a pasted key.
+    if is_oauth_login(&name) {
+        start_oauth_login(&name, host);
+        return LoginPick::Done;
+    }
+    // A keyless (self-hosted) endpoint needs no API key — apply and finish.
+    if !p.remote {
+        match apply_provider(host, &name, None) {
+            Ok(p) => {
+                host.persist_setting("provider", hrdr_agent::ConfigValue::Str(&name));
+                host.info(format!(
+                    "✓ using {name} ({}). No API key needed; set as your default provider.",
+                    p.base_url
+                ));
+            }
+            Err(e) => host.info(e),
+        }
+        return LoginPick::Done;
+    }
+    LoginPick::NeedsKey { name }
+}
+
+/// The plaintext-storage warning shown before the key is entered.
+pub fn login_key_warning(name: &str) -> String {
+    format!(
+        "Enter your API key for {name} ({}).\n⚠ It will be saved in PLAINTEXT at {} — anyone \
+         who can read that file can use the key.",
+        provider_label(name),
+        auth_location(),
+    )
+}
+
+/// Save the entered key and switch the live session to `name` (persisting it
+/// as the default provider). Shared by the wizard and the TUI's login modal.
+pub fn login_enter_key(name: &str, key: &str, host: &mut dyn CommandHost) {
+    // Save first so the credential survives even if the live switch races a
+    // busy turn; report the exact path back to the user.
+    let saved = match hrdr_agent::save_auth_token(name, key) {
+        Ok(path) => path.display().to_string(),
+        Err(e) => {
+            host.info(format!("couldn't save the API key: {e}"));
+            return;
+        }
+    };
+    match apply_provider(host, name, Some(key.to_string())) {
+        Ok(p) => {
+            host.persist_setting("provider", hrdr_agent::ConfigValue::Str(name));
+            host.info(format!(
+                "✓ logged in to {name} ({}). Key saved to {saved}; set as your default \
+                 provider.",
+                p.base_url
+            ));
+        }
+        Err(e) => host.info(format!("key saved to {saved}, but the switch failed: {e}")),
+    }
+}
+
 /// The provider-picker prompt (numbered built-ins + free-form name).
 fn provider_prompt() -> String {
     let mut s = String::from("🔑 /login — pick a provider:\n");
@@ -120,39 +247,25 @@ impl LoginWizard {
             return false;
         }
         let name = parse_provider_pick(line, hrdr_agent::BUILTIN_PROVIDERS);
-        let Some(p) = host.resolve_provider(&name) else {
+        // A typo'd name still errors inside login_pick_provider, but a valid
+        // pick either finishes (keyless/OAuth) or advances to the key step.
+        if host.resolve_provider(&name).is_none() {
             host.info(format!(
                 "unknown provider '{name}' — pick a number, or a built-in / configured name."
             ));
             return false;
-        };
-        // OAuth providers log in through the browser, not a pasted key.
-        if is_oauth_login(&name) {
-            return start_oauth_login(&name, host);
         }
-        // A keyless (self-hosted) endpoint needs no API key — apply and finish.
-        if !p.remote {
-            match apply_provider(host, &name, None) {
-                Ok(p) => {
-                    host.persist_setting("provider", hrdr_agent::ConfigValue::Str(&name));
-                    host.info(format!(
-                        "✓ using {name} ({}). No API key needed; set as your default provider.",
-                        p.base_url
-                    ));
-                }
-                Err(e) => host.info(e),
+        match login_pick_provider(&name, host) {
+            LoginPick::Done => true,
+            LoginPick::NeedsKey { name } => {
+                host.info(format!(
+                    "{}\nPaste the key, or /cancel to abort.",
+                    login_key_warning(&name)
+                ));
+                self.step = Step::Key { name };
+                false
             }
-            return true;
         }
-        host.info(format!(
-            "Enter your API key for {name} ({}).\n\
-             ⚠ It will be saved in PLAINTEXT at {} — anyone who can read that file can use \
-             the key.\nPaste the key, or /cancel to abort.",
-            provider_label(&name),
-            auth_location(),
-        ));
-        self.step = Step::Key { name };
-        false
     }
 
     /// Key step: save the credential, switch the live session, and persist the
@@ -162,26 +275,7 @@ impl LoginWizard {
             host.info("paste your API key, or /cancel to abort.".to_string());
             return false;
         }
-        // Save first so the credential survives even if the live switch races a
-        // busy turn; report the exact path back to the user.
-        let saved = match hrdr_agent::save_auth_token(name, line) {
-            Ok(path) => path.display().to_string(),
-            Err(e) => {
-                host.info(format!("couldn't save the API key: {e}"));
-                return true;
-            }
-        };
-        match apply_provider(host, name, Some(line.to_string())) {
-            Ok(p) => {
-                host.persist_setting("provider", hrdr_agent::ConfigValue::Str(name));
-                host.info(format!(
-                    "✓ logged in to {name} ({}). Key saved to {saved}; set as your default \
-                     provider.",
-                    p.base_url
-                ));
-            }
-            Err(e) => host.info(format!("key saved to {saved}, but the switch failed: {e}")),
-        }
+        login_enter_key(name, line, host);
         true
     }
 }

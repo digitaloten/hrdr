@@ -85,7 +85,8 @@ impl super::App {
         self.find = hrdr_app::FindState::default();
         self.pending_goto = None;
         self.pending_edit = None;
-        self.login = None;
+        self.login_modal = None;
+        self.skill_selector = None;
         self.expand_tools = false;
     }
     /// Apply an `/expand` mode (shared dispatch parses the arg), returning the
@@ -472,8 +473,22 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         }
     }
     fn begin_login(&mut self) {
-        let wizard = hrdr_app::LoginWizard::start(self);
-        self.app.login = Some(wizard);
+        self.app.login_modal = Some(super::LoginModal::Providers(
+            super::login_provider_selector(hrdr_app::login_provider_choices()),
+        ));
+    }
+    fn begin_skill_selector(&mut self) {
+        let skills = hrdr_app::discover_skills(&std::path::PathBuf::from(self.app.current_cwd()));
+        if skills.is_empty() {
+            self.info(
+                "no skills yet — put Markdown prompt templates in .hrdr/skills/ (or \
+                 .claude/commands/, ~/.config/hrdr/skills/), then invoke one with \
+                 :name [arguments]"
+                    .to_string(),
+            );
+            return;
+        }
+        self.app.skill_selector = Some(super::skill_selector(skills));
     }
     fn begin_model_selector(&mut self) {
         let choices = hrdr_agent::model_choices(&self.app.cfg, self.app.state.provider.as_deref());
@@ -485,7 +500,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
             );
             return;
         }
-        self.app.model_selector = Some(super::ModelSelector::new(choices));
+        self.app.model_selector = Some(super::model_selector(choices));
     }
     fn begin_session_selector(&mut self) {
         // Every directory's sessions, newest first — the cwd column tells them
@@ -498,17 +513,18 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
             ));
             return;
         }
-        self.app.session_selector = Some(super::SessionSelector::new(sessions));
+        self.app.session_selector = Some(super::session_selector(sessions));
     }
     fn begin_effort_selector(&mut self) {
         let choices =
             hrdr_app::effort_choices(self.app.state.provider.as_deref(), &self.app.state.model);
-        self.app.effort_selector = Some(super::EffortSelector::new(choices));
+        self.app.effort_selector = Some(super::effort_selector(choices));
     }
     fn begin_theme_selector(&mut self) {
-        let choices = hrdr_app::theme_choices();
-        let original = self.app.theme.clone();
-        self.app.theme_selector = Some(super::ThemeSelector::new(choices, original));
+        // Remember the theme in force for Esc / a filter that matches nothing
+        // (the picker live-previews the highlighted row).
+        self.app.theme_original = Some(self.app.theme.clone());
+        self.app.theme_selector = Some(super::theme_selector(hrdr_app::theme_choices()));
     }
     fn help_tips(&self) -> Option<String> {
         // The footer no longer repeats these, so `/help` is where they live.
@@ -699,10 +715,128 @@ impl super::App {
         }
     }
 
+    /// Route one key to the open `/skills` picker: Esc/Ctrl+C closes it,
+    /// Up/Down move the highlight, Enter inserts `:name ` into the input, and
+    /// any other character edits the fuzzy filter. Caller checks
+    /// `self.skill_selector.is_some()` first.
+    pub(super) fn skill_selector_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.skill_selector = None,
+            KeyCode::Char('c') if ctrl => self.skill_selector = None,
+            KeyCode::Up => {
+                if let Some(s) = &mut self.skill_selector {
+                    s.up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(s) = &mut self.skill_selector {
+                    s.down();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(s) = &mut self.skill_selector {
+                    s.backspace();
+                }
+            }
+            // Enter inserts the invocation and hands the cursor back — the
+            // user finishes the arguments and submits like any message.
+            KeyCode::Enter => {
+                let chosen = self
+                    .skill_selector
+                    .as_ref()
+                    .and_then(|s| s.current())
+                    .map(|sk| sk.name.clone());
+                self.skill_selector = None;
+                if let Some(name) = chosen {
+                    self.editor.set_content(&format!(":{name} "));
+                }
+            }
+            KeyCode::Char(ch) if !ctrl => {
+                if let Some(s) = &mut self.skill_selector {
+                    s.push_char(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Route one key to the open `/login` modal. Provider phase: a picker
+    /// (Esc cancels, Enter picks — OAuth/keyless finish immediately, a
+    /// key-based provider advances to the key phase). Key phase: a masked
+    /// input (chars/paste append, Enter saves + switches, Esc cancels).
+    /// Caller checks `self.login_modal.is_some()` first.
+    pub(super) fn login_modal_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match &mut self.login_modal {
+            Some(super::LoginModal::Providers(sel)) => match key.code {
+                KeyCode::Esc => self.login_modal = None,
+                KeyCode::Char('c') if ctrl => self.login_modal = None,
+                KeyCode::Up => sel.up(),
+                KeyCode::Down => sel.down(),
+                KeyCode::Backspace => sel.backspace(),
+                KeyCode::Enter => {
+                    let chosen = sel.current().cloned();
+                    let Some(c) = chosen else {
+                        self.login_modal = None;
+                        return;
+                    };
+                    let pick = {
+                        let mut host = TuiHost { app: self };
+                        hrdr_app::login_pick_provider(&c.name, &mut host)
+                    };
+                    self.login_modal = match pick {
+                        hrdr_app::LoginPick::Done => None,
+                        hrdr_app::LoginPick::NeedsKey { name } => {
+                            let warning = hrdr_app::login_key_warning(&name);
+                            Some(super::LoginModal::Key {
+                                name,
+                                label: c.label,
+                                warning,
+                                input: String::new(),
+                            })
+                        }
+                    };
+                }
+                KeyCode::Char(ch) if !ctrl => sel.push_char(ch),
+                _ => {}
+            },
+            Some(super::LoginModal::Key { name, input, .. }) => match key.code {
+                KeyCode::Esc => {
+                    self.login_modal = None;
+                    self.system("login cancelled.".to_string());
+                }
+                KeyCode::Char('c') if ctrl => {
+                    self.login_modal = None;
+                    self.system("login cancelled.".to_string());
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Enter => {
+                    if input.is_empty() {
+                        return;
+                    }
+                    let (name, key_text) = (name.clone(), input.clone());
+                    self.login_modal = None;
+                    let mut host = TuiHost { app: self };
+                    hrdr_app::login_enter_key(&name, &key_text, &mut host);
+                }
+                KeyCode::Char(ch) if !ctrl => input.push(ch),
+                _ => {}
+            },
+            None => {}
+        }
+    }
+
     /// Cancel the `/theme` picker, restoring the theme in force when it opened.
     fn close_theme_selector(&mut self) {
-        if let Some(sel) = self.theme_selector.take() {
-            self.theme = sel.original;
+        if self.theme_selector.take().is_some()
+            && let Some(orig) = self.theme_original.take()
+        {
+            self.theme = orig;
         }
     }
 
@@ -714,7 +848,7 @@ impl super::App {
         };
         self.theme = match sel.current() {
             Some(c) => crate::theme::Theme::load(Some(&c.spec)),
-            None => sel.original.clone(),
+            None => self.theme_original.clone().unwrap_or_default(),
         };
     }
 
@@ -724,8 +858,11 @@ impl super::App {
         let Some(sel) = self.theme_selector.take() else {
             return;
         };
+        let original = self.theme_original.take();
         let Some(c) = sel.current().cloned() else {
-            self.theme = sel.original;
+            if let Some(orig) = original {
+                self.theme = orig;
+            }
             return;
         };
         self.theme = crate::theme::Theme::load(Some(&c.spec));
@@ -797,20 +934,5 @@ impl super::App {
             Some(v) => format!("effort → {} ({v})", c.label),
             None => "effort → default (the model/provider default)".to_string(),
         });
-    }
-
-    /// Feed one submitted line to the active `/login` wizard, dropping the modal
-    /// slot when it finishes. Caller checks `self.login.is_some()` first.
-    pub(super) fn login_feed(&mut self, line: &str) {
-        let Some(mut wizard) = self.login.take() else {
-            return;
-        };
-        let done = {
-            let mut host = TuiHost { app: self };
-            wizard.step(line, &mut host)
-        };
-        if !done {
-            self.login = Some(wizard);
-        }
     }
 }

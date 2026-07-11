@@ -564,25 +564,9 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         }
         "reload" => host.reload_config(),
         "skills" => {
-            let skills = crate::discover_skills(&host.cwd());
-            if skills.is_empty() {
-                host.info(
-                    "no skills yet — put Markdown prompt templates in .hrdr/skills/ (or \
-                     .claude/commands/, ~/.config/hrdr/skills/), then invoke one with \
-                     :name [arguments]"
-                        .to_string(),
-                );
-                return true;
-            }
-            let mut msg = format!("{} skills (invoke with :name [arguments]):", skills.len());
-            for sk in skills {
-                msg.push_str(&format!("\n  :{}", sk.name));
-                if !sk.description.is_empty() {
-                    msg.push_str(&format!(" — {}", sk.description));
-                }
-                msg.push_str(&format!("  [{}]", sk.source));
-            }
-            host.info(msg);
+            // Interactive picker where supported; the default host lists the
+            // skills as text (see CommandHost::begin_skill_selector).
+            host.begin_skill_selector();
         }
         "login" => host.begin_login(),
         "resume" | "load" => {

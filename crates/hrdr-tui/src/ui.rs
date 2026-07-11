@@ -148,6 +148,10 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         draw_theme_selector(f, &app.theme, sel);
     } else if let Some(sel) = &app.effort_selector {
         draw_effort_selector(f, &app.theme, sel);
+    } else if let Some(sel) = &app.skill_selector {
+        draw_skill_selector(f, &app.theme, sel);
+    } else if let Some(modal) = &app.login_modal {
+        draw_login_modal(f, &app.theme, modal);
     } else if let Some(comp) = app.active_completions() {
         // Completion popup (slash command or `@file`), overlaid above the input.
         app.completion_idx = app.completion_idx.min(comp.items.len() - 1);
@@ -241,6 +245,234 @@ fn draw_model_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ModelSele
         lines.push(line);
     }
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The `/skills` picker modal: a search line, a hint, and a two-column list
+/// (`:name` · description [source]); Enter inserts the invocation into the
+/// input. Same chrome as the other pickers.
+fn draw_skill_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::SkillSelector) {
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(1, 92);
+    let height = area.height.saturating_sub(2).clamp(1, 24);
+    let rect = Rect {
+        x: (area.width.saturating_sub(width)) / 2,
+        y: (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .style(Style::default().bg(theme.user_bg))
+        .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height < 3 || inner.width < 6 {
+        return;
+    }
+
+    let rows: Vec<&hrdr_app::Skill> = sel.rows().collect();
+    let search = Line::from(vec![
+        Span::styled("Search  ", Style::default().fg(theme.dim)),
+        Span::styled(sel.filter.clone(), Style::default().fg(theme.user)),
+        Span::styled("▌", Style::default().fg(theme.accent)),
+    ]);
+    let hint = Line::from(Span::styled(
+        format!(
+            "{} skill{} · ↑↓ select · Enter insert · Esc cancel",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" },
+        ),
+        Style::default().fg(theme.dim),
+    ));
+
+    let list_height = inner.height.saturating_sub(3) as usize;
+    let inner_w = inner.width as usize;
+    let start = if sel.selected >= list_height {
+        (sel.selected + 1).saturating_sub(list_height)
+    } else {
+        0
+    };
+
+    let mut lines = vec![search, hint, Line::from("")];
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no skills match",
+            Style::default().fg(theme.dim),
+        )));
+    }
+    for (i, sk) in rows.iter().enumerate().skip(start).take(list_height) {
+        let selected = i == sel.selected;
+        let right = if sk.description.is_empty() {
+            sk.source.clone()
+        } else {
+            sk.description.clone()
+        };
+        let right = truncate_chars(&right, (inner_w * 2 / 3).max(1));
+        let name = format!(":{}", sk.name);
+        let avail = inner_w.saturating_sub(right.chars().count() + 1).max(1);
+        let name = truncate_chars(&name, avail);
+        let pad = inner_w
+            .saturating_sub(name.chars().count() + right.chars().count())
+            .max(1);
+        let line = if selected {
+            Line::from(Span::styled(
+                format!("{name}{}{right}", " ".repeat(pad)),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.user)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Line::from(vec![
+                Span::styled(name, Style::default().fg(theme.user)),
+                Span::styled(
+                    format!("{}{right}", " ".repeat(pad)),
+                    Style::default().fg(theme.dim),
+                ),
+            ])
+        };
+        lines.push(line);
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The `/login` modal. Provider phase: the same two-column picker chrome as
+/// every other picker (label · auth method). Key phase: a masked input field
+/// under the plaintext-storage warning — the key never touches the editor,
+/// history, or transcript.
+fn draw_login_modal(f: &mut Frame, theme: &Theme, modal: &crate::app::LoginModal) {
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(1, 76);
+    match modal {
+        crate::app::LoginModal::Providers(sel) => {
+            let height = area.height.saturating_sub(2).clamp(1, 16);
+            let rect = Rect {
+                x: (area.width.saturating_sub(width)) / 2,
+                y: (area.height.saturating_sub(height)) / 2,
+                width,
+                height,
+            };
+            f.render_widget(Clear, rect);
+            let block = Block::default()
+                .style(Style::default().bg(theme.user_bg))
+                .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            if inner.height < 3 || inner.width < 6 {
+                return;
+            }
+            let rows: Vec<&hrdr_app::LoginProviderChoice> = sel.rows().collect();
+            let search = Line::from(vec![
+                Span::styled("🔑 /login  ", Style::default().fg(theme.warn)),
+                Span::styled("Search  ", Style::default().fg(theme.dim)),
+                Span::styled(sel.filter.clone(), Style::default().fg(theme.user)),
+                Span::styled("▌", Style::default().fg(theme.accent)),
+            ]);
+            let hint = Line::from(Span::styled(
+                format!(
+                    "{} provider{} · ↑↓ select · Enter continue · Esc cancel",
+                    rows.len(),
+                    if rows.len() == 1 { "" } else { "s" },
+                ),
+                Style::default().fg(theme.dim),
+            ));
+            let list_height = inner.height.saturating_sub(3) as usize;
+            let inner_w = inner.width as usize;
+            let start = if sel.selected >= list_height {
+                (sel.selected + 1).saturating_sub(list_height)
+            } else {
+                0
+            };
+            let mut lines = vec![search, hint, Line::from("")];
+            if rows.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "no providers match",
+                    Style::default().fg(theme.dim),
+                )));
+            }
+            for (i, c) in rows.iter().enumerate().skip(start).take(list_height) {
+                let selected = i == sel.selected;
+                let detail = truncate_chars(&c.detail, (inner_w / 2).max(1));
+                let label = format!("{}  ({})", c.label, c.name);
+                let avail = inner_w.saturating_sub(detail.chars().count() + 1).max(1);
+                let label = truncate_chars(&label, avail);
+                let pad = inner_w
+                    .saturating_sub(label.chars().count() + detail.chars().count())
+                    .max(1);
+                let line = if selected {
+                    Line::from(Span::styled(
+                        format!("{label}{}{detail}", " ".repeat(pad)),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(theme.user)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                } else {
+                    Line::from(vec![
+                        Span::styled(label, Style::default().fg(theme.user)),
+                        Span::styled(
+                            format!("{}{detail}", " ".repeat(pad)),
+                            Style::default().fg(theme.dim),
+                        ),
+                    ])
+                };
+                lines.push(line);
+            }
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+        crate::app::LoginModal::Key {
+            label,
+            warning,
+            input,
+            ..
+        } => {
+            // Title + wrapped warning + masked field + hint.
+            let warn_rows = (warning.chars().count() / (width.saturating_sub(6) as usize).max(1)
+                + warning.matches('\n').count()
+                + 1) as u16;
+            let height = (warn_rows + 6).min(area.height.saturating_sub(2).max(1));
+            let rect = Rect {
+                x: (area.width.saturating_sub(width)) / 2,
+                y: (area.height.saturating_sub(height)) / 2,
+                width,
+                height,
+            };
+            f.render_widget(Clear, rect);
+            let block = Block::default()
+                .style(Style::default().bg(theme.user_bg))
+                .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            if inner.height < 4 || inner.width < 6 {
+                return;
+            }
+            let masked: String = std::iter::repeat_n('•', input.chars().count())
+                .take(inner.width.saturating_sub(2) as usize)
+                .collect();
+            let lines = vec![
+                Line::from(Span::styled(
+                    format!("🔑 API key — {label}"),
+                    Style::default().fg(theme.warn),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    warning.clone(),
+                    Style::default().fg(theme.dim),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Key  ", Style::default().fg(theme.dim)),
+                    Span::styled(masked, Style::default().fg(theme.user)),
+                    Span::styled("▌", Style::default().fg(theme.accent)),
+                ]),
+                Line::from(Span::styled(
+                    "paste or type · Enter save & switch · Esc cancel",
+                    Style::default().fg(theme.dim),
+                )),
+            ];
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        }
+    }
 }
 
 /// The `/effort` picker modal: a search line, a hint, and a two-column list
@@ -940,11 +1172,7 @@ fn draw_pane(f: &mut Frame, theme: &Theme, area: Rect, bar: Color) -> Rect {
 
 fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = draw_pane(f, &app.theme, area, app.theme.prompt_border);
-    if app.masks_input() {
-        draw_masked_input(f, app, inner);
-    } else {
-        app.editor.render(f, inner);
-    }
+    app.editor.render(f, inner);
 
     // Both banners float on the same row above the pane; the quit confirmation
     // takes the spot when both would apply. Only the follow banner is clickable.
@@ -980,37 +1208,6 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         app.follow_button = None;
     }
-}
-
-/// Render the input pane with every character replaced by `•`, for the
-/// `/login` API-key prompt. The key is already kept out of history, the
-/// transcript, and the session file (see `LoginWizard::enter_key`); this
-/// keeps it off the screen too, while the editor still holds — and `/login`
-/// still reads — the real text underneath.
-///
-/// Cursor placement assumes the common case of typing/pasting straight
-/// through to the end (true for every key-entry path today); editing back
-/// into the middle of a masked value would place the cursor by count alone,
-/// same as the wrap below.
-fn draw_masked_input(f: &mut Frame, app: &App, area: Rect) {
-    let count = app.editor.content().chars().count();
-    let width = (area.width.max(1)) as usize;
-    let bullets: Vec<char> = std::iter::repeat_n('•', count).collect();
-    let lines: Vec<Line> = if bullets.is_empty() {
-        vec![Line::from("")]
-    } else {
-        bullets
-            .chunks(width)
-            .map(|c| Line::from(c.iter().collect::<String>()))
-            .collect()
-    };
-    f.render_widget(Paragraph::new(lines), area);
-
-    let row = (count / width) as u16;
-    let col = (count % width) as u16;
-    let sy = area.y + row.min(area.height.saturating_sub(1));
-    let sx = area.x + col.min(area.width.saturating_sub(1));
-    f.set_cursor_position((sx, sy));
 }
 
 /// Rows above the input pane that a banner floats on, clear of its padding.

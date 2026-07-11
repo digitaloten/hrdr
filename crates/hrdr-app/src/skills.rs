@@ -160,6 +160,24 @@ pub fn expand_skill(input: &str, skills: &[Skill]) -> Option<String> {
     })
 }
 
+/// Case-insensitive fuzzy filter over skills for the `/skills` picker: the
+/// query's characters must appear in order within `"name description source"`.
+/// Returns matching indices in input order; an empty query matches everything.
+pub fn filter_skills(skills: &[Skill], query: &str) -> Vec<usize> {
+    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
+    if q.is_empty() {
+        return (0..skills.len()).collect();
+    }
+    skills
+        .iter()
+        .enumerate()
+        .filter_map(|(i, sk)| {
+            let hay = format!("{} {} {}", sk.name, sk.description, sk.source).to_lowercase();
+            crate::is_subsequence(&q, &hay).then_some(i)
+        })
+        .collect()
+}
+
 /// Skills matching an in-progress `:…` input (empty once a space is typed) as
 /// `(":name", description)` rows for the completion popup. Ranked like the
 /// slash commands: name-prefix, then name-substring, then description.

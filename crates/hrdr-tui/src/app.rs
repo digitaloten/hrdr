@@ -21,26 +21,41 @@ use crate::theme::Theme;
 
 mod commands;
 mod completion;
-mod effort_selector;
-mod model_selector;
+mod selector;
 mod session;
-mod session_selector;
-mod theme_selector;
 mod util;
 
 use completion::CompletionKind;
 pub(crate) use completion::Completions;
-pub(crate) use effort_selector::EffortSelector;
 use hrdr_app::config_mtime as current_config_mtime;
 use hrdr_app::{
     SubAgentPanel, age_completed_todos, display_dir, git_branch, is_known_command, is_quit_command,
 };
-pub(crate) use model_selector::ModelSelector;
-pub(crate) use session_selector::SessionSelector;
-pub(crate) use theme_selector::ThemeSelector;
+pub(crate) use selector::{
+    EffortSelector, LoginProviderSelector, ModelSelector, SessionSelector, SkillSelector,
+    ThemeSelector, effort_selector, login_provider_selector, model_selector, session_selector,
+    skill_selector, theme_selector,
+};
 // Re-exported so the `tui` driver module (which owns the event loop + terminal)
 // can reach these terminal-facing helpers.
 pub(crate) use util::run_editor;
+
+/// The `/login` modal's two phases: pick a provider from a fuzzy list, then —
+/// for a remote key-based provider — enter the API key in a masked field.
+/// OAuth and keyless providers finish straight from the first phase.
+pub(crate) enum LoginModal {
+    Providers(LoginProviderSelector),
+    Key {
+        /// Provider name the key belongs to.
+        name: String,
+        /// Friendly label for the modal title.
+        label: String,
+        /// The plaintext-storage warning shown above the field.
+        warning: String,
+        /// The key as typed/pasted (rendered masked).
+        input: String,
+    },
+}
 
 // The display-mode enums live in the shared `hrdr-app` core so every frontend
 // resolve/persist these settings identically.
@@ -154,9 +169,6 @@ pub(crate) struct App {
     pending_init: bool,
     /// A file `/edit` requested to open in `$EDITOR`, consumed by the run loop.
     pending_edit: Option<std::path::PathBuf>,
-    /// An in-progress `/login` wizard; while `Some`, submitted lines feed it
-    /// instead of the model or the slash dispatcher.
-    login: Option<hrdr_app::LoginWizard>,
     /// The open `/model` selector modal; while `Some`, it captures every key.
     pub(crate) model_selector: Option<ModelSelector>,
     /// The open `/resume` session picker modal; while `Some`, it captures every key.
@@ -164,8 +176,16 @@ pub(crate) struct App {
     /// The open `/theme` picker modal; while `Some`, it captures every key and
     /// live-previews the highlighted theme.
     pub(crate) theme_selector: Option<ThemeSelector>,
+    /// The theme in force when the `/theme` picker opened — restored on Esc
+    /// (and while no row matches its filter).
+    pub(crate) theme_original: Option<Theme>,
     /// The open `/effort` picker modal; while `Some`, it captures every key.
     pub(crate) effort_selector: Option<EffortSelector>,
+    /// The open `/skills` picker modal; while `Some`, it captures every key.
+    pub(crate) skill_selector: Option<SkillSelector>,
+    /// The open `/login` modal (provider list, then masked key entry); while
+    /// `Some`, it captures every key (and pasted text, for the key field).
+    pub(crate) login_modal: Option<LoginModal>,
     /// USD already spent when the current session was adopted (a resumed
     /// session's saved spend); the agent's live counter adds on top of it.
     pub(crate) cost_base: f64,
@@ -390,11 +410,13 @@ impl App {
             compacting: false,
             pending_init: false,
             pending_edit: None,
-            login: None,
             model_selector: None,
             session_selector: None,
             theme_selector: None,
+            theme_original: None,
             effort_selector: None,
+            skill_selector: None,
+            login_modal: None,
             cost_base: 0.0,
             skills: hrdr_app::discover_skills(&cwd_for_skills),
             pending_goto: None,
@@ -518,6 +540,14 @@ impl App {
         }
         if self.effort_selector.is_some() {
             self.effort_selector_key(key);
+            return Action::None;
+        }
+        if self.skill_selector.is_some() {
+            self.skill_selector_key(key);
+            return Action::None;
+        }
+        if self.login_modal.is_some() {
+            self.login_modal_key(key);
             return Action::None;
         }
 
@@ -668,14 +698,6 @@ impl App {
             if input.trim().is_empty() {
                 return Action::None;
             }
-            // A running `/login` wizard captures the line (an API key must never
-            // reach input history or the transcript), before anything else.
-            if self.login.is_some() {
-                self.login_feed(input.trim());
-                self.editor.set_content("");
-                self.scroll_offset = 0;
-                return Action::None;
-            }
             self.record_history(&input);
             // Common quit commands exit the session instead of being sent.
             if is_quit_command(input.trim()) {
@@ -740,6 +762,18 @@ impl App {
         Action::None
     }
 
+    /// Route pasted text: the `/login` key field takes it whole (an API key
+    /// paste must not leak into the editor/history); otherwise it goes to the
+    /// input editor.
+    pub(crate) fn on_paste(&mut self, text: &str) {
+        self.quit_armed = false;
+        if let Some(LoginModal::Key { input, .. }) = &mut self.login_modal {
+            input.push_str(text.trim());
+            return;
+        }
+        self.editor.paste(text);
+    }
+
     /// Mouse: wheel scrolls the transcript; a left click on the follow button
     /// resumes following the newest output.
     pub(crate) fn on_mouse(&mut self, m: MouseEvent) {
@@ -775,6 +809,22 @@ impl App {
             return;
         }
         if let Some(sel) = &mut self.effort_selector {
+            match m.kind {
+                MouseEventKind::ScrollUp => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.up()),
+                MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(sel) = &mut self.skill_selector {
+            match m.kind {
+                MouseEventKind::ScrollUp => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.up()),
+                MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(LoginModal::Providers(sel)) = &mut self.login_modal {
             match m.kind {
                 MouseEventKind::ScrollUp => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.up()),
                 MouseEventKind::ScrollDown => (0..MOUSE_SCROLL_LINES).for_each(|_| sel.down()),
@@ -845,10 +895,6 @@ impl App {
     /// value stays in the editor buffer untouched (`/login` reads it via
     /// `self.editor.content()` as usual); only the on-screen rendering
     /// changes, so the key isn't fully visible on screen as it's typed.
-    pub(crate) fn masks_input(&self) -> bool {
-        self.login.as_ref().is_some_and(|w| w.wants_secret_input())
-    }
-
     /// Show a transient status line: a command's output, a usage hint, a busy
     /// guard, a reload notice. These are chrome — regenerated on demand and
     /// never persisted (see [`hrdr_app::EntryKind::Notice`]).

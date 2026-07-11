@@ -100,10 +100,7 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
                     Action::None => {}
                 },
                 Some(Ok(Event::Mouse(m))) => app.on_mouse(m),
-                Some(Ok(Event::Paste(text))) => {
-                    app.quit_armed = false;
-                    app.editor.paste(&text);
-                }
+                Some(Ok(Event::Paste(text))) => app.on_paste(&text),
                 Some(Ok(_)) => {}
                 Some(Err(_)) | None => break,
             },

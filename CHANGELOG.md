@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/skills` picker.** `/skills` now opens a fuzzy picker over the discovered
+  skills (name · description · source); Enter inserts `:name ` into the input,
+  ready for arguments.
+- **`/login` is a full modal flow.** Provider selection is a fuzzy picker (label
+  · auth method), and key-based providers continue to a **masked key field
+  inside the modal** — typed or pasted keys never touch the input editor,
+  history, or transcript. OAuth (OpenRouter, ChatGPT) and keyless (`local`)
+  providers finish straight from the list. The line-based wizard remains for
+  frontends without the modal.
+- **One picker engine.** The model/session/theme/effort/skills/login pickers now
+  share a generic `Selector<T>` state machine (filter + navigation); per-picker
+  code is just a choice type, a fuzzy filter, and an Enter action.
 - **`/effort` picker.** A bare `/effort` (the argument form is gone) opens a
   fuzzy-searchable picker of the reasoning levels the **current model actually
   accepts**, read from the models.dev catalog's `reasoning_options` — ordered

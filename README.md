@@ -132,8 +132,9 @@ are discovered from `.hrdr/skills/`, `.claude/commands/`, and
 `~/.claude/commands/`, and `~/.config/opencode/command/` — first match by name
 wins. Optional `name:` / `description:` frontmatter (plus `args: [a, b]` —
 candidate argument values the completion popup offers after `:name `); the file
-stem names it otherwise. `/skills` lists what's loaded; the transcript shows the
-raw `:name args` you typed while the model receives the expanded prompt.
+stem names it otherwise. `/skills` opens a picker over what's loaded (Enter
+inserts `:name ` into the input); the transcript shows the raw `:name args` you
+typed while the model receives the expanded prompt.
 
 ```markdown
 ## <!-- .hrdr/skills/review.md -->
@@ -169,11 +170,13 @@ Type `/` to see the menu (fuzzy-matched, `Tab` to accept). Highlights:
   first — or `/resume <id|name>` directly), `/rename`, `/compact`, `/status`
   (alias `/info`), `/goto <N|5m|top|end>`, `/find <text>` (`/next` `/prev`)
 - **Model** — `/model` (picker: switches model _and_ provider, includes the
-  keyless `local` endpoint), `/login` (guided provider + key setup), `/temp`,
-  `/effort` (picker: the reasoning levels the current model actually accepts —
-  per the models.dev catalog — highest first, "Default" on top to clear the
-  override; sent as `reasoning_effort` to OpenAI-style reasoning models, or a
-  `thinking` budget on the native Anthropic backend), `/reasoning`
+  keyless `local` endpoint), `/login` (modal: pick a provider from a fuzzy list,
+  then enter the API key in a masked field — OAuth and keyless providers finish
+  straight from the list), `/temp`, `/effort` (picker: the reasoning levels the
+  current model actually accepts — per the models.dev catalog — highest first,
+  "Default" on top to clear the override; sent as `reasoning_effort` to
+  OpenAI-style reasoning models, or a `thinking` budget on the native Anthropic
+  backend), `/reasoning`
 - **Files** — `/init` (write `AGENTS.md`), `/add`, `/edit <file>`, `/diff`,
   `/revert` + `/checkpoints` (file undo), `/tools`, `/expand`, `/paste`
 - **Reply** — `/copy [code|all|msg N]`, `/export [--json]`, `/retry [model]`,
