@@ -31,6 +31,10 @@ pub const DEFAULT_LSP_WAIT_MS: u64 = 2_000;
 const SETTLE_MS: u64 = 300;
 /// Diagnostics lines shown per edit before "…and N more".
 const MAX_DIAG_LINES: usize = 8;
+/// How long a navigation request (`definition`/`references`/`rename`) may
+/// take — longer than the diagnostics wait: the model asked explicitly, and
+/// an indexing server answers when ready.
+const NAV_TIMEOUT_MS: u64 = 30_000;
 
 /// One language server: which command to run and which files it checks.
 #[derive(Debug, Clone)]
@@ -237,6 +241,67 @@ impl LspRegistry {
         self.wait_ms
     }
 
+    /// The client + extension for a navigation request on `path` — unlike the
+    /// diagnostics path, absence is an error here (the model called a tool and
+    /// deserves to know why nothing came back).
+    async fn nav_client(&self, path: &Path) -> Result<(Arc<LspClient>, String)> {
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let config = self
+            .configs
+            .iter()
+            .find(|c| c.extensions.iter().any(|e| e == &ext))
+            .ok_or_else(|| anyhow::anyhow!("no language server is configured for .{ext} files"))?;
+        let command = config.command.clone();
+        let client = self
+            .client_for(config)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the {command} language server is not available"))?;
+        Ok((client, ext))
+    }
+
+    /// The workspace root the servers were initialized against.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// One position-based navigation request (`textDocument/definition`,
+    /// `…/references`, `…/rename`) for the symbol at `position` —
+    /// 0-based `(line, character)`, `character` in UTF-16 code units, per
+    /// LSP. `content` is the file's current text, synced to the server first.
+    /// `extra` params are merged in (e.g. `newName`). Gated on the server's
+    /// advertised `<capability>Provider`.
+    pub async fn nav_request(
+        &self,
+        method: &str,
+        capability: &str,
+        path: &Path,
+        content: &str,
+        position: (u32, u32),
+        extra: Value,
+    ) -> Result<Value> {
+        let (client, ext) = self.nav_client(path).await?;
+        if !client.supports(capability) {
+            anyhow::bail!("this language server does not support {method}");
+        }
+        let uri = file_uri(path);
+        client.sync_file(&uri, &ext, content).await?;
+        let mut params = json!({
+            "textDocument": {"uri": uri},
+            "position": {"line": position.0, "character": position.1},
+        });
+        if let (Some(obj), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        client
+            .request(method, params, Duration::from_millis(NAV_TIMEOUT_MS))
+            .await
+    }
+
     /// Spawn + initialize the servers for `extensions` now instead of on the
     /// first edit, so indexing-heavy servers (rust-analyzer) overlap their
     /// warm-up with the session's first prompt rather than its first edit.
@@ -271,6 +336,9 @@ struct LspClient {
     diag_notify: tokio::sync::Notify,
     /// Documents already opened on the server: URI → version.
     open_docs: tokio::sync::Mutex<HashMap<String, i64>>,
+    /// The server's advertised capabilities (from the `initialize` result) —
+    /// gates the navigation requests.
+    capabilities: std::sync::OnceLock<Value>,
     /// Owns the process; `kill_on_drop` reaps it when the registry drops.
     _child: tokio::process::Child,
 }
@@ -296,6 +364,7 @@ impl LspClient {
             diags: std::sync::Mutex::new(HashMap::new()),
             diag_notify: tokio::sync::Notify::new(),
             open_docs: tokio::sync::Mutex::new(HashMap::new()),
+            capabilities: std::sync::OnceLock::new(),
             _child: child,
         });
         tokio::spawn(Self::read_loop(Arc::clone(&client), stdout));
@@ -319,9 +388,20 @@ impl LspClient {
                 Duration::from_millis(INIT_TIMEOUT_MS),
             )
             .await?;
-        drop(init);
+        let _ = client
+            .capabilities
+            .set(init.get("capabilities").cloned().unwrap_or(Value::Null));
         client.notify("initialized", json!({})).await?;
         Ok(client)
+    }
+
+    /// Whether the server advertised `<name>Provider` in its capabilities
+    /// (either `true` or an options object counts).
+    fn supports(&self, provider_cap: &str) -> bool {
+        self.capabilities
+            .get()
+            .and_then(|c| c.get(provider_cap))
+            .is_some_and(|v| v.as_bool().unwrap_or(v.is_object()))
     }
 
     /// The reader half: parse framed messages forever, filing responses to
@@ -383,6 +463,43 @@ impl LspClient {
         }
     }
 
+    /// Sync the file's content to the server: `didOpen` on first touch,
+    /// `didChange` (full text) after. Returns the document version sent.
+    async fn sync_file(&self, uri: &str, ext: &str, content: &str) -> Result<i64> {
+        let mut open = self.open_docs.lock().await;
+        match open.get(uri) {
+            Some(v) => {
+                let v = v + 1;
+                open.insert(uri.to_string(), v);
+                self.notify(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": {"uri": uri, "version": v},
+                        "contentChanges": [{"text": content}],
+                    }),
+                )
+                .await?;
+                Ok(v)
+            }
+            None => {
+                open.insert(uri.to_string(), 1);
+                self.notify(
+                    "textDocument/didOpen",
+                    json!({
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": language_id(ext),
+                            "version": 1,
+                            "text": content,
+                        },
+                    }),
+                )
+                .await?;
+                Ok(1)
+            }
+        }
+    }
+
     /// Sync the file to the server (`didOpen` first time, `didChange` after)
     /// and wait — bounded by `wait` — for its diagnostics.
     async fn check_file(
@@ -398,47 +515,9 @@ impl LspClient {
         if let Ok(mut d) = self.diags.lock() {
             d.remove(&uri);
         }
-        let mut open = self.open_docs.lock().await;
-        let version = match open.get(&uri) {
-            Some(v) => {
-                let v = v + 1;
-                open.insert(uri.clone(), v);
-                let sent = self
-                    .notify(
-                        "textDocument/didChange",
-                        json!({
-                            "textDocument": {"uri": uri, "version": v},
-                            "contentChanges": [{"text": content}],
-                        }),
-                    )
-                    .await;
-                if sent.is_err() {
-                    return Vec::new();
-                }
-                v
-            }
-            None => {
-                open.insert(uri.clone(), 1);
-                let sent = self
-                    .notify(
-                        "textDocument/didOpen",
-                        json!({
-                            "textDocument": {
-                                "uri": uri,
-                                "languageId": language_id(ext),
-                                "version": 1,
-                                "text": content,
-                            },
-                        }),
-                    )
-                    .await;
-                if sent.is_err() {
-                    return Vec::new();
-                }
-                1
-            }
+        let Ok(version) = self.sync_file(&uri, ext, content).await else {
+            return Vec::new();
         };
-        drop(open);
 
         // Wait for a publish for this URI. Servers often publish a quick
         // (stale or empty) set and the real analysis shortly after, so once
@@ -499,6 +578,217 @@ impl LspClient {
         stdin.flush().await?;
         Ok(())
     }
+}
+
+// ── Navigation-result plumbing (shared by the definition/references/rename
+//    tools) ─────────────────────────────────────────────────────────────────
+
+/// A resolved code location, 1-based, ready to print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspLocation {
+    pub path: PathBuf,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// One text replacement from a rename's `WorkspaceEdit`, 0-based LSP
+/// positions (UTF-16 `character`s).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspTextEdit {
+    pub start: (u32, u32),
+    pub end: (u32, u32),
+    pub new_text: String,
+}
+
+/// All of one file's edits from a rename.
+#[derive(Debug, Clone)]
+pub struct LspFileEdits {
+    pub path: PathBuf,
+    pub edits: Vec<LspTextEdit>,
+}
+
+/// A `file://` URI back to a path (reverses [`file_uri`]'s escaping).
+pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // Windows drive form `file:///C:/…` keeps the path after the third slash.
+    let rest = if rest.len() > 2 && rest.as_bytes()[0] == b'/' && rest.as_bytes()[2] == b':' {
+        &rest[1..]
+    } else {
+        rest
+    };
+    let mut out = String::with_capacity(rest.len());
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    let mut raw = Vec::new();
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&rest[i + 1..i + 3], 16)
+        {
+            raw.push(b);
+            i += 3;
+            continue;
+        }
+        if !raw.is_empty() {
+            out.push_str(&String::from_utf8_lossy(&raw));
+            raw.clear();
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    if !raw.is_empty() {
+        out.push_str(&String::from_utf8_lossy(&raw));
+    }
+    Some(PathBuf::from(out))
+}
+
+/// The UTF-16 column of byte offset `byte_col` within `line` (for building a
+/// request position from a byte-indexed symbol match).
+pub fn byte_to_utf16_col(line: &str, byte_col: usize) -> u32 {
+    line[..byte_col.min(line.len())]
+        .chars()
+        .map(|c| c.len_utf16() as u32)
+        .sum()
+}
+
+/// The byte offset of UTF-16 column `utf16_col` within `line` (clamped to the
+/// line's end).
+fn utf16_to_byte_col(line: &str, utf16_col: u32) -> usize {
+    let mut units = 0u32;
+    for (i, c) in line.char_indices() {
+        if units >= utf16_col {
+            return i;
+        }
+        units += c.len_utf16() as u32;
+    }
+    line.len()
+}
+
+/// Normalize a definition/references result — `null`, a single `Location`, an
+/// array of `Location`s, or an array of `LocationLink`s — into printable
+/// locations (1-based).
+pub fn parse_locations(result: &Value) -> Vec<LspLocation> {
+    let one = |v: &Value| -> Option<LspLocation> {
+        // LocationLink targets; plain Locations carry `uri` + `range`.
+        let (uri, range) = if let Some(target) = v.get("targetUri") {
+            (
+                target.as_str()?,
+                v.get("targetSelectionRange")
+                    .or_else(|| v.get("targetRange"))?,
+            )
+        } else {
+            (v.get("uri")?.as_str()?, v.get("range")?)
+        };
+        Some(LspLocation {
+            path: uri_to_path(uri)?,
+            line: range.pointer("/start/line")?.as_u64()? as u32 + 1,
+            column: range.pointer("/start/character")?.as_u64()? as u32 + 1,
+        })
+    };
+    match result {
+        Value::Array(items) => items.iter().filter_map(one).collect(),
+        Value::Null => Vec::new(),
+        v => one(v).into_iter().collect(),
+    }
+}
+
+/// Parse a rename's `WorkspaceEdit` (either the `changes` map or
+/// `documentChanges` array form) into per-file edit lists. Errors on file
+/// create/rename/delete operations — hrdr applies text edits only.
+pub fn parse_workspace_edit(result: &Value) -> Result<Vec<LspFileEdits>> {
+    fn text_edits(edits: &Value) -> Vec<LspTextEdit> {
+        edits
+            .as_array()
+            .map(|a| a.iter().filter_map(one_edit).collect())
+            .unwrap_or_default()
+    }
+    fn one_edit(e: &Value) -> Option<LspTextEdit> {
+        Some(LspTextEdit {
+            start: (
+                e.pointer("/range/start/line")?.as_u64()? as u32,
+                e.pointer("/range/start/character")?.as_u64()? as u32,
+            ),
+            end: (
+                e.pointer("/range/end/line")?.as_u64()? as u32,
+                e.pointer("/range/end/character")?.as_u64()? as u32,
+            ),
+            new_text: e.get("newText")?.as_str()?.to_string(),
+        })
+    }
+
+    let mut out = Vec::new();
+    if let Some(changes) = result.get("changes").and_then(Value::as_object) {
+        for (uri, edits) in changes {
+            let path = uri_to_path(uri).context("bad uri in WorkspaceEdit")?;
+            out.push(LspFileEdits {
+                path,
+                edits: text_edits(edits),
+            });
+        }
+    } else if let Some(doc_changes) = result.get("documentChanges").and_then(Value::as_array) {
+        for change in doc_changes {
+            if let Some(kind) = change.get("kind").and_then(Value::as_str) {
+                anyhow::bail!("rename requires a file {kind} operation, which hrdr doesn't apply");
+            }
+            let uri = change
+                .pointer("/textDocument/uri")
+                .and_then(Value::as_str)
+                .context("bad documentChanges entry")?;
+            out.push(LspFileEdits {
+                path: uri_to_path(uri).context("bad uri in WorkspaceEdit")?,
+                edits: text_edits(change.get("edits").unwrap_or(&Value::Null)),
+            });
+        }
+    } else if !result.is_null() {
+        anyhow::bail!("unrecognized WorkspaceEdit shape");
+    }
+    out.retain(|f| !f.edits.is_empty());
+    Ok(out)
+}
+
+/// Apply LSP text edits to `content`. Positions are 0-based lines + UTF-16
+/// columns; edits are converted to byte ranges and applied last-first so
+/// earlier offsets stay valid. Overlapping edits are an error.
+pub fn apply_lsp_edits(content: &str, edits: &[LspTextEdit]) -> Result<String> {
+    // Byte offset of each line start (including a virtual line past the end,
+    // so an edit ending at the start of the line after the last is valid).
+    let mut line_starts = vec![0usize];
+    for (i, b) in content.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let line_text = |l: usize| -> &str {
+        let start = line_starts[l];
+        let end = line_starts.get(l + 1).map_or(content.len(), |n| n - 1);
+        &content[start..end.max(start)]
+    };
+    let to_offset = |(line, col): (u32, u32)| -> Result<usize> {
+        let l = line as usize;
+        if l >= line_starts.len() {
+            anyhow::bail!(
+                "edit position line {} is past the end of the file",
+                line + 1
+            );
+        }
+        Ok(line_starts[l] + utf16_to_byte_col(line_text(l), col))
+    };
+
+    let mut spans: Vec<(usize, usize, &str)> = Vec::with_capacity(edits.len());
+    for e in edits {
+        spans.push((to_offset(e.start)?, to_offset(e.end)?, &e.new_text));
+    }
+    spans.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    let mut prev_start = usize::MAX;
+    let mut out = content.to_string();
+    for (start, end, text) in spans {
+        if end > prev_start || start > end {
+            anyhow::bail!("overlapping or inverted edits in the rename");
+        }
+        prev_start = start;
+        out.replace_range(start..end, text);
+    }
+    Ok(out)
 }
 
 /// Read one `Content-Length`-framed JSON-RPC message.
@@ -769,12 +1059,162 @@ mod tests {
         );
     }
 
-    /// A minimal, protocol-correct LSP server: answers `initialize`, and on
-    /// `didOpen`/`didChange` publishes one error per line containing "boom"
-    /// (with the document's version, exercising the stale-publish guard).
-    #[cfg(unix)] // used only by the unix-gated integration test above
+    #[test]
+    fn uris_round_trip_and_utf16_columns_convert() {
+        let p = Path::new("/proj/src/a b.rs");
+        assert_eq!(uri_to_path(&file_uri(p)).unwrap(), p);
+        // Non-BMP char (🦀 = 2 UTF-16 units, 4 UTF-8 bytes).
+        let line = "let 🦀 = boom;";
+        let byte = line.find("boom").unwrap();
+        let utf16 = byte_to_utf16_col(line, byte);
+        assert_eq!(utf16, 9, "4 ascii + surrogate pair (2) + 3 ascii");
+        assert_eq!(utf16_to_byte_col(line, utf16), byte);
+    }
+
+    #[test]
+    fn locations_parse_all_three_shapes() {
+        let loc = serde_json::json!({"uri": "file:///p/a.rs",
+            "range": {"start": {"line": 4, "character": 2}, "end": {"line": 4, "character": 6}}});
+        let link = serde_json::json!({"targetUri": "file:///p/b.rs",
+            "targetSelectionRange": {"start": {"line": 0, "character": 0},
+                                     "end": {"line": 0, "character": 1}}});
+        let single = parse_locations(&loc);
+        assert_eq!(single[0].path, PathBuf::from("/p/a.rs"));
+        assert_eq!((single[0].line, single[0].column), (5, 3), "1-based");
+        let many = parse_locations(&serde_json::json!([loc, link]));
+        assert_eq!(many.len(), 2);
+        assert_eq!(many[1].path, PathBuf::from("/p/b.rs"));
+        assert!(parse_locations(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn workspace_edits_parse_and_apply() {
+        // The `changes` map form.
+        let we = serde_json::json!({"changes": {"file:///p/a.rs": [
+            {"range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 8}},
+             "newText": "blast"},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}},
+             "newText": "blast"}
+        ]}});
+        let files = parse_workspace_edit(&we).unwrap();
+        assert_eq!(files.len(), 1);
+        let out = apply_lsp_edits("let boom = 1;\nboom();\n", &files[0].edits).unwrap();
+        assert_eq!(out, "let blast = 1;\nblast();\n");
+
+        // The `documentChanges` form; a file-operation entry is refused.
+        let dc = serde_json::json!({"documentChanges": [
+            {"textDocument": {"uri": "file:///p/a.rs", "version": 1},
+             "edits": [{"range": {"start": {"line": 0, "character": 0},
+                                  "end": {"line": 0, "character": 3}}, "newText": "new"}]}
+        ]});
+        assert_eq!(parse_workspace_edit(&dc).unwrap().len(), 1);
+        let op = serde_json::json!({"documentChanges": [{"kind": "rename"}]});
+        assert!(parse_workspace_edit(&op).is_err());
+
+        // Overlapping edits are refused rather than corrupting the file.
+        let overlap = vec![
+            LspTextEdit {
+                start: (0, 0),
+                end: (0, 4),
+                new_text: "x".into(),
+            },
+            LspTextEdit {
+                start: (0, 2),
+                end: (0, 6),
+                new_text: "y".into(),
+            },
+        ];
+        assert!(apply_lsp_edits("abcdefgh", &overlap).is_err());
+    }
+
+    /// The navigation tools end-to-end against the scripted server:
+    /// definition + references resolve `symbol` on a 1-based line, and rename
+    /// applies the server's WorkspaceEdit through the checkpointed write path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nav_tools_ride_the_language_server() {
+        if which::which("python3").is_err() {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        use crate::Tool as _;
+        let dir = tempfile::tempdir().unwrap();
+        let server = dir.path().join("fake_lsp.py");
+        std::fs::write(&server, FAKE_LSP_PY).unwrap();
+        let file = dir.path().join("main.xyz");
+        std::fs::write(&file, "boom here\nuse boom\n").unwrap();
+
+        let mut ctx = crate::ToolContext::new(dir.path());
+        ctx.lsp = Some(Arc::new(LspRegistry::new(
+            dir.path().to_path_buf(),
+            vec![LspServerConfig {
+                command: "python3".to_string(),
+                args: vec![server.display().to_string()],
+                extensions: vec!["xyz".to_string()],
+            }],
+            Some(5_000),
+        )));
+
+        // Definition: symbol on line 2 resolves to the first occurrence.
+        let out = crate::DefinitionTool
+            .execute(
+                serde_json::json!({"path": "main.xyz", "line": 2, "symbol": "boom"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("main.xyz:1:1"), "{out}");
+
+        // References: both occurrences, counted.
+        let out = crate::ReferencesTool
+            .execute(
+                serde_json::json!({"path": "main.xyz", "line": 1, "symbol": "boom"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.starts_with("2 reference(s):"), "{out}");
+        assert!(out.contains("main.xyz:2:5"), "{out}");
+
+        // A symbol that isn't on the line is a plain, actionable error.
+        let err = crate::DefinitionTool
+            .execute(
+                serde_json::json!({"path": "main.xyz", "line": 1, "symbol": "nope"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not appear"), "{err}");
+
+        // Rename: the server's edits land on disk through apply_file_change.
+        let out = crate::RenameTool
+            .execute(
+                serde_json::json!({"path": "main.xyz", "line": 1, "symbol": "boom",
+                                   "new_name": "blast"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.contains("Renamed `boom` → `blast` in 1 file(s)"),
+            "{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "blast here\nuse blast\n"
+        );
+    }
+
+    /// A minimal, protocol-correct LSP server: answers `initialize`
+    /// (advertising the navigation capabilities), publishes one error per
+    /// line containing "boom" on `didOpen`/`didChange` (with the document's
+    /// version, exercising the stale-publish guard), and serves
+    /// definition/references/rename for the word "boom" from the synced text.
+    #[cfg(unix)] // used only by the unix-gated integration tests above
     const FAKE_LSP_PY: &str = r#"
 import json, sys
+
+texts = {}
 
 def read():
     length = None
@@ -794,6 +1234,7 @@ def send(msg):
     sys.stdout.buffer.flush()
 
 def publish(uri, version, text):
+    texts[uri] = text
     diags = []
     for i, line in enumerate(text.splitlines()):
         if "boom" in line:
@@ -806,17 +1247,53 @@ def publish(uri, version, text):
     send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
           "params": {"uri": uri, "version": version, "diagnostics": diags}})
 
+def occurrences(uri):
+    out = []
+    for i, line in enumerate(texts.get(uri, "").splitlines()):
+        start = 0
+        while True:
+            j = line.find("boom", start)
+            if j < 0:
+                break
+            out.append((i, j))
+            start = j + 4
+    return out
+
+def loc(uri, l, c):
+    return {"uri": uri, "range": {"start": {"line": l, "character": c},
+                                  "end": {"line": l, "character": c + 4}}}
+
 while True:
     msg = read()
     method = msg.get("method")
     if method == "initialize":
-        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {}}})
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {
+            "definitionProvider": True,
+            "referencesProvider": True,
+            "renameProvider": True,
+        }}})
     elif method == "textDocument/didOpen":
         d = msg["params"]["textDocument"]
         publish(d["uri"], d["version"], d["text"])
     elif method == "textDocument/didChange":
         d = msg["params"]["textDocument"]
         publish(d["uri"], d["version"], msg["params"]["contentChanges"][0]["text"])
+    elif method == "textDocument/definition":
+        uri = msg["params"]["textDocument"]["uri"]
+        occ = occurrences(uri)
+        result = loc(uri, *occ[0]) if occ else None
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": result})
+    elif method == "textDocument/references":
+        uri = msg["params"]["textDocument"]["uri"]
+        send({"jsonrpc": "2.0", "id": msg["id"],
+              "result": [loc(uri, l, c) for (l, c) in occurrences(uri)]})
+    elif method == "textDocument/rename":
+        uri = msg["params"]["textDocument"]["uri"]
+        new = msg["params"]["newName"]
+        edits = [{"range": loc(uri, l, c)["range"], "newText": new}
+                 for (l, c) in occurrences(uri)]
+        send({"jsonrpc": "2.0", "id": msg["id"],
+              "result": {"changes": {uri: edits}}})
     elif method == "shutdown":
         send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
 "#;

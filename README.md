@@ -784,6 +784,15 @@ command = "zls"
 extensions = ["zig"]
 ```
 
+The same warm servers back three **model tools**: `definition` and `references`
+(read-only lookups — the model gives a file, a 1-based line, and the symbol text
+on that line; results come back as `path:line:col`), and `rename`, which applies
+the server-computed workspace edit through the normal checkpointed write path —
+so `/undo` reverts the whole rename, formatter hooks and post-edit diagnostics
+run per touched file, and edits are validated atomically before anything is
+written. Read-only sub-agents (`explore`, `review`) get the lookups; `rename` is
+pruned with the other writers.
+
 ### Theme
 
 The TUI colors come from an [hjkl](https://github.com/kryptic-sh/hjkl) theme.

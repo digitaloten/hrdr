@@ -367,8 +367,10 @@ fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     base.subagents = false;
     base.mcp = Vec::new();
     // Sub-agents share the parent's language servers (`SubagentTool` hands
-    // them its registry Arc) instead of spawning their own set.
+    // them its registry Arc) instead of spawning their own set — but still
+    // register the LSP tools, which resolve the registry at call time.
     base.lsp = false;
+    base.lsp_shared = true;
     // The unnamed default sub-agent runs the main prompt with the full tool set;
     // profiles opt into a persona / read-only scope via `config_for_agent_profile`.
     base.agent_prompt = None;
@@ -860,6 +862,11 @@ pub struct AgentConfig {
     pub lsp_wait_ms: Option<u64>,
     /// Custom `[[lsp.servers]]`, consulted before the built-in registry.
     pub lsp_servers: Vec<LspServerEntry>,
+    /// Internal (sub-agents): the tool context receives the parent's shared
+    /// `LspRegistry` after construction — register the LSP tools, but don't
+    /// build a registry of our own (`lsp` is `false` alongside this).
+    #[doc(hidden)]
+    pub lsp_shared: bool,
     /// Per-tool output byte cap before truncation (`[tool_output] max_bytes`).
     /// Larger `bash`/`grep` output is truncated and the full text saved to disk.
     pub tool_max_bytes: usize,
@@ -1293,6 +1300,7 @@ impl Default for AgentConfig {
             lsp: true,
             lsp_wait_ms: None,
             lsp_servers: Vec::new(),
+            lsp_shared: false,
         }
     }
 }
@@ -2486,6 +2494,14 @@ impl Agent {
                 config.lsp_wait_ms,
             ))
         });
+        // The LSP navigation tools ride the same registry (a sub-agent's is
+        // injected after construction — `lsp_shared`). Registered before the
+        // system prompt renders so the model sees them.
+        if config.lsp || config.lsp_shared {
+            tools.register(Arc::new(hrdr_tools::DefinitionTool));
+            tools.register(Arc::new(hrdr_tools::ReferencesTool));
+            tools.register(Arc::new(hrdr_tools::RenameTool));
+        }
         // Pre-warm the project's language server(s) in the background so
         // indexing-heavy servers (rust-analyzer) overlap their warm-up with
         // the first prompt instead of missing the first edit's diagnostics.
@@ -4690,9 +4706,19 @@ mod tests {
         // Read-only: no writer, no shell, no delegation. `fetch`/`search` are in
         // the set — read-only means "does not mutate the working tree", not
         // "no network". `git` is here too: its subcommands are an allow-list of
-        // read-only ones.
+        // read-only ones — and so are the LSP lookups (`definition`/
+        // `references`); the mutating `rename` is pruned with the writers.
         let readers = [
-            "fetch", "find", "git", "grep", "ls", "read", "search", "tree",
+            "definition",
+            "fetch",
+            "find",
+            "git",
+            "grep",
+            "ls",
+            "read",
+            "references",
+            "search",
+            "tree",
         ];
         assert_eq!(tools("explore"), readers);
         assert_eq!(tools("review"), readers);
@@ -4700,13 +4726,19 @@ mod tests {
         // `plan` adds the mutating tools — still no shell. Each gates on
         // `ensure_within_cwd`, which enforces `write_ext`, so its writes are
         // confined to markdown (patch validates before it writes anything, and
-        // move/delete guard both the source and the destination).
+        // move/delete guard both the source and the destination). LSP `rename`
+        // is not in the writer allow-list: a server-computed workspace edit
+        // could touch any file type, sidestepping the extension gate.
         let mut planner = readers.to_vec();
         planner.extend([
             "copy", "delete", "edit", "move", "patch", "replace", "write",
         ]);
         planner.sort();
         assert_eq!(tools("plan"), planner);
+        assert!(
+            !tools("plan").contains(&"rename".to_string()),
+            "extension-gated writers must not get the LSP rename"
+        );
 
         // A general sub-agent has the full set, shell included…
         let general = tools("general");

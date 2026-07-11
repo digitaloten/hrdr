@@ -30,16 +30,17 @@ pub use hooks::{
     run_file_hooks,
 };
 pub use lsp::{
-    DEFAULT_LSP_WAIT_MS, LspRegistry, LspServerConfig, LspServerReport, LspServerStatus,
-    default_lsp_servers,
+    DEFAULT_LSP_WAIT_MS, LspFileEdits, LspLocation, LspRegistry, LspServerConfig, LspServerReport,
+    LspServerStatus, LspTextEdit, apply_lsp_edits, default_lsp_servers, parse_locations,
+    parse_workspace_edit, uri_to_path,
 };
 pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use patch::PatchTool;
 pub use tools::{
-    BashTool, CopyTool, DeleteTool, EditTool, FindTool, GitTool, GrepTool, LsTool, MoveTool,
-    PowerShellTool, ReadTool, ReplaceTool, TodoTool, TreeTool, WriteTool, available_shell_tools,
-    user_shell,
+    BashTool, CopyTool, DefinitionTool, DeleteTool, EditTool, FindTool, GitTool, GrepTool, LsTool,
+    MoveTool, PowerShellTool, ReadTool, ReferencesTool, RenameTool, ReplaceTool, TodoTool,
+    TreeTool, WriteTool, available_shell_tools, user_shell,
 };
 pub use web::{WebFetchTool, WebSearchTool};
 

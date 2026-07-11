@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **LSP navigation tools.** The warm language servers now back three model
+  tools: `definition` and `references` (read-only symbol lookups — file +
+  1-based line + the symbol text on that line; results as `path:line:col`,
+  capped at 50), and `rename` (the server's WorkspaceEdit applied atomically
+  through the checkpointed write path, so `/undo` reverts it and formatter
+  hooks + post-edit diagnostics run per touched file). Capability-gated on the
+  server's `initialize` response; registered only when LSP is enabled; read-only
+  sub-agents get the lookups but not `rename`.
 - **LSP diagnostics after edits.** After `edit`/`write`/`patch`/`replace` mutate
   a file, its language server checks the on-disk result (post-formatter hooks)
   and any **errors** ride back to the model appended to the tool result — wrong
