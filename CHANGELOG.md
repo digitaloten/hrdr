@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`!` shell escape.** A message starting with `!` runs the rest as a shell
+  command (bash, else PowerShell) in the agent's cwd: the output streams into
+  the transcript as a live tool block, and the command + (bounded) output are
+  appended to the model's history as a user note — the next turn sees what you
+  ran. User-initiated, so guardrails don't apply; rejected while a turn is
+  running. Pasting works; no model call is made.
 - **`/skills` picker.** `/skills` now opens a fuzzy picker over the discovered
   skills (name · description · source); Enter inserts `:name ` into the input,
   ready for arguments.

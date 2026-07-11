@@ -3768,6 +3768,77 @@ async fn login_modal_flow_masks_the_key_entry() {
     assert!(h.app.login_modal.is_none(), "Esc closes the modal");
 }
 
+/// `!command` runs the shell directly: the output streams into a transcript
+/// tool block, and the command + output are recorded into the model's history
+/// as a user note — no model turn is spawned.
+#[tokio::test]
+async fn bang_runs_a_user_shell_command_and_records_it() {
+    let mut h = Harness::new(vec![]).await;
+    h.type_str("!echo hello-from-shell");
+    h.press(KeyCode::Enter);
+    assert!(!h.app.running, "no model turn spawns for a !command");
+    assert!(
+        h.app
+            .state
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::Tool { .. })),
+        "the tool block opened synchronously: {:?}",
+        h.app
+            .state
+            .transcript
+            .iter()
+            .map(|e| &e.kind)
+            .collect::<Vec<_>>()
+    );
+
+    // Drain the events the spawned shell task sends until the block closes.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !h
+        .app
+        .state
+        .transcript
+        .iter()
+        .any(|e| matches!(&e.kind, EntryKind::Tool { done: true, .. }))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "shell events never arrived"
+        );
+        match tokio::time::timeout(std::time::Duration::from_secs(5), h.rx.recv()).await {
+            Ok(Some(msg)) => h.app.on_turn_msg(msg),
+            Ok(None) => panic!("channel closed before the shell finished"),
+            Err(_) => panic!("timed out waiting for shell events"),
+        }
+    }
+    let screen = h.render();
+    assert!(
+        screen.contains("hello-from-shell"),
+        "output in the transcript:\n{screen}"
+    );
+
+    // The history note lands right after ToolEnd (a separate lock push) —
+    // poll briefly rather than racing it.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let noted = h.app.agent.try_lock().is_ok_and(|a| {
+            a.messages_owned().iter().any(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains("hello-from-shell") && c.contains("I ran"))
+            })
+        });
+        if noted {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the history note never landed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// `/skills` opens a picker of the discovered skills; Enter inserts the
 /// `:name ` invocation into the input and hands the cursor back.
 #[tokio::test]

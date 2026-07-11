@@ -2732,6 +2732,13 @@ impl Agent {
         self.cost_rates.as_ref().and_then(|(_, r)| *r)
     }
 
+    /// Append a user-role note to the history without running a turn. The
+    /// TUI's `!command` shell escape records the command + its output this
+    /// way, so the next model call sees what the user ran.
+    pub fn push_user_note(&mut self, text: impl Into<String>) {
+        self.messages.push(ChatMessage::user(text));
+    }
+
     /// Estimated USD spent this session: every model call, including delegated
     /// sub-agents'. Estimates come from the models.dev catalog; unpriced
     /// models (local servers) count as $0.

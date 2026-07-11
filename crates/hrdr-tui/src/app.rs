@@ -96,6 +96,10 @@ pub(crate) use hrdr_app::{Entry, EntryKind};
 /// Messages from the background agent task back to the UI loop.
 pub(crate) enum TurnMsg {
     Event(AgentEvent),
+    /// A user-initiated `!command` shell event. Separate from [`TurnMsg::Event`]
+    /// so it bypasses the "ignore buffered events after cancellation" guard —
+    /// these aren't turn events and arrive while no turn is running.
+    UserShell(AgentEvent),
     /// Turn finished; `Some` carries an error string.
     Done(Option<String>),
     /// Out-of-band system line (e.g. async `/models` result).
@@ -704,6 +708,20 @@ impl App {
                 self.request_quit();
                 return Action::None;
             }
+            // `!command` — the user-initiated shell escape: run it directly
+            // (bash/PowerShell), stream the output into a transcript tool
+            // block, and record command + output into the model's history.
+            if let Some(cmd) = input.trim().strip_prefix('!') {
+                let cmd = cmd.trim().to_string();
+                self.editor.set_content("");
+                self.scroll_offset = 0;
+                if cmd.is_empty() {
+                    self.system("usage: !<shell command>  (e.g. !git status)".to_string());
+                } else {
+                    self.user_shell_command(cmd);
+                }
+                return Action::None;
+            }
             // Slash commands are handled locally, not sent to the model.
             if self.handle_slash(input.trim()) {
                 self.editor.set_content("");
@@ -760,6 +778,143 @@ impl App {
 
         self.editor.feed_key(ekey);
         Action::None
+    }
+
+    /// Run a user-typed `!command`: spawn the shell in the agent's cwd,
+    /// stream its output through the normal tool-event pipeline (so it renders
+    /// as a live tool block), and, when it finishes, append the command +
+    /// (bounded) output to the model's history so the next turn sees it.
+    /// User-initiated, so hrdr's shell guardrails don't apply — this is the
+    /// user's own shell. Rejected while a turn is running: its tool blocks
+    /// would interleave with the model's.
+    pub(crate) fn user_shell_command(&mut self, command: String) {
+        if self.running {
+            self.system(
+                "a turn is running — wait for it (or interrupt with Esc) before running                  !commands"
+                    .to_string(),
+            );
+            return;
+        }
+        let Some((program, mut args)) = hrdr_tools::user_shell() else {
+            self.system("no shell found — !commands need bash or PowerShell on PATH".to_string());
+            return;
+        };
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = format!(
+            "user-shell-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let shell_name = if program.contains("pwsh") || program.contains("powershell") {
+            "powershell"
+        } else {
+            "bash"
+        };
+        // Open the tool block immediately (synchronously, so it lands before
+        // any streamed output).
+        self.apply_event(AgentEvent::ToolStart {
+            id: id.clone(),
+            name: shell_name.to_string(),
+            args: format!("! {command}"),
+        });
+        let cwd = hrdr_app::agent_cwd(&self.agent);
+        let tx = self.tx.clone();
+        let agent = self.agent.clone();
+        args.push(command.clone());
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut child = tokio::process::Command::new(&program);
+            child
+                .args(&args)
+                .current_dir(&cwd)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            let mut child = match child.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(TurnMsg::UserShell(AgentEvent::ToolEnd {
+                        id,
+                        name: shell_name.to_string(),
+                        result: format!("couldn't run {program}: {e}"),
+                        ok: false,
+                    }));
+                    return;
+                }
+            };
+            // Stream stdout and stderr as they arrive, accumulating a bounded
+            // copy for the result + the model's history note.
+            let mut out = String::new();
+            let mut stdout = child.stdout.take();
+            let mut stderr = child.stderr.take();
+            let mut buf_out = [0u8; 4096];
+            let mut buf_err = [0u8; 4096];
+            let mut open_out = stdout.is_some();
+            let mut open_err = stderr.is_some();
+            while open_out || open_err {
+                tokio::select! {
+                    r = async { stdout.as_mut().unwrap().read(&mut buf_out).await }, if open_out => {
+                        match r {
+                            Ok(0) | Err(_) => open_out = false,
+                            Ok(n) => {
+                                let chunk = String::from_utf8_lossy(&buf_out[..n]).into_owned();
+                                out.push_str(&chunk);
+                                let _ = tx.send(TurnMsg::UserShell(AgentEvent::ToolOutput {
+                                    id: id.clone(),
+                                    chunk,
+                                }));
+                            }
+                        }
+                    }
+                    r = async { stderr.as_mut().unwrap().read(&mut buf_err).await }, if open_err => {
+                        match r {
+                            Ok(0) | Err(_) => open_err = false,
+                            Ok(n) => {
+                                let chunk = String::from_utf8_lossy(&buf_err[..n]).into_owned();
+                                out.push_str(&chunk);
+                                let _ = tx.send(TurnMsg::UserShell(AgentEvent::ToolOutput {
+                                    id: id.clone(),
+                                    chunk,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            let status = child.wait().await;
+            let ok = status.as_ref().is_ok_and(std::process::ExitStatus::success);
+            // Bound what lands in the transcript result + history (the live
+            // stream above already showed everything).
+            let bounded = hrdr_tools::truncate_inline(&out, 50_000);
+            let result = if out.trim().is_empty() {
+                match &status {
+                    Ok(st) => format!("(no output — exit {})", st.code().unwrap_or(-1)),
+                    Err(e) => format!("(no output — {e})"),
+                }
+            } else {
+                bounded.clone()
+            };
+            let _ = tx.send(TurnMsg::UserShell(AgentEvent::ToolEnd {
+                id,
+                name: shell_name.to_string(),
+                result,
+                ok,
+            }));
+            // Record it for the model: the next request carries what the user
+            // ran and saw. (Waits on the agent lock if a turn started since.)
+            let exit = match &status {
+                Ok(st) => st.code().map_or_else(|| "?".to_string(), |c| c.to_string()),
+                Err(e) => format!("spawn error: {e}"),
+            };
+            let note = format!(
+                "I ran `{command}` in the shell (exit {exit}). Output:
+```
+{}
+```",
+                bounded.trim_end()
+            );
+            agent.lock().await.push_user_note(note);
+        });
     }
 
     /// Route pasted text: the `/login` key field takes it whole (an API key
@@ -1270,6 +1425,7 @@ impl App {
                     self.apply_event(ev);
                 }
             }
+            TurnMsg::UserShell(ev) => self.apply_event(ev),
             TurnMsg::System(text) => {
                 self.push_entry(Entry::notice(text));
                 // Do NOT reset scroll_offset here: this is an async/passive line

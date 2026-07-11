@@ -114,7 +114,10 @@ JSON-per-line.
 
 In the TUI, type a message and press `Enter` to send. `@` completes sub-agent
 names (routing the message to that agent) and file paths (attaching the file),
-typing `/` opens a slash-command menu, and `:` invokes a custom skill. All share
+typing `/` opens a slash-command menu, `:` invokes a custom skill, and `!` runs
+a shell command directly (`!git status` — output streams into the transcript as
+a tool block and is recorded into the model's context, so the next turn knows
+what you ran and saw; your `!` commands skip hrdr's shell guardrails). All share
 one popup: at most five rows (scroll for more), anchored above the token being
 completed. After a command name + space the popup completes the **argument** too
 — enum values (`/thinking on`, `/timestamps relative`), theme names, session ids

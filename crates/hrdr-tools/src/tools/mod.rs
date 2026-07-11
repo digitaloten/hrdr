@@ -36,7 +36,7 @@ pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use read::ReadTool;
 pub use replace::ReplaceTool;
-pub use shell::{BashTool, PowerShellTool, available_shell_tools};
+pub use shell::{BashTool, PowerShellTool, available_shell_tools, user_shell};
 pub use todo::TodoTool;
 pub use tree::TreeTool;
 pub use write::WriteTool;

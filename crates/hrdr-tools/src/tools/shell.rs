@@ -289,6 +289,26 @@ pub fn available_shell_tools() -> Vec<std::sync::Arc<dyn Tool>> {
     tools
 }
 
+/// The interpreter for a *user-typed* `!command` (the TUI's shell escape):
+/// `(program, leading args)` — `bash -c` when bash is on `PATH`, else
+/// PowerShell (`-NoProfile -NonInteractive -Command`). `None` when neither
+/// interpreter exists. The command string is appended as the final argument.
+pub fn user_shell() -> Option<(String, Vec<String>)> {
+    if which::which("bash").is_ok() {
+        return Some(("bash".to_string(), vec!["-c".to_string()]));
+    }
+    detect_powershell().map(|p| {
+        (
+            p,
+            vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+            ],
+        )
+    })
+}
+
 /// Locate a PowerShell interpreter: prefer `pwsh` (PowerShell 7+, cross-platform)
 /// then `powershell` (Windows PowerShell). `None` if neither is on `PATH`.
 fn detect_powershell() -> Option<String> {
