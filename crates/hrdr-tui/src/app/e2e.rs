@@ -3885,3 +3885,35 @@ async fn theme_selector_previews_and_esc_restores() {
     assert!(h.app.theme_selector.is_none(), "Esc closes the picker");
     assert_eq!(h.app.theme.user, original_user, "original theme restored");
 }
+
+/// The completion popup shows at most 5 rows plus a "… N more" hint, and
+/// slides its window to keep the selection visible.
+#[tokio::test]
+async fn completion_popup_caps_at_five_rows_and_scrolls() {
+    let mut h = Harness::new(vec![]).await;
+    h.type_str("/");
+    let screen = h.render();
+    let shown = |s: &str| {
+        s.lines()
+            .filter(|l| l.trim_start().starts_with('/'))
+            .count()
+    };
+    assert!(shown(&screen) <= 5, "at most 5 rows visible:\n{screen}");
+    assert!(screen.contains("more"), "overflow hint:\n{screen}");
+    assert!(screen.contains("/new"), "canonical /new listed:\n{screen}");
+
+    // Moving the selection past the window slides it: the sixth command shows
+    // only after stepping the selection down to it.
+    let sixth = hrdr_app::slash_completions("/")[5].0;
+    assert!(
+        !h.render().contains(sixth),
+        "sixth command hidden initially"
+    );
+    for _ in 0..6 {
+        h.press(KeyCode::Down);
+    }
+    assert!(
+        h.render().contains(sixth),
+        "window slid to keep the selection visible"
+    );
+}

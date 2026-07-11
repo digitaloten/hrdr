@@ -150,6 +150,10 @@ pub trait CommandHost {
     fn session_tokens(&self) -> (usize, usize) {
         (0, 0)
     }
+    /// Session-cumulative estimated cost in USD (0 when nothing was priced).
+    fn session_cost(&self) -> f64 {
+        0.0
+    }
     /// Update the effort label (persistence is dispatch's job).
     fn set_effort(&mut self, label: String) {
         let _ = label;

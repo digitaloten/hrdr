@@ -111,6 +111,71 @@ fn lookup(catalog: &Value, provider: Option<&str>, model: &str) -> Option<u32> {
     catalog.as_object()?.values().filter_map(window).min()
 }
 
+/// A model's price card: **USD per million tokens**, from the catalog's
+/// `cost` object. `cache_read` is the discounted rate for prompt tokens served
+/// from the provider's prompt cache; `None` when the provider doesn't publish
+/// one (cached tokens are then priced at the full input rate).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ModelCost {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: Option<f64>,
+}
+
+impl ModelCost {
+    /// Estimated USD for one model call: uncached prompt tokens at the input
+    /// rate, cached ones at the cache-read rate, completion (which includes
+    /// any reasoning tokens) at the output rate.
+    pub fn call_cost(
+        &self,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cached: Option<u32>,
+    ) -> f64 {
+        const M: f64 = 1_000_000.0;
+        let cached = f64::from(cached.unwrap_or(0).min(prompt_tokens));
+        let uncached = f64::from(prompt_tokens) - cached;
+        uncached / M * self.input
+            + cached / M * self.cache_read.unwrap_or(self.input)
+            + f64::from(completion_tokens) / M * self.output
+    }
+}
+
+/// The price card for `model`, from the models.dev catalog. Same resolution
+/// as [`context_window`]: the configured provider's own entry wins; without
+/// one, every provider serving this model id is searched and the **most
+/// expensive** offering is used — overstating an estimate is the safe
+/// direction for a cost display and a budget cap alike. `None` when the
+/// catalog can't be read or doesn't price the model (e.g. a local server).
+pub async fn model_cost(provider: Option<&str>, model: &str) -> Option<ModelCost> {
+    lookup_cost(&load().await?, provider, model)
+}
+
+/// Find `model`'s price card in an already-loaded catalog. Pure, so the
+/// resolution rules are testable without a cache or a network.
+fn lookup_cost(catalog: &Value, provider: Option<&str>, model: &str) -> Option<ModelCost> {
+    let cost = |p: &Value| -> Option<ModelCost> {
+        let c = p.get("models")?.get(model)?.get("cost")?;
+        let f = |k: &str| c.get(k).and_then(Value::as_f64);
+        Some(ModelCost {
+            input: f("input")?,
+            output: f("output")?,
+            cache_read: f("cache_read"),
+        })
+    };
+    if let Some(name) = provider
+        && let Some(p) = catalog.get(name)
+        && let Some(c) = cost(p)
+    {
+        return Some(c);
+    }
+    catalog
+        .as_object()?
+        .values()
+        .filter_map(cost)
+        .max_by(|a, b| (a.input + a.output).total_cmp(&(b.input + b.output)))
+}
+
 /// The cache file, `$XDG_CACHE_HOME/hrdr/models.json`.
 fn cache_path() -> Option<PathBuf> {
     Some(hjkl_xdg::cache_dir("hrdr").ok()?.join("models.json"))
@@ -221,6 +286,62 @@ mod tests {
                 "weird": { "id": "weird" },
             }},
         })
+    }
+
+    /// The price-card resolution: the configured provider wins; otherwise the
+    /// most expensive offering across providers; `None` when unpriced.
+    #[test]
+    fn lookup_cost_prefers_provider_then_most_expensive() {
+        let c = json!({
+            "cheap": { "models": {
+                "m": { "cost": { "input": 1.0, "output": 5.0, "cache_read": 0.1 } },
+            }},
+            "pricey": { "models": {
+                "m": { "cost": { "input": 10.0, "output": 50.0 } },
+            }},
+            "local": { "models": { "m": {} } },
+        });
+        // The configured provider's own card.
+        assert_eq!(
+            lookup_cost(&c, Some("cheap"), "m"),
+            Some(ModelCost {
+                input: 1.0,
+                output: 5.0,
+                cache_read: Some(0.1)
+            })
+        );
+        // No provider → the most expensive offering (safe overestimate).
+        assert_eq!(lookup_cost(&c, None, "m").unwrap().input, 10.0);
+        // Unknown provider falls back the same way.
+        assert_eq!(lookup_cost(&c, Some("nope"), "m").unwrap().output, 50.0);
+        // Unpriced model → None.
+        assert_eq!(lookup_cost(&c, Some("local"), "unpriced"), None);
+    }
+
+    /// Call pricing: cached prompt tokens get the cache-read rate (input rate
+    /// when the provider doesn't publish one).
+    #[test]
+    fn call_cost_prices_cached_tokens_at_the_discount() {
+        let card = ModelCost {
+            input: 10.0,
+            output: 50.0,
+            cache_read: Some(1.0),
+        };
+        // 1M uncached prompt + 1M output = $10 + $50.
+        assert!((card.call_cost(1_000_000, 1_000_000, None) - 60.0).abs() < 1e-9);
+        // Fully cached prompt: $1 instead of $10.
+        assert!((card.call_cost(1_000_000, 0, Some(1_000_000)) - 1.0).abs() < 1e-9);
+        // Cached count is clamped to the prompt size.
+        assert!(
+            (card.call_cost(100, 0, Some(1_000)) - card.call_cost(100, 0, Some(100))).abs() < 1e-12
+        );
+        // No published cache rate → cached tokens cost the full input rate.
+        let flat = ModelCost {
+            input: 10.0,
+            output: 50.0,
+            cache_read: None,
+        };
+        assert!((flat.call_cost(1_000_000, 0, Some(1_000_000)) - 10.0).abs() < 1e-9);
     }
 
     /// `provider_models` returns the provider's friendly name and its models,

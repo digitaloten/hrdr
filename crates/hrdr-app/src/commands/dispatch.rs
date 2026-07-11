@@ -25,9 +25,9 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             }
             host.info(s);
         }
-        // `/clear`, `/new`, `/reset` — optionally naming the fresh session, so it
+        // `/new`, `/clear`, `/reset` — optionally naming the fresh session, so it
         // saves under that name instead of one derived from its first message.
-        "clear" => {
+        "new" => {
             host.clear_conversation();
             if arg.is_empty() {
                 host.info("conversation cleared".to_string());
@@ -92,6 +92,12 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 _ => "—".to_string(),
             };
             let (tokens_in, tokens_out) = host.session_tokens();
+            let cost = host.session_cost();
+            let cost_line = if cost > 0.0 {
+                format!("\ncost: {} (est.)", crate::fmt_cost(cost))
+            } else {
+                String::new()
+            };
             let effort = host.effort().unwrap_or_else(|| "—".to_string());
             host.spawn_line(Box::pin(async move {
                 let (temp, messages, cache) = {
@@ -102,7 +108,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 let branch = crate::git_branch(&cwd).unwrap_or_else(|| "—".to_string());
                 format!(
                     "session: {session}\nmodel: {model}\nendpoint: {base_url}\ncwd: {dir} \
-                     ({branch})\ncontext: {ctx}\ntokens: ↑{tokens_in} ↓{tokens_out}\n\
+                     ({branch})\ncontext: {ctx}\ntokens: ↑{tokens_in} ↓{tokens_out}{cost_line}\n\
                      temperature: {}\neffort: {effort}\nprompt cache: {}\nmessages: {messages}",
                     temp.map(|t| t.to_string())
                         .unwrap_or_else(|| "default".to_string()),
@@ -597,9 +603,12 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         }
         "cost" => {
             let (tokens_in, tokens_out) = host.session_tokens();
-            host.info(format!(
-                "session tokens: ↑{tokens_in} input · ↓{tokens_out} output"
-            ));
+            let mut line = format!("session tokens: ↑{tokens_in} input · ↓{tokens_out} output");
+            let cost = host.session_cost();
+            if cost > 0.0 {
+                line.push_str(&format!(" · est. {}", crate::fmt_cost(cost)));
+            }
+            host.info(line);
         }
         "doctor" => {
             let agent = host.agent();

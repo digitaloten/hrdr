@@ -16,7 +16,7 @@ fn is_alias(name: &str) -> bool {
 /// Commands matching the in-progress `/…` input (empty once a space is typed).
 ///
 /// Matches the query (the text after `/`) against the command name, its
-/// aliases (e.g. `/new` surfaces `/clear`), and its description
+/// aliases (e.g. `/clear` surfaces `/new`), and its description
 /// (case-insensitive substring), so e.g. `/list` surfaces `/help`
 /// ("list commands"). Alias rows themselves never appear in the results — the
 /// canonical command is shown instead. Ranked: name-prefix, alias-prefix,
@@ -129,6 +129,33 @@ pub fn rank_file_matches(files: &[String], query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Rank sub-agent names against an `@…` `query`: name-prefix matches first,
+/// then anywhere-substring, ties broken lexicographically. Case-insensitive;
+/// an empty query keeps input order. The mention popup lists these above the
+/// file matches (an `@name` token routes to that sub-agent when it matches —
+/// see `extract_agent_mention`).
+pub fn rank_agent_matches(names: &[String], query: &str) -> Vec<String> {
+    let q = query.to_ascii_lowercase();
+    let mut scored: Vec<(u8, &String)> = names
+        .iter()
+        .filter_map(|n| {
+            if q.is_empty() {
+                return Some((1u8, n));
+            }
+            let nl = n.to_ascii_lowercase();
+            if nl.starts_with(&q) {
+                Some((0, n))
+            } else if nl.contains(&q) {
+                Some((1, n))
+            } else {
+                None
+            }
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
+    scored.into_iter().map(|(_, n)| n.clone()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,12 +169,13 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(names("/he").first(), Some(&"/help"));
-        // Name-prefix matches rank first (/clear, /cwd, /copy all start with c).
-        assert_eq!(names("/c").first(), Some(&"/clear"));
+        // Name-prefix matches rank first (/compact, /cwd, /copy all start
+        // with c); /compact is the earliest such canonical in registry order.
+        assert_eq!(names("/c").first(), Some(&"/compact"));
         assert!(names("/c").contains(&"/copy") && names("/c").contains(&"/cwd"));
         // Description match: "/list" surfaces "/help" ("list commands").
         assert!(names("/list").contains(&"/help"));
-        assert!(!names("/list").contains(&"/clear"));
+        assert!(!names("/list").contains(&"/new"));
         // A space kills completion; non-slash input yields nothing.
         assert!(names("/help ").is_empty());
         assert!(names("hello").is_empty());
@@ -166,7 +194,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         // Typing an alias surfaces its canonical command…
-        assert_eq!(names("/new").first(), Some(&"/clear"));
+        assert_eq!(names("/clear").first(), Some(&"/new"));
         assert_eq!(names("/usage").first(), Some(&"/cost"));
         assert_eq!(names("/health").first(), Some(&"/doctor"));
         // …and alias rows themselves never appear anywhere in the list.
@@ -179,11 +207,11 @@ mod tests {
         }
         // A canonical name still outranks an alias on the same prefix:
         // "/re" prefix-matches /rename, /resume, /retry, /reload (rank 0)
-        // before /clear via its "reset" alias (rank 1).
+        // before /new via its "reset" alias (rank 1).
         let re = names("/re");
-        let clear_pos = re.iter().position(|n| *n == "/clear");
+        let new_pos = re.iter().position(|n| *n == "/new");
         assert!(re.contains(&"/rename") && re.contains(&"/resume"));
-        assert!(clear_pos > re.iter().position(|n| *n == "/rename"));
+        assert!(new_pos > re.iter().position(|n| *n == "/rename"));
     }
 
     #[test]
@@ -196,6 +224,25 @@ mod tests {
         assert_eq!(active_file_token("me@host"), None); // not a token boundary
         assert_eq!(active_file_token("@src/main.rs and"), None); // completed
         assert_eq!(active_file_token("hello world"), None); // no @
+    }
+
+    #[test]
+    fn rank_agent_matches_prefix_then_substring() {
+        let names: Vec<String> = ["reviewer", "planner", "code-reviewer"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            rank_agent_matches(&names, "rev"),
+            vec!["reviewer".to_string(), "code-reviewer".to_string()]
+        );
+        assert_eq!(rank_agent_matches(&names, "").len(), 3);
+        assert!(rank_agent_matches(&names, "zzz").is_empty());
+        // Case-insensitive.
+        assert_eq!(
+            rank_agent_matches(&names, "PLAN"),
+            vec!["planner".to_string()]
+        );
     }
 
     #[test]

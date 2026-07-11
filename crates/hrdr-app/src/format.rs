@@ -13,6 +13,16 @@ pub fn fmt_count(n: usize) -> String {
     }
 }
 
+/// Estimated-cost display: sub-cent totals keep four decimals so they don't
+/// round to a lying "$0.00"; everything else shows cents ("$0.0042", "$1.24").
+pub fn fmt_cost(usd: f64) -> String {
+    if usd > 0.0 && usd < 0.01 {
+        format!("${usd:.4}")
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
 /// Human-friendly elapsed time since `then`, with compound units for the larger
 /// ranges (`now`, `42s ago`, `5m ago`, `1h30m ago`, `2d3h ago`).
 pub fn relative_time(then: chrono::DateTime<chrono::Local>) -> String {
@@ -51,6 +61,13 @@ mod tests {
         assert_eq!(fmt_count(1_800_000), "1.8M");
         assert_eq!(fmt_count(0), "0");
         assert_eq!(fmt_count(999), "999");
+    }
+
+    #[test]
+    fn fmt_cost_keeps_subcent_precision() {
+        assert_eq!(fmt_cost(0.0042), "$0.0042");
+        assert_eq!(fmt_cost(0.0), "$0.00");
+        assert_eq!(fmt_cost(1.237), "$1.24");
     }
 
     #[test]

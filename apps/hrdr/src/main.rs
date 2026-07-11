@@ -187,6 +187,11 @@ enum Command {
         /// Override the tool-round budget for this run.
         #[arg(long, value_name = "N")]
         max_steps: Option<usize>,
+        /// Stop before the next model call once the estimated session spend
+        /// (USD, incl. sub-agents; priced from the models.dev catalog)
+        /// reaches this cap.
+        #[arg(long, value_name = "USD")]
+        max_cost: Option<f64>,
         /// The task prompt (all trailing words are joined).
         #[arg(trailing_var_arg = true, required = true)]
         prompt: Vec<String>,
@@ -415,10 +420,14 @@ async fn main() -> Result<()> {
             json,
             quiet,
             max_steps,
+            max_cost,
             prompt,
         }) => {
             if let Some(n) = max_steps {
                 config.max_steps = n;
+            }
+            if max_cost.is_some() {
+                config.max_cost = max_cost;
             }
             run_headless(config, prompt.join(" "), json, quiet).await
         }
@@ -480,6 +489,8 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
                     completion_tokens,
                     cached_prompt_tokens,
                     reasoning_tokens,
+                    session_cost_usd,
+                    ..
                 } if !quiet => {
                     let cached = cached_prompt_tokens
                         .map(|c| format!(" ({c} cached)"))
@@ -487,8 +498,11 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
                     let reasoning = reasoning_tokens
                         .map(|r| format!(" · reasoning {r}"))
                         .unwrap_or_default();
+                    let cost = session_cost_usd
+                        .map(|c| format!(" · est. {}", hrdr_app::fmt_cost(c)))
+                        .unwrap_or_default();
                     eprintln!(
-                        "\x1b[90m[usage] ctx {prompt_tokens}{cached} · out {completion_tokens}{reasoning}\x1b[0m"
+                        "\x1b[90m[usage] ctx {prompt_tokens}{cached} · out {completion_tokens}{reasoning}{cost}\x1b[0m"
                     );
                 }
                 AgentEvent::TurnDone => println!(),
@@ -535,6 +549,8 @@ fn event_json(ev: &AgentEvent) -> String {
             completion_tokens,
             cached_prompt_tokens,
             reasoning_tokens,
+            cost_usd,
+            session_cost_usd,
         } => {
             json!({
                 "type": "usage",
@@ -542,6 +558,8 @@ fn event_json(ev: &AgentEvent) -> String {
                 "completion_tokens": completion_tokens,
                 "cached_prompt_tokens": cached_prompt_tokens,
                 "reasoning_tokens": reasoning_tokens,
+                "cost_usd": cost_usd,
+                "session_cost_usd": session_cost_usd,
             })
         }
         AgentEvent::TurnDone => json!({"type": "done"}),

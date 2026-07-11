@@ -69,6 +69,14 @@ pub enum AgentEvent {
         cached_prompt_tokens: Option<u32>,
         /// Completion tokens spent on reasoning/thinking, if reported.
         reasoning_tokens: Option<u32>,
+        /// Estimated USD for this call, when the models.dev catalog prices the
+        /// model (cached prompt tokens get the cache-read discount). `None`
+        /// for an unpriced model (e.g. a local server).
+        cost_usd: Option<f64>,
+        /// Estimated USD spent this session so far — this agent's calls plus
+        /// every delegated sub-agent's (they share the counter). `None` until
+        /// any call has been priced.
+        session_cost_usd: Option<f64>,
     },
     /// An out-of-band notice from the agent (e.g. a retry or auto-compaction),
     /// surfaced to the user as a system line.
@@ -210,6 +218,7 @@ fn wants_background(args: &serde_json::Value, isolated: bool) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_background(
     cfg: AgentConfig,
     prompt: String,
@@ -218,6 +227,7 @@ fn spawn_background(
     slot: SubagentSlot,
     registry: &Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>>,
     handles: &BgHandles,
+    cost_total: Arc<std::sync::Mutex<f64>>,
 ) -> String {
     use std::sync::atomic::Ordering;
     let id = BG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
@@ -248,6 +258,7 @@ fn spawn_background(
             let mut out = String::new();
             let result: anyhow::Result<()> = async {
                 let mut sub = Agent::new(cfg)?;
+                sub.cost_total = cost_total;
                 sub.run(prompt, steering_queue(), |ev| {
                     let chunk = match ev {
                         AgentEvent::Text(t) => {
@@ -411,10 +422,19 @@ struct SubagentTool {
     caps: (usize, usize),
     /// Slots held by the sub-agents running right now.
     slots: Arc<SubagentSlots>,
+    /// The owning agent's session cost counter — every sub-agent spawned here
+    /// adds its spend to it, so `/cost` and the `max_cost` budget see the
+    /// whole tree, not just the main loop.
+    cost_total: Arc<std::sync::Mutex<f64>>,
 }
 
 impl SubagentTool {
-    fn new(base: AgentConfig, profiles: Vec<SubagentProfile>, bg_handles: BgHandles) -> Self {
+    fn new(
+        base: AgentConfig,
+        profiles: Vec<SubagentProfile>,
+        bg_handles: BgHandles,
+        cost_total: Arc<std::sync::Mutex<f64>>,
+    ) -> Self {
         let caps = (base.max_readonly_subagents, base.max_write_subagents);
         let mut desc = String::from(
             "Delegate a self-contained sub-task to a fresh sub-agent with its own context \
@@ -470,6 +490,7 @@ impl SubagentTool {
             bg_handles,
             caps,
             slots: Arc::new(SubagentSlots::default()),
+            cost_total,
         }
     }
 }
@@ -626,6 +647,7 @@ impl hrdr_tools::Tool for SubagentTool {
                 slot,
                 &ctx.background_tasks,
                 &self.bg_handles,
+                Arc::clone(&self.cost_total),
             ));
         }
         // Blocking: hold the slot until this call returns.
@@ -649,6 +671,7 @@ impl hrdr_tools::Tool for SubagentTool {
 
         let mut sub =
             Agent::new(cfg).with_context(|| format!("creating sub-agent (model={model})"))?;
+        sub.cost_total = Arc::clone(&self.cost_total);
         let mut output = String::new();
         let steering = steering_queue();
         let run = sub
@@ -700,6 +723,11 @@ pub struct AgentConfig {
     pub temperature: Option<f32>,
     /// Safety bound on tool-call iterations per user turn.
     pub max_steps: usize,
+    /// Cost budget in USD: the turn loop stops before the next model call once
+    /// the session's estimated spend (incl. sub-agents) reaches it. `None` =
+    /// unlimited. Estimates come from the models.dev catalog; calls on an
+    /// unpriced model count as $0.
+    pub max_cost: Option<f64>,
     /// Named provider preset (e.g. `zen`, `openai`, `local`). Resolved by the
     /// binary into `base_url`/`api_key`/backend behaviour via [`resolve_provider`].
     pub provider: Option<String>,
@@ -1168,6 +1196,7 @@ impl Default for AgentConfig {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             temperature: None,
             max_steps: 50,
+            max_cost: None,
             provider: None,
             context_window: None,
             max_tokens: None,
@@ -1476,6 +1505,7 @@ struct FileConfig {
     stream_usage: Option<bool>,
     request_timeout: Option<u64>,
     prompt_cache_ttl: Option<String>,
+    max_cost: Option<f64>,
     subagents: Option<bool>,
     memory: Option<bool>,
     memory_dir: Option<String>,
@@ -1596,6 +1626,9 @@ impl AgentConfig {
         }
         if let Some(v) = fc.prompt_cache_ttl {
             self.prompt_cache_ttl = Some(v);
+        }
+        if let Some(v) = fc.max_cost {
+            self.max_cost = Some(v);
         }
         if let Some(v) = fc.subagents {
             self.subagents = v;
@@ -2170,6 +2203,17 @@ pub struct Agent {
     /// `background: true`), keyed by task id. Stored so [`Self::clear`] can
     /// abort them and so callers can query the live count.
     bg_handles: BgHandles,
+    /// Estimated USD spent this session: every model call of this agent plus
+    /// every delegated sub-agent's (the `task` tool hands each sub-agent this
+    /// same counter). Std mutex — held only long enough to add.
+    cost_total: Arc<std::sync::Mutex<f64>>,
+    /// Price-card memo for the current `(provider, model)`, so the catalog
+    /// isn't re-read on every usage event. The inner `None` remembers an
+    /// unpriced model (e.g. a local server).
+    cost_rates: Option<(String, Option<hrdr_llm::catalog::ModelCost>)>,
+    /// Abort the turn before the next model call once `cost_total` reaches
+    /// this many USD ([`AgentConfig::max_cost`]).
+    max_cost: Option<f64>,
 }
 
 /// Append a sub-agent persona (its role / operating instructions) after the base
@@ -2303,6 +2347,7 @@ impl Agent {
         // config) is resolved by [`resolve_agent_profiles`].
         let mut agent_names: Vec<String> = Vec::new();
         let bg_handles: BgHandles = bg_handles();
+        let cost_total: Arc<std::sync::Mutex<f64>> = Arc::new(std::sync::Mutex::new(0.0));
         if config.subagents {
             let profiles = resolve_agent_profiles(&config);
             agent_names = profiles.iter().map(|p| p.name.clone()).collect();
@@ -2310,6 +2355,7 @@ impl Agent {
                 subagent_base_config(&config),
                 profiles,
                 Arc::clone(&bg_handles),
+                Arc::clone(&cost_total),
             )));
         }
         // Memory: expose the `memory` tool (registered before scoping so a
@@ -2456,6 +2502,9 @@ impl Agent {
             memory_dir: config.memory_dir,
             agent_names,
             bg_handles,
+            cost_total,
+            cost_rates: None,
+            max_cost: config.max_cost,
         })
     }
 
@@ -2552,6 +2601,7 @@ impl Agent {
         self.abort_background_tasks();
         self.messages.clear();
         self.reset_read_files();
+        self.reset_session_cost();
         self.refresh_system();
     }
 
@@ -2658,6 +2708,36 @@ impl Agent {
     /// Most OpenAI-compatible endpoints — opencode zen and OpenAI itself among
     /// them — publish nothing, so without the catalog the status bar's gauge has
     /// no "of Y" and auto-compaction has no threshold. `None` when neither knows.
+    /// The current `(provider, model)` price card from the models.dev
+    /// catalog, memoized per pair — the inner `None` remembers an unpriced
+    /// model (a local server) so the catalog isn't re-read every call.
+    async fn current_cost_rates(&mut self) -> Option<hrdr_llm::catalog::ModelCost> {
+        let key = format!(
+            "{}/{}",
+            self.provider.as_deref().unwrap_or(""),
+            self.client.model
+        );
+        if self.cost_rates.as_ref().map(|(k, _)| k.as_str()) != Some(key.as_str()) {
+            let rates =
+                hrdr_llm::catalog::model_cost(self.provider.as_deref(), &self.client.model).await;
+            self.cost_rates = Some((key, rates));
+        }
+        self.cost_rates.as_ref().and_then(|(_, r)| *r)
+    }
+
+    /// Estimated USD spent this session: every model call, including delegated
+    /// sub-agents'. Estimates come from the models.dev catalog; unpriced
+    /// models (local servers) count as $0.
+    pub fn session_cost(&self) -> f64 {
+        *self.cost_total.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Zero the session cost counter (session reset / resume — the counter
+    /// tracks the *session*, not the process).
+    pub fn reset_session_cost(&self) {
+        *self.cost_total.lock().unwrap_or_else(|p| p.into_inner()) = 0.0;
+    }
+
     pub async fn probe_context_window(&self) -> Option<u32> {
         if let Some(n) = self.client.context_window().await {
             return Some(n);
@@ -2999,6 +3079,17 @@ impl Agent {
                     )));
                 }
             }
+            // Cost budget: stop before issuing another model call once the
+            // session's estimated spend (incl. sub-agents) reaches the cap.
+            if let Some(cap) = self.max_cost {
+                let spent = *self.cost_total.lock().unwrap_or_else(|p| p.into_inner());
+                if spent >= cap {
+                    on_event(AgentEvent::Notice(format!(
+                        "cost budget exhausted (est. ${spent:.2} of ${cap:.2}) — stopping"
+                    )));
+                    bail!("cost budget exhausted: est. ${spent:.2} ≥ cap ${cap:.2}");
+                }
+            }
             // Stream one assistant turn, accumulating text + tool calls. The
             // connect is retried on transient errors and auto-compacted once on
             // a context-length overflow. Mid-stream failures are retried too
@@ -3020,11 +3111,25 @@ impl Agent {
                     estimate_tokens(&acc.content),
                 ),
             };
+            let cached_prompt_tokens = acc.usage.as_ref().and_then(|u| u.cached_tokens());
+            // Price the call with the current model's catalog card and add it
+            // to the session counter (shared with delegated sub-agents).
+            let cost_usd = self
+                .current_cost_rates()
+                .await
+                .map(|r| r.call_cost(prompt_tokens, completion_tokens, cached_prompt_tokens));
+            let session_cost_usd = {
+                let mut t = self.cost_total.lock().unwrap_or_else(|p| p.into_inner());
+                *t += cost_usd.unwrap_or(0.0);
+                (*t > 0.0).then_some(*t)
+            };
             on_event(AgentEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
-                cached_prompt_tokens: acc.usage.as_ref().and_then(|u| u.cached_tokens()),
+                cached_prompt_tokens,
                 reasoning_tokens: acc.usage.as_ref().and_then(|u| u.reasoning_tokens()),
+                cost_usd,
+                session_cost_usd,
             });
 
             // The reply hit the output cap — warn so a silently-truncated answer
@@ -3562,10 +3667,16 @@ fn tail_window(msgs: &[ChatMessage], div: usize) -> Vec<ChatMessage> {
     msgs[start..].to_vec()
 }
 
-/// Exponential backoff for retry `attempt` (1-based), capped at 8s.
+/// Exponential backoff for retry `attempt` (1-based), capped at 8s, with
+/// ±25% jitter so parallel agents (sub-agents especially) tripping the same
+/// rate limit don't retry in lockstep and re-trip it together.
 fn retry_backoff(attempt: usize) -> std::time::Duration {
-    let secs = 0.5 * 2f64.powi((attempt as i32 - 1).max(0));
-    std::time::Duration::from_secs_f64(secs.min(8.0))
+    let secs = (0.5 * 2f64.powi((attempt as i32 - 1).max(0))).min(8.0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let jitter = 0.75 + f64::from(nanos % 1_000) / 2_000.0; // 0.75..1.25
+    std::time::Duration::from_secs_f64(secs * jitter)
 }
 
 /// The server-requested wait from a `Retry-After` header, if the client embedded
@@ -4960,6 +5071,7 @@ mod tests {
         cfg.apply_file(FileConfig {
             max_readonly_subagents: None,
             max_write_subagents: None,
+            max_cost: Some(2.5),
             base_url: Some("http://custom/v1".to_string()),
             api_key: Some("key123".to_string()),
             model: Some("gpt-4".to_string()),
@@ -5014,6 +5126,7 @@ mod tests {
         assert!(!cfg.stream_usage);
         assert_eq!(cfg.request_timeout, Some(30));
         assert_eq!(cfg.prompt_cache_ttl.as_deref(), Some("1h"));
+        assert_eq!(cfg.max_cost, Some(2.5));
         assert!(!cfg.subagents);
         assert!(!cfg.memory);
         assert_eq!(
@@ -5223,6 +5336,19 @@ mod tests {
         assert_eq!(retry_after_hint(&big).map(|d| d.as_secs()), Some(60));
         // Absent → None (falls back to exponential backoff).
         assert_eq!(retry_after_hint(&anyhow::anyhow!("returned 500")), None);
+    }
+
+    #[test]
+    fn retry_backoff_grows_capped_with_bounded_jitter() {
+        use super::retry_backoff;
+        for attempt in 1..=8 {
+            let base = (0.5 * 2f64.powi(attempt as i32 - 1)).min(8.0);
+            let d = retry_backoff(attempt).as_secs_f64();
+            assert!(
+                d >= base * 0.75 - 1e-9 && d <= base * 1.25 + 1e-9,
+                "attempt {attempt}: {d}s outside ±25% of {base}s"
+            );
+        }
     }
 
     #[test]
@@ -5920,6 +6046,33 @@ mod tests {
             assert!(
                 events.iter().any(|e| matches!(e, AgentEvent::TurnDone)),
                 "TurnDone must fire"
+            );
+        }
+
+        /// `max_cost` stops the turn before the first model call once the
+        /// session counter has reached the cap (a zero cap trips immediately),
+        /// with a Notice explaining why.
+        #[tokio::test]
+        async fn max_cost_zero_stops_before_any_model_call() {
+            let server = MockServer::start(vec![]).await; // must never be hit
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.max_cost = Some(0.0);
+            let mut agent = Agent::new(cfg).unwrap();
+            let mut events: Vec<AgentEvent> = Vec::new();
+            let err = agent
+                .run("hi", steering_queue(), |ev| events.push(ev))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("cost budget"),
+                "budget error: {err}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("cost budget"))),
+                "a Notice explains the stop: {events:?}"
             );
         }
 

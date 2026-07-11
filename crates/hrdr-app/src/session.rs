@@ -24,12 +24,16 @@ const SESSION_VERSION: u32 = 1;
 /// usage — the prompt half is the live context size ("X of Y"). `context_window`
 /// is the model's advertised maximum, kept so the "of Y" is right immediately on
 /// resume, before the endpoint has been re-probed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionUsage {
     #[serde(default)]
     pub tokens_in: usize,
     #[serde(default)]
     pub tokens_out: usize,
+    /// Estimated USD spent this session (all model calls, incl. sub-agents),
+    /// priced from the models.dev catalog; 0 when nothing was priceable.
+    #[serde(default)]
+    pub cost_usd: f64,
     #[serde(default)]
     pub last_prompt_tokens: Option<u32>,
     #[serde(default)]
@@ -491,6 +495,7 @@ mod tests {
             st.usage = SessionUsage {
                 tokens_in: 10,
                 tokens_out: 5,
+                cost_usd: 0.25,
                 last_prompt_tokens: Some(10),
                 last_completion_tokens: Some(5),
                 context_window: Some(1000),
@@ -699,6 +704,7 @@ mod roundtrip_audit {
             usage: SessionUsage {
                 tokens_in: 10,
                 tokens_out: 5,
+                cost_usd: 0.25,
                 last_prompt_tokens: Some(10),
                 last_completion_tokens: Some(5),
                 context_window: Some(1000),

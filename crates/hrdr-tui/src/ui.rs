@@ -454,6 +454,9 @@ fn truncate_chars(s: &str, max: usize) -> String {
     format!("{}…", s.chars().take(keep).collect::<String>())
 }
 
+/// Rows the completion popup shows at once; the selection scrolls the window.
+const COMPLETION_MAX_ROWS: usize = 5;
+
 fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &crate::app::Completions) {
     let theme = &app.theme;
     // Clamped to the frame itself, not just the input pane: on a very short
@@ -461,10 +464,22 @@ fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &crate::app
     // than exist, leaving its border/top items rendered outside the visible
     // area (ratatui clips silently — no panic, but nothing there to click).
     let frame_area = f.area();
-    // Height: one row per item, plus the block's one padded row above and below.
-    let height = (comp.items.len() as u16 + 2).min(frame_area.height.max(1));
-    let widest = comp
-        .items
+    // At most COMPLETION_MAX_ROWS rows show; the window slides so the
+    // selection stays visible.
+    let total = comp.items.len();
+    let sel = app.completion_idx.min(total - 1);
+    let start = if sel >= COMPLETION_MAX_ROWS {
+        sel + 1 - COMPLETION_MAX_ROWS
+    } else {
+        0
+    };
+    let shown = &comp.items[start..(start + COMPLETION_MAX_ROWS).min(total)];
+    // Height: one row per shown item, plus the block's padded row above and
+    // below, plus a trailing "N more" hint when the list is windowed.
+    let more = total - (start + shown.len());
+    let hint_rows = usize::from(more > 0);
+    let height = ((shown.len() + hint_rows) as u16 + 2).min(frame_area.height.max(1));
+    let widest = shown
         .iter()
         .map(|(n, d)| n.chars().count() + d.chars().count() + 3)
         .max()
@@ -473,8 +488,12 @@ fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &crate::app
     let width = ((widest + BLOCK_PAD_X * 2) as u16)
         .clamp(20, input_area.width.max(20))
         .min(frame_area.width.max(1));
+    // Anchor the popup at the column of the token being completed (the `/` or
+    // `@`), so it sits above the text it belongs to instead of the pane's
+    // left edge. INPUT_PAD_X mirrors the input pane's own left padding.
+    let anchor_x = input_area.x + INPUT_PAD_X as u16 + clamp_u16(comp.anchor_col);
     let rect = Rect {
-        x: input_area.x.min(frame_area.width.saturating_sub(width)),
+        x: anchor_x.min(frame_area.width.saturating_sub(width)),
         y: input_area.y.saturating_sub(height),
         width,
         height,
@@ -488,12 +507,11 @@ fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &crate::app
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let lines: Vec<Line> = comp
-        .items
+    let mut lines: Vec<Line> = shown
         .iter()
         .enumerate()
         .map(|(i, (name, desc))| {
-            let name_style = if i == app.completion_idx {
+            let name_style = if start + i == sel {
                 Style::default()
                     .fg(Color::Black)
                     .bg(theme.user)
@@ -507,6 +525,12 @@ fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &crate::app
             ])
         })
         .collect();
+    if more > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(" … {more} more"),
+            Style::default().fg(theme.dim),
+        )));
+    }
     f.render_widget(Paragraph::new(lines), inner);
 }
 

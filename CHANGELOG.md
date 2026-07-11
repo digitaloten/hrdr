@@ -37,6 +37,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still resumes directly. Frontends without the modal fall back to the text
   listing (`session_list_text`).
 
+- **Cost accounting.** Every model call is priced from the models.dev catalog
+  (`cost.input`/`output`, with the `cache_read` discount applied to cached
+  prompt tokens); sub-agents share the session counter, so `/cost` and `/status`
+  show the whole tree's estimated USD. `Usage` events (and `hrdr run --json`)
+  carry `cost_usd` + `session_cost_usd`; the headless stderr usage line shows
+  the running estimate. Unpriced models (local servers) count as $0. Estimates
+  persist in the session file and survive resume.
+- **Cost budget.** `max_cost` (config.toml) / `--max-cost <USD>` (`hrdr run`)
+  stops the turn with a notice before the next model call once the session's
+  estimated spend reaches the cap — sub-agents included, and enforced inside
+  sub-agents too.
+- **Retry jitter.** The transient-error backoff (connect and mid-stream) now
+  carries ±25% jitter so parallel sub-agents tripping the same rate limit don't
+  retry in lockstep.
+
 ### Changed
 
 - **Alias rows hidden from slash-command autocomplete.** `slash_completions` no
@@ -46,6 +61,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   description.
 - **`/info` renamed to `/status`** (the Claude Code name); `/info` stays as an
   alias.
+- **`/new` is the canonical new-session command**; `/clear` and `/reset` stay as
+  aliases.
+- **Completion popup: capped, anchored, unified.** At most 5 rows show at once
+  (the window slides with the selection; a "… N more" hint marks overflow), and
+  the popup is anchored above the column of the token being completed (the `/`
+  or `@`) instead of the input pane's left edge. `@` completion now offers
+  **sub-agent names** (which route the message via `@name` mention) above the
+  file-path matches, in the same popup.
 - **`/sessions` is now an alias of `/resume`** — both open the session picker.
   The `--all` flag is gone (the picker always lists every directory, with a cwd
   column); `session_list_text()` (the no-modal text fallback) lost its

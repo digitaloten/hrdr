@@ -25,7 +25,7 @@ impl super::App {
         let messages = state.messages.len();
         self.adopt_state(state, Some(id));
         self.push_entry(Entry::notice(format!(
-            "resumed most recent session '{name}' ({messages} messages) — /clear to start fresh"
+            "resumed most recent session '{name}' ({messages} messages) — /new to start fresh"
         )));
     }
 
@@ -124,9 +124,13 @@ impl super::App {
             self.state.provider = provider;
         }
 
+        // The resumed session's saved spend is the display base; the agent's
+        // live counter tracks only what this process spends on top of it.
+        self.cost_base = self.state.usage.cost_usd;
         self.with_agent(|a| {
             a.set_messages(self.state.messages.clone());
             a.set_model(self.state.model.clone());
+            a.reset_session_cost();
         });
         if let Ok(mut todos) = self.todos.lock() {
             *todos = self.state.todos.clone();

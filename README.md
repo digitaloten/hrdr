@@ -103,14 +103,19 @@ hrdr run "add a --json flag to the status command"
 # scripting/CI: NDJSON events, no chrome, bounded budget
 hrdr run --json --max-steps 20 "bump the patch version" | jq -r 'select(.type=="text").text'
 hrdr run --quiet "summarize the failing tests"
+
+# cap the estimated spend (USD, incl. sub-agents; priced from models.dev)
+hrdr run --max-cost 0.50 "audit the error handling"
 ```
 
 For debugging harness ⇄ server disagreements, `HRDR_LOG_REQUESTS=<path>` appends
 every chat request body, raw SSE line, and non-2xx response to the file as
 JSON-per-line.
 
-In the TUI, type a message and press `Enter` to send. `@path` attaches a file
-(with completion), and typing `/` opens a slash-command menu.
+In the TUI, type a message and press `Enter` to send. `@` completes sub-agent
+names (routing the message to that agent) and file paths (attaching the file),
+and typing `/` opens a slash-command menu. Both share one popup: at most five
+rows (scroll for more), anchored above the token being completed.
 
 ### Keybindings
 
@@ -119,7 +124,7 @@ In the TUI, type a message and press `Enter` to send. `@path` attaches a file
 | `Enter`                   | Send; **while a reply runs, queues it** (delivered with the next tool result, else sent as its own turn) |
 | `Alt+Enter` / `\`+`Enter` | Insert a newline (`Shift+Enter` too, where supported)                                                    |
 | `Up` / `Down`             | Recall previous inputs (single-line); drive the `/` menu                                                 |
-| `@path`                   | Attach a file to the message                                                                             |
+| `@name` / `@path`         | Mention a sub-agent (routes to it) or attach a file                                                      |
 | `Ctrl+G`                  | Edit the input in `$EDITOR` / `$VISUAL`                                                                  |
 | `PageUp/Down`, mouse      | Scroll the transcript; `End` follows the newest output                                                   |
 | `Ctrl+L`                  | Clear + repaint the screen                                                                               |
@@ -133,7 +138,7 @@ the input pane instead of the default plain input.
 
 Type `/` to see the menu (fuzzy-matched, `Tab` to accept). Highlights:
 
-- **Session** — `/clear [name]` (aliases `/new`, `/reset`), `/resume` (aliases
+- **Session** — `/new [name]` (aliases `/clear`, `/reset`), `/resume` (aliases
   `/continue`, `/sessions`; a fuzzy-searchable picker of saved sessions, newest
   first — or `/resume <id|name>` directly), `/rename`, `/compact`, `/status`
   (alias `/info`), `/goto <N|5m|top|end>`, `/find <text>` (`/next` `/prev`)
@@ -145,7 +150,8 @@ Type `/` to see the menu (fuzzy-matched, `Tab` to accept). Highlights:
 - **Files** — `/init` (write `AGENTS.md`), `/add`, `/edit <file>`, `/diff`,
   `/revert` + `/checkpoints` (file undo), `/tools`, `/expand`, `/paste`
 - **Reply** — `/copy [code|all|msg N]`, `/export [--json]`, `/retry [model]`,
-  `/undo`
+  `/undo`, `/cost` (alias `/usage`; session tokens + estimated USD, priced from
+  the models.dev catalog, sub-agents included)
 - **Appearance** — `/theme` (picker with live preview; 5 built-in palettes +
   `~/.config/hrdr/themes/*.toml`), `/timestamps [none|relative|exact]`,
   `/statusbar [none|truncate|wrap]`, `/todo-ttl [turns]`
@@ -320,6 +326,11 @@ preserve_recent_tokens = 8000  # …bounded by this token budget
 # beyond the cap is refused, and the model is told to wait or do the work itself.
 max_readonly_subagents = 5     # HRDR_MAX_READONLY_SUBAGENTS, --max-readonly-subagents
 max_write_subagents = 2        # HRDR_MAX_WRITE_SUBAGENTS, --max-write-subagents
+
+# Cost budget: stop before the next model call once the session's estimated
+# spend (USD, priced from the models.dev catalog, sub-agents included) reaches
+# the cap. `hrdr run --max-cost <USD>` overrides per run. Unset = unlimited.
+max_cost = 5.0
 ```
 
 `auto_prune` also honors `$HRDR_AUTO_PRUNE` / `--auto-prune on|off`.

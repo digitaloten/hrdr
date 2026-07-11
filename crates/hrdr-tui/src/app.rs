@@ -162,6 +162,9 @@ pub(crate) struct App {
     /// The open `/theme` picker modal; while `Some`, it captures every key and
     /// live-previews the highlighted theme.
     pub(crate) theme_selector: Option<ThemeSelector>,
+    /// USD already spent when the current session was adopted (a resumed
+    /// session's saved spend); the agent's live counter adds on top of it.
+    pub(crate) cost_base: f64,
     /// A `/goto` target message number, resolved to a scroll offset at draw.
     pub(crate) pending_goto: Option<usize>,
     /// A transcript index whose block should be pulled to the top of the
@@ -382,6 +385,7 @@ impl App {
             model_selector: None,
             session_selector: None,
             theme_selector: None,
+            cost_base: 0.0,
             pending_goto: None,
             pending_scroll_entry: None,
             pending_focus_entry: None,
@@ -502,9 +506,9 @@ impl App {
             return Action::None;
         }
 
-        // Completion popup (slash command or `@file`): Tab accepts the selection,
-        // Up/Down move it, Enter accepts; a slash Enter then submits, an `@file`
-        // Enter just inserts the path and keeps editing.
+        // Completion popup (slash command or `@` mention): Tab accepts the
+        // selection, Up/Down move it, Enter accepts; a slash Enter then
+        // submits, an `@` mention Enter just inserts and keeps editing.
         if key.modifiers.is_empty()
             && let Some(comp) = self.active_completions()
         {
@@ -526,9 +530,9 @@ impl App {
                 KeyCode::Enter => {
                     self.apply_completion(&comp, self.completion_idx.min(last), false);
                     self.completion_idx = 0;
-                    // A file mention just inserts; a slash command falls through
+                    // A mention just inserts; a slash command falls through
                     // to the submit path below so it runs.
-                    if matches!(comp.kind, CompletionKind::File { .. }) {
+                    if matches!(comp.kind, CompletionKind::Mention { .. }) {
                         return Action::None;
                     }
                 }
@@ -1428,10 +1432,17 @@ impl App {
                 completion_tokens,
                 cached_prompt_tokens,
                 reasoning_tokens,
+                session_cost_usd,
+                ..
             } => {
                 self.state
                     .usage
                     .record_call(prompt_tokens, completion_tokens);
+                if let Some(total) = session_cost_usd {
+                    // The agent's counter covers this process (incl. its
+                    // sub-agents); a resumed session's saved spend is the base.
+                    self.state.usage.cost_usd = self.cost_base + total;
+                }
                 self.last_cached_tokens = cached_prompt_tokens;
                 self.last_reasoning_tokens = reasoning_tokens;
             }

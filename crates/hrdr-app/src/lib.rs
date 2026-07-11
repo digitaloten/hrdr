@@ -40,7 +40,7 @@ pub use util::*;
 /// The slash commands, as `(name, one-line description)`. Frontends render this
 /// however they like (a completion popup, a `/` menu, a help screen).
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/clear", "reset the conversation (optional name)"),
+    ("/new", "start a fresh conversation (optional name)"),
     ("/compact", "summarize the conversation to reclaim context"),
     ("/resume", "resume a session (picker, or id/name)"),
     ("/rename", "rename the current session"),
@@ -81,8 +81,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
     ("/exit", "quit"),
     // Aliases for users switching from other agents (resolved by resolve_alias).
-    ("/new", "alias of /clear (optional name)"),
-    ("/reset", "alias of /clear"),
+    ("/clear", "alias of /new (optional name)"),
+    ("/reset", "alias of /new"),
     ("/cd", "alias of /cwd"),
     ("/info", "alias of /status"),
     ("/continue", "alias of /resume"),
@@ -97,8 +97,7 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
     (
         "Session",
         &[
-            "/clear", "/resume", "/rename", "/compact", "/status", "/goto", "/find", "/next",
-            "/prev",
+            "/new", "/resume", "/rename", "/compact", "/status", "/goto", "/find", "/next", "/prev",
         ],
     ),
     (
@@ -143,8 +142,8 @@ pub fn is_known_command(cmd: &str) -> bool {
 /// through unchanged.
 pub fn resolve_alias(cmd: &str) -> &str {
     match cmd.to_ascii_lowercase().as_str() {
-        // Claude Code / opencode / aider new-session & reset names.
-        "new" | "reset" => "clear",
+        // Claude Code / aider names for starting over; /new is opencode's.
+        "clear" | "reset" => "new",
         // aider/shell-style directory change.
         "cd" => "cwd",
         // hrdr's pre-Claude-style name for the session summary.
@@ -233,8 +232,8 @@ mod tests {
 
     #[test]
     fn aliases_resolve_to_canonical() {
-        assert_eq!(resolve_alias("new"), "clear");
-        assert_eq!(resolve_alias("RESET"), "clear"); // case-insensitive
+        assert_eq!(resolve_alias("clear"), "new");
+        assert_eq!(resolve_alias("RESET"), "new"); // case-insensitive
         assert_eq!(resolve_alias("cd"), "cwd");
         assert_eq!(resolve_alias("info"), "status");
         assert_eq!(resolve_alias("continue"), "resume");

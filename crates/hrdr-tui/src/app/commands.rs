@@ -79,6 +79,7 @@ impl super::App {
         };
         self.last_cached_tokens = None;
         self.last_reasoning_tokens = None;
+        self.cost_base = 0.0; // Agent::clear zeroes the live counter too
         self.state.id = None; // detach; next message starts a new session
         self.state.name.clear();
         self.find = hrdr_app::FindState::default();
@@ -417,6 +418,9 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
             self.app.state.usage.tokens_in,
             self.app.state.usage.tokens_out,
         )
+    }
+    fn session_cost(&self) -> f64 {
+        self.app.state.usage.cost_usd
     }
     fn set_effort(&mut self, label: String) {
         self.app.effort = Some(label);
