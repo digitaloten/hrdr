@@ -13,7 +13,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the transcript as a live tool block, and the command + (bounded) output are
   appended to the model's history as a user note — the next turn sees what you
   ran. User-initiated, so guardrails don't apply; rejected while a turn is
-  running. Pasting works; no model call is made.
+  running. Pasting works; no model call is made. **Esc cancels** a running
+  `!command`: the child is killed, the block closes as "(cancelled)", and a
+  history note tells the model it didn't finish.
 - **`/skills` picker.** `/skills` now opens a fuzzy picker over the discovered
   skills (name · description · source); Enter inserts `:name ` into the input,
   ready for arguments.

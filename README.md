@@ -158,7 +158,7 @@ Review the working-tree diff. Focus on: $ARGUMENTS
 | `Ctrl+G`                  | Edit the input in `$EDITOR` / `$VISUAL`                                                                  |
 | `PageUp/Down`, mouse      | Scroll the transcript; `End` follows the newest output                                                   |
 | `Ctrl+L`                  | Clear + repaint the screen                                                                               |
-| `Esc` / `Ctrl+C`          | Interrupt the running turn                                                                               |
+| `Esc` / `Ctrl+C`          | Interrupt the running turn; Esc also cancels a running `!command`                                        |
 | `Ctrl+C` twice / `Ctrl+D` | Quit (`Ctrl+D` on an empty input); `Ctrl+Q` quits at once                                                |
 
 Pass `--vim` for a full [hjkl](https://github.com/kryptic-sh/hjkl) vim editor in
