@@ -1348,20 +1348,33 @@ pub struct GuardrailConfig {
     pub message: String,
 }
 
-/// One post-edit hook from a `[[hooks]]` config entry: after tool `on`
-/// (`edit`, `write`, or `*`) successfully mutates a file matching
-/// `glob`, run shell command `run` (`{path}` is substituted). Formatters,
-/// mostly. Failures surface as warnings in the tool result, never as errors.
+/// One hook from a `[[hooks]]` config entry.
+///
+/// Without `event` it is a **post-edit file hook**: after tool `on` (`edit`,
+/// `write`, or `*`) successfully mutates a file matching `glob`, run shell
+/// command `run` (`{path}` is substituted). Formatters, mostly. Failures
+/// surface as warnings in the tool result, never as errors.
+///
+/// With `event` it is a **lifecycle hook** (`pre_tool`, `post_tool`,
+/// `user_prompt`, `turn_end`, `session_start`, `session_end`): `run` receives
+/// the event payload as JSON on stdin; for the tool events `on` filters by
+/// tool name. Exit 2 blocks the tool call / prompt; other failures warn. See
+/// [`hrdr_tools::run_event_hooks`].
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
 pub struct HookConfig {
-    /// Triggering tool; defaults to `*` (any file-mutating tool).
+    /// Lifecycle event name; absent = a post-edit file hook.
+    #[serde(default)]
+    pub event: Option<String>,
+    /// Triggering tool; defaults to `*` (any file-mutating tool, or — for a
+    /// lifecycle tool event — any tool).
     #[serde(default = "default_hook_on")]
     pub on: String,
     /// File filter (matched against name and cwd-relative path); absent =
-    /// every file.
+    /// every file. File hooks only.
     #[serde(default)]
     pub glob: Option<String>,
-    /// Shell command template; `{path}` becomes the quoted file path.
+    /// Shell command template; `{path}` becomes the quoted file path (file
+    /// hooks), and lifecycle hooks read the JSON payload from stdin.
     pub run: String,
     /// Per-run timeout in milliseconds (default 30000).
     #[serde(default)]
@@ -2221,6 +2234,10 @@ pub struct Agent {
     /// Abort the turn before the next model call once `cost_total` reaches
     /// this many USD ([`AgentConfig::max_cost`]).
     max_cost: Option<f64>,
+    /// Lifecycle hooks from `[[hooks]]` entries with an `event` (the
+    /// event-less entries become the post-edit file hooks in `ctx.hooks`).
+    /// Arc: cloned into each tool call's future for the pre/post tool events.
+    event_hooks: Arc<Vec<hrdr_tools::EventHook>>,
 }
 
 /// Append a sub-agent persona (its role / operating instructions) after the base
@@ -2405,26 +2422,43 @@ impl Agent {
             ctx.memory_project = Some(proj.clone());
             ctx.memory_global = Some(glob.clone());
         }
+        let mut event_hooks = Vec::new();
         if !config.hooks.is_empty() {
-            // Invalid globs are skipped (lenient, like the rest of config).
-            let hooks: Vec<hrdr_tools::Hook> = config
-                .hooks
-                .iter()
-                .filter_map(|h| {
-                    let glob = match &h.glob {
-                        Some(g) => Some(glob::Pattern::new(g).ok()?),
-                        None => None,
-                    };
-                    Some(hrdr_tools::Hook {
-                        on: h.on.clone(),
-                        glob,
-                        run: h.run.clone(),
-                        timeout_ms: h.timeout_ms.unwrap_or(hrdr_tools::DEFAULT_HOOK_TIMEOUT_MS),
-                    })
-                })
-                .collect();
-            ctx.hooks = Arc::new(hooks);
+            // Entries with an `event` are lifecycle hooks; the rest are
+            // post-edit file hooks. Invalid globs and unknown event names are
+            // skipped (lenient, like the rest of config).
+            let mut file_hooks = Vec::new();
+            for h in &config.hooks {
+                if let Some(event) = &h.event {
+                    if let Some(event) = hrdr_tools::HookEvent::parse(event) {
+                        event_hooks.push(hrdr_tools::EventHook {
+                            event,
+                            on: h.on.clone(),
+                            run: h.run.clone(),
+                            timeout_ms: h.timeout_ms.unwrap_or(hrdr_tools::DEFAULT_HOOK_TIMEOUT_MS),
+                        });
+                    }
+                    continue;
+                }
+                let glob = match &h.glob {
+                    Some(g) => match glob::Pattern::new(g) {
+                        Ok(p) => Some(p),
+                        Err(_) => continue,
+                    },
+                    None => None,
+                };
+                file_hooks.push(hrdr_tools::Hook {
+                    on: h.on.clone(),
+                    glob,
+                    run: h.run.clone(),
+                    timeout_ms: h.timeout_ms.unwrap_or(hrdr_tools::DEFAULT_HOOK_TIMEOUT_MS),
+                });
+            }
+            if !file_hooks.is_empty() {
+                ctx.hooks = Arc::new(file_hooks);
+            }
         }
+        let event_hooks = Arc::new(event_hooks);
         // User guardrails layer on top of the built-in set; an invalid regex
         // is skipped (lenient, like the rest of config parsing).
         if !config.guardrails.is_empty() {
@@ -2512,6 +2546,7 @@ impl Agent {
             cost_total,
             cost_rates: None,
             max_cost: config.max_cost,
+            event_hooks,
         })
     }
 
@@ -3054,8 +3089,38 @@ impl Agent {
         // with an assistant `tool_calls` message whose results are missing —
         // strict servers reject that. Backfill stubs before the new user turn.
         repair_dangling_tool_calls(&mut self.messages);
-        let user_input = user_input.into();
+        let mut user_input = user_input.into();
         if !user_input.trim().is_empty() {
+            // `user_prompt` hooks see the message before the turn starts: a
+            // block (exit 2) fails the turn before anything enters history;
+            // hook stdout rides along as extra context for the model (the
+            // frontend still displays only what the user typed).
+            if self.has_event_hooks(hrdr_tools::HookEvent::UserPrompt) {
+                let payload = serde_json::json!({
+                    "event": "user_prompt",
+                    "prompt": user_input,
+                    "cwd": self.ctx.cwd.display().to_string(),
+                    "model": self.client.model,
+                });
+                let out = hrdr_tools::run_event_hooks(
+                    &self.event_hooks,
+                    hrdr_tools::HookEvent::UserPrompt,
+                    None,
+                    &payload,
+                    &self.ctx.cwd,
+                )
+                .await;
+                for note in out.notes {
+                    on_event(AgentEvent::Notice(note));
+                }
+                if let Some(reason) = out.block {
+                    bail!("blocked by user_prompt hook: {reason}");
+                }
+                if !out.context.is_empty() {
+                    user_input.push_str("\n\n[hook context]\n");
+                    user_input.push_str(&out.context.join("\n"));
+                }
+            }
             self.messages.push(ChatMessage::user(user_input));
         }
         // Start a fresh file checkpoint for this turn's edits.
@@ -3167,6 +3232,7 @@ impl Agent {
                 // ride in on, so the frontend sends it as a turn of its own —
                 // steering redirects work in progress, it doesn't extend a turn
                 // the model already finished.
+                self.fire_turn_end_hooks(&mut on_event).await;
                 on_event(AgentEvent::TurnDone);
                 return Ok(());
             }
@@ -3230,8 +3296,57 @@ impl Agent {
             .connect_and_drain(&[], &mut overflow_compacted, &mut on_event)
             .await?;
         self.messages.push(acc.into_message());
+        self.fire_turn_end_hooks(&mut on_event).await;
         on_event(AgentEvent::TurnDone);
         Ok(())
+    }
+
+    /// Whether any lifecycle hook is registered for `event` — the cheap check
+    /// that keeps the hookless common path free of payload building.
+    fn has_event_hooks(&self, event: hrdr_tools::HookEvent) -> bool {
+        self.event_hooks.iter().any(|h| h.event == event)
+    }
+
+    /// Run the `turn_end` hooks (both turn exits call this just before
+    /// `TurnDone`). Failures surface as notices; nothing here can block.
+    async fn fire_turn_end_hooks<F: FnMut(AgentEvent)>(&self, on_event: &mut F) {
+        if !self.has_event_hooks(hrdr_tools::HookEvent::TurnEnd) {
+            return;
+        }
+        let payload = serde_json::json!({
+            "event": "turn_end",
+            "cwd": self.ctx.cwd.display().to_string(),
+            "model": self.client.model,
+        });
+        let out = hrdr_tools::run_event_hooks(
+            &self.event_hooks,
+            hrdr_tools::HookEvent::TurnEnd,
+            None,
+            &payload,
+            &self.ctx.cwd,
+        )
+        .await;
+        for note in out.notes.into_iter().chain(out.block) {
+            on_event(AgentEvent::Notice(note));
+        }
+    }
+
+    /// Run the `session_start`/`session_end` hooks — driven by the frontend
+    /// (the agent doesn't know when a session opens or the app quits). Returns
+    /// the failure notes for the frontend to display.
+    pub async fn run_session_hooks(&self, event: hrdr_tools::HookEvent) -> Vec<String> {
+        if !self.has_event_hooks(event) {
+            return Vec::new();
+        }
+        let payload = serde_json::json!({
+            "event": event.as_str(),
+            "cwd": self.ctx.cwd.display().to_string(),
+            "model": self.client.model,
+        });
+        let out =
+            hrdr_tools::run_event_hooks(&self.event_hooks, event, None, &payload, &self.ctx.cwd)
+                .await;
+        out.notes.into_iter().chain(out.block).collect()
     }
 
     /// Emit the `ToolEnd` event and push the tool-result message for a
@@ -3299,6 +3414,7 @@ impl Agent {
             // Cheap clone (Arc-backed registry) so the futures don't borrow
             // `self` — results are recorded with `&mut self` right after.
             let tools = self.tools.clone();
+            let hooks = Arc::clone(&self.event_hooks);
             // A refused call (repeat breaker) resolves immediately instead of
             // executing; boxing keeps the join order == call order.
             let fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> =
@@ -3317,7 +3433,71 @@ impl Agent {
                                 }
                             }
                         };
-                        tools.execute(&name, args, &ctx).await
+                        // `pre_tool` hooks can veto the call (exit 2): the
+                        // model sees the hook's reason as the tool error.
+                        if hooks
+                            .iter()
+                            .any(|h| h.event == hrdr_tools::HookEvent::PreTool)
+                        {
+                            let payload = serde_json::json!({
+                                "event": "pre_tool",
+                                "tool": name,
+                                "args": args,
+                                "cwd": ctx.cwd.display().to_string(),
+                            });
+                            let out = hrdr_tools::run_event_hooks(
+                                &hooks,
+                                hrdr_tools::HookEvent::PreTool,
+                                Some(&name),
+                                &payload,
+                                &ctx.cwd,
+                            )
+                            .await;
+                            if let Some(reason) = out.block {
+                                return Err(anyhow::anyhow!("blocked by pre_tool hook: {reason}"));
+                            }
+                            for note in out.notes {
+                                ctx.emit(format!("{note}\n"));
+                            }
+                        }
+                        let mut res = tools.execute(&name, args.clone(), &ctx).await;
+                        // `post_tool` hooks see the (bounded) result; their
+                        // complaints ride back to the model with it.
+                        if hooks
+                            .iter()
+                            .any(|h| h.event == hrdr_tools::HookEvent::PostTool)
+                        {
+                            let (ok, result_text) = match &res {
+                                Ok(r) => (true, hrdr_tools::truncate_inline(r, 30_000)),
+                                Err(e) => (false, e.to_string()),
+                            };
+                            let payload = serde_json::json!({
+                                "event": "post_tool",
+                                "tool": name,
+                                "args": args,
+                                "ok": ok,
+                                "result": result_text,
+                                "cwd": ctx.cwd.display().to_string(),
+                            });
+                            let out = hrdr_tools::run_event_hooks(
+                                &hooks,
+                                hrdr_tools::HookEvent::PostTool,
+                                Some(&name),
+                                &payload,
+                                &ctx.cwd,
+                            )
+                            .await;
+                            let notes: Vec<String> =
+                                out.notes.into_iter().chain(out.block).collect();
+                            if !notes.is_empty() {
+                                let joined = notes.join("\n");
+                                res = match res {
+                                    Ok(r) => Ok(format!("{r}\n{joined}")),
+                                    Err(e) => Err(anyhow::anyhow!("{e}\n{joined}")),
+                                };
+                            }
+                        }
+                        res
                     }),
                 };
             futs.push(fut);
@@ -5255,16 +5435,24 @@ mod tests {
             [[hooks]]
             run = "prettier --write {path}"
             timeout_ms = 5000
+
+            [[hooks]]
+            event = "pre_tool"
+            on = "bash"
+            run = "./check-command.sh"
             "#,
         )
         .unwrap();
         let mut cfg = AgentConfig::default();
         cfg.apply_file(fc);
-        assert_eq!(cfg.hooks.len(), 2);
+        assert_eq!(cfg.hooks.len(), 3);
         assert_eq!(cfg.hooks[0].on, "edit");
         assert_eq!(cfg.hooks[0].glob.as_deref(), Some("*.rs"));
+        assert_eq!(cfg.hooks[0].event, None); // no event = post-edit file hook
         assert_eq!(cfg.hooks[1].on, "*"); // default: any file-mutating tool
         assert_eq!(cfg.hooks[1].timeout_ms, Some(5000));
+        assert_eq!(cfg.hooks[2].event.as_deref(), Some("pre_tool"));
+        assert_eq!(cfg.hooks[2].on, "bash");
     }
 
     #[test]
@@ -6183,6 +6371,200 @@ mod tests {
                 hist.iter().any(|m| m.role == hrdr_llm::Role::User),
                 "snapshot carries the whole conversation"
             );
+        }
+
+        /// One `[[hooks]]` entry with an `event`, for the lifecycle tests.
+        fn event_hook_cfg(event: &str, on: &str, run: &str) -> crate::HookConfig {
+            crate::HookConfig {
+                event: Some(event.to_string()),
+                on: on.to_string(),
+                glob: None,
+                run: run.to_string(),
+                timeout_ms: None,
+            }
+        }
+
+        /// A `pre_tool` hook exiting 2 vetoes the call: the tool never runs and
+        /// the model sees the hook's stderr as the tool error. A `post_tool`
+        /// hook's failure rides back appended to the (successful) result.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn tool_hooks_block_and_annotate() {
+            let dir = tempfile::tempdir().unwrap();
+            let test_file = dir.path().join("data.txt");
+            std::fs::write(&test_file, "file content").unwrap();
+            let args_json =
+                serde_json::to_string(&json!({"path": test_file.to_string_lossy()})).unwrap();
+
+            let tool_round = |id: &str| {
+                MockResp::Sse(vec![
+                    tool_start_chunk(id, &format!("call_{id}"), "read"),
+                    tool_args_chunk(id, &args_json),
+                    tool_calls_stop_chunk(id),
+                    "[DONE]".to_string(),
+                ])
+            };
+            let server = MockServer::start(vec![
+                tool_round("c1"),
+                MockResp::Sse(vec![
+                    text_chunk("c2", "Done"),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.hooks = vec![
+                // Vetoes the read…
+                event_hook_cfg("pre_tool", "read", "echo not-allowed >&2; exit 2"),
+                // …so this one must never fire for the blocked call.
+                event_hook_cfg("post_tool", "read", "echo lint-warning >&2; exit 1"),
+            ];
+            let mut agent = Agent::new(cfg).unwrap();
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run("read the file", steering_queue(), |ev| events.push(ev))
+                .await
+                .unwrap();
+            let blocked = events.iter().any(|e| {
+                matches!(e, AgentEvent::ToolEnd { name, ok: false, result, .. }
+                    if name == "read" && result.contains("blocked by pre_tool hook: not-allowed"))
+            });
+            assert!(blocked, "the pre_tool hook vetoed the call: {events:?}");
+
+            // Same shape without the veto: the post_tool note rides the result.
+            let server = MockServer::start(vec![
+                tool_round("c1"),
+                MockResp::Sse(vec![
+                    text_chunk("c2", "Done"),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.hooks = vec![event_hook_cfg(
+                "post_tool",
+                "*",
+                "echo lint-warning >&2; exit 1",
+            )];
+            let mut agent = Agent::new(cfg).unwrap();
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run("read the file", steering_queue(), |ev| events.push(ev))
+                .await
+                .unwrap();
+            let annotated = events.iter().any(|e| {
+                matches!(e, AgentEvent::ToolEnd { name, ok: true, result, .. }
+                    if name == "read"
+                        && result.contains("file content")
+                        && result.contains("lint-warning"))
+            });
+            assert!(annotated, "the post_tool note rides the result: {events:?}");
+        }
+
+        /// `user_prompt` hooks bracket the message: stdout is injected as
+        /// context for the model (the history's user message carries it), and
+        /// exit 2 blocks the turn before anything enters history.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn user_prompt_hooks_inject_and_block() {
+            let dir = tempfile::tempdir().unwrap();
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "ok"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.hooks = vec![event_hook_cfg(
+                "user_prompt",
+                "*",
+                "echo remember-the-context",
+            )];
+            let mut agent = Agent::new(cfg).unwrap();
+            agent
+                .run("do the thing", steering_queue(), |_| {})
+                .await
+                .unwrap();
+            let user_msg = agent
+                .messages_owned()
+                .into_iter()
+                .find(|m| m.role == hrdr_llm::Role::User)
+                .expect("the user message is in history");
+            let content = user_msg.content.unwrap_or_default();
+            assert!(
+                content.contains("do the thing")
+                    && content.contains("[hook context]")
+                    && content.contains("remember-the-context"),
+                "hook stdout injected: {content}"
+            );
+
+            // Exit 2 blocks the prompt: the turn errors with the hook's reason
+            // and nothing was added to history (the server is never hit).
+            let server = MockServer::start(vec![]).await;
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.hooks = vec![event_hook_cfg(
+                "user_prompt",
+                "*",
+                "echo denied >&2; exit 2",
+            )];
+            let mut agent = Agent::new(cfg).unwrap();
+            let before = agent.messages_owned().len();
+            let err = agent
+                .run("do the thing", steering_queue(), |_| {})
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("blocked by user_prompt hook: denied"),
+                "{err}"
+            );
+            assert_eq!(
+                agent.messages_owned().len(),
+                before,
+                "a blocked prompt leaves history untouched"
+            );
+        }
+
+        /// `turn_end` fires before TurnDone, and the frontend-driven
+        /// `session_start`/`session_end` hooks run via `run_session_hooks`.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn turn_end_and_session_hooks_fire() {
+            let dir = tempfile::tempdir().unwrap();
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "ok"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.hooks = vec![
+                event_hook_cfg("turn_end", "*", "touch turn-end-ran"),
+                event_hook_cfg("session_start", "*", "touch session-start-ran"),
+                // A failing session hook surfaces as a note for the frontend.
+                event_hook_cfg("session_end", "*", "echo bye-failed >&2; exit 1"),
+            ];
+            let mut agent = Agent::new(cfg).unwrap();
+            agent.run("hi", steering_queue(), |_| {}).await.unwrap();
+            assert!(
+                dir.path().join("turn-end-ran").exists(),
+                "the turn_end hook ran (in the agent's cwd)"
+            );
+
+            let notes = agent
+                .run_session_hooks(hrdr_tools::HookEvent::SessionStart)
+                .await;
+            assert!(notes.is_empty(), "{notes:?}");
+            assert!(dir.path().join("session-start-ran").exists());
+
+            let notes = agent
+                .run_session_hooks(hrdr_tools::HookEvent::SessionEnd)
+                .await;
+            assert_eq!(notes.len(), 1);
+            assert!(notes[0].contains("bye-failed"), "{}", notes[0]);
         }
 
         /// A steering message pushed while the model is calling tools is drained

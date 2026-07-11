@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Lifecycle hooks.** A `[[hooks]]` config entry with an `event` runs on agent
+  lifecycle events: `pre_tool` (exit 2 **vetoes the tool call**, stderr becomes
+  the error the model sees; `on` filters by tool name), `post_tool` (failures
+  ride back appended to the result), `user_prompt` (exit 2 blocks the message;
+  stdout is injected as extra context for the model), `turn_end`,
+  `session_start`, and `session_end`. Each hook receives the event as a JSON
+  payload on stdin (plus `HRDR_HOOK_EVENT`/`HRDR_HOOK_TOOL` env), runs
+  sequentially with its own `timeout_ms`, and is inherited by delegated
+  sub-agents. Event-less `[[hooks]]` entries keep their post-edit file-hook
+  behavior unchanged.
 - **`!` shell escape.** A message starting with `!` runs the rest as a shell
   command (bash, else PowerShell) in the agent's cwd: the output streams into
   the transcript as a live tool block, and the command + (bounded) output are

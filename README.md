@@ -711,6 +711,46 @@ glob = "*.{md,ts,json}"
 run = "prettier --write {path}"
 ```
 
+### Lifecycle hooks
+
+A `[[hooks]]` entry with an `event` runs on agent lifecycle events instead of
+file edits. The command receives one JSON object on **stdin** describing the
+event (plus `HRDR_HOOK_EVENT` / `HRDR_HOOK_TOOL` in its environment) and speaks
+through its exit code: **0** proceeds, **2 blocks** the tool call or prompt
+(stderr becomes the reason the model sees), and any other failure is a
+non-blocking warning. Hooks run sequentially, each bounded by its own
+`timeout_ms`.
+
+| `event`         | Fires                                          | Payload extras                 | Special powers                               |
+| --------------- | ---------------------------------------------- | ------------------------------ | -------------------------------------------- |
+| `pre_tool`      | before a tool call (`on` filters by tool name) | `tool`, `args`                 | exit 2 vetoes the call                       |
+| `post_tool`     | after a tool call                              | `tool`, `args`, `ok`, `result` | failures ride back to the model              |
+| `user_prompt`   | when a message is submitted                    | `prompt`                       | exit 2 blocks it; stdout injected as context |
+| `turn_end`      | after each turn                                | —                              | —                                            |
+| `session_start` | when the session opens                         | —                              | —                                            |
+| `session_end`   | on quit (after the final save)                 | —                              | —                                            |
+
+```toml
+# Veto risky bash commands with your own policy script:
+[[hooks]]
+event = "pre_tool"
+on = "bash"                  # tool-name filter (* = any tool)
+run = "./scripts/check-command.py"   # reads the JSON payload from stdin
+
+# Remind the model of house rules on every prompt:
+[[hooks]]
+event = "user_prompt"
+run = "echo 'Remember: conventional commits only.'"
+
+# Ping when a turn finishes:
+[[hooks]]
+event = "turn_end"
+run = "notify-send hrdr 'turn done'"
+```
+
+Sub-agents inherit the same hooks, so a `pre_tool` policy also governs delegated
+work.
+
 ### Theme
 
 The TUI colors come from an [hjkl](https://github.com/kryptic-sh/hjkl) theme.

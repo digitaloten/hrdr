@@ -49,6 +49,8 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
     // The endpoint's advertised context window drives the status bar's gauge and
     // the auto-compaction threshold; probed once, in the background.
     app.spawn_context_probe();
+    // `session_start` lifecycle hooks, off-thread like the probes.
+    app.spawn_session_start_hooks();
     let mut events = EventStream::new();
     let mut rx = app.rx.take().expect("run_loop called once");
     // Periodic wake so the inference spinner animates between tokens.
@@ -80,6 +82,10 @@ pub(crate) async fn run_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
             // nothing new, so it never double-writes.
             app.reap_cancelled_turn().await;
             app.autosave();
+            // `session_end` hooks run after the final save, awaited (each
+            // hook's timeout bounds the wait) — a spawned task would be
+            // killed when the process exits right after.
+            app.run_session_end_hooks().await;
             break;
         }
 

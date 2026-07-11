@@ -523,6 +523,35 @@ impl App {
         });
     }
 
+    /// Fire the `session_start` lifecycle hooks on a background task; any
+    /// failures surface as system lines. A no-op without configured hooks.
+    pub(crate) fn spawn_session_start_hooks(&self) {
+        let agent = self.agent.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let notes = agent
+                .lock()
+                .await
+                .run_session_hooks(hrdr_tools::HookEvent::SessionStart)
+                .await;
+            for note in notes {
+                let _ = tx.send(TurnMsg::System(note));
+            }
+        });
+    }
+
+    /// Run the `session_end` lifecycle hooks on the quit path. Awaited — the
+    /// process is about to exit, so a spawned task would be killed mid-hook;
+    /// each hook's own timeout bounds the wait. Their output has nowhere to
+    /// go (the terminal is being restored), so notes are dropped.
+    pub(crate) async fn run_session_end_hooks(&self) {
+        // The quit path reaped any turn first, so the lock should be free; if
+        // something still holds it, skipping beats hanging the exit.
+        if let Ok(a) = self.agent.try_lock() {
+            let _ = a.run_session_hooks(hrdr_tools::HookEvent::SessionEnd).await;
+        }
+    }
+
     /// Start the shared config-file watch, piping change pings into the UI
     /// loop (dedup happens in [`Self::maybe_reload_config`]'s mtime guard).
     /// The returned guard must be kept alive for the watch to stay active.

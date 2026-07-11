@@ -1,9 +1,18 @@
-//! Post-edit hooks: user-configured shell commands that run after `edit` /
-//! `write` mutate a matching file — formatters, mostly (`cargo fmt`,
-//! `prettier --write`). Mechanical like the guardrails: a config rule the
-//! model can't forget. The mutating tool re-reads the file *after* hooks run,
-//! so the diff the model sees (and the text its next `old_string` must match)
-//! is the post-hook content.
+//! User-configured shell hooks, in two families:
+//!
+//! * **File hooks** ([`Hook`], [`run_file_hooks`]) — run after `edit`/`write`
+//!   mutate a matching file. Formatters, mostly (`cargo fmt`,
+//!   `prettier --write`). Mechanical like the guardrails: a config rule the
+//!   model can't forget. The mutating tool re-reads the file *after* hooks
+//!   run, so the diff the model sees (and the text its next `old_string`
+//!   must match) is the post-hook content.
+//! * **Lifecycle hooks** ([`EventHook`], [`run_event_hooks`]) — run on agent
+//!   events (`pre_tool`, `post_tool`, `user_prompt`, `turn_end`,
+//!   `session_start`, `session_end`). Each hook gets one JSON object on
+//!   stdin describing the event. Exit 0 proceeds (stdout of a `user_prompt`
+//!   hook is injected as context); **exit 2 blocks** the tool call / prompt
+//!   with the hook's stderr as the reason; any other failure is a
+//!   non-blocking warning.
 
 use std::path::Path;
 use std::time::Duration;
@@ -104,6 +113,176 @@ pub async fn run_file_hooks(hooks: &[Hook], tool: &str, path: &Path, cwd: &Path)
     notes
 }
 
+// ── Lifecycle hooks ─────────────────────────────────────────────────────────
+
+/// The agent events a lifecycle hook can attach to (config `event = "…"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookEvent {
+    /// Before a tool call executes. Exit 2 blocks the call.
+    PreTool,
+    /// After a tool call finishes (its result is in the payload).
+    PostTool,
+    /// When a user message is submitted, before the turn starts. Exit 2
+    /// blocks the message; stdout is injected as extra context for the model.
+    UserPrompt,
+    /// After a turn completes.
+    TurnEnd,
+    /// When a session opens.
+    SessionStart,
+    /// When a session ends (app quit).
+    SessionEnd,
+}
+
+impl HookEvent {
+    /// Parse a config `event` string. `None` for an unknown name (skipped,
+    /// lenient like the rest of config parsing).
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "pre_tool" => Self::PreTool,
+            "post_tool" => Self::PostTool,
+            "user_prompt" => Self::UserPrompt,
+            "turn_end" => Self::TurnEnd,
+            "session_start" => Self::SessionStart,
+            "session_end" => Self::SessionEnd,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreTool => "pre_tool",
+            Self::PostTool => "post_tool",
+            Self::UserPrompt => "user_prompt",
+            Self::TurnEnd => "turn_end",
+            Self::SessionStart => "session_start",
+            Self::SessionEnd => "session_end",
+        }
+    }
+}
+
+/// One configured lifecycle hook: run `run` when `event` fires (for the tool
+/// events, only when the tool's name matches `on`; `*` matches every tool).
+#[derive(Debug, Clone)]
+pub struct EventHook {
+    pub event: HookEvent,
+    /// Tool-name filter for `pre_tool`/`post_tool` (`*` = any tool). Ignored
+    /// by the non-tool events.
+    pub on: String,
+    /// Shell command; receives the event payload as JSON on stdin, plus
+    /// `HRDR_HOOK_EVENT` / `HRDR_HOOK_TOOL` in the environment.
+    pub run: String,
+    /// Kill the hook after this long (default [`DEFAULT_HOOK_TIMEOUT_MS`]).
+    pub timeout_ms: u64,
+}
+
+/// What a round of lifecycle hooks decided.
+#[derive(Debug, Default)]
+pub struct HookOutcome {
+    /// `Some(reason)` when a hook exited 2: block the tool call / prompt.
+    /// The first blocking hook wins; later hooks don't run.
+    pub block: Option<String>,
+    /// One warning per hook that failed (nonzero exit other than 2, couldn't
+    /// spawn, or timed out) — non-blocking, surfaced to the model/user.
+    pub notes: Vec<String>,
+    /// Successful hooks' stdout (trimmed, non-empty only) — `user_prompt`
+    /// hooks inject these as context for the model.
+    pub context: Vec<String>,
+}
+
+/// Run every hook registered for `event` (and matching `tool`, for the tool
+/// events) sequentially, feeding each `payload` as JSON on stdin.
+pub async fn run_event_hooks(
+    hooks: &[EventHook],
+    event: HookEvent,
+    tool: Option<&str>,
+    payload: &serde_json::Value,
+    cwd: &Path,
+) -> HookOutcome {
+    let mut out = HookOutcome::default();
+    let matching = hooks.iter().filter(|h| {
+        h.event == event
+            && match tool {
+                Some(t) => h.on == "*" || h.on == t,
+                None => true,
+            }
+    });
+    let payload = payload.to_string();
+    for hook in matching {
+        let mut cmd = if cfg!(windows) {
+            let mut c = tokio::process::Command::new("cmd");
+            c.args(["/C", &hook.run]);
+            c
+        } else {
+            let mut c = tokio::process::Command::new("bash");
+            c.arg("-c").arg(&hook.run);
+            c
+        };
+        cmd.current_dir(cwd)
+            .env("HRDR_HOOK_EVENT", event.as_str())
+            .env("HRDR_HOOK_TOOL", tool.unwrap_or(""))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let timeout = Duration::from_millis(hook.timeout_ms);
+        let ran = tokio::time::timeout(timeout, async {
+            let mut child = cmd.spawn()?;
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                // A hook that never reads stdin is fine — the write fails
+                // when the pipe closes and we move on to waiting.
+                let _ = stdin.write_all(payload.as_bytes()).await;
+            }
+            child.wait_with_output().await
+        })
+        .await;
+        match ran {
+            Ok(Ok(o)) if o.status.success() => {
+                let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if !stdout.is_empty() {
+                    out.context.push(crate::truncate_inline(&stdout, 10_000));
+                }
+            }
+            Ok(Ok(o)) if o.status.code() == Some(2) => {
+                let mut reason = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                if reason.is_empty() {
+                    reason = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                }
+                if reason.is_empty() {
+                    reason = format!("hook `{}` exited 2", hook.run);
+                }
+                out.block = Some(crate::truncate_inline(&reason, 2_000));
+                break;
+            }
+            Ok(Ok(o)) => {
+                let mut detail = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                if detail.is_empty() {
+                    detail = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                }
+                let detail = crate::truncate_inline(&detail, 300);
+                out.notes.push(format!(
+                    "[hook `{}` failed ({}){}]",
+                    hook.run,
+                    o.status,
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {detail}")
+                    }
+                ));
+            }
+            Ok(Err(e)) => out
+                .notes
+                .push(format!("[hook `{}` couldn't run: {e}]", hook.run)),
+            Err(_) => out.notes.push(format!(
+                "[hook `{}` timed out after {}ms; killed]",
+                hook.run, hook.timeout_ms
+            )),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +349,101 @@ mod tests {
         let notes = run_file_hooks(&[slow], "edit", &file, dir.path()).await;
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("timed out"), "{}", notes[0]);
+    }
+
+    fn event_hook(event: HookEvent, on: &str, run: &str) -> EventHook {
+        EventHook {
+            event,
+            on: on.to_string(),
+            run: run.to_string(),
+            timeout_ms: DEFAULT_HOOK_TIMEOUT_MS,
+        }
+    }
+
+    #[test]
+    fn event_names_round_trip() {
+        for name in [
+            "pre_tool",
+            "post_tool",
+            "user_prompt",
+            "turn_end",
+            "session_start",
+            "session_end",
+        ] {
+            assert_eq!(HookEvent::parse(name).unwrap().as_str(), name);
+        }
+        assert!(HookEvent::parse("no_such_event").is_none());
+        assert!(
+            HookEvent::parse("file").is_none(),
+            "file hooks aren't events"
+        );
+    }
+
+    /// The whole contract in one pass: matching by event + tool, the JSON
+    /// payload on stdin, exit 2 blocking with stderr as the reason (and
+    /// stopping later hooks), other failures becoming notes, and stdout of a
+    /// clean hook landing in `context`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn event_hooks_block_note_and_inject() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = serde_json::json!({"event": "pre_tool", "tool": "bash"});
+
+        // Only hooks for this event + tool run.
+        let hooks = vec![
+            event_hook(HookEvent::PostTool, "*", "exit 2"), // wrong event
+            event_hook(HookEvent::PreTool, "edit", "exit 2"), // wrong tool
+            event_hook(HookEvent::PreTool, "bash", "cat > /dev/null; echo saw-it"),
+        ];
+        let out = run_event_hooks(
+            &hooks,
+            HookEvent::PreTool,
+            Some("bash"),
+            &payload,
+            dir.path(),
+        )
+        .await;
+        assert!(out.block.is_none());
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+        assert_eq!(out.context, vec!["saw-it".to_string()]);
+
+        // The payload arrives on stdin.
+        let hooks = vec![event_hook(HookEvent::PreTool, "*", "grep -o pre_tool")];
+        let out = run_event_hooks(
+            &hooks,
+            HookEvent::PreTool,
+            Some("bash"),
+            &payload,
+            dir.path(),
+        )
+        .await;
+        assert_eq!(out.context, vec!["pre_tool".to_string()]);
+
+        // Exit 2 blocks with stderr as the reason and stops the chain.
+        let hooks = vec![
+            event_hook(HookEvent::PreTool, "*", "echo nope >&2; exit 2"),
+            event_hook(HookEvent::PreTool, "*", "echo never-runs"),
+        ];
+        let out = run_event_hooks(
+            &hooks,
+            HookEvent::PreTool,
+            Some("bash"),
+            &payload,
+            dir.path(),
+        )
+        .await;
+        assert_eq!(out.block.as_deref(), Some("nope"));
+        assert!(out.context.is_empty(), "the chain stopped at the block");
+
+        // Any other failure is a non-blocking note.
+        let hooks = vec![event_hook(
+            HookEvent::TurnEnd,
+            "*",
+            "echo broken >&2; exit 1",
+        )];
+        let out = run_event_hooks(&hooks, HookEvent::TurnEnd, None, &payload, dir.path()).await;
+        assert!(out.block.is_none());
+        assert_eq!(out.notes.len(), 1);
+        assert!(out.notes[0].contains("broken"), "{}", out.notes[0]);
     }
 }

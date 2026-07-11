@@ -451,6 +451,15 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
             eprintln!("\x1b[90m[{notice}]\x1b[0m");
         }
     }
+    // A headless run is a one-turn session: session hooks bracket the turn.
+    for note in agent
+        .run_session_hooks(hrdr_tools::HookEvent::SessionStart)
+        .await
+    {
+        if !quiet {
+            eprintln!("\x1b[90m[{note}]\x1b[0m");
+        }
+    }
     // Headless runs have no interactive steering.
     let result = agent
         .run(prompt, hrdr_agent::steering_queue(), |ev| {
@@ -510,6 +519,14 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
             }
         })
         .await;
+    for note in agent
+        .run_session_hooks(hrdr_tools::HookEvent::SessionEnd)
+        .await
+    {
+        if !quiet {
+            eprintln!("\x1b[90m[{note}]\x1b[0m");
+        }
+    }
     if let Err(e) = result {
         if json {
             println!(
