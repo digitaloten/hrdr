@@ -6,6 +6,11 @@ use sha2::{Digest, Sha256};
 
 use crate::{OAuthAccess, valid_access_token_result, write_atomic};
 
+// This is a wire-protocol compatibility declaration, not a model allowlist.
+// Bump it only after validating hrdr against a newer Codex release: advertising
+// an untested latest version could expose models requiring unsupported request,
+// tool, or streaming behavior. New models compatible with this version still
+// arrive dynamically through the upstream catalog.
 pub const CODEX_CATALOG_COMPAT_VERSION: &str = "0.144.1";
 const CACHE_SCHEMA: u32 = 1;
 const FRESH_TTL_MS: u64 = 5 * 60 * 1000;
