@@ -28,6 +28,15 @@ use crate::{Agent, SteeringQueue};
 /// for its panes.
 static LIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// What happened to a prompt handed to an agent — see [`LiveSubagents::send_prompt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptDelivery {
+    /// A turn was already in flight, so the prompt was injected into it.
+    Steered,
+    /// The agent was idle, so a fresh turn was started on it.
+    StartedTurn,
+}
+
 /// How a sub-agent was delegated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentKind {
@@ -125,6 +134,60 @@ impl LiveSubagents {
                 .find(|e| e.key == key)
                 .map(|e| (Arc::clone(&e.agent), Arc::clone(&e.steering)))
         })
+    }
+
+    /// Send a user prompt to sub-agent `key`.
+    ///
+    /// The whole decision lives here, not in a frontend, because it is not a
+    /// frontend's decision — it is the same rule for any agent, driven by anything:
+    ///
+    /// * a turn is **in flight** → the prompt is *steering*. It goes into the very
+    ///   queue that agent's `run` is draining, so the model reads it before its next
+    ///   request. Identical to steering the main agent.
+    /// * the agent is **idle** (its delegated task already landed) → drive a **new
+    ///   turn** on it. This is what retaining the agent was for: it is still alive
+    ///   with its full history, so a further turn continues the conversation instead
+    ///   of re-delegating from scratch.
+    ///
+    /// A frontend supplies only `on_event` — how to *surface* what comes back. It
+    /// makes no routing decision and holds no rule of its own.
+    ///
+    /// `None` when the sub-agent has already been released (finished, delivered and
+    /// pruned), so a caller can say so rather than swallow the prompt.
+    pub fn send_prompt<F>(&self, key: u64, input: String, on_event: F) -> Option<PromptDelivery>
+    where
+        F: FnMut(crate::AgentEvent) + Send + 'static,
+    {
+        let (agent, steering, running) = self.with(|v| {
+            v.iter()
+                .find(|e| e.key == key)
+                .map(|e| (Arc::clone(&e.agent), Arc::clone(&e.steering), e.running))
+        })?;
+
+        if running {
+            if let Ok(mut q) = steering.lock() {
+                q.push_back(input);
+            }
+            return Some(PromptDelivery::Steered);
+        }
+
+        // Idle: a further turn on the agent we kept alive for exactly this.
+        self.update(key, |e| e.running = true);
+        let live = self.clone();
+        tokio::spawn(async move {
+            // The guard marks it idle again on every exit — including cancellation,
+            // where nothing after the await would run.
+            let _guard = RunGuard::new(live, key);
+            let mut on_event = on_event;
+            let mut a = agent.lock().await;
+            if let Err(e) = a.run(input, steering, &mut on_event).await {
+                on_event(crate::AgentEvent::Notice(format!("[error] {e:#}")));
+                // `run` only emits `TurnDone` on success; a frontend still needs to
+                // know the turn is over.
+                on_event(crate::AgentEvent::TurnDone);
+            }
+        });
+        Some(PromptDelivery::StartedTurn)
     }
 
     /// Drop every entry that is finished, delivered, and unpinned. Called by the
@@ -313,6 +376,63 @@ mod tests {
         // Unfinished work is never aged out, however long it takes.
         age_completed_todos(&mut todos, &mut stamps, 99, 2);
         assert_eq!(todos.len(), 1, "in-progress work is not swept away");
+    }
+
+    /// The routing rule lives here, not in a frontend — so it is testable with no
+    /// UI at all. A prompt to a *busy* agent steers the turn in flight: it goes
+    /// into the very queue that agent's `run` is draining.
+    #[tokio::test]
+    async fn a_prompt_to_a_busy_agent_steers_the_turn_in_flight() {
+        let live = LiveSubagents::new();
+        live.register(entry(1)); // `entry` is running
+        let steering = live.with(|v| Arc::clone(&v[0].steering));
+
+        let delivery = live.send_prompt(1, "look at auth too".to_string(), |_| {});
+        assert_eq!(delivery, Some(PromptDelivery::Steered));
+        assert_eq!(
+            steering.lock().unwrap().iter().cloned().collect::<Vec<_>>(),
+            vec!["look at auth too".to_string()],
+            "it reaches the queue the agent's run() drains"
+        );
+        assert!(
+            live.with(|v| v[0].running),
+            "steering does not start a second turn"
+        );
+    }
+
+    /// A prompt to an *idle* agent starts a further turn on it. This is what
+    /// retaining the agent was for: it is still alive with its history, so the
+    /// conversation continues rather than being re-delegated from scratch.
+    #[tokio::test]
+    async fn a_prompt_to_an_idle_agent_starts_a_further_turn_on_it() {
+        let live = LiveSubagents::new();
+        live.register(entry(1));
+        // Its delegated task has landed.
+        live.update(1, |e| {
+            e.running = false;
+            e.done = true;
+        });
+
+        let delivery = live.send_prompt(1, "now summarise".to_string(), |_| {});
+        assert_eq!(
+            delivery,
+            Some(PromptDelivery::StartedTurn),
+            "an idle agent is driven, not steered into a void"
+        );
+        assert!(
+            live.with(|v| v[0].running),
+            "and it is marked busy, so the next prompt steers instead"
+        );
+        // The turn itself runs against an unreachable endpoint and fails; the
+        // RunGuard is what returns it to idle, which the cancellation test covers.
+    }
+
+    /// A prompt to an agent that has already been released reports that, so a
+    /// caller can say so rather than silently swallowing what the user typed.
+    #[test]
+    fn a_prompt_to_a_released_agent_is_reported_not_swallowed() {
+        let live = LiveSubagents::new();
+        assert!(live.send_prompt(99, "hello?".to_string(), |_| {}).is_none());
     }
 
     /// A cancelled run must not strand its sub-agent. The update after `.await`

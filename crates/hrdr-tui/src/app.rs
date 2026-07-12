@@ -134,8 +134,6 @@ pub(crate) enum TurnMsg {
     /// An event from a sub-agent being driven directly from its pane. Carried per
     /// pane key so it lands in that agent's transcript and nowhere else.
     SubAgent(u64, AgentEvent),
-    /// A user-driven sub-agent turn finished; `Some` carries an error string.
-    SubAgentDone(u64, Option<String>),
     /// Out-of-band system line (e.g. async `/models` result).
     System(String),
     /// Out-of-band diff block (e.g. async `/diff` result).
@@ -1343,59 +1341,27 @@ impl App {
 
     /// Send `input` to the sub-agent whose pane is on screen.
     ///
-    /// Two cases, and they are the same two the main agent has:
-    /// * a turn is in flight → the message is *steering*. It goes into the very
-    ///   queue that sub-agent's `run` is draining, so it reaches the model before
-    ///   its next request, exactly as steering the main agent does.
-    /// * it is idle (its delegated task has landed) → drive a **new turn** on the
-    ///   retained agent. This is what the whole retention mechanism was built for:
-    ///   the sub-agent is still alive, with its full history, so you can keep
-    ///   talking to it instead of re-delegating from scratch.
-    ///
-    /// Its answer still belongs to it: events land in its pane, not the parent's
-    /// conversation. Nothing here is fed back into the main agent's context.
+    /// The routing rule — steer a turn in flight, start a new one on an idle agent
+    /// — is not the TUI's to own: it is the same for any agent driven by anything,
+    /// so it lives in `LiveSubagents::send_prompt`. All the frontend does here is
+    /// show what was said, and say where the events should be surfaced.
     fn send_to_subagent(&mut self, key: u64, input: String) {
-        let Some((agent, steering)) = self.live_subagents.handle(key) else {
-            // It was released while we were looking at it (finished, delivered,
-            // and the prune won the race). Fall back rather than swallow the text.
-            self.focus_pane(hrdr_app::PaneId::Main);
-            self.system("that sub-agent has finished and been released".to_string());
-            return;
-        };
-        // Show it where it was said, in that agent's transcript.
+        // Show it in that agent's transcript, where it was said.
         self.sync_panes();
         if let Some(pane) = self.panes.sub_mut(key) {
             hrdr_app::apply_event(&mut pane.transcript, &AgentEvent::Steered(input.clone()));
         }
 
-        let running = self
-            .live_subagents
-            .with(|v| v.iter().find(|e| e.key == key).is_some_and(|e| e.running));
-        if running {
-            // Mid-turn: steer it.
-            if let Ok(mut q) = steering.lock() {
-                q.push_back(input);
-            }
-            return;
-        }
-
-        // Idle: drive another turn on the agent we kept alive for exactly this.
-        self.live_subagents.update(key, |e| e.running = true);
         let tx = self.tx.clone();
-        let live = self.live_subagents.clone();
-        tokio::spawn(async move {
-            let mut a = agent.lock().await;
-            let tx_ev = tx.clone();
-            let err = a
-                .run(input, steering, move |ev| {
-                    let _ = tx_ev.send(TurnMsg::SubAgent(key, ev));
-                })
-                .await
-                .err()
-                .map(|e| format!("{e:#}"));
-            live.update(key, |e| e.running = false);
-            let _ = tx.send(TurnMsg::SubAgentDone(key, err));
+        let delivered = self.live_subagents.send_prompt(key, input, move |ev| {
+            let _ = tx.send(TurnMsg::SubAgent(key, ev));
         });
+        if delivered.is_none() {
+            // Released while we were looking at it (finished, delivered, and the
+            // prune won the race). Fall back rather than swallow what was typed.
+            self.focus_pane(hrdr_app::PaneId::Main);
+            self.system("that sub-agent has finished and been released".to_string());
+        }
     }
 
     /// Switch the view to `id`: the transcript, the scroll position and the input
@@ -1849,17 +1815,6 @@ impl App {
                 self.sync_panes();
                 if let Some(pane) = self.panes.sub_mut(key) {
                     hrdr_app::apply_event(&mut pane.transcript, &ev);
-                }
-            }
-            TurnMsg::SubAgentDone(key, err) => {
-                self.sync_panes();
-                if let Some(e) = err
-                    && let Some(pane) = self.panes.sub_mut(key)
-                {
-                    hrdr_app::apply_event(
-                        &mut pane.transcript,
-                        &AgentEvent::Notice(format!("[error] {e}")),
-                    );
                 }
             }
             TurnMsg::BrowserLogin(outcome) => self.on_browser_login(outcome),

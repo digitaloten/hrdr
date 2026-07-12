@@ -31,7 +31,9 @@ mod paths;
 pub use paths::cwd_slug;
 mod models;
 mod subagent_live;
-pub use subagent_live::{LiveSubagent, LiveSubagents, RunGuard, SubagentKind, age_completed_todos};
+pub use subagent_live::{
+    LiveSubagent, LiveSubagents, PromptDelivery, RunGuard, SubagentKind, age_completed_todos,
+};
 mod subagent_transcript;
 pub use models::{
     AvailableModel, ModelChoice, ModelSource, available_models, builtin_catalog_key,
