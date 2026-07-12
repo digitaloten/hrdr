@@ -205,18 +205,27 @@ impl super::App {
             state.provider = provider;
         }
         self.refresh_subagent_dir();
+        // The pane is rebuilt from the registry every frame, main agent included —
+        // so a resumed session's model/endpoint/counters have to land there too, or
+        // the next draw quietly restores the ones we just replaced.
+        self.publish_main_agent();
 
-        // The resumed session's saved spend is the display base; the agent's
-        // live counter tracks only what this process spends on top of it.
-        self.cost_base = self.state().usage.cost_usd;
-        let (messages, model, todos) = {
+        // The resumed session's spend is seeded into the agent's own counter, so it
+        // counts on from there — rather than the frontend keeping a second tally and
+        // adding it to the agent's on the way to the screen.
+        let (messages, model, todos, spent) = {
             let s = self.state();
-            (s.messages.clone(), s.model.clone(), s.todos.clone())
+            (
+                s.messages.clone(),
+                s.model.clone(),
+                s.todos.clone(),
+                s.usage.cost_usd,
+            )
         };
         self.with_agent(|a| {
             a.set_messages(messages);
             a.set_model(model);
-            a.reset_session_cost();
+            a.set_session_cost(spent);
         });
         if let Ok(mut t) = self.todos.lock() {
             *t = todos;

@@ -28,13 +28,64 @@ use crate::{Agent, SteeringQueue};
 /// for its panes.
 static LIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The session's own agent, in the same registry as every delegated one.
+///
+/// The main agent is not a different *kind* of thing — it is the agent that
+/// happens to have been there first. Registering it here is what lets a frontend
+/// build its view the same way for all of them: replay the agent's record. Keys
+/// from [`LiveAgents::next_key`] start at 1, so this never collides.
+pub const MAIN_KEY: u64 = 0;
+
 /// An agent's own record of what it has emitted, in order. Shared between the
-/// running agent (which appends) and any frontend (which replays).
-pub type EventLog = Arc<Mutex<Vec<crate::AgentEvent>>>;
+/// running agent (which appends) and a frontend (which replays).
+///
+/// Consumed events are dropped once every reader has seen them
+/// ([`LiveAgents::compact`]), so a long session does not retain every token delta
+/// it ever streamed — `base` keeps cursors stable across that.
+#[derive(Default)]
+pub struct Events {
+    events: std::collections::VecDeque<crate::AgentEvent>,
+    /// Absolute index of `events[0]` — cursors are absolute, so compaction is
+    /// invisible to a reader.
+    base: usize,
+}
+
+impl Events {
+    pub fn push(&mut self, ev: crate::AgentEvent) {
+        self.events.push_back(ev);
+    }
+
+    /// Everything from absolute index `from`, and the cursor to resume at. A
+    /// cursor behind what has been compacted away yields what is still held —
+    /// never a panic, and never a replay of something already folded in.
+    pub fn since(&self, from: usize) -> (Vec<crate::AgentEvent>, usize) {
+        let start = from.saturating_sub(self.base).min(self.events.len());
+        let tail = self.events.iter().skip(start).cloned().collect();
+        (tail, self.base + self.events.len())
+    }
+
+    /// Drop everything before `upto` — the reader has folded it into its view.
+    pub fn compact(&mut self, upto: usize) {
+        let drop = upto.saturating_sub(self.base).min(self.events.len());
+        self.events.drain(..drop);
+        self.base += drop;
+    }
+
+    pub fn len(&self) -> usize {
+        self.base + self.events.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+/// An agent's event record, shared between the agent and its frontend.
+pub type EventLog = Arc<Mutex<Events>>;
 
 /// A fresh, empty event log.
 pub fn event_log() -> EventLog {
-    Arc::new(Mutex::new(Vec::new()))
+    Arc::new(Mutex::new(Events::default()))
 }
 
 /// What happened to a prompt handed to an agent — see [`LiveSubagents::send_prompt`].
@@ -116,8 +167,10 @@ pub struct LiveSubagent {
 impl LiveSubagent {
     /// Whether this entry may be dropped: its work is done, the main agent has
     /// its result, and nobody is looking at it.
+    ///
+    /// The session's own agent is never disposable — it is the conversation.
     fn disposable(&self) -> bool {
-        !self.running && self.done && self.delivered && !self.pinned
+        self.key != MAIN_KEY && !self.running && self.done && self.delivered && !self.pinned
     }
 }
 
@@ -142,9 +195,50 @@ impl LiveSubagents {
         f(&mut v)
     }
 
-    /// Register a sub-agent at spawn.
+    /// Register an agent.
     pub fn register(&self, entry: LiveSubagent) {
         self.with(|v| v.push(entry));
+    }
+
+    /// Register the session's own agent, so it is an entry in the registry like
+    /// every delegated one — same record, same counters, same chrome.
+    ///
+    /// This is what makes a frontend able to stop special-casing it: it builds the
+    /// main agent's view by replaying the main agent's record, exactly as it builds
+    /// a sub-agent's. Idempotent.
+    pub fn register_main(
+        &self,
+        agent: Arc<tokio::sync::Mutex<Agent>>,
+        steering: SteeringQueue,
+        model: String,
+        provider: Option<String>,
+        base_url: String,
+        usage: crate::AgentUsage,
+    ) {
+        self.with(|v| {
+            if v.iter().any(|e| e.key == MAIN_KEY) {
+                return;
+            }
+            v.push(LiveSubagent {
+                key: MAIN_KEY,
+                bg_id: None,
+                tool_id: None,
+                label: "main".to_string(),
+                model,
+                provider,
+                base_url,
+                usage,
+                events: event_log(),
+                kind: SubagentKind::Blocking,
+                agent,
+                steering,
+                running: false,
+                // The session's agent is never finished, never owed, never pruned.
+                done: false,
+                delivered: false,
+                pinned: true,
+            });
+        });
     }
 
     /// Apply `f` to the entry with `key`, if it is still present.
@@ -172,7 +266,7 @@ impl LiveSubagents {
         });
     }
 
-    /// Sub-agent `key`'s events from `from` onwards, and the new cursor.
+    /// Agent `key`'s events from `from` onwards, and the new cursor.
     ///
     /// A frontend keeps a cursor per pane and folds what it hasn't seen yet, so a
     /// pane opened long after the agent started still shows the whole run — and one
@@ -181,9 +275,21 @@ impl LiveSubagents {
         self.with(|v| {
             let e = v.iter().find(|e| e.key == key)?;
             let log = e.events.lock().ok()?;
-            let next = log.len();
-            Some((log.get(from..).unwrap_or_default().to_vec(), next))
+            Some(log.since(from))
         })
+    }
+
+    /// Release agent `key`'s events before `upto` — its reader has folded them
+    /// into its view and will never ask for them again.
+    ///
+    /// Without this the record is an ever-growing second copy of the transcript:
+    /// one entry per streamed token delta, for the life of the session.
+    pub fn compact(&self, key: u64, upto: usize) {
+        self.update(key, |e| {
+            if let Ok(mut log) = e.events.lock() {
+                log.compact(upto);
+            }
+        });
     }
 
     /// A snapshot of `key`'s usage, for a frontend showing that agent.
@@ -580,6 +686,37 @@ mod tests {
             live.events_since(99, 0).is_none(),
             "an unknown key has none"
         );
+    }
+
+    /// A record whose reader has folded everything in is released — otherwise it is
+    /// a second copy of the transcript, one entry per streamed token delta, kept for
+    /// the life of the session. Cursors are absolute, so compaction is invisible to
+    /// the reader.
+    #[test]
+    fn a_folded_in_record_is_released_without_disturbing_the_cursor() {
+        let live = LiveSubagents::new();
+        live.register(entry(1));
+        live.record(1, &crate::AgentEvent::Text("a".into()));
+        live.record(1, &crate::AgentEvent::Text("b".into()));
+
+        let (_, cursor) = live.events_since(1, 0).unwrap();
+        assert_eq!(cursor, 2);
+        live.compact(1, cursor);
+        assert!(
+            live.with(|v| v[0].events.lock().unwrap().is_empty()),
+            "what has been folded in is not kept"
+        );
+
+        // The cursor still means the same thing: nothing is replayed, and new work
+        // is picked up exactly once.
+        assert!(live.events_since(1, cursor).unwrap().0.is_empty());
+        live.record(1, &crate::AgentEvent::Text("c".into()));
+        let (events, cursor) = live.events_since(1, cursor).unwrap();
+        assert!(
+            matches!(&events[..], [crate::AgentEvent::Text(t)] if t == "c"),
+            "the tail after a compaction is still the tail"
+        );
+        assert_eq!(cursor, 3, "cursors stay absolute across compaction");
     }
 
     /// A sub-agent's tokens are a fact about *that agent*, so they are counted on

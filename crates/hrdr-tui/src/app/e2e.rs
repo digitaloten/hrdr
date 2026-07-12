@@ -3031,6 +3031,9 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
         context_window: Some(200_000),
         ..Default::default()
     };
+    // The main agent is an entry in the registry like any other, and its pane is
+    // rebuilt from that entry every frame — so its chrome is published there.
+    h.app.publish_main_agent();
 
     let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
         checkpoints: Some("off".to_string()),
@@ -3100,7 +3103,11 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
         "/model switched the agent on screen"
     );
     assert_eq!(
-        h.app.live_subagents.with(|v| v[0].model.clone()),
+        h.app.live_subagents.with(|v| v
+            .iter()
+            .find(|e| e.key == 1)
+            .map(|e| e.model.clone())
+            .unwrap()),
         "gpt-5",
         "the switch lands on the registry — the pane is rebuilt from it every \
          frame, so a pane-only write would be silently undone"

@@ -32,7 +32,7 @@ pub use paths::cwd_slug;
 mod models;
 mod subagent_live;
 pub use subagent_live::{
-    EventLog, LiveSubagent, LiveSubagents, PromptDelivery, RunGuard, SubagentKind,
+    EventLog, LiveSubagent, LiveSubagents, MAIN_KEY, PromptDelivery, RunGuard, SubagentKind,
     age_completed_todos, event_log,
 };
 mod subagent_transcript;
@@ -4151,10 +4151,20 @@ impl Agent {
         *self.cost_total.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Zero the session cost counter (session reset / resume — the counter
-    /// tracks the *session*, not the process).
+    /// Zero the session cost counter (session reset — the counter tracks the
+    /// *session*, not the process).
     pub fn reset_session_cost(&self) {
-        *self.cost_total.lock().unwrap_or_else(|p| p.into_inner()) = 0.0;
+        self.set_session_cost(0.0);
+    }
+
+    /// Seed the cost counter — a resumed conversation has already spent something,
+    /// so the agent counts on from there.
+    ///
+    /// The agent reports this total with every `Usage` event, and that is what the
+    /// counters show. A frontend adding a saved base on top of the agent's figure
+    /// would be keeping a second, divergent tally of the same number.
+    pub fn set_session_cost(&self, usd: f64) {
+        *self.cost_total.lock().unwrap_or_else(|p| p.into_inner()) = usd;
     }
 
     /// Status of the post-edit LSP layer for `/doctor`:

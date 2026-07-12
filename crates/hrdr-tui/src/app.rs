@@ -267,9 +267,6 @@ pub(crate) struct App {
     pub(crate) browser_login_task: Option<tokio::task::JoinHandle<()>>,
     /// The running user `!command`, if any — Esc cancels it.
     pub(crate) user_shell: Option<UserShell>,
-    /// USD already spent when the current session was adopted (a resumed
-    /// session's saved spend); the agent's live counter adds on top of it.
-    pub(crate) cost_base: f64,
     /// Discovered `:skill` prompt templates for the current cwd, for the
     /// completion popup (refreshed on cwd change and `/reload`; the send path
     /// re-discovers on its own, so a stale list only affects completion).
@@ -521,7 +518,6 @@ impl App {
             next_login_id: 0,
             browser_login_task: None,
             user_shell: None,
-            cost_base: 0.0,
             skills: hrdr_app::discover_skills(&cwd_for_skills),
             pending_goto: None,
             pending_scroll_entry: None,
@@ -561,10 +557,48 @@ impl App {
             rx: Some(rx),
             should_quit: false,
         };
+        // The session's agent joins the registry alongside every delegated one, so
+        // the frontend can build its view the same way for all of them.
+        app.publish_main_agent();
         if auto_resume {
             app.auto_resume_latest();
         }
         Ok(app)
+    }
+
+    /// Put the session's agent in the registry, and keep its chrome there in step
+    /// with the pane's state.
+    ///
+    /// The registry is what a pane is built from — for the main agent as much as a
+    /// delegated one — so a `/model` switch, a resume, or a `/clear` has to land
+    /// there, or the next frame would quietly restore the old values.
+    pub(crate) fn publish_main_agent(&mut self) {
+        let (model, provider, base_url, usage) = {
+            let s = self.state();
+            (
+                s.model.clone(),
+                s.provider.clone(),
+                s.base_url.clone(),
+                s.usage,
+            )
+        };
+        self.live_subagents.register_main(
+            self.agent.clone(),
+            self.steering.clone(),
+            model.clone(),
+            provider.clone(),
+            base_url.clone(),
+            usage,
+        );
+        // Idempotent registration means a later call is a no-op, so push the
+        // current chrome explicitly — this doubles as "the main agent's state
+        // changed, tell the registry".
+        self.live_subagents.update(hrdr_agent::MAIN_KEY, |e| {
+            e.model = model;
+            e.provider = provider;
+            e.base_url = base_url;
+            e.usage = usage;
+        });
     }
 
     /// Probe the endpoint (list its models) on a background task and post a
@@ -1326,12 +1360,11 @@ impl App {
     /// the main pane's row. Called each frame: `sync` is also what *pins* the pane
     /// being viewed, which is the only thing keeping the agent from releasing it.
     pub(crate) fn sync_panes(&mut self) {
+        // The registry drives every pane's status, main included — so tell it
+        // whether the session's agent is working.
         let running = self.running;
-        self.panes.main_mut().status = if running {
-            hrdr_app::PaneStatus::Running
-        } else {
-            hrdr_app::PaneStatus::Idle
-        };
+        self.live_subagents
+            .update(hrdr_agent::MAIN_KEY, |e| e.running = running);
         self.panes.sync(&self.live_subagents);
     }
 
@@ -1413,15 +1446,14 @@ impl App {
     /// pane would be silently overwritten on the next draw. The registry is the
     /// agent's own record of what it is running on, so that is where it belongs.
     fn update_chrome(&mut self, id: hrdr_app::PaneId, f: impl FnOnce(&mut hrdr_app::SessionState)) {
-        let Some(key) = id.key() else {
-            f(self.state_mut());
-            return;
-        };
-        let Some(pane) = self.panes.sub_mut(key) else {
+        let key = id.key().unwrap_or(hrdr_agent::MAIN_KEY);
+        let Some(pane) = self.panes.pane_mut(id) else {
             return; // released while we were switching it
         };
         // Apply to the pane's state, then push the fields the registry owns back
-        // onto the entry.
+        // onto the entry. The registry is what the pane is rebuilt from every
+        // frame, main agent included — a pane-only write would be undone at the
+        // next draw.
         let mut s = std::mem::take(&mut pane.state);
         f(&mut s);
         self.live_subagents.update(key, |e| {
@@ -1430,7 +1462,7 @@ impl App {
             e.base_url = s.base_url.clone();
             e.usage = s.usage;
         });
-        if let Some(p) = self.panes.sub_mut(key) {
+        if let Some(p) = self.panes.pane_mut(id) {
             p.state = s;
         }
     }
@@ -1475,16 +1507,6 @@ impl App {
         let view = &mut self.panes.active_pane_mut().view;
         view.scroll = scroll;
         view.draft = draft;
-    }
-
-    /// The pane a sub-agent's live output belongs to, found by the `task` call that
-    /// spawned it — which is the id its output arrives under.
-    fn pane_for_tool(&self, tool_id: &str) -> Option<hrdr_app::PaneId> {
-        self.live_subagents.with(|v| {
-            v.iter()
-                .find(|e| e.tool_id.as_deref() == Some(tool_id))
-                .map(|e| hrdr_app::PaneId::Sub(e.key))
-        })
     }
 
     fn push_entry(&mut self, e: Entry) {
@@ -2072,147 +2094,46 @@ impl App {
         }
     }
 
+    /// Handle one of the **main agent's** events.
+    ///
+    /// The transcript is not built here. It is built by replaying the agent's own
+    /// record ([`hrdr_app::PaneSet::sync`]) — the same way a sub-agent's is, by the
+    /// same reducer, from the same kind of record. There is one implementation of
+    /// "what does this event do to a conversation", and it does not live in a
+    /// frontend.
+    ///
+    /// What is left here is what is genuinely the terminal's: the turn clock, the
+    /// loader, the stats line, and writing the session file.
     fn apply_event(&mut self, ev: AgentEvent) {
-        // Stamp the elapsed thinking time on the last reasoning block when
-        // thinking ends (the next event after Reasoning is something else).
-        let end_reasoning = !matches!(ev, AgentEvent::Reasoning(_));
-        if end_reasoning {
-            self.finish_reasoning();
-        }
-        match ev {
-            AgentEvent::Text(t) => {
-                self.count_token();
-                match self
-                    .panes
-                    .main_mut()
-                    .transcript_mut()
-                    .last_mut()
-                    .map(|e| &mut e.kind)
-                {
-                    Some(EntryKind::Assistant(s)) => s.push_str(&t),
-                    // Don't open an assistant entry for an empty delta — a turn
-                    // that only calls tools would leave an empty one behind.
-                    _ if t.is_empty() => {}
-                    _ => self.push_entry(Entry::assistant(t)),
-                }
+        // A steered message is displayed as the user typed it, not in its
+        // `@file`-expanded form — the expansion is for the model, not the reader.
+        let ev = match ev {
+            AgentEvent::Steered(sent) => {
+                AgentEvent::Steered(self.queue.pop_front().unwrap_or(sent))
             }
-            AgentEvent::Reasoning(t) => {
-                self.count_token();
-                if self.reasoning_start.is_none() {
-                    self.reasoning_start = Some(Instant::now());
-                }
-                match self
-                    .panes
-                    .main_mut()
-                    .transcript_mut()
-                    .last_mut()
-                    .map(|e| &mut e.kind)
-                {
-                    Some(EntryKind::Reasoning {
-                        text,
-                        took_ms: None,
-                    }) => text.push_str(&t),
-                    _ => self.push_entry(Entry::reasoning(t)),
-                }
-            }
-            AgentEvent::History(messages) => self.persist_mid_turn(messages),
+            other => other,
+        };
+
+        // ── the terminal's own bookkeeping ────────────────────────────────────
+        match &ev {
+            AgentEvent::Text(_) | AgentEvent::Reasoning(_) => self.count_token(),
             AgentEvent::Usage {
-                prompt_tokens,
-                completion_tokens,
                 cached_prompt_tokens,
                 reasoning_tokens,
-                session_cost_usd,
                 ..
             } => {
-                let base = self.cost_base;
-                let usage = &mut self.state_mut().usage;
-                usage.record_call(prompt_tokens, completion_tokens);
-                if let Some(total) = session_cost_usd {
-                    // The agent's counter covers this process (incl. its
-                    // sub-agents); a resumed session's saved spend is the base.
-                    usage.cost_usd = base + total;
-                }
-                self.last_cached_tokens = cached_prompt_tokens;
-                self.last_reasoning_tokens = reasoning_tokens;
+                self.last_cached_tokens = *cached_prompt_tokens;
+                self.last_reasoning_tokens = *reasoning_tokens;
             }
-            AgentEvent::ToolStart { id, name, args } => {
+            AgentEvent::ToolStart { .. } => {
                 // The model has handed off: it is idle until every tool of this
                 // round returns. Stop its clock and hide the loader.
                 self.tools_running += 1;
                 if self.tools_running == 1 {
                     self.pause_inference();
                 }
-                self.push_entry(Entry::tool_running(id.clone(), name.clone(), args));
             }
-            AgentEvent::ToolOutput { id, chunk } => {
-                // A blocking sub-agent's answer also arrives here, flattened, as
-                // `ToolOutput` on the `task` call that spawned it. Drop it: the
-                // sub-agent already recorded the real events on its own entry, and
-                // its pane is built from those. Folding this in as well would
-                // duplicate the whole run as prose, and putting it in the parent's
-                // block would make the parent replay work it delegated — the block
-                // records *what was delegated to*, and the sub-agent's transcript
-                // stays self-contained.
-                if self.pane_for_tool(&id).is_some() {
-                    return;
-                }
-                // Append live output to the running tool's entry.
-                for entry in self.panes.main_mut().transcript_mut().iter_mut().rev() {
-                    if let EntryKind::Tool {
-                        id: tid,
-                        result: r,
-                        done,
-                        ..
-                    } = &mut entry.kind
-                        && *tid == id
-                        && !*done
-                    {
-                        r.push_str(&chunk);
-                        break;
-                    }
-                }
-            }
-            AgentEvent::ToolEnd {
-                id,
-                result,
-                ok,
-                name: _,
-            } => {
-                // A finished `task` records the delegation, not its output: what was
-                // asked, and which provider/model answered. The answer itself lives
-                // in that sub-agent's own transcript (and still reaches the model as
-                // the real tool result — this only changes what is *shown*).
-                let delegated = self.live_subagents.with(|v| {
-                    v.iter()
-                        .find(|e| e.tool_id.as_deref() == Some(id.as_str()))
-                        .map(|e| match &e.provider {
-                            Some(p) => format!("{} · {p}/{}", e.label, e.model),
-                            None => format!("{} · {}", e.label, e.model),
-                        })
-                });
-                let result = match delegated {
-                    Some(summary) => format!("↳ delegated to {summary}"),
-                    None => result,
-                };
-                for entry in self.panes.main_mut().transcript_mut().iter_mut().rev() {
-                    if let EntryKind::Tool {
-                        id: tid,
-                        result: r,
-                        ok: o,
-                        done,
-                        ..
-                    } = &mut entry.kind
-                        && *tid == id
-                        && !*done
-                    {
-                        *r = result;
-                        *o = ok;
-                        *done = true;
-                        break;
-                    }
-                }
-                // The sub-agent finished — its result is now in the transcript;
-                // drop it from the live panel.
+            AgentEvent::ToolEnd { .. } => {
                 // The last tool of the round returned: the agent is about to ask
                 // the model again, so it is working from here.
                 self.tools_running = self.tools_running.saturating_sub(1);
@@ -2220,23 +2141,21 @@ impl App {
                     self.resume_inference();
                 }
             }
-            AgentEvent::Notice(text) => {
-                self.push_entry(Entry::system(text));
-                // Do NOT reset scroll_offset: notices (MCP warnings, health
-                // alerts, step-budget exhaustion) are passive async lines. When
-                // the user is scrolled up, the new line appends without moving
-                // their view. When already following (offset == 0) it stays 0.
-            }
-            AgentEvent::Steered(sent) => {
-                // It just entered the conversation, after the tool results of the
-                // round that carried it. Display it at *this* point so the
-                // transcript's order matches the model's view — and show what the
-                // user typed, not its `@file`-expanded form.
-                let shown = self.queue.pop_front().unwrap_or(sent);
-                self.push_entry(Entry::user(shown));
-            }
-            AgentEvent::TurnDone => {}
+            AgentEvent::History(messages) => self.persist_mid_turn(messages.clone()),
+            _ => {}
         }
+        // Thinking time is wall-clock, which only the frontend is holding. Stamp it
+        // on the open block *before* the event is folded: the reducer closes an
+        // unstamped block with a placeholder, and leaves a stamped one alone.
+        if matches!(ev, AgentEvent::Reasoning(_)) {
+            self.reasoning_start.get_or_insert_with(Instant::now);
+        } else {
+            self.finish_reasoning();
+        }
+
+        // ── the agent's own record, which its pane is built from ──────────────
+        self.live_subagents.record(hrdr_agent::MAIN_KEY, &ev);
+        self.sync_panes();
     }
 }
 

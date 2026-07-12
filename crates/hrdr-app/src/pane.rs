@@ -193,7 +193,11 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
                 *done = true;
             }
         }
-        AgentEvent::Notice(text) => transcript.push(Entry::notice(text.clone())),
+        // An agent's notice (an error, an MCP warning, an exhausted step budget) is
+        // something the agent said about the run, so it is a system line and it
+        // persists — unlike frontend chrome (`Entry::notice`), which is stripped
+        // from a saved session.
+        AgentEvent::Notice(text) => transcript.push(Entry::system(text.clone())),
         // A steered message is a real user turn in this conversation.
         AgentEvent::Steered(sent) => transcript.push(Entry::user(sent.clone())),
         AgentEvent::Usage { .. } | AgentEvent::History(_) | AgentEvent::TurnDone => {}
@@ -310,6 +314,23 @@ impl PaneSet {
         self.subs.iter_mut().find(|p| p.id == PaneId::Sub(key))
     }
 
+    /// The pane for a registry key — the main agent's for [`hrdr_agent::MAIN_KEY`],
+    /// otherwise the sub-agent's. Lets `sync` treat every agent the same.
+    fn pane_for(&mut self, key: u64) -> Option<&mut Pane> {
+        if key == hrdr_agent::MAIN_KEY {
+            return Some(&mut self.main);
+        }
+        self.sub_mut(key)
+    }
+
+    /// A pane by id, main or sub.
+    pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
+        match id {
+            PaneId::Main => Some(&mut self.main),
+            PaneId::Sub(k) => self.sub_mut(k),
+        }
+    }
+
     /// The pane on screen.
     pub fn active_pane(&self) -> &Pane {
         match self.active {
@@ -353,7 +374,8 @@ impl PaneSet {
         let active_key = self.active.key();
         let seen: Vec<LiveSnapshot> = live.with(|v| {
             for e in v.iter_mut() {
-                e.pinned = Some(e.key) == active_key;
+                // The main agent is always pinned — it is the conversation.
+                e.pinned = e.key == hrdr_agent::MAIN_KEY || Some(e.key) == active_key;
             }
             v.iter()
                 .map(|e| LiveSnapshot {
@@ -365,21 +387,30 @@ impl PaneSet {
                     usage: e.usage,
                     running: e.running,
                     done: e.done,
+                    // A finished `task` block shows *what was delegated to*, not the
+                    // work — the work is in that agent's own transcript.
+                    tool_id: e.tool_id.clone(),
+                    delegation: (e.key != hrdr_agent::MAIN_KEY).then(|| match &e.provider {
+                        Some(p) => format!("{} · {p}/{}", e.label, e.model),
+                        None => format!("{} · {}", e.label, e.model),
+                    }),
                 })
                 .collect()
         });
 
-        // Adopt newly delegated sub-agents, and refresh what the registry owns for
-        // the ones already known: its model/provider/endpoint (a `/model` switch
-        // repoints the entry) and its usage (the agent counts its own tokens,
-        // whether or not anyone was watching this pane while it worked).
+        // Every agent is brought up to date the same way — the main one included.
+        // Adopt any newly delegated agent, refresh what the registry owns (its
+        // model/provider/endpoint, which a `/model` switch repoints, and its usage,
+        // which it counts for itself), then replay whatever it has emitted since we
+        // last looked.
         for s in &seen {
             let status = match (s.running, s.done) {
                 (true, _) => PaneStatus::Running,
                 (false, true) => PaneStatus::Done,
                 (false, false) => PaneStatus::Idle,
             };
-            let pane = match self.sub_mut(s.key) {
+            let is_main = s.key == hrdr_agent::MAIN_KEY;
+            let pane = match self.pane_for(s.key) {
                 Some(p) => p,
                 None => {
                     self.subs.push(Pane {
@@ -393,30 +424,34 @@ impl PaneSet {
                 }
             };
             pane.status = status;
-            pane.state.name = s.label.clone();
             pane.state.model = s.model.clone();
             pane.state.provider = s.provider.clone();
             pane.state.base_url = s.base_url.clone();
             pane.state.usage = s.usage;
+            // The main pane's name is the *session's*, which the session file owns —
+            // it is not the agent's label.
+            if !is_main {
+                pane.state.name = s.label.clone();
+            }
 
-            // Fold in whatever this agent has emitted since we last looked. This is
-            // the only thing that builds a sub-agent's transcript, and it is a
-            // replay of the agent's own record — so a background sub-agent (whose
-            // `task` call returned the instant it was spawned, leaving no live tool
-            // call to stream through) is shown exactly like a blocking one, and both
-            // get real tool blocks rather than flattened text.
+            // Replay the agent's own record into its transcript. This is the only
+            // thing that builds any transcript, main or delegated: one reducer, one
+            // record, one rule — a frontend renders an agent without knowing which
+            // kind it is.
             let from = pane.consumed;
             if let Some((events, next)) = live.events_since(s.key, from) {
-                let pane = self.sub_mut(s.key).expect("just adopted");
+                let pane = self.pane_for(s.key).expect("just adopted");
                 for ev in &events {
-                    apply_event(&mut pane.state.transcript, ev);
+                    apply_replayed(&mut pane.state.transcript, ev, &seen);
                 }
                 pane.consumed = next;
+                // Folded in — the agent may release them.
+                live.compact(s.key, next);
             }
         }
 
-        // Drop panes whose sub-agent the agent has released. The active one is
-        // pinned above, so it cannot vanish from under the user mid-read.
+        // Drop panes whose agent has been released. The active one is pinned above,
+        // so it cannot vanish from under the user mid-read.
         self.subs
             .retain(|p| p.id.key().is_some_and(|k| seen.iter().any(|s| s.key == k)));
 
@@ -440,6 +475,44 @@ struct LiveSnapshot {
     usage: crate::SessionUsage,
     running: bool,
     done: bool,
+    /// The `task` call that spawned this agent, if it was delegated.
+    tool_id: Option<String>,
+    /// How that `task` block should read once it finishes: what was delegated, and
+    /// which provider/model answered. `None` for the main agent.
+    delegation: Option<String>,
+}
+
+/// Fold a replayed event into a transcript, applying the one thing a transcript
+/// cannot know from the event alone: a `task` call is a *delegation*.
+///
+/// A `task` block shows what was handed off and who to — not the sub-agent's
+/// output. The output streams back through the same call (`ToolOutput`) and its
+/// answer lands as the call's result, but replaying either into the parent would
+/// make the parent's transcript a second, flattened copy of a conversation that
+/// has a transcript of its own. The model still receives the real result; this is
+/// only what is *shown*.
+fn apply_replayed(transcript: &mut Vec<Entry>, ev: &AgentEvent, agents: &[LiveSnapshot]) {
+    let delegated = |id: &str| {
+        agents
+            .iter()
+            .find(|s| s.tool_id.as_deref() == Some(id))
+            .and_then(|s| s.delegation.clone())
+    };
+    match ev {
+        AgentEvent::ToolOutput { id, .. } if delegated(id).is_some() => {}
+        AgentEvent::ToolEnd { id, name, ok, .. } if delegated(id).is_some() => {
+            apply_event(
+                transcript,
+                &AgentEvent::ToolEnd {
+                    id: id.clone(),
+                    name: name.clone(),
+                    result: format!("↳ delegated to {}", delegated(id).unwrap_or_default()),
+                    ok: *ok,
+                },
+            );
+        }
+        _ => apply_event(transcript, ev),
+    }
 }
 
 /// One row of the pane switcher: the main agent first, then each sub-agent.
@@ -740,6 +813,59 @@ mod tests {
             "streamed text coalesces into the same block"
         );
         assert!(matches!(&t[2].kind, EntryKind::Assistant(s) if s == "found it — auth.rs:42"));
+    }
+
+    /// The main agent is an agent. Its pane is built from its own record, by the
+    /// same reducer, from the same registry, as a delegated one — a frontend
+    /// renders an agent without knowing which kind it is.
+    ///
+    /// Before this there were two implementations of "what does an event do to a
+    /// conversation": the shared reducer for sub-agents, and a hand-written copy in
+    /// the TUI for the main agent. They had already drifted.
+    #[test]
+    fn the_main_agent_is_built_from_its_own_record_like_any_other() {
+        let live = LiveSubagents::new();
+        let agent = || {
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
+                    checkpoints: Some("off".to_string()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ))
+        };
+        live.register_main(
+            agent(),
+            hrdr_agent::steering_queue(),
+            "opus".to_string(),
+            Some("claude".to_string()),
+            "https://api".to_string(),
+            hrdr_agent::AgentUsage::default(),
+        );
+
+        let mut panes = PaneSet::new();
+        live.record(hrdr_agent::MAIN_KEY, &AgentEvent::Text("hello".into()));
+        panes.sync(&live);
+
+        assert!(
+            matches!(&panes.main().transcript()[0].kind, EntryKind::Assistant(s) if s == "hello"),
+            "the main agent's transcript is a replay of its record"
+        );
+        assert_eq!(panes.main().model(), "opus", "and so is its chrome");
+        assert!(
+            !panes.show_switcher(),
+            "being in the registry does not make the main agent a row in the list"
+        );
+
+        // It is never pruned, however idle it is: it is the conversation.
+        live.prune();
+        panes.sync(&live);
+        assert_eq!(panes.main().transcript().len(), 1);
+        assert_eq!(
+            live.len(),
+            1,
+            "the session's agent survives a prune that would collect any sub-agent"
+        );
     }
 
     #[test]
