@@ -81,6 +81,14 @@ impl super::App {
         self.last_reasoning_tokens = None;
         self.cost_base = 0.0; // Agent::clear zeroes the live counter too
         self.state.id = None; // detach; next message starts a new session
+        // Detach the sub-agent transcript dir with it — otherwise a `task`
+        // spawned early in the next session (before its first autosave assigns
+        // an id) would resolve this now-abandoned session's dir and misfile its
+        // transcript there. Cleared to `None` = not persisted until the new id
+        // lands, matching the documented pre-first-save behavior.
+        if let Ok(mut cell) = self.subagent_dir.lock() {
+            *cell = None;
+        }
         self.state.name.clear();
         self.find = hrdr_app::FindState::default();
         self.pending_goto = None;

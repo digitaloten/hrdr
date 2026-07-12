@@ -1578,6 +1578,14 @@ async fn autosave_populates_the_subagent_transcript_dir() {
         Some(want),
         "cell points at the session's sub-agent dir after autosave"
     );
+
+    // `/clear` detaches the session, so the cell must be reset too — otherwise
+    // the next session's early sub-agents would misfile into this dir.
+    h.app.clear_all();
+    assert!(
+        h.app.subagent_dir.lock().unwrap().is_none(),
+        "clear_all resets the sub-agent transcript cell"
+    );
 }
 
 /// A new session opens with the banner: an animated logo on the left and the

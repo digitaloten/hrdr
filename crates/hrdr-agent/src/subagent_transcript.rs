@@ -53,6 +53,11 @@ pub enum Event {
     },
     End {
         status: EndStatus,
+        /// Approximate size hint: the byte length of the accumulated output at
+        /// the terminal point. Trimming and availability vary by path (untrimmed
+        /// on the blocking path, trimmed on background Ok, `0` on panic/cancel),
+        /// so treat it as a rough indicator, not an exact count. Not used to gate
+        /// anything.
         bytes: usize,
     },
 }
