@@ -15,6 +15,7 @@ mod highlight;
 mod history;
 mod login;
 mod palette;
+mod pane;
 mod session;
 mod sessions;
 mod skills;
@@ -32,6 +33,10 @@ pub use highlight::*;
 pub use history::*;
 pub use login::*;
 pub use palette::*;
+pub use pane::{
+    Pane, PaneId, PaneRow, PaneSet, PaneStatus, apply_event, holds_main_turn, pane_row_marker,
+    pane_rows,
+};
 pub use session::*;
 pub use sessions::*;
 pub use skills::*;
