@@ -64,6 +64,14 @@ pub struct LiveSubagent {
     /// `task` block, which reports *what was delegated to* rather than replaying
     /// the sub-agent's output.
     pub provider: Option<String>,
+    /// Endpoint it is talking to — it need not be the parent's (a sub-agent can
+    /// be delegated to a different provider entirely).
+    pub base_url: String,
+    /// Its own token/cost counters, folded from every call it makes — by
+    /// [`LiveSubagents::send_prompt`] for a turn the user drove, and by the `task`
+    /// tool for the delegated run. A frontend showing this agent reads its usage
+    /// from here; nothing has to be watching for the figures to be right.
+    pub usage: crate::AgentUsage,
     pub kind: SubagentKind,
     /// The sub-agent itself, retained so a frontend can drive a further turn on
     /// it once its delegated task has landed.
@@ -127,6 +135,20 @@ impl LiveSubagents {
         });
     }
 
+    /// Fold one agent event into sub-agent `key`'s own usage counters. A no-op for
+    /// every event that isn't [`crate::AgentEvent::Usage`], so callers can hand it
+    /// the whole stream.
+    pub fn record_usage(&self, key: u64, ev: &crate::AgentEvent) {
+        if matches!(ev, crate::AgentEvent::Usage { .. }) {
+            self.update(key, |e| e.usage.record_event(ev));
+        }
+    }
+
+    /// A snapshot of `key`'s usage, for a frontend showing that agent.
+    pub fn usage(&self, key: u64) -> Option<crate::AgentUsage> {
+        self.with(|v| v.iter().find(|e| e.key == key).map(|e| e.usage))
+    }
+
     /// The steering queue and agent handle for `key`, if it is still live.
     pub fn handle(&self, key: u64) -> Option<(Arc<tokio::sync::Mutex<Agent>>, SteeringQueue)> {
         self.with(|v| {
@@ -177,8 +199,15 @@ impl LiveSubagents {
         tokio::spawn(async move {
             // The guard marks it idle again on every exit — including cancellation,
             // where nothing after the await would run.
-            let _guard = RunGuard::new(live, key);
+            let _guard = RunGuard::new(live.clone(), key);
             let mut on_event = on_event;
+            // The agent's own counters are updated here rather than by whoever is
+            // watching: a turn's tokens are a fact about the agent, not about the
+            // fact that someone happened to be looking at it.
+            let mut on_event = move |ev: crate::AgentEvent| {
+                live.record_usage(key, &ev);
+                on_event(ev);
+            };
             let mut a = agent.lock().await;
             if let Err(e) = a.run(input, steering, &mut on_event).await {
                 on_event(crate::AgentEvent::Notice(format!("[error] {e:#}")));
@@ -285,6 +314,8 @@ mod tests {
             label: "l".to_string(),
             model: "m".to_string(),
             provider: None,
+            base_url: String::new(),
+            usage: crate::AgentUsage::default(),
             kind: SubagentKind::Blocking,
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             steering: steering_queue(),
@@ -456,6 +487,40 @@ mod tests {
         live.update(1, |e| e.delivered = true);
         live.prune();
         assert!(live.is_empty(), "and then it is released, not leaked");
+    }
+
+    /// A sub-agent's tokens are a fact about *that agent*, so they are counted on
+    /// its registry entry — not in whichever frontend happens to be showing it.
+    /// A status bar reading the agent you are looking at reads these.
+    #[test]
+    fn a_sub_agents_calls_are_counted_on_its_own_entry() {
+        let live = LiveSubagents::new();
+        live.register(entry(1));
+        live.register(entry(2));
+        live.record_usage(
+            1,
+            &crate::AgentEvent::Usage {
+                prompt_tokens: 120,
+                completion_tokens: 30,
+                cached_prompt_tokens: None,
+                reasoning_tokens: None,
+                cost_usd: None,
+                session_cost_usd: Some(0.02),
+            },
+        );
+        // Everything else in the stream leaves the counters alone.
+        live.record_usage(1, &crate::AgentEvent::Text("hi".into()));
+
+        let u = live.usage(1).expect("a live sub-agent has usage");
+        assert_eq!((u.tokens_in, u.tokens_out), (120, 30));
+        assert_eq!(u.ctx_used(), 120, "its own context, not the parent's");
+        assert_eq!(u.cost_usd, 0.02);
+        assert_eq!(
+            live.usage(2).unwrap().tokens_in,
+            0,
+            "one sub-agent's tokens are not another's"
+        );
+        assert!(live.usage(99).is_none());
     }
 
     #[tokio::test]

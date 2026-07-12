@@ -1164,7 +1164,7 @@ fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    let ctx = match app.state.usage.last() {
+    let ctx = match app.panes.active_pane().state.usage.last() {
         Some((prompt, completion)) => {
             let ratio = if completion > 0 {
                 prompt as f64 / completion as f64
@@ -1320,23 +1320,33 @@ fn status_section_width(s: &StatusSection) -> usize {
 /// name, laid out flush-right by [`draw_statusbar`].
 fn build_status_sections(app: &App) -> (Vec<StatusSection>, Vec<StatusSection>) {
     let t = &app.theme;
-    let ttft = match (app.turn_started, app.first_token_at) {
-        (Some(start), Some(first)) => Some(first.duration_since(start).as_secs_f64()),
+    // The bar describes **the agent you are looking at**. Model, provider, context
+    // gauge, tokens and cost all come off the active pane's state: a sub-agent on
+    // a different provider fills a different window at a different price, and a bar
+    // that always reported the main agent's figures was describing a conversation
+    // that wasn't on screen.
+    let pane = app.panes.active_pane();
+    // Timing is the *turn's*, and only the main agent's turn is clocked here — so
+    // it is shown only while its own pane is up, rather than mislabelled as a
+    // sub-agent's.
+    let ttft = match (pane.id.is_main(), app.turn_started, app.first_token_at) {
+        (true, Some(start), Some(first)) => Some(first.duration_since(start).as_secs_f64()),
         _ => None,
     };
-    // Cap the session name so a long one can't crowd out the left side.
-    let session = truncate_chars(&app.state.name, 28);
+    // The session name is the session's, whichever agent is being viewed — it is
+    // what the file on disk is called.
+    let session = truncate_chars(&app.state().name, 28);
     let inputs = hrdr_app::StatusInputs {
         dir: &app.dir,
         branch: app.branch.as_deref(),
-        tokens_in: app.state.usage.tokens_in,
-        tokens_out: app.state.usage.tokens_out,
-        ctx_used: app.state.usage.ctx_used(),
-        context_window: app.state.usage.context_window,
+        tokens_in: pane.state.usage.tokens_in,
+        tokens_out: pane.state.usage.tokens_out,
+        ctx_used: pane.state.usage.ctx_used(),
+        context_window: pane.state.usage.context_window,
         auto_compact_enabled: app.auto_compact_enabled,
         compaction_reserved: app.compaction_reserved,
-        provider: app.state.provider.as_deref(),
-        model: &app.state.model,
+        provider: pane.state.provider.as_deref(),
+        model: pane.model(),
         session: Some(session.as_str()),
         effort: app.effort.as_deref(),
         ttft,
@@ -1718,10 +1728,12 @@ fn header_lines(app: &App, anchor: std::time::Instant, width: u16) -> Vec<Line<'
         env!("CARGO_PKG_VERSION").to_string(),
         Style::default().fg(theme.user).bold(),
     );
-    field("model", app.state.model.clone(), val);
+    // The header block describes the agent on screen, like the status bar.
+    let pane = app.panes.active_pane();
+    field("model", pane.model().to_string(), val);
     field(
         "provider",
-        app.state.provider.clone().unwrap_or_else(|| "—".into()),
+        pane.state.provider.clone().unwrap_or_else(|| "—".into()),
         val,
     );
     if let Some(e) = &app.effort {
@@ -2132,8 +2144,8 @@ fn transcript_lines(
             return Vec::new();
         }
         let time = app
-            .state
-            .transcript
+            .panes
+            .active_transcript()
             .get(i)
             .map(|e| {
                 if app.timestamp_style == TimestampStyle::Relative {

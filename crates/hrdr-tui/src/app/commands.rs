@@ -73,14 +73,15 @@ impl super::App {
         self.max_scroll = 0;
         // Reset the counters, but keep the probed context window: it describes
         // the model/endpoint, not the conversation.
-        self.state.usage = hrdr_app::SessionUsage {
-            context_window: self.state.usage.context_window,
+        let window = self.state().usage.context_window;
+        self.state_mut().usage = hrdr_app::SessionUsage {
+            context_window: window,
             ..Default::default()
         };
         self.last_cached_tokens = None;
         self.last_reasoning_tokens = None;
         self.cost_base = 0.0; // Agent::clear zeroes the live counter too
-        self.state.id = None; // detach; next message starts a new session
+        self.state_mut().id = None; // detach; next message starts a new session
         // Detach the sub-agent transcript dir with it — otherwise a `task`
         // spawned early in the next session (before its first autosave assigns
         // an id) would resolve this now-abandoned session's dir and misfile its
@@ -89,7 +90,7 @@ impl super::App {
         if let Ok(mut cell) = self.subagent_dir.lock() {
             *cell = None;
         }
-        self.state.name.clear();
+        self.state_mut().name.clear();
         self.find = hrdr_app::FindState::default();
         self.pending_goto = None;
         self.pending_edit = None;
@@ -119,14 +120,14 @@ impl super::App {
                 // Keep the toggled block's top where the reader is looking; its
                 // height is about to change (see `pending_scroll_entry`).
                 let idx = self
-                    .state
-                    .transcript
+                    .panes
+                    .active_transcript()
                     .iter()
                     .rposition(|e| matches!(e.kind, EntryKind::Tool { .. }));
                 self.pending_scroll_entry = idx;
                 let last = self
-                    .state
-                    .transcript
+                    .panes
+                    .active_transcript_mut()
                     .iter_mut()
                     .rev()
                     .find_map(|e| match &mut e.kind {
@@ -163,8 +164,9 @@ impl super::App {
             .ok()
             .and_then(|mut a| a.rewind_last_user())?;
         if let Some(idx) = self
-            .state
-            .transcript
+            .panes
+            .main()
+            .transcript()
             .iter()
             .rposition(|e| matches!(e.kind, EntryKind::User(_)))
         {
@@ -217,17 +219,19 @@ impl super::App {
             }
         }
     }
+    // These read *the conversation on screen*, like every other command: `/copy
+    // msg 3` in a sub-agent's view means that agent's third message.
     /// Number of user/assistant messages in the transcript.
     fn display_message_count(&self) -> usize {
-        hrdr_app::message_count(&self.panes.main().transcript)
+        hrdr_app::message_count(self.panes.active_transcript())
     }
     /// The number of the first user/assistant message sent at/after `cutoff`.
     fn first_message_since(&self, cutoff: chrono::DateTime<chrono::Local>) -> Option<usize> {
-        hrdr_app::first_message_since(&self.panes.main().transcript, cutoff)
+        hrdr_app::first_message_since(self.panes.active_transcript(), cutoff)
     }
     /// The text of the Nth (1-based) user/assistant message in the transcript.
     fn nth_message_text(&self, n: usize) -> Option<String> {
-        hrdr_app::nth_message_text(&self.panes.main().transcript, n)
+        hrdr_app::nth_message_text(self.panes.active_transcript(), n)
     }
     /// Write `text` to the system clipboard, returning a status line (used by the
     /// shared `/copy` via [`hrdr_app::CommandHost`]).
@@ -236,8 +240,8 @@ impl super::App {
     }
     /// The most recent assistant message text.
     fn last_assistant_text(&self) -> Option<String> {
-        self.state
-            .transcript
+        self.panes
+            .active_transcript()
             .iter()
             .rev()
             .find_map(|e| match &e.kind {
@@ -247,8 +251,8 @@ impl super::App {
     }
     /// The most recent fenced code block across assistant messages.
     fn last_code_block(&self) -> Option<String> {
-        self.state
-            .transcript
+        self.panes
+            .active_transcript()
             .iter()
             .rev()
             .find_map(|e| match &e.kind {
@@ -288,8 +292,8 @@ const HELP_TIPS: &str = "  @path attaches a file · Up/Down recalls history\n   
 /// The TUI's [`hrdr_app::CommandHost`] — a thin adapter over `App` so the shared
 /// slash-command dispatcher can drive it. Commands with a richer TUI rendering
 /// stay in [`App::handle_slash`] and never reach here.
-struct TuiHost<'a> {
-    app: &'a mut super::App,
+pub(super) struct TuiHost<'a> {
+    pub(super) app: &'a mut super::App,
 }
 
 impl hrdr_app::CommandHost for TuiHost<'_> {
@@ -308,8 +312,13 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     }
     fn context_window_poster(&self) -> Box<dyn Fn(u32) + Send> {
         let tx = self.app.tx.clone();
+        // Bind the pane *now*, when the command is issued: the probe lands later,
+        // by which time the user may be looking at a different agent — and the
+        // window belongs to the agent that was switched, not to whatever is on
+        // screen when the answer arrives.
+        let id = self.app.panes.active();
         Box::new(move |tokens| {
-            let _ = tx.send(TurnMsg::ContextWindow(tokens));
+            let _ = tx.send(TurnMsg::ContextWindow(id, tokens));
         })
     }
     fn agent(&self) -> std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>> {
@@ -319,29 +328,27 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.active_agent()
     }
 
-    fn session_agent(&self) -> std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>> {
-        // The session's own agent. Switching the session's model/provider is tied
-        // to the saved session and the chrome that shows it, so it must not
-        // repoint whichever sub-agent happens to be on screen.
-        self.app.agent.clone()
-    }
     fn cwd(&self) -> std::path::PathBuf {
         hrdr_app::agent_cwd(&self.app.agent)
     }
+    // Chrome — model, provider, endpoint, context window — belongs to whichever
+    // agent is on screen, and is read back from it. `/model` on a sub-agent's view
+    // switches *that* agent's model, and the status bar (which reads the active
+    // pane) shows it, because they are the same piece of state.
     fn base_url(&self) -> String {
-        self.app.state.base_url.clone()
+        self.app.panes.active_pane().state.base_url.clone()
     }
     fn model(&self) -> String {
-        self.app.state.model.clone()
+        self.app.active_model()
     }
     fn set_model(&mut self, model: String) {
-        self.app.state.model = model;
+        self.app.set_active_model(model);
     }
     fn provider(&self) -> Option<String> {
-        self.app.state.provider.clone()
+        self.app.panes.active_pane().state.provider.clone()
     }
     fn set_provider(&mut self, name: String) {
-        self.app.state.provider = Some(name);
+        self.app.set_active_provider(name);
     }
     fn show_thinking(&self) -> bool {
         self.app.show_reasoning
@@ -355,10 +362,10 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.clear_all();
     }
     fn session_id(&self) -> Option<String> {
-        self.app.state.id.clone()
+        self.app.state().id.clone()
     }
     fn set_session_label(&mut self, name: String) {
-        self.app.state.name = name;
+        self.app.state_mut().name = name;
     }
     fn autosave(&mut self) {
         self.app.autosave();
@@ -429,22 +436,22 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.effort.clone()
     }
     fn session_label(&self) -> Option<String> {
-        Some(self.app.state.name.clone()).filter(|n| !n.is_empty())
+        Some(self.app.state().name.clone()).filter(|n| !n.is_empty())
     }
+    // Usage reads the conversation on screen too: `/status` and `/cost` in a
+    // sub-agent's view report what *that* agent has used and cost.
     fn context_usage(&self) -> Option<(u32, u32)> {
-        self.app.state.usage.last()
+        self.app.panes.active_pane().state.usage.last()
     }
     fn context_window(&self) -> Option<u32> {
-        self.app.state.usage.context_window
+        self.app.panes.active_pane().state.usage.context_window
     }
     fn session_tokens(&self) -> (usize, usize) {
-        (
-            self.app.state.usage.tokens_in,
-            self.app.state.usage.tokens_out,
-        )
+        let u = &self.app.panes.active_pane().state.usage;
+        (u.tokens_in, u.tokens_out)
     }
     fn session_cost(&self) -> f64 {
-        self.app.state.usage.cost_usd
+        self.app.panes.active_pane().state.usage.cost_usd
     }
     fn set_effort(&mut self, label: String) {
         self.app.effort = Some(label);
@@ -487,11 +494,11 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.cfg.resolve_provider(name)
     }
     fn set_base_url(&mut self, url: String) {
-        self.app.state.base_url = url;
+        self.app.set_active_base_url(url);
     }
     fn set_context_window(&mut self, tokens: Option<u32>) {
         if tokens.is_some() {
-            self.app.state.usage.context_window = tokens;
+            self.app.set_active_context_window(tokens);
         }
     }
     fn begin_login(&mut self) {
@@ -513,7 +520,8 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.skill_selector = Some(super::skill_selector(skills));
     }
     fn begin_model_selector(&mut self) {
-        let choices = hrdr_agent::model_choices(&self.app.cfg, self.app.state.provider.as_deref());
+        let choices =
+            hrdr_agent::model_choices(&self.app.cfg, self.app.state().provider.as_deref());
         // A built-in ChatGPT login contributes rows asynchronously (its models
         // aren't in the sync catalog), so the picker may open even when the sync
         // list is empty — the async load fills it. Gated on the TRUSTED built-in
@@ -553,8 +561,10 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.session_selector = Some(super::session_selector(sessions));
     }
     fn begin_effort_selector(&mut self) {
-        let choices =
-            hrdr_app::effort_choices(self.app.state.provider.as_deref(), &self.app.state.model);
+        let choices = hrdr_app::effort_choices(
+            self.app.state().provider.as_deref(),
+            &self.app.state().model,
+        );
         self.app.effort_selector = Some(super::effort_selector(choices));
     }
     fn begin_theme_selector(&mut self) {
@@ -994,7 +1004,7 @@ impl super::App {
         if provider != "chatgpt" {
             return;
         }
-        let choices = hrdr_agent::model_choices(&self.cfg, self.state.provider.as_deref());
+        let choices = hrdr_agent::model_choices(&self.cfg, self.state().provider.as_deref());
         self.model_gen = self.model_gen.wrapping_add(1);
         self.model_source = None;
         self.model_selector = Some(super::model_selector(choices));
@@ -1080,8 +1090,9 @@ impl super::App {
             return; // token/refresh failed — keep the cached rows.
         }
         self.model_source = Some(source);
+        let provider = self.state().provider.clone();
         if let Some(sel) = &mut self.model_selector {
-            let base = hrdr_agent::model_choices(&self.cfg, self.state.provider.as_deref());
+            let base = hrdr_agent::model_choices(&self.cfg, provider.as_deref());
             let usage = hrdr_agent::load_model_usage();
             let merged = hrdr_agent::merge_chatgpt_choices(base, &models, &usage);
             sel.replace_model_choices(merged);

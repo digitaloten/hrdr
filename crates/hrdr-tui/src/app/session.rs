@@ -11,7 +11,7 @@ impl super::App {
     /// Called after the session id is assigned; sub-agents spawned before this
     /// (a brand-new session's first turn) are simply not persisted.
     pub(super) fn refresh_subagent_dir(&self) {
-        if let Some(id) = &self.state.id {
+        if let Some(id) = &self.state().id {
             let dir = hrdr_app::subagent_transcript_dir(&self.current_cwd(), id);
             if let Ok(mut cell) = self.subagent_dir.lock() {
                 *cell = Some(dir);
@@ -47,18 +47,20 @@ impl super::App {
     /// adopt the snapshot it sent and persist that instead. With this, a crash
     /// mid-turn loses at most the round in flight.
     pub(super) fn persist_mid_turn(&mut self, messages: Vec<hrdr_agent::Message>) {
-        self.state.messages = messages;
-        self.state.todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
+        let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
         // `state.cwd` is only synced by the turn-end autosave; on the very
         // first turn it is still empty, which would file the session under the
         // wrong cwd slug.
-        self.state.cwd = self.current_cwd();
-        self.state.transcript = self.panes.main().transcript.clone();
-        if let Some(o) = hrdr_app::save_session(&self.state) {
+        let cwd = self.current_cwd();
+        let state = self.state_mut();
+        state.messages = messages;
+        state.todos = todos;
+        state.cwd = cwd;
+        if let Some(o) = hrdr_app::save_session(self.state()) {
             if o.first_save {
                 self.push_entry(Entry::notice(hrdr_app::session_saved_notice(&o.id)));
             }
-            self.state.id = Some(o.id);
+            self.state_mut().id = Some(o.id);
             self.refresh_subagent_dir();
         }
     }
@@ -83,20 +85,21 @@ impl super::App {
     ///
     /// [`unique_session_id`]: hrdr_app::unique_session_id
     pub(crate) fn reserve_session_id(&mut self, sent: &str) {
-        if self.state.id.is_some() {
+        if self.state().id.is_some() {
             return;
         }
         // `save_session` skips a conversation with no user message, and the agent
         // does not push this one until the turn starts — so seed the mirror. The
         // next autosave replaces it with the agent's own history.
-        self.state.messages.push(hrdr_agent::Message::user(sent));
-        self.state.transcript = self.panes.main().transcript.clone();
-        if let Some(o) = hrdr_app::save_session(&self.state) {
+        self.state_mut()
+            .messages
+            .push(hrdr_agent::Message::user(sent));
+        if let Some(o) = hrdr_app::save_session(self.state()) {
             // Stay silent here: the notice belongs *after* the turn, not ahead of
             // the reply. Hand it to the first autosave, which would otherwise see
             // an id already set and conclude this was not a first save.
             self.session_notice_pending = o.first_save;
-            self.state.id = Some(o.id);
+            self.state_mut().id = Some(o.id);
             self.refresh_subagent_dir();
         }
     }
@@ -119,20 +122,16 @@ impl super::App {
             return;
         };
         let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
-        self.state.sync_from(msgs, todos, cwd);
-        // The main pane owns the live transcript; `state`'s copy exists only to
-        // be written. Refresh it here, the same way `sync_from` refreshes the
-        // message mirror from the agent.
-        self.state.transcript = self.panes.main().transcript.clone();
+        self.state_mut().sync_from(msgs, todos, cwd);
 
-        if let Some(o) = hrdr_app::save_session(&self.state) {
+        if let Some(o) = hrdr_app::save_session(self.state()) {
             // Notify once, when the session is first created — including when
             // `reserve_session_id` created it at turn start and deferred the
             // notice to here (it sees `first_save` as false by then).
             if o.first_save || std::mem::take(&mut self.session_notice_pending) {
                 self.push_entry(Entry::notice(hrdr_app::session_saved_notice(&o.id)));
             }
-            self.state.id = Some(o.id);
+            self.state_mut().id = Some(o.id);
             self.refresh_subagent_dir();
         }
     }
@@ -154,7 +153,7 @@ impl super::App {
         let plan = hrdr_app::resume_plan(
             &session.state,
             std::path::Path::new(&self.current_cwd()),
-            &self.state.base_url,
+            &self.state().base_url,
         );
         self.adopt_state(session.state, Some(id));
         self.scroll_offset = 0;
@@ -184,38 +183,43 @@ impl super::App {
     ///   **flag > env > session > config**. Applies to `/resume` as well as to
     ///   startup auto-resume: a pinned model never switches out from under you.
     fn adopt_state(&mut self, state: hrdr_app::SessionState, id: Option<String>) {
-        let probed_window = self.state.usage.context_window;
-        let base_url = std::mem::take(&mut self.state.base_url);
-        let pinned_model = self.cfg.model_pinned.then(|| self.state.model.clone());
+        let probed_window = self.state().usage.context_window;
+        let base_url = std::mem::take(&mut self.state_mut().base_url);
+        let pinned_model = self.cfg.model_pinned.then(|| self.state().model.clone());
         let pinned_provider = self
             .cfg
             .provider_pinned
-            .then(|| self.state.provider.clone());
+            .then(|| self.state().provider.clone());
 
-        self.state = state.restored();
-        // The pane owns the live transcript — a restored session hands it back.
-        self.panes.main_mut().transcript = std::mem::take(&mut self.state.transcript);
-        self.state.id = id;
-        self.refresh_subagent_dir();
-        self.state.base_url = base_url;
-        self.state.usage.context_window = probed_window.or(self.state.usage.context_window);
+        // The state *is* the main pane's — transcript, counters and all — so
+        // adopting a session is one assignment. There is nothing left to hand back.
+        *self.state_mut() = state.restored();
+        let state = self.state_mut();
+        state.id = id;
+        state.base_url = base_url;
+        state.usage.context_window = probed_window.or(state.usage.context_window);
         if let Some(model) = pinned_model {
-            self.state.model = model;
+            state.model = model;
         }
         if let Some(provider) = pinned_provider {
-            self.state.provider = provider;
+            state.provider = provider;
         }
+        self.refresh_subagent_dir();
 
         // The resumed session's saved spend is the display base; the agent's
         // live counter tracks only what this process spends on top of it.
-        self.cost_base = self.state.usage.cost_usd;
+        self.cost_base = self.state().usage.cost_usd;
+        let (messages, model, todos) = {
+            let s = self.state();
+            (s.messages.clone(), s.model.clone(), s.todos.clone())
+        };
         self.with_agent(|a| {
-            a.set_messages(self.state.messages.clone());
-            a.set_model(self.state.model.clone());
+            a.set_messages(messages);
+            a.set_model(model);
             a.reset_session_cost();
         });
-        if let Ok(mut todos) = self.todos.lock() {
-            *todos = self.state.todos.clone();
+        if let Ok(mut t) = self.todos.lock() {
+            *t = todos;
         }
         crate::ui::clear_transcript_cache();
     }

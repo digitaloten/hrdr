@@ -141,7 +141,9 @@ pub(crate) enum TurnMsg {
     /// Compaction finished: `Ok((before, after))` message counts, or an error.
     Compacted(Result<(usize, usize), String>),
     /// A model/provider switch re-probed the endpoint's advertised context window.
-    ContextWindow(u32),
+    /// Carries the pane whose agent was switched: `/model` acts on the agent being
+    /// viewed, so its probe result belongs to that agent and not to the session's.
+    ContextWindow(hrdr_app::PaneId, u32),
     /// A browser OAuth login's exchange/save step finished. Carries the typed
     /// outcome (with its originating `login_id`) so the loop can reject a stale
     /// login and, on a match, run the live provider switch.
@@ -188,11 +190,6 @@ pub(crate) struct App {
     /// Persistent clock anchor for the header's logo animation. Captured once:
     /// re-anchoring per frame would pin the animation's tick at 0.
     pub(crate) header_anchor: Instant,
-    /// The whole persisted session: the display transcript (each entry carries
-    /// its own timestamp), the chat history, the TODO snapshot, the token
-    /// counters, and the session's identity. Saving serializes this; resuming
-    /// assigns it.
-    pub(crate) state: hrdr_app::SessionState,
     /// Per-message timestamp style: none / relative / exact (`/timestamps`).
     pub(crate) timestamp_style: TimestampStyle,
     /// Status-bar mode: none / truncate / wrap (`/statusbar`).
@@ -463,11 +460,14 @@ impl App {
         if project_docs_loaded {
             transcript.push(Entry::notice(hrdr_app::PROJECT_DOCS_LOADED_MSG));
         }
+        // The main agent's state *is* its pane's state — its model, its endpoint,
+        // its counters and its transcript, held exactly the way a sub-agent's are.
+        // The opening chrome (banner + welcome) is seeded straight into it.
         let state = hrdr_app::SessionState {
             model,
             provider,
             base_url,
-            transcript: Vec::new(),
+            transcript,
             usage: hrdr_app::SessionUsage {
                 context_window,
                 ..Default::default()
@@ -478,11 +478,9 @@ impl App {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             subagent_dir,
             live_subagents,
-            // The main agent's pane owns the live transcript from the start; the
-            // opening chrome (banner + welcome) is seeded straight into it.
             panes: {
                 let mut panes = hrdr_app::PaneSet::new();
-                panes.main_mut().transcript = transcript;
+                panes.main_mut().state = state;
                 panes
             },
             session_notice_pending: false,
@@ -490,7 +488,6 @@ impl App {
             theme,
             logo,
             header_anchor: Instant::now(),
-            state,
             timestamp_style,
             statusbar_mode,
             running: false,
@@ -575,8 +572,8 @@ impl App {
     /// Stays silent on success so it doesn't clutter the transcript.
     pub(crate) fn spawn_health_check(&self) {
         let agent = self.agent.clone();
-        let model = self.state.model.clone();
-        let base_url = self.state.base_url.clone();
+        let model = self.state().model.clone();
+        let base_url = self.state().base_url.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
             if let Some(warning) = hrdr_app::endpoint_health_warning(agent, model, base_url).await {
@@ -593,7 +590,7 @@ impl App {
     /// gauge had no "of Y" side on any endpoint that doesn't declare a window
     /// up front, because the only other probe ran on a `/model` switch.
     pub(crate) fn spawn_context_probe(&self) {
-        if self.state.usage.context_window.is_some() {
+        if self.state().usage.context_window.is_some() {
             return;
         }
         let agent = self.agent.clone();
@@ -601,7 +598,8 @@ impl App {
         tokio::spawn(async move {
             let window = agent.lock().await.probe_context_window().await;
             if let Some(w) = window {
-                let _ = tx.send(TurnMsg::ContextWindow(w));
+                // The startup probe is the *session* agent's, whatever is on screen.
+                let _ = tx.send(TurnMsg::ContextWindow(hrdr_app::PaneId::Main, w));
             }
         });
     }
@@ -1297,41 +1295,43 @@ impl App {
 
     /// Append a transcript entry. Each entry carries its own timestamp, set when
     /// it was constructed.
-    /// The live transcript of the main agent — the session's conversation.
-    /// `state.transcript` is only its saved shape, refreshed at save time.
-    /// (Tests reach for this; the app itself goes through `panes` directly.)
+    /// The main agent's transcript — the session's conversation, and the very one
+    /// its state persists. (Tests reach for this; the app goes through `panes`.)
     #[cfg(test)]
     pub(crate) fn transcript(&self) -> &Vec<Entry> {
-        &self.panes.main().transcript
+        self.panes.main().transcript()
     }
 
-    /// Mutable access to the main agent's live transcript.
+    /// Mutable access to the main agent's transcript.
     #[cfg(test)]
     pub(crate) fn transcript_mut(&mut self) -> &mut Vec<Entry> {
-        &mut self.panes.main_mut().transcript
+        self.panes.main_mut().transcript_mut()
+    }
+
+    /// The main agent's state: its name, model, endpoint, history, transcript and
+    /// token counters — and the payload the session file stores.
+    ///
+    /// It lives on the main *pane*, because it is the main agent's state and every
+    /// agent has one. The status bar reads whichever pane is active
+    /// ([`hrdr_app::PaneSet::active_pane`]); this is simply the main one by name.
+    pub(crate) fn state(&self) -> &hrdr_app::SessionState {
+        &self.panes.main().state
+    }
+
+    pub(crate) fn state_mut(&mut self) -> &mut hrdr_app::SessionState {
+        &mut self.panes.main_mut().state
     }
 
     /// Reconcile the pane list against the agent's live sub-agents, and refresh
     /// the main pane's row. Called each frame: `sync` is also what *pins* the pane
     /// being viewed, which is the only thing keeping the agent from releasing it.
     pub(crate) fn sync_panes(&mut self) {
-        let title = if self.state.name.is_empty() {
-            "main".to_string()
-        } else {
-            self.state.name.clone()
-        };
         let running = self.running;
-        let model = self.state.model.clone();
-        {
-            let main = self.panes.main_mut();
-            main.title = title;
-            main.model = model;
-            main.status = if running {
-                hrdr_app::PaneStatus::Running
-            } else {
-                hrdr_app::PaneStatus::Idle
-            };
-        }
+        self.panes.main_mut().status = if running {
+            hrdr_app::PaneStatus::Running
+        } else {
+            hrdr_app::PaneStatus::Idle
+        };
         self.panes.sync(&self.live_subagents);
     }
 
@@ -1345,7 +1345,7 @@ impl App {
         // Show it in that agent's transcript, where it was said.
         self.sync_panes();
         if let Some(pane) = self.panes.sub_mut(key) {
-            hrdr_app::apply_event(&mut pane.transcript, &AgentEvent::Steered(input.clone()));
+            hrdr_app::apply_event(pane.transcript_mut(), &AgentEvent::Steered(input.clone()));
         }
 
         let tx = self.tx.clone();
@@ -1387,7 +1387,12 @@ impl App {
     /// the same rule as the input box. (Session-scoped commands still use the main
     /// agent: `self.agent`.)
     pub(crate) fn active_agent(&self) -> Arc<tokio::sync::Mutex<Agent>> {
-        match self.panes.active().key() {
+        self.agent_for(self.panes.active())
+    }
+
+    /// The agent behind a given pane.
+    pub(crate) fn agent_for(&self, id: hrdr_app::PaneId) -> Arc<tokio::sync::Mutex<Agent>> {
+        match id.key() {
             None => self.agent.clone(),
             Some(key) => self
                 .live_subagents
@@ -1396,6 +1401,70 @@ impl App {
                 // Released while being viewed — fall back rather than do nothing.
                 .unwrap_or_else(|| self.agent.clone()),
         }
+    }
+
+    /// Repoint the **active** agent's chrome — the model/provider/endpoint/window
+    /// the status bar shows for it.
+    ///
+    /// For the main agent that is the session's state, which is what gets saved.
+    /// For a sub-agent it is its **registry entry**: the pane is rebuilt from the
+    /// registry every frame ([`hrdr_app::PaneSet::sync`]), so a write only to the
+    /// pane would be silently overwritten on the next draw. The registry is the
+    /// agent's own record of what it is running on, so that is where it belongs.
+    fn update_chrome(&mut self, id: hrdr_app::PaneId, f: impl FnOnce(&mut hrdr_app::SessionState)) {
+        let Some(key) = id.key() else {
+            f(self.state_mut());
+            return;
+        };
+        let Some(pane) = self.panes.sub_mut(key) else {
+            return; // released while we were switching it
+        };
+        // Apply to the pane's state, then push the fields the registry owns back
+        // onto the entry.
+        let mut s = std::mem::take(&mut pane.state);
+        f(&mut s);
+        self.live_subagents.update(key, |e| {
+            e.model = s.model.clone();
+            e.provider = s.provider.clone();
+            e.base_url = s.base_url.clone();
+            e.usage = s.usage;
+        });
+        if let Some(p) = self.panes.sub_mut(key) {
+            p.state = s;
+        }
+    }
+
+    fn update_active_chrome(&mut self, f: impl FnOnce(&mut hrdr_app::SessionState)) {
+        self.update_chrome(self.panes.active(), f);
+    }
+
+    /// Record a freshly-probed context window against the pane whose agent was
+    /// switched (see [`TurnMsg::ContextWindow`]).
+    fn set_pane_context_window(&mut self, id: hrdr_app::PaneId, tokens: Option<u32>) {
+        self.update_chrome(id, |s| s.usage.context_window = tokens);
+    }
+
+    /// The model shown for the agent on screen.
+    pub(crate) fn active_model(&self) -> String {
+        self.panes.active_pane().model().to_string()
+    }
+
+    /// `/model` (and `/login`'s provider switch) set the model of the agent being
+    /// viewed — the same agent the input box talks to and `/compact` compacts.
+    pub(crate) fn set_active_model(&mut self, model: String) {
+        self.update_active_chrome(|s| s.model = model);
+    }
+
+    pub(crate) fn set_active_provider(&mut self, name: String) {
+        self.update_active_chrome(|s| s.provider = Some(name));
+    }
+
+    pub(crate) fn set_active_base_url(&mut self, url: String) {
+        self.update_active_chrome(|s| s.base_url = url);
+    }
+
+    pub(crate) fn set_active_context_window(&mut self, tokens: Option<u32>) {
+        self.update_active_chrome(|s| s.usage.context_window = tokens);
     }
 
     /// Stow the reader's place and their unsent draft on the pane they are leaving.
@@ -1418,7 +1487,7 @@ impl App {
     }
 
     fn push_entry(&mut self, e: Entry) {
-        self.panes.main_mut().transcript.push(e);
+        self.panes.main_mut().transcript_mut().push(e);
         self.prune_scrollback();
     }
 
@@ -1427,7 +1496,7 @@ impl App {
     /// welcome/config/project-docs notices — see `App::new`) is always kept
     /// so the user never loses the intro banner.
     fn prune_scrollback(&mut self) {
-        if self.panes.main_mut().transcript.len() <= self.scrollback {
+        if self.panes.main_mut().transcript_mut().len() <= self.scrollback {
             return;
         }
         // Count leading `Header`/`Notice` entries: they form the intro block
@@ -1440,26 +1509,35 @@ impl App {
         let head = self
             .panes
             .main()
-            .transcript
+            .transcript()
             .iter()
             .take_while(|e| matches!(e.kind, EntryKind::Header | EntryKind::Notice(_)))
             .count();
         let excess = self
             .panes
-            .main_mut()
-            .transcript
+            .main()
+            .transcript()
             .len()
             .saturating_sub(self.scrollback);
         // Ensure we always keep at least `head` entries.
-        let remove = excess.min(self.panes.main_mut().transcript.len().saturating_sub(head));
+        let remove = excess.min(
+            self.panes
+                .main_mut()
+                .transcript_mut()
+                .len()
+                .saturating_sub(head),
+        );
         if remove == 0 {
             return;
         }
         // Drop the oldest non-head entries.
         let keep_start = head
             .saturating_add(remove)
-            .min(self.panes.main_mut().transcript.len());
-        self.panes.main_mut().transcript.drain(head..keep_start);
+            .min(self.panes.main_mut().transcript_mut().len());
+        self.panes
+            .main_mut()
+            .transcript_mut()
+            .drain(head..keep_start);
         // Prune the render cache: any key with an entry_idx that has shifted
         // is stale.  Easiest way: clear the whole thread-local transcript cache
         // once (cheap — it rebuilds lazily on the next frame).
@@ -1468,13 +1546,13 @@ impl App {
 
     /// Clear the transcript.
     fn clear_transcript(&mut self) {
-        self.panes.main_mut().transcript.clear();
+        self.panes.main_mut().transcript_mut().clear();
         crate::ui::clear_transcript_cache();
     }
 
     /// Truncate the transcript to `len`.
     fn truncate_transcript(&mut self, len: usize) {
-        self.panes.main_mut().transcript.truncate(len);
+        self.panes.main_mut().transcript_mut().truncate(len);
         crate::ui::clear_transcript_cache();
     }
 
@@ -1826,15 +1904,16 @@ impl App {
                 self.file_index_cwd = Some(cwd);
                 self.file_index_building = false;
             }
-            TurnMsg::ContextWindow(tokens) => {
+            TurnMsg::ContextWindow(id, tokens) => {
                 // A model/provider switch re-probed the endpoint; honor the new
-                // advertised max (drives "X of Y" + the auto-compaction trigger).
-                self.state.usage.context_window = Some(tokens);
-                // Hand it to the agent as well. The probe is the only place this
+                // advertised max (drives "X of Y" + the auto-compaction trigger)
+                // for the agent that was actually switched.
+                self.set_pane_context_window(id, Some(tokens));
+                // Hand it to that agent as well. The probe is the only place this
                 // figure exists, and keeping it in frontend state is what left the
                 // agent unable to tell how full it was — so it could never compact
                 // itself, and nor could any sub-agent that inherited from it.
-                let agent = self.agent.clone();
+                let agent = self.agent_for(id);
                 tokio::spawn(async move {
                     agent.lock().await.set_context_window(Some(tokens));
                 });
@@ -1844,7 +1923,7 @@ impl App {
             TurnMsg::SubAgent(key, ev) => {
                 self.sync_panes();
                 if let Some(pane) = self.panes.sub_mut(key) {
-                    hrdr_app::apply_event(&mut pane.transcript, &ev);
+                    hrdr_app::apply_event(pane.transcript_mut(), &ev);
                 }
             }
             TurnMsg::BrowserLogin(outcome) => self.on_browser_login(outcome),
@@ -1862,7 +1941,7 @@ impl App {
                 self.pause_inference();
                 // Context shrank; drop stale usage so the status bar refreshes
                 // on the next turn (and we don't immediately re-trigger).
-                self.state.usage.set_last(None);
+                self.state_mut().usage.set_last(None);
                 self.last_cached_tokens = None;
                 self.last_reasoning_tokens = None;
                 self.push_entry(Entry::system(hrdr_app::compaction_message(&res)));
@@ -1888,7 +1967,7 @@ impl App {
             self.first_token_at
                 .map(|t0| t0.duration_since(started).as_secs_f64()),
             self.out_tokens,
-            self.state.usage.last(),
+            self.state().usage.last(),
             self.last_cached_tokens,
             self.last_reasoning_tokens,
         )
@@ -1954,6 +2033,20 @@ impl App {
         self.resume_inference();
     }
 
+    /// Apply a `/model` pick without driving the picker's UI — the same
+    /// `apply_choice` call its confirm makes.
+    #[cfg(test)]
+    pub(crate) fn apply_model_choice_for_test(
+        &mut self,
+        provider: &str,
+        model: &str,
+        window: Option<u32>,
+    ) {
+        let mut host = commands::TuiHost { app: self };
+        hrdr_app::apply_choice(&mut host, provider, model.to_string(), window)
+            .expect("the model switch is applied");
+    }
+
     /// Count a streamed delta toward the live tok/s stats.
     fn count_token(&mut self) {
         if self.first_token_at.is_none() {
@@ -1973,7 +2066,7 @@ impl App {
         if let Some(EntryKind::Reasoning { took_ms, .. }) = self
             .panes
             .main_mut()
-            .transcript
+            .transcript_mut()
             .last_mut()
             .map(|e| &mut e.kind)
         {
@@ -1994,7 +2087,7 @@ impl App {
                 match self
                     .panes
                     .main_mut()
-                    .transcript
+                    .transcript_mut()
                     .last_mut()
                     .map(|e| &mut e.kind)
                 {
@@ -2013,7 +2106,7 @@ impl App {
                 match self
                     .panes
                     .main_mut()
-                    .transcript
+                    .transcript_mut()
                     .last_mut()
                     .map(|e| &mut e.kind)
                 {
@@ -2033,13 +2126,13 @@ impl App {
                 session_cost_usd,
                 ..
             } => {
-                self.state
-                    .usage
-                    .record_call(prompt_tokens, completion_tokens);
+                let base = self.cost_base;
+                let usage = &mut self.state_mut().usage;
+                usage.record_call(prompt_tokens, completion_tokens);
                 if let Some(total) = session_cost_usd {
                     // The agent's counter covers this process (incl. its
                     // sub-agents); a resumed session's saved spend is the base.
-                    self.state.usage.cost_usd = self.cost_base + total;
+                    usage.cost_usd = base + total;
                 }
                 self.last_cached_tokens = cached_prompt_tokens;
                 self.last_reasoning_tokens = reasoning_tokens;
@@ -2063,12 +2156,12 @@ impl App {
                 if let Some(hrdr_app::PaneId::Sub(key)) = self.pane_for_tool(&id) {
                     self.sync_panes();
                     if let Some(pane) = self.panes.sub_mut(key) {
-                        hrdr_app::apply_event(&mut pane.transcript, &AgentEvent::Text(chunk));
+                        hrdr_app::apply_event(pane.transcript_mut(), &AgentEvent::Text(chunk));
                     }
                     return;
                 }
                 // Append live output to the running tool's entry.
-                for entry in self.panes.main_mut().transcript.iter_mut().rev() {
+                for entry in self.panes.main_mut().transcript_mut().iter_mut().rev() {
                     if let EntryKind::Tool {
                         id: tid,
                         result: r,
@@ -2105,7 +2198,7 @@ impl App {
                     Some(summary) => format!("↳ delegated to {summary}"),
                     None => result,
                 };
-                for entry in self.panes.main_mut().transcript.iter_mut().rev() {
+                for entry in self.panes.main_mut().transcript_mut().iter_mut().rev() {
                     if let EntryKind::Tool {
                         id: tid,
                         result: r,

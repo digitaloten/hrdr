@@ -6,16 +6,23 @@ use tokio::sync::Mutex;
 use super::helpers::busy_generic;
 use super::host::CommandHost;
 
-/// Switch the live agent's model and, in the *same* locked step, re-probe the
-/// endpoint for the new model's advertised context window — delivering it to the
-/// UI so auto-compaction honors the model's real max. Folding the probe into the
-/// model-change future (rather than a separate task) avoids racing a probe of the
-/// old model against the switch.
+/// Switch **the active agent's** model and, in the *same* locked step, re-probe
+/// the endpoint for the new model's advertised context window — delivering it to
+/// the UI so auto-compaction honors the model's real max. Folding the probe into
+/// the model-change future (rather than a separate task) avoids racing a probe of
+/// the old model against the switch.
+///
+/// `/model` means "change the model of the conversation I am looking at", exactly
+/// as `/compact` means "compact the conversation I am looking at". [`set_model`]
+/// writes to that same agent's chrome, so the status bar follows it — the two are
+/// the same piece of state, not a display copy of one.
+///
+/// [`set_model`]: CommandHost::set_model
 pub(crate) fn switch_model(host: &mut dyn CommandHost, name: String) {
     host.set_model(name.clone());
     // Remember (current provider, new model) as the last-used combo.
     hrdr_agent::record_last_model(&host.provider().unwrap_or_default(), &name);
-    let agent = host.session_agent();
+    let agent = host.agent();
     let post = host.context_window_poster();
     host.spawn_line(Box::pin(async move {
         let mut a = agent.lock().await;
@@ -45,7 +52,7 @@ pub fn apply_provider(
         return Err(busy_generic());
     }
     let key = key.or_else(|| hrdr_agent::resolve_api_key(name, &p, None, None));
-    let agent = host.session_agent();
+    let agent = host.agent();
     let (url, model) = (p.base_url.clone(), p.model.clone());
     // The catalog fallback in `probe_context_window` is keyed `provider/model`.
     let provider = name.to_string();
@@ -106,7 +113,7 @@ pub fn apply_choice(
         return Err(busy_generic());
     }
     let key = hrdr_agent::resolve_api_key(provider_name, &p, None, None);
-    let agent = host.session_agent();
+    let agent = host.agent();
     let url = p.base_url.clone();
     let provider = provider_name.to_string();
     let headers: Vec<(String, String)> = p.headers.clone().into_iter().collect();

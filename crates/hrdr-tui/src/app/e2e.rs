@@ -631,13 +631,13 @@ async fn usage_captured_after_turn() {
     // The mock always sends prompt_tokens:10 completion_tokens:5 in its usage chunk.
     let mut h = Harness::new(vec![MockReply::Text("pong".to_string())]).await;
     assert!(
-        h.app.state.usage.last().is_none(),
+        h.app.state().usage.last().is_none(),
         "last_usage must be None before any turn"
     );
     h.submit("ping").await;
     assert!(!h.app.running);
     assert_eq!(
-        h.app.state.usage.last(),
+        h.app.state().usage.last(),
         Some((10, 5)),
         "last_usage should be populated from the mock's usage SSE chunk"
     );
@@ -1028,7 +1028,7 @@ async fn resume_restores_the_full_transcript_with_its_timestamps() {
     let state = hrdr_app::SessionState {
         name: "old chat".into(),
         model: "test-model".into(),
-        base_url: h.app.state.base_url.clone(),
+        base_url: h.app.state().base_url.clone(),
         cwd: h.app.current_cwd(),
         messages: vec![hrdr_agent::Message::system("sys")],
         transcript: transcript.clone(),
@@ -1093,7 +1093,7 @@ async fn autosave_persists_every_transcript_entry() {
         "the tool call is part of the state"
     );
     assert!(
-        h.app.state.is_saveable(),
+        h.app.state().is_saveable(),
         "a user message makes it saveable"
     );
 }
@@ -1326,7 +1326,7 @@ async fn resume_restores_the_status_bar_token_counters() {
     let mut h = Harness::new(vec![MockReply::Text("hello".into())]).await;
     h.submit("hi").await;
 
-    let usage = h.app.state.usage;
+    let usage = h.app.state().usage;
     assert!(
         usage.tokens_in > 0 && usage.tokens_out > 0,
         "turn accumulated tokens"
@@ -1334,7 +1334,11 @@ async fn resume_restores_the_status_bar_token_counters() {
     assert!(usage.last().is_some(), "turn reported usage");
 
     let mut h2 = Harness::new(vec![]).await;
-    assert_eq!(h2.app.state.usage.tokens_in, 0, "fresh app starts at zero");
+    assert_eq!(
+        h2.app.state().usage.tokens_in,
+        0,
+        "fresh app starts at zero"
+    );
     let state = hrdr_app::SessionState {
         cwd: h2.app.current_cwd(),
         messages: vec![hrdr_agent::Message::system("sys")],
@@ -1345,10 +1349,10 @@ async fn resume_restores_the_status_bar_token_counters() {
     h2.app
         .apply_session("chat".to_string(), hrdr_app::Session::new(state));
 
-    assert_eq!(h2.app.state.usage.tokens_in, usage.tokens_in);
-    assert_eq!(h2.app.state.usage.tokens_out, usage.tokens_out);
+    assert_eq!(h2.app.state().usage.tokens_in, usage.tokens_in);
+    assert_eq!(h2.app.state().usage.tokens_out, usage.tokens_out);
     assert_eq!(
-        h2.app.state.usage.last(),
+        h2.app.state().usage.last(),
         usage.last(),
         "context size restored"
     );
@@ -1359,7 +1363,7 @@ async fn resume_restores_the_status_bar_token_counters() {
 #[tokio::test]
 async fn a_saved_context_window_never_clobbers_the_probed_one() {
     let mut h = Harness::new(vec![]).await;
-    let probed = h.app.state.usage.context_window;
+    let probed = h.app.state().usage.context_window;
     assert!(probed.is_some(), "the harness config sets a context window");
 
     let cwd = h.app.current_cwd();
@@ -1378,15 +1382,16 @@ async fn a_saved_context_window_never_clobbers_the_probed_one() {
     // A stale saved window loses to the one we already know.
     h.app.apply_session("chat".to_string(), session(Some(999)));
     assert_eq!(
-        h.app.state.usage.context_window, probed,
+        h.app.state().usage.context_window,
+        probed,
         "probed window wins"
     );
 
     // With none known, the saved one fills in.
-    h.app.state.usage.context_window = None;
+    h.app.state_mut().usage.context_window = None;
     h.app.apply_session("chat".to_string(), session(Some(999)));
     assert_eq!(
-        h.app.state.usage.context_window,
+        h.app.state().usage.context_window,
         Some(999),
         "saved window fills the gap"
     );
@@ -1403,26 +1408,26 @@ async fn the_context_window_is_probed_from_the_endpoint_on_startup() {
     let mut h = Harness::new(vec![]).await;
 
     // Nothing configured: the probe asks the endpoint and posts what it says.
-    h.app.state.usage.context_window = None;
+    h.app.state_mut().usage.context_window = None;
     h.app.spawn_context_probe();
     let msg = tokio::time::timeout(std::time::Duration::from_secs(5), h.rx.recv())
         .await
         .expect("the probe posts a context window")
         .expect("the channel is open");
     assert!(
-        matches!(msg, TurnMsg::ContextWindow(w) if w == MOCK_CONTEXT_WINDOW),
+        matches!(msg, TurnMsg::ContextWindow(hrdr_app::PaneId::Main, w) if w == MOCK_CONTEXT_WINDOW),
         "the probe posts the endpoint's advertised window"
     );
     h.app.on_turn_msg(msg);
     assert_eq!(
-        h.app.state.usage.context_window,
+        h.app.state().usage.context_window,
         Some(MOCK_CONTEXT_WINDOW),
         "the probed window reaches the status bar"
     );
 
     // Already known (config, provider entry, or restored session): left alone,
     // and no request is made.
-    h.app.state.usage.context_window = Some(1000);
+    h.app.state_mut().usage.context_window = Some(1000);
     h.app.spawn_context_probe();
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(300), h.rx.recv())
@@ -1430,7 +1435,7 @@ async fn the_context_window_is_probed_from_the_endpoint_on_startup() {
             .is_err(),
         "a configured window is not re-probed"
     );
-    assert_eq!(h.app.state.usage.context_window, Some(1000));
+    assert_eq!(h.app.state().usage.context_window, Some(1000));
 }
 
 /// Mid-turn durability: a `History` snapshot (emitted after each committed
@@ -1457,7 +1462,7 @@ async fn history_snapshot_persists_the_session_mid_turn() {
 
     let id = h
         .app
-        .state
+        .state()
         .id
         .clone()
         .expect("the mid-turn snapshot assigned a session id");
@@ -1487,7 +1492,7 @@ async fn autosave_writes_the_state_and_it_loads_back_identically() {
     // The turn-end autosave assigned an id and wrote the file.
     let id = h
         .app
-        .state
+        .state()
         .id
         .clone()
         .expect("autosave assigned a session id");
@@ -1535,8 +1540,8 @@ async fn autosave_writes_the_state_and_it_loads_back_identically() {
     );
 
     // …as did the status bar's counters and the session's identity.
-    assert_eq!(loaded.state.usage, h.app.state.usage);
-    assert_eq!(loaded.state.model, h.app.state.model);
+    assert_eq!(loaded.state.usage, h.app.state().usage);
+    assert_eq!(loaded.state.model, h.app.state().model);
     assert_eq!(
         loaded.state.id.as_deref(),
         Some(id.as_str()),
@@ -1562,7 +1567,7 @@ async fn autosave_populates_the_subagent_transcript_dir() {
 
     let id = h
         .app
-        .state
+        .state()
         .id
         .clone()
         .expect("autosave assigned a session id");
@@ -1595,7 +1600,7 @@ async fn the_first_turn_reserves_the_session_id_before_any_tool_can_run() {
     let _data_home = isolated_data_home();
 
     let mut h = Harness::new(vec![MockReply::Text("done".into())]).await;
-    assert!(h.app.state.id.is_none(), "a fresh session has no id");
+    assert!(h.app.state().id.is_none(), "a fresh session has no id");
     assert!(h.app.subagent_dir.lock().unwrap().is_none());
 
     // Send the message but do NOT pump: the turn has been launched and nothing
@@ -1606,7 +1611,7 @@ async fn the_first_turn_reserves_the_session_id_before_any_tool_can_run() {
 
     let id = h
         .app
-        .state
+        .state()
         .id
         .clone()
         .expect("the id is reserved at turn start, before the agent runs");
@@ -1617,7 +1622,11 @@ async fn the_first_turn_reserves_the_session_id_before_any_tool_can_run() {
     );
 
     h.pump().await;
-    assert_eq!(h.app.state.id.as_deref(), Some(id.as_str()), "id is stable");
+    assert_eq!(
+        h.app.state().id.as_deref(),
+        Some(id.as_str()),
+        "id is stable"
+    );
 }
 
 /// A new session opens with the banner: an animated logo on the left and the
@@ -1795,9 +1804,9 @@ async fn a_pinned_model_and_provider_survive_a_resume() {
         // As if `--model flash --provider go` (or $HRDR_MODEL / $HRDR_PROVIDER).
         h.app.cfg.model_pinned = true;
         h.app.cfg.provider_pinned = true;
-        h.app.state.model = "flash".into();
-        h.app.state.provider = Some("go".into());
-        let launch_endpoint = h.app.state.base_url.clone();
+        h.app.state_mut().model = "flash".into();
+        h.app.state_mut().provider = Some("go".into());
+        let launch_endpoint = h.app.state().base_url.clone();
 
         let saved = hrdr_app::SessionState {
             cwd: h.app.current_cwd(),
@@ -1816,16 +1825,18 @@ async fn a_pinned_model_and_provider_survive_a_resume() {
         }
 
         assert_eq!(
-            h.app.state.model, "flash",
+            h.app.state().model,
+            "flash",
             "pinned model wins (explicit_resume={explicit_resume})"
         );
         assert_eq!(
-            h.app.state.provider.as_deref(),
+            h.app.state().provider.as_deref(),
             Some("go"),
             "pinned provider wins (explicit_resume={explicit_resume})"
         );
         assert_eq!(
-            h.app.state.base_url, launch_endpoint,
+            h.app.state().base_url,
+            launch_endpoint,
             "the endpoint belongs to this process, not the session"
         );
         // The conversation itself did come back.
@@ -1846,8 +1857,8 @@ async fn an_unpinned_model_and_provider_yield_to_the_session() {
     for explicit_resume in [false, true] {
         let mut h = Harness::new(vec![]).await;
         assert!(!h.app.cfg.model_pinned, "the harness config isn't pinned");
-        h.app.state.model = "from-config".into();
-        h.app.state.provider = None;
+        h.app.state_mut().model = "from-config".into();
+        h.app.state_mut().provider = None;
 
         let saved = hrdr_app::SessionState {
             cwd: h.app.current_cwd(),
@@ -1864,10 +1875,11 @@ async fn an_unpinned_model_and_provider_yield_to_the_session() {
         }
 
         assert_eq!(
-            h.app.state.model, "pro",
+            h.app.state().model,
+            "pro",
             "session beats config (explicit_resume={explicit_resume})"
         );
-        assert_eq!(h.app.state.provider.as_deref(), Some("zen"));
+        assert_eq!(h.app.state().provider.as_deref(), Some("zen"));
     }
 }
 
@@ -1884,7 +1896,7 @@ async fn resume_notices_do_not_accumulate() {
 
     let mut h = Harness::new(vec![MockReply::Text("ok".into())]).await;
     h.submit("hi").await;
-    let id = h.app.state.id.clone().expect("session saved");
+    let id = h.app.state().id.clone().expect("session saved");
     let cwd = h.app.current_cwd();
 
     let notices = |app: &App| {
@@ -1947,33 +1959,38 @@ async fn clear_and_new_take_a_session_name() {
     .await;
     h.submit("first message").await;
     assert_eq!(
-        h.app.state.name, "first message",
+        h.app.state().name,
+        "first message",
         "name derived from the message"
     );
 
     // Bare `/clear` starts an unnamed session.
     h.type_str("/clear");
     h.press(KeyCode::Enter);
-    assert!(h.app.state.name.is_empty(), "no name yet");
+    assert!(h.app.state().name.is_empty(), "no name yet");
     assert!(
-        h.app.state.id.is_none(),
+        h.app.state().id.is_none(),
         "detached from the old session file"
     );
 
     // `/new <name>` — the alias — names it up front.
     h.type_str("/new Project X");
     h.press(KeyCode::Enter);
-    assert_eq!(h.app.state.name, "Project X");
+    assert_eq!(h.app.state().name, "Project X");
     assert!(
-        h.app.state.id.is_none(),
+        h.app.state().id.is_none(),
         "id assigned on first save, not now"
     );
 
     // The next turn's autosave writes it under that name, slugified.
     h.submit("second message").await;
-    assert_eq!(h.app.state.name, "Project X", "the name survives the turn");
     assert_eq!(
-        h.app.state.id.as_deref(),
+        h.app.state().name,
+        "Project X",
+        "the name survives the turn"
+    );
+    assert_eq!(
+        h.app.state().id.as_deref(),
         Some("project-x"),
         "file id from the name"
     );
@@ -2244,7 +2261,7 @@ async fn user_prompts_render_like_the_models_output() {
     // The auto-derived session name echoes the first message (so it carries the
     // literal `**`); it now shows in the status bar, but this test is about the
     // transcript, so clear it to keep the `*`-free assertion focused there.
-    h.app.state.name.clear();
+    h.app.state_mut().name.clear();
 
     let mut term = Terminal::new(TestBackend::new(44, 30)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -2742,6 +2759,8 @@ async fn switching_agents_keeps_each_ones_place_and_draft() {
         label: "explore".to_string(),
         model: "haiku".to_string(),
         provider: None,
+        base_url: String::new(),
+        usage: hrdr_agent::AgentUsage::default(),
         kind: hrdr_agent::SubagentKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
@@ -2806,6 +2825,8 @@ async fn the_input_box_routes_to_the_focused_agent() {
         label: "explore".to_string(),
         model: "haiku".to_string(),
         provider: None,
+        base_url: String::new(),
+        usage: hrdr_agent::AgentUsage::default(),
         kind: hrdr_agent::SubagentKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: steering.clone(),
@@ -2839,7 +2860,7 @@ async fn the_input_box_routes_to_the_focused_agent() {
         .unwrap();
     assert!(
         sub_pane
-            .transcript
+            .transcript()
             .iter()
             .any(|e| matches!(&e.kind, EntryKind::User(t) if t == "check the auth module too")),
         "the sub-agent's transcript records what you said to it"
@@ -2864,7 +2885,7 @@ async fn the_agent_list_switches_the_focused_agent() {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
     let mut h = Harness::new(vec![]).await;
-    h.app.state.name = "my session".to_string();
+    h.app.state_mut().name = "my session".to_string();
 
     // With nothing delegated there is only the main agent, so no list at all.
     assert!(
@@ -2887,6 +2908,8 @@ async fn the_agent_list_switches_the_focused_agent() {
         label: "explore".to_string(),
         model: "haiku".to_string(),
         provider: Some("claude".to_string()),
+        base_url: String::new(),
+        usage: hrdr_agent::AgentUsage::default(),
         kind: hrdr_agent::SubagentKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
@@ -2954,6 +2977,123 @@ async fn the_agent_list_switches_the_focused_agent() {
         modifiers: crossterm::event::KeyModifiers::empty(),
     });
     assert!(h.app.panes.active().is_main(), "main is always reachable");
+}
+
+/// The status bar describes **the agent you are looking at**: its model, its
+/// provider, its context gauge, its tokens. A sub-agent runs on its own model
+/// against its own window and bills its own tokens, so a bar that always reported
+/// the main agent's figures was describing a conversation that wasn't on screen.
+///
+/// And because the bar reads the same state `/model` writes, `/model` on a
+/// sub-agent's view switches *that* agent and the bar shows it — one piece of
+/// state, not a display copy.
+#[tokio::test]
+async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.state_mut().model = "opus".to_string();
+    h.app.state_mut().provider = Some("claude".to_string());
+    h.app.state_mut().usage = hrdr_app::SessionUsage {
+        tokens_in: 5_000,
+        last_prompt_tokens: Some(5_000),
+        last_completion_tokens: Some(10),
+        context_window: Some(200_000),
+        ..Default::default()
+    };
+
+    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
+        checkpoints: Some("off".to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+    h.app.live_subagents.register(hrdr_agent::LiveSubagent {
+        key: 1,
+        bg_id: None,
+        tool_id: Some("call-1".to_string()),
+        label: "explore".to_string(),
+        model: "qwen3".to_string(),
+        provider: Some("local".to_string()),
+        base_url: "http://127.0.0.1:8080/v1".to_string(),
+        // A small local window, most of it already used — nothing like the
+        // parent's.
+        usage: hrdr_agent::AgentUsage {
+            tokens_in: 40_000,
+            tokens_out: 2_000,
+            last_prompt_tokens: Some(40_000),
+            last_completion_tokens: Some(120),
+            context_window: Some(64_000),
+            cost_usd: 0.0,
+        },
+        kind: hrdr_agent::SubagentKind::Blocking,
+        agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
+        steering: hrdr_agent::steering_queue(),
+        running: false,
+        done: true,
+        delivered: false,
+        pinned: false,
+    });
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("claude/opus") && screen.contains("200.0k"),
+        "on main, the bar shows the main agent's model and window:\n{screen}"
+    );
+
+    // Switch to the sub-agent: the bar switches with it.
+    h.app.focus_pane(hrdr_app::PaneId::Sub(1));
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("local/qwen3"),
+        "the bar shows the sub-agent's provider/model:\n{screen}"
+    );
+    assert!(
+        screen.contains("64.0k") && !screen.contains("200.0k"),
+        "and *its* context window, not the parent's:\n{screen}"
+    );
+    assert!(
+        screen.contains("↑40.0k") && screen.contains("↓2.0k"),
+        "and its own token counters:\n{screen}"
+    );
+
+    // Picking a model in `/model` now means "switch the model of *this* agent" —
+    // the same path the picker's confirm takes.
+    h.app
+        .apply_model_choice_for_test("openai", "gpt-5", Some(400_000));
+    assert_eq!(
+        h.app.active_model(),
+        "gpt-5",
+        "/model switched the agent on screen"
+    );
+    assert_eq!(
+        h.app.live_subagents.with(|v| v[0].model.clone()),
+        "gpt-5",
+        "the switch lands on the registry — the pane is rebuilt from it every \
+         frame, so a pane-only write would be silently undone"
+    );
+    assert_eq!(
+        h.app.state().model,
+        "opus",
+        "and the main agent is left alone"
+    );
+
+    // The bar follows it immediately, window and all.
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("openai/gpt-5") && screen.contains("400.0k"),
+        "the bar shows the newly-chosen model and its window:\n{screen}"
+    );
+
+    // Coming back to main restores main's chrome.
+    h.app.focus_pane(hrdr_app::PaneId::Main);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("claude/opus"),
+        "back on main, the bar is main's again:\n{screen}"
+    );
 }
 
 /// A detached sub-agent that finishes while nothing is running wakes the model:
@@ -3713,7 +3853,7 @@ async fn cancelling_a_turn_autosaves_the_in_progress_transcript() {
 
     let id = h
         .app
-        .state
+        .state()
         .id
         .clone()
         .expect("cancel_turn autosaved and assigned a session id");
@@ -3765,7 +3905,7 @@ async fn quitting_mid_turn_autosaves_the_in_progress_transcript() {
 
     let id = h
         .app
-        .state
+        .state()
         .id
         .clone()
         .expect("quitting mid-turn autosaved and assigned a session id");
@@ -4062,7 +4202,7 @@ async fn browser_login_success_switches_provider() {
         "the switch transaction closed the modal"
     );
     assert_eq!(
-        h.app.state.provider.as_deref(),
+        h.app.state().provider.as_deref(),
         Some("chatgpt"),
         "the live provider switched to ChatGPT"
     );
@@ -4219,7 +4359,7 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
     // closed tool block, not "whenever the next turn saves".
     let id = h
         .app
-        .state
+        .state()
         .id
         .clone()
         .expect("the !command's autosave assigned a session id");
@@ -4264,7 +4404,10 @@ async fn esc_cancels_a_running_user_shell_command() {
         })
     });
     assert!(noted, "the cancellation note landed with the cancel");
-    assert!(h.app.state.id.is_some(), "the cancel autosaved the session");
+    assert!(
+        h.app.state().id.is_some(),
+        "the cancel autosaved the session"
+    );
     let cancelled = h.app.transcript().iter().any(|e| {
         matches!(&e.kind, EntryKind::Tool { done: true, ok: false, result, .. }
             if result.contains("cancelled"))
@@ -4528,7 +4671,7 @@ Run the release checklist for $ARGUMENTS",
     // the turn-end autosave).
     let user = h
         .app
-        .state
+        .state()
         .messages
         .iter()
         .find(|m| m.role == hrdr_agent::MessageRole::User)

@@ -16,66 +16,29 @@ use serde::{Deserialize, Serialize};
 
 const SESSION_VERSION: u32 = 1;
 
-/// The token counters the status bar shows, persisted so a resumed session picks
-/// up where it left off instead of restarting from zero.
+/// The token counters the status bar shows, persisted so a resumed conversation
+/// picks up where it left off instead of restarting from zero.
 ///
-/// `tokens_in`/`tokens_out` accumulate over every model call of the session.
-/// `last_prompt_tokens`/`last_completion_tokens` are the most recent call's
-/// usage — the prompt half is the live context size ("X of Y"). `context_window`
-/// is the model's advertised maximum, kept so the "of Y" is right immediately on
-/// resume, before the endpoint has been re-probed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
-pub struct SessionUsage {
-    #[serde(default)]
-    pub tokens_in: usize,
-    #[serde(default)]
-    pub tokens_out: usize,
-    /// Estimated USD spent this session (all model calls, incl. sub-agents),
-    /// priced from the models.dev catalog; 0 when nothing was priceable.
-    #[serde(default)]
-    pub cost_usd: f64,
-    #[serde(default)]
-    pub last_prompt_tokens: Option<u32>,
-    #[serde(default)]
-    pub last_completion_tokens: Option<u32>,
-    #[serde(default)]
-    pub context_window: Option<u32>,
-}
+/// These belong to the **agent**, not to the session — every agent makes its own
+/// calls, fills its own window, and costs its own money — so the type lives in
+/// `hrdr-agent` ([`hrdr_agent::AgentUsage`]) where a sub-agent's counters are
+/// kept with no frontend attached. This alias is the name the session file and
+/// the status bar know it by.
+pub use hrdr_agent::AgentUsage as SessionUsage;
 
-impl SessionUsage {
-    /// The latest call's `(prompt, completion)` usage — the shape the frontends
-    /// hold it in — or `None` when no call has reported usage yet.
-    pub fn last(&self) -> Option<(u32, u32)> {
-        Some((self.last_prompt_tokens?, self.last_completion_tokens?))
-    }
-
-    /// Record the latest call's usage (`None` clears it, e.g. after `/clear`).
-    pub fn set_last(&mut self, last: Option<(u32, u32)>) {
-        self.last_prompt_tokens = last.map(|(p, _)| p);
-        self.last_completion_tokens = last.map(|(_, c)| c);
-    }
-
-    /// Accumulate one model call: add to the running totals and remember it as
-    /// the latest.
-    pub fn record_call(&mut self, prompt: u32, completion: u32) {
-        self.tokens_in += prompt as usize;
-        self.tokens_out += completion as usize;
-        self.set_last(Some((prompt, completion)));
-    }
-
-    /// The live context size — the last call's prompt tokens.
-    pub fn ctx_used(&self) -> usize {
-        self.last_prompt_tokens.unwrap_or(0) as usize
-    }
-}
-
-/// Everything about a live conversation that outlives the process: what the
-/// user saw, what the model saw, and the counters the status bar reads.
+/// Everything about **one agent's** conversation that outlives the process: what
+/// the user saw, what the model saw, which endpoint/model it ran on, and the
+/// counters its status bar reads.
 ///
-/// This is the single in-memory state a frontend keeps and the exact payload a
-/// session file stores — [`Session`] wraps it with file metadata and nothing
-/// else. Loading a session is an assignment; saving one is a serialize. There is
-/// no lossy rebuild step, and no parallel vectors to keep in sync.
+/// This is the single in-memory state a frontend keeps *per agent* and the exact
+/// payload a state file stores — [`Session`] wraps it with file metadata and
+/// nothing else. Loading is an assignment; saving is a serialize. There is no
+/// lossy rebuild step, and no parallel vectors to keep in sync.
+///
+/// Every [`crate::Pane`] owns one, main and sub-agent alike: a delegated
+/// sub-agent has a name, a model, a provider, a history and a token bill exactly
+/// as the main agent does, and the only thing that made the main one special was
+/// that it was the one the frontend happened to store.
 ///
 /// `messages` and `todos` mirror state whose runtime owners are the `Agent` and
 /// the `todo` tool respectively; [`SessionState::sync_from`] refreshes them

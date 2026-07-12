@@ -24,26 +24,22 @@ pub trait CommandHost {
     }
     /// The agent a command **acts on**: the one the user is looking at.
     ///
-    /// A command that inspects or changes *a conversation* — `/compact`, `/tools`,
-    /// `/prompt`, `/status`, `/temp`, `/doctor` — should act on the agent on
+    /// A command that inspects or changes *a conversation* — `/compact`, `/model`,
+    /// `/tools`, `/prompt`, `/status`, `/temp`, `/doctor` — acts on the agent on
     /// screen, exactly as the input box does. A frontend that shows only one agent
     /// simply returns it.
     fn agent(&self) -> Arc<Mutex<Agent>>;
 
-    /// The **session's own** agent, whichever one is being viewed.
-    ///
-    /// For the few commands that are the session's rather than a conversation's:
-    /// switching the session's model/provider is tied to the saved session and the
-    /// chrome that displays it, so it must not repoint whichever sub-agent happens
-    /// to be on screen. Defaults to [`Self::agent`], which is correct for a
-    /// frontend with a single agent.
-    fn session_agent(&self) -> Arc<Mutex<Agent>> {
-        self.agent()
-    }
     /// Working directory the tools operate in.
     fn cwd(&self) -> PathBuf;
     /// Current endpoint base URL (recorded into saved sessions).
     fn base_url(&self) -> String;
+
+    // The chrome below describes **the agent `agent()` returns** — the one on
+    // screen. `set_model` and friends must therefore write to *that* agent's
+    // state, not to a display copy of the session's: `/model` in a sub-agent's
+    // view switches that sub-agent, and the status bar shows it because it is
+    // reading the very same state.
 
     /// The displayed model name.
     fn model(&self) -> String;

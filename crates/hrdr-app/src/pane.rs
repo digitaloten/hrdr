@@ -15,7 +15,7 @@
 
 use hrdr_agent::{AgentEvent, LiveSubagents};
 
-use crate::{Entry, EntryKind};
+use crate::{Entry, EntryKind, SessionState};
 
 /// Which conversation a pane is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,16 +56,15 @@ pub enum PaneStatus {
 /// One addressable conversation.
 pub struct Pane {
     pub id: PaneId,
-    /// Row label: the session name for main, the task description for a sub.
-    pub title: String,
-    /// Model this pane's agent is on (shown on its row).
-    pub model: String,
     pub status: PaneStatus,
-    /// The pane's own transcript, built by [`apply_event`]. Every pane owns its
-    /// transcript, main included — the session's saved transcript is refreshed
-    /// *from* the main pane at save time (the same way `SessionState` refreshes
-    /// its message mirror from the agent), so there is exactly one live copy.
-    pub transcript: Vec<Entry>,
+    /// **This agent's own state**: its name, the model/provider/endpoint it runs
+    /// on, its chat history, its transcript, its token and cost counters.
+    ///
+    /// The same type the session file stores, held by every pane — because a
+    /// sub-agent has all of those things too. It is what makes the status bar able
+    /// to describe *the agent you are looking at* rather than always describing the
+    /// main one, and what a sub-agent's own state file will serialize.
+    pub state: SessionState,
     /// Where the reader is in this conversation, and what they had half-typed to
     /// it.
     ///
@@ -86,9 +85,34 @@ pub struct PaneView {
 }
 
 impl Pane {
-    /// Fold one of this pane's agent events into its transcript.
+    /// Fold one of this pane's agent events into its transcript *and* its
+    /// counters — the two things an event says about the agent it came from.
     pub fn apply(&mut self, ev: &AgentEvent) {
-        apply_event(&mut self.transcript, ev);
+        apply_event(&mut self.state.transcript, ev);
+        self.state.usage.record_event(ev);
+    }
+
+    /// This pane's live transcript.
+    pub fn transcript(&self) -> &Vec<Entry> {
+        &self.state.transcript
+    }
+
+    pub fn transcript_mut(&mut self) -> &mut Vec<Entry> {
+        &mut self.state.transcript
+    }
+
+    /// Row label: the session name for main, the task description for a sub. An
+    /// unnamed main session (nothing sent yet) reads as "main".
+    pub fn title(&self) -> &str {
+        match (&self.state.name, self.id) {
+            (n, PaneId::Main) if n.is_empty() => "main",
+            (n, _) => n,
+        }
+    }
+
+    /// The model this pane's agent is on.
+    pub fn model(&self) -> &str {
+        &self.state.model
     }
 }
 
@@ -209,10 +233,8 @@ impl Default for PaneSet {
         Self {
             main: Pane {
                 id: PaneId::Main,
-                title: "main".to_string(),
-                model: String::new(),
                 status: PaneStatus::Idle,
-                transcript: Vec::new(),
+                state: SessionState::default(),
                 view: PaneView::default(),
             },
             subs: Vec::new(),
@@ -242,28 +264,12 @@ impl PaneSet {
 
     /// The transcript currently on screen: whichever pane is active.
     pub fn active_transcript(&self) -> &Vec<Entry> {
-        match self.active {
-            PaneId::Main => &self.main.transcript,
-            PaneId::Sub(k) => self
-                .subs
-                .iter()
-                .find(|p| p.id == PaneId::Sub(k))
-                .map_or(&self.main.transcript, |p| &p.transcript),
-        }
+        self.active_pane().transcript()
     }
 
     /// Mutable access to the transcript on screen (per-entry `/expand`, etc.).
     pub fn active_transcript_mut(&mut self) -> &mut Vec<Entry> {
-        match self.active {
-            PaneId::Main => &mut self.main.transcript,
-            PaneId::Sub(k) => {
-                if let Some(i) = self.subs.iter().position(|p| p.id == PaneId::Sub(k)) {
-                    &mut self.subs[i].transcript
-                } else {
-                    &mut self.main.transcript
-                }
-            }
-        }
+        self.active_pane_mut().transcript_mut()
     }
 
     /// Whether the agent switcher should be shown at all. With nothing delegated
@@ -332,44 +338,58 @@ impl PaneSet {
     /// thing that says "someone is still reading this one".
     pub fn sync(&mut self, live: &LiveSubagents) {
         let active_key = self.active.key();
-        let seen: Vec<(u64, String, String, bool, bool)> = live.with(|v| {
+        let seen: Vec<LiveSnapshot> = live.with(|v| {
             for e in v.iter_mut() {
                 e.pinned = Some(e.key) == active_key;
             }
             v.iter()
-                .map(|e| (e.key, e.label.clone(), e.model.clone(), e.running, e.done))
+                .map(|e| LiveSnapshot {
+                    key: e.key,
+                    label: e.label.clone(),
+                    model: e.model.clone(),
+                    provider: e.provider.clone(),
+                    base_url: e.base_url.clone(),
+                    usage: e.usage,
+                    running: e.running,
+                    done: e.done,
+                })
                 .collect()
         });
 
-        // Adopt newly delegated sub-agents, refresh the status of known ones.
-        for (key, label, model, running, done) in &seen {
-            let status = match (running, done) {
+        // Adopt newly delegated sub-agents, and refresh what the registry owns for
+        // the ones already known: its model/provider/endpoint (a `/model` switch
+        // repoints the entry) and its usage (the agent counts its own tokens,
+        // whether or not anyone was watching this pane while it worked).
+        for s in &seen {
+            let status = match (s.running, s.done) {
                 (true, _) => PaneStatus::Running,
                 (false, true) => PaneStatus::Done,
                 (false, false) => PaneStatus::Idle,
             };
-            match self.sub_mut(*key) {
-                Some(p) => {
-                    p.status = status;
-                    p.title = label.clone();
+            let pane = match self.sub_mut(s.key) {
+                Some(p) => p,
+                None => {
+                    self.subs.push(Pane {
+                        id: PaneId::Sub(s.key),
+                        status,
+                        state: SessionState::default(),
+                        view: PaneView::default(),
+                    });
+                    self.subs.last_mut().expect("just pushed")
                 }
-                None => self.subs.push(Pane {
-                    id: PaneId::Sub(*key),
-                    title: label.clone(),
-                    model: model.clone(),
-                    status,
-                    transcript: Vec::new(),
-                    view: PaneView::default(),
-                }),
-            }
+            };
+            pane.status = status;
+            pane.state.name = s.label.clone();
+            pane.state.model = s.model.clone();
+            pane.state.provider = s.provider.clone();
+            pane.state.base_url = s.base_url.clone();
+            pane.state.usage = s.usage;
         }
 
         // Drop panes whose sub-agent the agent has released. The active one is
         // pinned above, so it cannot vanish from under the user mid-read.
-        self.subs.retain(|p| {
-            p.id.key()
-                .is_some_and(|k| seen.iter().any(|(s, ..)| *s == k))
-        });
+        self.subs
+            .retain(|p| p.id.key().is_some_and(|k| seen.iter().any(|s| s.key == k)));
 
         // If the active pane was released anyway (it was never live), fall back.
         if let Some(k) = self.active.key()
@@ -378,6 +398,19 @@ impl PaneSet {
             self.active = PaneId::Main;
         }
     }
+}
+
+/// What [`PaneSet::sync`] reads off one registry entry, taken under the lock and
+/// applied to the pane outside it.
+struct LiveSnapshot {
+    key: u64,
+    label: String,
+    model: String,
+    provider: Option<String>,
+    base_url: String,
+    usage: crate::SessionUsage,
+    running: bool,
+    done: bool,
 }
 
 /// One row of the pane switcher: the main agent first, then each sub-agent.
@@ -392,19 +425,15 @@ pub struct PaneRow {
 
 /// The switcher's rows. Main is always first — it is how you get back.
 pub fn pane_rows(panes: &PaneSet) -> Vec<PaneRow> {
-    let mut rows = vec![PaneRow {
-        id: PaneId::Main,
-        title: panes.main().title.clone(),
-        status: panes.main().status,
-        active: panes.active().is_main(),
-    }];
-    rows.extend(panes.subs().iter().map(|p| PaneRow {
-        id: p.id,
-        title: p.title.clone(),
-        status: p.status,
-        active: panes.active() == p.id,
-    }));
-    rows
+    std::iter::once(panes.main())
+        .chain(panes.subs())
+        .map(|p| PaneRow {
+            id: p.id,
+            title: p.title().to_string(),
+            status: p.status,
+            active: panes.active() == p.id,
+        })
+        .collect()
 }
 
 /// The marker a row shows: running spinner, finished tick, or idle dot.
@@ -509,12 +538,59 @@ mod tests {
     #[test]
     fn main_is_always_the_first_row_so_you_can_get_back() {
         let mut panes = PaneSet::new();
-        panes.main_mut().title = "my session".to_string();
+        let rows = pane_rows(&panes);
+        assert_eq!(rows[0].title, "main", "an unnamed session reads as main");
+
+        panes.main_mut().state.name = "my session".to_string();
         let rows = pane_rows(&panes);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, PaneId::Main);
         assert!(rows[0].active, "main is active by default");
         assert_eq!(rows[0].title, "my session");
+    }
+
+    /// Each pane carries *its own* agent's model, provider, endpoint and token
+    /// counters — which is what lets a status bar describe the agent being viewed
+    /// instead of always describing the main one.
+    #[test]
+    fn a_pane_carries_its_own_agents_model_and_counters() {
+        let live = live_with(&[1]);
+        live.update(1, |e| {
+            e.model = "haiku".into();
+            e.provider = Some("claude".into());
+            e.base_url = "https://api.anthropic.com/v1".into();
+            e.usage = hrdr_agent::AgentUsage {
+                tokens_in: 900,
+                tokens_out: 40,
+                last_prompt_tokens: Some(900),
+                last_completion_tokens: Some(40),
+                context_window: Some(64_000),
+                cost_usd: 0.01,
+            };
+        });
+
+        let mut panes = PaneSet::new();
+        panes.main_mut().state.model = "opus".to_string();
+        panes.sync(&live);
+
+        // Looking at main: main's model.
+        assert_eq!(panes.active_pane().model(), "opus");
+        assert_eq!(panes.active_pane().state.usage.ctx_used(), 0);
+
+        // Looking at the sub-agent: *its* model, endpoint, window and tokens.
+        panes.focus(PaneId::Sub(1));
+        let p = panes.active_pane();
+        assert_eq!(p.model(), "haiku");
+        assert_eq!(p.state.provider.as_deref(), Some("claude"));
+        assert_eq!(p.state.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(p.state.usage.ctx_used(), 900);
+        assert_eq!(p.state.usage.context_window, Some(64_000));
+        assert_eq!(p.state.usage.tokens_out, 40);
+        assert_eq!(p.state.usage.cost_usd, 0.01);
+
+        // And the main agent's own counters are untouched by any of it.
+        assert_eq!(panes.main().state.usage.tokens_in, 0);
+        assert_eq!(panes.main().model(), "opus");
     }
 
     /// A fresh session has only the main agent, and a one-row list of the thing
@@ -545,7 +621,7 @@ mod tests {
     fn the_main_pane_owns_the_session_transcript() {
         let mut panes = PaneSet::new();
         apply_event(
-            &mut panes.main_mut().transcript,
+            panes.main_mut().transcript_mut(),
             &AgentEvent::Text("hi".into()),
         );
         assert_eq!(
@@ -604,6 +680,8 @@ mod tests {
                 label: format!("task {key}"),
                 model: "m".to_string(),
                 provider: None,
+                base_url: String::new(),
+                usage: hrdr_agent::AgentUsage::default(),
                 kind: SubagentKind::Blocking,
                 agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
                 steering: hrdr_agent::steering_queue(),

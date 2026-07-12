@@ -35,11 +35,13 @@ pub use subagent_live::{
     LiveSubagent, LiveSubagents, PromptDelivery, RunGuard, SubagentKind, age_completed_todos,
 };
 mod subagent_transcript;
+mod usage;
 pub use models::{
     AvailableModel, ModelChoice, ModelSource, available_models, builtin_catalog_key,
     chatgpt_model_choices, filter_model_choices, load_last_model, load_model_usage,
     merge_chatgpt_choices, model_choices, record_last_model, record_model_use,
 };
+pub use usage::AgentUsage;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -576,6 +578,11 @@ fn spawn_background(
     let label_for_live = label.clone();
     let model_for_live = cfg.model.clone();
     let provider_for_live = cfg.provider.clone();
+    let base_url_for_live = cfg.base_url.clone();
+    let usage_for_live = AgentUsage {
+        context_window: cfg.context_window,
+        ..Default::default()
+    };
     if let Ok(mut v) = registry.lock() {
         v.push(hrdr_tools::BackgroundTask {
             id,
@@ -641,6 +648,8 @@ fn spawn_background(
                     label: label_for_live,
                     model: model_for_live,
                     provider: provider_for_live,
+                    base_url: base_url_for_live,
+                    usage: usage_for_live,
                     kind: SubagentKind::Background,
                     agent: Arc::clone(&sub),
                     steering: Arc::clone(&steering),
@@ -650,8 +659,12 @@ fn spawn_background(
                     pinned: false,
                 });
                 let _run_guard = RunGuard::new(live.clone(), live_key);
+                let usage_live = live.clone();
                 let mut sub = sub.lock().await;
                 sub.run(prompt, steering, |ev| {
+                    // Its delegated run's tokens are its own — counted on its entry,
+                    // exactly as a turn the user drives on it later would be.
+                    usage_live.record_usage(live_key, &ev);
                     if let Ok(mut g) = ts_inner.lock()
                         && let Some(t) = g.as_mut()
                         && let Some(tev) = subagent_event_for(&ev)
@@ -1466,6 +1479,11 @@ impl hrdr_tools::Tool for SubagentTool {
 
         // Captured before `cfg` is moved into the sub-agent.
         let provider_for_run = cfg.provider.clone();
+        let base_url_for_live = cfg.base_url.clone();
+        let usage_for_live = AgentUsage {
+            context_window: cfg.context_window,
+            ..Default::default()
+        };
         let mut sub =
             Agent::new(cfg).with_context(|| format!("creating sub-agent (model={model})"))?;
         sub.cost_total = Arc::clone(&self.cost_total);
@@ -1487,6 +1505,8 @@ impl hrdr_tools::Tool for SubagentTool {
             label: label.clone(),
             model: model.clone(),
             provider: cfg_provider,
+            base_url: base_url_for_live,
+            usage: usage_for_live,
             kind: SubagentKind::Blocking,
             agent: Arc::clone(&sub),
             steering: Arc::clone(&steering),
@@ -1499,10 +1519,14 @@ impl hrdr_tools::Tool for SubagentTool {
         // Cancelling the parent turn drops this future mid-`await`; the guard is
         // what marks the sub-agent idle in that case.
         let _run_guard = RunGuard::new(self.live.clone(), key);
+        let usage_live = self.live.clone();
         let mut output = String::new();
         let mut sub_guard = sub.lock().await;
         let run = sub_guard
             .run(prompt, steering, |ev| {
+                // Its tokens are its own: counted on its entry, so a frontend
+                // showing this agent shows *its* context and cost, not the parent's.
+                usage_live.record_usage(key, &ev);
                 if let Some(t) = transcript.as_mut()
                     && let Some(tev) = subagent_event_for(&ev)
                 {
