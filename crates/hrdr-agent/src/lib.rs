@@ -691,6 +691,12 @@ fn spawn_background(
                 format!("(background task panicked: {join_err})")
             }
             Err(_) => {
+                // Defensive: today's only cancel path (`abort_background_tasks`)
+                // aborts the outer guard, which detaches from `inner` without
+                // cancelling it — so `inner` runs on to its own Ok/Failed `End`
+                // (or is dropped as an orphan on process exit) and this arm isn't
+                // reached. It records a terminal `End` for any future path that
+                // cancels the inner task directly.
                 if let Ok(mut g) = ts_outer.lock()
                     && let Some(t) = g.as_mut()
                 {
