@@ -31,7 +31,7 @@ mod paths;
 pub use paths::cwd_slug;
 mod models;
 mod subagent_live;
-pub use subagent_live::{LiveSubagent, LiveSubagents, SubagentKind};
+pub use subagent_live::{LiveSubagent, LiveSubagents, RunGuard, SubagentKind};
 mod subagent_transcript;
 pub use models::{
     AvailableModel, ModelChoice, ModelSource, available_models, builtin_catalog_key,
@@ -645,6 +645,7 @@ fn spawn_background(
                     delivered: false,
                     pinned: false,
                 });
+                let _run_guard = RunGuard::new(live.clone(), live_key);
                 let mut sub = sub.lock().await;
                 sub.run(prompt, steering, |ev| {
                     if let Ok(mut g) = ts_inner.lock()
@@ -990,7 +991,12 @@ fn repoint_to_provider(
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    cfg.context_window = p.context_window;
+    // Only when the preset actually declares one: most built-ins carry `None`, and
+    // overwriting an inherited (probed) window with `None` would blind the agent to
+    // how full it is — silently disabling its own compaction.
+    if p.context_window.is_some() {
+        cfg.context_window = p.context_window;
+    }
     cfg.provider = Some(pname.to_string());
     if let Some(m) = model_override {
         cfg.model = m.to_string();
@@ -1479,6 +1485,9 @@ impl hrdr_tools::Tool for SubagentTool {
             pinned: false,
         });
 
+        // Cancelling the parent turn drops this future mid-`await`; the guard is
+        // what marks the sub-agent idle in that case.
+        let _run_guard = RunGuard::new(self.live.clone(), key);
         let mut output = String::new();
         let mut sub_guard = sub.lock().await;
         let run = sub_guard
@@ -3288,8 +3297,16 @@ pub struct Agent {
     /// ([`AgentConfig::compaction_reserved`]).
     compaction_reserved: u32,
     /// The model's context window, when known — the denominator for the
-    /// compaction trigger.
+    /// compaction trigger. Learned lazily by [`Agent::ensure_context_window`] when
+    /// the config did not carry one, and cleared on every model/provider change.
     context_window: Option<u32>,
+    /// We have already tried to discover `context_window` for the current model.
+    /// Stops a provider that reports nothing from being re-probed every round.
+    context_window_probed: bool,
+    /// A self-compaction attempt failed for this history. Latched so a summariser
+    /// that fails for a non-transient reason (a 401, a model that refuses the
+    /// request) is not retried on every subsequent round of the turn.
+    self_compact_failed: bool,
     /// Recent turns kept verbatim through compaction ([`AgentConfig::compaction_tail_turns`]).
     compaction_tail_turns: usize,
     /// Token budget for the kept-verbatim compaction tail
@@ -3742,6 +3759,9 @@ impl Agent {
             auto_compact: config.auto_compact,
             compaction_reserved: config.compaction_reserved,
             context_window: config.context_window,
+            // A config-supplied window is authoritative; otherwise we go looking.
+            context_window_probed: config.context_window.is_some(),
+            self_compact_failed: false,
             compaction_tail_turns: config.compaction_tail_turns,
             preserve_recent_tokens: config.preserve_recent_tokens,
             project_docs,
@@ -3957,6 +3977,8 @@ impl Agent {
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.client.model = model.into();
         self.cost_rates = None;
+        // A different model has a different window; the old figure is not ours.
+        self.invalidate_context_window();
         self.publish_delegation_runtime();
     }
 
@@ -3965,6 +3987,7 @@ impl Agent {
     pub fn set_provider(&mut self, provider: Option<String>) {
         self.provider = provider;
         self.cost_rates = None;
+        self.invalidate_context_window();
         self.publish_delegation_runtime();
     }
 
@@ -4037,6 +4060,19 @@ impl Agent {
         hrdr_llm::catalog::context_window(self.provider.as_deref(), &self.client.model).await
     }
 
+    /// Tell the agent its context window — e.g. a frontend that probed the
+    /// endpoint for its status bar can hand the figure over instead of making the
+    /// agent probe again. The agent discovers it on its own if nobody does.
+    pub fn set_context_window(&mut self, window: Option<u32>) {
+        self.context_window = window;
+        self.context_window_probed = window.is_some();
+    }
+
+    /// The context window in force, if known.
+    pub fn context_window(&self) -> Option<u32> {
+        self.context_window
+    }
+
     /// Working directory the tools operate in.
     pub fn cwd(&self) -> std::path::PathBuf {
         self.ctx.cwd.clone()
@@ -4104,6 +4140,7 @@ impl Agent {
             self.client.model = model;
         }
         self.cost_rates = None;
+        self.invalidate_context_window();
 
         let mut runtime = self
             .delegation_runtime
@@ -4242,6 +4279,11 @@ impl Agent {
     /// `(messages_before, messages_after)`; a no-op when there's nothing beyond
     /// the system prompt and one message.
     pub async fn compact(&mut self, instructions: Option<&str>) -> Result<(usize, usize)> {
+        // Whatever the outcome, the last prompt reading describes the history as it
+        // was *before* this call. Clearing it here (rather than in one caller) stops
+        // a frontend-driven `/compact` from leaving a stale, over-the-trigger figure
+        // that makes the agent immediately compact the history it just compacted.
+        self.last_prompt_tokens = None;
         let before = self.messages.len();
         if before <= 2 {
             return Ok((before, before));
@@ -4565,6 +4607,7 @@ impl Agent {
                 // steering redirects work in progress, it doesn't extend a turn
                 // the model already finished.
                 self.fire_turn_end_hooks(&mut on_event).await;
+                self.release_finished_subagents();
                 on_event(AgentEvent::TurnDone);
                 return Ok(());
             }
@@ -4599,12 +4642,6 @@ impl Agent {
             // here on loses at most the next round.
             on_event(AgentEvent::History(self.messages.clone()));
 
-            // Release sub-agents whose work is done, whose answers the main agent
-            // has, and that nobody is looking at. Doing it here — rather than
-            // leaving it to the frontend — means a frontend that never pins (the
-            // headless CLI, a test) cannot leak sub-agents by not participating.
-            self.live_subagents.prune();
-
             // Near the budget: tell the model so it wraps up instead of
             // getting cut off mid-plan.
             let remaining = self.max_steps - step - 1;
@@ -4635,6 +4672,7 @@ impl Agent {
             .await?;
         self.messages.push(acc.into_message());
         self.fire_turn_end_hooks(&mut on_event).await;
+        self.release_finished_subagents();
         on_event(AgentEvent::TurnDone);
         Ok(())
     }
@@ -4661,6 +4699,13 @@ impl Agent {
     /// Failure is non-fatal: if the summarising call fails, the turn proceeds and
     /// overflow recovery is still there to catch it.
     async fn maybe_self_compact<F: FnMut(AgentEvent)>(&mut self, on_event: &mut F) {
+        if !self.auto_compact || self.self_compact_failed || self.last_prompt_tokens.is_none() {
+            return;
+        }
+        // Learn our own window before judging how full it is. Without this the
+        // trigger is `None` for most agents and this whole path is dead code —
+        // exactly for the small-context models it exists to protect.
+        self.ensure_context_window();
         if !should_auto_compact(
             self.last_prompt_tokens,
             self.context_window,
@@ -4670,23 +4715,73 @@ impl Agent {
             return;
         }
         match self.compact(None).await {
+            // `compact` clears `last_prompt_tokens` itself: the reading described
+            // the history we just replaced, and leaving it set would re-trigger on
+            // the next round against a history that is already small.
             Ok((before, after)) if before != after => {
-                // The old reading described the pre-compaction history; keep it
-                // from re-triggering on the next round before fresh usage lands.
-                self.last_prompt_tokens = None;
                 on_event(AgentEvent::Notice(format!(
                     "context was filling up — compacted {before} → {after} messages"
                 )));
             }
-            Ok(_) => {
-                // Nothing to compact (the history is already minimal) — clear the
-                // reading anyway so we don't retry this every round.
-                self.last_prompt_tokens = None;
+            Ok(_) => {}
+            Err(e) => {
+                // Don't retry a summariser that failed for a reason a retry won't
+                // fix: it would burn a model call and a notice on every round.
+                // Overflow recovery is still there if the context really is too big.
+                self.self_compact_failed = true;
+                on_event(AgentEvent::Notice(format!(
+                    "could not compact a filling context ({e}) — continuing"
+                )));
             }
-            Err(e) => on_event(AgentEvent::Notice(format!(
-                "could not compact a filling context: {e}"
-            ))),
         }
+    }
+
+    /// Release sub-agents whose work is done, whose answers the main agent has,
+    /// and that nobody is looking at.
+    ///
+    /// At **turn end**, not per tool round. A blocking sub-agent is marked done and
+    /// delivered inside the very round that spawned it (its answer *is* the tool
+    /// result), so pruning mid-loop dropped it before the user could so much as see
+    /// its row — the retained agent was unreachable in practice unless they were
+    /// already looking at it. Holding until the turn ends gives the frontend the
+    /// whole turn to pin the one being read.
+    ///
+    /// Running inside the agent, rather than leaving it to the frontend, is what
+    /// keeps a headless run (which pins nothing) from leaking agents.
+    fn release_finished_subagents(&mut self) {
+        self.live_subagents.prune();
+    }
+
+    /// Learn this agent's context window if the config did not supply one, using
+    /// the **local model catalog only**.
+    ///
+    /// The agent has always been *able* to ask the endpoint
+    /// ([`Agent::probe_context_window`]) but never did so for itself — only
+    /// frontends probed, and they kept the answer in frontend state. So a headless
+    /// run, and every delegated sub-agent, had `context_window: None` and could
+    /// never work out that it was full.
+    ///
+    /// Deliberately no HTTP here: this runs inside a turn, and firing an
+    /// out-of-band request at the endpoint mid-turn is a surprise nobody asked for
+    /// (it also interleaves with the very stream we are about to open). Endpoint
+    /// probing stays where it belongs — at the edges, in `Agent::new`'s caller and
+    /// on a provider switch — and whoever does it hands the figure over with
+    /// [`Agent::set_context_window`]. Consulted once per model.
+    fn ensure_context_window(&mut self) {
+        if self.context_window_probed {
+            return;
+        }
+        self.context_window_probed = true;
+        self.context_window =
+            hrdr_llm::catalog::context_window_cached(self.provider.as_deref(), &self.client.model);
+    }
+
+    /// Forget what we knew about the window — the model or endpoint changed, so
+    /// the old figure describes a different model. It is re-learned on demand.
+    fn invalidate_context_window(&mut self) {
+        self.context_window = None;
+        self.context_window_probed = false;
+        self.self_compact_failed = false;
     }
 
     async fn fire_turn_end_hooks<F: FnMut(AgentEvent)>(&self, on_event: &mut F) {
@@ -5828,6 +5923,93 @@ mod tests {
         assert!(
             sub.auto_prune,
             "cheap tool-output pruning is not compaction"
+        );
+        // And so does context management: compaction is a *window* concern, not a
+        // session one. A sub-agent reading a codebase on a 64k local model fills
+        // its window like anything else, and nothing is watching it.
+        assert!(
+            sub.auto_compact,
+            "a sub-agent still compacts when it fills up"
+        );
+    }
+
+    /// A provider preset that declares no window must not erase one the agent
+    /// already knows.
+    ///
+    /// Most built-ins carry `context_window: None`, and `repoint_to_provider`
+    /// assigned it unconditionally — so a sub-agent repointed to one had its
+    /// inherited (probed) window clobbered to `None`. `should_auto_compact` is
+    /// `false` whenever the window is unknown, so self-compaction became dead code
+    /// precisely where it was needed: a small local model.
+    #[test]
+    fn repointing_to_a_provider_does_not_erase_a_known_context_window() {
+        use super::{builtin_provider, repoint_to_provider, should_auto_compact};
+        let mut cfg = AgentConfig {
+            base_url: "http://localhost:8080/v1".to_string(),
+            model: "local-64k".to_string(),
+            provider: Some("local".to_string()),
+            // Probed at startup: this agent knows it has a small window.
+            context_window: Some(64_000),
+            ..Default::default()
+        };
+        // `local`, like most built-ins, declares no window of its own.
+        assert!(builtin_provider("local").unwrap().context_window.is_none());
+
+        repoint_to_provider(&mut cfg, "local", Some("other-local")).unwrap();
+        assert_eq!(
+            cfg.context_window,
+            Some(64_000),
+            "a preset with no opinion must not blind the agent to its own window"
+        );
+        assert!(
+            should_auto_compact(Some(60_000), cfg.context_window, 16_384, true),
+            "so it can still tell that it is nearly full"
+        );
+
+        // A preset that *does* declare one still wins.
+        repoint_to_provider(&mut cfg, "chatgpt", Some("gpt-5.5")).unwrap();
+        assert_eq!(cfg.context_window, Some(400_000));
+    }
+
+    /// Compacting must clear the last prompt reading, whoever triggered it.
+    ///
+    /// The reading describes the history that was just replaced. Left in place, a
+    /// frontend-driven `/compact` (or the TUI's threshold pass) hands the agent a
+    /// stale, over-the-trigger figure — and on its very next round the agent
+    /// compacts the history it just compacted: a second summarising model call and
+    /// a second notice, for nothing.
+    #[tokio::test]
+    async fn compacting_clears_the_stale_prompt_reading() {
+        use super::should_auto_compact;
+        let mut agent = Agent::new(AgentConfig {
+            context_window: Some(64_000),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        agent.last_prompt_tokens = Some(60_000);
+        assert!(should_auto_compact(
+            agent.last_prompt_tokens,
+            agent.context_window,
+            agent.compaction_reserved,
+            true
+        ));
+
+        // Nothing to summarise (system prompt only), so this is a no-op compaction
+        // — but it must still retire the reading.
+        let _ = agent.compact(None).await;
+        assert_eq!(
+            agent.last_prompt_tokens, None,
+            "the reading described a history that no longer exists"
+        );
+        assert!(
+            !should_auto_compact(
+                agent.last_prompt_tokens,
+                agent.context_window,
+                agent.compaction_reserved,
+                true
+            ),
+            "so the agent does not immediately re-compact"
         );
     }
 

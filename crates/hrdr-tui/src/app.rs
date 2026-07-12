@@ -1746,6 +1746,14 @@ impl App {
                 // A model/provider switch re-probed the endpoint; honor the new
                 // advertised max (drives "X of Y" + the auto-compaction trigger).
                 self.state.usage.context_window = Some(tokens);
+                // Hand it to the agent as well. The probe is the only place this
+                // figure exists, and keeping it in frontend state is what left the
+                // agent unable to tell how full it was — so it could never compact
+                // itself, and nor could any sub-agent that inherited from it.
+                let agent = self.agent.clone();
+                tokio::spawn(async move {
+                    agent.lock().await.set_context_window(Some(tokens));
+                });
             }
             TurnMsg::BrowserLogin(outcome) => self.on_browser_login(outcome),
             TurnMsg::ModelCatalog {

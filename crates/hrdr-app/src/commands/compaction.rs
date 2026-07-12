@@ -7,28 +7,16 @@ use tokio::sync::Mutex;
 /// lock the agent and summarize. `Ok((before, after))` with `before == after`
 /// means there was nothing to compact.
 ///
-/// **Session-scoped.** Compaction manages the conversation the *user* owns and
-/// returns to. It is refused for a delegated sub-agent: that history is
-/// short-lived, nobody resumes it, and summarising it mid-task only costs a model
-/// call and loses fidelity the parent is waiting on. This is the structural guard
-/// — a frontend that lets you drive a sub-agent pane goes through here too, so it
-/// cannot compact one by accident.
-///
-/// Overflow recovery is a different thing and still applies to sub-agents: the
-/// agent compacts itself inside `connect_and_drain` when a request would
-/// otherwise fail outright, rescuing the task rather than losing it.
+/// Works on any agent, main or delegated. Compaction is a *context-window*
+/// concern, not a session one: a sub-agent reading its way through a codebase on
+/// a small local model fills its window like anything else, and it compacts
+/// itself as it goes ([`hrdr_agent::Agent::maybe_self_compact`]) because nothing
+/// else is watching its usage.
 pub async fn run_compaction(
     agent: Arc<Mutex<Agent>>,
     instructions: Option<String>,
 ) -> Result<(usize, usize), String> {
     let mut a = agent.lock().await;
-    if a.is_subagent() {
-        return Err(
-            "a sub-agent's conversation is not compacted — it is transient, \
-                    and its context is the parent's to manage"
-                .to_string(),
-        );
-    }
     a.compact(instructions.as_deref())
         .await
         .map_err(|e| e.to_string())

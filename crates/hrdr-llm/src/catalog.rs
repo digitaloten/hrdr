@@ -88,6 +88,15 @@ pub async fn context_window(provider: Option<&str>, model: &str) -> Option<u32> 
     lookup(&load().await?, provider, model)
 }
 
+/// [`context_window`] against the **already-cached** catalog only — no network, no
+/// await. For callers inside a live turn (the agent deciding whether its context is
+/// full), where firing an out-of-band HTTP request would interleave with the stream
+/// it is about to open. `None` when the catalog isn't cached or doesn't know the
+/// model; the caller simply doesn't get to compact proactively.
+pub fn context_window_cached(provider: Option<&str>, model: &str) -> Option<u32> {
+    lookup(&load_cached()?, provider, model)
+}
+
 /// Find `model`'s window in an already-loaded catalog. Pure, so the resolution
 /// rules are testable without a cache or a network.
 fn lookup(catalog: &Value, provider: Option<&str>, model: &str) -> Option<u32> {

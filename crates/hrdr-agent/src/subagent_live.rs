@@ -139,6 +139,33 @@ impl LiveSubagents {
     }
 }
 
+/// Marks a sub-agent idle on **every** exit path — including task cancellation,
+/// where the code after `run(...).await` simply never executes.
+///
+/// Without this, a cancelled turn (`/new`, Esc, quit) leaves its sub-agents stuck
+/// at `running: true, done: false`: never `disposable()`, so retained forever,
+/// each still holding an `Agent` — and shown to the user as a live pane they can
+/// "steer", with nothing on the other end.
+pub struct RunGuard {
+    live: LiveSubagents,
+    key: u64,
+}
+
+impl RunGuard {
+    pub fn new(live: LiveSubagents, key: u64) -> Self {
+        Self { live, key }
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        self.live.update(self.key, |e| {
+            e.running = false;
+            e.done = true;
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +237,29 @@ mod tests {
         let a = LiveSubagents::next_key();
         let b = LiveSubagents::next_key();
         assert_ne!(a, b);
+    }
+
+    /// A cancelled run must not strand its sub-agent. The update after `.await`
+    /// never runs when the task is aborted, so the guard has to do it on drop.
+    #[test]
+    fn a_cancelled_run_still_releases_its_sub_agent() {
+        let live = LiveSubagents::new();
+        live.register(entry(1));
+        {
+            let _guard = RunGuard::new(live.clone(), 1);
+            // ...task is aborted here: nothing after this point would have run.
+        }
+        let (running, done) = live.with(|v| (v[0].running, v[0].done));
+        assert!(!running, "a cancelled sub-agent is not still running");
+        assert!(done, "and it is finished, not stuck in flight");
+
+        // Its answer never reached the main agent, so it is still owed and kept —
+        // but once delivery is moot it becomes collectable rather than immortal.
+        live.prune();
+        assert_eq!(live.len(), 1, "undelivered work is still held");
+        live.update(1, |e| e.delivered = true);
+        live.prune();
+        assert!(live.is_empty(), "and then it is released, not leaked");
     }
 
     #[tokio::test]
