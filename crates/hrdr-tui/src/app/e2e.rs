@@ -2724,6 +2724,75 @@ async fn the_input_pane_matches_the_user_prompt_block() {
     assert!(!screen.contains("11 ch"), "no draft-size footer:\n{screen}");
 }
 
+/// The input box talks to whichever agent is on screen. On a sub-agent's pane a
+/// message steers *that* sub-agent — it goes into the very queue its `run` is
+/// draining — and is shown in its transcript. The main agent's conversation is not
+/// touched: a side-conversation stays on the side.
+#[tokio::test]
+async fn the_input_box_routes_to_the_focused_agent() {
+    let mut h = Harness::new(vec![]).await;
+
+    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
+        checkpoints: Some("off".to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+    let steering = hrdr_agent::steering_queue();
+    h.app.live_subagents.register(hrdr_agent::LiveSubagent {
+        key: 1,
+        bg_id: None,
+        tool_id: Some("call-1".to_string()),
+        label: "explore".to_string(),
+        model: "haiku".to_string(),
+        provider: None,
+        kind: hrdr_agent::SubagentKind::Blocking,
+        agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
+        steering: steering.clone(),
+        // Mid-turn: a message must be delivered as steering, not a new turn.
+        running: true,
+        done: false,
+        delivered: false,
+        pinned: false,
+    });
+    h.app.sync_panes();
+    h.app.focus_pane(hrdr_app::PaneId::Sub(1));
+
+    let main_before = h.app.transcript().len();
+    h.submit("check the auth module too").await;
+
+    // It reached the sub-agent's steering queue — the one its `run` drains.
+    let steered: Vec<String> = steering.lock().unwrap().iter().cloned().collect();
+    assert_eq!(
+        steered,
+        vec!["check the auth module too".to_string()],
+        "the message steers the agent being viewed"
+    );
+
+    // It is shown in that agent's transcript, where it was said…
+    let sub_pane = h
+        .app
+        .panes
+        .subs()
+        .iter()
+        .find(|p| p.id == hrdr_app::PaneId::Sub(1))
+        .unwrap();
+    assert!(
+        sub_pane
+            .transcript
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::User(t) if t == "check the auth module too")),
+        "the sub-agent's transcript records what you said to it"
+    );
+
+    // …and nowhere near the main conversation.
+    assert_eq!(
+        h.app.transcript().len(),
+        main_before,
+        "a side-conversation does not enter the main agent's transcript"
+    );
+    assert!(!h.app.running, "and it did not start a main-agent turn");
+}
+
 /// The agent list switches the view. It lists **main first** (so there is always a
 /// way back) and then each live sub-agent; clicking a row makes that agent the one
 /// on screen. The sub-agent's transcript is self-contained: it renders only while
