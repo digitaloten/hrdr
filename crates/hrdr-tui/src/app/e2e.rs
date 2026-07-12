@@ -2761,6 +2761,7 @@ async fn switching_agents_keeps_each_ones_place_and_draft() {
         provider: None,
         base_url: String::new(),
         usage: hrdr_agent::AgentUsage::default(),
+        events: hrdr_agent::event_log(),
         kind: hrdr_agent::SubagentKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
@@ -2827,6 +2828,7 @@ async fn the_input_box_routes_to_the_focused_agent() {
         provider: None,
         base_url: String::new(),
         usage: hrdr_agent::AgentUsage::default(),
+        events: hrdr_agent::event_log(),
         kind: hrdr_agent::SubagentKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: steering.clone(),
@@ -2850,7 +2852,15 @@ async fn the_input_box_routes_to_the_focused_agent() {
         "the message steers the agent being viewed"
     );
 
-    // It is shown in that agent's transcript, where it was said…
+    // It shows in that agent's transcript when the agent *takes* it — the same rule
+    // the main agent follows (`AgentEvent::Steered` is emitted as the message enters
+    // the conversation, so the transcript's order matches the model's view). Here
+    // that is the agent's own record; replay it as `run` would on its next round.
+    h.app.live_subagents.record(
+        1,
+        &hrdr_agent::AgentEvent::Steered("check the auth module too".to_string()),
+    );
+    h.app.sync_panes();
     let sub_pane = h
         .app
         .panes
@@ -2910,6 +2920,7 @@ async fn the_agent_list_switches_the_focused_agent() {
         provider: Some("claude".to_string()),
         base_url: String::new(),
         usage: hrdr_agent::AgentUsage::default(),
+        events: hrdr_agent::event_log(),
         kind: hrdr_agent::SubagentKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
@@ -2920,6 +2931,15 @@ async fn the_agent_list_switches_the_focused_agent() {
     });
 
     // Its output arrives as ToolOutput on the `task` call that spawned it.
+    // The sub-agent works. It records what it emits on its own entry — that record
+    // is what its pane is built from, so it does not matter whether anyone was
+    // watching (or even whether the pane existed) while it ran.
+    h.app.live_subagents.record(
+        1,
+        &hrdr_agent::AgentEvent::Text("reading the codebase".to_string()),
+    );
+    // The parent also sees the blocking call's flattened output. It must be
+    // dropped, not folded in twice.
     h.app.apply_event(hrdr_agent::AgentEvent::ToolOutput {
         id: "call-1".to_string(),
         chunk: "reading the codebase".to_string(),
@@ -2966,6 +2986,18 @@ async fn the_agent_list_switches_the_focused_agent() {
     assert!(
         screen.contains("reading the codebase"),
         "the sub-agent's own transcript renders when it is the active agent:\n{screen}"
+    );
+    assert_eq!(
+        h.app
+            .panes
+            .subs()
+            .iter()
+            .flat_map(|p| p.transcript())
+            .filter(|e| matches!(&e.kind, EntryKind::Assistant(s) if s == "reading the codebase"))
+            .count(),
+        1,
+        "its work is folded in once — from its own record, not also from the \
+         parent's flattened copy of it"
     );
 
     // Click main's row to come back.
@@ -3023,6 +3055,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
             context_window: Some(64_000),
             cost_usd: 0.0,
         },
+        events: hrdr_agent::event_log(),
         kind: hrdr_agent::SubagentKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),

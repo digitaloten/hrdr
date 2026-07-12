@@ -28,6 +28,15 @@ use crate::{Agent, SteeringQueue};
 /// for its panes.
 static LIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// An agent's own record of what it has emitted, in order. Shared between the
+/// running agent (which appends) and any frontend (which replays).
+pub type EventLog = Arc<Mutex<Vec<crate::AgentEvent>>>;
+
+/// A fresh, empty event log.
+pub fn event_log() -> EventLog {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
 /// What happened to a prompt handed to an agent — see [`LiveSubagents::send_prompt`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptDelivery {
@@ -72,6 +81,18 @@ pub struct LiveSubagent {
     /// tool for the delegated run. A frontend showing this agent reads its usage
     /// from here; nothing has to be watching for the figures to be right.
     pub usage: crate::AgentUsage,
+    /// **Everything this agent has emitted**, in order — the record a frontend
+    /// replays to build its transcript ([`LiveSubagents::events_since`]).
+    ///
+    /// The agent keeps it itself because it is the agent's own history, and
+    /// because the alternative does not work: a *background* sub-agent's `task`
+    /// call returns the moment it is spawned, so there is no live tool call left
+    /// to stream its output through — it emitted nothing to a frontend at all, and
+    /// its pane stayed empty however long it worked. A blocking one streamed only
+    /// flattened text through its parent's call, so its tool calls rendered as
+    /// prose. Recording the events themselves fixes both, and means a frontend
+    /// that attaches late still sees the whole run.
+    pub events: EventLog,
     pub kind: SubagentKind,
     /// The sub-agent itself, retained so a frontend can drive a further turn on
     /// it once its delegated task has landed.
@@ -135,13 +156,34 @@ impl LiveSubagents {
         });
     }
 
-    /// Fold one agent event into sub-agent `key`'s own usage counters. A no-op for
-    /// every event that isn't [`crate::AgentEvent::Usage`], so callers can hand it
-    /// the whole stream.
-    pub fn record_usage(&self, key: u64, ev: &crate::AgentEvent) {
-        if matches!(ev, crate::AgentEvent::Usage { .. }) {
-            self.update(key, |e| e.usage.record_event(ev));
-        }
+    /// Record one of sub-agent `key`'s events against it: append it to the agent's
+    /// event log, and fold it into the agent's usage counters.
+    ///
+    /// Every path a sub-agent's events travel calls this — its delegated run
+    /// (blocking or background) and any later turn the user drives on it — so what
+    /// the agent did and what it spent are recorded in one place, by the agent,
+    /// with nothing required to be watching.
+    pub fn record(&self, key: u64, ev: &crate::AgentEvent) {
+        self.update(key, |e| {
+            e.usage.record_event(ev);
+            if let Ok(mut log) = e.events.lock() {
+                log.push(ev.clone());
+            }
+        });
+    }
+
+    /// Sub-agent `key`'s events from `from` onwards, and the new cursor.
+    ///
+    /// A frontend keeps a cursor per pane and folds what it hasn't seen yet, so a
+    /// pane opened long after the agent started still shows the whole run — and one
+    /// that was never opened costs nothing to keep up to date.
+    pub fn events_since(&self, key: u64, from: usize) -> Option<(Vec<crate::AgentEvent>, usize)> {
+        self.with(|v| {
+            let e = v.iter().find(|e| e.key == key)?;
+            let log = e.events.lock().ok()?;
+            let next = log.len();
+            Some((log.get(from..).unwrap_or_default().to_vec(), next))
+        })
     }
 
     /// A snapshot of `key`'s usage, for a frontend showing that agent.
@@ -194,6 +236,12 @@ impl LiveSubagents {
         }
 
         // Idle: a further turn on the agent we kept alive for exactly this.
+        //
+        // `run` emits `Steered` for a message it *drains* mid-turn, but nothing for
+        // the input that opens a turn — so record it here. Without it the agent's
+        // record shows the reply and not the question, and a pane rebuilt from that
+        // record would too.
+        self.record(key, &crate::AgentEvent::Steered(input.clone()));
         self.update(key, |e| e.running = true);
         let live = self.clone();
         tokio::spawn(async move {
@@ -201,11 +249,11 @@ impl LiveSubagents {
             // where nothing after the await would run.
             let _guard = RunGuard::new(live.clone(), key);
             let mut on_event = on_event;
-            // The agent's own counters are updated here rather than by whoever is
-            // watching: a turn's tokens are a fact about the agent, not about the
-            // fact that someone happened to be looking at it.
+            // Recorded on the agent's own entry rather than by whoever is watching:
+            // what a turn did and what it spent are facts about the agent, not
+            // about the fact that someone happened to be looking at it.
             let mut on_event = move |ev: crate::AgentEvent| {
-                live.record_usage(key, &ev);
+                live.record(key, &ev);
                 on_event(ev);
             };
             let mut a = agent.lock().await;
@@ -316,6 +364,7 @@ mod tests {
             provider: None,
             base_url: String::new(),
             usage: crate::AgentUsage::default(),
+            events: event_log(),
             kind: SubagentKind::Blocking,
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             steering: steering_queue(),
@@ -489,6 +538,50 @@ mod tests {
         assert!(live.is_empty(), "and then it is released, not leaked");
     }
 
+    /// A sub-agent records everything it emits on its own entry, and a frontend
+    /// replays it from a cursor. This is what a pane is built from.
+    ///
+    /// Regression: nothing recorded a sub-agent's events, so a frontend could only
+    /// see what it happened to be listening for. For a *background* sub-agent that
+    /// was nothing at all — its `task` call returns the moment it is spawned, so
+    /// there is no live tool call left to stream through — and background is the
+    /// default. Its pane stayed empty however long it worked.
+    ///
+    /// Replaying from the agent's own record also means a pane opened late still
+    /// shows the whole run, which is the normal case: you click a sub-agent's row
+    /// *because* you noticed it working.
+    #[test]
+    fn an_agents_events_are_recorded_on_it_and_replayed_from_a_cursor() {
+        let live = LiveSubagents::new();
+        live.register(entry(1));
+
+        live.record(1, &crate::AgentEvent::Text("looking".into()));
+        live.record(1, &crate::AgentEvent::Text(" around".into()));
+
+        // A frontend attaching now — long after the work started — gets all of it.
+        let (events, cursor) = live.events_since(1, 0).expect("a live agent has a record");
+        assert_eq!(events.len(), 2, "the whole run, not just what came after");
+        assert_eq!(cursor, 2);
+
+        // From its cursor it sees only what is new.
+        live.record(1, &crate::AgentEvent::Text(" done".into()));
+        let (events, cursor) = live.events_since(1, cursor).unwrap();
+        assert!(
+            matches!(&events[..], [crate::AgentEvent::Text(t)] if t == " done"),
+            "only the unseen tail is replayed"
+        );
+        assert_eq!(cursor, 3);
+        assert!(
+            live.events_since(1, cursor).unwrap().0.is_empty(),
+            "and nothing is replayed twice"
+        );
+
+        assert!(
+            live.events_since(99, 0).is_none(),
+            "an unknown key has none"
+        );
+    }
+
     /// A sub-agent's tokens are a fact about *that agent*, so they are counted on
     /// its registry entry — not in whichever frontend happens to be showing it.
     /// A status bar reading the agent you are looking at reads these.
@@ -497,7 +590,7 @@ mod tests {
         let live = LiveSubagents::new();
         live.register(entry(1));
         live.register(entry(2));
-        live.record_usage(
+        live.record(
             1,
             &crate::AgentEvent::Usage {
                 prompt_tokens: 120,
@@ -509,7 +602,7 @@ mod tests {
             },
         );
         // Everything else in the stream leaves the counters alone.
-        live.record_usage(1, &crate::AgentEvent::Text("hi".into()));
+        live.record(1, &crate::AgentEvent::Text("hi".into()));
 
         let u = live.usage(1).expect("a live sub-agent has usage");
         assert_eq!((u.tokens_in, u.tokens_out), (120, 30));

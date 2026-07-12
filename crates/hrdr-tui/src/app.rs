@@ -1342,16 +1342,17 @@ impl App {
     /// so it lives in `LiveSubagents::send_prompt`. All the frontend does here is
     /// show what was said, and say where the events should be surfaced.
     fn send_to_subagent(&mut self, key: u64, input: String) {
-        // Show it in that agent's transcript, where it was said.
-        self.sync_panes();
-        if let Some(pane) = self.panes.sub_mut(key) {
-            hrdr_app::apply_event(pane.transcript_mut(), &AgentEvent::Steered(input.clone()));
-        }
-
+        // What was said and everything that comes back is recorded on the agent's
+        // own entry; the pane is rebuilt from that record by `sync_panes`. Nothing
+        // is folded into the transcript here — doing it in both places would show
+        // every message twice.
         let tx = self.tx.clone();
         let delivered = self.live_subagents.send_prompt(key, input, move |ev| {
+            // The events go to the agent's log; this only wakes the UI so the next
+            // frame picks them up.
             let _ = tx.send(TurnMsg::SubAgent(key, ev));
         });
+        self.sync_panes();
         if delivered.is_none() {
             // Released while we were looking at it (finished, delivered, and the
             // prune won the race). Fall back rather than swallow what was typed.
@@ -1918,14 +1919,11 @@ impl App {
                     agent.lock().await.set_context_window(Some(tokens));
                 });
             }
-            // A sub-agent's own events go to its transcript and nowhere else — the
-            // main conversation is not touched by a side-conversation.
-            TurnMsg::SubAgent(key, ev) => {
-                self.sync_panes();
-                if let Some(pane) = self.panes.sub_mut(key) {
-                    hrdr_app::apply_event(pane.transcript_mut(), &ev);
-                }
-            }
+            // A sub-agent's events are recorded on its own registry entry, and
+            // `sync_panes` replays them into its pane. This message carries no
+            // transcript work of its own — it exists to wake the UI so the next
+            // frame shows them.
+            TurnMsg::SubAgent(_key, _ev) => self.sync_panes(),
             TurnMsg::BrowserLogin(outcome) => self.on_browser_login(outcome),
             TurnMsg::ModelCatalog {
                 generation,
@@ -2147,17 +2145,15 @@ impl App {
                 self.push_entry(Entry::tool_running(id.clone(), name.clone(), args));
             }
             AgentEvent::ToolOutput { id, chunk } => {
-                // A sub-agent's output belongs to *its* transcript, not the
-                // parent's. It reaches us as `ToolOutput` on the `task` call that
-                // spawned it — route it to that agent's pane and leave the parent's
-                // block alone, so the block records the delegation rather than
-                // replaying the work. The transcript is then self-contained: it is
-                // rendered only when that agent is the one being viewed.
-                if let Some(hrdr_app::PaneId::Sub(key)) = self.pane_for_tool(&id) {
-                    self.sync_panes();
-                    if let Some(pane) = self.panes.sub_mut(key) {
-                        hrdr_app::apply_event(pane.transcript_mut(), &AgentEvent::Text(chunk));
-                    }
+                // A blocking sub-agent's answer also arrives here, flattened, as
+                // `ToolOutput` on the `task` call that spawned it. Drop it: the
+                // sub-agent already recorded the real events on its own entry, and
+                // its pane is built from those. Folding this in as well would
+                // duplicate the whole run as prose, and putting it in the parent's
+                // block would make the parent replay work it delegated — the block
+                // records *what was delegated to*, and the sub-agent's transcript
+                // stays self-contained.
+                if self.pane_for_tool(&id).is_some() {
                     return;
                 }
                 // Append live output to the running tool's entry.

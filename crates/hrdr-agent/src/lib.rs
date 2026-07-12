@@ -32,7 +32,8 @@ pub use paths::cwd_slug;
 mod models;
 mod subagent_live;
 pub use subagent_live::{
-    LiveSubagent, LiveSubagents, PromptDelivery, RunGuard, SubagentKind, age_completed_todos,
+    EventLog, LiveSubagent, LiveSubagents, PromptDelivery, RunGuard, SubagentKind,
+    age_completed_todos, event_log,
 };
 mod subagent_transcript;
 mod usage;
@@ -579,10 +580,7 @@ fn spawn_background(
     let model_for_live = cfg.model.clone();
     let provider_for_live = cfg.provider.clone();
     let base_url_for_live = cfg.base_url.clone();
-    let usage_for_live = AgentUsage {
-        context_window: cfg.context_window,
-        ..Default::default()
-    };
+    let usage_for_live = subagent_usage(&cfg);
     if let Ok(mut v) = registry.lock() {
         v.push(hrdr_tools::BackgroundTask {
             id,
@@ -650,6 +648,7 @@ fn spawn_background(
                     provider: provider_for_live,
                     base_url: base_url_for_live,
                     usage: usage_for_live,
+                    events: subagent_live::event_log(),
                     kind: SubagentKind::Background,
                     agent: Arc::clone(&sub),
                     steering: Arc::clone(&steering),
@@ -658,13 +657,18 @@ fn spawn_background(
                     delivered: false,
                     pinned: false,
                 });
+                // Open its record with the task it was given, so its transcript shows
+                // the question and not just the answer.
+                live.record(live_key, &AgentEvent::Steered(prompt.clone()));
                 let _run_guard = RunGuard::new(live.clone(), live_key);
                 let usage_live = live.clone();
                 let mut sub = sub.lock().await;
                 sub.run(prompt, steering, |ev| {
-                    // Its delegated run's tokens are its own — counted on its entry,
-                    // exactly as a turn the user drives on it later would be.
-                    usage_live.record_usage(live_key, &ev);
+                    // Its run is recorded on its own entry — what it did and what it
+                    // spent. This is the *only* way a background sub-agent's work
+                    // reaches a frontend: its `task` call returned the instant it was
+                    // spawned, so there is no live tool call left to stream through.
+                    usage_live.record(live_key, &ev);
                     if let Ok(mut g) = ts_inner.lock()
                         && let Some(t) = g.as_mut()
                         && let Some(tev) = subagent_event_for(&ev)
@@ -941,6 +945,23 @@ pub fn should_auto_compact(
         return false;
     };
     window > 0 && prompt >= compaction_trigger(window, reserved)
+}
+
+/// The opening usage counters for a delegated sub-agent — zeroed, but knowing
+/// the context window it is working against.
+///
+/// The window is resolved the same way the agent resolves its own
+/// (`Agent::ensure_context_window`): the config's, else the models.dev catalog,
+/// network-free. Without it a sub-agent's pane had a used-tokens count and no
+/// maximum, so its gauge could not draw — it showed a bare number where the main
+/// agent shows a bar.
+fn subagent_usage(cfg: &AgentConfig) -> AgentUsage {
+    AgentUsage {
+        context_window: cfg.context_window.or_else(|| {
+            hrdr_llm::catalog::context_window_cached(cfg.provider.as_deref(), &cfg.model)
+        }),
+        ..Default::default()
+    }
 }
 
 fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
@@ -1480,10 +1501,7 @@ impl hrdr_tools::Tool for SubagentTool {
         // Captured before `cfg` is moved into the sub-agent.
         let provider_for_run = cfg.provider.clone();
         let base_url_for_live = cfg.base_url.clone();
-        let usage_for_live = AgentUsage {
-            context_window: cfg.context_window,
-            ..Default::default()
-        };
+        let usage_for_live = subagent_usage(&cfg);
         let mut sub =
             Agent::new(cfg).with_context(|| format!("creating sub-agent (model={model})"))?;
         sub.cost_total = Arc::clone(&self.cost_total);
@@ -1507,6 +1525,7 @@ impl hrdr_tools::Tool for SubagentTool {
             provider: cfg_provider,
             base_url: base_url_for_live,
             usage: usage_for_live,
+            events: subagent_live::event_log(),
             kind: SubagentKind::Blocking,
             agent: Arc::clone(&sub),
             steering: Arc::clone(&steering),
@@ -1515,6 +1534,9 @@ impl hrdr_tools::Tool for SubagentTool {
             delivered: false,
             pinned: false,
         });
+        // Open its record with the task it was given, so its transcript shows the
+        // question and not just the answer.
+        self.live.record(key, &AgentEvent::Steered(prompt.clone()));
 
         // Cancelling the parent turn drops this future mid-`await`; the guard is
         // what marks the sub-agent idle in that case.
@@ -1526,7 +1548,7 @@ impl hrdr_tools::Tool for SubagentTool {
             .run(prompt, steering, |ev| {
                 // Its tokens are its own: counted on its entry, so a frontend
                 // showing this agent shows *its* context and cost, not the parent's.
-                usage_live.record_usage(key, &ev);
+                usage_live.record(key, &ev);
                 if let Some(t) = transcript.as_mut()
                     && let Some(tev) = subagent_event_for(&ev)
                 {

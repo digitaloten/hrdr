@@ -65,6 +65,14 @@ pub struct Pane {
     /// to describe *the agent you are looking at* rather than always describing the
     /// main one, and what a sub-agent's own state file will serialize.
     pub state: SessionState,
+    /// How many of this agent's recorded events have been folded into the
+    /// transcript above. [`PaneSet::sync`] replays the rest.
+    ///
+    /// A sub-agent records everything it emits ([`hrdr_agent::LiveSubagent::events`]),
+    /// so a pane opened ten minutes into a run still shows the whole run — the
+    /// transcript is rebuilt from the agent's own record rather than assembled from
+    /// whatever the frontend happened to be listening for at the time.
+    consumed: usize,
     /// Where the reader is in this conversation, and what they had half-typed to
     /// it.
     ///
@@ -239,6 +247,7 @@ impl Default for PaneSet {
                 id: PaneId::Main,
                 status: PaneStatus::Idle,
                 state: SessionState::default(),
+                consumed: 0,
                 view: PaneView::default(),
             },
             subs: Vec::new(),
@@ -377,6 +386,7 @@ impl PaneSet {
                         id: PaneId::Sub(s.key),
                         status,
                         state: SessionState::default(),
+                        consumed: 0,
                         view: PaneView::default(),
                     });
                     self.subs.last_mut().expect("just pushed")
@@ -388,6 +398,21 @@ impl PaneSet {
             pane.state.provider = s.provider.clone();
             pane.state.base_url = s.base_url.clone();
             pane.state.usage = s.usage;
+
+            // Fold in whatever this agent has emitted since we last looked. This is
+            // the only thing that builds a sub-agent's transcript, and it is a
+            // replay of the agent's own record — so a background sub-agent (whose
+            // `task` call returned the instant it was spawned, leaving no live tool
+            // call to stream through) is shown exactly like a blocking one, and both
+            // get real tool blocks rather than flattened text.
+            let from = pane.consumed;
+            if let Some((events, next)) = live.events_since(s.key, from) {
+                let pane = self.sub_mut(s.key).expect("just adopted");
+                for ev in &events {
+                    apply_event(&mut pane.state.transcript, ev);
+                }
+                pane.consumed = next;
+            }
         }
 
         // Drop panes whose sub-agent the agent has released. The active one is
@@ -657,6 +682,66 @@ mod tests {
         );
     }
 
+    /// A sub-agent's transcript is replayed from the agent's own record, so it is
+    /// built whether or not anyone was watching while it ran — and it is built from
+    /// the *events*, so its tool calls are real tool blocks.
+    ///
+    /// Regression: a background sub-agent emitted nothing to the frontend (its
+    /// `task` call returns the instant it is spawned, leaving no live tool call to
+    /// stream through), so its pane was empty no matter how long it worked — and
+    /// background is the default. A blocking one streamed flattened text through
+    /// its parent's call, so its tool calls showed up as prose.
+    #[test]
+    fn a_sub_agents_transcript_is_replayed_from_its_own_record() {
+        let live = live_with(&[1]);
+        // It works away with nobody watching — no pane exists yet.
+        live.record(1, &AgentEvent::Steered("audit the auth module".into()));
+        live.record(1, &tool_start("t1", "grep"));
+        live.record(
+            1,
+            &AgentEvent::ToolEnd {
+                id: "t1".into(),
+                name: "grep".into(),
+                result: "3 hits".into(),
+                ok: true,
+            },
+        );
+        live.record(1, &AgentEvent::Text("found it".into()));
+
+        // The pane is adopted now, and the whole run is there.
+        let mut panes = PaneSet::new();
+        panes.sync(&live);
+        let t = panes.subs()[0].transcript();
+        assert!(
+            matches!(&t[0].kind, EntryKind::User(s) if s == "audit the auth module"),
+            "it opens with the task it was given, not just the answer"
+        );
+        assert!(
+            matches!(&t[1].kind, EntryKind::Tool { name, result, done: true, .. }
+                     if name == "grep" && result == "3 hits"),
+            "its tool calls are tool blocks, not prose: {:?}",
+            t[1].kind
+        );
+        assert!(matches!(&t[2].kind, EntryKind::Assistant(s) if s == "found it"));
+
+        // Syncing again replays nothing: the cursor means no event lands twice.
+        let before = t.len();
+        panes.sync(&live);
+        panes.sync(&live);
+        assert_eq!(panes.subs()[0].transcript().len(), before);
+
+        // New work appends.
+        live.record(1, &AgentEvent::Text(" — auth.rs:42".into()));
+        panes.sync(&live);
+        let t = panes.subs()[0].transcript();
+        assert_eq!(
+            t.len(),
+            before,
+            "streamed text coalesces into the same block"
+        );
+        assert!(matches!(&t[2].kind, EntryKind::Assistant(s) if s == "found it — auth.rs:42"));
+    }
+
     #[test]
     fn focusing_a_sub_agent_that_is_gone_falls_back_to_main() {
         let mut panes = PaneSet::new();
@@ -687,6 +772,7 @@ mod tests {
                 provider: None,
                 base_url: String::new(),
                 usage: hrdr_agent::AgentUsage::default(),
+                events: hrdr_agent::event_log(),
                 kind: SubagentKind::Blocking,
                 agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
                 steering: hrdr_agent::steering_queue(),
