@@ -42,6 +42,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   false 401 to it); the authenticated catalog still surfaces a genuine 401/403,
   so a revoked credential is not masked. Async endpoint/catalog warnings render
   as ephemeral notices and are never written to saved sessions.
+- **A `model` in `config.toml` no longer follows you onto another provider.** It
+  belongs to the provider the config names, so `model = "…"` plus
+  `hrdr --provider chatgpt` no longer suppresses the preset default and sends a
+  foreign model id to the Codex endpoint; the provider's own default (or the
+  `default` sentinel) applies instead.
+- **A signed-out ChatGPT session says so.** When the token refresh fails while
+  the `/model` picker loads, the picker now warns and points at `/login` instead
+  of silently showing an empty list.
+- **Every ChatGPT alias is superseded by the live catalog.** The `/model` merge
+  matches `chatgpt`/`codex`/`openai-oauth` case-insensitively, so a config
+  spelled `provider = "codex"` no longer leaves a duplicate, context-window-less
+  row in the picker. The alias set now has a single owner
+  (`is_chatgpt_provider_name`).
+- **An unusable advertised context window is ignored.** A catalog row reporting
+  `0` (or a value that would wrap `u32`) is treated as "unknown, probe it"
+  instead of `Some(0)`, which silently disabled the context gauge and
+  auto-compaction for the rest of the session.
+- **The catalog fetch refuses redirects.** `reqwest` strips `Authorization`
+  across origins but not our `ChatGPT-Account-Id`, so an open redirect on the
+  host could have forwarded the account id to a third party.
+- **The model feature gate is honest.** `required_features` is a deny-list of
+  features hrdr cannot serve; an unrecognised feature keeps the row rather than
+  hiding an entitled model. The browser-login copy no longer advertises a
+  5-minute deadline (ChatGPT's is 60 minutes) or a `/cancel` that the modal
+  cannot receive.
 
 ## [0.2.11] - 2026-07-12
 

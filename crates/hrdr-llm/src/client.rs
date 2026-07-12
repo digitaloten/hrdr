@@ -323,6 +323,13 @@ impl Client {
             .any(|(k, _)| k.eq_ignore_ascii_case(name))
     }
 
+    /// Whether a credential (API key, or an injected OAuth bearer) is currently
+    /// set. Returns only the presence bit — never the secret — so a caller can
+    /// assert a credential was cleared without being able to read it.
+    pub fn has_api_key(&self) -> bool {
+        self.api_key.as_ref().is_some_and(|k| !k.is_empty())
+    }
+
     /// Set the Azure OpenAI API version (enables the Azure URL + `api-key` auth
     /// quirks); `None` for a standard OpenAI-compatible endpoint.
     pub fn set_api_version(&mut self, api_version: Option<String>) {

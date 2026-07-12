@@ -1627,6 +1627,25 @@ fn provider_auth_state_with(
     ProviderAuthState::Missing
 }
 
+/// The spellings that name the built-in ChatGPT subscription provider. Sole
+/// owner of the alias set: resolution, the `/login` route, and the `/model`
+/// selector's catalog merge all ask [`is_chatgpt_provider_name`] rather than
+/// re-encoding the list, so they cannot drift apart.
+///
+/// A name matching here is only *offered* the built-in — a user's
+/// `[providers.<name>]` entry still shadows it and resolves to
+/// [`ResolvedProviderKind::Custom`]. This is a spelling test, never a trust test.
+pub const CHATGPT_PROVIDER_ALIASES: &[&str] = &["chatgpt", "codex", "openai-oauth"];
+
+/// Whether `name` spells the built-in ChatGPT provider (case- and
+/// whitespace-insensitive). See [`CHATGPT_PROVIDER_ALIASES`] — not a trust test.
+pub fn is_chatgpt_provider_name(name: &str) -> bool {
+    let name = name.trim();
+    CHATGPT_PROVIDER_ALIASES
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(name))
+}
+
 /// Resolve a built-in provider name (case-insensitive).
 ///
 /// - `zen` / `opencode` — OpenCode Zen gateway (`OPENCODE_API_KEY`).
@@ -1636,10 +1655,7 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
     // ChatGPT via Codex OAuth: no `key_env` (the Bearer token comes from the
     // OAuth store, refreshed per request), the native Codex Responses backend
     // (selected by the base URL), and a default allow-listed model.
-    if matches!(
-        name.trim().to_ascii_lowercase().as_str(),
-        "chatgpt" | "codex" | "openai-oauth"
-    ) {
+    if is_chatgpt_provider_name(name) {
         return Some(ResolvedProvider {
             base_url: CHATGPT_CODEX_BASE_URL.to_string(),
             key_env: None,
@@ -4529,6 +4545,48 @@ mod tests {
         assert_eq!(
             builtin_provider("chatgpt").unwrap().base_url,
             CHATGPT_CODEX_BASE_URL
+        );
+    }
+
+    /// The OAuth bearer must never outlive the provider it belongs to. Switching
+    /// away from ChatGPT repoints the endpoint with the new provider's own
+    /// credential (`None` for a keyless one), and the next request's
+    /// `refresh_oauth_if_needed` must not re-inject or retain the ChatGPT bearer
+    /// or the `ChatGPT-Account-Id` header — otherwise we would send a ChatGPT
+    /// subscription token to an unrelated host.
+    #[tokio::test]
+    async fn switching_away_from_chatgpt_leaves_no_bearer_or_account_header() {
+        use super::{CHATGPT_CODEX_BASE_URL, ResolvedProviderKind};
+        let config = AgentConfig {
+            provider: Some("chatgpt".to_string()),
+            base_url: CHATGPT_CODEX_BASE_URL.to_string(),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(config).unwrap();
+        assert_eq!(agent.provider_kind(), ResolvedProviderKind::ChatGptOAuth);
+
+        // Stand in for a completed OAuth injection: bearer + account header.
+        agent.set_endpoint(CHATGPT_CODEX_BASE_URL, Some("oauth-bearer".to_string()));
+        agent.set_headers(vec![(
+            "ChatGPT-Account-Id".to_string(),
+            "acct-123".to_string(),
+        )]);
+        assert!(agent.client().has_api_key());
+
+        // Now switch to a keyless local provider, exactly as `apply_provider` /
+        // `apply_choice` do: endpoint + key, then the trust identity.
+        agent.set_endpoint("http://127.0.0.1:1234/v1", None);
+        agent.set_provider(Some("local".to_string()));
+        agent.set_provider_identity(ResolvedProviderKind::BuiltIn, Vec::new());
+        agent.refresh_oauth_if_needed().await;
+
+        assert!(
+            !agent.client().has_api_key(),
+            "the ChatGPT bearer must not survive a switch to a keyless provider"
+        );
+        assert!(
+            !agent.client().extra_headers_contains("ChatGPT-Account-Id"),
+            "the account header must not survive a switch away from ChatGPT"
         );
     }
 

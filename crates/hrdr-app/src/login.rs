@@ -46,9 +46,9 @@ fn provider_label(name: &str) -> &'static str {
 }
 
 /// Whether `name` authenticates via an OAuth browser flow rather than a pasted
-/// API key.
+/// API key. The ChatGPT aliases are owned by `hrdr_agent`, not re-listed here.
 fn is_oauth_login(name: &str) -> bool {
-    matches!(name, "openrouter" | "chatgpt" | "codex" | "openai-oauth")
+    name == "openrouter" || hrdr_agent::is_chatgpt_provider_name(name)
 }
 
 /// Milliseconds since the Unix epoch, for OAuth token expiry.
@@ -335,7 +335,7 @@ pub fn browser_login_start(
         const PORT: u16 = 1456;
         let callback = format!("http://localhost:{PORT}/auth/callback");
         let url = hrdr_agent::openrouter_authorize_url(&callback, &challenge);
-        open_browser(&url, label, host);
+        open_browser(&url, label, "5 minutes", host);
         let future = Box::pin(async move {
             let (token_saved, error) = match openrouter_exchange_and_save(PORT, &verifier).await {
                 Ok(()) => (true, None),
@@ -358,7 +358,7 @@ pub fn browser_login_start(
     // Only the ChatGPT aliases reach the Codex flow below; any other name is not
     // a browser-login provider (callers route via `login_route` first, but guard
     // so an unexpected name never silently launches a ChatGPT OAuth flow).
-    if !matches!(name, "chatgpt" | "codex" | "openai-oauth") {
+    if !hrdr_agent::is_chatgpt_provider_name(name) {
         return None;
     }
 
@@ -370,7 +370,7 @@ pub fn browser_login_start(
     host.info(
         "⚠ This signs in with your ChatGPT subscription for use in a third-party tool.".to_string(),
     );
-    open_browser(&url, label, host);
+    open_browser(&url, label, "60 minutes", host);
     let future = Box::pin(async move {
         let flow = chatgpt_exchange_and_save(&verifier, &state, &redirect);
         let (token_saved, error) =
@@ -434,11 +434,18 @@ fn start_oauth_login(name: &str, host: &mut dyn CommandHost) -> bool {
 }
 
 /// Print the authorize URL (a fallback if the browser can't open) and launch it.
-fn open_browser(url: &str, label: &str, host: &mut dyn CommandHost) {
+///
+/// `deadline` is the flow's own wait limit — the flows differ (OpenRouter holds
+/// the 5-minute callback deadline, ChatGPT the 60-minute backstop), so it is
+/// passed in rather than hardcoded into copy that would be wrong for one of them.
+/// Esc always abandons the wait; `/cancel` additionally works in the typed
+/// wizard, but the login modal swallows keys other than Esc, so Esc is what the
+/// copy leads with.
+fn open_browser(url: &str, label: &str, deadline: &str, host: &mut dyn CommandHost) {
     host.info(format!(
         "🔑 Opening your browser to authorize {label}…\n\
          If it doesn't open, visit:\n{url}\n\
-         Waiting for you to finish in the browser (/cancel time is ~5 min)."
+         Waiting for you to finish in the browser (up to {deadline}). Esc aborts."
     ));
     let _ = crate::open_system_handler(std::path::Path::new(url));
 }

@@ -195,21 +195,30 @@ pub fn chatgpt_model_choices(models: &[crate::ChatGptModel]) -> Vec<ModelChoice>
 }
 
 /// Merge authenticated ChatGPT rows into a base selector list, then re-sort by
-/// the global ordering. Any existing `chatgpt` rows in `base` are replaced (the
+/// the global ordering. Any existing ChatGPT row in `base` is replaced (the
 /// authenticated catalog supersedes the static one); every other provider is
 /// left untouched. ChatGPT rows retain their upstream order within equal
 /// usage/label ties via the stable sort.
+///
+/// The superseded rows are matched with [`crate::is_chatgpt_provider_name`], not
+/// an exact `"chatgpt"` compare: a base row carries the provider name as the
+/// user spelled it, so a config that says `provider = "codex"` would otherwise
+/// survive the filter and leave the picker showing the model twice — once from
+/// the stale preset (with no context window) and once from the live catalog.
+///
+/// `usage` is passed in rather than loaded here: this runs on the UI thread when
+/// the async catalog lands, and a pure merge keeps its test hermetic.
 pub fn merge_chatgpt_choices(
     base: Vec<ModelChoice>,
     chatgpt: &[crate::ChatGptModel],
+    usage: &HashMap<String, u64>,
 ) -> Vec<ModelChoice> {
-    let usage = load_model_usage();
     let mut out: Vec<ModelChoice> = base
         .into_iter()
-        .filter(|c| c.provider != "chatgpt")
+        .filter(|c| !crate::is_chatgpt_provider_name(&c.provider))
         .collect();
     out.extend(chatgpt_model_choices(chatgpt));
-    sort_choices(&mut out, &usage);
+    sort_choices(&mut out, usage);
     out
 }
 
@@ -489,7 +498,7 @@ mod tests {
             label: "fresh".into(),
             context_window: Some(1),
         }];
-        let out = merge_chatgpt_choices(base, &cg);
+        let out = merge_chatgpt_choices(base, &cg, &HashMap::new());
         let chatgpt: Vec<&str> = out
             .iter()
             .filter(|c| c.provider == "chatgpt")
@@ -500,6 +509,36 @@ mod tests {
             out.iter().any(|c| c.provider == "zen" && c.model == "keep"),
             "other providers untouched"
         );
+    }
+
+    #[test]
+    fn merge_replaces_chatgpt_rows_spelled_with_any_alias() {
+        use crate::ChatGptModel;
+        // A base row carries the provider name as the user spelled it in config.
+        // Every ChatGPT alias must be superseded by the authenticated catalog —
+        // an exact `== "chatgpt"` compare would leave a duplicate row behind.
+        for alias in ["chatgpt", "codex", "openai-oauth", "ChatGPT", "CODEX"] {
+            let base = vec![ModelChoice {
+                provider: alias.into(),
+                model: "stale".into(),
+                provider_label: "ChatGPT".into(),
+                model_label: "stale".into(),
+                context_window: None,
+            }];
+            let cg = vec![ChatGptModel {
+                slug: "fresh".into(),
+                label: "fresh".into(),
+                context_window: Some(400_000),
+            }];
+            let out = merge_chatgpt_choices(base, &cg, &HashMap::new());
+            assert_eq!(
+                out.len(),
+                1,
+                "{alias}: stale row must be replaced, not duplicated"
+            );
+            assert_eq!(out[0].model, "fresh");
+            assert_eq!(out[0].context_window, Some(400_000));
+        }
     }
 
     #[test]

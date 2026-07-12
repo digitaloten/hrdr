@@ -1013,13 +1013,20 @@ impl super::App {
                         warning: r.warning,
                     }
                 }
-                // Couldn't obtain a token — leave the cached rows in place; just
-                // clear the loading flag (empty models => no replace).
+                // Couldn't obtain a token (revoked/expired refresh, no creds):
+                // leave the cached rows in place, but SAY so. The picker opened
+                // because credentials looked present, so a silent empty result
+                // reads as "you have no models" instead of "you are signed out".
+                // The error itself is not shown — it can name the token store.
                 Err(_) => TurnMsg::ModelCatalog {
                     generation,
                     models: Vec::new(),
                     source: CatalogSource::BuiltInFallback,
-                    warning: None,
+                    warning: Some(
+                        "⚠ ChatGPT credentials could not be refreshed — run /login. \
+                         Showing built-in ChatGPT models."
+                            .to_string(),
+                    ),
                 },
             };
             let _ = tx.send(msg);
@@ -1040,16 +1047,21 @@ impl super::App {
             return; // stale — a newer picker/provider superseded this load.
         }
         self.model_loading = false;
+        // Surface the warning BEFORE the empty-rows check: a failed token refresh
+        // returns no rows, and that is precisely the case the user needs told
+        // about — the picker only opened because credentials looked present, so
+        // silence reads as "you have no models" rather than "you are signed out".
+        if let Some(w) = warning {
+            self.system(w);
+        }
         if models.is_empty() {
             return; // token/refresh failed — keep the cached rows.
         }
         self.model_source = Some(source);
-        if let Some(w) = warning {
-            self.system(w);
-        }
         if let Some(sel) = &mut self.model_selector {
             let base = hrdr_agent::model_choices(&self.cfg, self.state.provider.as_deref());
-            let merged = hrdr_agent::merge_chatgpt_choices(base, &models);
+            let usage = hrdr_agent::load_model_usage();
+            let merged = hrdr_agent::merge_chatgpt_choices(base, &models, &usage);
             sel.replace_model_choices(merged);
         }
     }

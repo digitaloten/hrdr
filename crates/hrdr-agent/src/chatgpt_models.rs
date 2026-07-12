@@ -112,10 +112,30 @@ fn cache_path() -> Option<PathBuf> {
 
 // ── Parser ──────────────────────────────────────────────────────────────────
 
+/// Model features hrdr's OpenAI-compatible chat path cannot serve. A catalog row
+/// that *requires* one of these is unusable, so it is hidden from the picker.
+///
+/// Deliberately a deny-list, not an allow-list: the upstream feature vocabulary
+/// is not a contract we control, and an allow-list would hide any model that
+/// named a feature we had not enumerated yet — including entitled models the
+/// user is paying for. Matched case-insensitively.
+const UNSUPPORTED_FEATURES: &[&str] = &[
+    // The synthetic marker the catalog fixtures use for "hrdr cannot run this".
+    "unsupported",
+];
+
+/// Whether a `required_features` entry names something hrdr cannot serve.
+/// Unrecognised features are treated as supported — see [`UNSUPPORTED_FEATURES`].
+fn is_unsupported_feature(feature: &str) -> bool {
+    UNSUPPORTED_FEATURES
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(feature))
+}
+
 /// Parse a Codex `/models` success payload into list-visible models, in upstream
 /// order. Tolerant: unknown fields are ignored and missing optional fields
-/// defaulted. Rows that are not list-visible, have an empty slug, or are missing
-/// a required feature the client does not support are dropped.
+/// defaulted. Rows that are not list-visible, have an empty slug, or require a
+/// feature hrdr cannot serve ([`UNSUPPORTED_FEATURES`]) are dropped.
 ///
 /// Errors only on a structurally malformed payload (no models array at all), so
 /// the caller can distinguish "parsed, possibly empty" from "not a catalog".
@@ -145,10 +165,16 @@ pub fn parse_catalog(v: &Value) -> Result<Vec<ChatGptModel>> {
         if slug.is_empty() {
             continue;
         }
-        // Required features the row declares must be marked supported; a row
-        // demanding an unsupported feature is dropped. Absent/empty → included.
+        // A row declaring a feature we know we cannot serve is dropped. The
+        // upstream feature vocabulary is not contractual, so this is a deny-list
+        // of features hrdr is known to lack, never an allow-list: an unrecognised
+        // feature keeps the row (hiding an entitled model the user paid for is
+        // worse than a request that fails at send time and says why).
         if let Some(reqs) = m.get("required_features").and_then(Value::as_array)
-            && reqs.iter().any(|f| f.as_str() == Some("unsupported"))
+            && reqs
+                .iter()
+                .filter_map(Value::as_str)
+                .any(is_unsupported_feature)
         {
             continue;
         }
@@ -159,11 +185,16 @@ pub fn parse_catalog(v: &Value) -> Result<Vec<ChatGptModel>> {
             .filter(|s| !s.is_empty())
             .unwrap_or(slug)
             .to_string();
+        // Reject a window we cannot act on: `as u32` would wrap a >=2^32 value to
+        // a small number (or to 0), and `Some(0)` propagates into `apply_choice`
+        // as "window known", suppressing the endpoint probe and silently
+        // disabling the context gauge and auto-compaction for the whole session.
         let context_window = m
             .get("context_window")
             .or_else(|| m.get("max_context_window"))
             .and_then(Value::as_u64)
-            .map(|n| n as u32);
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|w| *w > 0);
         out.push(ChatGptModel {
             slug: slug.to_string(),
             label,
@@ -382,6 +413,11 @@ pub async fn chatgpt_model_catalog(access: &OAuthAccess, force: bool) -> ChatGpt
 async fn fetch_catalog(access: &OAuthAccess, etag: Option<String>) -> FetchOutcome {
     let client = match reqwest::Client::builder()
         .timeout(CATALOG_HTTP_TIMEOUT)
+        // The catalog endpoint does not redirect. Refuse to follow one: reqwest
+        // strips `Authorization` across origins, but NOT our custom
+        // `ChatGPT-Account-Id`, so an open redirect on the host would hand the
+        // account id to a third party.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(c) => c,
@@ -493,6 +529,50 @@ mod tests {
         let out = parse_catalog(&payload(serde_json::json!([{ "slug": "m" }]))).unwrap();
         assert_eq!(out[0].context_window, None);
         assert_eq!(out[0].label, "m");
+    }
+
+    #[test]
+    fn parse_keeps_rows_whose_required_features_are_unrecognised() {
+        // The feature gate is a deny-list, not an allow-list: a feature we have
+        // never heard of must not hide an entitled model from the picker.
+        let v = payload(serde_json::json!([
+            { "slug": "novel", "required_features": ["some_future_feature"] },
+            { "slug": "mixed", "required_features": ["some_future_feature", "UNSUPPORTED"] },
+        ]));
+        let out = parse_catalog(&v).unwrap();
+        assert_eq!(
+            out.iter().map(|m| m.slug.as_str()).collect::<Vec<_>>(),
+            ["novel"],
+            "unknown feature keeps the row; a known-unsupported one (any case) drops it"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_a_context_window_we_cannot_act_on() {
+        // `Some(0)` would tell `apply_choice` the window is known, suppressing the
+        // endpoint probe and silently disabling the context gauge and
+        // auto-compaction for the session. A >=2^32 value must not wrap into one.
+        let v = payload(serde_json::json!([
+            { "slug": "zero", "context_window": 0 },
+            { "slug": "huge", "context_window": 4_294_967_296u64 },
+            { "slug": "wraps", "context_window": 4_294_967_297u64 },
+            { "slug": "sane", "context_window": 400_000 },
+        ]));
+        let out = parse_catalog(&v).unwrap();
+        let windows: Vec<(&str, Option<u32>)> = out
+            .iter()
+            .map(|m| (m.slug.as_str(), m.context_window))
+            .collect();
+        assert_eq!(
+            windows,
+            [
+                ("zero", None),
+                ("huge", None),
+                ("wraps", None),
+                ("sane", Some(400_000)),
+            ],
+            "an unusable window is None (probe it), never Some(0)"
+        );
     }
 
     #[test]

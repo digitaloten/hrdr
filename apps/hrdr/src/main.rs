@@ -235,6 +235,7 @@ async fn main() -> Result<()> {
     // combo the user switched to (recorded by the `/model` selector, `/provider`,
     // and `/model`). Captured before the resolution below sets `config.provider`.
     let last_used = hrdr_agent::load_last_model();
+    let config_provider = config.provider.clone();
     let config_had_provider = config.provider.is_some();
     let config_had_model = config.model != "default";
     let provider_name = cli
@@ -242,6 +243,18 @@ async fn main() -> Result<()> {
         .clone()
         .or_else(|| config.provider.clone())
         .or_else(|| last_used.as_ref().map(|(p, _)| p.clone()));
+    // A `model` in config.toml belongs to the provider config.toml names. It must
+    // NOT follow the user onto a provider they switched to — `model = "sonnet"`
+    // plus `hrdr --provider chatgpt` would otherwise suppress the ChatGPT preset's
+    // default and send a Claude model id to the Codex endpoint. A config model
+    // with no config provider is a global default, and so still yields to an
+    // explicit `--provider`.
+    let config_model_applies = config_had_model
+        && match (&config_provider, &provider_name) {
+            (Some(cp), Some(n)) => cp.eq_ignore_ascii_case(n),
+            (Some(_), None) => true,
+            (None, _) => cli.provider.is_none(),
+        };
     if let Some(name) = &provider_name {
         let p = config.resolve_provider(name).ok_or_else(|| {
             anyhow::anyhow!(
@@ -268,15 +281,16 @@ async fn main() -> Result<()> {
         }
         // Provider's default model, unless the user set one explicitly.
         let model_overridden = cli.model.is_some() || std::env::var_os("HRDR_MODEL").is_some();
-        // Precedence: flag/env > config.toml > preset default. Only fall back to
-        // the preset's default model when neither a flag/env nor the config file
-        // pinned one — otherwise a preset (e.g. ChatGPT's `gpt-5.5`) would
-        // silently clobber a `model = …` set in config.toml.
-        if !model_overridden
-            && !config_had_model
-            && let Some(m) = p.model.clone()
-        {
-            config.model = m;
+        // Precedence: flag/env > config.toml (for its own provider) > preset
+        // default. Only fall back to the preset's default model when neither a
+        // flag/env nor an applicable config model pinned one — otherwise a preset
+        // (e.g. ChatGPT's `gpt-5.5`) would silently clobber a `model = …` set in
+        // config.toml for this same provider.
+        if !model_overridden && !config_model_applies {
+            // The preset's default when it has one; otherwise the `default`
+            // sentinel (let the endpoint pick). Never leave another provider's
+            // model id in place.
+            config.model = p.model.clone().unwrap_or_else(|| "default".to_string());
         }
         if config.context_window.is_none() {
             config.context_window = p.context_window;
