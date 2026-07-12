@@ -162,6 +162,10 @@ pub(crate) enum TurnMsg {
 
 pub(crate) struct App {
     agent: Arc<tokio::sync::Mutex<Agent>>,
+    /// Shared cell for the sub-agent transcript dir, handed to the agent config
+    /// and refreshed whenever the session id is assigned (see
+    /// [`Self::refresh_subagent_dir`]).
+    subagent_dir: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     pub(crate) editor: Box<dyn TuiEditorEngine>,
     /// Resolved chat-UI colors (from an hjkl theme).
     pub(crate) theme: Theme,
@@ -377,7 +381,7 @@ pub(crate) struct App {
 
 impl App {
     pub(crate) fn new(
-        config: AgentConfig,
+        mut config: AgentConfig,
         ui: hrdr_app::UiConfig,
         logo: &'static str,
     ) -> Result<Self> {
@@ -407,6 +411,11 @@ impl App {
         let effort = config.effort.clone();
         let base_url = config.base_url.clone();
         let provider = config.provider.clone();
+        // Shared transcript-dir cell: handed to the agent (so the `task` tool
+        // can persist sub-agent runs) and kept here to repoint at the session's
+        // dir once an id is assigned (`refresh_subagent_dir`).
+        let subagent_dir = Arc::new(std::sync::Mutex::new(None));
+        config.subagent_transcript_dir = Some(subagent_dir.clone());
         let cfg = config.clone();
         let agent = Agent::new(config)?;
         let todos = agent.todos();
@@ -452,6 +461,7 @@ impl App {
         };
         let mut app = Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
+            subagent_dir,
             editor,
             theme,
             logo,

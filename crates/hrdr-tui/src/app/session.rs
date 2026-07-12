@@ -7,6 +7,18 @@
 use super::*;
 
 impl super::App {
+    /// Point the shared sub-agent transcript cell at the current session's dir.
+    /// Called after the session id is assigned; sub-agents spawned before this
+    /// (a brand-new session's first turn) are simply not persisted.
+    pub(super) fn refresh_subagent_dir(&self) {
+        if let Some(id) = &self.state.id {
+            let dir = hrdr_app::subagent_transcript_dir(&self.current_cwd(), id);
+            if let Ok(mut cell) = self.subagent_dir.lock() {
+                *cell = Some(dir);
+            }
+        }
+    }
+
     /// On startup, resume the most recent saved session for the current
     /// directory (if any). No match → leave the fresh session as-is.
     pub(super) fn auto_resume_latest(&mut self) {
@@ -46,6 +58,7 @@ impl super::App {
                 self.push_entry(Entry::notice(hrdr_app::session_saved_notice(&o.id)));
             }
             self.state.id = Some(o.id);
+            self.refresh_subagent_dir();
         }
     }
 
@@ -75,6 +88,7 @@ impl super::App {
                 self.push_entry(Entry::notice(hrdr_app::session_saved_notice(&o.id)));
             }
             self.state.id = Some(o.id);
+            self.refresh_subagent_dir();
         }
     }
 
@@ -135,6 +149,7 @@ impl super::App {
 
         self.state = state.restored();
         self.state.id = id;
+        self.refresh_subagent_dir();
         self.state.base_url = base_url;
         self.state.usage.context_window = probed_window.or(self.state.usage.context_window);
         if let Some(model) = pinned_model {
