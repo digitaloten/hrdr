@@ -6,6 +6,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **ChatGPT subscription login + entitled model discovery.** A built-in
+  `chatgpt` provider logs in through the browser (Codex OAuth) from the `/login`
+  modal's typed authorizing state, then loads your account's entitled models
+  into the generic `/model` selector asynchronously (cached per account for five
+  minutes, with a built-in fallback when the endpoint is unreachable). The
+  picker opens immediately with cached rows and merges the authenticated catalog
+  when it arrives, preserving your filter and selection; catalog provenance
+  (live/cached/built-in) shows on the hint line. A login triggers a forced
+  refresh and opens the picker without a restart.
+
+### Changed
+
+- **Trusted provider identity isolates ChatGPT OAuth.** Provider resolution now
+  stamps a trust kind (`Custom`/`BuiltIn`/`ChatGptOAuth`); a custom provider
+  named `chatgpt`/`codex`/`openai-oauth` resolves to `Custom` and can never read
+  the built-in OAuth credential slot, receive the `Authorization`/
+  `ChatGPT-Account-Id` header injection, or enter the browser-login flow. OAuth
+  header injection is gated on both the trusted kind and the canonical Codex
+  endpoint.
+
+### Fixed
+
+- **ChatGPT token refresh no longer races.** A process-global, cancel-safe
+  single-flight coordinator collapses concurrent refreshes into one request
+  (shared across sub-agents), prefers a newer browser-installed credential over
+  stale refresh output, and clears its gate on cancellation/panic — so
+  concurrent refreshes can no longer clobber a rotated refresh chain. Token-
+  endpoint errors are sanitized to a status + short OAuth error code; response
+  bodies (which carry tokens/codes/verifiers) are never surfaced.
+- **No false "model not found" warning for ChatGPT.** The generic `/models`
+  health probe is skipped for trusted ChatGPT OAuth (the Codex backend returns a
+  false 401 to it); the authenticated catalog still surfaces a genuine 401/403,
+  so a revoked credential is not masked. Async endpoint/catalog warnings render
+  as ephemeral notices and are never written to saved sessions.
+
 ## [0.2.11] - 2026-07-12
 
 ### Added

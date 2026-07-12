@@ -440,6 +440,51 @@ mod tests {
         }
     }
 
+    /// Async endpoint/catalog warnings are `Notice` entries, which `persisted()`
+    /// strips — so they never persist and cannot accrete a fresh copy across
+    /// save/resume cycles (the Task 6 diagnostics invariant).
+    #[test]
+    fn async_warning_notices_do_not_persist_or_accrete() {
+        let t = crate::time_from_unix(1_700_000_000, chrono::Local::now());
+        let mut s = state("Chat", "/tmp/p");
+        s.transcript = vec![
+            Entry::at(EntryKind::User("hi".into()), t),
+            Entry::at(
+                EntryKind::Notice("Showing built-in ChatGPT models.".into()),
+                t,
+            ),
+        ];
+        // Save strips the async-warning Notice; the User entry is kept.
+        let saved = s.persisted();
+        let notices = |st: &SessionState| {
+            st.transcript
+                .iter()
+                .filter(|e| matches!(e.kind, EntryKind::Notice(_)))
+                .count()
+        };
+        assert_eq!(notices(&saved), 0, "async warnings are not persisted");
+        assert_eq!(
+            saved
+                .transcript
+                .iter()
+                .filter(|e| matches!(e.kind, EntryKind::User(_)))
+                .count(),
+            1
+        );
+        // Resume restores `saved`; a fresh warning is added at runtime and it is
+        // re-saved — still no accreted warnings.
+        let mut resumed = saved.clone();
+        resumed.transcript.push(Entry::at(
+            EntryKind::Notice("Showing built-in ChatGPT models.".into()),
+            t,
+        ));
+        assert_eq!(
+            notices(&resumed.persisted()),
+            0,
+            "warnings do not accrete across resume cycles"
+        );
+    }
+
     // ── sanitize_name ─────────────────────────────────────────────────────────
 
     #[test]
