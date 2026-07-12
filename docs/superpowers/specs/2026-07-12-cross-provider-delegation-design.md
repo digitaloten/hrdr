@@ -141,9 +141,12 @@ and gate:
 - **Un-authenticated remote provider** → compute
   `provider_auth_state(pname, &p, cfg.api_key.as_deref(), Some(&cfg.base_url))`
   (`lib.rs:1593`), where `cfg` still holds the **parent's** key/base_url at this
-  point. If `Missing` → hard error **before spawn**:
-  `task: provider 'X' is not configured — set $<KEY_ENV>, or run /login`.
-  `OAuth` (chatgpt), `Keyless` (local), and `Key` all pass.
+  point. If `Missing` → hard error **before spawn**. The hint is conditional on
+  `key_env`: providers that read an env var → `set $<KEY_ENV>, or run /login`;
+  `key_env`-less providers (chatgpt OAuth, a keyless `[providers.*]`) →
+  `run /login, or add an api_key/key_env to [providers.X]` (never suggest
+  `$HRDR_API_KEY`, which `resolve_api_key` does not consult for them). `OAuth`
+  (chatgpt), `Keyless` (local), and `Key` all pass.
 
 **Ordering (required):** run the auth gate on the parent's `cfg.api_key` /
 `cfg.base_url` (the inheritance context) **before** calling
