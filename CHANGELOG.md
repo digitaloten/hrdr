@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Ad-hoc cross-provider delegation.** The `task` tool takes an optional
+  `provider` argument, so a sub-agent can run on any configured and
+  authenticated provider/model at delegation time rather than only through a
+  predefined `[[subagent]]` profile. The target is auth-gated before the
+  sub-agent spawns.
 - **Durable sub-agent transcripts.** Every delegated `task` run now streams an
   append-only JSONL log to
   `sessions/<cwd>/subagents/<session-id>/NNN-<label>.jsonl` — the spawn prompt,
@@ -48,6 +53,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A repointed sub-agent carries its own provider identity.** A sub-agent sent
+  to another provider now sets `config.provider` to match, so its derived
+  provider kind agrees with its endpoint instead of inheriting the parent's.
+  That also fixes its cost attribution: the models.dev price card is keyed by
+  `(provider, model)`, so a repointed sub-agent used to be priced under the
+  parent's provider — often not priced at all.
 - **A new session's first delegated task is now recorded.** The session id — and
   with it the sub-agent transcript directory — is reserved when the turn starts,
   not when the agent emits its first history snapshot (which lands _after_ that
