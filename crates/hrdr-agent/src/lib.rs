@@ -8094,11 +8094,39 @@ mod tests {
             cwd: &std::path::Path,
             ts_dir: &std::path::Path,
         ) -> SubagentTool {
+            use super::super::{
+                DelegationEndpoint, DelegationRuntime, PublicModelRuntime, ResolvedProviderKind,
+                SharedDelegationRuntime,
+            };
             let cell: SubagentDirCell = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
                 ts_dir.to_path_buf(),
             ))));
+            let cfg = test_cfg(base_url, cwd);
+            // A minimal delegation runtime built from the test config; the
+            // transcript tests don't exercise it, only its presence.
+            let runtime: SharedDelegationRuntime =
+                std::sync::Arc::new(std::sync::Mutex::new(DelegationRuntime {
+                    public: PublicModelRuntime {
+                        provider: cfg.provider.clone(),
+                        model: cfg.model.clone(),
+                        effort: cfg.effort.clone(),
+                        delegation_enabled: cfg.subagents,
+                    },
+                    endpoint: DelegationEndpoint {
+                        provider: cfg.provider.clone(),
+                        model: cfg.model.clone(),
+                        effort: cfg.effort.clone(),
+                        base_url: cfg.base_url.clone(),
+                        api_key: cfg.api_key.clone(),
+                        api_version: cfg.api_version.clone(),
+                        configured_headers: Vec::new(),
+                        provider_kind: ResolvedProviderKind::Custom,
+                    },
+                    explicit_subagent_model: cfg.subagent_model.clone(),
+                }));
             SubagentTool::new(
-                test_cfg(base_url, cwd),
+                cfg,
+                runtime,
                 Vec::new(),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
