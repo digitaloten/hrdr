@@ -162,6 +162,10 @@ pub(crate) enum TurnMsg {
 
 pub(crate) struct App {
     agent: Arc<tokio::sync::Mutex<Agent>>,
+    /// Every agent this session can show: the main one, plus each retained
+    /// sub-agent. The main agent's transcript lives in its pane — `state`'s copy
+    /// is a serialization shape, refreshed from the pane at save time.
+    pub(crate) panes: hrdr_app::PaneSet,
     /// Shared cell for the sub-agent transcript dir, handed to the agent config
     /// and refreshed whenever the session id is assigned (see
     /// [`Self::refresh_subagent_dir`]).
@@ -457,7 +461,7 @@ impl App {
             model,
             provider,
             base_url,
-            transcript,
+            transcript: Vec::new(),
             usage: hrdr_app::SessionUsage {
                 context_window,
                 ..Default::default()
@@ -467,6 +471,13 @@ impl App {
         let mut app = Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             subagent_dir,
+            // The main agent's pane owns the live transcript from the start; the
+            // opening chrome (banner + welcome) is seeded straight into it.
+            panes: {
+                let mut panes = hrdr_app::PaneSet::new();
+                panes.main_mut().transcript = transcript;
+                panes
+            },
             session_notice_pending: false,
             editor,
             theme,
@@ -1224,8 +1235,11 @@ impl App {
                     .find(|(r, _)| r.contains(m.column, m.row))
                     .map(|(_, i)| *i);
                 if let Some(idx) = hit
-                    && let Some(EntryKind::Tool { expanded, .. }) =
-                        self.state.transcript.get_mut(idx).map(|e| &mut e.kind)
+                    && let Some(EntryKind::Tool { expanded, .. }) = self
+                        .panes
+                        .active_transcript_mut()
+                        .get_mut(idx)
+                        .map(|e| &mut e.kind)
                 {
                     *expanded = !*expanded;
                     // The block's height just changed; keep its top where the
@@ -1241,8 +1255,8 @@ impl App {
     /// A sub-agent panel row jumps to it; the call may have been cleared by
     /// `/clear` or scrolled out of a compacted transcript, hence the `Option`.
     pub(crate) fn tool_entry_index(&self, id: &str) -> Option<usize> {
-        self.state
-            .transcript
+        self.panes
+            .active_transcript()
             .iter()
             .position(|e| matches!(&e.kind, EntryKind::Tool { id: tid, .. } if tid == id))
     }
@@ -1283,8 +1297,22 @@ impl App {
 
     /// Append a transcript entry. Each entry carries its own timestamp, set when
     /// it was constructed.
+    /// The live transcript of the main agent — the session's conversation.
+    /// `state.transcript` is only its saved shape, refreshed at save time.
+    /// (Tests reach for this; the app itself goes through `panes` directly.)
+    #[cfg(test)]
+    pub(crate) fn transcript(&self) -> &Vec<Entry> {
+        &self.panes.main().transcript
+    }
+
+    /// Mutable access to the main agent's live transcript.
+    #[cfg(test)]
+    pub(crate) fn transcript_mut(&mut self) -> &mut Vec<Entry> {
+        &mut self.panes.main_mut().transcript
+    }
+
     fn push_entry(&mut self, e: Entry) {
-        self.state.transcript.push(e);
+        self.panes.main_mut().transcript.push(e);
         self.prune_scrollback();
     }
 
@@ -1293,7 +1321,7 @@ impl App {
     /// welcome/config/project-docs notices — see `App::new`) is always kept
     /// so the user never loses the intro banner.
     fn prune_scrollback(&mut self) {
-        if self.state.transcript.len() <= self.scrollback {
+        if self.panes.main_mut().transcript.len() <= self.scrollback {
             return;
         }
         // Count leading `Header`/`Notice` entries: they form the intro block
@@ -1304,20 +1332,28 @@ impl App {
         // the intro is Header + Notice — so `head` was always 0 and the
         // welcome banner was the very first thing evicted.
         let head = self
-            .state
+            .panes
+            .main()
             .transcript
             .iter()
             .take_while(|e| matches!(e.kind, EntryKind::Header | EntryKind::Notice(_)))
             .count();
-        let excess = self.state.transcript.len().saturating_sub(self.scrollback);
+        let excess = self
+            .panes
+            .main_mut()
+            .transcript
+            .len()
+            .saturating_sub(self.scrollback);
         // Ensure we always keep at least `head` entries.
-        let remove = excess.min(self.state.transcript.len().saturating_sub(head));
+        let remove = excess.min(self.panes.main_mut().transcript.len().saturating_sub(head));
         if remove == 0 {
             return;
         }
         // Drop the oldest non-head entries.
-        let keep_start = head.saturating_add(remove).min(self.state.transcript.len());
-        self.state.transcript.drain(head..keep_start);
+        let keep_start = head
+            .saturating_add(remove)
+            .min(self.panes.main_mut().transcript.len());
+        self.panes.main_mut().transcript.drain(head..keep_start);
         // Prune the render cache: any key with an entry_idx that has shifted
         // is stale.  Easiest way: clear the whole thread-local transcript cache
         // once (cheap — it rebuilds lazily on the next frame).
@@ -1326,13 +1362,13 @@ impl App {
 
     /// Clear the transcript.
     fn clear_transcript(&mut self) {
-        self.state.transcript.clear();
+        self.panes.main_mut().transcript.clear();
         crate::ui::clear_transcript_cache();
     }
 
     /// Truncate the transcript to `len`.
     fn truncate_transcript(&mut self, len: usize) {
-        self.state.transcript.truncate(len);
+        self.panes.main_mut().transcript.truncate(len);
         crate::ui::clear_transcript_cache();
     }
 
@@ -1834,8 +1870,12 @@ impl App {
             return;
         };
         let elapsed = start.elapsed().as_millis() as u64;
-        if let Some(EntryKind::Reasoning { took_ms, .. }) =
-            self.state.transcript.last_mut().map(|e| &mut e.kind)
+        if let Some(EntryKind::Reasoning { took_ms, .. }) = self
+            .panes
+            .main_mut()
+            .transcript
+            .last_mut()
+            .map(|e| &mut e.kind)
         {
             *took_ms = Some(elapsed);
         }
@@ -1851,7 +1891,13 @@ impl App {
         match ev {
             AgentEvent::Text(t) => {
                 self.count_token();
-                match self.state.transcript.last_mut().map(|e| &mut e.kind) {
+                match self
+                    .panes
+                    .main_mut()
+                    .transcript
+                    .last_mut()
+                    .map(|e| &mut e.kind)
+                {
                     Some(EntryKind::Assistant(s)) => s.push_str(&t),
                     // Don't open an assistant entry for an empty delta — a turn
                     // that only calls tools would leave an empty one behind.
@@ -1864,7 +1910,13 @@ impl App {
                 if self.reasoning_start.is_none() {
                     self.reasoning_start = Some(Instant::now());
                 }
-                match self.state.transcript.last_mut().map(|e| &mut e.kind) {
+                match self
+                    .panes
+                    .main_mut()
+                    .transcript
+                    .last_mut()
+                    .map(|e| &mut e.kind)
+                {
                     Some(EntryKind::Reasoning {
                         text,
                         took_ms: None,
@@ -1907,7 +1959,7 @@ impl App {
             }
             AgentEvent::ToolOutput { id, chunk } => {
                 // Append live output to the running tool's entry.
-                for entry in self.state.transcript.iter_mut().rev() {
+                for entry in self.panes.main_mut().transcript.iter_mut().rev() {
                     if let EntryKind::Tool {
                         id: tid,
                         result: r,
@@ -1931,7 +1983,7 @@ impl App {
                 ok,
                 name: _,
             } => {
-                for entry in self.state.transcript.iter_mut().rev() {
+                for entry in self.panes.main_mut().transcript.iter_mut().rev() {
                     if let EntryKind::Tool {
                         id: tid,
                         result: r,

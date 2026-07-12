@@ -448,8 +448,7 @@ async fn parallel_tool_calls_in_one_turn_all_run() {
     // the tool blocks scroll off the top of a 30-row terminal.)
     let tools: Vec<String> = h
         .app
-        .state
-        .transcript
+        .transcript()
         .iter()
         .filter_map(|e| match &e.kind {
             EntryKind::Tool { name, .. } => Some(name.clone()),
@@ -656,7 +655,7 @@ async fn multi_chunk_text_assembles_correctly() {
     h.submit("say hello").await;
     assert!(!h.app.running);
     // The accumulator must stitch the deltas into a single entry.
-    let assembled = h.app.state.transcript.iter().find_map(|e| match &e.kind {
+    let assembled = h.app.transcript().iter().find_map(|e| match &e.kind {
         EntryKind::Assistant(s) => Some(s.clone()),
         _ => None,
     });
@@ -679,7 +678,7 @@ async fn reasoning_entry_appended_to_transcript() {
     assert!(h.app.show_reasoning, "show_reasoning must default to true");
     h.submit("think").await;
     assert!(!h.app.running);
-    let has_reasoning = h.app.state.transcript.iter().any(
+    let has_reasoning = h.app.transcript().iter().any(
         |e| matches!(&e.kind, EntryKind::Reasoning { text, .. } if text.contains("I am thinking.")),
     );
     assert!(
@@ -688,8 +687,7 @@ async fn reasoning_entry_appended_to_transcript() {
     );
     let has_text = h
         .app
-        .state
-        .transcript
+        .transcript()
         .iter()
         .any(|e| matches!(&e.kind, EntryKind::Assistant(t) if t.as_str() == "Done."));
     assert!(has_text, "EntryKind::Assistant missing from transcript");
@@ -1042,7 +1040,7 @@ async fn resume_restores_the_full_transcript_with_its_timestamps() {
 
     // The restored entries are the saved ones, verbatim — kinds, order, times.
     // (Entries after these are the `/resume` notices, stamped now.)
-    assert_eq!(&h.app.state.transcript[..transcript.len()], &transcript[..]);
+    assert_eq!(&h.app.transcript()[..transcript.len()], &transcript[..]);
 }
 
 /// A tool call still running when the session was saved restores as finished
@@ -1060,7 +1058,7 @@ async fn resume_settles_a_tool_call_that_was_still_running() {
     h.app
         .apply_session("interrupted".to_string(), hrdr_app::Session::new(state));
 
-    let EntryKind::Tool { ok, done, .. } = &h.app.state.transcript[0].kind else {
+    let EntryKind::Tool { ok, done, .. } = &h.app.transcript()[0].kind else {
         panic!("tool entry lost");
     };
     assert!(*done, "no spinner on a restored block");
@@ -1083,7 +1081,7 @@ async fn autosave_persists_every_transcript_entry() {
 
     // The turn's stats line and the tool call are both in the state that a save
     // writes verbatim.
-    let kinds = &h.app.state.transcript;
+    let kinds = &h.app.transcript();
     assert!(
         kinds.iter().any(|e| matches!(e.kind, EntryKind::Stats(_))),
         "the per-turn stats line is part of the state"
@@ -1173,8 +1171,7 @@ async fn a_mid_turn_submit_waits_when_the_model_just_answers() {
     );
     assert!(
         !h.app
-            .state
-            .transcript
+            .transcript()
             .iter()
             .any(|e| matches!(&e.kind, EntryKind::User(t) if t == "second question")),
         "and not yet in the conversation"
@@ -1187,8 +1184,7 @@ async fn a_mid_turn_submit_waits_when_the_model_just_answers() {
     assert!(h.app.queue.is_empty(), "the queue drained");
     assert!(
         h.app
-            .state
-            .transcript
+            .transcript()
             .iter()
             .any(|e| matches!(&e.kind, EntryKind::User(t) if t == "second question")),
         "the queued message was sent after the turn"
@@ -1212,8 +1208,7 @@ async fn a_queued_message_rides_in_with_the_tool_results() {
     h.press(KeyCode::Enter);
     let user_entries = |h: &Harness| -> Vec<String> {
         h.app
-            .state
-            .transcript
+            .transcript()
             .iter()
             .filter_map(|e| match &e.kind {
                 EntryKind::User(t) => Some(t.clone()),
@@ -1298,7 +1293,7 @@ async fn every_transcript_row_is_rendered_through_the_block_path() {
     ])
     .await;
     h.submit("run it").await;
-    h.app.state.transcript.push(Entry::diff("+added"));
+    h.app.transcript_mut().push(Entry::diff("+added"));
     h.app.queue.push_back("queued msg".into());
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
@@ -1343,7 +1338,7 @@ async fn resume_restores_the_status_bar_token_counters() {
     let state = hrdr_app::SessionState {
         cwd: h2.app.current_cwd(),
         messages: vec![hrdr_agent::Message::system("sys")],
-        transcript: h.app.state.transcript.clone(),
+        transcript: h.app.transcript().clone(),
         usage,
         ..Default::default()
     };
@@ -1505,8 +1500,7 @@ async fn autosave_writes_the_state_and_it_loads_back_identically() {
     let saved = &loaded.state.transcript;
     let live: Vec<&Entry> = h
         .app
-        .state
-        .transcript
+        .transcript()
         .iter()
         .filter(|e| !matches!(e.kind, EntryKind::Notice(_)))
         .collect();
@@ -1632,7 +1626,7 @@ async fn the_first_turn_reserves_the_session_id_before_any_tool_can_run() {
 async fn a_new_session_opens_with_the_header_banner() {
     let mut h = Harness::new(vec![]).await;
     assert!(
-        matches!(h.app.state.transcript[0].kind, EntryKind::Header),
+        matches!(h.app.transcript()[0].kind, EntryKind::Header),
         "the header is the transcript's first entry"
     );
 
@@ -1716,13 +1710,12 @@ async fn clearing_reseeds_the_header() {
     h.submit("hi").await;
     h.app.clear_all();
     assert!(
-        matches!(h.app.state.transcript[0].kind, EntryKind::Header),
+        matches!(h.app.transcript()[0].kind, EntryKind::Header),
         "a cleared transcript opens with the header again"
     );
     assert_eq!(
         h.app
-            .state
-            .transcript
+            .transcript()
             .iter()
             .filter(|e| matches!(e.kind, EntryKind::Header))
             .count(),
@@ -1838,8 +1831,7 @@ async fn a_pinned_model_and_provider_survive_a_resume() {
         // The conversation itself did come back.
         assert!(
             h.app
-                .state
-                .transcript
+                .transcript()
                 .iter()
                 .any(|e| matches!(&e.kind, EntryKind::User(t) if t == "earlier")),
             "the saved transcript is restored"
@@ -1896,8 +1888,7 @@ async fn resume_notices_do_not_accumulate() {
     let cwd = h.app.current_cwd();
 
     let notices = |app: &App| {
-        app.state
-            .transcript
+        app.transcript()
             .iter()
             .filter(|e| matches!(e.kind, EntryKind::Notice(_)))
             .count()
@@ -1935,8 +1926,7 @@ async fn resume_notices_do_not_accumulate() {
     // The conversation itself is untouched by all that resuming.
     let user_msgs = h
         .app
-        .state
-        .transcript
+        .transcript()
         .iter()
         .filter(|e| matches!(&e.kind, EntryKind::User(t) if t == "hi"))
         .count();
@@ -2015,8 +2005,7 @@ async fn a_thinking_block_renders_no_label() {
 
     let reasoning = h
         .app
-        .state
-        .transcript
+        .transcript()
         .iter()
         .find_map(|e| match &e.kind {
             EntryKind::Reasoning { text, took_ms } => Some((text.clone(), *took_ms)),
@@ -2041,8 +2030,7 @@ async fn a_thinking_block_renders_no_label() {
     // Streaming shows no spinner label either.
     let mut h2 = Harness::new(vec![]).await;
     h2.app
-        .state
-        .transcript
+        .transcript_mut()
         .push(Entry::reasoning("streaming thoughts"));
     h2.app.running = true;
     h2.app.reasoning_start = Some(std::time::Instant::now());
@@ -2064,8 +2052,7 @@ async fn a_thinking_block_renders_no_label() {
 async fn an_empty_thinking_block_renders_nothing() {
     let mut h = Harness::new(vec![]).await;
     h.app
-        .state
-        .transcript
+        .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
     h.app.push_entry(Entry::user("go"));
     h.app.push_entry(Entry::reasoning("   \n"));
@@ -2080,11 +2067,11 @@ async fn an_empty_thinking_block_renders_nothing() {
 #[tokio::test]
 async fn an_empty_text_delta_opens_no_entry() {
     let mut h = Harness::new(vec![]).await;
-    let before = h.app.state.transcript.len();
+    let before = h.app.transcript().len();
     h.app
         .on_turn_msg(TurnMsg::Event(hrdr_agent::AgentEvent::Text(String::new())));
     assert_eq!(
-        h.app.state.transcript.len(),
+        h.app.transcript().len(),
         before,
         "an empty delta created a transcript entry"
     );
@@ -2096,8 +2083,7 @@ async fn an_empty_text_delta_opens_no_entry() {
 async fn goto_finds_a_text_less_assistant_turn() {
     let mut h = Harness::new(vec![]).await;
     h.app
-        .state
-        .transcript
+        .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
     h.app.push_entry(Entry::user("go"));
     // Enough filler that the target is off-screen before the jump.
@@ -2136,8 +2122,7 @@ async fn clicking_a_tool_block_toggles_its_expansion() {
     let long_output: String = (0..30).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(vec![]).await;
     h.app
-        .state
-        .transcript
+        .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
     h.app.push_entry(Entry::user("go"));
     h.app.push_entry(Entry::reasoning("thinking"));
@@ -2182,8 +2167,7 @@ async fn clicking_a_tool_block_toggles_its_expansion() {
         modifiers: crossterm::event::KeyModifiers::empty(),
     };
     let expanded = |app: &App| {
-        app.state
-            .transcript
+        app.transcript()
             .iter()
             .any(|e| matches!(&e.kind, EntryKind::Tool { expanded, .. } if *expanded))
     };
@@ -2202,8 +2186,7 @@ async fn the_stats_line_rides_on_the_turns_block() {
     let mut h = Harness::new(vec![MockReply::Text("all done".into())]).await;
     h.submit("run it").await;
     h.app
-        .state
-        .transcript
+        .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
 
     let mut term = Terminal::new(TestBackend::new(46, 30)).unwrap();
@@ -2256,8 +2239,7 @@ async fn user_prompts_render_like_the_models_output() {
     let mut h = Harness::new(vec![MockReply::Text("**reply** text".into())]).await;
     h.submit("**prompt** text").await;
     h.app
-        .state
-        .transcript
+        .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
     // The auto-derived session name echoes the first message (so it carries the
     // literal `**`); it now shows in the status bar, but this test is about the
@@ -2316,8 +2298,7 @@ async fn fenced_code_has_no_extra_indent_or_language_row() {
     .await;
     h.submit("go").await;
     h.app
-        .state
-        .transcript
+        .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
 
     let mut term = Terminal::new(TestBackend::new(44, 30)).unwrap();
@@ -2378,8 +2359,7 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
     };
     let mut h = Harness::new(vec![]).await;
     h.app
-        .state
-        .transcript
+        .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
     h.app.push_entry(Entry::user("prompt"));
     h.app.push_entry(tool("a", "ls"));
@@ -2457,8 +2437,7 @@ async fn separator_rows_appear_only_between_tinted_blocks() {
 async fn a_thought_and_the_output_after_it_share_one_blank_row() {
     let mut h = Harness::new(vec![]).await;
     h.app
-        .state
-        .transcript
+        .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
     h.app.push_entry(Entry::now(EntryKind::Reasoning {
         text: "thinking here".into(),
@@ -2533,8 +2512,7 @@ async fn collapsing_a_tool_block_keeps_it_at_the_top_of_the_view() {
     let long: String = (0..40).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(vec![]).await;
     h.app
-        .state
-        .transcript
+        .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
     h.app.push_entry(Entry::user("go"));
     h.app.push_entry(Entry::now(EntryKind::Tool {
@@ -2598,8 +2576,7 @@ async fn collapsing_while_following_stays_at_the_bottom() {
     let long: String = (0..40).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(vec![]).await;
     h.app
-        .state
-        .transcript
+        .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
     h.app.push_entry(Entry::now(EntryKind::Tool {
         id: "c1".into(),
@@ -2634,8 +2611,7 @@ async fn collapsing_while_following_stays_at_the_bottom() {
 async fn a_trailing_tinted_block_ends_with_a_blank_row() {
     let mut h = Harness::new(vec![]).await;
     h.app
-        .state
-        .transcript
+        .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
     h.app.push_entry(Entry::user("go"));
     h.app.push_entry(Entry::now(EntryKind::Tool {
@@ -2760,7 +2736,7 @@ async fn a_sub_agent_row_lists_the_agent_and_jumps_to_its_tool_call() {
     // it is scrolled out of view while following the newest output.
     h.app
         .push_entry(Entry::tool_running("call-1", "task", "{}"));
-    let call_idx = h.app.state.transcript.len() - 1;
+    let call_idx = h.app.transcript().len() - 1;
     for i in 0..40 {
         h.app.push_entry(Entry::system(format!("filler {i}")));
     }
@@ -2851,11 +2827,11 @@ async fn a_finished_background_task_wakes_an_idle_model() {
     // Finished, undelivered, idle: the model is woken with an empty turn — no
     // user message of its own is added to the transcript.
     *h.app.background_tasks.lock().unwrap() = vec![task(true, false)];
-    let before = h.app.state.transcript.len();
+    let before = h.app.transcript().len();
     h.app.maybe_deliver_background();
     assert!(h.app.running, "the model was woken");
     assert_eq!(
-        h.app.state.transcript.len(),
+        h.app.transcript().len(),
         before,
         "the wake-up turn adds no user message"
     );
@@ -3305,8 +3281,7 @@ async fn the_generating_line_heads_the_input_area_with_a_blank_row_each_side() {
 async fn the_prompt_and_input_wear_a_left_bar() {
     let mut h = Harness::new(vec![]).await;
     h.app
-        .state
-        .transcript
+        .transcript_mut()
         .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
     h.app.push_entry(Entry::user("prompt here"));
     h.app.push_entry(Entry::now(EntryKind::Tool {
@@ -3443,8 +3418,7 @@ async fn the_footer_is_gone_and_the_keys_live_in_help() {
     h.press(KeyCode::Enter);
     let help = h
         .app
-        .state
-        .transcript
+        .transcript()
         .iter()
         .rev()
         .find_map(|e| match &e.kind {
@@ -3538,8 +3512,7 @@ async fn pump_until_partial_reply(h: &mut Harness) {
         let msg = h.rx.recv().await.expect("the mock server always replies");
         h.app.on_turn_msg(msg);
         if h.app
-            .state
-            .transcript
+            .transcript()
             .iter()
             .any(|e| matches!(&e.kind, EntryKind::Assistant(t) if t.contains("partial")))
         {
@@ -3664,7 +3637,7 @@ async fn pruning_keeps_the_header_banner_not_a_leading_system_entry() {
     let mut h = Harness::new(vec![]).await;
     h.app.scrollback = 5;
     assert!(
-        matches!(h.app.state.transcript[0].kind, EntryKind::Header),
+        matches!(h.app.transcript()[0].kind, EntryKind::Header),
         "the header opens every session"
     );
 
@@ -3673,26 +3646,24 @@ async fn pruning_keeps_the_header_banner_not_a_leading_system_entry() {
     }
 
     assert!(
-        matches!(h.app.state.transcript[0].kind, EntryKind::Header),
+        matches!(h.app.transcript()[0].kind, EntryKind::Header),
         "the header banner must survive pruning: {:?}",
-        h.app.state.transcript[0].kind
+        h.app.transcript()[0].kind
     );
     assert!(
-        h.app.state.transcript.len() <= 5,
+        h.app.transcript().len() <= 5,
         "the scrollback cap is enforced"
     );
     assert!(
         !h.app
-            .state
-            .transcript
+            .transcript()
             .iter()
             .any(|e| matches!(&e.kind, EntryKind::System(s) if s == "entry 0")),
         "the oldest conversation entry was evicted"
     );
     assert!(
         h.app
-            .state
-            .transcript
+            .transcript()
             .iter()
             .any(|e| matches!(&e.kind, EntryKind::System(s) if s == "entry 19")),
         "the newest conversation entry is kept"
@@ -3757,8 +3728,7 @@ async fn an_unrecognized_slash_command_is_reported_not_sent_to_the_model() {
     assert!(!h.app.running, "no turn should have been spawned");
     assert!(
         !h.app
-            .state
-            .transcript
+            .transcript()
             .iter()
             .any(|e| matches!(&e.kind, EntryKind::User(_))),
         "the typo must not enter the conversation as a user message"
@@ -3780,8 +3750,7 @@ async fn a_path_like_message_starting_with_slash_still_sends() {
 
     assert!(
         h.app
-            .state
-            .transcript
+            .transcript()
             .iter()
             .any(|e| matches!(&e.kind, EntryKind::User(t) if t.starts_with("/etc/hosts"))),
         "a path-shaped message should be sent as a normal chat message"
@@ -3956,8 +3925,7 @@ async fn browser_login_failure_reports_and_closes() {
     );
     assert!(
         h.app
-            .state
-            .transcript
+            .transcript()
             .iter()
             .any(|e| matches!(&e.kind, EntryKind::Notice(t) if t.contains("login failed"))),
         "the failure is reported to the user"
@@ -4037,14 +4005,12 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
     assert!(!h.app.running, "no model turn spawns for a !command");
     assert!(
         h.app
-            .state
-            .transcript
+            .transcript()
             .iter()
             .any(|e| matches!(&e.kind, EntryKind::Tool { .. })),
         "the tool block opened synchronously: {:?}",
         h.app
-            .state
-            .transcript
+            .transcript()
             .iter()
             .map(|e| &e.kind)
             .collect::<Vec<_>>()
@@ -4054,8 +4020,7 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     while !h
         .app
-        .state
-        .transcript
+        .transcript()
         .iter()
         .any(|e| matches!(&e.kind, EntryKind::Tool { done: true, .. }))
     {
@@ -4135,7 +4100,7 @@ async fn esc_cancels_a_running_user_shell_command() {
     });
     assert!(noted, "the cancellation note landed with the cancel");
     assert!(h.app.state.id.is_some(), "the cancel autosaved the session");
-    let cancelled = h.app.state.transcript.iter().any(|e| {
+    let cancelled = h.app.transcript().iter().any(|e| {
         matches!(&e.kind, EntryKind::Tool { done: true, ok: false, result, .. }
             if result.contains("cancelled"))
     });

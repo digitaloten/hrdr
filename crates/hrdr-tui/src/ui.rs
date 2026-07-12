@@ -2139,7 +2139,7 @@ fn transcript_lines(
     let w = width as usize;
     let inner = inner_width(w);
     let mut pending: Option<PendingBlock> = None;
-    for (i, entry) in app.state.transcript.iter().enumerate() {
+    for (i, entry) in app.panes.active_transcript().iter().enumerate() {
         // Cache key shared by all arms (Reasoning skip happens before this).
         let ck = (
             i,

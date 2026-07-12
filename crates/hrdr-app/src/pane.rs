@@ -61,9 +61,10 @@ pub struct Pane {
     /// Model this pane's agent is on (shown on its row).
     pub model: String,
     pub status: PaneStatus,
-    /// The pane's own transcript, built by [`apply_event`]. For [`PaneId::Main`]
-    /// the frontend owns the transcript (it is the session's, and is persisted),
-    /// so this stays empty and the frontend substitutes its own.
+    /// The pane's own transcript, built by [`apply_event`]. Every pane owns its
+    /// transcript, main included — the session's saved transcript is refreshed
+    /// *from* the main pane at save time (the same way `SessionState` refreshes
+    /// its message mirror from the agent), so there is exactly one live copy.
     pub transcript: Vec<Entry>,
 }
 
@@ -180,6 +181,8 @@ fn finish_reasoning(transcript: &mut [Entry]) {
 /// **pinning the active one** so the agent's prune leaves it alone while the user
 /// is reading it.
 pub struct PaneSet {
+    /// The session's own agent. A pane like any other — it simply always exists.
+    main: Pane,
     subs: Vec<Pane>,
     active: PaneId,
 }
@@ -187,6 +190,13 @@ pub struct PaneSet {
 impl Default for PaneSet {
     fn default() -> Self {
         Self {
+            main: Pane {
+                id: PaneId::Main,
+                title: "main".to_string(),
+                model: String::new(),
+                status: PaneStatus::Idle,
+                transcript: Vec::new(),
+            },
             subs: Vec::new(),
             active: PaneId::Main,
         }
@@ -200,6 +210,49 @@ impl PaneSet {
 
     pub fn active(&self) -> PaneId {
         self.active
+    }
+
+    /// The main agent's pane. Its transcript is the session's — the one that is
+    /// saved and restored.
+    pub fn main(&self) -> &Pane {
+        &self.main
+    }
+
+    pub fn main_mut(&mut self) -> &mut Pane {
+        &mut self.main
+    }
+
+    /// The transcript currently on screen: whichever pane is active.
+    pub fn active_transcript(&self) -> &Vec<Entry> {
+        match self.active {
+            PaneId::Main => &self.main.transcript,
+            PaneId::Sub(k) => self
+                .subs
+                .iter()
+                .find(|p| p.id == PaneId::Sub(k))
+                .map_or(&self.main.transcript, |p| &p.transcript),
+        }
+    }
+
+    /// Mutable access to the transcript on screen (per-entry `/expand`, etc.).
+    pub fn active_transcript_mut(&mut self) -> &mut Vec<Entry> {
+        match self.active {
+            PaneId::Main => &mut self.main.transcript,
+            PaneId::Sub(k) => {
+                if let Some(i) = self.subs.iter().position(|p| p.id == PaneId::Sub(k)) {
+                    &mut self.subs[i].transcript
+                } else {
+                    &mut self.main.transcript
+                }
+            }
+        }
+    }
+
+    /// Whether the agent switcher should be shown at all. With nothing delegated
+    /// there is only the main agent, and a one-row list of the thing you are
+    /// already looking at is just noise — so a fresh session shows no list.
+    pub fn show_switcher(&self) -> bool {
+        !self.subs.is_empty()
     }
 
     /// Switch the active pane. Selecting a sub-agent that is no longer live falls
@@ -292,15 +345,11 @@ pub struct PaneRow {
 }
 
 /// The switcher's rows. Main is always first — it is how you get back.
-pub fn pane_rows(panes: &PaneSet, main_title: &str, main_running: bool) -> Vec<PaneRow> {
+pub fn pane_rows(panes: &PaneSet) -> Vec<PaneRow> {
     let mut rows = vec![PaneRow {
         id: PaneId::Main,
-        title: main_title.to_string(),
-        status: if main_running {
-            PaneStatus::Running
-        } else {
-            PaneStatus::Idle
-        },
+        title: panes.main().title.clone(),
+        status: panes.main().status,
         active: panes.active().is_main(),
     }];
     rows.extend(panes.subs().iter().map(|p| PaneRow {
@@ -419,12 +468,72 @@ mod tests {
 
     #[test]
     fn main_is_always_the_first_row_so_you_can_get_back() {
-        let panes = PaneSet::new();
-        let rows = pane_rows(&panes, "my session", false);
+        let mut panes = PaneSet::new();
+        panes.main_mut().title = "my session".to_string();
+        let rows = pane_rows(&panes);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, PaneId::Main);
         assert!(rows[0].active, "main is active by default");
         assert_eq!(rows[0].title, "my session");
+    }
+
+    /// A fresh session has only the main agent, and a one-row list of the thing
+    /// you are already looking at is noise — so the switcher stays hidden until
+    /// something is actually delegated.
+    #[test]
+    fn the_switcher_is_hidden_until_there_is_more_than_one_agent() {
+        let mut panes = PaneSet::new();
+        assert!(
+            !panes.show_switcher(),
+            "a fresh session shows no agent list"
+        );
+
+        let live = live_with(&[1]);
+        panes.sync(&live);
+        assert!(
+            panes.show_switcher(),
+            "delegating a sub-agent brings the list up"
+        );
+
+        // The sub-agent is released; we are back to one agent, so it goes away.
+        live.prune();
+        panes.sync(&live);
+        assert!(!panes.show_switcher());
+    }
+
+    #[test]
+    fn the_main_pane_owns_the_session_transcript() {
+        let mut panes = PaneSet::new();
+        apply_event(
+            &mut panes.main_mut().transcript,
+            &AgentEvent::Text("hi".into()),
+        );
+        assert_eq!(
+            panes.active_transcript().len(),
+            1,
+            "main is active, so its transcript is on screen"
+        );
+
+        // Switching to a sub-agent shows *that* pane's transcript, and the main
+        // one is untouched behind it.
+        let live = live_with(&[3]);
+        panes.sync(&live);
+        panes.focus(PaneId::Sub(3));
+        assert!(
+            panes.active_transcript().is_empty(),
+            "a fresh sub-agent pane starts empty"
+        );
+        apply_event(
+            panes.active_transcript_mut(),
+            &AgentEvent::Text("sub".into()),
+        );
+        assert_eq!(panes.active_transcript().len(), 1);
+
+        panes.focus(PaneId::Main);
+        assert!(
+            matches!(&panes.active_transcript()[0].kind, EntryKind::Assistant(s) if s == "hi"),
+            "the main transcript survived the excursion"
+        );
     }
 
     #[test]
@@ -507,6 +616,6 @@ mod tests {
         live.prune();
         panes.sync(&live);
         assert!(panes.subs().is_empty());
-        assert_eq!(pane_rows(&panes, "session", false).len(), 1);
+        assert_eq!(pane_rows(&panes).len(), 1);
     }
 }

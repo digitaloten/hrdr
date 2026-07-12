@@ -53,6 +53,7 @@ impl super::App {
         // first turn it is still empty, which would file the session under the
         // wrong cwd slug.
         self.state.cwd = self.current_cwd();
+        self.state.transcript = self.panes.main().transcript.clone();
         if let Some(o) = hrdr_app::save_session(&self.state) {
             if o.first_save {
                 self.push_entry(Entry::notice(hrdr_app::session_saved_notice(&o.id)));
@@ -89,6 +90,7 @@ impl super::App {
         // does not push this one until the turn starts — so seed the mirror. The
         // next autosave replaces it with the agent's own history.
         self.state.messages.push(hrdr_agent::Message::user(sent));
+        self.state.transcript = self.panes.main().transcript.clone();
         if let Some(o) = hrdr_app::save_session(&self.state) {
             // Stay silent here: the notice belongs *after* the turn, not ahead of
             // the reply. Hand it to the first autosave, which would otherwise see
@@ -118,6 +120,10 @@ impl super::App {
         };
         let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
         self.state.sync_from(msgs, todos, cwd);
+        // The main pane owns the live transcript; `state`'s copy exists only to
+        // be written. Refresh it here, the same way `sync_from` refreshes the
+        // message mirror from the agent.
+        self.state.transcript = self.panes.main().transcript.clone();
 
         if let Some(o) = hrdr_app::save_session(&self.state) {
             // Notify once, when the session is first created — including when
@@ -187,6 +193,8 @@ impl super::App {
             .then(|| self.state.provider.clone());
 
         self.state = state.restored();
+        // The pane owns the live transcript — a restored session hands it back.
+        self.panes.main_mut().transcript = std::mem::take(&mut self.state.transcript);
         self.state.id = id;
         self.refresh_subagent_dir();
         self.state.base_url = base_url;

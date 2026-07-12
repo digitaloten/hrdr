@@ -108,7 +108,7 @@ impl super::App {
             }
             hrdr_app::ExpandMode::Off => {
                 self.expand_tools = false;
-                for e in self.state.transcript.iter_mut() {
+                for e in self.panes.active_transcript_mut().iter_mut() {
                     if let EntryKind::Tool { expanded, .. } = &mut e.kind {
                         *expanded = false;
                     }
@@ -187,7 +187,9 @@ impl super::App {
     /// `/find clear` (or `off`/`discard`) drops the search + highlight.
     fn find_cmd(&mut self, arg: &str) {
         let mut st = std::mem::take(&mut self.find);
-        let act = st.find(arg, |q| hrdr_app::find_hits(&self.state.transcript, q));
+        let act = st.find(arg, |q| {
+            hrdr_app::find_hits(self.panes.active_transcript(), q)
+        });
         self.find = st;
         self.apply_find_action(act);
     }
@@ -195,7 +197,9 @@ impl super::App {
     /// wrapping around; used by `/next` and `/prev`.
     fn find_cycle(&mut self, forward: bool) {
         let mut st = std::mem::take(&mut self.find);
-        let act = st.cycle(forward, |q| hrdr_app::find_hits(&self.state.transcript, q));
+        let act = st.cycle(forward, |q| {
+            hrdr_app::find_hits(self.panes.active_transcript(), q)
+        });
         self.find = st;
         self.apply_find_action(act);
     }
@@ -215,15 +219,15 @@ impl super::App {
     }
     /// Number of user/assistant messages in the transcript.
     fn display_message_count(&self) -> usize {
-        hrdr_app::message_count(&self.state.transcript)
+        hrdr_app::message_count(&self.panes.main().transcript)
     }
     /// The number of the first user/assistant message sent at/after `cutoff`.
     fn first_message_since(&self, cutoff: chrono::DateTime<chrono::Local>) -> Option<usize> {
-        hrdr_app::first_message_since(&self.state.transcript, cutoff)
+        hrdr_app::first_message_since(&self.panes.main().transcript, cutoff)
     }
     /// The text of the Nth (1-based) user/assistant message in the transcript.
     fn nth_message_text(&self, n: usize) -> Option<String> {
-        hrdr_app::nth_message_text(&self.state.transcript, n)
+        hrdr_app::nth_message_text(&self.panes.main().transcript, n)
     }
     /// Write `text` to the system clipboard, returning a status line (used by the
     /// shared `/copy` via [`hrdr_app::CommandHost`]).
@@ -254,7 +258,7 @@ impl super::App {
     }
     /// A plain-text rendering of the conversation for `/copy all`.
     fn transcript_text(&self) -> String {
-        hrdr_app::transcript_to_text(&self.state.transcript)
+        hrdr_app::transcript_to_text(self.panes.active_transcript())
     }
     /// `/edit <file>` — open a file (relative to the cwd) in `$EDITOR`.
     fn edit_file_cmd(&mut self, arg: &str) {
