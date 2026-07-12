@@ -1551,6 +1551,43 @@ async fn autosave_writes_the_state_and_it_loads_back_identically() {
     assert_eq!(loaded.state.messages.len(), 3, "system + user + assistant");
 }
 
+/// The shared sub-agent transcript cell starts empty (no id yet) and is
+/// repointed at the session's dir once the first autosave assigns an id.
+#[tokio::test]
+async fn autosave_populates_the_subagent_transcript_dir() {
+    let _data_home = isolated_data_home();
+
+    let mut h = Harness::new(vec![MockReply::Text("done".into())]).await;
+    // Before any save there is no id, so the cell stays empty.
+    assert!(
+        h.app.subagent_dir.lock().unwrap().is_none(),
+        "cell empty until an id is assigned"
+    );
+
+    h.submit("go").await;
+
+    let id = h
+        .app
+        .state
+        .id
+        .clone()
+        .expect("autosave assigned a session id");
+    let want = hrdr_app::subagent_transcript_dir(&h.app.current_cwd(), &id);
+    assert_eq!(
+        *h.app.subagent_dir.lock().unwrap(),
+        Some(want),
+        "cell points at the session's sub-agent dir after autosave"
+    );
+
+    // `/clear` detaches the session, so the cell must be reset too — otherwise
+    // the next session's early sub-agents would misfile into this dir.
+    h.app.clear_all();
+    assert!(
+        h.app.subagent_dir.lock().unwrap().is_none(),
+        "clear_all resets the sub-agent transcript cell"
+    );
+}
+
 /// A new session opens with the banner: an animated logo on the left and the
 /// session's details (model, provider, cwd) on the right, all inside one block.
 #[tokio::test]
