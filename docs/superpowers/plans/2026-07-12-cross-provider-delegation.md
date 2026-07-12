@@ -226,6 +226,12 @@ Add to `mod tests`:
         assert_eq!(cfg.base_url, "http://localhost:8080/v1");
         assert_eq!(cfg.provider.as_deref(), Some("local"));
         assert_eq!(cfg.model, "my-local-model");
+        // Identity drives the derived kind that Agent::new will compute from
+        // `cfg.provider` — the whole point of setting it during repoint.
+        assert_eq!(
+            cfg.resolve_provider("local").map(|p| p.kind),
+            Some(super::ResolvedProviderKind::BuiltIn)
+        );
         // Unknown provider errors.
         assert!(repoint_to_provider(&mut cfg, "nope", Some("m")).is_err());
     }
@@ -424,8 +430,16 @@ fn apply_task_overrides(
         if provider_auth_state(pname, &p, cfg.api_key.as_deref(), Some(cfg.base_url.as_str()))
             == ProviderAuthState::Missing
         {
-            let env = p.key_env.as_deref().unwrap_or("HRDR_API_KEY");
-            bail!("task: provider '{pname}' is not configured — set ${env}, or run /login");
+            // Only suggest an env var when the provider actually reads one;
+            // key_env-less providers (chatgpt OAuth, a keyless [providers.*])
+            // would be sent chasing a var that resolve_api_key never consults.
+            let hint = match p.key_env.as_deref() {
+                Some(env) => format!("set ${env}, or run /login"),
+                None => format!(
+                    "run /login, or add an `api_key`/`key_env` to a [providers.{pname}] entry"
+                ),
+            };
+            bail!("task: provider '{pname}' is not configured — {hint}");
         }
         if model.is_none() && p.model.is_none() {
             bail!("task: provider '{pname}' requires an explicit model (it has no default)");
@@ -457,8 +471,25 @@ reads `"Optional model override (on the selected provider). …"`; change to:
             },
             "provider": {
                 "type": "string",
-                "description": "Optional provider for the sub-agent: a built-in (zen, openai, openrouter, claude, local, chatgpt) or a [providers.*] from config. Must be configured and authenticated. Omit to keep the current provider; when set, pass `model` too (unless the provider has a default)."
+                "description": "Optional provider for the sub-agent — any built-in provider name or a [providers.*] entry from config that is configured and authenticated. Omit to keep the current provider; when set, pass `model` too (unless the provider has a default)."
             },
+```
+
+(Do **not** hardcode the built-in list in the description — `BUILTIN_PROVIDERS`
+already includes `go` and the runtime error text derives from it, so an
+enumerated copy drifts out of sync.)
+
+- [ ] **Step 5b: Mention `provider` in the tool's top-level description.**
+
+The `task` tool description is built in `SubagentTool::new` (`:485`), ending
+`"… Run cheaper/faster work on a different \`model\`"`. Change that trailing
+clause to also advertise provider selection, so a model reading the tool list
+discovers the feature (spec Surfaces item 2):
+
+```rust
+             working — its result is delivered to you automatically when it finishes. Run \
+             cheaper/faster work on a different `model`, or delegate to a different, \
+             already-configured `provider`",
 ```
 
 - [ ] **Step 6: Wire `apply_task_overrides` into `execute`.**
@@ -537,7 +568,9 @@ different, already-configured provider without defining a `[[subagent]]` profile
 `provider = "openrouter", model = "deepseek/deepseek-chat"`. The target provider
 must be configured and authenticated (a built-in with its key/OAuth set, or a
 `[providers.*]` entry); an unconfigured provider is rejected before the
-sub-agent starts.
+sub-agent starts. When `provider` is set, pass `model` too — the provider's
+default model is used only if it has one, otherwise the call errors. An explicit
+`model` always wins, including over a named profile's model.
 ```
 
 - [ ] **Step 2: CHANGELOG — add entries under `[Unreleased]`.**
@@ -557,7 +590,10 @@ absent):
 
 - Sub-agents repointed to another provider now carry that provider's identity
   (`config.provider`), so their derived provider kind matches their endpoint
-  instead of inheriting the parent's.
+  instead of inheriting the parent's. This also fixes cost attribution for such
+  sub-agents (the models.dev price card is keyed by `(provider, model)`; a
+  repointed sub was previously priced under the parent's provider, often
+  unpriced).
 ```
 
 - [ ] **Step 3: Format the markdown.**
@@ -631,7 +667,11 @@ whose key is unset.
 - No-default-model error → Task 2 test (c) + impl. ✓
 - Model applies once → `apply_task_overrides` is the single application site;
   old unconditional block removed. ✓
-- Docs/CHANGELOG/reword → Task 3. ✓
+- Derived `provider_kind` follows identity → asserted in
+  `repoint_to_provider_sets_identity_and_model` (Task 1 Step 5). ✓
+- Docs: schema `provider` prop + `model` reword (Task 2 Step 5), tool top-level
+  description (Task 2 Step 5b), README + CHANGELOG incl. cost-attribution (Task
+  3). ✓
 - Live e2e → Task 3 Steps 5-6. ✓
 
 **2. Placeholder scan:** `<valid-slug>` in Task 3 is a runtime value discovered

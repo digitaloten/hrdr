@@ -46,9 +46,11 @@ task(
 )
 ```
 
-`provider` accepts any built-in provider name (`zen`, `openai`, `openrouter`,
-`claude`, `local`, `chatgpt`/`codex`) or a `[providers.<name>]` defined in
-`config.toml` — the same set `resolve_provider` already accepts.
+`provider` accepts any built-in provider name (the `BUILTIN_PROVIDERS` set —
+today `zen`, `go`, `openai`, `openrouter`, `claude`, `chatgpt`, `local`) or a
+`[providers.<name>]` defined in `config.toml` — the same set `resolve_provider`
+already accepts. Descriptions/errors should derive the list from
+`BUILTIN_PROVIDERS`, not hardcode it.
 
 Also reword the `model` arg description: drop "(on the selected provider)",
 since the provider is now selectable.
@@ -168,11 +170,11 @@ exactly once, on the resolved provider".)
   provider-identity fix keeps `provider_kind = ChatGptOAuth` consistent.
   Requires #7's OAuth (hence #7 is the base).
 - **Unchanged by design:** isolation (profile-only; ad-hoc sets none),
-  background/foreground detach, cost tracking (priced by model id from the
-  models.dev catalog — a cross-provider model is priced by its own id),
-  concurrency (`concurrent()` stays true; each sub builds its own client),
-  reasoning effort (inherited from the parent; ignored by models that do not use
-  it).
+  background/foreground detach, cost tracking (the models.dev price card is
+  keyed by the `(provider, model)` pair — the provider-identity fix is what
+  makes a repointed sub price correctly under its real provider), concurrency
+  (`concurrent()` stays true; each sub builds its own client), reasoning effort
+  (inherited from the parent; ignored by models that do not use it).
 
 ## Testing
 
