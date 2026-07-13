@@ -241,9 +241,32 @@ impl ToolContext {
         if !self.restrict_to_cwd {
             return Ok(());
         }
+        // Where the walk stops: the project root, and the system temp dir that
+        // [`ensure_inside_cwd`](Self::ensure_inside_cwd) admits as scratch. Above
+        // those, symlinks are the *user's* filesystem, not something the project
+        // could have planted — a home directory reached through a symlink, or (on
+        // macOS) a temp dir that lives under `/var`, which **is** a symlink to
+        // `/private/var`. Without a stop, that one symlink would refuse every
+        // scratch file hrdr writes on a Mac.
+        //
+        // Compared canonically, on both sides, and computed once. Path equality is
+        // textual — `/var/folders/…` and `/private/var/folders/…` are the same
+        // directory and different `Path`s — so a stop that compares raw paths misses
+        // whenever a caller hands us a resolved path (or `$TMPDIR` is spelled another
+        // way), the walk sails past the stop, finds the symlink above it, and refuses
+        // a write that was always legitimate. An environment-dependent, macOS-only
+        // refusal is precisely the bug you cannot reproduce on the machine you have.
+        //
+        // The stop is *at* the temp dir, not below it: `/tmp` is world-writable, and
+        // a symlink planted inside it by another local user is the oldest trick
+        // there is. Components below the stop are still checked.
+        let stops = [
+            canonicalize_nearest(&self.cwd),
+            canonicalize_nearest(&std::env::temp_dir()),
+        ];
         let mut current = Some(path);
         while let Some(candidate) = current {
-            if candidate == self.cwd || candidate == std::env::temp_dir() {
+            if stops.contains(&canonicalize_nearest(candidate)) {
                 break;
             }
             match std::fs::symlink_metadata(candidate) {
