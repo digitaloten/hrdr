@@ -28,6 +28,9 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 const BOOT: Duration = Duration::from_secs(60);
 /// How long to wait for the process to leave after being told to quit.
 const EXIT: Duration = Duration::from_secs(30);
+/// Grace for output still in flight. A ConPTY hands its buffer over when it is torn
+/// down, so a child that has already exited can still have a screenful coming.
+const DRAIN: Duration = Duration::from_secs(2);
 
 /// Strip ANSI escape sequences, so assertions read the *text* on the screen rather
 /// than the control codes that positioned it.
@@ -75,8 +78,19 @@ fn grab(screen: &Arc<Mutex<String>>) -> std::sync::MutexGuard<'_, String> {
     screen.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Run the TUI in a pty; return everything it painted, plus how it exited.
-fn run_tui(keys: &str) -> (String, portable_pty::ExitStatus) {
+/// What one run of the TUI in a pty did.
+struct Run {
+    /// Everything it painted, with the escape codes stripped.
+    screen: String,
+    status: portable_pty::ExitStatus,
+    /// It quit on its own, before being told to. A TUI that exits by itself the
+    /// moment it is put in a terminal is broken, however cleanly it exits — so this
+    /// is a fact the tests assert on, not one the harness papers over.
+    exited_unbidden: bool,
+}
+
+/// Run the TUI in a pty: wait for it to paint, type `keys`, and see it out.
+fn run_tui(keys: &str) -> Run {
     let home = tempfile::tempdir().expect("temp home");
     let project = tempfile::tempdir().expect("temp project");
 
@@ -187,42 +201,64 @@ fn run_tui(keys: &str) -> (String, portable_pty::ExitStatus) {
     // which is the whole question this test exists to answer.
     let start = Instant::now();
     while !snapshot().contains("pty-smoke") {
+        // A ConPTY hands its output over when it is torn down, so a child that has
+        // already exited may still have a screenful in flight. Drain before
+        // concluding anything about what it painted — otherwise a *quick* program
+        // looks like a silent one.
+        if let Some(status) = child.try_wait().expect("poll child") {
+            std::thread::sleep(DRAIN);
+            let seen = snapshot();
+            assert!(
+                seen.contains("pty-smoke"),
+                "hrdr exited ({status:?}) without painting. Screen ({} bytes):\n{seen}",
+                seen.len()
+            );
+            break;
+        }
         let seen = snapshot();
         assert!(
             start.elapsed() < BOOT,
             "the TUI never painted a frame in {BOOT:?} ({} bytes read). Screen so far:\n{seen}",
             seen.len()
         );
-        assert!(
-            child.try_wait().expect("poll child").is_none(),
-            "hrdr exited before painting anything. Screen:\n{seen}"
-        );
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    {
-        let mut w = grab_writer(&writer);
-        w.write_all(keys.as_bytes()).expect("write keys");
-        w.flush().expect("flush keys");
-    }
+    // Did it stay up to be typed at, or leave on its own?
+    let early = child.try_wait().expect("poll child");
+    let exited_unbidden = early.is_some();
 
-    let start = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll child") {
-            break status;
+    let status = match early {
+        Some(status) => status,
+        None => {
+            {
+                let mut w = grab_writer(&writer);
+                w.write_all(keys.as_bytes()).expect("write keys");
+                w.flush().expect("flush keys");
+            }
+            let start = Instant::now();
+            loop {
+                if let Some(status) = child.try_wait().expect("poll child") {
+                    break status;
+                }
+                if start.elapsed() > EXIT {
+                    child.kill().expect("kill child");
+                    panic!(
+                        "hrdr did not exit within {EXIT:?} of being told to quit. Screen:\n{}",
+                        snapshot()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
-        if start.elapsed() > EXIT {
-            child.kill().expect("kill child");
-            panic!(
-                "hrdr did not exit within {EXIT:?} of being told to quit. Screen:\n{}",
-                snapshot()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
     };
 
-    let out = snapshot();
-    (out, status)
+    std::thread::sleep(DRAIN);
+    Run {
+        screen: snapshot(),
+        status,
+        exited_unbidden,
+    }
 }
 
 /// The built binary starts a real TUI in a real terminal, paints its first frame,
@@ -234,8 +270,17 @@ fn run_tui(keys: &str) -> (String, portable_pty::ExitStatus) {
 /// unexercised until a user ran it.
 #[test]
 fn the_tui_starts_paints_and_exits_cleanly() {
-    let (screen, status) = run_tui("quit\r");
+    let Run {
+        screen,
+        status,
+        exited_unbidden,
+    } = run_tui("quit\r");
 
+    assert!(
+        !exited_unbidden,
+        "hrdr quit on its own, without being asked. A TUI that will not stay up in a \
+         terminal is broken however cleanly it leaves ({status:?}). Screen:\n{screen}"
+    );
     assert!(
         status.success(),
         "hrdr exited {status:?} after `quit`. Screen:\n{screen}"
@@ -262,8 +307,16 @@ fn the_tui_starts_paints_and_exits_cleanly() {
 /// on startup with a connection error.
 #[test]
 fn an_unreachable_endpoint_does_not_take_the_tui_down() {
-    let (screen, status) = run_tui("quit\r");
+    let Run {
+        screen,
+        status,
+        exited_unbidden,
+    } = run_tui("quit\r");
     assert!(status.success(), "Screen:\n{screen}");
+    assert!(
+        !exited_unbidden,
+        "a dead endpoint must not make the TUI quit. Screen:\n{screen}"
+    );
     assert!(
         screen.contains("pty-smoke"),
         "the TUI must come up and stay up with a dead endpoint. Screen:\n{screen}"
