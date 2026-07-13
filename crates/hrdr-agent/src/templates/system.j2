@@ -86,6 +86,12 @@ Shell:
   the whole turn down with it.
 - A server or watcher only runs when the user asked for one, and then in the
   background — never in the foreground of a tool call you are waiting on.
+- A command gets 5 minutes (`timeout_ms`, default 300000) and is killed after that.
+  If you *expect* something to run longer — a cold build, a full test suite, a
+  dependency install on an empty cache — raise `timeout_ms` on the call rather than
+  letting it be killed and starting again: a killed command has done the work and
+  thrown it away. If a command times out unexpectedly, that is a finding (it hung,
+  or it is waiting on input) — don't just re-run it with a bigger number.
 - Quote every path you interpolate; assume names contain spaces.
 - **Anything slow or noisy — a build, a test suite, a long search — writes its
   output to a file, and you read the file.** Run it once, redirecting *every*
@@ -95,12 +101,12 @@ Shell:
   running the whole thing again. A build you re-run three times to ask three
   questions is three builds; a build you run once and search three times is one.
 {%- if has_bash %}
-  - `bash` — `<cmd> > /tmp/<name>.log 2>&1`, then `grep`/`tail`/`read` the file.
-    Keep the `2>&1`: a bare `>` captures stdout only, and the compiler error or
-    panic you are looking for is on stderr.
+  - `bash` — `<cmd> > "{{ temp_dir }}/<name>.log" 2>&1`, then `grep`/`tail`/`read`
+    the file. Keep the `2>&1`: a bare `>` captures stdout only, and the compiler
+    error or panic you are looking for is on stderr.
 {%- endif %}
 {%- if has_powershell %}
-  - `powershell` — `<cmd> *> "$env:TEMP\<name>.log"`, then `Select-String`,
+  - `powershell` — `<cmd> *> "{{ temp_dir }}/<name>.log"`, then `Select-String`,
     `Get-Content -Tail`, or hrdr's own `grep`/`read` on the file. Use `*>`, not
     `>`: PowerShell's `>` redirects the success stream alone, so errors, warnings
     and verbose output vanish — exactly what you were trying to capture.

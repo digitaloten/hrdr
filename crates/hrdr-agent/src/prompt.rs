@@ -58,6 +58,12 @@ pub fn render_system(
             // meant to capture. A machine with both gets both.
             has_bash => has("bash"),
             has_powershell => has("powershell"),
+            // The temp directory the *running machine* actually has, not a
+            // hard-coded `/tmp`: that path doesn't exist on Windows, and
+            // PowerShell's own `$env:TEMP` is unset when `pwsh` runs on Linux — so
+            // either literal is wrong on some machine hrdr supports. An example the
+            // model can't paste is worse than no example.
+            temp_dir => temp_dir(),
             instructions => instructions,
         })
         .context("rendering system template")?;
@@ -72,6 +78,25 @@ pub fn render_system(
     // `.gitattributes` now pins the checkout to LF, but that only helps a fresh
     // clone — this makes it true of the string we actually send, always.
     Ok(rendered.replace("\r\n", "\n"))
+}
+
+/// This machine's temp directory, as a path the shell in the prompt's examples can
+/// actually be handed.
+///
+/// [`std::env::temp_dir`] answers per-platform and honours the environment:
+/// `$TMPDIR` when set (macOS gives every process its own `/var/folders/…` sandbox),
+/// `/tmp` on Linux otherwise, `%TEMP%` on Windows (`C:\Users\<you>\AppData\Local\
+/// Temp`). Backslashes are normalised to `/`, which every shell hrdr drives —
+/// bash, and PowerShell on any platform — accepts as a separator, so one example
+/// serves both.
+fn temp_dir() -> String {
+    std::env::temp_dir()
+        .display()
+        .to_string()
+        .replace('\\', "/")
+        // A trailing separator would render as `C:/…/Temp//build.log`.
+        .trim_end_matches('/')
+        .to_string()
 }
 
 /// One-line OS description for the system prompt: kernel/family, the distro
@@ -382,6 +407,7 @@ mod tests {
                     can_delegate => false,
                     has_bash => has_bash,
                     has_powershell => has_powershell,
+                    temp_dir => "/scratch",
                     instructions => None::<&str>,
                 })
                 .unwrap()
@@ -389,7 +415,7 @@ mod tests {
 
         // bash only: the bash idiom, and not a word about PowerShell.
         let p = render(true, false);
-        assert!(p.contains("`bash` — `<cmd> > /tmp/<name>.log 2>&1`"));
+        assert!(p.contains(r#"`bash` — `<cmd> > "/scratch/<name>.log" 2>&1`"#));
         assert!(
             p.contains("Keep the `2>&1`"),
             "the bash idiom, with the reason stderr matters"
@@ -399,14 +425,17 @@ mod tests {
 
         // PowerShell only: `*>`, and not a word of bash.
         let p = render(false, true);
-        assert!(p.contains(r#"`powershell` — `<cmd> *> "$env:TEMP\<name>.log"`"#));
+        assert!(p.contains(r#"`powershell` — `<cmd> *> "/scratch/<name>.log"`"#));
         assert!(
             p.contains("Use `*>`, not\n    `>`"),
             "`>` in PowerShell drops the errors — the whole point of capturing"
         );
         assert!(p.contains("PowerShell is not bash"));
-        assert!(!p.contains("/tmp/<name>.log"), "no bash syntax: {p}");
         assert!(!p.contains("2>&1"), "no bash syntax: {p}");
+        assert!(
+            !p.contains("grep`/`tail`/`read` the"),
+            "no bash syntax: {p}"
+        );
 
         // Both (a machine with `pwsh` on PATH beside bash): both idioms, and the
         // shared rule stated once.
@@ -422,6 +451,83 @@ mod tests {
         // Neither: no shell, no shell rules.
         let p = render(false, false);
         assert!(!p.contains("Shell:"), "{p}");
+    }
+
+    /// The redirect example names a temp directory that exists on *this* machine.
+    ///
+    /// A hard-coded `/tmp` is a path Windows does not have, and PowerShell's own
+    /// `$env:TEMP` is unset when `pwsh` runs on Linux — so any literal in the
+    /// template is wrong on some platform hrdr ships to, and an example the model
+    /// cannot paste is worse than none. The path comes from the machine instead.
+    ///
+    /// Whatever it is, it must be absolute (the shell runs in the *project* cwd, so
+    /// a relative path would drop build logs into the user's repo), it must exist,
+    /// and it must be the path the example actually shows.
+    #[test]
+    fn the_redirect_example_points_at_a_temp_dir_that_exists_here() {
+        let dir = temp_dir();
+        let path = Path::new(&dir);
+        assert!(path.is_absolute(), "temp dir must be absolute: {dir}");
+        assert!(path.is_dir(), "temp dir must exist: {dir}");
+        assert!(!dir.ends_with('/'), "no trailing separator: {dir}");
+        assert!(!dir.contains('\\'), "separators normalised to `/`: {dir}");
+
+        // And the prompt shows *that* directory, not a literal someone typed.
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, Path::new("/tmp/x"), None).unwrap();
+        if p.contains("Shell:") {
+            assert!(
+                p.contains(&format!("{dir}/<name>.log")),
+                "the example must use this machine's temp dir ({dir}): {p}"
+            );
+        }
+    }
+
+    /// Linux: `/tmp`, unless `$TMPDIR` says otherwise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn temp_dir_on_linux() {
+        // `std::env::temp_dir` honours `$TMPDIR` first; on a stock box (and on CI)
+        // nothing sets it and the answer is `/tmp`. Assert the *rule*, not the
+        // machine, so a developer with `TMPDIR` set doesn't get a spurious failure.
+        let expected = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+        let expected = expected.trim_end_matches('/');
+        assert_eq!(temp_dir(), expected);
+    }
+
+    /// macOS: the per-process sandbox `$TMPDIR` points at (`/var/folders/…`), not
+    /// `/tmp` — which exists, but is not where a Mac puts scratch files.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn temp_dir_on_macos() {
+        let dir = temp_dir();
+        let expected = std::env::var("TMPDIR").unwrap_or_else(|_| "/var/folders".to_string());
+        assert!(
+            dir.starts_with(expected.trim_end_matches('/')) || dir.starts_with("/var/folders"),
+            "macOS temp is the TMPDIR sandbox, got {dir}"
+        );
+        assert!(dir.starts_with('/'), "absolute: {dir}");
+    }
+
+    /// Windows: `%TEMP%` (`C:\Users\<you>\AppData\Local\Temp`), rendered with `/`
+    /// separators — which PowerShell accepts, and which keeps the example from
+    /// carrying backslashes that a shell would read as escapes.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn temp_dir_on_windows() {
+        let dir = temp_dir();
+        assert!(!dir.contains('\\'), "separators normalised: {dir}");
+        assert!(
+            dir.chars().nth(1) == Some(':'),
+            "a drive-qualified absolute path: {dir}"
+        );
+        assert!(
+            dir.to_ascii_lowercase().contains("temp"),
+            "Windows scratch lives under Temp: {dir}"
+        );
+        // `/tmp` — the thing a hard-coded example would have said — is exactly what
+        // this must *not* be.
+        assert_ne!(dir, "/tmp");
     }
 
     /// The gates are wired to the tool set, not to a guess about the platform.

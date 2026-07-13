@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::{Tool, ToolContext};
 
-use super::{BASH_LINE_CAP, DEFAULT_BASH_TIMEOUT_MS};
+use super::{BASH_LINE_CAP, DEFAULT_SHELL_TIMEOUT_MS};
 
 // ---- bash ----
 
@@ -30,7 +30,14 @@ fn shell_parameters(command_desc: &str) -> serde_json::Value {
         "type": "object",
         "properties": {
             "command": {"type": "string", "description": command_desc},
-            "timeout_ms": {"type": "integer", "description": "Timeout in ms (default 120000)."}
+            "timeout_ms": {
+                "type": "integer",
+                "description": "How long to let the command run, in milliseconds. \
+                                Default 300000 (5 minutes). Raise it for something you \
+                                expect to be slow — a cold build, a full test suite, a \
+                                dependency install — rather than letting it be killed \
+                                and starting over."
+            }
         },
         "required": ["command"]
     })
@@ -59,7 +66,7 @@ impl Tool for BashTool {
         }
         let mut cmd = tokio::process::Command::new("bash");
         cmd.arg("-c").arg(&a.command).current_dir(&ctx.cwd);
-        let timeout = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_BASH_TIMEOUT_MS));
+        let timeout = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS));
         run_streamed_command(cmd, timeout, ctx).await
     }
 }
@@ -355,7 +362,84 @@ impl Tool for PowerShellTool {
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(["-NoProfile", "-NonInteractive", "-Command", &a.command])
             .current_dir(&ctx.cwd);
-        let timeout = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_BASH_TIMEOUT_MS));
+        let timeout = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS));
         run_streamed_command(cmd, timeout, ctx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A shell command gets five minutes unless the model says otherwise — and the
+    /// schema *says so*, for both shells.
+    ///
+    /// The default has to cover the commands actually worth running: a cold
+    /// `cargo build`, a full test suite, an `npm install` on a fresh tree. At two
+    /// minutes those died just often enough to matter, and a killed build teaches
+    /// the model nothing — it retries something narrower, and the work is redone
+    /// rather than finished. A genuine hang is still caught; it just gets a
+    /// realistic amount of rope first.
+    ///
+    /// `timeout_ms` is only useful if the model can *see* what it overrides: a
+    /// default it doesn't know about is a default it won't reason about. So the
+    /// number, its unit, and when to raise it all live in the description the model
+    /// is handed with every request.
+    #[test]
+    fn a_shell_command_gets_five_minutes_by_default_and_says_so() {
+        assert_eq!(
+            DEFAULT_SHELL_TIMEOUT_MS, 300_000,
+            "five minutes: long enough for a cold build, short enough to catch a hang"
+        );
+
+        // Both shells, through the schema each actually advertises.
+        let schemas = [
+            BashTool.parameters(),
+            PowerShellTool {
+                program: "pwsh".to_string(),
+            }
+            .parameters(),
+        ];
+        for schema in schemas {
+            let desc = schema["properties"]["timeout_ms"]["description"]
+                .as_str()
+                .expect("timeout_ms is documented");
+            assert!(
+                desc.contains("300000"),
+                "the model must see the default it is overriding: {desc}"
+            );
+            assert!(
+                desc.contains("5 minutes"),
+                "and in units a reader parses at a glance: {desc}"
+            );
+            assert!(
+                desc.contains("cold build"),
+                "and when raising it beats being killed: {desc}"
+            );
+        }
+    }
+
+    /// An unset `timeout_ms` means the default, not "no timeout" — and a set one is
+    /// honoured. The parse is the only thing standing between a hung command and a
+    /// wedged turn.
+    #[test]
+    fn timeout_ms_defaults_when_absent_and_is_honoured_when_given() {
+        let default: ShellArgs = serde_json::from_value(serde_json::json!({"command": "true"}))
+            .expect("command alone is valid");
+        assert_eq!(default.timeout_ms, None, "absent means absent");
+        assert_eq!(
+            Duration::from_millis(default.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)),
+            Duration::from_secs(300),
+            "…and absent resolves to five minutes"
+        );
+
+        let given: ShellArgs =
+            serde_json::from_value(serde_json::json!({"command": "true", "timeout_ms": 900_000}))
+                .expect("an override is valid");
+        assert_eq!(
+            Duration::from_millis(given.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)),
+            Duration::from_secs(900),
+            "a model that asks for fifteen minutes gets fifteen minutes"
+        );
     }
 }

@@ -24,7 +24,16 @@ pub(crate) const DEFAULT_READ_LIMIT: usize = 2_000;
 /// multi-gigabyte (or special/device) file would stall or OOM the process
 /// before a single line comes back. Generous enough for any real source file.
 pub(crate) const MAX_READ_BYTES: u64 = 50 * 1024 * 1024;
-pub(crate) const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
+/// How long a shell command gets before it is killed, unless the model asks for
+/// more with `timeout_ms`. Shared by `bash` and `powershell`.
+///
+/// Five minutes, because the commands worth running are the slow ones: a cold
+/// `cargo build`, a full test suite, an `npm install` on a fresh tree. The old
+/// two-minute default killed those *just* often enough to be maddening — and a
+/// killed build teaches the model nothing except to try a narrower command, so the
+/// work is redone rather than finished. A command that hangs is still caught; it
+/// just gets a realistic amount of rope first.
+pub(crate) const DEFAULT_SHELL_TIMEOUT_MS: u64 = 300_000;
 /// Hard cap on a single output line accumulated from bash/powershell; prevents
 /// a minified-file line from blowing the per-turn context.
 pub(crate) const BASH_LINE_CAP: usize = 8_192;
