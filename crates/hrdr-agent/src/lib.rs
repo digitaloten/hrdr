@@ -84,19 +84,26 @@ struct DelegationRuntime {
 
 type SharedDelegationRuntime = Arc<Mutex<DelegationRuntime>>;
 
-struct ModelInfoTool {
+struct ModelsTool {
     runtime: SharedDelegationRuntime,
     available: Vec<AvailableModel>,
 }
 
 #[async_trait::async_trait]
-impl hrdr_tools::Tool for ModelInfoTool {
+impl hrdr_tools::Tool for ModelsTool {
     fn name(&self) -> &'static str {
-        "model_info"
+        "models"
     }
 
     fn description(&self) -> &'static str {
-        "Inspect the active provider, model, reasoning effort, delegation default, and discoverable model choices. Read-only; use mode `available` only when model choices are needed."
+        "What you are running on, and what else you could run on. \
+         `current` (default, free): the active provider, model, reasoning effort, and the model \
+         delegated `task` calls use by default. \
+         `available`: every model this session can reach, as {provider, model, label, current} rows \
+         — the row you are running on is flagged `current: true`. \
+         Call it with `available` when the user names a model to delegate to (\"@explore with big \
+         pickle\") and you need the id and provider that name resolves to; the ids are what `task` \
+         accepts. Read-only, and it changes nothing — it cannot switch your model."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -127,7 +134,7 @@ impl hrdr_tools::Tool for ModelInfoTool {
             .and_then(|v| v.as_str())
             .unwrap_or("current");
         if !matches!(mode, "current" | "available") {
-            bail!("unknown model_info mode '{mode}' (supported: current, available)");
+            bail!("unknown models mode '{mode}' (supported: current, available)");
         }
         let runtime = self
             .runtime
@@ -243,11 +250,19 @@ impl hrdr_tools::Tool for ModelInfoTool {
             let rows: Vec<_> = available
                 .iter()
                 .map(|m| {
+                    // Flag the row the agent is *itself* running on. The same pair
+                    // is in the payload's `provider`/`model` fields, but a caller
+                    // scanning a long list to pick a model for delegation reads the
+                    // rows, not the envelope — and the answer to "which provider
+                    // should I keep the sub-agent on" is right there in the row.
+                    let current = runtime.public.provider.as_deref() == Some(m.provider.as_str())
+                        && runtime.public.model == m.model;
                     serde_json::json!({
                         "provider": m.provider,
                         "model": m.model,
                         "label": m.label,
-                        "source": m.source
+                        "source": m.source,
+                        "current": current
                     })
                 })
                 .collect();
@@ -2674,7 +2689,7 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
 /// The trusted ChatGPT OAuth provider does not expose the OpenAI-compatible
 /// `/v1/models` endpoint (a plain `GET` there returns `401 Unauthorized`), so it
 /// is discovered through the account model catalog behind a coordinated —
-/// refreshing — OAuth access token, the same source the agent's `model_info`
+/// refreshing — OAuth access token, the same source the agent's `models`
 /// tool uses. Every other provider falls back to the OpenAI-compatible
 /// `/v1/models` listing.
 pub async fn list_provider_models(config: &AgentConfig) -> Result<Vec<String>> {
@@ -3692,7 +3707,7 @@ impl Agent {
         let configured_headers = config.headers.clone();
         let delegation_runtime = new_delegation_runtime(&config, provider_kind);
         let live_subagents = LiveSubagents::new();
-        tools.register(Arc::new(ModelInfoTool {
+        tools.register(Arc::new(ModelsTool {
             runtime: Arc::clone(&delegation_runtime),
             available: available_models(&config, config.provider.as_deref()),
         }));
@@ -5988,7 +6003,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_info_reports_live_state_without_secrets() {
+    async fn models_reports_live_state_without_secrets() {
         let mut agent = Agent::new(AgentConfig {
             provider: Some("openai".to_string()),
             model: "old".to_string(),
@@ -6001,7 +6016,7 @@ mod tests {
         agent.set_model("new");
         let out = agent
             .tools
-            .execute("model_info", serde_json::json!({}), &agent.ctx)
+            .execute("models", serde_json::json!({}), &agent.ctx)
             .await
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -6013,8 +6028,88 @@ mod tests {
         assert!(value.get("available_models").is_none());
     }
 
+    /// The `available` rows flag the model the agent is itself running on, and the
+    /// prompt tells it what that flag is for.
+    ///
+    /// "@explore the codebase using big pickle" names the model the *sub-agent*
+    /// should run on. To honour it, the agent has to turn a human name into an id
+    /// (`models` → the row that matches) and then decide which provider to run it
+    /// on. The answer is almost always "the one I am already on" — same endpoint,
+    /// same key, same bill — and the `current: true` row is how it knows which that
+    /// is without trusting its own memory of the session.
     #[tokio::test]
-    async fn model_info_available_filters_default_and_returns_valid_json() {
+    async fn models_flags_the_row_the_agent_is_running_on() {
+        let agent = Agent::new(AgentConfig {
+            provider: Some("openai".to_string()),
+            model: "gpt-5".to_string(),
+            api_key: Some("k".to_string()),
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let out = agent
+            .tools
+            .execute(
+                "models",
+                serde_json::json!({"mode": "available"}),
+                &agent.ctx,
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let rows = value["available_models"].as_array().expect("rows");
+
+        let current: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| r["current"] == serde_json::Value::Bool(true))
+            .collect();
+        assert_eq!(
+            current.len(),
+            1,
+            "exactly one row is the one we're on: {out}"
+        );
+        assert_eq!(current[0]["provider"], "openai");
+        assert_eq!(current[0]["model"], "gpt-5");
+        // Every other row is explicitly *not* current — a missing flag would read
+        // as "unknown" rather than "no".
+        assert!(
+            rows.iter().all(|r| r["current"].is_boolean()),
+            "every row answers the question: {out}"
+        );
+    }
+
+    /// The delegation guidance reaches an agent that can actually delegate.
+    ///
+    /// `task` and `models` are registered by `Agent::new`, so this is the only
+    /// place the `can_delegate` gate can be checked as the user sees it. The
+    /// negative — a sub-agent, with neither tool, getting none of it — is
+    /// `prompt::tests::an_agent_without_task_is_not_told_how_to_delegate`.
+    #[test]
+    fn the_delegation_guidance_reaches_an_agent_that_can_delegate() {
+        let agent = Agent::new(AgentConfig {
+            checkpoints: Some("off".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let system = agent
+            .messages()
+            .first()
+            .map(|m| m.content.clone().unwrap_or_default())
+            .unwrap_or_default();
+        assert!(
+            system.contains("Delegating to a model the user named:"),
+            "an agent with `task` + `models` is told how to honour a named model"
+        );
+        assert!(system.contains("call `models`"), "resolve, don't guess");
+        assert!(system.contains("Never guess an id"));
+        assert!(
+            system.contains("current: true"),
+            "and stay on the provider the rows flag as ours"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_available_filters_default_and_returns_valid_json() {
         let agent = Agent::new(AgentConfig {
             model: "default".to_string(),
             checkpoints: Some("off".to_string()),
@@ -6024,7 +6119,7 @@ mod tests {
         let out = agent
             .tools
             .execute(
-                "model_info",
+                "models",
                 serde_json::json!({"mode": "available"}),
                 &agent.ctx,
             )
@@ -6091,7 +6186,7 @@ mod tests {
     /// a provider switch. A config spelled `codex` must not yield rows labelled
     /// `chatgpt` — nor leave the stale preset row behind as a duplicate.
     #[tokio::test]
-    async fn model_info_available_has_no_duplicate_or_misnamed_chatgpt_rows() {
+    async fn models_available_has_no_duplicate_or_misnamed_chatgpt_rows() {
         use super::CHATGPT_CODEX_BASE_URL;
         let agent = Agent::new(AgentConfig {
             provider: Some("codex".to_string()),
@@ -6104,7 +6199,7 @@ mod tests {
         let out = agent
             .tools
             .execute(
-                "model_info",
+                "models",
                 serde_json::json!({"mode": "available"}),
                 &agent.ctx,
             )
@@ -7505,7 +7600,7 @@ mod tests {
             "git",
             "grep",
             "ls",
-            "model_info",
+            "models",
             "read",
             "references",
             "search",

@@ -8,6 +8,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Delegate to a model by name.** Say `@explore the codebase using big pickle`
+  and the agent now understands that the name is what the _sub-agent_ should run
+  on, resolves that human name to a real model id through the `models` tool, and
+  runs the `task` on it — staying on the provider it is already authenticated
+  and billed on, and only crossing to another when its own provider doesn't
+  offer that model (in which case it says so). It asks rather than silently
+  falling back to its own model when nothing matches the name. The guidance is
+  gated on the agent actually having `task`, so a sub-agent isn't told how to
+  use a tool it lacks.
+
+### Changed
+
+- **`model_info` is now `models`**, with a description that says what it is
+  _for_ rather than what it contains, and `mode: "available"` rows now carry
+  `current: true` on the model the agent is itself running on — so an agent
+  picking a model for delegation can see which provider it is already on without
+  trusting its memory of the session.
+
+### Added
+
 - **Run a command straight from the shell: `hrdr <command>`.** Anything the
   input box takes, the command line now takes too — `hrdr /new` opens a fresh
   session instead of auto-resuming, `hrdr /model` comes up with the picker open,

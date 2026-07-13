@@ -35,6 +35,8 @@ pub fn render_system(
         .collect::<Vec<_>>()
         .join(", ");
 
+    let has = |name: &str| tools.defs().iter().any(|d| d.function.name == name);
+
     tmpl.render(context! {
         cwd => cwd.display().to_string(),
         os => os_context(),
@@ -43,6 +45,10 @@ pub fn render_system(
         // mutating tools, so those sections would be dead weight (and mildly
         // contradict its persona).
         can_write => tools.has_write_tool(),
+        // Delegation guidance is for an agent that can actually delegate — a
+        // sub-agent has no `task` tool, and telling it how to pick a model for one
+        // would be instructions for a tool it cannot call.
+        can_delegate => has("task") && has("models"),
         instructions => instructions,
     })
     .context("rendering system template")
@@ -269,6 +275,25 @@ mod tests {
         assert!(
             p.contains("Deleting is not a way around a problem"),
             "clearing state to silence a failure is the habit to break"
+        );
+    }
+
+    /// An agent that *cannot* delegate is not told how to.
+    ///
+    /// `task` and `models` are registered by `Agent::new`, not by
+    /// `with_defaults` — so a bare registry, like the scoped one a sub-agent gets,
+    /// has neither, and guidance about picking a sub-agent's model would be
+    /// instructions for a tool it cannot call. (The other half — that an agent
+    /// which *can* delegate does get it — is
+    /// `the_delegation_guidance_reaches_an_agent_that_can_delegate`, which needs a
+    /// real agent to have the tools at all.)
+    #[test]
+    fn an_agent_without_task_is_not_told_how_to_delegate() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, Path::new("/tmp/x"), None).unwrap();
+        assert!(
+            !p.contains("Delegating to a model the user named:"),
+            "no `task` tool → no delegation guidance: {p}"
         );
     }
 

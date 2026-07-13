@@ -506,9 +506,17 @@ adds Markdown-only writes, `general` gets everything. Without an explicit
 `subagent_model`, later delegations inherit the main agent's current provider,
 model, and effort, including changes made through `/model` or `/effort`.
 
-The read-only `model_info` tool lets an agent inspect its current provider,
-model, effort, resolved default sub-agent model, and—using
-`{"mode":"available"}`—discoverable configured/catalog models. Availability is
+The read-only `models` tool lets an agent inspect its current provider, model,
+effort and resolved default sub-agent model, and—using
+`{"mode":"available"}`—the models this session can reach, as
+`{provider, model, label, current}` rows. The row the agent is itself running on
+is flagged `current: true`.
+
+That is what makes **"delegate this to a model by name"** work: say
+`@explore the codebase using big pickle` and the agent resolves that human name
+to an id through `models`, then runs the `task` on it — staying on the provider
+it is already authenticated and billed on unless that provider doesn't offer the
+model, in which case it passes `provider` too and tells you. Availability is
 best-effort and does not guarantee account authorization; hrdr does not rank
 models by price.
 
