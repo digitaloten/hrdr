@@ -84,6 +84,15 @@ Shell:
   the whole turn down with it.
 - A server or watcher only runs when the user asked for one, and then in the
   background — never in the foreground of a tool call you are waiting on.
+- **Anything slow or noisy — a build, a test suite, a long search — writes its
+  output to a file, and you read the file.** Run it once as
+  `<cmd> > /tmp/<name>.log 2>&1` (a fresh name you choose, so nothing is
+  overwritten), then `grep`/`tail`/`read` that file as many times as you like.
+  Piping straight into `| grep` or `| tail` throws the rest away, so the next
+  question — what came *before* the error, what else failed, what did the warning
+  say — means running the whole thing again. A build you re-run three times to ask
+  three questions is three builds; a build you run once and grep three times is
+  one. Keep `2>&1`: the error you want is usually on stderr.
 - Quote every path you interpolate; assume names contain spaces.
 
 Git:

@@ -316,6 +316,37 @@ mod tests {
         assert!(p.contains("**by name**"));
     }
 
+    /// A slow command's output is captured to a file, not piped into `grep`.
+    ///
+    /// `cargo test 2>&1 | grep FAILED` answers exactly one question and destroys
+    /// the evidence for every other one. The next question — what preceded the
+    /// failure, what else broke, what did the warning say — costs another full
+    /// build. Redirect once, then grep the file as many times as you like: three
+    /// questions become one build instead of three.
+    #[test]
+    fn the_prompt_captures_slow_output_to_a_file() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, Path::new("/tmp/x"), None).unwrap();
+        assert!(
+            p.contains("writes its\n  output to a file, and you read the file"),
+            "slow/noisy commands are captured, not piped away"
+        );
+        assert!(
+            p.contains("> /tmp/<name>.log 2>&1"),
+            "the prompt shows the redirect, stderr included — the error is usually there"
+        );
+        // The reason, not just the rule: re-running a build to ask a second
+        // question is the cost being avoided.
+        assert!(p.contains("Piping straight into `| grep` or `| tail` throws the rest away"));
+        assert!(p.contains("is three builds; a build you run once and grep three times is\n  one"));
+        // And it must not read as licence to clobber an existing file — `>` was
+        // called out elsewhere as truncating on open.
+        assert!(
+            p.contains("a fresh name you choose, so nothing is\n  overwritten"),
+            "the redirect target is a new file, not an existing one"
+        );
+    }
+
     /// The prompt forbids the cheapest way to make a red test green: changing the
     /// test.
     ///
