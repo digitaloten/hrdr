@@ -138,9 +138,11 @@ async fn grep_ripgrep(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
         cmd.arg("--glob").arg(g);
     }
     cmd.arg("--").arg(&a.pattern);
-    if let Some(p) = &a.path {
-        cmd.arg(p);
-    }
+    // Always pass an explicit path. With none, ripgrep reads STDIN when it isn't
+    // a TTY — and under a nulled/redirected stdin every unscoped search would
+    // silently return "(no matches)" or hang. Default to cwd, matching the POSIX
+    // backend below.
+    cmd.arg(a.path.as_deref().unwrap_or("."));
     run_search_cmd(cmd, "ripgrep", a.max_matches(), ctx).await
 }
 
@@ -167,18 +169,25 @@ async fn grep_posix(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
 /// tools exit non-zero on no match) unless stderr reports a real error;
 /// otherwise the truncated stdout. Shared postlude of the rg/grep backends.
 async fn run_search_cmd(
-    mut cmd: tokio::process::Command,
+    cmd: tokio::process::Command,
     tool: &str,
     max_matches: usize,
     ctx: &ToolContext,
 ) -> Result<String> {
-    let output = cmd
-        .output()
+    // `output()` would buffer the *entire* stdout before any cap ran — an
+    // unscoped `grep .` across a monorepo can be hundreds of MB — and would not
+    // kill the child on Esc. `run_capped_output` nulls stdin, sets
+    // `kill_on_drop`, and stops accumulating stdout past a generous ceiling
+    // (5× the byte budget `truncate_saved` trims to below, the same headroom the
+    // shell tool keeps in memory) so a 10 GB output is cut early. Anything that
+    // fits under the ceiling is byte-for-byte what `output()` produced.
+    let cap = ctx.max_output.saturating_mul(5).max(ctx.max_output);
+    let (_status, stdout_bytes, stderr_bytes) = super::run_capped_output(cmd, cap, cap)
         .await
         .with_context(|| format!("running {tool}"))?;
-    let raw = String::from_utf8_lossy(&output.stdout);
+    let raw = String::from_utf8_lossy(&stdout_bytes);
     if raw.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         if !stderr.is_empty() {
             bail!("{tool}: {}", stderr.trim());
         }
@@ -519,6 +528,30 @@ mod tests {
         let out = grep_builtin(&multiline_args("(?s).*"), &ctx).unwrap();
         assert!(out.lines().count() <= 7, "{out}");
         assert!(out.contains("full output"), "{out}");
+    }
+
+    /// An unscoped search (no `path`) must search the working tree, not stdin.
+    /// ripgrep with no path argument reads STDIN when it isn't a TTY, so under a
+    /// nulled/redirected stdin an unscoped grep used to silently return
+    /// "(no matches)" — the model would wrongly conclude the symbol is absent.
+    /// Passing an explicit `.` fixes it and aligns rg with the POSIX backend.
+    #[tokio::test]
+    async fn ripgrep_without_path_searches_the_tree_not_stdin() {
+        if which::which("rg").is_err() {
+            return; // best-effort: exercise the real backend when available
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("code.rs"), "fn needle() {}\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let a = GrepArgs {
+            pattern: "needle".to_string(),
+            path: None,
+            glob: None,
+            context: None,
+            multiline: false,
+        };
+        let out = grep_ripgrep(&a, &ctx).await.unwrap();
+        assert!(out.contains("code.rs:1:fn needle"), "{out}");
     }
 
     #[tokio::test]

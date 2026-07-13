@@ -82,6 +82,10 @@ pub async fn run_file_hooks(hooks: &[Hook], tool: &str, path: &Path, cwd: &Path)
             c
         };
         cmd.current_dir(cwd);
+        // A file hook (a formatter, mostly) never reads stdin; leaving it
+        // inherited would let it block on the TUI's terminal. Null it — the
+        // lifecycle hooks below deliberately pipe stdin to feed their payload.
+        cmd.stdin(std::process::Stdio::null());
         cmd.kill_on_drop(true);
         let timeout = Duration::from_millis(hook.timeout_ms);
         match tokio::time::timeout(timeout, cmd.output()).await {

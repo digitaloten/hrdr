@@ -167,6 +167,9 @@ async fn run_check(command: &str, ctx: &ToolContext) -> Result<(Option<i32>, Str
     cmd.args(args)
         .arg(command)
         .current_dir(&ctx.cwd)
+        // A model-supplied check must never block reading the TUI's terminal
+        // (e.g. a `sudo` password prompt) — nothing feeds it stdin.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // The turn was cancelled (Esc), or the watch gave up: the check must not

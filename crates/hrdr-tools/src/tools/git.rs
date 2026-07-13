@@ -261,20 +261,26 @@ impl Tool for GitTool {
             bail!(msg);
         }
 
-        let out = tokio::process::Command::new("git")
-            .arg(sub)
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.arg(sub)
             .args(&a.args)
             .current_dir(&ctx.cwd)
             // A pager would hang waiting for a terminal that isn't there.
             .env("GIT_PAGER", "cat")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .output()
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        // `run_capped_output` nulls stdin, sets `kill_on_drop` (so Esc actually
+        // stops a `git log -p` on a huge repo), and caps how much stdout is
+        // buffered — `output()` would hold the entire diff/log in memory before
+        // the byte cap below ran. 5× the display budget is generous headroom;
+        // anything that fits is identical to what `output()` returned.
+        let cap = ctx.max_output.saturating_mul(5).max(ctx.max_output);
+        let (status, stdout_bytes, stderr_bytes) = super::run_capped_output(cmd, cap, cap)
             .await
             .context("running git (is it installed?)")?;
 
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if !out.status.success() {
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        if !status.success() {
             let msg = if stderr.trim().is_empty() {
                 stdout.trim()
             } else {

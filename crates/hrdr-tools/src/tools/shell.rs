@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 use crate::{Tool, ToolContext};
 
@@ -71,6 +71,54 @@ impl Tool for BashTool {
     }
 }
 
+/// Read one line (through `\n`) from `reader` into `buf`, but never buffer more
+/// than `cap` bytes of it: once `buf` holds `cap` bytes the rest of an
+/// over-long line is consumed and discarded up to its newline. This is the
+/// memory bound `read_until` lacks — `read_until` would grow `buf` without
+/// limit on a newline-less multi-gigabyte run (`tr '\0' a </dev/zero`, a huge
+/// minified blob) and OOM the process before the [`BASH_LINE_CAP`] display cap
+/// ever ran.
+///
+/// Returns `buf.len()` after the read: `0` means EOF with nothing buffered
+/// (caller stops); any non-zero value means a line (possibly capped, possibly
+/// the final newline-less tail at EOF) is ready to ingest. The trailing `\n` is
+/// included when present. `overflowing` carries the "already past cap for this
+/// line" state across calls so the loop stays cancel-safe (each `fill_buf`
+/// await is the only suspension point, and it consumes nothing until it
+/// returns), exactly as the persistent `buf` did for `read_until`.
+async fn read_line_capped<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    overflowing: &mut bool,
+    cap: usize,
+) -> std::io::Result<usize> {
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(buf.len()); // EOF: hand back whatever partial line remains
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if !*overflowing {
+            let remaining = cap.saturating_sub(buf.len());
+            if take <= remaining {
+                buf.extend_from_slice(&available[..take]);
+            } else {
+                buf.extend_from_slice(&available[..remaining]);
+                *overflowing = true; // drop the rest of this over-long line
+            }
+        }
+        let ended = available[take - 1] == b'\n';
+        reader.consume(take);
+        if ended {
+            *overflowing = false;
+            return Ok(buf.len());
+        }
+    }
+}
+
 /// Spawn a configured command, streaming its stdout/stderr line-by-line to the
 /// UI sink while accumulating a length-bounded view of the output. Full output
 /// is written incrementally to an overflow file so the model can read/grep it
@@ -81,6 +129,10 @@ async fn run_streamed_command(
     ctx: &ToolContext,
 ) -> Result<String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // A model-supplied command must never read the TUI's terminal: something
+    // like `sudo` prompting for a password would block on the user's keystrokes
+    // for the whole timeout. Nothing here feeds the child stdin, so null it.
+    cmd.stdin(Stdio::null());
     // Cancelled future → child must not linger.
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().context("spawning command")?;
@@ -181,31 +233,35 @@ async fn run_streamed_command(
         }};
     }
 
-    // Read stdout + stderr concurrently; use read_until(b'\n') so a single
-    // newline-less line (e.g. minified source) can't exhaust memory.
+    // Read stdout + stderr concurrently; read_line_capped bounds each line at
+    // BASH_LINE_CAP as it reads, so a single newline-less run (minified source,
+    // `tr '\0' a </dev/zero`) is cut instead of buffered whole and OOMing.
     let collect = async {
         let mut out_done = false;
         let mut err_done = false;
         let mut out_buf = Vec::<u8>::new();
         let mut err_buf = Vec::<u8>::new();
+        let mut out_over = false;
+        let mut err_over = false;
         loop {
             tokio::select! {
-                n = out_reader.read_until(b'\n', &mut out_buf), if !out_done => {
+                n = read_line_capped(&mut out_reader, &mut out_buf, &mut out_over, BASH_LINE_CAP), if !out_done => {
                     match n? {
                         0 => out_done = true,
                         _ => {
-                            // read_until includes the delimiter; strip trailing
-                            // newline / carriage-return then cap at BASH_LINE_CAP.
+                            // The buffer is already capped at BASH_LINE_CAP; strip
+                            // any trailing newline / carriage-return.
                             if out_buf.last() == Some(&b'\n') { out_buf.pop(); }
                             if out_buf.last() == Some(&b'\r') { out_buf.pop(); }
                             let capped_len = out_buf.len().min(BASH_LINE_CAP);
                             let line = String::from_utf8_lossy(&out_buf[..capped_len]).into_owned();
                             ingest_line!(&line);
                             out_buf.clear();
+                            out_over = false;
                         }
                     }
                 }
-                n = err_reader.read_until(b'\n', &mut err_buf), if !err_done => {
+                n = read_line_capped(&mut err_reader, &mut err_buf, &mut err_over, BASH_LINE_CAP), if !err_done => {
                     match n? {
                         0 => err_done = true,
                         _ => {
@@ -215,6 +271,7 @@ async fn run_streamed_command(
                             let line = String::from_utf8_lossy(&err_buf[..capped_len]).into_owned();
                             ingest_line!(&line);
                             err_buf.clear();
+                            err_over = false;
                         }
                     }
                 }
@@ -370,6 +427,50 @@ impl Tool for PowerShellTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A newline-less run far larger than the cap is bounded *as it is read* —
+    /// `buf` never grows past `cap` — and the over-long line is drained through
+    /// its newline so the next line comes back intact. This is the memory bound
+    /// `read_until` lacked: it would have buffered the whole 1 MiB run first.
+    #[tokio::test]
+    async fn read_line_capped_bounds_a_newlineless_run_and_resumes() {
+        // 1 MiB of 'a' with no newline, then a newline, then a short line.
+        let mut data = vec![b'a'; 1 << 20];
+        data.push(b'\n');
+        data.extend_from_slice(b"second\n");
+        let mut reader = BufReader::new(&data[..]);
+
+        let mut buf = Vec::new();
+        let mut over = false;
+        let n = read_line_capped(&mut reader, &mut buf, &mut over, 64)
+            .await
+            .unwrap();
+        assert_eq!(n, 64, "the over-long line is handed back capped");
+        assert!(
+            buf.len() <= 64,
+            "buffer never exceeds the cap: {}",
+            buf.len()
+        );
+
+        // The rest of that line was discarded up to its newline, so the next
+        // read yields the following line whole (not a tail of the 1 MiB run).
+        buf.clear();
+        over = false;
+        let n = read_line_capped(&mut reader, &mut buf, &mut over, 64)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..n], b"second\n");
+
+        // EOF returns 0 with nothing buffered.
+        buf.clear();
+        over = false;
+        assert_eq!(
+            read_line_capped(&mut reader, &mut buf, &mut over, 64)
+                .await
+                .unwrap(),
+            0
+        );
+    }
 
     /// A shell command gets five minutes unless the model says otherwise — and the
     /// schema *says so*, for both shells.

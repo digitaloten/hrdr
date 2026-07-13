@@ -58,6 +58,84 @@ pub(crate) const MAX_WATCH_TIMEOUT_SECS: u64 = 6 * 60 * 60;
 /// timeout of its own) must not wedge the watch.
 pub(crate) const WATCH_CHECK_TIMEOUT_SECS: u64 = 120;
 
+/// Spawn `cmd` and collect its output, but *bounded*: stdin is nulled (a
+/// model-supplied command must never block reading the TUI's terminal),
+/// `kill_on_drop` is set (a cancelled turn must not leave the child running),
+/// and stdout/stderr are read into memory only up to `stdout_cap`/`stderr_cap`
+/// bytes — a pathological multi-gigabyte output is cut early instead of being
+/// fully buffered by [`tokio::process::Command::output`] and only then
+/// truncated. Returns the exit status and the (possibly capped) stdout/stderr.
+///
+/// Both streams are drained concurrently so the child never deadlocks on a full
+/// pipe; when stdout hits its cap we stop accumulating and kill the child so it
+/// can't block writing the rest. For any output that fits under the caps this is
+/// byte-for-byte identical to `output()`.
+pub(crate) async fn run_capped_output(
+    mut cmd: tokio::process::Command,
+    stdout_cap: usize,
+    stderr_cap: usize,
+) -> std::io::Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    use tokio::io::AsyncReadExt;
+
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn()?;
+    let mut out = child.stdout.take().expect("stdout was piped");
+    let mut err = child.stderr.take().expect("stderr was piped");
+
+    // Drain stderr in the background (discarding anything past its cap) so the
+    // child can never block on a full stderr pipe while we read stdout.
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match err.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if buf.len() < stderr_cap {
+                        let room = stderr_cap - buf.len();
+                        buf.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                    // Keep reading past the cap so the pipe never fills.
+                }
+            }
+        }
+        buf
+    });
+
+    // Read stdout up to its cap. If it overflows we stop reading and kill the
+    // child so it cannot wedge on a now-unread pipe.
+    let mut stdout_buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut over_cap = false;
+    loop {
+        let n = out.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        if stdout_buf.len() >= stdout_cap {
+            over_cap = true;
+            break;
+        }
+        let room = stdout_cap - stdout_buf.len();
+        if n <= room {
+            stdout_buf.extend_from_slice(&chunk[..n]);
+        } else {
+            stdout_buf.extend_from_slice(&chunk[..room]);
+            over_cap = true;
+            break;
+        }
+    }
+    if over_cap {
+        let _ = child.start_kill();
+    }
+    let status = child.wait().await?;
+    let stderr_buf = stderr_task.await.unwrap_or_default();
+    Ok((status, stdout_buf, stderr_buf))
+}
+
 pub use edit::EditTool;
 pub use fileops::{CopyTool, DeleteTool, MoveTool};
 pub use find::FindTool;
@@ -1048,5 +1126,45 @@ mod tests {
         );
         // Must start with some actual output (head preserved).
         assert!(result.contains("line 1"), "head not preserved: {result}");
+    }
+
+    /// A single newline-less run far larger than the caps (`tr '\0' a </dev/zero`)
+    /// must come back *bounded* rather than hang or OOM: the per-line read is
+    /// capped as it streams, so the result is a small, marked truncation — not a
+    /// gigabyte buffered whole and only then trimmed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_newlineless_run_is_bounded_not_hung() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = ToolContext::new(dir.path());
+        c.max_output = 200;
+        c.max_output_lines = 10;
+
+        // 2 MiB of 'a' with no newline at all.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            BashTool.execute(
+                serde_json::json!({
+                    "command": "head -c 2097152 /dev/zero | tr '\\0' 'a'"
+                }),
+                &c,
+            ),
+        )
+        .await
+        .expect("a newline-less run must not hang")
+        .unwrap();
+
+        // Bounded: the single line was capped at BASH_LINE_CAP, nowhere near 2 MiB.
+        assert!(
+            result.len() <= BASH_LINE_CAP + 4096,
+            "output should be bounded, got {} bytes",
+            result.len()
+        );
+        // Over the (tiny) display cap, so the truncation pointer is present.
+        assert!(
+            result.contains("full output") || result.contains("truncated"),
+            "marker missing from bounded output: {}",
+            &result[..result.len().min(200)]
+        );
     }
 }
