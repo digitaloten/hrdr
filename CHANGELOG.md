@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-13
+
+**This is the release of everything in 0.3.0.** `v0.3.0` was tagged but never
+published: its Windows test job failed, the release build is gated on the tests,
+and no binaries were produced. The tag stays where it is; this is the version to
+install.
+
+### Fixed
+
+- **The system prompt is LF on every platform.** `system.j2` is `include_str!`d
+  into the binary, and git on Windows checks text out as CRLF by default — so a
+  Windows build shipped a system prompt whose every line ended `\r\n`, sending
+  the model different bytes than the Linux and macOS builds did.
+  `.gitattributes` now pins the checkout to LF, and `render_system` normalizes
+  what it returns (which also covers a CRLF `AGENTS.md`, entirely normal on
+  Windows). This was the failure that kept 0.3.0 from publishing.
+
 ## [0.3.0] - 2026-07-13
 
 A minor bump rather than a patch: the `model_info` tool is now `models`, and a
@@ -2364,7 +2381,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/kryptic-sh/hrdr/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/kryptic-sh/hrdr/compare/v0.2.12...v0.3.0
 [0.2.12]: https://github.com/kryptic-sh/hrdr/compare/v0.2.11...v0.2.12
 [0.2.11]: https://github.com/kryptic-sh/hrdr/compare/v0.2.10...v0.2.11
