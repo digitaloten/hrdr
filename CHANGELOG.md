@@ -6,6 +6,89 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-14
+
+**If you run hrdr on Windows, this is the release you need.** Every build before
+it failed to start on a console without VT support.
+
+### Fixed
+
+- **hrdr would not start on a legacy Windows console.** It printed
+  `Keyboard progressive enhancement not implemented for the legacy Windows API`
+  and exited 1, without painting a frame. `TerminalGuard::enter` asked for
+  keyboard enhancement flags in the same `execute!` as the alternate screen and
+  propagated the error with `?`; crossterm has no implementation of that command
+  for the legacy Windows console API. The flags are a nicety (unambiguous
+  `Shift+Enter`) — hrdr now asks for them and carries on without them. Found by
+  the new terminal tests below, on their first honest run.
+- **A checkpoint store that cannot be locked is now declined, not fatal.**
+  `flock` fails on filesystems that don't support it (NFS without lockd, some
+  FUSE and container volume mounts), and the store lives under the user's XDG
+  data dir — a home directory on NFS was enough to hit it. It panicked, which
+  killed the turn inside a bare `tokio::spawn`: the loader span forever, input
+  queued instead of sending, and nothing said why. `/undo` is now switched off
+  with a message (`checkpoints disabled — … (/undo unavailable)`) and the
+  session runs.
+- **The symlink guard no longer refuses legitimate writes.** It stopped its
+  upward walk with raw path equality, and path equality is textual —
+  `/var/folders/…` and `/private/var/folders/…` are one directory and two
+  `Path`s. A project whose root was spelled differently from the path under test
+  let the walk sail past the root, meet a symlink above it, and refuse a write
+  that was always fine. Both stops are canonicalised now, matching
+  `ensure_inside_cwd`. The stop stays _at_ the temp dir, not below it: `/tmp` is
+  world-writable, and a planted symlink there is the oldest trick there is.
+
+### Added
+
+- **The TUI is now tested in a real terminal, on Linux, macOS and Windows.**
+  hrdr starts in a pty (a ConPTY on Windows), paints a frame, is typed at, and
+  must exit cleanly. Everything else drives `App` against a `TestBackend` — no
+  terminal, no process, no OS — which proves the widgets lay out but not that
+  the program runs; and CI's smoke job only ran `--version`/`--help`, which
+  return before a terminal is ever constructed. That is how the Windows startup
+  bug shipped.
+- **Shell commands get five minutes** (`timeout_ms`, default `300000`,
+  overridable per call), up from two. Two minutes killed the commands actually
+  worth running — a cold build, a full test suite, `npm install` on an empty
+  cache — and a killed build teaches the model nothing: it retries something
+  narrower and the work is redone. The schema now states the default, its unit,
+  and when raising it beats being killed.
+- **The system prompt learned the ways an agent quietly does damage**, each rule
+  gated on the agent having the tools it talks about: honest reporting (never
+  claim a check you didn't run), test integrity (make the code pass the test,
+  never the test pass the code), untrusted content (a fetched page or MCP result
+  is data being read, not a command to obey), scope, secrets, shell hygiene, and
+  a release workflow it can actually run.
+- **The shell rules are written in the shell the machine has.** `2>&1` is the
+  bash idiom; in PowerShell `>` redirects the success stream _alone_, so an
+  agent handed the bash idiom would write a log with the errors missing —
+  exactly what it set out to capture. Both idioms are gated on which shell is
+  registered, and the redirect example uses the machine's real temp dir (`/tmp`
+  doesn't exist on Windows, and PowerShell's `$env:TEMP` is unset when `pwsh`
+  runs on Linux).
+- `patch` repairs inaccurate hunk counts and relocates hunks whose line numbers
+  are wrong when the context is unique, rejects renames, and rolls back applied
+  files when a later one in the same patch fails. `grep` gains `multiline`.
+
+### Changed
+
+- **Checkpoints can undo more than a file.** Records are typed (missing / file /
+  directory / symlink), a whole tree can be snapshotted (empty directories and
+  symlink targets included), and revert replays children after parents — so a
+  moved or deleted _directory_ is now revertible, an empty directory survives,
+  and a symlink comes back as a symlink. Old journals still load.
+- **The checkpoint journal takes a real OS lock** (`fs2`) instead of a lock file
+  it would _steal_ after 30 seconds, and the turn counter moved to disk — two
+  agents sharing a non-git working directory can no longer interleave journal
+  rewrites and blob GC, one collecting the blobs the other just referenced.
+- **Mutating through a symlink is refused**, `copy`/`move` will not put a
+  directory inside itself, a patch will not apply the same file section twice,
+  and the LSP and MCP readers are bounded (16 MiB frames, 16 KiB headers) — a
+  peer, or a crash mid-write, could previously make hrdr allocate until it died.
+- The agent is told to prefer `git restore` over hand-editing a file back to its
+  old state — but only after checking the file is tracked and reading its full
+  diff, and never when the diff also contains changes that aren't its own.
+
 ## [0.3.1] - 2026-07-13
 
 **This is the release of everything in 0.3.0.** `v0.3.0` was tagged but never
@@ -2381,7 +2464,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/kryptic-sh/hrdr/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/kryptic-sh/hrdr/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/kryptic-sh/hrdr/compare/v0.2.12...v0.3.0
 [0.2.12]: https://github.com/kryptic-sh/hrdr/compare/v0.2.11...v0.2.12
