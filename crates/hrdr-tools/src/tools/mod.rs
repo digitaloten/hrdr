@@ -255,9 +255,9 @@ mod tests {
             .execute(serde_json::json!({"path": path.to_str().unwrap()}), &c)
             .await
             .unwrap();
-        assert!(out.contains("     1\talpha"), "line 1 not found: {out}");
-        assert!(out.contains("     2\tbeta"), "line 2 not found: {out}");
-        assert!(out.contains("     3\tgamma"), "line 3 not found: {out}");
+        assert!(out.contains("     1: alpha"), "line 1 not found: {out}");
+        assert!(out.contains("     2: beta"), "line 2 not found: {out}");
+        assert!(out.contains("     3: gamma"), "line 3 not found: {out}");
     }
 
     #[tokio::test]
@@ -273,10 +273,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!out.contains("     1\t"), "line 1 should be skipped");
-        assert!(out.contains("     2\t2"), "line 2 missing: {out}");
-        assert!(out.contains("     3\t3"), "line 3 missing: {out}");
-        assert!(!out.contains("     4\t"), "line 4 should be skipped");
+        assert!(!out.contains("     1: "), "line 1 should be skipped");
+        assert!(out.contains("     2: 2"), "line 2 missing: {out}");
+        assert!(out.contains("     3: 3"), "line 3 missing: {out}");
+        assert!(!out.contains("     4: "), "line 4 should be skipped");
     }
 
     /// A file over the size cap is refused via a fast `metadata` stat, before

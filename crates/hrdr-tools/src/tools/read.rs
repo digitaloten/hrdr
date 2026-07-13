@@ -29,7 +29,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &'static str {
-        "Read a file from disk. Returns 1-based line-numbered content (the `N\\t` prefix is \
+        "Read a file from disk. Returns 1-based line-numbered content (the `N: ` prefix is \
          display-only — never include it in edit strings). Use `offset`/`limit` to page \
          through large files. You must read a file before editing it."
     }
@@ -80,7 +80,7 @@ impl Tool for ReadTool {
         for (i, line) in text.lines().enumerate().skip(start - 1).take(limit) {
             let n = i + 1;
             let line = &line[..crate::floor_char_boundary(line, MAX_LINE)];
-            out.push_str(&format!("{n:>6}\t{line}\n"));
+            out.push_str(&format!("{n:>6}: {line}\n"));
         }
         if out.is_empty() {
             out.push_str("(file is empty or offset past end)");
