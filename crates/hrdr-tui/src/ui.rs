@@ -2216,9 +2216,9 @@ fn transcript_lines(
                 msg_num += 1;
                 msg_here += 1;
                 footer.extend(meta(i, msg_num, "you"));
-                let md = md_theme.clone();
-                let bg = BlockKind::User.bg(theme);
-                let body = cache_entry(ck, || markdown_lines(text, &md, bg, inner));
+                let body = cache_entry(ck, || {
+                    markdown_lines(text, &md_theme, BlockKind::User.bg(theme), inner)
+                });
                 (BlockKind::User, body)
             }
             // Assistant text is rendered as markdown (headings, lists, emphasis,
@@ -2228,9 +2228,9 @@ fn transcript_lines(
                 msg_num += 1;
                 msg_here += 1;
                 footer.extend(meta(i, msg_num, "assistant"));
-                let md = md_theme.clone();
-                let bg = BlockKind::Assistant.bg(theme);
-                let body = cache_entry(ck, || markdown_lines(text, &md, bg, inner));
+                let body = cache_entry(ck, || {
+                    markdown_lines(text, &md_theme, BlockKind::Assistant.bg(theme), inner)
+                });
                 (BlockKind::Assistant, body)
             }
             EntryKind::Reasoning { .. } if !app.show_reasoning => continue, // hidden via /reasoning
@@ -2241,9 +2241,14 @@ fn transcript_lines(
             EntryKind::Reasoning { text, .. } => {
                 // Same markdown pipeline as assistant, in the same colors —
                 // only dimmer, so thoughts read as a quieter version of output.
-                let md = theme.md_theme_dim();
-                let bg = BlockKind::Reasoning.bg(theme);
-                let body = cache_entry(ck, || markdown_lines(text, &md, bg, inner));
+                let body = cache_entry(ck, || {
+                    markdown_lines(
+                        text,
+                        &theme.md_theme_dim(),
+                        BlockKind::Reasoning.bg(theme),
+                        inner,
+                    )
+                });
                 (BlockKind::Reasoning, body)
             }
             EntryKind::Tool {
@@ -2255,19 +2260,15 @@ fn transcript_lines(
                 expanded,
                 ..
             } => {
-                let expand = *expanded || app.expand_tools;
-                let (ok_v, done_v) = (*ok, *done);
-                let (name_s, args_s, result_s) = (name.clone(), args.clone(), result.clone());
-                let theme_snap = theme.clone();
                 let body = cache_entry(ck, || {
                     tool_lines(
-                        &theme_snap,
-                        &name_s,
-                        &args_s,
-                        &result_s,
-                        ok_v,
-                        done_v,
-                        expand,
+                        theme,
+                        name,
+                        args,
+                        result,
+                        *ok,
+                        *done,
+                        *expanded || app.expand_tools,
                     )
                 });
                 (BlockKind::Tool, body)
@@ -2275,16 +2276,15 @@ fn transcript_lines(
             // Slash-command output and status notices read like assistant output
             // — same markdown, same colors, no dimming — on their own background.
             EntryKind::System(text) | EntryKind::Notice(text) => {
-                let md = md_theme.clone();
-                let bg = BlockKind::Command.bg(theme);
-                let body = cache_entry(ck, || markdown_lines(text, &md, bg, inner));
+                let body = cache_entry(ck, || {
+                    markdown_lines(text, &md_theme, BlockKind::Command.bg(theme), inner)
+                });
                 (BlockKind::Command, body)
             }
             // The per-turn stats line belongs to the turn that just ended, so it
             // closes that turn's block rather than opening one of its own.
             EntryKind::Stats(text) => {
-                let dim = theme.dim;
-                let body = cache_entry(ck, || text_lines(text, Style::default().fg(dim)));
+                let body = cache_entry(ck, || text_lines(text, Style::default().fg(theme.dim)));
                 match pending.as_mut() {
                     Some(block) => {
                         let mut rows = vec![Line::raw("")];
@@ -2300,13 +2300,12 @@ fn transcript_lines(
             // `/diff` is slash-command output too, but with diff coloring
             // instead of markdown.
             EntryKind::Diff(text) => {
-                let theme_snap = theme.clone();
                 let body = cache_entry(ck, || {
                     text.lines()
                         .map(|line| {
                             Line::from(Span::styled(
                                 line.to_string(),
-                                Style::default().fg(diff_line_color(line, &theme_snap)),
+                                Style::default().fg(diff_line_color(line, theme)),
                             ))
                         })
                         .collect()
