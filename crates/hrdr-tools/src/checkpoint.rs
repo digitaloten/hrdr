@@ -84,7 +84,11 @@ impl Checkpoints {
         // Prune old checkpoints + GC orphan blobs under the lock, reconciling
         // with anything another instance in this dir has written.
         {
-            let _lock = JournalLock::acquire(&cp.dir);
+            // The gate: a store we cannot lock is a store we cannot safely share
+            // with another agent in this directory, so we decline to open it. The
+            // caller turns that into "checkpoints are off for this session" — which
+            // is what it already did for every other kind of open failure.
+            let _lock = JournalLock::acquire(&cp.dir)?;
             cp.reload_records();
             let _ = cp.prune();
         }
@@ -150,7 +154,17 @@ impl Checkpoints {
 
     /// Begin a new turn (its file changes form one checkpoint).
     pub fn begin_turn(&mut self) {
-        let _lock = JournalLock::acquire(&self.dir);
+        // `open` already proved the lock works, so a failure here is something
+        // changing underfoot (the data dir went away, fds ran out). Say so and take
+        // the turn anyway: refusing to start one would be a worse answer than a
+        // checkpoint that might race a second agent in the same directory.
+        let _lock = match JournalLock::acquire(&self.dir) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                eprintln!("hrdr: checkpoint: {error} — continuing without the journal lock");
+                None
+            }
+        };
         self.reload_records();
         let counter_path = self.dir.join("next-turn");
         let reserved = std::fs::read_to_string(&counter_path)
@@ -178,8 +192,22 @@ impl Checkpoints {
         }
         // Hold the lock across blob-store + journal-append so a concurrent
         // instance's blob GC can't delete a blob between our write and the
-        // record that references it.
-        let _lock = JournalLock::acquire(&self.dir);
+        // record that references it. Without the lock we cannot promise that, so
+        // take the path this function already has for "couldn't snapshot it": skip
+        // the checkpoint, say why, and leave `touched` clear so a later write this
+        // turn can still try. The edit itself goes ahead — a file that is not
+        // revertible is a smaller loss than a turn that dies.
+        let _lock = match JournalLock::acquire(&self.dir) {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.touched.remove(&key);
+                eprintln!(
+                    "hrdr: checkpoint: {error} — {} won't be revertible for this turn",
+                    path.display()
+                );
+                return;
+            }
+        };
         let pre = match std::fs::read(path) {
             Ok(bytes) => match self.store_blob(&bytes) {
                 Ok(hash) => Some(hash),
@@ -248,7 +276,7 @@ impl Checkpoints {
     pub fn record_tree_pre(&mut self, root: &Path) -> Result<()> {
         // Keep blob creation and journal references under one lock so concurrent
         // garbage collection cannot remove a newly stored tree blob.
-        let _lock = JournalLock::acquire(&self.dir);
+        let _lock = JournalLock::acquire(&self.dir)?;
         let mut nodes = Vec::new();
         let mut stack = vec![root.to_path_buf()];
         while let Some(path) = stack.pop() {
@@ -306,7 +334,7 @@ impl Checkpoints {
     }
 
     fn append_record(&mut self, rec: ChangeRecord) -> Result<()> {
-        let _lock = JournalLock::acquire(&self.dir);
+        let _lock = JournalLock::acquire(&self.dir)?;
         self.append_record_unlocked(rec)
     }
 
@@ -355,7 +383,7 @@ impl Checkpoints {
         // to the current on-disk record set (which may include records another
         // instance in this dir appended) rather than this instance's stale
         // in-memory view — otherwise the rewrite would silently discard them.
-        let _lock = JournalLock::acquire(&self.dir);
+        let _lock = JournalLock::acquire(&self.dir)?;
         self.reload_records();
         // For each file touched in turns >= `turn`, the pre-`turn` state is the
         // pre-image recorded at the SMALLEST such turn.
@@ -478,7 +506,27 @@ struct JournalLock {
 }
 
 impl JournalLock {
-    fn acquire(dir: &Path) -> Self {
+    /// Take the lock, or say why not.
+    ///
+    /// This is fallible because the ways it fails are *environmental*, not bugs: a
+    /// filesystem with no `flock` (NFS without lockd, some FUSE and container
+    /// volume mounts), a data directory that isn't writable, an exhausted file
+    /// descriptor table. None of those are hrdr's fault and none of them are worth
+    /// a dead agent — the store lives under the user's XDG data dir, and a home
+    /// directory on NFS is an ordinary corporate setup.
+    ///
+    /// It used to `panic!` on both. That crashed the turn *inside* a bare
+    /// `tokio::spawn`, so the TUI never got its `Done` message: the loader span
+    /// forever, input queued instead of sending, and nothing said why — while the
+    /// panic hook tore the terminal out of the alternate screen. Worse, the one
+    /// caller that had *designed* a graceful path for this — `Checkpoints::open`,
+    /// whose `Err` disables checkpointing via `.ok()` — could never reach it,
+    /// because `.ok()` does not catch a panic.
+    ///
+    /// Locking still gates the store: `open` refuses to hand back a `Checkpoints`
+    /// it cannot lock, so a session either has a store it can serialise against or
+    /// no store at all. What it never has again is a crash.
+    fn acquire(dir: &Path) -> Result<Self> {
         use fs2::FileExt;
         let path = dir.join("journal.lock");
         let file = std::fs::OpenOptions::new()
@@ -487,11 +535,10 @@ impl JournalLock {
             .create(true)
             .truncate(false)
             .open(&path)
-            .unwrap_or_else(|error| panic!("opening checkpoint lock {}: {error}", path.display()));
-        file.lock_exclusive().unwrap_or_else(|error| {
-            panic!("locking checkpoint journal {}: {error}", path.display())
-        });
-        Self { file }
+            .with_context(|| format!("opening checkpoint lock {}", path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("locking checkpoint journal {}", path.display()))?;
+        Ok(Self { file })
     }
 }
 
@@ -516,6 +563,54 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store that cannot be locked is *declined*, not fatal.
+    ///
+    /// The ways the lock fails are environmental — a filesystem with no `flock`
+    /// (NFS without lockd, some FUSE and container mounts), a data dir that isn't
+    /// writable, an exhausted fd table — and the store lives under the user's XDG
+    /// data dir, so a home directory on NFS is enough to hit it.
+    ///
+    /// It used to `panic!`. Inside the TUI that killed the turn in a bare
+    /// `tokio::spawn`, so the `Done` message never arrived: the loader span forever,
+    /// input queued instead of sending, nothing said why. And the one caller that
+    /// had a graceful path for exactly this — `Agent::new`, which disables
+    /// checkpointing when `open` returns `Err` — could never reach it, because
+    /// `.ok()` does not catch a panic.
+    ///
+    /// Simulated with the failure that is portable: a lock path that cannot be
+    /// opened as a file, because a directory already sits there.
+    #[test]
+    fn a_store_that_cannot_be_locked_is_declined_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("cp");
+        // `journal.lock` is where the lock file goes; make that name unopenable.
+        std::fs::create_dir_all(store.join("journal.lock")).unwrap();
+
+        let err = match Checkpoints::open(store) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a store whose lock cannot be taken must not open"),
+        };
+        assert!(
+            err.contains("checkpoint lock"),
+            "the error must name what failed, so the user knows why /undo is gone: {err}"
+        );
+    }
+
+    /// And the graceful path is real: `Agent::new`'s `Err` arm turns that into
+    /// "checkpoints off", which only works because `open` *returns* rather than
+    /// panics. This pins the contract that arm depends on.
+    #[test]
+    fn open_reports_failure_by_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("cp");
+        std::fs::create_dir_all(store.join("journal.lock")).unwrap();
+
+        // The whole point: a caller can *handle* this. If `open` panicked, this
+        // line would take the test process down instead of yielding `None`.
+        let handled = Checkpoints::open(store).ok();
+        assert!(handled.is_none(), "an unlockable store yields no store");
+    }
 
     #[test]
     fn revert_restores_directory_tree_empty_dirs_and_symlinks() {

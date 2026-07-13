@@ -3902,7 +3902,18 @@ impl Agent {
         let checkpoints = enable_checkpoints
             .then(|| checkpoint_dir(&config.cwd))
             .flatten()
-            .and_then(|dir| Checkpoints::open(dir).ok())
+            .and_then(|dir| match Checkpoints::open(dir) {
+                Ok(cp) => Some(cp),
+                // Checkpointing is a convenience (`/undo`), not a precondition for
+                // running — a data dir that can't be written or locked (NFS without
+                // lockd, an odd container mount) turns it off rather than stopping
+                // the session. Say so once: a silent `.ok()` here would leave the
+                // user to discover it at the moment they reach for `/undo`.
+                Err(error) => {
+                    eprintln!("hrdr: checkpoints disabled — {error} (/undo unavailable)");
+                    None
+                }
+            })
             .map(|c| Arc::new(Mutex::new(c)));
 
         ctx.checkpoints = checkpoints.clone();
