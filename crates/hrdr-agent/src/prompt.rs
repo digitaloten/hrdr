@@ -553,6 +553,31 @@ mod tests {
         );
     }
 
+    /// Waiting on something outside hrdr is `watch`'s job, and the prompt says so.
+    ///
+    /// A model that doesn't know the tool exists does one of two things, and both
+    /// are bad: it sleeps in the shell (which tells it nothing until the sleep ends,
+    /// and gets killed at the shell timeout), or it runs a check-think-sleep-check
+    /// loop, paying a full model round-trip for every look at a CI run that takes
+    /// half an hour. The tool schema alone doesn't fix that — the *habit* has to be
+    /// named.
+    #[test]
+    fn the_prompt_points_at_watch_for_waiting() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, Path::new("/tmp/x"), None).unwrap();
+        assert!(
+            p.contains("is what `watch` is for"),
+            "waiting on CI/a deploy/a build must name the tool that does it"
+        );
+        // The shape of a check: a command whose *exit code* is the answer.
+        assert!(p.contains("answers the question with\n  its exit code"));
+        // And the two habits it replaces.
+        assert!(
+            p.contains("Don't poll it yourself"),
+            "the point is to stop the check-think-sleep-check loop: {p}"
+        );
+    }
+
     /// The prompt forbids the cheapest way to make a red test green: changing the
     /// test.
     ///

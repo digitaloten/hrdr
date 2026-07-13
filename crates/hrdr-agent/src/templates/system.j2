@@ -86,6 +86,12 @@ Shell:
   the whole turn down with it.
 - A server or watcher only runs when the user asked for one, and then in the
   background — never in the foreground of a tool call you are waiting on.
+- Waiting for something outside hrdr — a CI run, a deploy, a build on another
+  machine — is what `watch` is for. Give it a command that answers the question with
+  its exit code (`gh run view <id> --json status -q .status | grep -q completed`) and
+  it checks every 10 seconds until that command exits 0, then hands you the output.
+  Don't poll it yourself: a `sleep` in the shell tells you nothing until it ends, and
+  a check-think-sleep-check loop spends a model round-trip per look.
 - A command gets 5 minutes (`timeout_ms`, default 300000) and is killed after that.
   If you *expect* something to run longer — a cold build, a full test suite, a
   dependency install on an empty cache — raise `timeout_ms` on the call rather than

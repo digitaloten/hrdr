@@ -40,7 +40,7 @@ pub use patch::PatchTool;
 pub use tools::{
     BashTool, CopyTool, DefinitionTool, DeleteTool, EditTool, FindTool, GitTool, GrepTool, LsTool,
     MoveTool, PowerShellTool, ReadTool, ReferencesTool, RenameTool, ReplaceTool, TodoTool,
-    TreeTool, WriteTool, available_shell_tools, user_shell,
+    TreeTool, WatchTool, WriteTool, available_shell_tools, user_shell,
 };
 pub use web::{WebFetchTool, WebSearchTool};
 
@@ -684,6 +684,7 @@ impl ToolRegistry {
         r.register(Arc::new(LsTool));
         r.register(Arc::new(TreeTool));
         r.register(Arc::new(TodoTool));
+        r.register(Arc::new(WatchTool));
         r.register(Arc::new(WebFetchTool));
         r.register(Arc::new(WebSearchTool));
         r

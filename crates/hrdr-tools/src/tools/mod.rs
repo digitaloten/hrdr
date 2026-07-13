@@ -13,6 +13,7 @@ pub(crate) mod replace;
 pub(crate) mod shell;
 pub(crate) mod todo;
 pub(crate) mod tree;
+pub(crate) mod watch;
 pub(crate) mod write;
 
 /// Hard cap on a rendered source line, so one minified file can't blow context.
@@ -38,6 +39,25 @@ pub(crate) const DEFAULT_SHELL_TIMEOUT_MS: u64 = 300_000;
 /// a minified-file line from blowing the per-turn context.
 pub(crate) const BASH_LINE_CAP: usize = 8_192;
 
+/// How long `watch` sleeps between checks when the model doesn't say.
+///
+/// Ten seconds is the compromise: fast enough that a build finishing is noticed
+/// while the agent still has the context to act on it, slow enough not to hammer
+/// someone else's API (`gh` is rate-limited) for the half-hour a CI run can take.
+pub(crate) const DEFAULT_WATCH_INTERVAL_SECS: u64 = 10;
+/// How long `watch` waits in total before giving up. Far longer than a shell
+/// command's timeout, because waiting is the *point* — but bounded, so a condition
+/// that will never hold ends the call rather than the turn.
+pub(crate) const DEFAULT_WATCH_TIMEOUT_SECS: u64 = 30 * 60;
+/// The most a model can ask `watch` to wait. Six hours is longer than any CI run
+/// worth waiting on; past that, the agent should hand the job back to the user
+/// rather than sit on a tool call.
+pub(crate) const MAX_WATCH_TIMEOUT_SECS: u64 = 6 * 60 * 60;
+/// How long any single `watch` check gets before it is killed and read as "not
+/// yet". A check is a question, not a job — one that hangs (a network call with no
+/// timeout of its own) must not wedge the watch.
+pub(crate) const WATCH_CHECK_TIMEOUT_SECS: u64 = 120;
+
 pub use edit::EditTool;
 pub use fileops::{CopyTool, DeleteTool, MoveTool};
 pub use find::FindTool;
@@ -50,6 +70,7 @@ pub use replace::ReplaceTool;
 pub use shell::{BashTool, PowerShellTool, available_shell_tools, user_shell};
 pub use todo::TodoTool;
 pub use tree::TreeTool;
+pub use watch::WatchTool;
 pub use write::WriteTool;
 
 #[cfg(test)]
