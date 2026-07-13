@@ -37,21 +37,33 @@ pub fn render_system(
 
     let has = |name: &str| tools.defs().iter().any(|d| d.function.name == name);
 
-    tmpl.render(context! {
-        cwd => cwd.display().to_string(),
-        os => os_context(),
-        tool_names => tool_names,
-        // Gate the edit/git guidance: a purely read-only sub-agent has no
-        // mutating tools, so those sections would be dead weight (and mildly
-        // contradict its persona).
-        can_write => tools.has_write_tool(),
-        // Delegation guidance is for an agent that can actually delegate — a
-        // sub-agent has no `task` tool, and telling it how to pick a model for one
-        // would be instructions for a tool it cannot call.
-        can_delegate => has("task") && has("models"),
-        instructions => instructions,
-    })
-    .context("rendering system template")
+    let rendered = tmpl
+        .render(context! {
+            cwd => cwd.display().to_string(),
+            os => os_context(),
+            tool_names => tool_names,
+            // Gate the edit/git guidance: a purely read-only sub-agent has no
+            // mutating tools, so those sections would be dead weight (and mildly
+            // contradict its persona).
+            can_write => tools.has_write_tool(),
+            // Delegation guidance is for an agent that can actually delegate — a
+            // sub-agent has no `task` tool, and telling it how to pick a model for one
+            // would be instructions for a tool it cannot call.
+            can_delegate => has("task") && has("models"),
+            instructions => instructions,
+        })
+        .context("rendering system template")?;
+
+    // The prompt is LF, whatever the checkout did to the template.
+    //
+    // `SYSTEM_TEMPLATE` is `include_str!`d, so whatever line endings the file had
+    // when the binary was compiled are baked into it — and git's Windows default
+    // (`core.autocrlf=true`) rewrites LF to CRLF on checkout. A Windows build
+    // therefore shipped a prompt whose every line ended `\r\n`: different bytes to
+    // the model than every other platform sends, for no reason a user could see.
+    // `.gitattributes` now pins the checkout to LF, but that only helps a fresh
+    // clone — this makes it true of the string we actually send, always.
+    Ok(rendered.replace("\r\n", "\n"))
 }
 
 /// One-line OS description for the system prompt: kernel/family, the distro
@@ -180,6 +192,36 @@ mod tests {
         // The OS line names the platform (and, where detectable, the distro +
         // package manager) so system-wide installs use the right tool.
         assert!(p.contains(&format!("- OS: {}", std::env::consts::OS)));
+    }
+
+    /// The prompt carries no `\r`, whatever the checkout did to the template.
+    ///
+    /// Regression, and a CI-only one: `system.j2` is `include_str!`d, and git on
+    /// Windows checks text out as CRLF by default — so a Windows build embedded a
+    /// prompt whose every line ended `\r\n` and sent different bytes to the model
+    /// than Linux and macOS did. It surfaced as three prompt tests failing on
+    /// windows-latest and nowhere else (their assertions span a line break), which
+    /// took the whole `test` job red — and since the release `Build` job is gated on
+    /// the tests, v0.3.0 was tagged but never published.
+    ///
+    /// This test fails on *any* platform if the normalization is dropped, which is
+    /// the point: the bug was invisible to a Linux `cargo test`, and the fix must
+    /// not be.
+    #[test]
+    fn the_prompt_has_no_carriage_returns() {
+        let tools = ToolRegistry::with_defaults();
+        // Project instructions arrive from a file on disk too, and a CRLF AGENTS.md
+        // is entirely normal on Windows — it must not smuggle `\r` in either.
+        let p = render_system(
+            &tools,
+            Path::new("/tmp/x"),
+            Some("Use tabs.\r\nPrefer clarity.\r\n"),
+        )
+        .unwrap();
+        assert!(
+            !p.contains('\r'),
+            "the rendered prompt must be LF-only, whatever the checkout did"
+        );
     }
 
     #[test]

@@ -1,0 +1,23 @@
+# Check every text file out with LF, on every platform.
+#
+# Without this, git's Windows default (`core.autocrlf=true`) rewrites LF to CRLF
+# on checkout — and files hrdr *embeds* come along for the ride. The system prompt
+# is `include_str!`d from `templates/system.j2`, so a Windows build shipped a
+# prompt whose every line ended `\r\n`: different bytes to the model than every
+# other platform sends, and three prompt tests that match across a line break
+# failed there and only there (the `Build` job is gated on the tests, so the
+# v0.3.0 release never published).
+#
+# The rendered prompt is data, not source — it should not depend on the OS the
+# binary was built on.
+* text=auto eol=lf
+
+# Anything embedded in the binary or compared byte-for-byte is LF, always.
+*.j2 text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+
+# Binary: never touched.
+*.png binary
+*.ico binary
