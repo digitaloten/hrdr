@@ -451,6 +451,25 @@ mod tests {
         assert!(err.to_string().contains("may have changed"), "{err}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mutations_refuse_symlink_path_components() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink("real", dir.path().join("linked")).unwrap();
+        let c = ctx(dir.path().to_path_buf());
+
+        let err = WriteTool
+            .execute(
+                serde_json::json!({"path": "linked/file.txt", "content": "blocked"}),
+                &c,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("symlink component"), "{err}");
+        assert!(!dir.path().join("real/file.txt").exists());
+    }
+
     #[tokio::test]
     async fn mutations_outside_cwd_refused() {
         // Tempdirs are inside the always-allowed temp tree, so the "outside"

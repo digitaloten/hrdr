@@ -44,6 +44,19 @@ async fn guard_victim(ctx: &ToolContext, path: &std::path::Path, verb: &str) -> 
     Ok(())
 }
 
+fn reject_descendant_destination(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    let source = crate::canonicalize_nearest(from);
+    let destination = crate::canonicalize_nearest(to);
+    if destination == source || destination.starts_with(&source) {
+        bail!(
+            "{} is inside its source {} — copying or moving a directory into itself is refused",
+            to.display(),
+            from.display()
+        );
+    }
+    Ok(())
+}
+
 // ---- move ----
 
 pub struct MoveTool;
@@ -83,6 +96,9 @@ impl Tool for MoveTool {
         let to = ctx.resolve(&a.to);
         guard_victim(ctx, &from, "move").await?;
         guard_dest(ctx, &to)?;
+        if from.is_dir() {
+            reject_descendant_destination(&from, &to)?;
+        }
 
         let dest_exists = tokio::fs::try_exists(&to).await.unwrap_or(false);
         if dest_exists && !a.overwrite {
@@ -93,15 +109,27 @@ impl Tool for MoveTool {
         }
         // Both sides are checkpointed: undo has to restore the source *and* undo
         // the clobbering of an overwritten destination.
-        ctx.checkpoint(&from);
+        if from.is_dir() {
+            ctx.checkpoint_tree(&from)?;
+        } else {
+            ctx.checkpoint(&from);
+        }
         if dest_exists {
-            ctx.checkpoint(&to);
+            if to.is_dir() {
+                ctx.checkpoint_tree(&to)?;
+            } else {
+                ctx.checkpoint(&to);
+            }
+        } else {
+            ctx.checkpoint_missing(&to)?;
         }
         if let Some(parent) = to.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
+        guard_victim(ctx, &from, "move").await?;
+        guard_dest(ctx, &to)?;
         rename_or_copy(&from, &to)
             .await
             .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
@@ -120,7 +148,7 @@ async fn rename_or_copy(from: &std::path::Path, to: &std::path::Path) -> Result<
     match tokio::fs::rename(from, to).await {
         Ok(()) => Ok(()),
         Err(_) if from.is_dir() => {
-            copy_dir(from, to).await?;
+            staged_copy_dir(from, to).await?;
             tokio::fs::remove_dir_all(from).await?;
             Ok(())
         }
@@ -132,6 +160,52 @@ async fn rename_or_copy(from: &std::path::Path, to: &std::path::Path) -> Result<
     }
 }
 
+async fn validate_copy_tree(root: &std::path::Path) -> Result<()> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if file_type.is_symlink() {
+                bail!(
+                    "{} is a symlink inside the source tree — recursive copy refuses symlinks to avoid following content outside the project",
+                    entry.path().display()
+                );
+            }
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn staging_path(to: &std::path::Path) -> std::path::PathBuf {
+    let name = to.file_name().unwrap_or_default().to_string_lossy();
+    to.with_file_name(format!(".{name}.hrdr-stage-{}", std::process::id()))
+}
+
+async fn staged_copy_dir(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    validate_copy_tree(from).await?;
+    let stage = staging_path(to);
+    if tokio::fs::try_exists(&stage).await.unwrap_or(false) {
+        tokio::fs::remove_dir_all(&stage).await?;
+    }
+    if let Err(error) = copy_dir(from, &stage).await {
+        let _ = tokio::fs::remove_dir_all(&stage).await;
+        return Err(error);
+    }
+    if tokio::fs::try_exists(to).await.unwrap_or(false) {
+        if to.is_dir() {
+            tokio::fs::remove_dir_all(to).await?;
+        } else {
+            tokio::fs::remove_file(to).await?;
+        }
+    }
+    tokio::fs::rename(&stage, to).await?;
+    Ok(())
+}
+
 /// Recursive directory copy (`tokio::fs` has no equivalent). Iterative, so a
 /// deep tree can't blow the stack.
 async fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
@@ -141,7 +215,14 @@ async fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
         let mut entries = tokio::fs::read_dir(&src).await?;
         while let Some(entry) = entries.next_entry().await? {
             let (s, d) = (entry.path(), dst.join(entry.file_name()));
-            if entry.file_type().await?.is_dir() {
+            let file_type = entry.file_type().await?;
+            if file_type.is_symlink() {
+                bail!(
+                    "{} is a symlink inside the source tree — recursive copy refuses symlinks to avoid following content outside the project",
+                    s.display()
+                );
+            }
+            if file_type.is_dir() {
                 stack.push((s, d));
             } else {
                 tokio::fs::copy(&s, &d).await?;
@@ -193,12 +274,9 @@ impl Tool for DeleteTool {
                     path.display()
                 );
             }
-            // Checkpoint each file, so undo can restore the whole tree.
-            let mut count = 0usize;
-            for file in walk_files(&path).await? {
-                ctx.checkpoint(&file);
-                count += 1;
-            }
+            ctx.checkpoint_tree(&path)?;
+            let count = walk_files(&path).await?.len();
+            guard_victim(ctx, &path, "delete").await?;
             tokio::fs::remove_dir_all(&path)
                 .await
                 .with_context(|| format!("deleting {}", path.display()))?;
@@ -209,6 +287,7 @@ impl Tool for DeleteTool {
             ))
         } else {
             ctx.checkpoint(&path);
+            guard_victim(ctx, &path, "delete").await?;
             tokio::fs::remove_file(&path)
                 .await
                 .with_context(|| format!("deleting {}", path.display()))?;
@@ -284,6 +363,9 @@ impl Tool for CopyTool {
             );
         }
         guard_dest(ctx, &to)?;
+        if from.is_dir() {
+            reject_descendant_destination(&from, &to)?;
+        }
 
         let dest_exists = tokio::fs::try_exists(&to).await.unwrap_or(false);
         if dest_exists && !a.overwrite {
@@ -293,15 +375,23 @@ impl Tool for CopyTool {
             );
         }
         if dest_exists {
-            ctx.checkpoint(&to);
+            if to.is_dir() {
+                ctx.checkpoint_tree(&to)?;
+            } else {
+                ctx.checkpoint(&to);
+            }
+        } else {
+            ctx.checkpoint_missing(&to)?;
         }
         if let Some(parent) = to.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
+        ctx.ensure_within_cwd(&from)?;
+        guard_dest(ctx, &to)?;
         if from.is_dir() {
-            copy_dir(&from, &to).await?;
+            staged_copy_dir(&from, &to).await?;
             Ok(format!("Copied {}/ → {}/", from.display(), to.display()))
         } else {
             tokio::fs::copy(&from, &to)
@@ -328,6 +418,60 @@ mod tests {
             tokio::fs::create_dir_all(p).await.unwrap();
         }
         tokio::fs::write(path, body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_and_move_refuse_a_directorys_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path());
+        write(&dir.path().join("tree/a.txt"), "a").await;
+
+        let copy_err = CopyTool
+            .execute(json!({"from": "tree", "to": "tree/copy"}), &c)
+            .await
+            .unwrap_err();
+        assert!(
+            copy_err.to_string().contains("inside its source"),
+            "{copy_err}"
+        );
+        let move_err = MoveTool
+            .execute(json!({"from": "tree", "to": "tree/moved"}), &c)
+            .await
+            .unwrap_err();
+        assert!(
+            move_err.to_string().contains("inside its source"),
+            "{move_err}"
+        );
+        for destination in ["tree/copy", "tree/moved"] {
+            assert!(!dir.path().join(destination).exists());
+        }
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("tree/a.txt"))
+                .await
+                .unwrap(),
+            "a"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recursive_copy_refuses_embedded_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(&outside.path().join("secret.txt"), "secret").await;
+        write(&dir.path().join("tree/normal.txt"), "normal").await;
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            dir.path().join("tree/link.txt"),
+        )
+        .unwrap();
+        let c = ctx(dir.path());
+        let err = CopyTool
+            .execute(json!({"from": "tree", "to": "copied"}), &c)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!dir.path().join("copied/link.txt").exists());
     }
 
     #[tokio::test]

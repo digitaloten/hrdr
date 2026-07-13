@@ -72,7 +72,7 @@ impl Tool for PatchTool {
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: PatchArgs = crate::tool_args("patch", args)?;
-        let files = split_patch(&a.patch);
+        let files = split_patch(&a.patch)?;
         if files.is_empty() {
             bail!("no file sections in the patch — need `--- `/`+++ ` headers per file");
         }
@@ -82,10 +82,13 @@ impl Tool for PatchTool {
         let mut targets = std::collections::HashSet::new();
         for fd in &files {
             let target = fd.new_path.as_ref().or(fd.old_path.as_ref());
-            if let Some(path) = target
-                && !targets.insert(path)
-            {
-                bail!("patch not applied (no files changed): duplicate file section for {path}");
+            if let Some(path) = target {
+                let resolved = crate::canonicalize_nearest(&ctx.resolve(path));
+                if !targets.insert(resolved) {
+                    bail!(
+                        "patch not applied (no files changed): duplicate file section for {path}"
+                    );
+                }
             }
         }
 
@@ -451,7 +454,7 @@ fn sequence_starts(haystack: &[&str], needle: &[&str]) -> Vec<usize> {
 /// Split a (possibly multi-file) unified diff into per-file slices. Splits on
 /// `diff --git ` lines when present, else on each `--- `/`+++ ` header pair — so
 /// a removed line that happens to start with `--- ` isn't mistaken for a header.
-fn split_patch(patch: &str) -> Vec<FileDiff> {
+fn split_patch(patch: &str) -> Result<Vec<FileDiff>> {
     let lines: Vec<&str> = patch.lines().collect();
     let has_git = lines.iter().any(|l| l.starts_with("diff --git "));
     let starts: Vec<usize> = (0..lines.len())
@@ -473,8 +476,14 @@ fn split_patch(patch: &str) -> Vec<FileDiff> {
             section.iter().position(|l| l.starts_with("--- ")),
             section.iter().position(|l| l.starts_with("+++ ")),
         ) else {
-            continue; // header lines missing → not a real file section
+            bail!(
+                "patch section {} is missing `---` or `+++` file headers",
+                k + 1
+            );
         };
+        if pi != mi + 1 {
+            bail!("patch section {} has unordered file headers", k + 1);
+        }
         let old_path = parse_diff_path(&section[mi][4..]);
         let new_path = parse_diff_path(&section[pi][4..]);
         // diffy wants the file's `--- … @@ …` block, newline-terminated.
@@ -485,7 +494,7 @@ fn split_patch(patch: &str) -> Vec<FileDiff> {
             diff,
         });
     }
-    out
+    Ok(out)
 }
 
 /// A diff header path (`a/foo.rs`, `b/foo.rs`, `/dev/null`, possibly followed by
@@ -530,7 +539,7 @@ diff --git a/bar.txt b/bar.txt
 -a
 +b
 ";
-        let files = split_patch(patch);
+        let files = split_patch(patch).unwrap();
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].new_path.as_deref(), Some("foo.txt"));
         assert_eq!(files[1].new_path.as_deref(), Some("bar.txt"));
@@ -549,7 +558,7 @@ diff --git a/bar.txt b/bar.txt
 @@ -1 +0,0 @@
 -bye
 ";
-        let files = split_patch(patch);
+        let files = split_patch(patch).unwrap();
         assert_eq!(files.len(), 2);
         assert!(files[0].old_path.is_none()); // creation
         assert_eq!(files[0].new_path.as_deref(), Some("new.txt"));

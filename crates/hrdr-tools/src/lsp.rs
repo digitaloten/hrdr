@@ -791,29 +791,51 @@ pub fn apply_lsp_edits(content: &str, edits: &[LspTextEdit]) -> Result<String> {
     Ok(out)
 }
 
-/// Read one `Content-Length`-framed JSON-RPC message.
+const MAX_LSP_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LSP_HEADER_BYTES: usize = 16 * 1024;
+const MAX_LSP_HEADERS: usize = 64;
+
+/// Read one `Content-Length`-framed JSON-RPC message under strict framing caps.
 async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<Value> {
     let mut length: Option<usize> = None;
-    loop {
+    let mut header_bytes = 0usize;
+    for _ in 0..MAX_LSP_HEADERS {
         let mut line = String::new();
-        if reader.read_line(&mut line).await? == 0 {
+        let remaining = MAX_LSP_HEADER_BYTES.saturating_sub(header_bytes);
+        if remaining == 0 {
+            anyhow::bail!("LSP header exceeds {MAX_LSP_HEADER_BYTES} bytes");
+        }
+        let read = reader
+            .take((remaining + 1) as u64)
+            .read_line(&mut line)
+            .await?;
+        if read == 0 {
             anyhow::bail!("eof");
+        }
+        header_bytes += read;
+        if header_bytes > MAX_LSP_HEADER_BYTES {
+            anyhow::bail!("LSP header exceeds {MAX_LSP_HEADER_BYTES} bytes");
         }
         let line = line.trim_end();
         if line.is_empty() {
-            break; // end of headers
+            let length = length.context("no Content-Length header")?;
+            if length > MAX_LSP_FRAME_BYTES {
+                anyhow::bail!(
+                    "LSP Content-Length {length} exceeds {MAX_LSP_FRAME_BYTES}-byte frame limit"
+                );
+            }
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body).await?;
+            return Ok(serde_json::from_slice(&body)?);
         }
         if let Some(v) = line
             .strip_prefix("Content-Length:")
             .or_else(|| line.strip_prefix("content-length:"))
         {
-            length = v.trim().parse().ok();
+            length = Some(v.trim().parse().context("invalid Content-Length header")?);
         }
     }
-    let length = length.context("no Content-Length header")?;
-    let mut body = vec![0u8; length];
-    reader.read_exact(&mut body).await?;
-    Ok(serde_json::from_slice(&body)?)
+    anyhow::bail!("LSP header exceeds {MAX_LSP_HEADERS} lines")
 }
 
 /// Format the **errors** among `diags` as one tool-result note. Warnings and
@@ -865,6 +887,22 @@ fn format_diagnostics(root: &Path, path: &Path, diags: &[Value]) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oversized_lsp_frame_is_rejected_before_body_read() {
+        let input = format!("Content-Length: {}\r\n\r\n", MAX_LSP_FRAME_BYTES + 1);
+        let mut reader = tokio::io::BufReader::new(input.as_bytes());
+        let err = read_frame(&mut reader).await.unwrap_err().to_string();
+        assert!(err.contains("exceeds"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn oversized_lsp_header_is_bounded() {
+        let input = format!("X-Test: {}\r\n\r\n", "x".repeat(MAX_LSP_HEADER_BYTES + 1));
+        let mut reader = tokio::io::BufReader::new(input.as_bytes());
+        let err = read_frame(&mut reader).await.unwrap_err().to_string();
+        assert!(err.contains("header"), "{err}");
+    }
 
     #[test]
     fn uris_and_language_ids() {

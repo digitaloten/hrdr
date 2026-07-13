@@ -33,6 +33,7 @@ const FORBIDDEN_ANY: &[&str] = &[
     "--config-env",
     // Run an external program as part of the diff.
     "--ext-diff",
+    "--textconv",
     "--exec",
     // `git diff --output=FILE` writes to the filesystem.
     "--output",
@@ -68,12 +69,6 @@ const FORBIDDEN_BRANCH: &[&str] = &[
     "-u",
     "--unset-upstream",
 ];
-
-/// `remote` sub-subcommands that only read (no mutation, no network fetch of
-/// a remote's refs). Anything else (`add`, `remove`/`rm`, `set-url`, `rename`,
-/// `update`, `prune`, `set-head`, …) either mutates `.git/config` or reaches
-/// out to the network — refused by the allow-list in [`check_remote_args`].
-const REMOTE_READ_ONLY_FORMS: &[&str] = &["-v", "--verbose", "show", "get-url"];
 
 /// Single-character flags that, bundled into one dash-prefixed short-flag
 /// group (e.g. `-fD`, a `git` convention this parser must not be fooled by),
@@ -157,17 +152,23 @@ fn escaping_path_arg<'a>(sub: &str, args: &'a [String], cwd: &std::path::Path) -
         .find(|arg| !arg.starts_with('-') && escapes_workspace(arg, cwd))
 }
 
-/// For `remote`: only the read-only forms are allowed — bare `git remote`
-/// (list), `-v`/`--verbose`, `show [name]`, `get-url <name>`. Anything else
-/// (`add`, `remove`/`rm`, `set-url`, `rename`, `update`, `prune`, `set-head`,
-/// or an unrecognized sub-subcommand) mutates config or talks to the network.
+/// For `remote`, accept only complete local read-only grammar. Options cannot
+/// prefix another subcommand, and `show` must disable network queries.
 fn check_remote_args(args: &[String]) -> Result<(), &'static str> {
-    match args.first().map(String::as_str) {
-        None => Ok(()), // bare `git remote` — lists remotes
-        Some(first) if REMOTE_READ_ONLY_FORMS.contains(&first) => Ok(()),
+    match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [] | ["-v"] | ["--verbose"] => Ok(()),
+        ["get-url", name] if !name.starts_with('-') => Ok(()),
+        ["get-url", "--all", name] if !name.starts_with('-') => Ok(()),
+        ["show", "-n"] | ["show", "--no-query"] => Ok(()),
+        ["show", "-n", name] | ["show", "--no-query", name] if !name.starts_with('-') => Ok(()),
         _ => Err(
-            "`git remote` only allows the read-only forms: no args, -v, show [name], \
-             get-url <name> — add/remove/set-url/rename/update/prune are refused",
+            "`git remote` only allows the read-only forms: no args, -v, get-url [--all] \
+             <name>, show -n [name] — mutating and networking forms are refused",
         ),
     }
 }
@@ -498,6 +499,8 @@ mod tests {
         let ctx = ToolContext::new(dir.path());
         for args in [
             vec!["add", "origin", "https://evil.example/repo.git"],
+            vec!["-v", "add", "origin", "https://evil.example/repo.git"],
+            vec!["--verbose", "remove", "origin"],
             vec!["remove", "origin"],
             vec!["rm", "origin"],
             vec!["set-url", "origin", "https://evil.example/repo.git"],
@@ -516,7 +519,11 @@ mod tests {
             );
         }
         // The read-only forms still work.
-        for args in [vec![], vec!["-v".to_string()], vec!["show".to_string()]] {
+        for args in [
+            vec![],
+            vec!["-v".to_string()],
+            vec!["show".to_string(), "-n".to_string()],
+        ] {
             GitTool
                 .execute(json!({"subcommand": "remote", "args": args.clone()}), &ctx)
                 .await

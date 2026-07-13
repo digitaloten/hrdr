@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use reqwest::header::ACCEPT;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, watch};
 
@@ -22,6 +22,47 @@ use super::{
     sse_request, stdio_request,
 };
 use super::{extract_content_text, rpc_error_message, sanitize_tool_name};
+
+/// Read one newline-delimited stdio message without ever buffering more than
+/// the protocol cap. Oversized lines are drained through their newline so the
+/// next valid message remains parseable. An empty vector means EOF; `None`
+/// means an oversized line was discarded.
+async fn read_stdio_line_capped<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut out = Vec::new();
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if out.is_empty() && !oversized {
+                Ok(Some(Vec::new()))
+            } else if oversized {
+                Ok(None)
+            } else {
+                Ok(Some(out))
+            };
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if !oversized {
+            let remaining = super::MAX_MCP_MESSAGE_BYTES.saturating_sub(out.len());
+            if take > remaining {
+                oversized = true;
+                out.clear();
+            } else {
+                out.extend_from_slice(&available[..take]);
+            }
+        }
+        let ended = available[take - 1] == b'\n';
+        reader.consume(take);
+        if ended {
+            return if oversized { Ok(None) } else { Ok(Some(out)) };
+        }
+    }
+}
 
 impl McpClient {
     /// Spawn `command args…` (with extra `env`) and connect over stdio.
@@ -66,21 +107,12 @@ impl McpClient {
             let pending = pending.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout);
-                let mut buf: Vec<u8> = Vec::new();
                 loop {
-                    buf.clear();
-                    match reader.read_until(b'\n', &mut buf).await {
-                        Ok(0) => break, // EOF
+                    match read_stdio_line_capped(&mut reader).await {
+                        Ok(None) => continue,
                         Err(_) => break,
-                        Ok(_) => {
-                            // Bound how large a single line we'll hand to
-                            // `serde_json` — a misbehaving/hostile server with
-                            // no valid JSON-RPC framing must not grow this
-                            // process's memory without limit. Oversized lines
-                            // are dropped rather than parsed.
-                            if buf.len() > super::MAX_MCP_MESSAGE_BYTES {
-                                continue;
-                            }
+                        Ok(Some(buf)) if buf.is_empty() => break,
+                        Ok(Some(buf)) => {
                             let Ok(line) = std::str::from_utf8(&buf) else {
                                 continue; // not valid UTF-8: not JSON either
                             };
@@ -162,14 +194,28 @@ impl McpClient {
             let pending = pending.clone();
             tokio::spawn(async move {
                 let mut stream = resp.bytes_stream();
+                let mut connection_bytes = 0usize;
                 // Use the shared SseDecoder for byte-safe incremental parsing:
                 // raw bytes are fed directly (no lossy UTF-8 conversion), and
                 // the decoder handles chunk boundaries including mid-codepoint
                 // splits via per-line buffering.
                 let mut decoder = SseDecoder::new();
+                let mut undecoded_bytes = 0usize;
                 while let Some(Ok(chunk)) = stream.next().await {
+                    connection_bytes = connection_bytes.saturating_add(chunk.len());
+                    if connection_bytes > super::MAX_MCP_MESSAGE_BYTES {
+                        break;
+                    }
+                    undecoded_bytes = undecoded_bytes.saturating_add(chunk.len());
+                    if undecoded_bytes > super::MAX_MCP_MESSAGE_BYTES {
+                        break;
+                    }
                     decoder.push(&chunk);
-                    for ev in decoder.drain() {
+                    let events = decoder.drain();
+                    if !events.is_empty() {
+                        undecoded_bytes = 0;
+                    }
+                    for ev in events {
                         if ev.event.as_deref() == Some("endpoint") {
                             if let Ok(u) = base.join(ev.data.trim()) {
                                 let _ = ep_tx.send(Some(u.to_string()));
@@ -519,5 +565,22 @@ impl McpClient {
             out.push_str(&format!("{role}: {text}"));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stdio_line_reader_drops_oversized_line_and_recovers() {
+        let input = format!(
+            "{}\n{{\"ok\":true}}\n",
+            "x".repeat(super::super::MAX_MCP_MESSAGE_BYTES + 1)
+        );
+        let mut reader = BufReader::new(input.as_bytes());
+        assert!(read_stdio_line_capped(&mut reader).await.unwrap().is_none());
+        let next = read_stdio_line_capped(&mut reader).await.unwrap().unwrap();
+        assert_eq!(next, b"{\"ok\":true}\n");
     }
 }

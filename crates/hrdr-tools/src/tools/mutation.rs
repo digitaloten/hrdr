@@ -18,7 +18,12 @@ pub async fn apply_file_change(
     hook_event: &str,
     content: &str,
 ) -> Result<FileChange> {
+    ctx.ensure_within_cwd(path)?;
     ctx.checkpoint(path);
+    // Re-check immediately before the pathname operation. This portable guard
+    // cannot make arbitrary filesystems transactional, but closes the long
+    // validation/planning window and refuses any symlink inserted meanwhile.
+    ctx.ensure_within_cwd(path)?;
     tokio::fs::write(path, content)
         .await
         .with_context(|| format!("writing {}", path.display()))?;

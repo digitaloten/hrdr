@@ -9,7 +9,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -20,9 +19,6 @@ const CHECKPOINT_KEEP_TURNS: u64 = 200;
 /// Also drop any checkpoint whose record is older than this (abandoned
 /// sessions). Kept generous — the turn cap is the primary bound.
 const CHECKPOINT_MAX_AGE_SECS: u64 = 14 * 24 * 60 * 60;
-/// A `journal.lock` older than this is presumed abandoned (crashed holder) and
-/// stolen, so a stale lock can't wedge the store forever.
-const LOCK_STALE_SECS: u64 = 30;
 
 /// A single file change: the file `path` and its content hash *before* the turn
 /// modified it (`pre = None` if the file didn't exist yet).
@@ -37,6 +33,19 @@ struct ChangeRecord {
     ts: u64,
     path: String,
     pre: Option<String>,
+    /// Filesystem object type. `None` is a legacy journal record: `pre: Some`
+    /// means file, `pre: None` means the path did not exist.
+    #[serde(default)]
+    kind: Option<NodeKind>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NodeKind {
+    Missing,
+    File,
+    Directory,
+    Symlink,
 }
 
 /// One revertible checkpoint (a turn that changed files).
@@ -141,7 +150,22 @@ impl Checkpoints {
 
     /// Begin a new turn (its file changes form one checkpoint).
     pub fn begin_turn(&mut self) {
-        self.turn += 1;
+        let _lock = JournalLock::acquire(&self.dir);
+        self.reload_records();
+        let counter_path = self.dir.join("next-turn");
+        let reserved = std::fs::read_to_string(&counter_path)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                self.records
+                    .iter()
+                    .map(|record| record.turn)
+                    .max()
+                    .unwrap_or(0)
+                    + 1
+            });
+        self.turn = reserved;
+        let _ = std::fs::write(counter_path, (reserved + 1).to_string());
         self.touched.clear();
     }
 
@@ -185,6 +209,7 @@ impl Checkpoints {
             ts: crate::unix_now(),
             path: key,
             pre,
+            kind: None,
         };
         if let Ok(line) = serde_json::to_string(&rec) {
             use std::io::Write;
@@ -197,6 +222,104 @@ impl Checkpoints {
             }
         }
         self.records.push(rec);
+    }
+
+    pub fn record_missing_pre(&mut self, path: &Path) -> Result<()> {
+        let key = path.to_string_lossy().to_string();
+        if !self.touched.insert(key.clone()) {
+            return Ok(());
+        }
+        if std::fs::symlink_metadata(path).is_ok() {
+            self.touched.remove(&key);
+            anyhow::bail!("{} exists; cannot checkpoint it as missing", path.display());
+        }
+        self.append_record(ChangeRecord {
+            turn: self.turn,
+            ts: crate::unix_now(),
+            path: key,
+            pre: None,
+            kind: Some(NodeKind::Missing),
+        })
+    }
+
+    /// Snapshot an entire filesystem tree, including empty directories and
+    /// symlink identity. Records children before parents so revert can recreate
+    /// parent directories before restoring their contents.
+    pub fn record_tree_pre(&mut self, root: &Path) -> Result<()> {
+        // Keep blob creation and journal references under one lock so concurrent
+        // garbage collection cannot remove a newly stored tree blob.
+        let _lock = JournalLock::acquire(&self.dir);
+        let mut nodes = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("reading checkpoint metadata for {}", path.display()))?;
+            if metadata.file_type().is_dir() {
+                let mut children = Vec::new();
+                for entry in std::fs::read_dir(&path)
+                    .with_context(|| format!("reading directory {}", path.display()))?
+                {
+                    children.push(entry?.path());
+                }
+                stack.extend(children);
+            }
+            nodes.push(path);
+        }
+        nodes.sort_by_key(|path| path.components().count());
+        for path in nodes {
+            self.record_node_pre(&path)?;
+        }
+        Ok(())
+    }
+
+    fn record_node_pre(&mut self, path: &Path) -> Result<()> {
+        let key = path.to_string_lossy().to_string();
+        if !self.touched.insert(key.clone()) {
+            return Ok(());
+        }
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("reading checkpoint metadata for {}", path.display()))?;
+        let (kind, pre) = if metadata.file_type().is_dir() {
+            (NodeKind::Directory, None)
+        } else if metadata.file_type().is_symlink() {
+            let target = std::fs::read_link(path)
+                .with_context(|| format!("reading symlink {}", path.display()))?;
+            let hash = self.store_blob(target.to_string_lossy().as_bytes())?;
+            (NodeKind::Symlink, Some(hash))
+        } else if metadata.file_type().is_file() {
+            let hash = self.store_blob(&std::fs::read(path)?)?;
+            (NodeKind::File, Some(hash))
+        } else {
+            self.touched.remove(&key);
+            anyhow::bail!(
+                "unsupported filesystem object in checkpoint: {}",
+                path.display()
+            );
+        };
+        self.append_record_unlocked(ChangeRecord {
+            turn: self.turn,
+            ts: crate::unix_now(),
+            path: key,
+            pre,
+            kind: Some(kind),
+        })
+    }
+
+    fn append_record(&mut self, rec: ChangeRecord) -> Result<()> {
+        let _lock = JournalLock::acquire(&self.dir);
+        self.append_record_unlocked(rec)
+    }
+
+    fn append_record_unlocked(&mut self, rec: ChangeRecord) -> Result<()> {
+        let line = serde_json::to_string(&rec)?;
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.journal_path)?;
+        writeln!(file, "{line}")?;
+        self.records.push(rec);
+        Ok(())
     }
 
     /// The revertible checkpoints (turns with changes), newest first.
@@ -236,30 +359,52 @@ impl Checkpoints {
         self.reload_records();
         // For each file touched in turns >= `turn`, the pre-`turn` state is the
         // pre-image recorded at the SMALLEST such turn.
-        let mut earliest: BTreeMap<String, (u64, Option<String>)> = BTreeMap::new();
+        let mut earliest: BTreeMap<String, (u64, Option<String>, Option<NodeKind>)> =
+            BTreeMap::new();
         for r in self.records.iter().filter(|r| r.turn >= turn) {
             let e = earliest
                 .entry(r.path.clone())
-                .or_insert((r.turn, r.pre.clone()));
+                .or_insert((r.turn, r.pre.clone(), r.kind));
             if r.turn < e.0 {
-                *e = (r.turn, r.pre.clone());
+                *e = (r.turn, r.pre.clone(), r.kind);
             }
         }
+        let mut restore_entries: Vec<_> = earliest.into_iter().collect();
+        restore_entries.sort_by_key(|(path, _)| Path::new(path).components().count());
         let mut restored = Vec::new();
-        for (path, (_t, pre)) in &earliest {
+        for (path, (_t, pre, kind)) in &restore_entries {
             let p = PathBuf::from(path);
-            match pre {
-                Some(hash) => {
-                    let bytes = self.load_blob(hash)?;
+            let effective = kind.unwrap_or(if pre.is_some() {
+                NodeKind::File
+            } else {
+                NodeKind::Missing
+            });
+            match effective {
+                NodeKind::Directory => std::fs::create_dir_all(&p)
+                    .with_context(|| format!("restoring directory {}", p.display()))?,
+                NodeKind::File => {
+                    let bytes =
+                        self.load_blob(pre.as_deref().context("file checkpoint has no blob")?)?;
                     if let Some(parent) = p.parent() {
-                        let _ = std::fs::create_dir_all(parent);
+                        std::fs::create_dir_all(parent)?;
                     }
+                    remove_existing_node(&p)?;
                     std::fs::write(&p, bytes)
                         .with_context(|| format!("restoring {}", p.display()))?;
                 }
-                None => {
-                    let _ = std::fs::remove_file(&p); // didn't exist before the turn
+                NodeKind::Symlink => {
+                    let bytes =
+                        self.load_blob(pre.as_deref().context("symlink checkpoint has no blob")?)?;
+                    let target = PathBuf::from(
+                        String::from_utf8(bytes).context("symlink target is not UTF-8")?,
+                    );
+                    if let Some(parent) = p.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    remove_existing_node(&p)?;
+                    create_symlink(&target, &p)?;
                 }
+                NodeKind::Missing => remove_existing_node(&p)?,
             }
             restored.push(p);
         }
@@ -301,67 +446,59 @@ impl Checkpoints {
     }
 }
 
-/// Best-effort advisory lock over a checkpoint directory's journal so two
-/// `Checkpoints` in the same dir (e.g. a main agent + a background sub-agent
-/// sharing a non-git cwd) serialize journal rewrites and blob GC. Implemented as
-/// an `O_EXCL` lock file — no extra dependency — with staleness detection so a
-/// crashed holder's lock (older than [`LOCK_STALE_SECS`]) is stolen rather than
-/// wedging the store. Released on drop. If the lock can't be acquired within the
-/// spin budget it proceeds *unlocked* (best-effort — never wedge the agent);
-/// `held` records whether this instance owns the file so drop doesn't remove a
-/// lock it didn't create.
+fn remove_existing_node(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir_all(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, path: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, path: &Path) -> Result<()> {
+    if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, path)?;
+    } else {
+        std::os::windows::fs::symlink_file(target, path)?;
+    }
+    Ok(())
+}
+
+/// Exclusive OS-backed lock over the checkpoint journal and blob GC.
 struct JournalLock {
-    path: PathBuf,
-    held: bool,
+    file: std::fs::File,
 }
 
 impl JournalLock {
     fn acquire(dir: &Path) -> Self {
+        use fs2::FileExt;
         let path = dir.join("journal.lock");
-        for _ in 0..100 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut f) => {
-                    use std::io::Write;
-                    let _ = write!(f, "{}", std::process::id());
-                    return Self { path, held: true };
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if lock_is_stale(&path) {
-                        let _ = std::fs::remove_file(&path);
-                        continue; // steal it
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(_) => break, // can't create (perms) — proceed unlocked
-            }
-        }
-        Self { path, held: false }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap_or_else(|error| panic!("opening checkpoint lock {}: {error}", path.display()));
+        file.lock_exclusive().unwrap_or_else(|error| {
+            panic!("locking checkpoint journal {}: {error}", path.display())
+        });
+        Self { file }
     }
 }
 
 impl Drop for JournalLock {
     fn drop(&mut self) {
-        if self.held {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        let _ = fs2::FileExt::unlock(&self.file);
     }
-}
-
-/// Whether the lock file is missing/unreadable or older than the staleness
-/// window (its holder presumed crashed).
-fn lock_is_stale(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map(|t| {
-            t.elapsed()
-                .map(|e| e > Duration::from_secs(LOCK_STALE_SECS))
-                .unwrap_or(true)
-        })
-        .unwrap_or(true)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -379,6 +516,33 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revert_restores_directory_tree_empty_dirs_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join("empty/nested")).unwrap();
+        std::fs::write(tree.join("file.txt"), "content").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("file.txt", tree.join("link.txt")).unwrap();
+
+        let mut cp = Checkpoints::open(dir.path().join("cp")).unwrap();
+        cp.begin_turn();
+        cp.record_tree_pre(&tree).unwrap();
+        std::fs::remove_dir_all(&tree).unwrap();
+        cp.revert_last().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tree.join("file.txt")).unwrap(),
+            "content"
+        );
+        assert!(tree.join("empty/nested").is_dir());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read_link(tree.join("link.txt")).unwrap(),
+            PathBuf::from("file.txt")
+        );
+    }
 
     #[test]
     fn revert_restores_and_deletes() {

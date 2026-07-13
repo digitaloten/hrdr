@@ -187,6 +187,26 @@ impl ToolContext {
         }
     }
 
+    pub fn checkpoint_tree(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(cp) = &self.checkpoints {
+            let mut cp = cp
+                .lock()
+                .map_err(|_| anyhow::anyhow!("checkpoint store lock is poisoned"))?;
+            cp.record_tree_pre(path)?;
+        }
+        Ok(())
+    }
+
+    pub fn checkpoint_missing(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(cp) = &self.checkpoints {
+            let mut cp = cp
+                .lock()
+                .map_err(|_| anyhow::anyhow!("checkpoint store lock is poisoned"))?;
+            cp.record_missing_pre(path)?;
+        }
+        Ok(())
+    }
+
     /// Resolve a possibly-relative path against `cwd`.
     pub fn resolve(&self, path: &str) -> PathBuf {
         resolve_under(&self.cwd, path)
@@ -209,7 +229,43 @@ impl ToolContext {
     /// resolve too) — `../` tricks don't slip through.
     pub fn ensure_within_cwd(&self, path: &std::path::Path) -> Result<()> {
         self.ensure_writable_ext(path)?;
-        self.ensure_inside_cwd(path)
+        self.ensure_inside_cwd(path)?;
+        self.ensure_no_symlink_components(path)
+    }
+
+    /// Refuse mutating through symlink path components. Canonical confinement
+    /// proves where a path points at check time; this additional lexical walk
+    /// prevents later pathname operations from following project-controlled
+    /// symlinks and narrows swap races between validation and mutation.
+    pub fn ensure_no_symlink_components(&self, path: &std::path::Path) -> Result<()> {
+        if !self.restrict_to_cwd {
+            return Ok(());
+        }
+        let mut current = Some(path);
+        while let Some(candidate) = current {
+            if candidate == self.cwd || candidate == std::env::temp_dir() {
+                break;
+            }
+            match std::fs::symlink_metadata(candidate) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(anyhow!(
+                        "{} contains symlink component {} — mutations through symlinks are refused",
+                        path.display(),
+                        candidate.display()
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(anyhow!(
+                        "checking path component {}: {error}",
+                        candidate.display()
+                    ));
+                }
+            }
+            current = candidate.parent();
+        }
+        Ok(())
     }
 
     /// Confinement only, without the [`write_allow_ext`](Self::write_allow_ext)
