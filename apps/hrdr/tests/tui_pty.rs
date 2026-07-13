@@ -61,6 +61,13 @@ fn visible(raw: &str) -> String {
     out
 }
 
+/// Lock the screen, ignoring poisoning. A test that panics mid-assertion should
+/// report *its* failure, not have the reader thread die of a poisoned mutex and
+/// report that instead.
+fn grab(screen: &Arc<Mutex<String>>) -> std::sync::MutexGuard<'_, String> {
+    screen.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Run the TUI in a pty; return everything it painted, plus how it exited.
 fn run_tui(keys: &str) -> (String, portable_pty::ExitStatus) {
     let home = tempfile::tempdir().expect("temp home");
@@ -120,34 +127,52 @@ fn run_tui(keys: &str) -> (String, portable_pty::ExitStatus) {
     let sink = Arc::clone(&screen);
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
-        while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 {
-                break;
+        loop {
+            match reader.read(&mut buf) {
+                // EOF: the child closed the pty. Nothing more is coming.
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut s = grab(&sink);
+                    s.push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+                // Not an error — *not yet*. A ConPTY master returns these before the
+                // child has written anything, and a loop that treats the first `Err`
+                // as the end reads zero bytes forever: the screen stays blank, the
+                // TUI looks like it never painted, and the failure lands on Windows
+                // and nowhere else. (It did.)
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
             }
-            let mut s = sink.lock().expect("screen");
-            s.push_str(&String::from_utf8_lossy(&buf[..n]));
         }
     });
 
-    let painted = |needle: &str| -> bool {
-        let s = screen.lock().expect("screen");
-        visible(&s).contains(needle)
-    };
+    // Take a copy rather than hold the lock: the assertions below panic *with* the
+    // screen in their message, and panicking while holding the guard poisons the
+    // mutex — which then kills the reader thread and buries the real failure under
+    // a second, meaningless one.
+    let snapshot = || -> String { visible(&grab(&screen)) };
 
     // The session header names the model it is running on. Waiting for it means the
     // terminal was set up, a frame was composed, and the frame reached the screen —
     // which is the whole question this test exists to answer.
     let start = Instant::now();
-    while !painted("pty-smoke") {
+    while !snapshot().contains("pty-smoke") {
+        let seen = snapshot();
         assert!(
             start.elapsed() < BOOT,
-            "the TUI never painted a frame in {BOOT:?}. Screen so far:\n{}",
-            visible(&screen.lock().expect("screen"))
+            "the TUI never painted a frame in {BOOT:?} ({} bytes read). Screen so far:\n{seen}",
+            seen.len()
         );
         assert!(
             child.try_wait().expect("poll child").is_none(),
-            "hrdr exited before painting anything. Screen:\n{}",
-            visible(&screen.lock().expect("screen"))
+            "hrdr exited before painting anything. Screen:\n{seen}"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -165,13 +190,13 @@ fn run_tui(keys: &str) -> (String, portable_pty::ExitStatus) {
             child.kill().expect("kill child");
             panic!(
                 "hrdr did not exit within {EXIT:?} of being told to quit. Screen:\n{}",
-                visible(&screen.lock().expect("screen"))
+                snapshot()
             );
         }
         std::thread::sleep(Duration::from_millis(100));
     };
 
-    let out = visible(&screen.lock().expect("screen"));
+    let out = snapshot();
     (out, status)
 }
 
