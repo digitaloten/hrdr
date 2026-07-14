@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -188,9 +188,26 @@ impl LspRegistry {
             .iter()
             .find(|c| c.extensions.iter().any(|e| e == &ext))?;
         let client = self.client_for(config).await?;
-        let diags = client
-            .check_file(path, &ext, content, Duration::from_millis(self.wait_ms))
-            .await;
+        let wait = Duration::from_millis(self.wait_ms);
+        // Bound the whole sync + wait interaction. A wedged server — one that
+        // stopped draining its stdin (a crashed-but-not-exited process, a
+        // rust-analyzer stuck on a huge crate) — must not hang the edit. `send`
+        // already caps each write, but wrap the collection too so a stall
+        // degrades to "no diagnostics" (best-effort, the edit still succeeds)
+        // instead of a stuck tool call, and retire the server so later edits
+        // skip it fast.
+        let diags = match tokio::time::timeout(
+            wait + client.send_timeout + Duration::from_millis(500),
+            client.check_file(path, &ext, content, wait),
+        )
+        .await
+        {
+            Ok(diags) => diags,
+            Err(_) => {
+                client.mark_degraded();
+                return None;
+            }
+        };
         format_diagnostics(&self.root, path, &diags)
     }
 
@@ -199,14 +216,27 @@ impl LspRegistry {
     async fn client_for(&self, config: &LspServerConfig) -> Option<Arc<LspClient>> {
         let mut clients = self.clients.lock().await;
         match clients.get(&config.command) {
-            Some(ClientSlot::Running(c)) => return Some(Arc::clone(c)),
+            Some(ClientSlot::Running(c)) => {
+                if c.is_degraded() {
+                    // A prior call wedged this server (a write timed out on a
+                    // stalled stdin). Retire the slot so it's never handed out
+                    // again and later edits skip it fast instead of each
+                    // re-hitting the write timeout.
+                    clients.insert(
+                        config.command.clone(),
+                        ClientSlot::Unavailable(LspServerStatus::Failed),
+                    );
+                    return None;
+                }
+                return Some(Arc::clone(c));
+            }
             Some(ClientSlot::Unavailable(_)) => return None,
             None => {}
         }
         let slot = if which::which(&config.command).is_err() {
             ClientSlot::Unavailable(LspServerStatus::NotInstalled)
         } else {
-            match LspClient::start(config, &self.root).await {
+            match LspClient::start(config, &self.root, self.wait_ms).await {
                 Ok(c) => ClientSlot::Running(c),
                 Err(_) => ClientSlot::Unavailable(LspServerStatus::Failed),
             }
@@ -229,7 +259,14 @@ impl LspRegistry {
                 extensions: c.extensions.clone(),
                 status: match clients.get(&c.command) {
                     None => LspServerStatus::NotYetUsed,
-                    Some(ClientSlot::Running(_)) => LspServerStatus::Running,
+                    Some(ClientSlot::Running(client)) => {
+                        if client.is_degraded() {
+                            // Spawned fine, but a later write wedged it.
+                            LspServerStatus::Failed
+                        } else {
+                            LspServerStatus::Running
+                        }
+                    }
                     Some(ClientSlot::Unavailable(s)) => *s,
                 },
             })
@@ -339,13 +376,21 @@ struct LspClient {
     /// The server's advertised capabilities (from the `initialize` result) —
     /// gates the navigation requests.
     capabilities: std::sync::OnceLock<Value>,
+    /// Set once a write timed out on this server's stdin (it stopped draining):
+    /// every later `send` fails fast and the registry retires the client, so a
+    /// wedged server can't hang each edit for the full timeout.
+    degraded: AtomicBool,
+    /// Per-write budget: a single framed message must reach the server's stdin
+    /// within this long or the server is treated as wedged. Derived from the
+    /// registry's diagnostics wait budget.
+    send_timeout: Duration,
     /// Owns the process; `kill_on_drop` reaps it when the registry drops.
     _child: tokio::process::Child,
 }
 
 impl LspClient {
     /// Spawn + `initialize` + `initialized`.
-    async fn start(config: &LspServerConfig, root: &Path) -> Result<Arc<Self>> {
+    async fn start(config: &LspServerConfig, root: &Path, wait_ms: u64) -> Result<Arc<Self>> {
         let mut child = tokio::process::Command::new(&config.command)
             .args(&config.args)
             .current_dir(root)
@@ -365,6 +410,8 @@ impl LspClient {
             diag_notify: tokio::sync::Notify::new(),
             open_docs: tokio::sync::Mutex::new(HashMap::new()),
             capabilities: std::sync::OnceLock::new(),
+            degraded: AtomicBool::new(false),
+            send_timeout: Duration::from_millis(wait_ms),
             _child: child,
         });
         tokio::spawn(Self::read_loop(Arc::clone(&client), stdout));
@@ -555,12 +602,41 @@ impl LspClient {
         if let Ok(mut p) = self.pending.lock() {
             p.insert(id, tx);
         }
-        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-            .await?;
-        let res = tokio::time::timeout(timeout, rx)
+        if let Err(e) = self
+            .send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .await
-            .with_context(|| format!("{method} timed out"))?;
-        res.map_err(|_| anyhow::anyhow!("{method}: server closed"))
+        {
+            // The write never went out; don't leave a waiter behind.
+            self.drop_pending(id);
+            return Err(e);
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(res) => res.map_err(|_| anyhow::anyhow!("{method}: server closed")),
+            // Timed out waiting for the response: remove the pending entry so it
+            // doesn't leak (a late response finds no waiter and is dropped).
+            // Mirrors `mcp::transport::request_via_pending`'s cleanup.
+            Err(_) => {
+                self.drop_pending(id);
+                anyhow::bail!("{method} timed out")
+            }
+        }
+    }
+
+    /// Remove an in-flight request's waiter (on send failure or timeout).
+    fn drop_pending(&self, id: i64) {
+        if let Ok(mut p) = self.pending.lock() {
+            p.remove(&id);
+        }
+    }
+
+    /// Whether a previous write wedged this server (stdin stopped draining).
+    fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
+    /// Mark the server unusable so later calls skip it fast.
+    fn mark_degraded(&self) {
+        self.degraded.store(true, Ordering::Relaxed);
     }
 
     /// Send a notification (no response expected).
@@ -569,14 +645,31 @@ impl LspClient {
             .await
     }
 
-    /// Write one framed message.
+    /// Write one framed message, bounded by [`Self::send_timeout`]. A server
+    /// that stopped draining its stdin fills the ~64KB pipe and would block the
+    /// write forever; the timeout turns that into an error and marks the client
+    /// degraded so the caller (best-effort diagnostics) skips it and later calls
+    /// fail fast rather than each hanging.
     async fn send(&self, msg: &Value) -> Result<()> {
+        if self.is_degraded() {
+            anyhow::bail!("language server is unavailable (a previous write timed out)");
+        }
         let body = msg.to_string();
         let frame = format!("Content-Length: {}\r\n\r\n{body}", body.len());
         let mut stdin = self.stdin.lock().await;
-        stdin.write_all(frame.as_bytes()).await?;
-        stdin.flush().await?;
-        Ok(())
+        let write = async {
+            stdin.write_all(frame.as_bytes()).await?;
+            stdin.flush().await?;
+            Ok::<(), std::io::Error>(())
+        };
+        match tokio::time::timeout(self.send_timeout, write).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e.into()),
+            Err(_) => {
+                self.mark_degraded();
+                anyhow::bail!("language server write timed out (stdin not draining)")
+            }
+        }
     }
 }
 
@@ -1243,6 +1336,59 @@ mod tests {
         );
     }
 
+    /// A server that initializes fine but then stops draining its stdin must
+    /// not hang the edit: the bounded write times out, diagnostics degrade to
+    /// `None` (the edit still succeeds), and the server is retired so later
+    /// edits skip it fast instead of each re-hitting the timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_wedged_server_times_out_and_is_retired() {
+        if which::which("python3").is_err() {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let server = dir.path().join("wedged_lsp.py");
+        std::fs::write(&server, FAKE_LSP_WEDGED_PY).unwrap();
+        let registry = LspRegistry::new(
+            dir.path().to_path_buf(),
+            vec![LspServerConfig {
+                command: "python3".to_string(),
+                args: vec![server.display().to_string()],
+                extensions: vec!["xyz".to_string()],
+            }],
+            Some(500), // short write budget so the test is quick
+        );
+
+        // A body larger than the OS pipe buffer (~64KB) forces `write_all` to
+        // block on a server that isn't reading — the wedge we're guarding.
+        let big = "x\n".repeat(200_000);
+        let file = dir.path().join("main.xyz");
+
+        let start = std::time::Instant::now();
+        let note = registry.diagnostics_note(&file, &big).await;
+        assert_eq!(
+            note, None,
+            "a wedged server yields no diagnostics, not a hang"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "must not hang: took {:?}",
+            start.elapsed()
+        );
+
+        // The server is retired; `/doctor` reports it failed and a second edit
+        // returns immediately without re-hitting the write timeout.
+        assert_eq!(registry.statuses().await[0].status, LspServerStatus::Failed);
+        let start = std::time::Instant::now();
+        assert_eq!(registry.diagnostics_note(&file, &big).await, None);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "a retired server is skipped fast: took {:?}",
+            start.elapsed()
+        );
+    }
+
     /// A minimal, protocol-correct LSP server: answers `initialize`
     /// (advertising the navigation capabilities), publishes one error per
     /// line containing "boom" on `didOpen`/`didChange` (with the document's
@@ -1334,5 +1480,37 @@ while True:
               "result": {"changes": {uri: edits}}})
     elif method == "shutdown":
         send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+"#;
+
+    /// A server that answers `initialize` (so `start` succeeds) and then stops
+    /// reading its stdin entirely — modelling a crashed-but-not-exited / wedged
+    /// server. The next large write fills the pipe and blocks, exercising the
+    /// per-write timeout.
+    #[cfg(unix)]
+    const FAKE_LSP_WEDGED_PY: &str = r#"
+import json, sys, time
+
+def read():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline().decode()
+        if not line or line == "\r\n":
+            break
+        if line.lower().startswith("content-length:"):
+            length = int(line.split(":")[1].strip())
+    if length is None:
+        sys.exit(0)
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+
+msg = read()
+if msg.get("method") == "initialize":
+    send({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {}}})
+# Now go deaf: never read stdin again, so the next big write wedges.
+time.sleep(3600)
 "#;
 }

@@ -25,6 +25,12 @@ const FETCH_BODY_MULTIPLIER: usize = 8;
 /// Absolute floor on the raw-body cap, so a small `max_output` still allows a
 /// normal page through.
 const FETCH_BODY_FLOOR: usize = 256 * 1024;
+/// Byte cap on a search backend's response body (SearXNG JSON / DuckDuckGo
+/// HTML), read as a bounded stream before parsing. Generous — a real search
+/// response is a few hundred KB at most — while still bounding a hostile or
+/// compromised instance (a `SEARXNG_URL` the user set, a MITM'd DuckDuckGo
+/// answer) that streams gigabytes to OOM the process.
+const SEARCH_BODY_CAP: usize = 8 * 1024 * 1024;
 
 /// Redirect hops a single `fetch` will follow before giving up — generous
 /// enough for normal link-shorteners/CDNs, small enough to bound the SSRF
@@ -84,7 +90,8 @@ impl reqwest::dns::Resolve for SsrfGuardResolver {
 /// SSRF defence is layered: [`SsrfGuardResolver`] filters resolved IPs at
 /// connect time (the authoritative, TOCTOU-free guard, covering the initial
 /// request *and* every redirect target), while the initial [`is_blocked_host`]
-/// check and the custom redirect policy reject obviously-internal hostnames
+/// check (full, DNS-resolving) and the custom redirect policy (literal-only, so
+/// its synchronous closure never blocks on DNS) reject obviously-internal hosts
 /// earlier with a clearer message and cap the hop count.
 static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -95,7 +102,16 @@ static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(||
             if attempt.previous().len() >= MAX_REDIRECTS {
                 return attempt.error("too many redirects");
             }
-            if is_blocked_url(attempt.url()) {
+            // This closure is synchronous and runs on a runtime worker, so it
+            // must not block on DNS. Check only what's free — an internal
+            // *literal* IP or a `localhost` name — and skip the `getaddrinfo`
+            // for hostnames. That's not a hole: `SsrfGuardResolver` resolves and
+            // filters the redirect target's addresses at connect time (the
+            // authoritative, TOCTOU-free guard), so a hostname that resolves to
+            // an internal IP is still refused — just at connect with the
+            // resolver's message instead of here. This check is only an earlier,
+            // clearer error for the cases it can decide without blocking.
+            if is_blocked_url_literal(attempt.url()) {
                 let url = attempt.url().clone();
                 return attempt.error(format!(
                     "refusing to follow redirect to {url}: internal/loopback host is blocked"
@@ -159,8 +175,14 @@ impl Tool for WebFetchTool {
         }
         // Block obviously-internal targets: prompt-injected content can point
         // `fetch` at the cloud metadata endpoint or a loopback service to read
-        // credentials / pivot (SSRF).
-        if is_blocked_host(url) {
+        // credentials / pivot (SSRF). `is_blocked_host` does a blocking
+        // `getaddrinfo` for hostnames, so run it on the blocking pool rather
+        // than stalling a runtime worker on a slow/blackholed resolver.
+        let owned = url.to_string();
+        let blocked = tokio::task::spawn_blocking(move || is_blocked_host(&owned))
+            .await
+            .unwrap_or(false);
+        if blocked {
             bail!("refusing to fetch {url}: internal/loopback host is blocked");
         }
         let resp = http_client()?.get(url).send().await?;
@@ -181,16 +203,7 @@ impl Tool for WebFetchTool {
             .max_output
             .saturating_mul(FETCH_BODY_MULTIPLIER)
             .max(FETCH_BODY_FLOOR);
-        let mut stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
-        let mut body_truncated = false;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("reading response body")?;
-            if push_capped(&mut buf, &chunk, raw_cap) {
-                body_truncated = true;
-                break;
-            }
-        }
+        let (buf, body_truncated) = read_capped(resp.bytes_stream(), raw_cap).await?;
         let body = String::from_utf8_lossy(&buf).into_owned();
         let text = if is_html || looks_like_html(&body) {
             strip_html(&body)
@@ -289,7 +302,13 @@ async fn searxng_search(base: &str, query: &str, n: usize) -> Result<Vec<Hit>> {
     if !resp.status().is_success() {
         bail!("SearXNG HTTP {} from {base}", resp.status());
     }
-    let v: serde_json::Value = resp.json().await?;
+    // Read under a byte cap before parsing: an unbounded `resp.json()` lets a
+    // hostile/compromised instance stream gigabytes and OOM the process. A real
+    // results payload is far under the cap, so this never truncates a genuine
+    // response.
+    let (buf, _) = read_capped(resp.bytes_stream(), SEARCH_BODY_CAP).await?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&buf).context("parsing SearXNG JSON response")?;
     let mut hits = Vec::new();
     if let Some(arr) = v.get("results").and_then(|r| r.as_array()) {
         for r in arr.iter().take(n) {
@@ -314,7 +333,10 @@ async fn ddg_search(query: &str, n: usize) -> Result<Vec<Hit>> {
     if !resp.status().is_success() {
         bail!("DuckDuckGo HTTP {}", resp.status());
     }
-    let html = resp.text().await?;
+    // Bounded read before parsing (see `searxng_search`): an unbounded
+    // `resp.text()` would let a MITM'd response stream gigabytes.
+    let (buf, _) = read_capped(resp.bytes_stream(), SEARCH_BODY_CAP).await?;
+    let html = String::from_utf8_lossy(&buf).into_owned();
     Ok(parse_ddg(&html, n))
 }
 
@@ -383,6 +405,29 @@ fn clean_ddg_url(href: &str) -> String {
     href.to_string()
 }
 
+/// Read a response body stream into a buffer under a hard byte `cap`, returning
+/// `(bytes, truncated)`. The single guard behind every web body read — `fetch`
+/// and both search backends route through it so no path ever buffers an
+/// unbounded response. Generic over the chunk/error types so it's unit-testable
+/// with a synthetic stream (not just a live `reqwest` body).
+async fn read_capped<S, B, E>(mut stream: S, cap: usize) -> Result<(Vec<u8>, bool)>
+where
+    S: futures_util::Stream<Item = std::result::Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading response body")?;
+        if push_capped(&mut buf, chunk.as_ref(), cap) {
+            truncated = true;
+            break;
+        }
+    }
+    Ok((buf, truncated))
+}
+
 /// Append `chunk` to `buf` without letting it exceed `cap` bytes. Returns `true`
 /// when the cap is reached (the caller stops reading) — the streaming guard that
 /// bounds `fetch`'s response body. Pure, so the cap logic is unit-testable
@@ -403,26 +448,53 @@ fn push_capped(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
 /// (literal or resolved via DNS), and the link-local cloud metadata endpoint.
 /// A URL that doesn't parse is not blocked here (the caller already enforced
 /// an `http(s)` scheme).
+///
+/// Performs a blocking `getaddrinfo` for hostnames, so async callers must run
+/// it on the blocking pool (`spawn_blocking`) rather than on a runtime worker.
 fn is_blocked_host(url: &str) -> bool {
     match reqwest::Url::parse(url) {
-        Ok(u) => is_blocked_url(&u),
+        Ok(u) => u.host_str().is_some_and(is_internal_host),
         Err(_) => false,
     }
 }
 
-/// [`is_blocked_host`] on an already-parsed URL — used by the redirect policy,
-/// which hands us a [`reqwest::Url`] for each hop.
-fn is_blocked_url(url: &reqwest::Url) -> bool {
-    url.host_str().is_some_and(is_internal_host)
+/// The non-blocking half of the host check on an already-parsed URL — used by
+/// the redirect policy, whose closure is synchronous and must not block on DNS.
+/// See [`is_internal_host_literal`].
+fn is_blocked_url_literal(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(is_internal_host_literal)
 }
 
-/// The host-name test behind [`is_blocked_host`]: refuses well-known internal
-/// names outright, then resolves the host to concrete IP addresses (a literal
-/// IP parses directly; a hostname goes through DNS via `to_socket_addrs`) and
-/// blocks if *any* resolved address is internal — so a hostile DNS answer or
-/// an alternate encoding of a loopback/private address doesn't slip past a
-/// string-only check.
+/// The full host-name test behind [`is_blocked_host`]: [`is_internal_host_literal`]
+/// plus a DNS resolution (`to_socket_addrs`) for hostnames, blocking if *any*
+/// resolved address is internal — so a hostile DNS answer or an alternate
+/// encoding of a loopback/private address doesn't slip past a string-only check.
+/// Blocking; callers in async context go through `spawn_blocking`.
 fn is_internal_host(host: &str) -> bool {
+    if is_internal_host_literal(host) {
+        return true;
+    }
+    let h = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    // Not a literal IP: resolve via DNS and check every address it comes back
+    // with. `to_socket_addrs` needs a port; 0 is never dialed here — the
+    // lookup is resolution-only, the real request goes through reqwest.
+    match (h.as_str(), 0u16).to_socket_addrs() {
+        Ok(addrs) => addrs.map(|a| a.ip()).any(is_blocked_ip),
+        // Unresolvable: not blocked here — the real request will fail with
+        // its own (clearer) DNS error.
+        Err(_) => false,
+    }
+}
+
+/// The non-blocking part of [`is_internal_host`]: well-known internal names and
+/// *literal* internal IPs, with no DNS lookup. Safe to call from a synchronous
+/// runtime context. A hostname that resolves *only* to internal IPs is not
+/// caught here — the authoritative [`SsrfGuardResolver`] blocks it at connect
+/// time instead.
+fn is_internal_host_literal(host: &str) -> bool {
     let h = host
         .trim_start_matches('[')
         .trim_end_matches(']')
@@ -433,15 +505,7 @@ fn is_internal_host(host: &str) -> bool {
     if let Ok(ip) = h.parse::<IpAddr>() {
         return is_blocked_ip(ip);
     }
-    // Not a literal IP: resolve via DNS and check every address it comes back
-    // with. `to_socket_addrs` needs a port; 0 is never dialed here — the
-    // lookup is resolution-only, the real request goes through reqwest.
-    match (h.as_str(), 0u16).to_socket_addrs() {
-        Ok(addrs) => addrs.map(|a| a.ip()).any(is_blocked_ip),
-        // Unresolvable: not blocked here — the real request will fail with
-        // its own (clearer) DNS error.
-        Err(_) => false,
-    }
+    false
 }
 
 /// Whether `ip` is a loopback/private/link-local/unique-local address —
@@ -703,6 +767,30 @@ mod tests {
         let mut buf = Vec::new();
         assert!(push_capped(&mut buf, b"0123456789", 10));
         assert_eq!(buf.len(), 10);
+    }
+
+    /// A search/fetch body that streams past the cap is cut before it's parsed
+    /// — the guard that stops a hostile instance OOMing the process. Uses a
+    /// synthetic chunk stream (the same code path `resp.bytes_stream()` feeds).
+    #[tokio::test]
+    async fn read_capped_truncates_an_oversized_body() {
+        let chunks: Vec<std::result::Result<Vec<u8>, std::io::Error>> = vec![
+            Ok(vec![b'a'; 6]),
+            Ok(vec![b'b'; 6]), // this chunk crosses the 10-byte cap
+            Ok(vec![b'c'; 6]), // never read
+        ];
+        let stream = futures_util::stream::iter(chunks);
+        let (buf, truncated) = read_capped(stream, 10).await.unwrap();
+        assert!(truncated, "an over-cap body is flagged truncated");
+        assert_eq!(buf.len(), 10, "cut at exactly the cap");
+
+        // A body under the cap is returned whole, untruncated.
+        let small: Vec<std::result::Result<Vec<u8>, std::io::Error>> = vec![Ok(b"hi".to_vec())];
+        let (buf, truncated) = read_capped(futures_util::stream::iter(small), 10)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(buf, b"hi");
     }
 
     #[test]
