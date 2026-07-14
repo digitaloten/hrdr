@@ -245,28 +245,77 @@ fn build_sorted(
 }
 
 /// Render the collected entries as a tree with box-drawing characters.
+///
+/// `entries` is in DFS pre-order (see `build_sorted`): a node's whole subtree is
+/// contiguous and immediately follows it, so the subtree of the ancestor at any
+/// depth `da` ends exactly where the *next* entry's depth drops to `da` or less.
+/// That makes a single one-step look-ahead — the depth of entry `i + 1` — enough
+/// to draw every column and connector in `O(n · depth)`, byte-for-byte identical
+/// to the earlier `O(n² · depth)` all-pairs look-ahead (which asked the same
+/// "is anything left in this ancestor's subtree?" question the slow way).
 fn render_tree(root_label: &str, entries: &[Collected]) -> String {
     let mut buf = format!("{}/\n", root_label);
     if entries.is_empty() {
         return buf;
     }
 
-    // Group entries by depth. We track which entries are the last child of their
-    // parent so we can draw connectors correctly.
+    let n = entries.len();
+    for i in 0..n {
+        let depth = entries[i].components.len();
+        // Depth of the next entry (0 past the end): the subtree of the ancestor
+        // at depth `da` still has more entries after `i` iff `next_depth > da`.
+        let next_depth = entries.get(i + 1).map_or(0, |e| e.components.len());
+
+        // Prefix: one column per ancestor (depths `1..depth`) — a blank gap once
+        // that ancestor's subtree is spent, otherwise a continuation bar.
+        for ancestor_depth in 1..depth {
+            if next_depth <= ancestor_depth {
+                buf.push_str("    ");
+            } else {
+                buf.push_str("│   ");
+            }
+        }
+
+        // Connector: the parent sits at depth `depth - 1`; this is its last
+        // shown child once nothing deeper follows (`next_depth < depth`).
+        if next_depth < depth {
+            buf.push_str("└── ");
+        } else {
+            buf.push_str("├── ");
+        }
+
+        let name = &entries[i].components[depth - 1];
+        let suffix = if entries[i].is_symlink {
+            "@"
+        } else if entries[i].is_dir {
+            "/"
+        } else {
+            ""
+        };
+        buf.push_str(&format!("{name}{suffix}\n"));
+    }
+
+    buf
+}
+
+/// The original `O(n² · depth)` look-ahead renderer, kept as the reference the
+/// linear `render_tree` is proven byte-identical against. Test-only.
+#[cfg(test)]
+fn render_tree_naive(root_label: &str, entries: &[Collected]) -> String {
+    let mut buf = format!("{}/\n", root_label);
+    if entries.is_empty() {
+        return buf;
+    }
+
     let n = entries.len();
     for i in 0..n {
         let depth = entries[i].components.len();
 
-        // Determine whether this entry is the last child of its parent
-        // by looking ahead: if the next entry at the same depth or shallower
-        // has a different prefix at depth-1, this is the last child.
         let is_last = (i + 1..n).all(|j| {
             entries[j].components.len() < depth
                 || entries[j].components[..depth - 1] != entries[i].components[..depth - 1]
         });
 
-        // Build the prefix: for each ancestor level, emit "│   " or "    "
-        // depending on whether that ancestor was the last child.
         for level in 0..depth.saturating_sub(1) {
             let ancestor_last = (i + 1..n).all(|j| {
                 entries[j].components.len() <= level
@@ -279,7 +328,6 @@ fn render_tree(root_label: &str, entries: &[Collected]) -> String {
             }
         }
 
-        // Connector.
         if is_last {
             buf.push_str("└── ");
         } else {
@@ -303,6 +351,74 @@ fn render_tree(root_label: &str, entries: &[Collected]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `Collected` from `"a/b/c"`-style paths with a trailing marker:
+    /// `/` = dir, `@` = symlink, none = file.
+    fn collected(spec: &str) -> Collected {
+        let (path, is_dir, is_symlink) = if let Some(p) = spec.strip_suffix('/') {
+            (p, true, false)
+        } else if let Some(p) = spec.strip_suffix('@') {
+            (p, false, true)
+        } else {
+            (spec, false, false)
+        };
+        Collected {
+            components: path.split('/').map(str::to_string).collect(),
+            is_dir,
+            is_symlink,
+        }
+    }
+
+    /// A non-trivial nested structure exercising multiple sibling groups,
+    /// several depths, last/non-last children at each depth, and a symlink.
+    fn sample_entries() -> Vec<Collected> {
+        // DFS pre-order, mirroring `build_sorted`'s dirs-first, then alpha order.
+        [
+            "src/",
+            "src/net/",
+            "src/net/http.rs",
+            "src/net/tcp.rs",
+            "src/main.rs",
+            "src/util.rs",
+            "tests/",
+            "tests/fixtures/",
+            "tests/fixtures/data.json",
+            "tests/integration.rs",
+            "Cargo.toml",
+            "link.rs@",
+            "README.md",
+        ]
+        .iter()
+        .map(|s| collected(s))
+        .collect()
+    }
+
+    /// The linear renderer must be byte-for-byte identical to the reference
+    /// look-ahead renderer — the mechanical equivalence proof for the `O(n²)`→
+    /// `O(n · depth)` rewrite. Preferred over a hand-written golden (which could
+    /// silently encode a bug): every drawn byte is checked against the original
+    /// code over a realistic tree plus edge cases.
+    #[test]
+    fn render_tree_matches_naive_reference() {
+        let entries = sample_entries();
+        let fast = render_tree("root", &entries);
+        let naive = render_tree_naive("root", &entries);
+        assert_eq!(fast, naive, "linear render diverged from reference");
+
+        // Empty, single-entry, and a deep single chain (exercises every prefix
+        // column at successive depths) all agree too.
+        assert_eq!(render_tree("root", &[]), render_tree_naive("root", &[]));
+        let one = vec![collected("only.rs")];
+        assert_eq!(render_tree("root", &one), render_tree_naive("root", &one));
+        let chain: Vec<Collected> = ["a/", "a/b/", "a/b/c/", "a/b/c/d.rs"]
+            .iter()
+            .map(|s| collected(s))
+            .collect();
+        assert_eq!(
+            render_tree("root", &chain),
+            render_tree_naive("root", &chain)
+        );
+    }
 
     #[tokio::test]
     async fn tree_basic_output() {

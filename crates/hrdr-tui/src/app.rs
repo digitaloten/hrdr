@@ -1743,16 +1743,29 @@ impl App {
         let tx = self.tx.clone();
         let tx_events = tx.clone();
         let handle = tokio::spawn(async move {
+            use futures_util::FutureExt;
             // Release the agent lock before signalling Done, so the UI's
             // auto-save (try_lock) can run immediately afterward.
-            let result = {
+            //
+            // A tool that `unwrap`s (or otherwise panics) unwinds this task; guard
+            // the run future with `catch_unwind` so `Done` is ALWAYS sent, turning a
+            // crash into a finished turn with an error rather than a forever-spinner.
+            // The future isn't `UnwindSafe`, hence `AssertUnwindSafe`. The cancel
+            // path aborts the task (dropping the future) and drives the UI itself, so
+            // an abort still sends no `Done` — `catch_unwind` does not intercept it.
+            let run = async {
                 let mut a = agent.lock().await;
                 a.run(input, steering, |ev| {
                     let _ = tx_events.send(TurnMsg::Event(ev));
                 })
                 .await
             };
-            let _ = tx.send(TurnMsg::Done(result.err().map(|e| e.to_string())));
+            let outcome = std::panic::AssertUnwindSafe(run).catch_unwind().await;
+            let err = match outcome {
+                Ok(result) => result.err().map(|e| e.to_string()),
+                Err(payload) => Some(format!("turn crashed: {}", panic_message(&*payload))),
+            };
+            let _ = tx.send(TurnMsg::Done(err));
         });
         self.turn_handle = Some(handle);
     }
@@ -2065,12 +2078,52 @@ impl App {
     }
 }
 
+/// Best-effort text of a caught panic payload (`Box<dyn Any>`), for turning a
+/// crashed turn into a reported error instead of a hung spinner.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
 #[cfg(test)]
 mod e2e;
 
 #[cfg(test)]
 mod tests {
     use super::HitRect;
+    use futures_util::FutureExt;
+
+    /// A turn task guards its run future with `catch_unwind` so a panicking tool
+    /// still delivers `Done`. Model the wrapper in isolation: a future that
+    /// panics must surface as an `Err(payload)` we can turn into a message,
+    /// never a lost signal.
+    #[tokio::test]
+    async fn panicking_turn_future_is_caught_and_reported() {
+        let run = async { panic!("tool exploded") };
+        let outcome = std::panic::AssertUnwindSafe(run).catch_unwind().await;
+        let err = match outcome {
+            Ok(()) => None,
+            Err(payload) => Some(format!("turn crashed: {}", super::panic_message(&*payload))),
+        };
+        assert_eq!(err.as_deref(), Some("turn crashed: tool exploded"));
+    }
+
+    /// `panic_message` extracts both `&str` and `String` payloads and falls back
+    /// for anything else.
+    #[test]
+    fn panic_message_extracts_common_payloads() {
+        let s: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(super::panic_message(&*s), "boom");
+        let s: Box<dyn std::any::Any + Send> = Box::new(String::from("kaboom"));
+        assert_eq!(super::panic_message(&*s), "kaboom");
+        let s: Box<dyn std::any::Any + Send> = Box::new(42u8);
+        assert_eq!(super::panic_message(&*s), "unknown panic");
+    }
 
     /// The TUI's TODO-panel default lifetime must track the shared UI-config
     /// default (the aging logic itself is tested in `hrdr-app`).
