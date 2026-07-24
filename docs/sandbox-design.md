@@ -121,23 +121,62 @@ happens:
 ### 1. OS sandbox — for `shell` children (the untrusted-command vector)
 
 Applied to each spawned command, not to hrdr itself, so the app is unaffected.
+**Mirror Codex** (`~/Projects/mxaddict/codex/codex-rs`): one policy (writable
+roots + read/network access) behind a **per-OS backend**, each delegating to
+that OS's kernel mechanism. There is no userspace-only boundary — a child makes
+its syscalls straight to the kernel, so enforcement must sit **below** it
+(kernel or VM). Do NOT reimplement the mechanisms; drive the OS's own.
 
-- **Linux (primary):** [Landlock](https://landlock.io) via a `pre_exec` closure
-  in the child (post-fork, pre-exec), added in `proc::configure` /
-  `run_streamed_command`'s spawn. The child (`bash`) and every descendant
-  (`cargo`, `git`, …) inherit the ruleset — read/write rights granted only on
-  the mode's roots. `cd /parent && git commit` then **fails at the OS**: the
-  parent isn't a writable root. Requires kernel ≥ 5.13 (Landlock ABI 1); newer
-  ABIs add finer rights. The `landlock` crate gives a safe builder.
-- **macOS:** wrap the command with `sandbox-exec` and a generated `.sb` profile
-  (seatbelt) granting the same roots. (Seatbelt is deprecated-but-present; the
-  same approach Codex uses.)
-- **Windows:** no first-class equivalent; `SandboxMode` is advisory there
-  (software layer only) with a one-time notice. Not a regression — there is no
-  sandbox today.
-- **Fallback (old kernel / unsupported):** skip the OS layer, keep the software
-  layer, and surface once that shell commands are **not** OS-confined so the
-  user knows the guarantee is degraded. Never silently pretend to sandbox.
+**Linux — bubblewrap primary, Landlock fallback, seccomp for network.**
+
+- **Primary: bubblewrap (`bwrap`).** Reconstruct the child's filesystem view
+  with Linux mount + user + pid namespaces (unprivileged — no root): bind-mount
+  the writable roots read-write, the rest read-only, nothing else visible.
+  Invoke it as a wrapper, like Codex: build the arg list and run
+  `bwrap <opts> -- <shell> -c <command>`. For `Write` mode: `--ro-bind / /`
+  (read-all) `--bind <worktree> <worktree>` `--bind <scratch> <scratch>`
+  `--bind <tool_output_dir> …` `--proc /proc` `--dev /dev` `--unshare-pid`
+  (`--unshare-net` when network denied) `--chdir <worktree>`. A `git commit` in
+  the parent then hits a **read-only mount → `EROFS`**, however it's reached
+  (`cd`, `eval`, `python -c`, a redirect) — the kernel enforces the _effect_,
+  not the command syntax. For `Read` mode, DON'T `--ro-bind / /`; bind only
+  `<worktree>` + the specific tool dirs (`/usr`, `/lib`, `/bin` ro), so the rest
+  of the FS isn't even readable (Landlock cannot do this — see below). **Don't
+  reimplement bwrap** (weeks of security-critical code); shell out to the system
+  binary, and **bundle** one later (Codex ships `bundled_bwrap`) for hosts
+  without it. Caveat: needs unprivileged user namespaces enabled (some hardened
+  distros disable them → fall back).
+- **Fallback: Landlock** (`landlock` crate), applied via a `pre_exec` closure in
+  the child, for hosts where unprivileged user namespaces are off or `bwrap` is
+  missing. Ruleset = Codex's (`linux-sandbox/src/landlock.rs`): `handle_access`
+  all rights; read-only on `/`; read-write on `/dev/null` + the writable roots;
+  `restrict_self()`. ~15 lines, kernel ≥ 5.13. **Limit:** Landlock can't cleanly
+  restrict _reads_, so `Read` mode degrades to `Write`-with-notice under the
+  Landlock fallback — exactly why Codex made bwrap primary.
+- **Network + hardening: seccomp** (`seccompiler`, as Codex) — deny network
+  syscalls for `Read`/no-network, plus `no_new_privs`. The hook lives here;
+  wiring the network axis is the deferred follow-up.
+
+**macOS — Seatbelt (bespoke; mirror Codex `sandboxing/src/seatbelt.rs`).**
+Generate an SBPL profile — `(deny default)`, `(allow file-read* (subpath "/"))`,
+`(allow file-write* (subpath "<worktree>") (subpath "<scratch>"))`, network
+clauses — and run under `/usr/bin/sandbox-exec -p <profile> -- <command>` (pin
+the `/usr/bin` path for tamper-resistance, like Codex). No namespace equivalent
+exists, so Seatbelt is the ceiling on macOS; it's deprecated-but-present. `Read`
+mode drops the broad `file-read*` and allow-lists only the needed subpaths.
+
+**Windows — restricted token / AppContainer (bespoke; mirror Codex
+`windows-sandbox-rs/`).** The hard one, weakest guarantee: no namespaces, no
+clean "confine writes to a dir" primitive. Either a **restricted token**
+(`CreateRestrictedToken`, drop write SIDs) or an **AppContainer** with explicit
+filesystem-capability grants for the writable roots, plus a Job Object. Codex
+needed a whole crate for it; multi-week. **Out of v1** — Windows runs
+software-layer + command-heuristic only, with a notice that shell isn't
+OS-confined. Not a regression (no sandbox today).
+
+**Fallback (any OS, unsupported / old kernel):** skip the OS layer, keep the
+software layer, and surface once that shell commands are **not** OS-confined —
+never silently pretend to sandbox.
 
 ### 2. Software path-guard — for the in-process file tools
 
@@ -209,11 +248,14 @@ suspenders.
 2. Software path-guard in `ToolContext` (writable/readable roots + resolve-time
    check) for the file tools. Flip default to `Write`. Tests: write outside cwd
    refused; read outside cwd refused in `Read`; scratch + tool_output writable.
-3. Linux Landlock layer in the shell spawn (`pre_exec`), gated on kernel
-   support, with graceful fallback + the degraded-guarantee notice. Tests behind
-   a Linux+Landlock cfg.
-4. Prompt declaration of mode + writable roots (interpolated).
-5. macOS `sandbox-exec` layer. (Windows stays software-only.)
+3. **Linux `bwrap` wrap** on the shell spawn — writable-root bind-mounts, shell
+   out to the system binary. This is the real fix for the observed shell escape.
+   **Landlock fallback** (`pre_exec`) where user namespaces are off; graceful
+   degrade + the "not OS-confined" notice. Tests behind a Linux cfg.
+4. Prompt declaration of mode + writable roots (interpolated, Codex-style).
+5. macOS Seatbelt layer (`sandbox-exec` + generated profile). Windows stays
+   software-layer only.
+6. (later) seccomp network axis; bundle a `bwrap` binary for hosts without one.
 
 Slice 1–2 give the software boundary (works everywhere, closes the file-tool
 vector immediately); slice 3 adds the OS hard-floor for shell on Linux, which is
