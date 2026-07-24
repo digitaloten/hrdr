@@ -579,6 +579,10 @@ mod tests {
             sub.contains("the parent project directory your worktree was"),
             "the parent-repo trap is named for a write sub-agent"
         );
+        assert!(
+            sub.contains("your entire workspace"),
+            "the positive allow-list framing is present"
+        );
         assert!(sub.contains("command, git included, from this worktree"));
         assert!(
             !main.contains("the parent project directory your worktree was"),
