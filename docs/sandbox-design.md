@@ -7,6 +7,52 @@ investigation). Guidance alone only reaches models inclined to obey; hrdr runs
 arbitrary models, so it needs an **enforced** boundary — what Codex has by
 default and Claude Code has opt-in.
 
+## Resume plan (start here — refinements from review)
+
+The full cross-platform sandbox below is the ambition; the **actual problem** is
+narrow (one non-Claude write sub-agent, on Linux, `cd`'d out via `shell` and
+committed to `main`). Don't boil the ocean. In priority order:
+
+- **Guidance clause — DONE** (`system.j2`, write sub-agents). Handles steerable
+  models.
+- **Software path-guard (slice 2)** — closes the `write`/`edit`/`delete` **file
+  tool** vector. Portable, days of work. **Does NOT catch the `shell` escape.**
+- **bwrap wrap on Linux (the real fix for the observed failure)** — the `shell`
+  → `cd /parent && git commit` escape is a subprocess, so only an OS sandbox on
+  the shell child catches it. **Shell out to the system `bwrap`** (bundle
+  later); do **not** reimplement it (weeks of security-critical code). Days.
+  Landlock via the `landlock` crate is the fallback where unprivileged user
+  namespaces are disabled.
+- **macOS = seatbelt profile + `sandbox-exec`** (days, deprecated-but-works).
+  **Windows = software-layer only** — real Windows sandboxing (AppContainer /
+  restricted tokens) is weeks and the guarantee is weak; skip it for v1, like
+  Claude Code and hrdr today.
+
+Which layer catches which vector (the crux):
+
+| Vector                                              | Caught by                     |
+| --------------------------------------------------- | ----------------------------- |
+| `write`/`edit`/`delete` tool with a parent path     | software path-guard (slice 2) |
+| `shell` → `cd /parent && git commit` (**observed**) | bwrap/landlock (Linux)        |
+| TOCTOU-proof, all shells/interpreters/redirects     | bwrap/landlock (kernel)       |
+
+A shell **command parser** (split on `&&`/`;`/`\|`) can catch the _honest_ shell
+escapes with a nice message, but it is a heuristic, not a boundary: command
+substitution, variables, nested interpreters (`python -c os.system(...)`), and
+non-git write vectors evade it. Use it as a friendly pre-flight in front of
+bwrap, never instead of it.
+
+**Off-ramp:** hrdr runs Claude models almost always and has seen this exactly
+once (a deepseek delegate). Shipping only the guidance clause and building the
+bwrap wrap **the day writes to non-Claude models become routine** is a
+defensible call. Don't build a boundary for a threat you rarely run.
+
+Reference implementation: Codex (`~/Projects/mxaddict/codex/codex-rs`) —
+`linux-sandbox/` (bwrap primary + seccomp, Landlock backup, a
+`codex-linux-sandbox` helper binary, bundled bwrap),
+`sandboxing/src/seatbelt.rs` (macOS), `windows-sandbox-rs/` (Windows). Its
+Landlock ruleset is exactly the "read-all, write-roots" model below.
+
 ## Goal
 
 Confine an agent's filesystem access to its **working directory** plus a
