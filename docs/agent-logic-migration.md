@@ -1,7 +1,10 @@
 # Agent-logic migration: hrdr-agent owns all agent logic, hrdr-app is only glue
 
-Status: **Phase 1 complete** (on main). **W2 complete** (main agent on the
-event-fold jsonl). Phase 2 pending.
+Status: **complete.** Phase 1 (on main), **W2** (main agent on the event-fold
+jsonl), and **Phase 2** all done. See the Phase 2 note below — the sweep turned
+out to be near-empty: the genuine agent logic was already in `hrdr-agent`, and
+what remained in `hrdr-app` (skills, the login wizard, `util` helpers) is
+frontend logic that correctly stays there.
 
 ## Progress
 
@@ -108,7 +111,10 @@ all fall out of one shared path.
 - `pane.rs` — `Pane`, `PaneSet`, `PaneView`
   (manage-a-set-of-agent-conversations; view fields ride along as plain data the
   TUI reads/writes).
-- (Phase 2) skills model, login auth/provider core, agent-side `util` helpers.
+- ~~(Phase 2) skills model, login auth/provider core, agent-side `util`
+  helpers.~~ **Reassessed — did not move (see the Phase 2 note): these are
+  frontend logic with no `hrdr-agent` consumer; the login _core_ (auth/oauth/
+  `ResolvedProvider`) was already in `hrdr-agent`.**
 
 **Stays in hrdr-app (glue / frontend):**
 
@@ -138,10 +144,42 @@ slices used. New hrdr-agent deps that follow `session.rs`: `zstd`, `filetime`
    — the actual parity fix. (Unblocks `task_revive` + disk-aware `task_list`
    later.)
 
-**Phase 2 — finish the principle**
+**Phase 2 — finish the principle** — DONE
 
-4. Sweep the rest: skills model, login auth/provider core, agent-side `util`,
-   leaving hrdr-app as pure glue.
+4. Sweep the rest — reassessed and found near-empty (see the Phase 2 note). The
+   only concrete move was removing a duplicate `age_completed_todos` from
+   `hrdr-app/util.rs` (the agent already owns it in `subagent_live.rs`, and
+   hrdr-app already re-exports that one).
+
+## Phase 2 note: the sweep was near-empty (and why that's correct)
+
+Investigating the Phase 2 list against the code showed most of it should NOT
+move — moving it would invert the layering, not finish it:
+
+- **`hrdr-agent` has zero dependency on `hrdr-app`** (verified: no Cargo dep,
+  only doc-comment references). So by construction there is no agent logic
+  _stranded_ in hrdr-app — if there were, a sub-agent (which lives in hrdr-agent
+  and cannot see hrdr-app) would be broken, and sub-agents work. Whatever
+  remains in hrdr-app is, by definition, something hrdr-agent does not need.
+- **skills** (`skills.rs`) — consumed only by `hrdr-tui` (discovery, the
+  `:skill` selector, expansion before send). The agent never sees "skills"; it
+  receives an already-expanded message. Frontend logic → stays.
+- **login** — the auth/provider **core** (`auth.rs`, `oauth.rs`,
+  `auth_store.rs`, `ResolvedProvider`) is **already** in `hrdr-agent`.
+  `hrdr-app/login.rs` is the login _wizard/flow_ that drives the `CommandHost` —
+  glue → stays.
+- **util** (`util.rs`) — mention/attachment expansion, config-watch, file-index,
+  display helpers; all consumed only by `hrdr-tui`, none agent logic. **Except**
+  `age_completed_todos`, which was a genuine duplicate of the agent's copy
+  (`subagent_live.rs`, `pub`, re-exported by hrdr-app) with no non-test caller —
+  removed.
+
+So `hrdr-app`'s real role is not "pure agent↔TUI glue" but **shared frontend
+logic + the command/host glue** (skills, login wizard, completion, formatting,
+config, message-prep) — a legitimate layer that a second frontend (the planned
+web UI) will reuse. The migration principle — _`hrdr-agent` owns all agent
+logic_ — holds: it's satisfied precisely because hrdr-agent depends on nothing
+above it.
 
 ## No-migration note (pre-1.0)
 
