@@ -1594,7 +1594,7 @@ impl Agent {
 
     /// Re-gather `AGENTS.md` for the current cwd and rebuild the system prompt
     /// in `messages[0]` (seeding it if the history is empty). Shared by
-    /// [`Self::clear`] and [`Self::set_cwd`].
+    /// [`Self::clear`], [`Self::set_cwd`] and [`Self::set_messages`].
     fn refresh_system(&mut self) {
         // Whether the project docs on disk differ from the ones already in the
         // prompt. Content, not just mtime: a `touch` moves the timestamp without
@@ -1643,9 +1643,31 @@ impl Agent {
 
     /// Replace the message history (for resuming a session). Resets the
     /// read-before-edit gate: this conversation didn't read those files.
+    ///
+    /// **The saved `messages[0]` is not restored — the system prompt is rebuilt.**
+    /// A resume is a new session in a new process, and the whole prompt is
+    /// regenerated every session by design (the section ordering is what makes
+    /// that cache-safe). The saved copy is stale by construction: yesterday's
+    /// date, the memory index and `AGENTS.md` as they were when the session was
+    /// written, and — the reason this is a bug and not just staleness — bytes
+    /// that no longer match the cache split the client computed for the prompt
+    /// built in [`Agent::new`]. Installing saved text under a fresh offset puts
+    /// the Anthropic `cache_control` breakpoint at the wrong byte and silently
+    /// costs the stable-prefix cache hit.
+    ///
+    /// Only `messages[0]` is rewritten; the conversation itself — including the
+    /// signed Anthropic thinking blocks a pending `tool_use` needs — is installed
+    /// verbatim.
     pub fn set_messages(&mut self, messages: Vec<ChatMessage>) {
         self.messages = messages;
         self.reset_read_files();
+        // `refresh_system` re-gathers `AGENTS.md` and so recomputes
+        // `project_docs_changed`. That flag means "a *new* conversation (`/new`)
+        // picked up an edited file, tell the user" — a resume is not that event
+        // and must not raise the notice, so restore whatever it was.
+        let docs_changed = self.project_docs_changed;
+        self.refresh_system();
+        self.project_docs_changed = docs_changed;
     }
 
     /// Adopt this agent's entry in the registry a frontend reads, and publish its
@@ -2173,6 +2195,80 @@ mod tests {
             !agent.project_docs_changed(),
             "an unchanged file is not announced as reloaded"
         );
+    }
+
+    /// Resuming a session installs the saved conversation but **rebuilds** the
+    /// system prompt: the saved `messages[0]` is stale by construction (old date,
+    /// frozen memory index / `AGENTS.md`) and its bytes do not match the cache
+    /// split the client computed for the prompt this process built — the
+    /// Anthropic `cache_control` breakpoint would land mid-prefix and the stable
+    /// prefix would stop being reused.
+    #[test]
+    fn resuming_rebuilds_the_system_prompt_and_keeps_the_cache_split_in_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // A session file written by an older binary, in a different cwd, on a
+        // different day: a system prompt whose length has nothing to do with the
+        // split this process computed.
+        let mut thinking = ChatMessage::assistant("done".to_string());
+        thinking.anthropic_thinking_blocks = vec![serde_json::json!({
+            "type": "thinking",
+            "thinking": "…",
+            "signature": "sig-abc",
+        })];
+        let saved = vec![
+            ChatMessage::system("SAVED PROMPT from a previous run".to_string()),
+            ChatMessage::user("hello".to_string()),
+            thinking,
+        ];
+        agent.set_messages(saved);
+        let cwd = agent.cwd().display().to_string();
+
+        let system = agent.messages[0].content.clone().unwrap_or_default();
+        assert_eq!(agent.messages[0].role, Role::System);
+        assert_ne!(
+            system, "SAVED PROMPT from a previous run",
+            "a resume must not reinstall the saved prompt"
+        );
+        assert!(
+            system.contains(&cwd),
+            "the rebuilt prompt describes *this* process's environment: {system}"
+        );
+
+        // Everything after message 0 is the conversation, installed verbatim —
+        // signed thinking blocks included (a pending tool_use resend needs them).
+        assert_eq!(agent.messages.len(), 3);
+        assert_eq!(agent.messages[1].role, Role::User);
+        assert_eq!(agent.messages[1].content.as_deref(), Some("hello"));
+        assert_eq!(agent.messages[2].role, Role::Assistant);
+        assert_eq!(agent.messages[2].content.as_deref(), Some("done"));
+        assert_eq!(
+            agent.messages[2].anthropic_thinking_blocks[0]["signature"],
+            "sig-abc"
+        );
+
+        // And the client's cache boundary describes the text that was installed:
+        // the stable prefix stops right before the volatile environment block.
+        let split = agent
+            .client
+            .system_cache_split()
+            .expect("a rebuilt prompt always has an environment section");
+        assert!(
+            !system[..split].contains(&cwd),
+            "the cached prefix must not carry the working directory"
+        );
+        assert!(
+            system[split..].contains(&cwd),
+            "…which belongs to the volatile tail"
+        );
+
+        // A resume is not `/new`: it never raises the "AGENTS.md reloaded" notice.
+        assert!(!agent.project_docs_changed());
     }
 
     /// Relevance recall injects a matching memory's **body** into the

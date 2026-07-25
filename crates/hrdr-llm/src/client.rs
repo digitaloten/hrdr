@@ -613,6 +613,14 @@ impl Client {
         self.system_cache_split = at;
     }
 
+    /// The cache-split offset currently in force — so a caller that rebuilds the
+    /// system prompt can assert the boundary it installed describes the text it
+    /// installed (an offset from a *different* build closes the breakpoint in the
+    /// wrong place, silently losing the prefix cache hit).
+    pub fn system_cache_split(&self) -> Option<usize> {
+        self.system_cache_split
+    }
+
     pub fn set_api_version(&mut self, api_version: Option<String>) {
         self.api_version = api_version;
     }

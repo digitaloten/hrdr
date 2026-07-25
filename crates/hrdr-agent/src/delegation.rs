@@ -178,7 +178,9 @@ fn spawn_background(
     // A revived sub-agent continues its prior conversation: restore the persisted
     // messages (with the signed thinking blocks a pending tool_use needs) and its
     // running spend, so the follow-up turn stacks on the original run instead of
-    // starting from an empty context.
+    // starting from an empty context. `set_messages` rebuilds the system prompt on
+    // top of them — the revived run gets today's environment and the current memory
+    // index, and a cache split that matches the text it installed.
     if let Some(r) = restore {
         sub.set_messages(r.messages);
         sub.set_session_cost(r.session_cost);

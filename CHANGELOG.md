@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Resumed and revived sessions rebuild the system prompt**, keeping the
+  Anthropic prompt-cache split in step. `Agent::set_messages` used to install
+  the session file's saved `messages[0]` while the client still held the cache
+  boundary computed for the prompt built at startup; when the two differed in
+  length (memory or `AGENTS.md` changed since the save, or an older binary wrote
+  the session) the `cache_control` breakpoint landed at the wrong byte and the
+  stable-prefix cache hit was silently lost. A resume now regenerates the prompt
+  — current memory index, current `AGENTS.md`, today's environment — and updates
+  the split with it. The conversation itself, signed thinking blocks included,
+  is installed verbatim; only `messages[0]` is rewritten, and a resume never
+  raises the "AGENTS.md reloaded" notice.
+
 ## [0.7.1] - 2026-07-23
 
 ### Added
