@@ -49,6 +49,16 @@ future work; those are collected under **Standing constraints** at the bottom.
   `guardrails.rs`, outside the `Shell` seam, because `default_guardrails()` has
   no shell in scope. Correct today — the shell is always bash/sh — but it is the
   one place a new shell dialect would have to be threaded through by hand.
+- **Windows-drift audit pass, not done.** Roughly 40 `cfg(unix)`-only blocks
+  across the workspace have no Windows counterpart and were never audited as a
+  set. Most are permission-bit or signal conveniences with no Windows analogue
+  by design rather than drifted dual implementations, and the two most
+  consequential were checked and are clean or honestly documented (`proc.rs`'s
+  `ProcessGroup`, which honours the same contract via a Job Object; the wire
+  log's `0600` + `O_NOFOLLOW`, whose Windows gap is disclosed in its doc
+  comment). If a deeper pass is wanted, `hrdr-agent/src/store_lock.rs`,
+  `auth.rs`, and `auth_store.rs` are the next places to look. Related: security
+  finding O3 is exactly this class (see `security-audit.md`).
 
 ## Test coverage gaps
 
@@ -73,6 +83,61 @@ future work; those are collected under **Standing constraints** at the bottom.
   call. By design (it reports model speed, not wall-clock throughput). Showing
   "running tool…" instead of hiding the loader, or tracking wall-clock
   throughput separately, would be a new feature rather than a bug fix.
+
+## Considered and declined
+
+Duplication and near-duplication that two audits (a DRY pass and a seam pass,
+both since closed and deleted) examined and deliberately left alone. Recorded so
+the next audit does not re-litigate them — if you disagree, argue with the
+reason, don't just re-file the finding.
+
+- **Slash-command dispatch is mirrored** between `hrdr-tui/src/app/commands.rs`
+  and `hrdr-app/src/commands/dispatch.rs`. Intentional: the TUI handler
+  intercepts TUI-only commands (`edit`, `reload`, `goto`, `find`, `next`/`prev`)
+  then falls through to the shared dispatcher. The `CommandHost` trait is the
+  DRY mechanism; the split is explained in a comment at the call site.
+- **Two project-dir walks** — `skills.rs::skill_dirs` and
+  `prompt.rs::gather_agent_docs` both walk cwd → `/` plus XDG dirs. Same
+  pattern, different payloads (skills vs AGENTS.md). A shared iterator would DRY
+  the traversal, but each is ~15 lines and what they collect diverges; judged
+  borderline over-engineering at this scale.
+- **Three `CommandHost` impls** — the real TUI host plus `TestHost` and
+  `TestLoginHost`. The trait is the shared mechanism; the two test hosts share
+  some trivial no-op bodies, but the login host carries login-specific state. A
+  shared test base would remove a few no-ops for very little gain.
+- **Secret-file write/edit guards are tailored, not shared.** `write.rs`,
+  `edit.rs` and `fileops.rs` each `bail!` with their own message ("refusing to
+  write…", "refusing to edit…", "copying it would place its contents…"). The
+  structure repeats; the wording is deliberately specific and meaningful to the
+  model. The read side (`guard_secret_read`) is already shared.
+- **`tree.rs` and `replace.rs` build their own walkers.** Genuinely different
+  configuration — variable `max_depth` and no ignore toggles in `tree.rs`;
+  `hidden(false)` with no `.gitignore` handling at all in `replace.rs` — so they
+  stayed out of the shared `ignore_walker` that `find` and `grep` now use.
+- **The three grep backends keep separate bodies.** `grep_ripgrep` /
+  `grep_posix` / `grep_builtin` have divergent flag sets (ripgrep's
+  `--hidden`/`--glob`, POSIX grep's documented `--exclude-dir` trap, the
+  built-in `ignore::Walk`). `GrepBackend` already dispatches them by exhaustive
+  match; shared methods would be a thin wrapper over nothing.
+- **Two "is this the ChatGPT/Codex endpoint" checks, on purpose.**
+  `hrdr-llm::detect_backend` uses a permissive host+substring test to pick a
+  wire protocol (a mirror or gateway still needs the Responses-API body shape);
+  `is_codex_oauth` uses strict equality against one constant to gate OAuth
+  credential injection. Unifying them would weaken a security boundary that is
+  documented at its call site.
+- **`AgentEvent` is matched in two places** — `transcript.rs` and
+  `subagent_transcript.rs` — but they build different artifacts (live TUI
+  transcript vs serializable `Record`) from the shared `apply_event` fold. Not a
+  fork.
+- **`lsp.rs` and `mcp/client.rs` spawn without `proc::spawn_group`.** They hold
+  `Option<ProcessGroup>` in long-lived struct fields, rely purely on the guard's
+  `Drop` with documented field ordering, and never kill explicitly — the
+  `GroupKill` handle would be dead weight.
+
+Seams already done right, worth copying rather than reinventing: `Shell`
+(`tools/shell.rs`), `EditorEngine` (`hrdr-editor`, trait + 2 impls with zero
+call-site branching), `Transport` (`mcp/types.rs`), `GrepBackend`, `ModelRef`,
+`ChatErrorKind`, `proc::ProcessGroup`.
 
 ## Standing constraints
 
