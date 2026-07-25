@@ -46,7 +46,7 @@ once (a deepseek delegate). Shipping only the guidance clause and building the
 bwrap wrap **the day writes to non-Claude models become routine** is a
 defensible call. Don't build a boundary for a threat you rarely run.
 
-Reference implementation: Codex (`~/Projects/mxaddict/codex/codex-rs`) —
+Reference implementation: Codex (`~/Projects/harness/codex/codex-rs`) —
 `linux-sandbox/` (bwrap primary + seccomp, Landlock backup, a
 `codex-linux-sandbox` helper binary, bundled bwrap),
 `sandboxing/src/seatbelt.rs` (macOS), `windows-sandbox-rs/` (Windows). Its
@@ -120,7 +120,7 @@ happens:
 ### 1. OS sandbox — for `shell` children (the untrusted-command vector)
 
 Applied to each spawned command, not to hrdr itself, so the app is unaffected.
-**Mirror Codex** (`~/Projects/mxaddict/codex/codex-rs`): one policy (writable
+**Mirror Codex** (`~/Projects/harness/codex/codex-rs`): one policy (writable
 roots + read/network access) behind a **per-OS backend**, each delegating to
 that OS's kernel mechanism. There is no userspace-only boundary — a child makes
 its syscalls straight to the kernel, so enforcement must sit **below** it
