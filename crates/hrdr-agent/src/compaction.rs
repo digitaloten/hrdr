@@ -601,9 +601,20 @@ impl Agent {
             bail!("compaction produced an empty summary");
         }
 
-        // Replace history: the original (coding) system prompt, a user
-        // message carrying the summary as the continuation seed, then the
-        // recent tail verbatim.
+        // Replace history: the system prompt, a user message carrying the
+        // summary as the continuation seed, then the recent tail verbatim.
+        //
+        // The system prompt is rebuilt rather than cloned, so the memory index
+        // reflects notes saved during THIS session. It has to happen here
+        // specifically: the agent's own `memory` write is visible to it only as a
+        // tool exchange in the history, and compaction is the moment that exchange
+        // is summarized away. Cloning the old prompt forward would leave the note
+        // on disk, absent from the index, and no longer in the conversation —
+        // saved and then invisible. Refreshing costs nothing here because
+        // compaction rewrites the history anyway, so the prefix cache is already
+        // gone. (A *running* session is otherwise never re-seeded — see
+        // `refresh_system`'s callers.)
+        self.refresh_system_prompt_in_place();
         let system = self.messages[0].clone();
         let tail: Vec<ChatMessage> = self.messages[tail_start..].to_vec();
         let continuation = format!(

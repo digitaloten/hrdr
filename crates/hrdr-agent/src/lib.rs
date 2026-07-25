@@ -859,15 +859,14 @@ pub struct Agent {
 
 /// Append a sub-agent persona (its role / operating instructions) after the base
 /// system prompt. A no-op when `persona` is empty.
-fn append_persona(mut system: String, persona: Option<&str>) -> String {
-    if let Some(p) = persona.map(str::trim).filter(|p| !p.is_empty()) {
-        system.push_str(
-            "\n\n# Your role\n\nThis role is your specific assignment; where it \
-             conflicts with the general guidance above, the role wins.\n\n",
-        );
-        system.push_str(p);
-    }
-    system
+fn persona_section(persona: Option<&str>) -> String {
+    let Some(p) = persona.map(str::trim).filter(|p| !p.is_empty()) else {
+        return String::new();
+    };
+    format!(
+        "\n\n# Your role\n\nThis role is your specific assignment; where it \
+         conflicts with the general guidance above, the role wins.\n\n{p}"
+    )
 }
 
 /// The most of a memory index loaded into the prompt each session, in lines /
@@ -957,19 +956,61 @@ fn gather_memory(project: &std::path::Path, global: &std::path::Path) -> Option<
 
 /// Append the saved-memory block after the base system prompt. A no-op when
 /// there's no memory.
-fn append_memory(mut system: String, memory: Option<&str>) -> String {
-    if let Some(m) = memory.map(str::trim).filter(|m| !m.is_empty()) {
-        system.push_str(
-            "\n\n# Memory\n\nDurable notes you saved in earlier sessions (via the `memory` \
-             tool). Trust them but verify against the code before acting; update or prune \
-             entries as things change. Detail lives in topic files you can `read`/`grep`.\n\n",
-        );
-        system.push_str(m);
-    }
-    system
+fn memory_section(memory: Option<&str>) -> String {
+    let Some(m) = memory.map(str::trim).filter(|m| !m.is_empty()) else {
+        return String::new();
+    };
+    format!(
+        "\n\n# Memory\n\nDurable notes you saved in earlier sessions (via the `memory` \
+         tool). Trust them but verify against the code before acting; update or prune \
+         entries as things change. Detail lives in topic files you can `read`/`grep`.\n\n{m}"
+    )
 }
 
-/// Build the full system prompt: base template + memory + persona.
+/// Build the system prompt as ordered, named sections.
+///
+/// Least-volatile first, so the longest possible prefix is byte-identical across
+/// runs and a provider prefix cache covers it. The order is the cache strategy
+/// and is documented in full on [`prompt::render_system`]; the short version:
+///
+///   1. base        — changes only when hrdr itself changes
+///   2. agents_md   — changes when the project's docs change on disk
+///   3. memory      — changes when the agent saves a note
+///   4. persona     — differs per agent profile
+///   5. environment — cwd and date: the volatile tail, dead last
+///
+/// Open a new session in a project whose docs and memory are untouched and
+/// everything up to (4) is a cache hit.
+///
+/// Persona sits at (4) rather than earlier on purpose. The common case is
+/// several *different* profiles working the *same* project — an `explore`, a
+/// `review` and a `coder` sub-agent — and they share the project's docs and
+/// memory while differing in persona. Putting persona last-but-one lets all of
+/// them share everything above it. The reverse case (one profile across
+/// different projects) shares less, but switching projects is far rarer than
+/// switching profiles within one.
+fn build_system_prompt_sections(
+    tools: &ToolRegistry,
+    cwd: &std::path::Path,
+    docs: Option<&str>,
+    memory: Option<&str>,
+    persona: Option<&str>,
+    is_subagent: bool,
+) -> Result<prompt::SystemPrompt> {
+    use prompt::{
+        SECTION_AGENTS_MD, SECTION_BASE, SECTION_ENVIRONMENT, SECTION_MEMORY, SECTION_PERSONA,
+    };
+    let mut p = prompt::SystemPrompt::default();
+    p.push(SECTION_BASE, render_system(tools, is_subagent)?);
+    p.push(SECTION_AGENTS_MD, prompt::agent_docs_section(docs));
+    p.push(SECTION_MEMORY, memory_section(memory));
+    p.push(SECTION_PERSONA, persona_section(persona));
+    p.push(SECTION_ENVIRONMENT, prompt::environment_section(cwd, tools));
+    Ok(p)
+}
+
+/// The assembled system prompt. See [`build_system_prompt_sections`] for the
+/// order and why it is that order.
 fn build_system_prompt(
     tools: &ToolRegistry,
     cwd: &std::path::Path,
@@ -978,13 +1019,7 @@ fn build_system_prompt(
     persona: Option<&str>,
     is_subagent: bool,
 ) -> Result<String> {
-    let system = render_system(tools, docs, is_subagent)?;
-    let system = append_memory(system, memory);
-    // Environment (incl. the working directory) goes out last — after memory —
-    // so the volatile `cwd` line is the tail of the prompt and everything before
-    // it stays a cache-shareable prefix across sibling sub-agents.
-    let system = prompt::append_environment(system, cwd, tools);
-    Ok(append_persona(system, persona))
+    Ok(build_system_prompt_sections(tools, cwd, docs, memory, persona, is_subagent)?.render())
 }
 
 /// The initial delegation-runtime projection for `config`. The single place the
@@ -1449,6 +1484,44 @@ impl Agent {
     fn reset_read_files(&mut self) {
         if let Ok(mut set) = self.ctx.read_files.lock() {
             set.clear();
+        }
+    }
+
+    /// Rebuild `messages[0]` with a freshly-read memory index, leaving project
+    /// docs as they are.
+    ///
+    /// Only compaction calls this. A running conversation is deliberately never
+    /// re-seeded from `AGENTS.md` — the agent that edited the file already has
+    /// the change in its context — but the *memory index* is different: a note
+    /// the agent saves this session exists for it only as a tool exchange in the
+    /// history, and compaction summarizes that exchange away. Without this the
+    /// note would be on disk, missing from the index, and gone from the
+    /// conversation: saved and then invisible.
+    ///
+    /// Re-reads from the memory roots already resolved for this cwd, so it does
+    /// no path resolution and cannot change scope.
+    pub(crate) fn refresh_system_prompt_in_place(&mut self) {
+        if !self.memory_enabled {
+            return;
+        }
+        let memory = match (&self.ctx.memory_project, &self.ctx.memory_global) {
+            (Some(proj), Some(glob)) => gather_memory(proj, glob),
+            _ => return,
+        };
+        let Ok(system) = build_system_prompt(
+            &self.tools,
+            &self.ctx.cwd,
+            self.project_docs.as_deref(),
+            memory.as_deref(),
+            self.agent_prompt.as_deref(),
+            self.is_subagent,
+        ) else {
+            return;
+        };
+        if self.messages.first().map(|m| m.role == Role::System) == Some(true) {
+            self.messages[0] = ChatMessage::system(system);
+        } else {
+            self.messages.insert(0, ChatMessage::system(system));
         }
     }
 
@@ -3993,6 +4066,133 @@ mod tests {
         // The project scope is the inherited root, NOT projects/<worktree-slug>.
         assert_eq!(agent.ctx.memory_project.as_deref(), Some(proj.as_path()));
         assert_eq!(agent.ctx.memory_global.as_deref(), Some(glob.as_path()));
+    }
+
+    /// The assembly order IS the cache strategy: least-volatile first, so a new
+    /// session in an unchanged project reuses every byte up to the environment
+    /// block. Pinned positionally because a well-meaning reorder is exactly how
+    /// this regresses, and nothing else would fail.
+    #[test]
+    fn system_prompt_is_ordered_least_volatile_first() {
+        use super::prompt::{
+            SECTION_AGENTS_MD, SECTION_BASE, SECTION_ENVIRONMENT, SECTION_MEMORY, SECTION_PERSONA,
+        };
+        let tools = hrdr_tools::ToolRegistry::with_defaults();
+        let p = super::build_system_prompt_sections(
+            &tools,
+            std::path::Path::new("/tmp/proj"),
+            Some("the project docs"),
+            Some("the memory index"),
+            Some("the persona"),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            p.names(),
+            [
+                SECTION_BASE,
+                SECTION_AGENTS_MD,
+                SECTION_MEMORY,
+                SECTION_PERSONA,
+                SECTION_ENVIRONMENT,
+            ],
+            "assembly order is the cache strategy: least-volatile first, so a new session \
+             in an unchanged project reuses every byte up to the environment block"
+        );
+    }
+
+    /// An agent with no persona and no memory simply has fewer sections — the
+    /// prompt must not carry an empty `# Memory` header, and the order of what
+    /// remains is unchanged.
+    #[test]
+    fn absent_sections_are_dropped_not_left_empty() {
+        use super::prompt::{SECTION_BASE, SECTION_ENVIRONMENT};
+        let tools = hrdr_tools::ToolRegistry::with_defaults();
+        let p = super::build_system_prompt_sections(
+            &tools,
+            std::path::Path::new("/tmp/proj"),
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(p.names(), [SECTION_BASE, SECTION_ENVIRONMENT]);
+        assert!(!p.render().contains("# Memory"));
+        assert!(!p.render().contains("# Your role"));
+    }
+
+    /// The cache boundary is a fold over section lengths, not a substring search:
+    /// everything before the environment block is the stable prefix.
+    #[test]
+    fn stable_prefix_ends_where_the_environment_begins() {
+        use super::prompt::SECTION_ENVIRONMENT;
+        let tools = hrdr_tools::ToolRegistry::with_defaults();
+        let p = super::build_system_prompt_sections(
+            &tools,
+            std::path::Path::new("/tmp/proj"),
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let rendered = p.render();
+        let len = p
+            .prefix_len_before(SECTION_ENVIRONMENT)
+            .expect("the environment section is always present");
+        assert!(
+            !rendered[..len].contains("/tmp/proj"),
+            "the stable prefix must not contain the working directory"
+        );
+        assert!(
+            rendered[len..].contains("/tmp/proj"),
+            "…which lives in the volatile tail"
+        );
+    }
+
+    /// Compaction rebuilds the system prompt so a note saved *this* session is in
+    /// the index afterwards. Without this the note is on disk, absent from the
+    /// index, and gone from the history compaction just summarized away — saved
+    /// and then invisible.
+    #[test]
+    fn compaction_refreshes_the_memory_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("project");
+        let glob = dir.path().join("global");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&glob).unwrap();
+
+        let mut agent = Agent::new(AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            ..Default::default()
+        })
+        .unwrap();
+        agent.memory_enabled = true;
+        agent.ctx.memory_project = Some(proj.clone());
+        agent.ctx.memory_global = Some(glob.clone());
+        agent.messages = vec![ChatMessage::system("stale prompt".to_string())];
+
+        // A note saved mid-session, the way the `memory` tool writes one.
+        std::fs::write(
+            proj.join("MEMORY.md"),
+            "- [Pin](pin.md) — this project pins hjkl 0.33.6\n",
+        )
+        .unwrap();
+
+        agent.refresh_system_prompt_in_place();
+        assert!(
+            agent.messages[0]
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("hjkl 0.33.6"),
+            "the refreshed prompt must carry the note saved this session: {}",
+            agent.messages[0].content.as_deref().unwrap_or_default()
+        );
     }
 
     #[test]
@@ -9236,6 +9436,68 @@ mod tests {
                 .expect("compaction must survive a transient error on the summarization call");
             assert_eq!(b, before);
             assert!(after < before, "history should shrink after compaction");
+        }
+
+        /// REGRESSION: a note saved *during* a session must survive compaction.
+        ///
+        /// The agent's own `memory` write is visible to it only as a tool
+        /// exchange in the history — and compaction is precisely the moment that
+        /// exchange is summarized away. The system prompt used to be cloned
+        /// forward verbatim, so the note ended up on disk, absent from the index,
+        /// and gone from the conversation: saved and then invisible. This drives
+        /// the real `compact()` end to end through the summarization call.
+        #[tokio::test]
+        async fn compaction_carries_a_note_saved_this_session_into_the_prompt() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("s1", "Summary of the conversation so far."),
+                stop_chunk("s1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let proj = dir.path().join("mem-project");
+            let glob = dir.path().join("mem-global");
+            std::fs::create_dir_all(&proj).unwrap();
+            std::fs::create_dir_all(&glob).unwrap();
+
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            // `test_cfg` disables memory for isolation; this test is about it.
+            agent.memory_enabled = true;
+            agent.ctx.memory_project = Some(proj.clone());
+            agent.ctx.memory_global = Some(glob.clone());
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+            assert!(
+                !agent.messages[0]
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("SAVED_MID_SESSION"),
+                "precondition: the note is not in the prompt yet"
+            );
+
+            // The agent saves a note, the way the `memory` tool writes one.
+            std::fs::write(
+                proj.join("MEMORY.md"),
+                "- [Pin](pin.md) — SAVED_MID_SESSION\n",
+            )
+            .unwrap();
+
+            agent.compact(None).await.expect("compaction succeeds");
+
+            assert!(
+                agent.messages[0]
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("SAVED_MID_SESSION"),
+                "the post-compaction prompt must carry the note saved this session"
+            );
         }
 
         // ── overflow recovery for a single oversized turn (Part A) ────────────
