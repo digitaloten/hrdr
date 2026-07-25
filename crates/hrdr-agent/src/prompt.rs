@@ -45,10 +45,10 @@ pub fn render_system(
     let tmpl = env.get_template("system")?;
 
     let has = |name: &str| tools.defs().iter().any(|d| d.function.name == name);
-    // The interpreter the `shell` tool runs (`"bash"`/`"sh"`), or `None` when the
-    // agent has no shell (read-only, or no shell on PATH). Read from the tool set
-    // itself so the prompt agrees with what was actually registered.
-    let shell_program = tools.shell_program();
+    // The shell the `shell` tool runs, or `None` when the agent has no shell
+    // (read-only, or no shell on PATH). Read from the tool set itself so the
+    // prompt agrees with what was actually registered.
+    let shell = tools.shell();
 
     let rendered = tmpl
         .render(context! {
@@ -66,10 +66,12 @@ pub fn render_system(
             is_subagent => is_subagent,
             // The shell section only renders when the `shell` tool is present (a
             // write agent on a machine with a shell on PATH). `shell_posix` gates
-            // an extra pitfall note shown only when the shell is plain POSIX `sh`
-            // rather than bash — the general shell guidance assumes bash.
-            has_shell => shell_program.is_some(),
-            shell_posix => shell_program == Some("sh"),
+            // an extra pitfall note shown only when the shell needs it (plain
+            // POSIX `sh`) — the general shell guidance assumes bash. Both come
+            // from `Shell`, so a new dialect answers for itself instead of
+            // falling through a program-name comparison here.
+            has_shell => shell.is_some(),
+            shell_posix => shell.is_some_and(|s| s.needs_posix_caveat()),
             instructions => instructions,
         })
         .context("rendering system template")?;
@@ -110,10 +112,9 @@ pub fn append_environment(mut system: String, cwd: &Path, tools: &ToolRegistry) 
     // Name the shell the `shell` tool runs, so the model writes for it — but only
     // when the agent actually has a shell (a read-only agent gets no line). Goes
     // before the working directory so `cwd` stays the volatile tail.
-    let shell_line = match tools.shell_program() {
-        Some("sh") => "\n- Shell: sh (POSIX — avoid bashisms)",
-        Some(_) => "\n- Shell: bash",
-        None => "",
+    let shell_line = match tools.shell() {
+        Some(shell) => format!("\n- Shell: {}", shell.env_label()),
+        None => String::new(),
     };
     system.push_str(&format!(
         "\n\nEnvironment:\n\
@@ -825,16 +826,16 @@ mod tests {
         let tools = ToolRegistry::with_defaults();
         let p = render_system(&tools, None, false).unwrap();
 
-        let shell = tools.shell_program();
+        let shell = tools.shell();
         assert_eq!(
             shell.is_some(),
             p.contains("Shell:"),
             "the Shell section appears exactly when a shell tool does"
         );
         assert_eq!(
-            shell == Some("sh"),
+            shell.is_some_and(|s| s.needs_posix_caveat()),
             p.contains("POSIX `sh`, NOT bash"),
-            "the POSIX-sh note appears exactly when the shell tool runs `sh`"
+            "the POSIX-sh note appears exactly when the shell asks for it"
         );
     }
 
@@ -1407,24 +1408,21 @@ mod tests {
     #[test]
     fn the_environment_names_the_shell_only_when_there_is_one() {
         let tools = ToolRegistry::with_defaults();
-        let shell = tools.shell_program().expect("a dev machine has a shell");
+        let shell = tools.shell().expect("a dev machine has a shell");
         let write = append_environment(
             render_system(&tools, None, false).unwrap(),
             Path::new("/tmp/x"),
             &tools,
         );
-        let expected = if shell == "sh" {
-            "- Shell: sh (POSIX — avoid bashisms)"
-        } else {
-            "- Shell: bash"
-        };
-        assert!(write.contains(expected), "{write}");
+        // Whatever this machine resolved, the line is the shell's own label.
+        let expected = format!("- Shell: {}", shell.env_label());
+        assert!(write.contains(&expected), "{write}");
 
         // A read-only agent has no shell tool → no line.
         let mut ro = ToolRegistry::with_defaults();
         let names = ro.read_only_names();
         ro.retain_only(&names);
-        assert!(ro.shell_program().is_none());
+        assert!(ro.shell().is_none());
         let read = append_environment(
             render_system(&ro, None, false).unwrap(),
             Path::new("/tmp/x"),

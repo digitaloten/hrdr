@@ -135,7 +135,8 @@ pub fn default_guardrails() -> Vec<Guardrail> {
     // this machine's real temp dir; the fetch command is POSIX everywhere,
     // because the shell is always bash/sh (on Windows, WSL or Git Bash — both
     // ship `curl`). There is no PowerShell path to write an `iwr | iex`
-    // equivalent for.
+    // equivalent for — if a dialect is ever added to [`crate::Shell`], this
+    // example (and the regex below) is the other place that assumes POSIX.
     let script = std::env::temp_dir().join("script.sh");
     let fetch_example = format!("curl -fsSL <url> -o {}", script.display());
     let pipe_message = format!(

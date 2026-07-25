@@ -18,6 +18,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::Shell;
+
 /// One configured hook: run `run` (with `{path}` substituted) after tool `on`
 /// successfully mutates a file matching `glob`.
 #[derive(Debug, Clone)]
@@ -54,24 +56,13 @@ impl Hook {
     }
 }
 
-/// Substitute `{path}` with the shell-quoted file path.
+/// Substitute `{path}` with the file path quoted for `shell`.
 ///
-/// POSIX single-quote escaping (`'` -> `'\''`) on every platform, because hooks
-/// run through the same shell the `shell` tool resolves (`bash`, then `sh`) —
-/// on Windows that means WSL or Git Bash. There is no `cmd.exe` path to quote
-/// for, which is what makes this airtight: single quotes neutralize everything,
-/// where `cmd`'s double quotes still expand `%VAR%` and honour `^`.
-fn render_command(template: &str, path: &Path) -> String {
-    let quoted = format!("'{}'", path.display().to_string().replace('\'', r"'\''"));
+/// The quoting is the shell's own (see [`Shell::quote`]) — hooks run through the
+/// same interpreter the `shell` tool resolves, so they must quote the same way.
+fn render_command(template: &str, path: &Path, shell: Shell) -> String {
+    let quoted = shell.quote(&path.display().to_string());
     template.replace("{path}", &quoted)
-}
-
-/// The shell every hook runs through — the same one the `shell` tool and `watch`
-/// use, so a hook can't end up in a different interpreter than the commands the
-/// model writes. `None` when the machine has neither `bash` nor `sh`, which is
-/// reported to the model rather than silently skipping the hook.
-fn hook_shell() -> Option<(String, Vec<String>)> {
-    crate::tools::shell::user_shell()
 }
 
 /// Run every hook matching (`tool`, `path`) sequentially, returning one
@@ -80,17 +71,26 @@ fn hook_shell() -> Option<(String, Vec<String>)> {
 /// the model sees the effect, not the chatter.
 pub async fn run_file_hooks(hooks: &[Hook], tool: &str, path: &Path, cwd: &Path) -> Vec<String> {
     let mut notes = Vec::new();
-    for hook in hooks.iter().filter(|h| h.matches(tool, path, cwd)) {
-        let cmd_line = render_command(&hook.run, path);
-        let Some((program, shell_args)) = hook_shell() else {
-            notes.push(format!(
-                "hook `{}` skipped: no shell available to run it",
-                hook.run
-            ));
-            continue;
-        };
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(shell_args).arg(&cmd_line);
+    let matching: Vec<&Hook> = hooks
+        .iter()
+        .filter(|h| h.matches(tool, path, cwd))
+        .collect();
+    // Resolve the shell once, and only when a hook actually matched — reported
+    // once rather than per hook, and never on the common no-hooks path.
+    if matching.is_empty() {
+        return notes;
+    }
+    let Some(shell) = Shell::detect() else {
+        notes.push(
+            "file hooks skipped: no shell (bash or sh) on PATH to run them — on Windows, \
+             use WSL or Git Bash"
+                .to_string(),
+        );
+        return notes;
+    };
+    for hook in matching {
+        let cmd_line = render_command(&hook.run, path, shell);
+        let mut cmd = shell.command(&cmd_line);
         cmd.current_dir(cwd);
         // A file hook (a formatter, mostly) never reads stdin; leaving it
         // inherited would let it block on the TUI's terminal. Null it — the
@@ -243,24 +243,29 @@ pub async fn run_event_hooks(
     cwd: &Path,
 ) -> HookOutcome {
     let mut out = HookOutcome::default();
-    let matching = hooks.iter().filter(|h| {
+    let matches = |h: &EventHook| {
         h.event == event
             && match tool {
                 Some(t) => h.on == "*" || h.on == t,
                 None => true,
             }
-    });
+    };
+    // As in `run_file_hooks`: one shell, resolved only once a hook matched.
+    if !hooks.iter().any(matches) {
+        return out;
+    }
+    let matching = hooks.iter().filter(|h| matches(h));
+    let Some(shell) = Shell::detect() else {
+        out.notes.push(
+            "lifecycle hooks skipped: no shell (bash or sh) on PATH to run them — on \
+             Windows, use WSL or Git Bash"
+                .to_string(),
+        );
+        return out;
+    };
     let payload = payload.to_string();
     for hook in matching {
-        let Some((program, shell_args)) = hook_shell() else {
-            out.notes.push(format!(
-                "hook `{}` skipped: no shell available to run it",
-                hook.run
-            ));
-            continue;
-        };
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(shell_args).arg(&hook.run);
+        let mut cmd = shell.command(&hook.run);
         cmd.current_dir(cwd)
             .env("HRDR_HOOK_EVENT", event.as_str())
             .env("HRDR_HOOK_TOOL", tool.unwrap_or(""))
@@ -382,7 +387,11 @@ mod tests {
 
     #[test]
     fn command_rendering_quotes_path() {
-        let cmd = render_command("fmt {path} && check {path}", Path::new("/tmp/a b.rs"));
+        let cmd = render_command(
+            "fmt {path} && check {path}",
+            Path::new("/tmp/a b.rs"),
+            Shell::Bash,
+        );
         // POSIX quoting on every platform — hooks always run through bash/sh.
         assert_eq!(cmd, "fmt '/tmp/a b.rs' && check '/tmp/a b.rs'");
     }
@@ -392,16 +401,20 @@ mod tests {
     /// `^` escaping) are just literal bytes inside the quotes.
     #[test]
     fn command_rendering_neutralizes_shell_metacharacters() {
-        let cmd = render_command("fmt {path}", Path::new("/tmp/a %PATH% ^ b.rs"));
+        let cmd = render_command("fmt {path}", Path::new("/tmp/a %PATH% ^ b.rs"), Shell::Bash);
         assert_eq!(cmd, "fmt '/tmp/a %PATH% ^ b.rs'");
 
         // `'` -> `'\''`: close the quote, escaped literal quote, reopen.
-        let cmd = render_command("fmt {path}", Path::new("/tmp/it's.rs"));
+        let cmd = render_command("fmt {path}", Path::new("/tmp/it's.rs"), Shell::Bash);
         assert_eq!(cmd, r"fmt '/tmp/it'\''s.rs'");
 
         // A path that tries to close the quote and append a command stays one
         // argument — the injected `;` and `rm` are inside the quotes.
-        let cmd = render_command("fmt {path}", Path::new("/tmp/a'; rm -rf /; '.rs"));
+        let cmd = render_command(
+            "fmt {path}",
+            Path::new("/tmp/a'; rm -rf /; '.rs"),
+            Shell::Bash,
+        );
         assert_eq!(cmd, r"fmt '/tmp/a'\''; rm -rf /; '\''.rs'");
     }
 

@@ -1154,7 +1154,7 @@ impl App {
             );
             return;
         }
-        let Some((program, mut args)) = hrdr_tools::user_shell() else {
+        let Some(shell) = hrdr_tools::Shell::detect() else {
             self.system(
                 "no shell found — !commands need bash or a POSIX shell on PATH (on Windows, \
                  use WSL or Git Bash)"
@@ -1195,13 +1195,12 @@ impl App {
         }
         let cwd = hrdr_app::agent_cwd(&self.agent);
         let tx = self.tx.clone();
-        args.push(command.clone());
         let task_command = command.clone();
+        let spawn_command = command.clone();
         let handle = tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
-            let mut child = tokio::process::Command::new(&program);
+            let mut child = shell.command(&spawn_command);
             child
-                .args(&args)
                 .current_dir(&cwd)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
@@ -1215,7 +1214,7 @@ impl App {
                             AgentEvent::ToolEnd {
                                 id: task_id,
                                 name: "shell".to_string(),
-                                result: format!("couldn't run {program}: {e}"),
+                                result: format!("couldn't run {}: {e}", shell.program()),
                                 ok: false,
                             },
                             None,

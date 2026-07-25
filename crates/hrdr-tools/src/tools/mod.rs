@@ -197,7 +197,7 @@ pub use ls::LsTool;
 pub use lsp_nav::{DefinitionTool, ReferencesTool, RenameTool};
 pub use read::ReadTool;
 pub use replace::ReplaceTool;
-pub use shell::{ShellTool, available_shell_tools, user_shell};
+pub use shell::{Shell, ShellTool, available_shell_tools};
 pub use todo::TodoTool;
 pub use tree::TreeTool;
 pub use watch::WatchTool;
@@ -716,7 +716,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let c = ctx(dir.path().to_path_buf());
-        let err = ShellTool::bash()
+        let err = ShellTool::new(Shell::Bash)
             .execute(serde_json::json!({"command": "git add -A"}), &c)
             .await
             .unwrap_err();
@@ -725,7 +725,7 @@ mod tests {
         // PATH is the WSL stub, which errors without a distro installed.
         #[cfg(unix)]
         {
-            let out = ShellTool::bash()
+            let out = ShellTool::new(Shell::Bash)
                 .execute(serde_json::json!({"command": "echo ok"}), &c)
                 .await
                 .unwrap();
@@ -1101,7 +1101,7 @@ mod tests {
     #[tokio::test]
     async fn bash_echo_captures_output() {
         let c = ctx(std::path::PathBuf::from("."));
-        let out = ShellTool::bash()
+        let out = ShellTool::new(Shell::Bash)
             .execute(serde_json::json!({"command": "echo hello_hrdr"}), &c)
             .await
             .unwrap();
@@ -1112,7 +1112,7 @@ mod tests {
     #[tokio::test]
     async fn bash_exit_nonzero_includes_status() {
         let c = ctx(std::path::PathBuf::from("."));
-        let out = ShellTool::bash()
+        let out = ShellTool::new(Shell::Bash)
             .execute(serde_json::json!({"command": "exit 42"}), &c)
             .await
             .unwrap();
@@ -1123,7 +1123,7 @@ mod tests {
     #[tokio::test]
     async fn bash_timeout_kills_process_and_keeps_partial_output() {
         let c = ctx(std::path::PathBuf::from("."));
-        let out = ShellTool::bash()
+        let out = ShellTool::new(Shell::Bash)
             .execute(
                 serde_json::json!({"command": "echo early; sleep 30", "timeout_ms": 300}),
                 &c,
@@ -1142,7 +1142,7 @@ mod tests {
     async fn bash_small_output_has_no_overflow_pointer() {
         let dir = tempfile::tempdir().unwrap();
         let c = ctx(dir.path().to_path_buf());
-        let out = ShellTool::bash()
+        let out = ShellTool::new(Shell::Bash)
             .execute(serde_json::json!({"command": "echo tiny"}), &c)
             .await
             .unwrap();
@@ -1165,7 +1165,7 @@ mod tests {
         c.max_output_lines = 10;
 
         // Generate 50 lines of ~20 chars each (well above both caps).
-        let result = ShellTool::bash()
+        let result = ShellTool::new(Shell::Bash)
             .execute(
                 serde_json::json!({"command": "for i in $(seq 1 50); do echo \"line $i: some padding text here\"; done"}),
                 &c,
@@ -1203,7 +1203,7 @@ mod tests {
         // 2 MiB of 'a' with no newline at all.
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            ShellTool::bash().execute(
+            ShellTool::new(Shell::Bash).execute(
                 serde_json::json!({
                     "command": "head -c 2097152 /dev/zero | tr '\\0' 'a'"
                 }),

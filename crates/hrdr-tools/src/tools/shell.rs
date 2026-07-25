@@ -16,20 +16,95 @@ use super::{BASH_LINE_CAP, DEFAULT_SHELL_TIMEOUT_MS};
 /// The shell interpreter this session runs commands through, resolved once from
 /// `PATH`: `bash`, then POSIX `sh`. hrdr targets UNIX workflows, so there is no
 /// PowerShell path; on Windows this means WSL or Git Bash. The model is told
-/// which one it has (see [`ShellTool::description`]) so it can avoid bashisms
+/// which one it has (see [`Shell::tool_description`]) so it can avoid bashisms
 /// when only `sh` is present.
-#[derive(Clone, Copy)]
-enum ShellKind {
+///
+/// **This enum is the single seam for shell support.** Everything that differs
+/// between shells lives on it: how the interpreter is invoked, how an argument
+/// is quoted for it, what the model is told it has. Callers spawn through
+/// [`Shell::command`] and quote through [`Shell::quote`] rather than assembling
+/// a program name and `-c` themselves — so adding a dialect (PowerShell, say)
+/// means adding a variant and filling in these methods, with no caller left
+/// branching on which shell it got.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shell {
     Bash,
     Posix,
 }
 
-impl ShellKind {
-    /// The interpreter program to invoke as `<program> -c <command>`.
-    fn program(self) -> &'static str {
+impl Shell {
+    /// Resolve the session's shell from `PATH`: `bash`, then POSIX `sh`. `None`
+    /// when neither exists (on Windows, install WSL or Git Bash).
+    pub fn detect() -> Option<Shell> {
+        if which::which("bash").is_ok() {
+            Some(Shell::Bash)
+        } else if which::which("sh").is_ok() {
+            Some(Shell::Posix)
+        } else {
+            None
+        }
+    }
+
+    /// The interpreter program name.
+    pub fn program(self) -> &'static str {
         match self {
-            ShellKind::Bash => "bash",
-            ShellKind::Posix => "sh",
+            Shell::Bash => "bash",
+            Shell::Posix => "sh",
+        }
+    }
+
+    /// The arguments that precede the command string. Separate from
+    /// [`Shell::program`] because it is not universally `-c` — PowerShell would
+    /// want `-NoProfile -Command`.
+    fn invoke_args(self) -> &'static [&'static str] {
+        match self {
+            Shell::Bash | Shell::Posix => &["-c"],
+        }
+    }
+
+    /// A `Command` that runs `command` through this shell. Nothing else is
+    /// configured — the caller owns cwd, stdio, timeouts and process groups.
+    pub fn command(self, command: &str) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(self.program());
+        cmd.args(self.invoke_args()).arg(command);
+        cmd
+    }
+
+    /// `s` quoted so this shell treats it as one literal argument.
+    ///
+    /// POSIX single-quoting (`'` -> `'\''`): inside single quotes nothing is
+    /// live — no expansion, no escape character, no word splitting. A dialect
+    /// with different rules (PowerShell doubles `'` and has no `'\''` form)
+    /// overrides here rather than at the call sites.
+    pub fn quote(self, s: &str) -> String {
+        match self {
+            Shell::Bash | Shell::Posix => format!("'{}'", s.replace('\'', r"'\''")),
+        }
+    }
+
+    /// The `shell` tool description handed to the model — it names the actual
+    /// interpreter, so the model writes for the shell it really has.
+    pub fn tool_description(self) -> &'static str {
+        match self {
+            Shell::Bash => BASH_DESC,
+            Shell::Posix => SH_DESC,
+        }
+    }
+
+    /// How the prompt's Environment block names this shell.
+    pub fn env_label(self) -> &'static str {
+        match self {
+            Shell::Bash => "bash",
+            Shell::Posix => "sh (POSIX — avoid bashisms)",
+        }
+    }
+
+    /// Whether the general shell guidance (written for bash) needs the extra
+    /// "avoid bashisms" pitfall note.
+    pub fn needs_posix_caveat(self) -> bool {
+        match self {
+            Shell::Posix => true,
+            Shell::Bash => false,
         }
     }
 }
@@ -38,21 +113,13 @@ impl ShellKind {
 /// auto-detected (`bash` or POSIX `sh`); its name is always `shell`, and its
 /// description names the actual interpreter in use.
 pub struct ShellTool {
-    kind: ShellKind,
+    shell: Shell,
 }
 
 impl ShellTool {
-    /// A `shell` tool backed by `bash`.
-    pub fn bash() -> Self {
-        Self {
-            kind: ShellKind::Bash,
-        }
-    }
-    /// A `shell` tool backed by POSIX `sh`.
-    pub fn posix() -> Self {
-        Self {
-            kind: ShellKind::Posix,
-        }
+    /// A `shell` tool that runs commands through `shell`.
+    pub fn new(shell: Shell) -> Self {
+        Self { shell }
     }
 }
 
@@ -107,13 +174,10 @@ impl Tool for ShellTool {
         "shell"
     }
     fn description(&self) -> &'static str {
-        match self.kind {
-            ShellKind::Bash => BASH_DESC,
-            ShellKind::Posix => SH_DESC,
-        }
+        self.shell.tool_description()
     }
-    fn shell_program(&self) -> Option<&'static str> {
-        Some(self.kind.program())
+    fn shell(&self) -> Option<Shell> {
+        Some(self.shell)
     }
     fn parameters(&self) -> serde_json::Value {
         shell_parameters("Shell command to run.")
@@ -123,8 +187,8 @@ impl Tool for ShellTool {
         if let Some(msg) = crate::check_guardrails(&a.command, &ctx.guardrails) {
             bail!("command blocked: {msg}");
         }
-        let mut cmd = tokio::process::Command::new(self.kind.program());
-        cmd.arg("-c").arg(&a.command).current_dir(&ctx.cwd);
+        let mut cmd = self.shell.command(&a.command);
+        cmd.current_dir(&ctx.cwd);
         let timeout = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS));
         run_streamed_command(cmd, timeout, ctx).await
     }
@@ -437,34 +501,61 @@ fn cap_display(text: &str, max_bytes: usize, max_lines: usize, from_tail: bool) 
 /// register it in the same presence-gated loop as its other tools). `bash`
 /// first, then POSIX `sh`; empty when neither is on `PATH`.
 pub fn available_shell_tools() -> Vec<std::sync::Arc<dyn Tool>> {
-    detect_shell()
-        .map(|tool| vec![std::sync::Arc::new(tool) as std::sync::Arc<dyn Tool>])
+    Shell::detect()
+        .map(|shell| vec![std::sync::Arc::new(ShellTool::new(shell)) as std::sync::Arc<dyn Tool>])
         .unwrap_or_default()
-}
-
-/// Resolve the session's shell from `PATH`: `bash`, then POSIX `sh`. `None`
-/// when neither exists (on Windows, install WSL or Git Bash).
-fn detect_shell() -> Option<ShellTool> {
-    if which::which("bash").is_ok() {
-        Some(ShellTool::bash())
-    } else if which::which("sh").is_ok() {
-        Some(ShellTool::posix())
-    } else {
-        None
-    }
-}
-
-/// The interpreter for a *user-typed* `!command` (the TUI's shell escape):
-/// `(program, leading args)` — the same shell the `shell` tool resolves to
-/// (`bash -c`, then `sh -c`). `None` when neither is on `PATH`. The command
-/// string is appended as the final argument.
-pub fn user_shell() -> Option<(String, Vec<String>)> {
-    detect_shell().map(|s| (s.kind.program().to_string(), vec!["-c".to_string()]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every dialect answers the whole seam, and the answers agree with each
+    /// other: `command` invokes `program` with `invoke_args`, and `quote`
+    /// produces something that shell would read as one literal argument. A new
+    /// variant added to `Shell` fails this test until it fills all of them in
+    /// — which is the point of keeping them on one type.
+    #[test]
+    fn every_shell_answers_the_whole_seam() {
+        for shell in [Shell::Bash, Shell::Posix] {
+            assert!(!shell.program().is_empty());
+            assert!(!shell.invoke_args().is_empty());
+            assert!(!shell.env_label().is_empty());
+            assert!(!shell.tool_description().is_empty());
+
+            let cmd = shell.command("echo hi");
+            let std_cmd = cmd.as_std();
+            assert!(
+                std_cmd
+                    .get_program()
+                    .to_string_lossy()
+                    .ends_with(shell.program()),
+                "{shell:?} spawns its own program"
+            );
+            let args: Vec<_> = std_cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            let mut expected: Vec<String> =
+                shell.invoke_args().iter().map(|a| a.to_string()).collect();
+            expected.push("echo hi".to_string());
+            assert_eq!(args, expected, "{shell:?} passes the command last");
+
+            // Quoting is a wrapper, not a passthrough: the raw string can't
+            // survive unquoted or it would be re-parsed by the shell.
+            let quoted = shell.quote("a b");
+            assert_ne!(quoted, "a b", "{shell:?} must quote");
+            assert!(quoted.contains("a b"), "{shell:?} keeps the content");
+        }
+    }
+
+    /// The POSIX caveat tracks the dialect, not a program-name string — the
+    /// prompt gate reads this rather than comparing against `"sh"`.
+    #[test]
+    fn only_posix_sh_asks_for_the_bashism_caveat() {
+        assert!(Shell::Posix.needs_posix_caveat());
+        assert!(!Shell::Bash.needs_posix_caveat());
+    }
 
     /// A newline-less run far larger than the cap is bounded *as it is read* —
     /// `buf` never grows past `cap` — and the over-long line is drained through
@@ -533,8 +624,8 @@ mod tests {
 
         // Both backends, through the schema each actually advertises.
         let schemas = [
-            ShellTool::bash().parameters(),
-            ShellTool::posix().parameters(),
+            ShellTool::new(Shell::Bash).parameters(),
+            ShellTool::new(Shell::Posix).parameters(),
         ];
         for schema in schemas {
             let desc = schema["properties"]["timeout_ms"]["description"]
@@ -607,7 +698,7 @@ mod tests {
         );
 
         let ctx = ToolContext::new(dir.path().to_path_buf());
-        let out = ShellTool::bash()
+        let out = ShellTool::new(Shell::Bash)
             .execute(json!({"command": command, "timeout_ms": 300}), &ctx)
             .await
             .unwrap();
@@ -657,7 +748,7 @@ mod tests {
         // 50 lines of ~33 chars each (~1650 bytes total) — comfortably over
         // both caps, and small enough to stay under the 5x in-memory ring too
         // (so this exercises the final display trim, not the ring cap).
-        let result = ShellTool::bash()
+        let result = ShellTool::new(Shell::Bash)
             .execute(
                 serde_json::json!({"command": "for i in $(seq 1 50); do echo \"line $i: some padding text here\"; done"}),
                 &c,

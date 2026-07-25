@@ -44,8 +44,8 @@ pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use tools::{
     CopyTool, DefinitionTool, DeleteTool, EditTool, FindTool, GitTool, GrepTool, LsTool, MoveTool,
-    ReadTool, ReferencesTool, RenameTool, ReplaceTool, ShellTool, TodoTool, TreeTool, WatchTool,
-    WriteTool, available_shell_tools, redact_secret_diffs, user_shell,
+    ReadTool, ReferencesTool, RenameTool, ReplaceTool, Shell, ShellTool, TodoTool, TreeTool,
+    WatchTool, WriteTool, available_shell_tools, redact_secret_diffs,
 };
 pub use web::{WebFetchTool, WebSearchTool};
 
@@ -848,11 +848,10 @@ pub trait Tool: Send + Sync {
         self.read_only()
     }
 
-    /// If this is the `shell` tool, the interpreter it runs (`"bash"` or `"sh"`);
-    /// `None` for every other tool. Lets the prompt name the session's shell and
-    /// gate POSIX-`sh`-specific guidance, without the tool set knowing about
-    /// shell kinds.
-    fn shell_program(&self) -> Option<&'static str> {
+    /// If this is the `shell` tool, the [`Shell`] it runs; `None` for every other
+    /// tool. Lets the prompt name the session's shell and gate dialect-specific
+    /// guidance by asking `Shell` rather than matching on a program name.
+    fn shell(&self) -> Option<Shell> {
         None
     }
 
@@ -877,12 +876,11 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// The interpreter the registered `shell` tool runs (`"bash"` or `"sh"`), or
-    /// `None` when no shell tool is present (a read-only agent, or a machine with
-    /// no shell on `PATH`). Drives the prompt's shell gating and the Environment
-    /// block's `Shell:` line.
-    pub fn shell_program(&self) -> Option<&'static str> {
-        self.tools.values().find_map(|t| t.shell_program())
+    /// The [`Shell`] the registered `shell` tool runs, or `None` when no shell
+    /// tool is present (a read-only agent, or a machine with no shell on `PATH`).
+    /// Drives the prompt's shell gating and the Environment block's `Shell:` line.
+    pub fn shell(&self) -> Option<Shell> {
+        self.tools.values().find_map(|t| t.shell())
     }
 
     /// The default set: file/search/todo/web tools plus the `shell` tool when a

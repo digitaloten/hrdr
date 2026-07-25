@@ -162,13 +162,11 @@ impl Tool for WatchTool {
 /// error: a check that hangs (a network call with no timeout of its own) must not
 /// wedge the watch.
 async fn run_check(command: &str, ctx: &ToolContext) -> Result<(Option<i32>, String)> {
-    let Some((program, args)) = super::shell::user_shell() else {
+    let Some(shell) = super::Shell::detect() else {
         bail!("no shell available to run the watch check");
     };
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args)
-        .arg(command)
-        .current_dir(&ctx.cwd)
+    let mut cmd = shell.command(command);
+    cmd.current_dir(&ctx.cwd)
         // A model-supplied check must never block reading the TUI's terminal
         // (e.g. a `sudo` password prompt) — nothing feeds it stdin.
         .stdin(Stdio::null())
