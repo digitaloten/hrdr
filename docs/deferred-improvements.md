@@ -2,11 +2,17 @@
 
 Smaller items that were identified but not yet done or tracked elsewhere. Larger
 efforts have their own docs (`agent-logic-migration.md`, `task-revive.md`,
-`security-audit.md`, `dry-audit.md`, `memory-tool-analysis.md`). Sandbox mode is
-issue #13; the Codex catalog pin is issue #2.
+`security-audit.md`, `dry-audit.md`). Sandbox mode is issue #13; the Codex
+catalog pin is issue #2.
 
 ## Tooling / agent capability
 
+- **Memory drift detection.** A periodic prune/verify pass over the `memory`
+  store — check each `<slug>.md` still has a `MEMORY.md` pointer (and vice
+  versa) and flag/prune stale or contradicted memories. Cheap now that the tool
+  regenerates the pointer index on every change, so the files and index can't
+  drift structurally; this is the leftover §G7 thread from the (now-shipped)
+  memory-tool design.
 - **Model pre-flight validation.** Verify a configured model actually exists on
   its provider before starting a turn, so a typo'd/unavailable model fails fast
   with a clear message instead of mid-turn.
