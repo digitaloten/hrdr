@@ -241,10 +241,9 @@ impl SystemPrompt {
     /// with respect to that section. `None` when the section isn't present.
     ///
     /// This is what a provider cache breakpoint wants: the boundary between the
-    /// bytes that repeat across sessions and the ones that don't. Test-only
-    /// until the Anthropic breakpoint lands (`compare.md`, hermes finding 1),
-    /// which is the production caller it exists for.
-    #[cfg(test)]
+    /// bytes that repeat across sessions and the ones that don't. The native
+    /// Anthropic path turns it into a second `cache_control` marker; see
+    /// [`crate::Agent`]'s use of [`SECTION_ENVIRONMENT`].
     pub fn prefix_len_before(&self, name: &str) -> Option<usize> {
         let idx = self.sections.iter().position(|(n, _)| *n == name)?;
         Some(self.sections[..idx].iter().map(|(_, b)| b.len()).sum())

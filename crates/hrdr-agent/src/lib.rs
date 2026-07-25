@@ -1064,6 +1064,11 @@ fn build_system_prompt_sections(
 
 /// The assembled system prompt. See [`build_system_prompt_sections`] for the
 /// order and why it is that order.
+/// The assembled prompt, plus the byte offset where its cache-stable prefix ends
+/// — everything before the environment block, which is the volatile tail (`cwd`,
+/// date). The native Anthropic path turns the offset into a second
+/// `cache_control` breakpoint so sibling write sub-agents, which share a persona
+/// but each have their own worktree `cwd`, stop re-sending the shared part.
 fn build_system_prompt(
     tools: &ToolRegistry,
     cwd: &std::path::Path,
@@ -1071,8 +1076,10 @@ fn build_system_prompt(
     memory: &MemoryIndex,
     persona: Option<&str>,
     is_subagent: bool,
-) -> Result<String> {
-    Ok(build_system_prompt_sections(tools, cwd, docs, memory, persona, is_subagent)?.render())
+) -> Result<(String, Option<usize>)> {
+    let p = build_system_prompt_sections(tools, cwd, docs, memory, persona, is_subagent)?;
+    let split = p.prefix_len_before(prompt::SECTION_ENVIRONMENT);
+    Ok((p.render(), split))
 }
 
 /// The initial delegation-runtime projection for `config`. The single place the
@@ -1340,7 +1347,7 @@ impl Agent {
             .as_ref()
             .map(|(p, g)| gather_memory(p, g))
             .unwrap_or_default();
-        let system = build_system_prompt(
+        let (system, system_cache_split) = build_system_prompt(
             &tools,
             &config.cwd,
             &project_docs,
@@ -1371,6 +1378,7 @@ impl Agent {
             include_usage: config.stream_usage,
         });
         client.set_headers(resolved.headers().to_vec());
+        client.set_system_cache_split(system_cache_split);
         client.set_api_version(resolved.api_version().map(str::to_string));
         client.set_cache_ttl_1h(config.prompt_cache_ttl.as_deref().map(str::trim) == Some("1h"));
         client.set_timeout(
@@ -1564,7 +1572,7 @@ impl Agent {
             (Some(proj), Some(glob)) => gather_memory(proj, glob),
             _ => return,
         };
-        let Ok(system) = build_system_prompt(
+        let Ok((system, system_cache_split)) = build_system_prompt(
             &self.tools,
             &self.ctx.cwd,
             &self.project_docs,
@@ -1574,6 +1582,9 @@ impl Agent {
         ) else {
             return;
         };
+        // Keep the client's cache boundary in step with the prompt it describes;
+        // a stale offset would close the breakpoint in the wrong place.
+        self.client.set_system_cache_split(system_cache_split);
         if self.messages.first().map(|m| m.role == Role::System) == Some(true) {
             self.messages[0] = ChatMessage::system(system);
         } else {
@@ -1605,7 +1616,7 @@ impl Agent {
         } else {
             MemoryIndex::default()
         };
-        let Ok(system) = build_system_prompt(
+        let Ok((system, system_cache_split)) = build_system_prompt(
             &self.tools,
             &self.ctx.cwd,
             &self.project_docs,
@@ -1615,6 +1626,9 @@ impl Agent {
         ) else {
             return;
         };
+        // Keep the client's cache boundary in step with the prompt it describes;
+        // a stale offset would close the breakpoint in the wrong place.
+        self.client.set_system_cache_split(system_cache_split);
         if self.messages.first().map(|m| m.role == Role::System) == Some(true) {
             self.messages[0] = ChatMessage::system(system);
         } else {

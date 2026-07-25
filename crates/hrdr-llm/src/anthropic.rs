@@ -52,6 +52,7 @@ pub(crate) fn build_body(
     stop: &[String],
     cache: CacheMode,
     ttl_1h: bool,
+    system_cache_split: Option<usize>,
     messages: &[ChatMessage],
     tools: &[ToolDef],
 ) -> Value {
@@ -88,8 +89,17 @@ pub(crate) fn build_body(
     }
 
     if !system.is_empty() {
-        let mut blocks = system;
+        let mut blocks = split_system_for_cache(system, system_cache_split);
         if ephemeral {
+            // Two breakpoints when the caller gave a boundary: one closing the
+            // stable prefix (everything up to the environment block) and the
+            // rolling one at the end. Sibling write sub-agents share a persona
+            // but each has its own worktree `cwd`, so the tail differs while
+            // everything above it does not — without the first breakpoint that
+            // shared prefix is re-sent for every one of them.
+            if blocks.len() > 1 {
+                blocks[0]["cache_control"] = crate::types::cache_control(ttl_1h);
+            }
             mark_last_block(&mut blocks, ttl_1h);
         }
         body["system"] = Value::Array(blocks);
@@ -150,6 +160,32 @@ pub(crate) fn thinking_budget(effort: Option<&str>, max_tokens: u32) -> Option<u
 /// same-role messages (e.g. a run of tool results) are coalesced into one
 /// message, since Anthropic requires alternating user/assistant turns and tool
 /// results to ride in a `user` message.
+/// Split the assembled system prompt into `[stable prefix, volatile tail]` at
+/// `at` bytes, so a cache breakpoint can close the prefix.
+///
+/// A no-op — one block, as before — when there is no boundary, when it lands
+/// outside the text, or when it is not a char boundary (it always is: it is a
+/// sum of section lengths, but slicing on a bad index would panic and a
+/// mis-cached prompt is not worth that).
+fn split_system_for_cache(system: Vec<Value>, at: Option<usize>) -> Vec<Value> {
+    let Some(at) = at else { return system };
+    // Only meaningful for the single assembled system message; anything else is
+    // left alone rather than guessed at.
+    if system.len() != 1 {
+        return system;
+    }
+    let Some(text) = system[0].get("text").and_then(|t| t.as_str()) else {
+        return system;
+    };
+    if at == 0 || at >= text.len() || !text.is_char_boundary(at) {
+        return system;
+    }
+    vec![
+        json!({ "type": "text", "text": &text[..at] }),
+        json!({ "type": "text", "text": &text[at..] }),
+    ]
+}
+
 fn split_system_and_messages(messages: &[ChatMessage]) -> (Vec<Value>, Vec<Value>) {
     let mut system: Vec<Value> = Vec::new();
     let mut out: Vec<Value> = Vec::new();
@@ -277,6 +313,7 @@ pub(crate) async fn chat_stream(
     cache: CacheMode,
     ttl_1h: bool,
     extra_headers: &[(String, String)],
+    system_cache_split: Option<usize>,
     messages: &[ChatMessage],
     tools: &[ToolDef],
 ) -> Result<crate::ChatStream> {
@@ -289,6 +326,7 @@ pub(crate) async fn chat_stream(
         stop,
         cache,
         ttl_1h,
+        system_cache_split,
         messages,
         tools,
     );
@@ -708,6 +746,7 @@ mod tests {
             &[],
             CacheMode::Off,
             false,
+            None,
             &msgs,
             &[],
         );
@@ -751,6 +790,7 @@ mod tests {
             &[],
             CacheMode::Off,
             false,
+            None,
             &[user("go"), assistant, result],
             &[],
         );
@@ -798,6 +838,7 @@ mod tests {
             &[],
             CacheMode::Off,
             false,
+            None,
             &[user("go"), assistant],
             &[],
         );
@@ -824,6 +865,7 @@ mod tests {
             &[],
             CacheMode::Off,
             false,
+            None,
             &msgs,
             &[],
         );
@@ -848,6 +890,7 @@ mod tests {
             &[],
             CacheMode::Off,
             false,
+            None,
             &[user("go")],
             &tools,
         );
@@ -870,6 +913,7 @@ mod tests {
             &[],
             CacheMode::Ephemeral,
             false,
+            None,
             &[sys("s"), user("hi")],
             &tools,
         );
@@ -879,6 +923,63 @@ mod tests {
         let last = m.last().unwrap();
         let blocks = last["content"].as_array().unwrap();
         assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
+    }
+
+    /// A caller-supplied boundary splits the system prompt into a cached stable
+    /// prefix and a volatile tail, and marks BOTH — the extra breakpoint is what
+    /// lets sibling write sub-agents (same persona, different worktree `cwd`)
+    /// stop re-sending everything above their environment block.
+    #[test]
+    fn a_system_cache_split_yields_two_marked_blocks() {
+        let body = build_body(
+            "claude",
+            256,
+            None,
+            None,
+            None,
+            &[],
+            CacheMode::Ephemeral,
+            false,
+            Some(6), // "STABLE" | "VOLATILE"
+            &[sys("STABLEVOLATILE"), user("hi")],
+            &[],
+        );
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(system.len(), 2, "prefix and tail are separate blocks");
+        assert_eq!(system[0]["text"], "STABLE");
+        assert_eq!(system[1]["text"], "VOLATILE");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(system[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// Degenerate boundaries leave the prompt as one block rather than risking a
+    /// mis-placed breakpoint — or a panic on a non-char boundary.
+    #[test]
+    fn a_bad_system_cache_split_is_ignored() {
+        let one_block = |at: Option<usize>| {
+            let body = build_body(
+                "claude",
+                256,
+                None,
+                None,
+                None,
+                &[],
+                CacheMode::Ephemeral,
+                false,
+                at,
+                &[sys("héllo"), user("hi")],
+                &[],
+            );
+            body["system"].as_array().unwrap().len()
+        };
+        assert_eq!(one_block(None), 1, "no boundary given");
+        assert_eq!(one_block(Some(0)), 1, "empty prefix");
+        assert_eq!(one_block(Some(999)), 1, "past the end");
+        assert_eq!(
+            one_block(Some(2)),
+            1,
+            "mid-codepoint: would panic if sliced"
+        );
     }
 
     #[test]
@@ -892,6 +993,7 @@ mod tests {
             &[],
             CacheMode::Off,
             false,
+            None,
             &[sys("s"), user("hi")],
             &[],
         );
@@ -915,6 +1017,7 @@ mod tests {
             &[],
             CacheMode::Off,
             false,
+            None,
             &[user("hi")],
             &[],
         );
@@ -932,6 +1035,7 @@ mod tests {
             &[],
             CacheMode::Off,
             false,
+            None,
             &[user("hi")],
             &[],
         );
@@ -953,6 +1057,7 @@ mod tests {
             &["STOP".to_string(), "END".to_string()],
             CacheMode::Off,
             false,
+            None,
             &[user("hi")],
             &[],
         );
@@ -971,6 +1076,7 @@ mod tests {
             &[],
             CacheMode::Off,
             false,
+            None,
             &[user("hi")],
             &[],
         );
@@ -986,6 +1092,7 @@ mod tests {
             &[],
             CacheMode::Off,
             false,
+            None,
             &[user("hi")],
             &[],
         );
@@ -1330,6 +1437,7 @@ mod tests {
             &[],
             CacheMode::Off,
             false,
+            None,
             &history,
             &[],
         );

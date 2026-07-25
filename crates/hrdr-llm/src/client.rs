@@ -351,6 +351,7 @@ pub struct Client {
     params: crate::RequestParams,
     /// Extra HTTP headers (provider-configured) sent with every request.
     extra_headers: Vec<(String, String)>,
+    system_cache_split: Option<usize>,
     /// Azure OpenAI API version. When set, requests append `?api-version=<v>` and
     /// authenticate with an `api-key` header instead of `Bearer` (Azure is still
     /// the OpenAI chat-completions wire, just a different URL + auth).
@@ -521,6 +522,7 @@ impl Client {
             effort: None,
             params: crate::RequestParams::default(),
             extra_headers: Vec::new(),
+            system_cache_split: None,
             api_version: None,
             backend,
         }
@@ -601,6 +603,16 @@ impl Client {
 
     /// Set the Azure OpenAI API version (enables the Azure URL + `api-key` auth
     /// quirks); `None` for a standard OpenAI-compatible endpoint.
+    /// Byte offset in the system prompt where the cache-stable prefix ends.
+    ///
+    /// The caller assembles the prompt least-volatile-first, so everything below
+    /// this offset repeats across runs while the tail (working directory, date)
+    /// does not. Used only by the native Anthropic path, which turns it into a
+    /// second `cache_control` breakpoint; other backends ignore it.
+    pub fn set_system_cache_split(&mut self, at: Option<usize>) {
+        self.system_cache_split = at;
+    }
+
     pub fn set_api_version(&mut self, api_version: Option<String>) {
         self.api_version = api_version;
     }
@@ -725,6 +737,7 @@ impl Client {
                 self.cache,
                 self.cache_1h,
                 &self.extra_headers,
+                self.system_cache_split,
                 messages,
                 tools,
             )
