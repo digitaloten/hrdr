@@ -28,7 +28,9 @@ static REQUEST_LOG: OnceLock<Option<WireLog>> = OnceLock::new();
 /// stop-at-cap behavior and avoiding warning/rename spam.
 static REQUEST_LOG_STOPPED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-static REQUEST_LOG_WARNING: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+/// One-shot slot for a client-level warning (wire log rotated, an auth header
+/// stripped from `extra_headers`) awaiting delivery to the caller.
+static CLIENT_WARNING: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// The open wire log together with its path, so [`log_wire`] can rotate the
 /// file in place (rename active → `<name>.1`, reopen a fresh active file).
@@ -37,10 +39,10 @@ struct WireLog {
     file: Mutex<std::fs::File>,
 }
 
-/// Take the one-shot wire-log warning for delivery through the caller's normal
+/// Take the one-shot client warning for delivery through the caller's normal
 /// event channel. This avoids writing stderr while a TUI owns the terminal.
-pub fn take_request_log_warning() -> Option<String> {
-    REQUEST_LOG_WARNING
+pub fn take_client_warning() -> Option<String> {
+    CLIENT_WARNING
         .get_or_init(|| Mutex::new(None))
         .lock()
         .ok()
@@ -173,10 +175,10 @@ fn wire_log_over_cap(current: u64, line_len: u64, cap: u64) -> bool {
     current >= cap || line_len > cap.saturating_sub(current)
 }
 
-/// Publish the one-shot wire-log warning for delivery through the caller's
-/// event channel (see [`take_request_log_warning`]).
-fn set_request_log_warning(msg: String) {
-    if let Ok(mut pending) = REQUEST_LOG_WARNING.get_or_init(|| Mutex::new(None)).lock() {
+/// Publish the one-shot client warning for delivery through the caller's
+/// event channel (see [`take_client_warning`]).
+fn set_client_warning(msg: String) {
+    if let Ok(mut pending) = CLIENT_WARNING.get_or_init(|| Mutex::new(None)).lock() {
         *pending = Some(msg);
     }
 }
@@ -213,7 +215,7 @@ fn log_wire(kind: &str, fields: serde_json::Value) {
             // so the warning is naturally throttled to once per rotation.
             match rotate_wire_log(&wire.path, &mut file) {
                 Ok(()) => {
-                    set_request_log_warning(format!(
+                    set_client_warning(format!(
                         "request log reached {mib} MiB; rotated to {} \
                          (keeping the newest {mib} MiB, at most {} MiB on disk)",
                         rotated_wire_log_path(&wire.path).display(),
@@ -224,7 +226,7 @@ fn log_wire(kind: &str, fields: serde_json::Value) {
                     // Rotation failed: fall back to the historical stop-at-cap
                     // behavior, warning once and then staying silent.
                     if !REQUEST_LOG_STOPPED.swap(true, Relaxed) {
-                        set_request_log_warning(format!(
+                        set_client_warning(format!(
                             "request log rotation failed; logging stopped after \
                              reaching {mib} MiB"
                         ));
@@ -443,6 +445,54 @@ pub fn wire_protocol(base_url: &str) -> &'static str {
     }
 }
 
+/// Header names that carry a credential. Only the client's own auth may set one
+/// of these — see [`apply_extra_headers`].
+const AUTH_HEADER_NAMES: [&str; 3] = ["authorization", "x-api-key", "api-key"];
+
+/// Latches after the first stripped auth header so the warning is emitted once
+/// per process instead of once per request.
+static AUTH_HEADER_STRIPPED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `name` is an auth-type header name. Compared case-insensitively
+/// because HTTP header names are: a provider config keyed `authorization` or
+/// `X-API-Key` has to match the same way `Authorization` does.
+fn is_auth_header_name(name: &str) -> bool {
+    AUTH_HEADER_NAMES
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
+}
+
+/// Apply operator-configured extra headers to `req`, skipping auth-type names.
+///
+/// `RequestBuilder::header` **appends**, so an `Authorization`/`x-api-key`
+/// arriving through `extra_headers` would ride on the wire *alongside* the real
+/// credential — and which of two same-named headers a server or proxy honors is
+/// undefined. Dropping the configured one leaves exactly one credential on the
+/// request. Shared by all three backends' request builders so the guarantee
+/// can't drift between them.
+pub(crate) fn apply_extra_headers(
+    mut req: reqwest::RequestBuilder,
+    extra_headers: &[(String, String)],
+) -> reqwest::RequestBuilder {
+    for (k, v) in extra_headers {
+        if is_auth_header_name(k) {
+            // Removing configured headers silently is a debugging trap, so say
+            // so once — through the event channel rather than stderr (a TUI may
+            // own the terminal). The value is never logged: it's a credential.
+            if !AUTH_HEADER_STRIPPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                set_client_warning(format!(
+                    "ignoring `{k}` from this provider's extra headers: auth headers come \
+                     from the configured credential, and sending two is ambiguous"
+                ));
+            }
+            continue;
+        }
+        req = req.header(k, v);
+    }
+    req
+}
+
 impl Client {
     /// `base_url` should include the `/v1` suffix, e.g. `http://localhost:8080/v1`.
     pub fn new(
@@ -613,9 +663,7 @@ impl Client {
     fn auth(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         // Apply operator-configured extra headers first so the auth header
         // (applied next) always wins — avoids ambiguity from header ordering.
-        for (k, v) in &self.extra_headers {
-            req = req.header(k, v);
-        }
+        req = apply_extra_headers(req, &self.extra_headers);
         if let Some(key) = &self.api_key {
             req = match self.backend {
                 Backend::Anthropic => req
@@ -1084,6 +1132,115 @@ mod tests {
             detect_backend("http://[::1]:8080/v1"),
             Backend::OpenAi,
             "an IPv6-literal endpoint must not mis-detect as Anthropic"
+        );
+    }
+
+    #[test]
+    fn auth_header_names_match_case_insensitively() {
+        for name in [
+            "Authorization",
+            "authorization",
+            "AUTHORIZATION",
+            "x-api-key",
+            "X-API-Key",
+            "api-key",
+            "Api-Key",
+        ] {
+            assert!(is_auth_header_name(name), "{name} must count as auth");
+        }
+        // Headers that merely look adjacent are not auth and must pass through.
+        for name in [
+            "anthropic-version",
+            "ChatGPT-Account-Id",
+            "x-api-key-id",
+            "proxy-authorization",
+        ] {
+            assert!(!is_auth_header_name(name), "{name} must not count as auth");
+        }
+    }
+
+    #[test]
+    fn extra_headers_cannot_duplicate_or_forge_the_credential() {
+        let mut client = Client::new(
+            "https://api.openai.com/v1",
+            Some("real-key".to_string()),
+            "gpt-4o",
+        );
+        client.set_headers(vec![
+            ("Authorization".to_string(), "Bearer forged".to_string()),
+            (
+                "authorization".to_string(),
+                "Bearer forged-lower".to_string(),
+            ),
+            ("X-API-Key".to_string(), "forged".to_string()),
+            ("api-key".to_string(), "forged".to_string()),
+            ("ChatGPT-Account-Id".to_string(), "acct-1".to_string()),
+        ]);
+        let req = client
+            .auth(client.http.post(client.url("chat/completions")))
+            .build()
+            .expect("request builds");
+
+        // `header()` appends, so a leaked auth entry would show up as a second
+        // value here — the real credential must be the only one.
+        let auth: Vec<_> = req.headers().get_all("authorization").iter().collect();
+        assert_eq!(auth.len(), 1, "exactly one Authorization header");
+        assert_eq!(auth[0].to_str().unwrap(), "Bearer real-key");
+        assert!(req.headers().get("x-api-key").is_none());
+        assert!(req.headers().get("api-key").is_none());
+        // A non-auth extra header still rides along untouched.
+        assert_eq!(
+            req.headers()
+                .get("chatgpt-account-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "acct-1"
+        );
+    }
+
+    #[test]
+    fn anthropic_auth_keeps_a_single_x_api_key() {
+        let mut client = Client::new(
+            "https://api.anthropic.com/v1",
+            Some("real-key".to_string()),
+            "claude-sonnet-4-5",
+        );
+        client.set_headers(vec![("x-api-key".to_string(), "forged".to_string())]);
+        let req = client
+            .auth(client.http.post(client.url("messages")))
+            .build()
+            .expect("request builds");
+
+        let keys: Vec<_> = req.headers().get_all("x-api-key").iter().collect();
+        assert_eq!(keys.len(), 1, "exactly one x-api-key header");
+        assert_eq!(keys[0].to_str().unwrap(), "real-key");
+    }
+
+    #[test]
+    fn apply_extra_headers_filters_auth_names_for_the_streaming_backends() {
+        // The Anthropic/Codex streaming paths build their own requests and reach
+        // the filter through this helper, so assert on it directly too.
+        let http = reqwest::Client::new();
+        let req = apply_extra_headers(
+            http.post("http://localhost/v1/messages")
+                .header("x-api-key", "real-key"),
+            &[
+                ("Authorization".to_string(), "Bearer forged".to_string()),
+                ("X-API-KEY".to_string(), "forged".to_string()),
+                ("originator".to_string(), "hrdr".to_string()),
+            ],
+        )
+        .build()
+        .expect("request builds");
+
+        assert!(req.headers().get("authorization").is_none());
+        let keys: Vec<_> = req.headers().get_all("x-api-key").iter().collect();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].to_str().unwrap(), "real-key");
+        assert_eq!(
+            req.headers().get("originator").unwrap().to_str().unwrap(),
+            "hrdr"
         );
     }
 

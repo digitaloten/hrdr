@@ -504,7 +504,7 @@ impl Agent {
             let acc = self
                 .connect_and_drain(&defs, &mut overflow_compacted, &mut on_event)
                 .await?;
-            if let Some(warning) = hrdr_llm::take_request_log_warning() {
+            if let Some(warning) = hrdr_llm::take_client_warning() {
                 on_event(AgentEvent::Notice(warning));
             }
 

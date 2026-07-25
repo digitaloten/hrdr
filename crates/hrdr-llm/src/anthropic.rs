@@ -298,9 +298,9 @@ pub(crate) async fn chat_stream(
     if let Some(key) = api_key {
         req = req.header("x-api-key", key);
     }
-    for (k, v) in extra_headers {
-        req = req.header(k, v);
-    }
+    // Auth-type names are filtered out here, so `x-api-key` above stays the only
+    // credential on the request (see `crate::client::apply_extra_headers`).
+    req = crate::client::apply_extra_headers(req, extra_headers);
     // Betas: interleaved thinking (reason between tool calls) when thinking is on
     // with tools; extended 1-hour cache TTL when requested.
     let mut betas: Vec<&str> = Vec::new();

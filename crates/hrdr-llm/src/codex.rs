@@ -205,10 +205,10 @@ pub(crate) async fn chat_stream(
         req = req.bearer_auth(key);
     }
     // Provider-configured extra headers carry `ChatGPT-Account-Id` (and anything
-    // else the integrator sets via `Client::set_headers`).
-    for (k, v) in extra_headers {
-        req = req.header(k, v);
-    }
+    // else the integrator sets via `Client::set_headers`). Auth-type names are
+    // filtered out, so the Bearer above stays the only credential on the request
+    // (see `crate::client::apply_extra_headers`).
+    req = crate::client::apply_extra_headers(req, extra_headers);
 
     let resp = req.send().await.context("chat stream request failed")?;
     let status = resp.status();
