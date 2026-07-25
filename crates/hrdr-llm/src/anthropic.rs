@@ -261,7 +261,8 @@ fn mark_last_block(blocks: &mut [Value], ttl_1h: bool) {
 ///
 /// Takes slices to avoid cloning the full history on every retry. The request
 /// body is serialized before any network I/O, so the borrow does not extend
-/// into the returned [`crate::ChatStream`] future.
+/// into the returned [`crate::ChatStream`] future. Writes its own `request` /
+/// `error_response` / `sse` wire-log records (see [`crate::client::log_wire`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn chat_stream(
     http: &reqwest::Client,
@@ -278,7 +279,7 @@ pub(crate) async fn chat_stream(
     extra_headers: &[(String, String)],
     messages: &[ChatMessage],
     tools: &[ToolDef],
-) -> Result<(Value, crate::ChatStream)> {
+) -> Result<crate::ChatStream> {
     let body = build_body(
         model,
         max_tokens,
@@ -291,8 +292,9 @@ pub(crate) async fn chat_stream(
         messages,
         tools,
     );
+    let url = format!("{base_url}/messages");
     let mut req = http
-        .post(format!("{base_url}/messages"))
+        .post(&url)
         .header("anthropic-version", API_VERSION)
         .json(&body);
     if let Some(key) = api_key {
@@ -313,6 +315,12 @@ pub(crate) async fn chat_stream(
     if !betas.is_empty() {
         req = req.header("anthropic-beta", betas.join(","));
     }
+    // Log before the send, not after: the round-trip and the status check below
+    // both happen here, so logging afterwards would miss exactly the requests
+    // the wire log exists to explain (a 401, a 400 on a malformed tool block).
+    // Only the body goes in — the credential is a header (`x-api-key`), and
+    // `build_body` never sees it.
+    crate::client::log_wire("request", json!({"url": url, "body": body}));
     let resp = req.send().await.context("chat stream request failed")?;
     let status = resp.status();
     if !status.is_success() {
@@ -321,6 +329,10 @@ pub(crate) async fn chat_stream(
             crate::capped_read::read_capped_text(resp, crate::capped_read::MAX_DIAGNOSTIC_BYTES)
                 .await;
         let status_u16 = status.as_u16();
+        crate::client::log_wire(
+            "error_response",
+            json!({"status": status_u16, "body": text}),
+        );
         return Err(anyhow::Error::new(crate::client::ChatError {
             status: Some(status_u16),
             retry_after,
@@ -403,6 +415,9 @@ pub(crate) async fn chat_stream(
             for sse_ev in events {
                 let data = &sse_ev.data;
                 if data.is_empty() { continue; }
+                // Raw line, before parsing: a payload we fail to decode is the
+                // one worth having in the log.
+                crate::client::log_wire("sse", json!({"data": data}));
                 let ev: Value = serde_json::from_str(data)
                     .with_context(|| format!("decoding stream event: {data}"))?;
                 if let Some(out) = map_event(
@@ -454,7 +469,7 @@ pub(crate) async fn chat_stream(
             })?;
         }
     };
-    Ok((body, Box::pin(stream)))
+    Ok(Box::pin(stream))
 }
 
 /// Translate one Anthropic stream event into a [`ChatChunk`] (or `None` for

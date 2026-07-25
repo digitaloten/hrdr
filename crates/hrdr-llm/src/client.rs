@@ -184,7 +184,13 @@ fn set_client_warning(msg: String) {
 }
 
 /// Append one `{"ts":…,"kind":…,…}` line to the wire log (no-op when off).
-fn log_wire(kind: &str, fields: serde_json::Value) {
+///
+/// `pub(crate)` because the wire log is a promise about *every* backend, and the
+/// native Anthropic/Codex paths build and send their own requests — they have to
+/// be able to log them (see [`crate::anthropic::chat_stream`],
+/// [`crate::codex::chat_stream`]). Returns before touching `fields` when the log
+/// is off, so a call site costs only the `json!` it hands in.
+pub(crate) fn log_wire(kind: &str, fields: serde_json::Value) {
     use std::sync::atomic::Ordering::Relaxed;
 
     let Some(wire) = request_log() else {
@@ -701,8 +707,11 @@ impl Client {
         messages: &[ChatMessage],
         tools: &[ToolDef],
     ) -> Result<ChatStream> {
+        // The native backends build, log, and send their own requests — see the
+        // `log_wire` calls in `crate::anthropic` / `crate::codex`. Logging here
+        // instead would only ever record a request that already succeeded.
         if self.backend == Backend::Anthropic {
-            let (body, stream) = crate::anthropic::chat_stream(
+            return crate::anthropic::chat_stream(
                 &self.http,
                 &self.base_url,
                 self.api_key.as_deref(),
@@ -720,18 +729,10 @@ impl Client {
                 messages,
                 tools,
             )
-            .await?;
-            log_wire(
-                "request",
-                serde_json::json!({
-                    "url": format!("{}/messages", self.base_url),
-                    "body": body,
-                }),
-            );
-            return Ok(stream);
+            .await;
         }
         if self.backend == Backend::Codex {
-            let (body, stream) = crate::codex::chat_stream(
+            return crate::codex::chat_stream(
                 &self.http,
                 &self.base_url,
                 self.api_key.as_deref(),
@@ -746,15 +747,7 @@ impl Client {
                 messages,
                 tools,
             )
-            .await?;
-            log_wire(
-                "request",
-                serde_json::json!({
-                    "url": format!("{}/responses", self.base_url),
-                    "body": body,
-                }),
-            );
-            return Ok(stream);
+            .await;
         }
         let body = self.body_json(&self.request(messages, tools, true));
         log_wire(

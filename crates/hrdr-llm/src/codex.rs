@@ -171,8 +171,9 @@ fn split_instructions_and_input(messages: &[ChatMessage]) -> (String, Vec<Value>
 ///
 /// Takes slices to avoid cloning the full history on every retry. The request
 /// body is serialized before any network I/O, so the borrow does not extend into
-/// the returned [`crate::ChatStream`] future. Returns the serialized body (for
-/// the wire log) alongside the stream, mirroring [`crate::anthropic::chat_stream`].
+/// the returned [`crate::ChatStream`] future. Writes its own `request` /
+/// `error_response` / `sse` wire-log records (see [`crate::client::log_wire`]),
+/// mirroring [`crate::anthropic::chat_stream`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn chat_stream(
     http: &reqwest::Client,
@@ -186,7 +187,7 @@ pub(crate) async fn chat_stream(
     extra_headers: &[(String, String)],
     messages: &[ChatMessage],
     tools: &[ToolDef],
-) -> Result<(Value, crate::ChatStream)> {
+) -> Result<crate::ChatStream> {
     let body = build_body(
         model,
         effort,
@@ -196,8 +197,9 @@ pub(crate) async fn chat_stream(
         messages,
         tools,
     );
+    let url = format!("{base_url}/responses");
     let mut req = http
-        .post(format!("{base_url}/responses"))
+        .post(&url)
         // Codex identifies the client via `originator`; the endpoint expects it.
         .header("originator", "hrdr")
         .json(&body);
@@ -210,6 +212,12 @@ pub(crate) async fn chat_stream(
     // (see `crate::client::apply_extra_headers`).
     req = crate::client::apply_extra_headers(req, extra_headers);
 
+    // Log before the send, not after: the round-trip and the status check below
+    // both happen here, so logging afterwards would miss exactly the requests
+    // the wire log exists to explain (an expired OAuth token, a rejected item
+    // in `input[]`). Only the body goes in — the credential is the `Bearer`
+    // header, and `build_body` never sees it.
+    crate::client::log_wire("request", json!({"url": url, "body": body}));
     let resp = req.send().await.context("chat stream request failed")?;
     let status = resp.status();
     if !status.is_success() {
@@ -218,6 +226,10 @@ pub(crate) async fn chat_stream(
             crate::capped_read::read_capped_text(resp, crate::capped_read::MAX_DIAGNOSTIC_BYTES)
                 .await;
         let status_u16 = status.as_u16();
+        crate::client::log_wire(
+            "error_response",
+            json!({"status": status_u16, "body": text}),
+        );
         return Err(anyhow::Error::new(crate::client::ChatError {
             status: Some(status_u16),
             retry_after,
@@ -288,6 +300,9 @@ pub(crate) async fn chat_stream(
             for sse_ev in events {
                 let data = sse_ev.data.trim();
                 if data.is_empty() { continue; }
+                // Raw line, before parsing: a payload we fail to decode is the
+                // one worth having in the log.
+                crate::client::log_wire("sse", json!({"data": data}));
                 // The Responses stream has no `[DONE]` sentinel — it terminates
                 // with `response.completed`/`.incomplete`/`.failed`.
                 let ev: Value = serde_json::from_str(data)
@@ -313,7 +328,7 @@ pub(crate) async fn chat_stream(
             })?;
         }
     };
-    Ok((body, Box::pin(stream)))
+    Ok(Box::pin(stream))
 }
 
 /// Per-stream state threaded through [`map_event`]. Responses keys function
