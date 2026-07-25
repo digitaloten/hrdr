@@ -62,25 +62,6 @@ future work; those are collected under **Standing constraints** at the bottom.
   once on `hrdr_llm::owner_only_options`. Setting per-user ACLs needs a new
   dependency in `hrdr-llm` and is a deliberate non-goal until someone runs hrdr
   on Windows in anger.
-- **Stale `system_cache_split` on resume.** `set_messages` (TUI session resume
-  at `hrdr-tui/src/app/session.rs:365`, `task_revive` at `delegation.rs:183`)
-  restores the _saved_ `messages[0]` system prompt, but the client keeps the
-  split offset computed for the _freshly built_ prompt in `Agent::new`. If the
-  two differ in length (memory/docs changed since save, older binary), the
-  Anthropic breakpoint lands at the wrong byte of the restored text — harmless
-  to the model (the two blocks concatenate to the same string; OOB/non-char
-  boundary offsets are already ignored) but the stable-prefix reuse degrades.
-  Fix candidates: rebuild the prompt on resume (matches the "regenerate the
-  whole prompt every session" design — also unfreezes memory/docs across
-  resume), or clear the split when `set_messages` installs a foreign system
-  message.
-- **OpenRouter path ignores the system cache split.**
-  `hrdr-llm/src/types.rs::apply_cache_breakpoints` marks the system message as
-  one block and the last message — it never sees `system_cache_split`, so
-  OpenRouter-routed Anthropic models don't get the stable/volatile split the
-  native path got in `b1a698f`. Threading the split through would mean splitting
-  the system message's content into two `text` parts, each with `cache_control`.
-  Low priority until someone runs Anthropic via OpenRouter in anger.
 - **`O_NOFOLLOW` covers only the final path component.** A symlinked _parent_
   directory is still traversed on the wire-log open, and there is no Windows
   equivalent applied at all, so callers relying on it keep their own preflight

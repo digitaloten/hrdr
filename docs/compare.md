@@ -751,13 +751,10 @@ into two marked blocks there. All 4 breakpoints now spent: tools, stable prefix,
 system tail, rolling last message. Sub-nit (a) — persona after environment — was
 fixed by the section reorder in `c5e5ced`; persona now sits just above the
 environment tail, and the breakpoint sits between them. The residuals from the
-caveat stand: the OpenRouter/OpenAI-shape path (`apply_cache_breakpoints`) still
-marks the system message as **one** block and ignores the split, and a
-**resumed** session (`set_messages` — TUI resume, `task_revive`) restores the
-saved `messages[0]` while the client keeps the split computed for the freshly
-built prompt, so the breakpoint can land at the wrong byte of the restored text
-(harmless to the model — the blocks concatenate — but the shared-prefix reuse
-degrades). Both are tracked in `deferred-improvements.md`.
+caveat were closed the same day: a resumed/revived session now rebuilds the
+prompt so the split matches the installed text (`5adc9ff`), and the
+OpenRouter/OpenAI-shape path (`apply_cache_breakpoints`) emits the system
+message as two marked parts at the same boundary (`e02cb5f`).
 
 **2. hrdr injects a cloned repo's `AGENTS.md` into its system prompt unscanned —
 and silently drops it if over 64 KiB.** Two defects in one place.
