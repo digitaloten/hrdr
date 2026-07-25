@@ -803,7 +803,7 @@ pub struct Agent {
     /// ([`AgentConfig::preserve_recent_tokens`]).
     preserve_recent_tokens: u32,
     /// Gathered `AGENTS.md` project instructions for the current cwd, if any.
-    project_docs: Option<String>,
+    project_docs: prompt::AgentDocs,
     /// The last `refresh_system` found different project docs on disk than were in
     /// the prompt. Read by a frontend after `/new` to say so.
     project_docs_changed: bool,
@@ -934,38 +934,65 @@ fn read_memory_index(root: &std::path::Path) -> Option<(PathBuf, String)> {
 
 /// Assemble the memory block for the system prompt from the two scopes' indexes
 /// (global first, then project). `None` when both are empty.
-fn gather_memory(project: &std::path::Path, global: &std::path::Path) -> Option<String> {
-    let g = read_memory_index(global);
-    let p = read_memory_index(project);
-    if g.is_none() && p.is_none() {
-        return None;
+/// The saved-memory index split by scope, so each can be its own prompt section.
+///
+/// Same reason as [`prompt::AgentDocs`]: the global index is identical in every
+/// project, so a section of its own keeps it inside the reusable prefix when the
+/// project index differs.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MemoryIndex {
+    pub(crate) global: Option<String>,
+    pub(crate) project: Option<String>,
+}
+
+impl MemoryIndex {
+    /// Whether either scope found an index. Test-only: production code passes the
+    /// struct straight to the section builders, which no-op per scope.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.global.is_none() && self.project.is_none()
     }
-    let mut out = String::new();
-    if let Some((path, content)) = g {
-        out.push_str(&format!(
-            "## Global — {}\n\n{}\n\n",
-            path.display(),
-            content
-        ));
+}
+
+fn gather_memory(project: &std::path::Path, global: &std::path::Path) -> MemoryIndex {
+    MemoryIndex {
+        global: read_memory_index(global)
+            .map(|(path, content)| format!("## {}\n\n{}", path.display(), content)),
+        project: read_memory_index(project)
+            .map(|(path, content)| format!("## {}\n\n{}", path.display(), content)),
     }
-    if let Some((path, content)) = p {
-        out.push_str(&format!("## Project — {}\n\n{}\n", path.display(), content));
-    }
-    Some(out)
 }
 
 /// Append the saved-memory block after the base system prompt. A no-op when
 /// there's no memory.
-fn memory_section(memory: Option<&str>) -> String {
+fn global_memory_section(memory: Option<&str>) -> String {
     let Some(m) = memory.map(str::trim).filter(|m| !m.is_empty()) else {
         return String::new();
     };
-    format!(
-        "\n\n# Memory\n\nDurable notes you saved in earlier sessions (via the `memory` \
-         tool). Trust them but verify against the code before acting; update or prune \
-         entries as things change. Detail lives in topic files you can `read`/`grep`.\n\n{m}"
-    )
+    format!("\n\n# Memory — global\n\n{MEMORY_PREAMBLE}\n\n{m}")
 }
+
+/// The project-scoped memory index as its own section.
+///
+/// Carries the shared preamble only when there is no global section above it to
+/// have carried it already — the explanation is the same either way, and paying
+/// for it twice is pure waste.
+fn project_memory_section(memory: Option<&str>, global_present: bool) -> String {
+    let Some(m) = memory.map(str::trim).filter(|m| !m.is_empty()) else {
+        return String::new();
+    };
+    if global_present {
+        format!("\n\n# Memory — project\n\n{m}")
+    } else {
+        format!("\n\n# Memory — project\n\n{MEMORY_PREAMBLE}\n\n{m}")
+    }
+}
+
+/// What the memory block means, stated once. Whichever memory section comes
+/// first carries it.
+const MEMORY_PREAMBLE: &str = "Durable notes you saved in earlier sessions (via the `memory` \
+     tool). Trust them but verify against the code before acting; update or prune entries as \
+     things change. Detail lives in topic files you can `read`/`grep`.";
 
 /// Build the system prompt as ordered, named sections.
 ///
@@ -992,25 +1019,44 @@ fn memory_section(memory: Option<&str>) -> String {
 fn build_system_prompt_sections(
     tools: &ToolRegistry,
     cwd: &std::path::Path,
-    docs: Option<&str>,
-    memory: Option<&str>,
+    docs: &prompt::AgentDocs,
+    memory: &MemoryIndex,
     persona: Option<&str>,
     is_subagent: bool,
 ) -> Result<prompt::SystemPrompt> {
     use prompt::{
-        SECTION_AGENTS_MD, SECTION_BASE, SECTION_ENVIRONMENT, SECTION_MEMORY, SECTION_PERSONA,
+        SECTION_BASE, SECTION_ENVIRONMENT, SECTION_GLOBAL_AGENTS_MD, SECTION_GLOBAL_MEMORY,
+        SECTION_PERSONA, SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY,
     };
     let mut p = prompt::SystemPrompt::default();
+    // 1. identical for every agent hrdr runs
     p.push(SECTION_BASE, prompt::base_section());
-    p.push(SECTION_AGENTS_MD, prompt::agent_docs_section(docs));
-    p.push(SECTION_MEMORY, memory_section(memory));
-    // The capability-gated group, each fragment its own named section so which
+    // 2-3. global scope: identical in every project, so it stays cached across them
+    p.push(
+        SECTION_GLOBAL_AGENTS_MD,
+        prompt::global_agent_docs_section(docs.global.as_deref()),
+    );
+    p.push(
+        SECTION_GLOBAL_MEMORY,
+        global_memory_section(memory.global.as_deref()),
+    );
+    // 4-5. project scope: identical across every agent working this project
+    p.push(
+        SECTION_PROJECT_AGENTS_MD,
+        prompt::project_agent_docs_section(docs.project.as_deref()),
+    );
+    p.push(
+        SECTION_PROJECT_MEMORY,
+        project_memory_section(memory.project.as_deref(), memory.global.is_some()),
+    );
+    // 6. the capability-gated group, each fragment its own named section so which
     // ones an agent got is inspectable. After the project content on purpose: a
     // read-only `explore` and a write `coder` in the same project then share every
     // byte above this line and diverge only here.
     for (name, body) in prompt::capability_sections(tools, is_subagent) {
         p.push(name, prompt::section_text(body));
     }
+    // 7-8. per-agent, then the volatile tail
     p.push(SECTION_PERSONA, persona_section(persona));
     p.push(SECTION_ENVIRONMENT, prompt::environment_section(cwd, tools));
     Ok(p)
@@ -1021,8 +1067,8 @@ fn build_system_prompt_sections(
 fn build_system_prompt(
     tools: &ToolRegistry,
     cwd: &std::path::Path,
-    docs: Option<&str>,
-    memory: Option<&str>,
+    docs: &prompt::AgentDocs,
+    memory: &MemoryIndex,
     persona: Option<&str>,
     is_subagent: bool,
 ) -> Result<String> {
@@ -1290,12 +1336,15 @@ impl Agent {
         }
         let project_docs = gather_agent_docs(&config.cwd);
         let project_docs_changed = false;
-        let memory = mem_dirs.as_ref().and_then(|(p, g)| gather_memory(p, g));
+        let memory = mem_dirs
+            .as_ref()
+            .map(|(p, g)| gather_memory(p, g))
+            .unwrap_or_default();
         let system = build_system_prompt(
             &tools,
             &config.cwd,
-            project_docs.as_deref(),
-            memory.as_deref(),
+            &project_docs,
+            &memory,
             config.agent_prompt.as_deref(),
             config.is_subagent,
         )?;
@@ -1457,7 +1506,7 @@ impl Agent {
     }
 
     pub fn project_docs(&self) -> Option<&str> {
-        self.project_docs.as_deref()
+        self.project_docs.project.as_deref()
     }
 
     pub fn messages(&self) -> &[ChatMessage] {
@@ -1518,8 +1567,8 @@ impl Agent {
         let Ok(system) = build_system_prompt(
             &self.tools,
             &self.ctx.cwd,
-            self.project_docs.as_deref(),
-            memory.as_deref(),
+            &self.project_docs,
+            &memory,
             self.agent_prompt.as_deref(),
             self.is_subagent,
         ) else {
@@ -1551,16 +1600,16 @@ impl Agent {
                 self.ctx.memory_global = Some(glob);
                 mem
             } else {
-                None
+                MemoryIndex::default()
             }
         } else {
-            None
+            MemoryIndex::default()
         };
         let Ok(system) = build_system_prompt(
             &self.tools,
             &self.ctx.cwd,
-            self.project_docs.as_deref(),
-            memory.as_deref(),
+            &self.project_docs,
+            &memory,
             self.agent_prompt.as_deref(),
             self.is_subagent,
         ) else {
@@ -4082,14 +4131,21 @@ mod tests {
     #[test]
     fn system_prompt_is_ordered_least_volatile_first() {
         use super::prompt::{
-            SECTION_AGENTS_MD, SECTION_BASE, SECTION_ENVIRONMENT, SECTION_MEMORY, SECTION_PERSONA,
+            SECTION_BASE, SECTION_ENVIRONMENT, SECTION_GLOBAL_AGENTS_MD, SECTION_GLOBAL_MEMORY,
+            SECTION_PERSONA, SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY,
         };
         let tools = hrdr_tools::ToolRegistry::with_defaults();
         let p = super::build_system_prompt_sections(
             &tools,
             std::path::Path::new("/tmp/proj"),
-            Some("the project docs"),
-            Some("the memory index"),
+            &super::prompt::AgentDocs {
+                global: Some("global docs".to_string()),
+                project: Some("project docs".to_string()),
+            },
+            &super::MemoryIndex {
+                global: Some("global memory".to_string()),
+                project: Some("project memory".to_string()),
+            },
             Some("the persona"),
             false,
         )
@@ -4099,8 +4155,10 @@ mod tests {
             p.names(),
             [
                 SECTION_BASE,
-                SECTION_AGENTS_MD,
-                SECTION_MEMORY,
+                SECTION_GLOBAL_AGENTS_MD,
+                SECTION_GLOBAL_MEMORY,
+                SECTION_PROJECT_AGENTS_MD,
+                SECTION_PROJECT_MEMORY,
                 // the capability group: differs by tool set / main-vs-sub
                 "write",
                 "shell",
@@ -4124,8 +4182,8 @@ mod tests {
         let p = super::build_system_prompt_sections(
             &tools,
             std::path::Path::new("/tmp/proj"),
-            None,
-            None,
+            &super::prompt::AgentDocs::default(),
+            &super::MemoryIndex::default(),
             None,
             false,
         )
@@ -4151,8 +4209,8 @@ mod tests {
         let p = super::build_system_prompt_sections(
             &tools,
             std::path::Path::new("/tmp/proj"),
-            None,
-            None,
+            &super::prompt::AgentDocs::default(),
+            &super::MemoryIndex::default(),
             None,
             false,
         )
@@ -4222,13 +4280,14 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::create_dir_all(&glob).unwrap();
         // Both empty → nothing injected.
-        assert!(gather_memory(&proj, &glob).is_none());
+        assert!(gather_memory(&proj, &glob).is_empty());
         std::fs::write(proj.join("MEMORY.md"), "- project fact").unwrap();
         std::fs::write(glob.join("MEMORY.md"), "- global fact").unwrap();
-        let mem = gather_memory(&proj, &glob).unwrap();
-        assert!(mem.contains("global fact") && mem.contains("project fact"));
-        // Global scope precedes project (least-specific first).
-        assert!(mem.find("Global").unwrap() < mem.find("Project").unwrap());
+        let mem = gather_memory(&proj, &glob);
+        // Each scope is its own field now, so it can be its own prompt section —
+        // global stays cached when the project index differs.
+        assert!(mem.global.as_deref().unwrap().contains("global fact"));
+        assert!(mem.project.as_deref().unwrap().contains("project fact"));
         // A huge index is bounded, with a pointer to read the rest.
         std::fs::write(proj.join("MEMORY.md"), "line\n".repeat(10_000)).unwrap();
         assert!(read_memory_index(&proj).unwrap().1.contains("truncated"));
@@ -4256,8 +4315,9 @@ mod tests {
         std::fs::remove_file(glob.join("MEMORY.md")).unwrap();
         std::fs::write(glob.join("index.md"), "- okf global fact").unwrap();
         std::fs::write(proj.join("index.md"), "- okf project fact").unwrap();
-        let mem = gather_memory(&proj, &glob).unwrap();
-        assert!(mem.contains("okf global fact") && mem.contains("okf project fact"));
+        let mem = gather_memory(&proj, &glob);
+        assert!(mem.global.as_deref().unwrap().contains("okf global fact"));
+        assert!(mem.project.as_deref().unwrap().contains("okf project fact"));
     }
 
     #[test]

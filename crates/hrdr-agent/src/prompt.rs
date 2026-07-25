@@ -57,13 +57,22 @@ mod frag {
 ///
 /// 1. **This function** ([`SECTION_BASE`]) — identity, rules, workflow,
 ///    capability-gated guidance. Changes only when hrdr itself changes.
-/// 2. **AGENTS.md** ([`agent_docs_section`]) — global instructions first, then
-///    the project's, so the global file is shared across every project.
-/// 3. **Memory index** ([`crate::memory_section`]) — global scope then project
-///    scope, for the same reason. Changes when the agent saves a note.
-/// 4. **Persona** ([`crate::persona_section`]) — differs per agent profile.
-/// 5. **Environment** ([`environment_section`]) — tool list, OS, date, and the
+/// 2. **Global AGENTS.md** ([`global_agent_docs_section`]) — the user-level file,
+///    identical in every project.
+/// 3. **Global memory** ([`crate::global_memory_section`]) — likewise.
+/// 4. **Project AGENTS.md** ([`project_agent_docs_section`]) — the cwd walk.
+/// 5. **Project memory** ([`crate::project_memory_section`]) — changes when the
+///    agent saves a note.
+/// 6. **Capability group** ([`capability_sections`]) — write/shell/delegate/
+///    sub-agent guidance. Differs by tool set, so it sits below everything that
+///    every agent in this project shares.
+/// 7. **Persona** ([`crate::persona_section`]) — differs per agent profile.
+/// 8. **Environment** ([`environment_section`]) — tool list, OS, date, and the
 ///    working directory. The volatile tail, **dead last**.
+///
+/// Scopes are split global-before-project (2-3 before 4-5) so switching projects
+/// still reuses the global bytes; joined into one block they would leave the
+/// prefix the moment the project part differed.
 ///
 /// The payoff: start a new session in a project whose AGENTS.md and memory are
 /// unchanged and every byte up to the persona is a cache hit. Persona sits at (4)
@@ -181,8 +190,10 @@ pub fn base_section() -> String {
 /// the builder and anything asserting on the order refer to the same thing —
 /// which is how the order is tested (see [`SystemPrompt::names`]).
 pub const SECTION_BASE: &str = "base";
-pub const SECTION_AGENTS_MD: &str = "agents_md";
-pub const SECTION_MEMORY: &str = "memory";
+pub const SECTION_GLOBAL_AGENTS_MD: &str = "global_agents_md";
+pub const SECTION_GLOBAL_MEMORY: &str = "global_memory";
+pub const SECTION_PROJECT_AGENTS_MD: &str = "project_agents_md";
+pub const SECTION_PROJECT_MEMORY: &str = "project_memory";
 // The capability-gated group: everything that differs by tool set or by
 // main-vs-sub. Sits after the project content so a read-only `explore` and a
 // write `coder` in the same project share every byte above it.
@@ -259,7 +270,27 @@ impl SystemPrompt {
 /// disk, and a CRLF `AGENTS.md` is entirely normal on Windows. Without this it
 /// would be the one part of the prompt that could still smuggle `\r` to the
 /// model.
-pub fn agent_docs_section(docs: Option<&str>) -> String {
+pub fn global_agent_docs_section(docs: Option<&str>) -> String {
+    let Some(d) = docs.map(str::trim).filter(|d| !d.is_empty()) else {
+        return String::new();
+    };
+    format!(
+        "\n\nGlobal instructions (your user-level AGENTS.md — they apply in every \
+         project; a project's own file below overrides them where they conflict):\n\n{}",
+        d.replace("\r\n", "\n")
+    )
+}
+
+/// The project's `AGENTS.md` instructions as a prompt section — the cwd walk,
+/// outer-first, so a nearer file appears later and takes precedence.
+///
+/// Separate from [`global_agent_docs_section`] so switching projects still reuses
+/// the global bytes; see [`AgentDocs`].
+///
+/// Normalizes CRLF: this content comes off disk, and a CRLF `AGENTS.md` is
+/// entirely normal on Windows. Without this it would be the one part of the prompt
+/// that could still smuggle `\r` to the model.
+pub fn project_agent_docs_section(docs: Option<&str>) -> String {
     let Some(d) = docs.map(str::trim).filter(|d| !d.is_empty()) else {
         return String::new();
     };
@@ -383,13 +414,37 @@ const MAX_AGENTS_TOTAL_BYTES: usize = 1024 * 1024; // 1 MiB
 /// the filesystem root, plus global instruction files from standard locations.
 /// Less specific files (system, then user-global, then ancestors) come first so
 /// nearer files override by appearing later. Returns `None` if nothing is found.
-pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
+/// Project instructions split by scope, so each can be its own prompt section.
+///
+/// The split exists for the prompt cache: the global file is the same in every
+/// project, so keeping it in a section of its own means switching projects still
+/// reuses it. Joined into one blob they would share a section and the global
+/// bytes would fall outside the reusable prefix the moment the project part
+/// differed.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct AgentDocs {
+    /// The single global instruction file, if any — least specific, so it is
+    /// emitted first and a nearer file overrides it.
+    pub global: Option<String>,
+    /// The `AGENTS.md` files found walking cwd up to the root, outer-first.
+    pub project: Option<String>,
+}
+
+impl AgentDocs {
+    /// Whether any instructions were found at all.
+    pub fn is_empty(&self) -> bool {
+        self.global.is_none() && self.project.is_none()
+    }
+}
+
+pub fn gather_agent_docs(cwd: &Path) -> AgentDocs {
     // Walk up from cwd; collect cwd-first (most specific first). Accumulate a
     // running byte total and stop once the next file would push it over the
     // aggregate ceiling: because the walk is cwd-first, breaking here keeps the
     // nearest/most-specific files already collected and drops only the farther
     // ancestors — the correct precedence (a nearer file overrides a farther one).
     let mut docs: Vec<String> = Vec::new();
+    let mut global: Option<String> = None;
     let mut total: usize = 0;
     let mut dir = Some(cwd);
     while let Some(d) = dir {
@@ -442,14 +497,13 @@ pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
             // defensive bound no real project reaches.
             && total.saturating_add(text.len()) <= MAX_AGENTS_TOTAL_BYTES
         {
-            docs.insert(0, text.to_string());
+            global = Some(text.to_string());
         }
     }
 
-    if docs.is_empty() {
-        None
-    } else {
-        Some(docs.join("\n\n---\n\n"))
+    AgentDocs {
+        global,
+        project: (!docs.is_empty()).then(|| docs.join("\n\n---\n\n")),
     }
 }
 
@@ -587,7 +641,7 @@ mod tests {
         );
         // AGENTS.md is no longer rendered through the template — it is appended
         // after it — so the CRLF guarantee has to hold on that path too.
-        let with_docs = p + &agent_docs_section(Some("Use tabs.\r\nPrefer clarity.\r\n"));
+        let with_docs = p + &project_agent_docs_section(Some("Use tabs.\r\nPrefer clarity.\r\n"));
         assert!(
             !with_docs.contains('\r'),
             "appended AGENTS.md must be LF-only too: it comes off disk, and a CRLF \
@@ -1439,7 +1493,8 @@ mod tests {
     #[test]
     fn system_prompt_appends_project_instructions() {
         let tools = ToolRegistry::with_defaults();
-        let p = render_system(&tools, false).unwrap() + &agent_docs_section(Some("Use tabs."));
+        let p =
+            render_system(&tools, false).unwrap() + &project_agent_docs_section(Some("Use tabs."));
         assert!(p.contains("Project instructions"));
         assert!(p.ends_with("Use tabs."));
     }
@@ -1592,7 +1647,7 @@ mod tests {
         // cwd walk — true regardless of the machine's global files. Mutating
         // HOME/XDG here used to race concurrent tests (`set_var` is process-wide
         // and unsafe under any parallel getenv), a source of CI-only flakes.
-        let docs = gather_agent_docs(&proj).unwrap();
+        let docs = gather_agent_docs(&proj).project.unwrap();
         assert!(docs.contains("Project-level"));
     }
 
@@ -1618,7 +1673,7 @@ mod tests {
             std::fs::write(dir.join(AGENTS_FILE), body).unwrap();
         }
         // `dir` is now the deepest level (l39) — the cwd, most specific.
-        let docs = gather_agent_docs(&dir).unwrap();
+        let docs = gather_agent_docs(&dir).project.unwrap();
 
         // Bounded: never more than the aggregate ceiling (any dropped global
         // only shrinks it further).
