@@ -66,8 +66,8 @@ removed 4 copies from `models.rs`, `resolve.rs`, `validate.rs`, `lib.rs`.
 
 ### 4b. `fn spec(s: &str) -> ModelSpec` — 4 copies → DRY ✅
 
-**Fixed** (`56b76ab`): one `pub(crate) fn spec` in `model_ref.rs` (#[cfg(test)]),
-removed 3 copies from `lib.rs` and 1 from `agents_dir.rs`.
+**Fixed** (`56b76ab`): one `pub(crate) fn spec` in `model_ref.rs`
+(#[cfg(test)]), removed 3 copies from `lib.rs` and 1 from `agents_dir.rs`.
 
 ### 4c. `ProviderConfig` — no `Default` impl → DRY ✅
 
@@ -244,10 +244,10 @@ cleaner.
 | 2   | Path helpers                       | DRY ✅    |
 | 3   | Slash-command dispatch             | DAMP ✅   |
 | 4   | AgentConfig test construction      | WET ⚠️    |
-| 4a  | `fn r()` ModelRef parser (×4)      | WET ⚠️    |
-| 4b  | `fn spec()` ModelSpec parser (×3)  | WET ⚠️    |
-| 4c  | `ProviderConfig` no Default (×25)  | WET ⚠️    |
-| 4d  | `SubagentProfile` no Default (×11) | WET ⚠️    |
+| 4a  | `fn r()` ModelRef parser (×4)      | DRY ✅    |
+| 4b  | `fn spec()` ModelSpec parser (×3)  | DRY ✅    |
+| 4c  | `ProviderConfig` no Default (×25)  | DRY ✅    |
+| 4d  | `SubagentProfile` no Default (×11) | DRY ✅    |
 | 5   | Session layering                   | DRY ✅    |
 | 6   | Project-dir walk                   | DAMP ✅   |
 | 7   | CommandHost impls                  | DAMP ✅   |
@@ -265,14 +265,14 @@ cleaner.
 
 1. Extract `draw_selector_modal<T>` for 6 TUI selector draw functions (#8) —
    ~500 lines consolidated, one place to change selector chrome.
-2. Add `Default` for `ProviderConfig` and constructor for `SubagentProfile`
-   (#4c/#4d) — eliminate ~36 full-field boilerplate sites.
-3. Extract shared test helpers in `hrdr-agent`: `fn r()`, `fn spec()`,
-   `fn cfg()` (#4a/#4b) — eliminate 9 duplicated definitions.
-4. Fix post-edit notes formatting (#10) — `fn formatted_notes()` on
+2. Dedup `cfg()`/`cfg_with()` across `validate.rs`/`resolve.rs` and consolidate
+   the ~60 inline `AgentConfig { … }` test constructions (#4) —
+   `fn r()`/`fn spec()` and the `Default` impls (#4a–#4d) already landed in
+   `56b76ab`.
+3. Fix post-edit notes formatting (#10) — `fn formatted_notes()` on
    `FileChange`.
-5. Extract `ensure_parent_dir()` (#11) — 3 call sites → 1.
-6. Low-hanging fruit: `NO_MATCHES` const (#14), `path_exists` helper (#13),
+4. Extract `ensure_parent_dir()` (#11) — 3 call sites → 1.
+5. Low-hanging fruit: `NO_MATCHES` const (#14), `path_exists` helper (#13),
    `rel_display` helper (#16).
 
 ---
