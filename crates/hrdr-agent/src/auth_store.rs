@@ -37,7 +37,12 @@ use crate::store_lock::StoreLock;
 /// Internally tagged on `type` so the two shapes coexist in one flat map and a
 /// reader can tell them apart. `account_id` is optional (`#[serde(default)]`) so
 /// an OAuth entry saved without it still parses.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Deliberately NO `Debug` derive: both variants hold live secrets (the `Key`'s
+/// raw API key, the `Oauth`'s bearer + refresh tokens), and a `{:?}` (or `anyhow`
+/// context) must never leak them. Mirrors [`OAuthCreds`]/[`crate::oauth::OAuthAccess`],
+/// which omit `Debug` for the same reason.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub(crate) enum AuthEntry {
     /// A raw API key.
@@ -207,7 +212,7 @@ mod tests {
         };
         let json = serde_json::to_string(&e).unwrap();
         assert_eq!(json, r#"{"type":"key","key":"sk-abc"}"#);
-        assert_eq!(serde_json::from_str::<AuthEntry>(&json).unwrap(), e);
+        assert!(serde_json::from_str::<AuthEntry>(&json).unwrap() == e);
     }
 
     #[test]
@@ -215,7 +220,7 @@ mod tests {
         let e = AuthEntry::from(oauth("acc", "ref", 123, Some("acct")));
         let json = serde_json::to_string(&e).unwrap();
         let back: AuthEntry = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, e);
+        assert!(back == e);
         assert!(back.as_oauth() == Some(oauth("acc", "ref", 123, Some("acct"))));
     }
 
@@ -243,7 +248,7 @@ mod tests {
         );
         let json = serde_json::to_vec_pretty(&map).unwrap();
         let back: HashMap<String, AuthEntry> = serde_json::from_slice(&json).unwrap();
-        assert_eq!(back, map);
+        assert!(back == map);
     }
 
     // ── Save / load ──────────────────────────────────────────────────────────
