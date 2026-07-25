@@ -43,7 +43,7 @@ shared dispatcher for everything else. The shared `CommandHost` trait lets both
 frontends drive the same command logic. The comment at line 18-21 explains the
 split explicitly.
 
-## 4. `AgentConfig` / test construction — WET ⚠️
+## 4. `AgentConfig` / test construction — DRY ✅
 
 **~60+ call sites construct `AgentConfig { … }` inline, mostly in tests.**
 
@@ -77,9 +77,33 @@ removed 4 copies from `models.rs`, `resolve.rs`, `validate.rs`, `lib.rs`.
 
 **Fixed** (`56b76ab`): `SubagentProfile` now derives `Default`.
 
-**Remaining**: `cfg()`/`cfg_with()` duplication across `validate.rs` and
-`resolve.rs`; `lib.rs` test modules have no equivalent helper. `AgentConfig`
-inline constructions (~60 sites) not yet consolidated.
+### 4e. `cfg()`/`cfg_with()` duplicated across `validate.rs`/`resolve.rs` → DRY ✅
+
+**Fixed**: one `cfg()`, `cfg_with(name, ProviderConfig)` and
+`provider_config(base_url)` in `config.rs` behind `#[cfg(test)]` (the
+`model_ref.rs` `r`/`spec` precedent); both private copies deleted.
+`validate.rs`'s base-url flavour of `cfg_with` folds into
+`cfg_with(name, provider_config(url))`, and `provider_config` now leans on
+`ProviderConfig::default()` instead of spelling out all 8 fields (the #4c
+leftover).
+
+### 4f. ~60 inline `AgentConfig { … }` test constructions → premise was stale
+
+Re-checked every `AgentConfig { … }` literal in the named files (69 `lib.rs`, 8
+`e2e.rs`, 3 `model.rs`, 1 `dispatch.rs`, 2 `login.rs`): **all of them already
+use `..Default::default()`** and pin only the 1–3 fields their test cares about.
+`AgentConfig` has had a real production `Default` impl all along. The
+consolidation this item imagined had effectively already happened; routing the
+survivors through a `cfg_*` helper would replace self-documenting named fields
+with positional args (the largest copy-paste cluster — 6 sites pinning
+`base_url`+`api_key`+`model` — carries different values at every site), so it
+was deliberately left alone.
+
+The one genuine win taken: 23 field-less `AgentConfig { ..Default::default() }`
+literals collapsed to `AgentConfig::default()` (16 in `lib.rs`, 7 in `e2e.rs`).
+`hrdr-app`'s 6 sites stay untouched — the helpers are `#[cfg(test)] pub(crate)`
+in a private module, and reaching them from another crate would mean exporting
+test scaffolding publicly.
 
 ## 5. Session management layering — DRY ✅
 
@@ -176,7 +200,7 @@ Both also share `crate::MAX_ATTACH_BYTES` from `util.rs:107`. The only
 difference is `/add` rejects overlarge files while `@file` truncates — a
 deliberate UX choice documented at `dispatch.rs:306-309`.
 
-## 10. Post-edit `FileChange` notes formatting — WET ⚠️
+## 10. Post-edit `FileChange` notes formatting — DRY ✅
 
 **`tools/write.rs:94-97`** and **`tools/edit.rs:216-219`** — identical 4-line
 block:
@@ -189,10 +213,12 @@ if !warn.is_empty() {
 ```
 
 Both tools call `apply_file_change`, receive `FileChange { notes, .. }`, and
-format the notes identically. A `fn formatted_notes(&self) -> String` on
-`FileChange` (or a free helper in `mutation.rs`) would replace both copies.
+format the notes identically.
 
-## 11. `create_dir_all` + `with_context` — WET ⚠️
+**Fixed**: `FileChange::formatted_notes()` in `mutation.rs`; both copies now
+call it.
+
+## 11. `create_dir_all` + `with_context` — DRY ✅
 
 **`tools/write.rs:86-89`**, **`tools/fileops.rs:99-102`** (MoveTool),
 **`tools/fileops.rs:410-413`** (CopyTool) — three identical instances:
@@ -205,8 +231,8 @@ if let Some(parent) = to.parent() {
 }
 ```
 
-Extract as `async fn ensure_parent_dir(path: &Path) -> Result<()>` in
-`tools/mod.rs`.
+**Fixed**: `ensure_parent_dir(path)` in `tools/mod.rs`, same context message;
+all three sites call it.
 
 ## 12. Secret-file write/edit guards — DAMP ✅
 
@@ -217,17 +243,19 @@ meaningful to the model. `fileops.rs:384-388` has a different message again
 ("copying it would place its contents…"). The read-side `guard_secret_read` is
 already a shared helper; the write-side variation is legitimately DAMP.
 
-## 13. `tokio::fs::try_exists(…).await.unwrap_or(false)` — minor WET
+## 13. `tokio::fs::try_exists(…).await.unwrap_or(false)` — DRY ✅
 
-8 occurrences: `tools/write.rs:52`,
-`tools/fileops.rs:20,92,184,197,199,391,403`. A trivial
-`async fn path_exists(path: &Path) -> bool` helper would clean these up. Low
-priority.
+8 occurrences across `tools/write.rs` and `tools/fileops.rs`.
 
-## 14. `"(no matches)"` string literal — minor WET
+**Fixed**: `path_exists(path)` in `tools/mod.rs`; all 8 sites converted.
 
-5 occurrences: `tools/find.rs:87`, `tools/grep.rs:244,255,409,511`. Should be a
-`const NO_MATCHES: &str = "(no matches)";` in `tools/mod.rs`.
+## 14. `"(no matches)"` string literal — DRY ✅
+
+5 occurrences in `tools/find.rs` and `tools/grep.rs`.
+
+**Fixed**: `const NO_MATCHES` in `tools/mod.rs`; all 5 production sites use it.
+Test assertions keep the bare literal — a test pinning the exact output string
+is legitimate.
 
 ## 15. `ignore::WalkBuilder` patterns — DAMP ✅
 
@@ -236,51 +264,47 @@ priority.
 `find.rs` has an inline copy differing only in `max_depth` and `parents`.
 `tree.rs` and `replace.rs` use intentionally different configurations.
 
-## 16. `strip_prefix(&ctx.cwd).unwrap_or(&path).display()` — minor WET
+## 16. `strip_prefix(&ctx.cwd).unwrap_or(&path).display()` — DRY ✅
 
-`tools/replace.rs:153,166`, `tools/lsp_nav.rs:442` — three uses of the same
-relative-path display pattern. A
-`fn rel_display<'a>(path: &'a Path, cwd: &Path) -> Display` helper would be
-cleaner.
+`tools/replace.rs` (×3, one of them producing an owned `String`) and
+`tools/lsp_nav.rs` — the same relative-path display pattern.
+
+**Fixed**: `rel_display(path, cwd) -> std::path::Display<'_>` in `tools/mod.rs`;
+all four sites converted. `strip_prefix` uses that yield a `&Path` rather than a
+`Display` are a different pattern and stay as they are.
 
 ---
 
 ## Summary
 
-| #   | Concern                            | Verdict   |
-| --- | ---------------------------------- | --------- |
-| 1   | Secret-file detection              | DRY ✅    |
-| 2   | Path helpers                       | DRY ✅    |
-| 3   | Slash-command dispatch             | DAMP ✅   |
-| 4   | AgentConfig test construction      | WET ⚠️    |
-| 4a  | `fn r()` ModelRef parser (×4)      | DRY ✅    |
-| 4b  | `fn spec()` ModelSpec parser (×3)  | DRY ✅    |
-| 4c  | `ProviderConfig` no Default (×25)  | DRY ✅    |
-| 4d  | `SubagentProfile` no Default (×11) | DRY ✅    |
-| 5   | Session layering                   | DRY ✅    |
-| 6   | Project-dir walk                   | DAMP ✅   |
-| 7   | CommandHost impls                  | DAMP ✅   |
-| 8   | TUI selector draw functions        | DRY ✅    |
-| 9   | File-attach flows                  | DRY ✅    |
-| 10  | Post-edit notes formatting         | WET ⚠️    |
-| 11  | `create_dir_all` + context         | WET ⚠️    |
-| 12  | Secret-file write/edit guards      | DAMP ✅   |
-| 13  | `try_exists` scattered (×8)        | minor WET |
-| 14  | `"(no matches)"` literal (×5)      | minor WET |
-| 15  | `ignore::WalkBuilder`              | DAMP ✅   |
-| 16  | `strip_prefix` display (×3)        | minor WET |
+| #   | Concern                            | Verdict |
+| --- | ---------------------------------- | ------- |
+| 1   | Secret-file detection              | DRY ✅  |
+| 2   | Path helpers                       | DRY ✅  |
+| 3   | Slash-command dispatch             | DAMP ✅ |
+| 4   | AgentConfig test construction      | DRY ✅  |
+| 4a  | `fn r()` ModelRef parser (×4)      | DRY ✅  |
+| 4b  | `fn spec()` ModelSpec parser (×3)  | DRY ✅  |
+| 4c  | `ProviderConfig` no Default (×25)  | DRY ✅  |
+| 4d  | `SubagentProfile` no Default (×11) | DRY ✅  |
+| 4e  | `cfg()`/`cfg_with()` (×2 copies)   | DRY ✅  |
+| 4f  | Inline `AgentConfig { … }` (×83)   | DRY ✅  |
+| 5   | Session layering                   | DRY ✅  |
+| 6   | Project-dir walk                   | DAMP ✅ |
+| 7   | CommandHost impls                  | DAMP ✅ |
+| 8   | TUI selector draw functions        | DRY ✅  |
+| 9   | File-attach flows                  | DRY ✅  |
+| 10  | Post-edit notes formatting         | DRY ✅  |
+| 11  | `create_dir_all` + context         | DRY ✅  |
+| 12  | Secret-file write/edit guards      | DAMP ✅ |
+| 13  | `try_exists` scattered (×8)        | DRY ✅  |
+| 14  | `"(no matches)"` literal (×5)      | DRY ✅  |
+| 15  | `ignore::WalkBuilder`              | DAMP ✅ |
+| 16  | `strip_prefix` display (×3)        | DRY ✅  |
 
-**Actionable items (ranked by impact):**
-
-1. Dedup `cfg()`/`cfg_with()` across `validate.rs`/`resolve.rs` and consolidate
-   the ~60 inline `AgentConfig { … }` test constructions (#4) —
-   `fn r()`/`fn spec()` and the `Default` impls (#4a–#4d) already landed in
-   `56b76ab`.
-2. Fix post-edit notes formatting (#10) — `fn formatted_notes()` on
-   `FileChange`.
-3. Extract `ensure_parent_dir()` (#11) — 3 call sites → 1.
-4. Low-hanging fruit: `NO_MATCHES` const (#14), `path_exists` helper (#13),
-   `rel_display` helper (#16).
+**All actionable items are closed.** #4a–#4d landed in `56b76ab`; #4e/#4f, #10,
+#11, #13, #14 and #16 landed after that. What remains in this document is the
+DAMP verdicts and the rationale for what was deliberately left duplicated.
 
 The biggest item — the six TUI selector draw functions (#8) — is done
 (`aa09f5b`).
@@ -288,5 +312,5 @@ The biggest item — the six TUI selector draw functions (#8) — is done
 ---
 
 Verdict: **The codebase is well-factored.** Most duplication is intentional
-(DAMP) with documented rationale. The WET spots are small, mechanical, and
-straightforward to fix — no architectural rot.
+(DAMP) with documented rationale. The WET spots were small and mechanical, and
+are now fixed — no architectural rot.

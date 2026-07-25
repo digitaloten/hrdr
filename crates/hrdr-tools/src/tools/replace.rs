@@ -173,11 +173,7 @@ impl Tool for ReplaceTool {
                 continue;
             }
             total += hits;
-            let rel = path
-                .strip_prefix(&ctx.cwd)
-                .unwrap_or(&path)
-                .display()
-                .to_string();
+            let rel = super::rel_display(&path, &ctx.cwd).to_string();
             planned.push((path, before, after, rel));
         }
 
