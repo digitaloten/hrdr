@@ -159,16 +159,29 @@ Codex decomposes mutable model-visible state into typed sections
 (`core/src/context/world_state/mod.rs:196-227`, ten of them) and emits, per
 sampling step, a **developer-role fragment containing only the delta**, wrapped
 in stable XML markers, byte-budgeted per section, with snapshots persisted into
-the rollout and advanced by RFC 7386 merge patches. hrdr instead rebuilds the
-whole system prompt and **replaces `messages[0]` in place** when memory or
-project docs change (`crates/hrdr-agent/src/lib.rs:1478-1490`). Two costs: the
-model gets different bytes with no signal anything changed (it cannot notice a
-tool disappeared), and rewriting the prefix invalidates the prompt cache that
-`prompt.rs:96-100` goes to real trouble to protect. _Caveat:_ hrdr's volatile
-set is much smaller — no plugins, apps, environments or collaboration modes. If
-the honest list is "memory changed, AGENTS.md changed", one appended
-`# Context update` developer message gets most of the value for a tenth of the
-machinery. Do the cheap version first.
+the rollout and advanced by RFC 7386 merge patches.
+
+> **Correction (from the hermes pass, verified independently).** This finding
+> originally said hrdr "rebuilds the whole system prompt and replaces
+> `messages[0]` in place **when memory or project docs change**." That is wrong,
+> and the truth is worse. `refresh_system` has exactly three non-test callers —
+> `lib.rs:1399` (MCP connect at startup), `:1439` (`clear()`), `:1749`
+> (`set_cwd()`) — and `gather_memory` has exactly two production call sites,
+> `:1251` (construction) and `:1469` (inside `refresh_system`). A mid-session
+> `memory` write therefore **never** reaches the prompt, and `compact()` clones
+> `messages[0]` verbatim (`compaction.rs:607`, `:616`) so it doesn't reach it at
+> compaction either. **hrdr's injected memory is frozen for the whole session.**
+> See the hermes section, finding 4, for the cheap fix.
+
+So hrdr does not have codex's problem of silently changing bytes — it has the
+opposite one. What still stands from this finding is the second half: hrdr has
+no way to _tell_ the model that anything changed (a tool appeared, the cwd
+moved, memory was written), because the only channel is a prompt rewrite that
+mostly never fires. _Caveat:_ hrdr's volatile set is much smaller than codex's —
+no plugins, apps, environments or collaboration modes. If the honest list is
+"memory changed, AGENTS.md changed", one appended `# Context update` developer
+message gets most of the value for a tenth of the machinery. Do the cheap
+version first.
 
 **3. Runtime-built tool descriptions.** Codex builds `description` as a `String`
 during spec planning: `spawn_agent` embeds the live model list
@@ -617,7 +630,372 @@ than observed at runtime — **I confirmed the chain independently.**
 
 ## hermes-agent
 
-_Pending._
+Comparison run 2026-07-26. Hermes is a general-purpose assistant, so most of its
+102 tool modules are irrelevant here and are not enumerated. Two of five claims
+came back **partly wrong**, and the pass **corrected a factual error already
+published in the codex section** (see the callout above) — which is the
+strongest argument for having run four independent comparisons rather than one.
+
+### Corrections to the shallow reading
+
+**The three cache tiers are real, but it's two breakpoints and the docstring
+overstates.** `build_system_prompt_parts` (`agent/system_prompt.py:149`) does
+return `{stable, context, volatile}`, and the stable tier becomes a genuine API
+cache breakpoint via `_apply_system_cache_markers`
+(`agent/prompt_caching.py:86-119`). The mechanism is the good part: the prompt
+stays **one stored string**, and the split into two `{"type":"text"}` blocks
+happens only in the outgoing request, gated on a `startswith` check so a
+mismatch degrades silently instead of rewriting bytes. But it marks the stable
+prefix and the _whole remainder_ — two markers, not three; the third tier is an
+**ordering discipline** keeping volatile content behind the second marker. And
+"never re-renders mid-session" is false: `invalidate_system_prompt` (`:571-580`)
+exists and runs after compression. The honest rule is _"rebuild only at a
+compaction boundary, where the cache is being invalidated anyway."_
+
+**`toolset_distributions.py` is not a runtime mechanism — REFUTED.** Its
+docstring is explicit: distributions of toolsets _"for data generation runs…
+their probability of being selected for any given prompt during the batch
+processing"_ (`:1-20`). It diversifies synthetic training trajectories. Hermes
+is a **datagen harness as much as an agent** — `batch_runner.py`,
+`mini_swe_runner.py`, `datagen-config-examples/` — because Nous post-trains its
+own models. The shipped default is not a selected subset either:
+`_HERMES_CORE_TOOLS` is a flat ~60-tool list (`toolsets.py:31-79`).
+
+**`trajectory_compressor.py` is also datagen — REFUTED.** It is an offline
+`fire` CLI that post-processes _completed_ trajectories "preserving training
+signal quality" (`:1-33`). Hermes' actual runtime compaction is
+`agent/conversation_compression.py` (2769 lines). **Do not compare either file
+to `compaction.rs`.**
+
+**The real tool-scaling answer is `tools/tool_search.py`, which I wasn't pointed
+at.** MCP and non-core plugin tools are replaced by three bridge tools
+(`tool_search`/`tool_describe`/`tool_call`); **core tools are never deferred**
+(_"Always-load means always-load. No exceptions."_, `:11-13`); the gate is a
+**no-op unless deferrable tools would consume more than ~10% of the context
+window** (`:14-17`); the catalog is rebuilt every assembly because a
+session-keyed one drifted and caused silent tool dropouts; and bridge calls
+route through the normal `handle_function_call` so guardrails, hooks and
+truncation fire identically. Plus `check_fn` runtime gating (~128 references) —
+a tool is absent from the schema entirely unless a predicate passes
+(`HASS_TOKEN`, `HERMES_KANBAN_TASK`, cua-driver installed), TTL-cached 30 s.
+
+**SOUL.md precedence is fine, and not a finding.** It does fully replace the
+built-in identity (`system_prompt.py:189-198`), but `DEFAULT_AGENT_IDENTITY` is
+eight lines of bland persona — **no safety rule, no untrusted-content rule, no
+tool contract lives there**. A hostile SOUL.md can change the voice, not delete
+the safety floor. hrdr's analog is safe for the opposite reason: persona is
+_appended_ with explicit conflict framing ("where it conflicts with the general
+guidance above, the role wins", `lib.rs:862-871`).
+
+### Findings hrdr should act on
+
+**1. Put a cache breakpoint at hrdr's own stable/volatile boundary.** Highest
+value per unit of work in this entire comparison. hrdr already does the hard
+part — a documented prefix-ordering invariant with four positional tests
+(`prompt.rs:15-36`, `:430`, `:471`, `:523`) — and then collects none of the
+reward on Anthropic native, because `mark_last_block` puts the single system
+breakpoint at the **end of the whole prompt**
+(`hrdr-llm/src/anthropic.rs:90-96`). Every byte of the carefully-ordered shared
+prefix sits in one cache unit that any tail change invalidates. Hermes'
+`_apply_system_cache_markers` is the missing ~30 lines, and **hrdr's boundary is
+already computed**: `build_system_prompt` (`lib.rs:973-988`) is literally
+`render_system` → `append_memory` → `append_environment` → `append_persona`, so
+`render_system`'s return value _is_ the stable prefix. Two sessions in different
+projects, a session before and after `/clear`, or six sibling sub-agents would
+then share a real cached prefix. Two sub-nits found while verifying: **(a)**
+`append_persona` runs _after_ `append_environment` (`lib.rs:986-987`), so the
+shared per-profile persona sits behind the per-agent `cwd` line — sibling
+sub-agents of the same profile can't share it, and it contradicts
+`prompt.rs:19-28`'s own claim that cwd is "dead last". One-line reorder. **(b)**
+hermes renders its timestamp **date-only** because minute precision invalidates
+KV cache on every rebuild (`system_prompt.py:520-528`); hrdr already does this
+(`prompt.rs:111`) — worth a comment so nobody "improves" it. _Caveat:_ hrdr's
+cache mode is `auto` and only fires where `cache_control` is real
+(`config.rs:1767-1798`) — nothing for local llama.cpp or OpenRouter-envelope
+routes. Anthropic caps breakpoints at 4 and hrdr spends 3; adding one leaves
+zero headroom.
+
+**2. hrdr injects a cloned repo's `AGENTS.md` into its system prompt unscanned —
+and silently drops it if over 64 KiB.** Two defects in one place.
+`gather_agent_docs` walks from cwd upward (`prompt.rs:210-229`) and concatenates
+whatever it finds under _"Project instructions (from AGENTS.md — follow these
+for this project)"_ (`system.j2:699-704`) with zero inspection. `cd` into an
+untrusted clone and its `AGENTS.md` becomes system-prompt-level instruction —
+driving straight through `system.j2:73-79`'s otherwise-good rule that tool
+output is data and never a command, because this text never arrives as tool
+output. Hermes runs every context file through `_scan_context_content` first,
+blocking with a `[BLOCKED: <file> contained potential prompt injection…]`
+placeholder, rationale stated exactly: _"Content matching is BLOCKED at this
+layer because the file would otherwise enter the system prompt verbatim and the
+user has no chance to intervene"_ (`prompt_builder.py:50-74`). The second half:
+`prompt.rs:213` skips any single `AGENTS.md` over 64 KiB **entirely and
+silently**. Hermes' own `AGENTS.md` is 73.4 KB — a real file hrdr would ignore
+without a word. Hermes caps per-file, **scales the cap to the model's context
+window** (6% of window × 4 chars/token, 20 K floor / 500 K ceiling,
+`prompt_builder.py:1244-1288`), and surfaces every truncation through the normal
+status channel. _Caveat:_ a regex scanner over project docs will false-positive
+on exactly the repos a coding agent gets pointed at — security tooling,
+shell-hardening guides, this very document. Hermes needed three scopes to make
+it tolerable. **The cheap 80%:** emit a notice when a new or changed `AGENTS.md`
+is loaded (naming path and byte count) and reframe the block header to
+distinguish project file from user instruction. Full scanning can wait for
+evidence.
+
+**3. Model-invocable skills — now two of three peers agree.** Hermes'
+`<available_skills>` block (`prompt_builder.py:1738-1766`) emits **category →
+`name: description`** only, never bodies, with `skill_view(name)` to load on
+demand. Two refinements over pi's flat list: category headers carry their own
+descriptions, and a "focus mode" demotes off-context categories to
+`[names only]` — descriptions dropped, names always kept "for recall"
+(`:1700-1722`). The index lives in the **stable** tier, so it's cached. This
+independently confirms pi's finding and closes the defect recorded in the pi
+section (`grep -ci skill` over `system.j2`/`prompt.rs` = 0). _Caveat:_ hermes'
+framing is aggressive ("## Skills (mandatory)… Err on the side of loading") —
+don't copy that verbatim into a coding agent. And hermes' hide-a- skill
+mechanism is **worse** than pi's: an operator config list (`skills.disabled`)
+that hides a skill from everyone, versus pi's per-skill author-declared
+frontmatter. **Take pi's `disable-model-invocation` shape.**
+
+**4. Refresh memory at the compaction boundary.** hrdr's injected memory is
+frozen for the entire session (verified above). An agent that saves "this
+project pins hjkl 0.33.6" at minute five still can't see it at minute ninety,
+and a hundred-turn session that compacts three times never picks it up. Hermes
+freezes deliberately for the same cache reason (`memory_tool.py:684-695`:
+_"returns the state captured at `load_from_disk()` time, NOT the live state…
+preserving the prefix cache"_) — but reloads at the one moment the cache dies
+anyway: `invalidate_system_prompt` clears the cached prompt **and** calls
+`load_from_disk()` (`system_prompt.py:571-580`). Fix is trivial: re-gather
+memory inside `compact()`. _Caveat:_ it makes the post-compaction prompt differ
+in a second way at once, complicating diagnosis of a bad compaction. And hrdr's
+memory block is an _index_ whose topic files the model can `read` any time, so
+the miss is narrower than in hermes, which injects full entry text. Two related
+notes: hermes has **no** memory usage tracking at all (grep for
+`usage_count`/`citation` in `memory_tool.py` returns nothing) — **codex remains
+the only harness doing usage-informed pruning**. Conversely hermes has a guard
+hrdr lacks: `_detect_external_drift` refuses a full-file rewrite when on-disk
+content wouldn't round-trip through the tool's own parser (manual edit, sibling
+session), backing up to `.bak.<ts>` instead of clobbering (`:93-120`,
+`:344-363`) — directly relevant to hrdr's tracked memory-drift item, which is
+currently scoped only to index/pointer structure.
+
+**5. Gate LSP tool registration on the project having a matching server.** hrdr
+registers `definition`/`references`/`rename` whenever `config.lsp` is on
+(`lib.rs:1073-1077`), then **two lines later** computes
+`project_lsp_extensions(&config.cwd)` to decide whether pre-warming is worth it
+(`:1085-1089`) — probing nine manifests and returning empty for anything else.
+So in a Ruby, PHP, Java or docs-only tree, hrdr ships three tool schemas whose
+only possible outcome is a failed call, with the information needed to suppress
+them already in hand. This is hermes' `check_fn` pattern applied where hrdr has
+the same shape of problem. _Caveat:_ it makes the tool set — and the prompt —
+vary with cwd contents, one more axis of prefix divergence; and the manifest
+probe would wrongly hide the tools in a monorepo whose `Cargo.toml` is one
+directory down. Gate on the union of _configured_ server extensions rather than
+the pre-warm heuristic.
+
+**6. Session search is a real gap; the ranking lessons are the valuable half.**
+hrdr persists sessions as `sessions/<cwd-slug>/<id>.json`, zstd-compressed once
+idle. No index, so cross-project recall means walking every slug directory and
+decompressing every archive — "what did we decide about the delegation retry
+backoff three weeks ago?" is currently unanswerable. Hermes: FTS5, three modes
+inferred from args, **zero LLM calls** (`session_search_tool.py:1-33`). Copy two
+specifics: **exclude sub-agent sessions from results**
+(`_HIDDEN_SESSION_SOURCES = ("subagent","tool")`) — hrdr's on-disk sub-agent
+runs are the exact analog and would flood every query; and **demote rather than
+exclude** automated sources, because repetitive scheduled-run vocabulary
+dominates bare BM25 and starves interactive sessions (issue #19434). _Caveat:_
+this is an index, a schema, a retention interaction and a tool — rank it below
+1-5. The honest smaller version: grep the current project's slug directory,
+decompressing lazily. No FTS engine, most of the value.
+
+**7. Ship the introspection that would let hrdr verify its own prompt claims.**
+Both this pass and the codex one closed with the same admission — neither binary
+was instrumented, so every size claim in this document is structural, not
+measured, and hrdr's prompt had to be **reconstructed in Python** to be counted.
+Hermes ships both halves: `agent/context_breakdown.py` computes a live
+per-category budget (system prompt, tool definitions, rules, skills index, **MCP
+separately from builtin schemas**, sub-agent definitions, memory, conversation)
+preferring the provider's measured `last_prompt_tokens` over its own estimate;
+and `hermes prompt-size` builds a real offline agent with dummy credentials so
+"the numbers match what actually ships on the wire" without a network call. hrdr
+has the estimators (`compaction.rs:450`, `:457`) and a context gauge, but no
+category attribution and no way to dump the assembled prompt. **This is leverage
+on everything above** — you can't argue about a 705-line prompt's budget without
+it. _Caveat:_ char/4 estimates invite false precision, and hermes strips its
+skills block out of `stable` by regex to avoid double-counting, which is
+fragile. Report bytes and labelled estimates; resist a percentage-of-window pie
+chart.
+
+### Where hrdr is ahead
+
+1. **Sub-agent filesystem isolation — hermes has none, and its own tool
+   description overstates what it has.** `grep` for
+   `worktree|mkdtemp|TemporaryDirectory|os.chdir|cwd=` across
+   `tools/delegate_tool.py` returns **zero matches**. The child's "workspace" is
+   a prompt string pointing at the **parent's own** cwd (`:739-759`,
+   `:685-690`), and the code says so — _"children share the parent's container,
+   and today they inherit the parent's live env.cwd implicitly"_ (`:1957-1962`)
+   — while the model-facing description claims _"Each subagent gets its own
+   terminal session (separate working directory and state)"_ (`:3479`).
+   "Separate" means a separate cwd-**tracking record** in a dict, not a separate
+   tree. With `max_concurrent_children` defaulting to 3, three sub-agents write
+   into one working tree concurrently. **hrdr's largest lead over hermes, and it
+   isn't close.**
+2. **Delegation lifecycle.** Hermes exposes exactly one delegation tool, whose
+   `background` parameter is documented DEPRECATED/IGNORED. No model-facing
+   steer, cancel-by-id, list, output-fetch, diff or revive — `/stop` and
+   `/agents` are human slash commands — and background delegations are
+   explicitly **not durable**: _"if the parent session is closed (/new) or the
+   process exits before a subagent finishes, that subagent's work is discarded"_
+   (`:3449-3454`).
+3. **Merge verification.** The parent model receives a 500-char summary;
+   `files_written`/`files_read`/`cost_usd` are computed then **popped before
+   reaching the model** (`:2270-2316`). Hermes' answer is a prompt instruction:
+   _"Subagent summaries are SELF-REPORTS, not verified facts… verify it
+   yourself."_ hrdr's `task_diff` hands over commits and the full diff, and
+   `task_cleanup` mechanically refuses to remove a worktree with unmerged
+   commits.
+4. **Read-before-write gating.** Hermes detects staleness but **never blocks** —
+   `_check_file_staleness`'s own docstring says _"Does not block — the write
+   still proceeds"_ (`file_tools.py:1507-1535`), and the `write_file` call site
+   attaches the finding as `result_dict["_warning"]`. hrdr **refuses** all three
+   non-`Fresh` states, and tracks the model's _context_ rather than disk. Same
+   lead as over pi, now confirmed against a second peer.
+5. **Guardrails cannot be switched off, and there is no fail-open path.**
+   Hermes' default `approvals.mode` is `"smart"` — an **auxiliary-LLM judge**
+   auto-approves flagged commands — and in a headless, non-cron, non-gateway run
+   the gate **auto-approves without even running the scanners**
+   (`approval.py:3243-3307`). `HERMES_YOLO_MODE` disables approvals wholesale
+   and is frozen at import precisely because otherwise a skill could set it
+   in-process and bypass everything; a contextvar race that dropped sessions
+   onto the auto-approve path has a CVE (GHSA-96vc-wcxf-jjff). Tirith is a
+   downloaded binary defaulting to `fail_open: True`. hrdr's 15 guardrails are
+   compiled in, read no env var, have no YOLO mode and no LLM in the loop, and
+   apply to sub-agents because _"those constrain tool calls, and a sub-agent
+   makes those too"_ (`config.rs:383-386`). **hrdr's autonomy posture is
+   coherent precisely because there is no headless carve-out.** (Hermes' cron
+   path _is_ fail-closed by default — the interactive default's inconsistency is
+   the finding.)
+6. **Per-sub-agent cost control** — hermes caps iterations and concurrency, has
+   no default wall-clock timeout and no spend cap; child cost is tracked for
+   reporting only.
+7. **Skill shadowing beats skill syncing.** hrdr embeds built-ins and lets
+   project or user files shadow by name, first-source-wins, tested. Hermes
+   copies bundled skills to `~/.hermes/skills/` and needs an MD5 origin-hash
+   manifest to work out whether the user customised a copy before overwriting,
+   plus a v1→v2 manifest migration and a `.no-bundled-skills` opt-out. hrdr has
+   no such state to get wrong.
+8. **Semantic code navigation** — as with codex, no LSP anywhere in hermes.
+
+### Agrees / disagrees with codex and pi
+
+**Agrees with codex** (strong signal — adopt with more confidence):
+
+- **Per-model behaviour as data, not code.** Codex ships a remote catalog;
+  hermes ships an editable substring list
+  (`TOOL_USE_ENFORCEMENT_MODELS = ("gpt","codex","gemini","gemma","grok","glm","qwen","deepseek")`,
+  `prompt_builder.py:321`) plus per-family text blocks. Both refuse to fork
+  assembly logic per model. **hrdr is the only one of the four with zero
+  per-model variation.** Notably, Claude/Anthropic is deliberately _absent_ from
+  hermes' enforcement list, and the blocks carry an attributed provenance trail
+  — _"Observed on DeepSeek v4-flash… returned fabricated listings"_, the Google
+  block _"adapted from OpenCode's gemini.txt"_, the parallel-call block _"Ported
+  from cline/cline#11514"_. Per-model prompt knowledge as a curated, dated
+  corpus.
+- **Post-trained models get less prompt** — codex's guidance shrinks from
+  gpt-5.2 to gpt-5.6 as behaviour moves into training; hermes pointedly omits
+  Claude. Two vendors independently concluding the same thing about who needs
+  steering.
+- **Deferred tool loading behind a search bridge**, and **both exempt core
+  tools**.
+- **An LLM in the approval loop.** The codex section recorded Guardian as
+  needing _"a cheap, trusted, fast second model: what a single-provider vendor
+  has and a multi-provider tool does not"_ — hermes **refutes that premise** (it
+  is aggressively multi-provider and does it anyway). hrdr's abstention remains
+  defensible; the recorded _reason_ was wrong.
+
+**Agrees with pi** (promotes "consider" to "two of three"):
+
+- Model-invocable skills via a name+description index, bodies read on demand.
+  **hrdr's skill invisibility is now the outlier.**
+- Progressive disclosure of harness knowledge generally — pi pages in 32
+  markdown docs; hermes points at hosted docs plus a `hermes-agent` skill and
+  declares the docs authoritative where they differ. **hrdr's knowledge is
+  resident.**
+
+**Goes the other way from codex:**
+
+- **`.git` protection.** Hermes' nearest equivalent is a regex on _skill
+  content_ flagging writes to crontab, shell rc files, `authorized_keys`,
+  sudoers and `AGENTS.md` — but nothing protects `.git`, and there is no
+  writable-root concept unless the operator sets `HERMES_WRITE_SAFE_ROOT`.
+  **Codex's finding 1 stands unweakened.**
+- **World-state diffs.** Codex emits per-step deltas; hermes goes the opposite
+  way — freeze everything, rebuild only at compaction. Given hrdr's small
+  volatile set, **hermes' posture is the cheaper correct answer for hrdr**, and
+  finding 4 is the concrete version of it.
+
+**Refines pi:** the pi section rejected rg/fd auto-download because _"its
+downloader does no integrity checking"_. Hermes downloads a security binary from
+GitHub releases too, but **verifies SHA-256 always and cosign provenance when
+cosign is on PATH** (`tirith_security.py:13-20`, `:293-340`). So the objection
+was to pi's _implementation_, not the idea. hrdr's single-static-binary posture
+still wins on distribution grounds and the narrower finding (force each grep
+backend in tests) is unchanged — but **"auto-download is inherently
+unacceptable" is not the lesson to carry forward.**
+
+### Deliberate differences, not gaps
+
+- **It is a datagen harness as much as an agent** — see the refuted claims
+  above.
+- **Cron/routines is not a gap for hrdr.** `cron/scheduler.py` is 194 KB and its
+  default executor is an in-process 60-second poll thread inside a long-lived
+  gateway daemon under launchd/systemd. It presupposes a resident daemon hrdr
+  does not have and does not want; scheduled work for a coding agent lives in
+  CI, and `watch` covers the intra-session case. Note the second-order cost
+  hermes paid: cron sessions poisoned session-search ranking badly enough to
+  need a demotion tier. The one detail worth stealing if hrdr ever ships
+  anything scheduled is the _posture_ — cron runs get `skip_memory=True`
+  unconditionally because _"cron system prompts would corrupt user
+  representations"_, and approvals fail **closed** there.
+- **A skills marketplace with a trust-tier install policy** — and its trust
+  model is **weaker than the filenames suggest**: `skills_ast_audit.py` is
+  explicitly "not a security gate" and never blocks, `skill_provenance.py` is a
+  ContextVar unrelated to supply chain, the SHA-256 hashes are change-detection
+  and cache keys rather than verification against a publisher signature, a
+  claimed NVIDIA `skill.oms.sig` has no verifying code anywhere, and trust
+  reduces to a hardcoded allowlist of four GitHub org strings plus post-download
+  regex. Hermes' own SECURITY.md calls the guard _"in-process heuristics —
+  useful, not boundaries"_. The genuinely good part is **boundary placement**:
+  install/search are CLI-and-human-only; the model gets list/view/manage over
+  local skills and no way to install a remote one. **hrdr's local-only skills
+  already sit on the safe side of that line.**
+- **A background self-improvement fork** that autonomously writes and curates
+  skills — an autonomy posture hrdr has not chosen.
+- **Nested delegation with orchestrator/leaf roles** versus hrdr's flat "you
+  cannot delegate further". Hermes needs roles because it has no isolation to
+  nest.
+- **Multi-surface product** (Telegram/Discord/Slack/Feishu gateways, Electron
+  app, ACP adapter, TUI gateway, per-platform prompt overrides).
+- **Non-blocking secret-file policy and no filesystem confinement**, documented
+  as defence-in-depth not a boundary: _"the agent can still `cat auth.json`…
+  treat any user-visible framing around this as 'may help' rather than 'stops
+  attackers'"_. hrdr made the same call explicitly when it removed cwd
+  confinement (`f0d903a`).
+
+### What could not be verified
+
+No prompt was rendered by running either tool — hermes' own `prompt-size` would
+settle it but constructing an `AIAgent` creates directories, out of bounds for a
+read-only pass. **Every size comparison here is structural, not measured.**
+Whether `tool_search` ever activates in a default install is unconfirmed (with
+no MCP servers configured, nothing is deferrable and the gate is a permanent
+no-op). `agent/conversation_compression.py` (2769 lines) was read only at its
+header, so **no claim is made that hrdr's compaction is better** — only that
+`trajectory_compressor.py` is not the comparison. `agent/coding_context.py` —
+likely the most directly comparable surface to `system.j2` — was reached only
+through call sites and **not read**; comparing the two prompts' _content_ is the
+obvious next pass. The persona-after-environment ordering nit is verified by
+construction, not observed on the wire.
 
 ## opencode
 
