@@ -4,6 +4,19 @@
 _both_ hrdr and its target, each given the same set of preliminary claims to
 verify or refute. Findings below are the hardened output, not the first pass.
 
+> **Status update (2026-07-26, later the same day — commits
+> `c5e5ced`..`b1a698f`):** the prompt-architecture findings below shipped.
+> `system.j2` is gone — the prompt is now ten `include_str!` markdown fragments
+> assembled as an ordered section list
+> (`base → global_agents_md → global_memory → project_agents_md → project_memory → capability group → persona → environment`),
+> minijinja is out of the workspace, memory is re-gathered at compaction (hermes
+> finding 4 / "frozen memory"), persona now precedes environment (hermes sub-nit
+> a), and the native Anthropic path places a `cache_control` breakpoint at the
+> stable/volatile boundary before the environment block (hermes finding 1).
+> Sections referring to `system.j2`, `append_environment`/`append_persona`, or
+> the frozen memory index describe the **pre-rewrite** baseline; each affected
+> finding carries a **Shipped** note inline.
+
 Harnesses compared (cloned in `~/Projects/harness/`):
 
 | Harness        | Repo                        | Language   | Size |
@@ -23,7 +36,9 @@ mixing the two is how a comparison like this turns into a bad backlog.
 
 ## hrdr as of this comparison
 
-The baseline everything below is measured against.
+The baseline everything below is measured against. (Snapshot: this section
+describes the pre-rewrite prompt — see the status update above for what changed
+the same day.)
 
 **System prompt** — one Jinja template,
 `crates/hrdr-agent/src/templates/system.j2`, 705 lines, rendered once per
@@ -170,6 +185,11 @@ the rollout and advanced by RFC 7386 merge patches.
 > `messages[0]` verbatim (`compaction.rs:607`, `:616`) so it doesn't reach it at
 > compaction either. **hrdr's injected memory is frozen for the whole session.**
 > See the hermes section, finding 4, for the cheap fix.
+>
+> **Shipped** (`c5e5ced`, see status update): `compact()` now calls
+> `refresh_system_prompt_in_place()`, which re-gathers the memory index and
+> rebuilds the prompt before the history is rewritten — the one moment the
+> prefix cache is already dead.
 
 So hrdr does not have codex's problem of silently changing bytes — it has the
 opposite one. What still stands from this finding is the second half: hrdr has
@@ -723,6 +743,22 @@ cache mode is `auto` and only fires where `cache_control` is real
 routes. Anthropic caps breakpoints at 4 and hrdr spends 3; adding one leaves
 zero headroom.
 
+**Shipped** (`b1a698f`): `build_system_prompt` returns the byte offset of the
+boundary (`SystemPrompt::prefix_len_before(SECTION_ENVIRONMENT)` — a fold over
+section lengths, no substring search), the client carries it as
+`system_cache_split`, and the native Anthropic path splits the system prompt
+into two marked blocks there. All 4 breakpoints now spent: tools, stable prefix,
+system tail, rolling last message. Sub-nit (a) — persona after environment — was
+fixed by the section reorder in `c5e5ced`; persona now sits just above the
+environment tail, and the breakpoint sits between them. The residuals from the
+caveat stand: the OpenRouter/OpenAI-shape path (`apply_cache_breakpoints`) still
+marks the system message as **one** block and ignores the split, and a
+**resumed** session (`set_messages` — TUI resume, `task_revive`) restores the
+saved `messages[0]` while the client keeps the split computed for the freshly
+built prompt, so the breakpoint can land at the wrong byte of the restored text
+(harmless to the model — the blocks concatenate — but the shared-prefix reuse
+degrades). Both are tracked in `deferred-improvements.md`.
+
 **2. hrdr injects a cloned repo's `AGENTS.md` into its system prompt unscanned —
 and silently drops it if over 64 KiB.** Two defects in one place.
 `gather_agent_docs` walks from cwd upward (`prompt.rs:210-229`) and concatenates
@@ -785,6 +821,11 @@ content wouldn't round-trip through the tool's own parser (manual edit, sibling
 session), backing up to `.bak.<ts>` instead of clobbering (`:93-120`,
 `:344-363`) — directly relevant to hrdr's tracked memory-drift item, which is
 currently scoped only to index/pointer structure.
+
+**Shipped** (`c5e5ced`): memory re-gathers at the compaction boundary — see the
+correction note in the codex section. The drift-guard note (hermes'
+`_detect_external_drift`) still stands as an open idea, folded into the tracked
+memory-drift item.
 
 **5. Gate LSP tool registration on the project having a matching server.** hrdr
 registers `definition`/`references`/`rename` whenever `config.lsp` is on
@@ -1366,9 +1407,11 @@ comparison found.
 
 1. **Model-invocable skills** (pi + hermes + opencode agree; closes a defect
    found here; low cost).
-2. **Cache breakpoint at hrdr's own stable/volatile boundary** + re-gather
+2. ~~**Cache breakpoint at hrdr's own stable/volatile boundary** + re-gather
    memory at compaction (hermes; ~30 lines each; the memory freeze is a live
-   defect).
+   defect).~~ **Shipped** — `c5e5ced` (memory unfreeze + ordered sections),
+   `5f6e386` (markdown fragments, no template engine), `6274c80` (global/project
+   scope split), `b1a698f` (the breakpoint). See the status update at the top.
 3. **`doom_loop` detection** (opencode; half a day; currently a stuck model
    burns the whole cost cap).
 4. **Protect `.git` inside the worktree** (codex; independent of issue #13;
