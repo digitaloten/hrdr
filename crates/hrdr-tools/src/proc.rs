@@ -59,6 +59,86 @@ pub(crate) fn configure(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Spawn `cmd` with its whole process tree made killable: [`configure`] it,
+/// `spawn()` it, and [`attach`](ProcessGroup::attach) a group to the resulting
+/// child — the three steps that only work together, in that order.
+///
+/// Prefer this over a bare `cmd.spawn()` for anything long-running. The stdio
+/// and `kill_on_drop(true)` setup stays with the caller (it differs per site);
+/// what this owns is the tree-kill invariant: `kill_on_drop`, and an explicit
+/// `child.kill()`, both act only on the single pid tokio spawned — the shell
+/// leader — so whatever that shell forked survives them. See the module docs
+/// for how each platform makes the tree reachable instead.
+///
+/// The returned [`GroupKill`] is the one place the explicit tree-kill is
+/// written; call [`GroupKill::kill`] on whatever path decides to stop the child
+/// early (a timeout elapsing, an output cap overflowing). The
+/// dropped-future path needs no call — the guard's `Drop` covers it.
+///
+/// The spawn is deliberately *outside* the caller's timeout race: the pid and
+/// group handle have to be captured while the `Child` is still in hand, and the
+/// timed future typically consumes it (`wait_with_output()`).
+///
+/// A failed attach is fatal here — the child is dropped (and so reaped by
+/// `kill_on_drop`) and the error propagates. Callers that would rather run a
+/// child un-guarded than not run it at all use [`spawn_group_best_effort`].
+pub(crate) fn spawn_group(
+    cmd: &mut tokio::process::Command,
+) -> io::Result<(tokio::process::Child, GroupKill)> {
+    configure(cmd);
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    let group = ProcessGroup::attach(&child)?;
+    Ok((
+        child,
+        GroupKill {
+            group: Some(group),
+            pid,
+        },
+    ))
+}
+
+/// Like [`spawn_group`], but a failed *attach* is not fatal: the child is
+/// returned anyway, with a [`GroupKill`] whose [`kill`](GroupKill::kill) is a
+/// no-op. Only a spawn failure is an error.
+///
+/// For callers whose child is worth running even un-guarded — a formatter hook
+/// is useful whether or not its forks can be reached later — where refusing to
+/// run it would be the bigger regression. (Attach only ever fails on Windows,
+/// where it creates a Job Object.)
+pub(crate) fn spawn_group_best_effort(
+    cmd: &mut tokio::process::Command,
+) -> io::Result<(tokio::process::Child, GroupKill)> {
+    configure(cmd);
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    let group = ProcessGroup::attach(&child).ok();
+    Ok((child, GroupKill { group, pid }))
+}
+
+/// A spawned child's tree-kill handle: the [`ProcessGroup`] guard plus the pid
+/// [`ProcessGroup::kill`] needs, captured at spawn so the caller doesn't have to
+/// carry it past the point where the `Child` is moved into a timed future.
+///
+/// `group` is `None` only for a [`spawn_group_best_effort`] child whose attach
+/// failed; [`kill`](GroupKill::kill) is then a no-op and only `kill_on_drop` (or
+/// an explicit child kill) reaches the leader.
+pub(crate) struct GroupKill {
+    group: Option<ProcessGroup>,
+    pid: Option<u32>,
+}
+
+impl GroupKill {
+    /// Kill the whole tree, now — the explicit path (timeout, output cap).
+    /// Pair with a direct child kill where the leader must also be reaped
+    /// immediately rather than whenever the `Child` is dropped.
+    pub(crate) fn kill(&self) {
+        if let Some(group) = &self.group {
+            group.kill(self.pid);
+        }
+    }
+}
+
 /// Handle to whatever OS resource lets [`kill`](ProcessGroup::kill) take down
 /// an entire process tree spawned through a [`configure`]d `Command`.
 ///

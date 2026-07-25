@@ -175,15 +175,11 @@ async fn run_check(command: &str, ctx: &ToolContext) -> Result<(Option<i32>, Str
         // The turn was cancelled (Esc), or the watch gave up: the check must not
         // outlive the call that started it.
         .kill_on_drop(true);
-    // Own process group / job object, so a check that backgrounds something
-    // (`some-daemon &`) can be killed in full on timeout, not just the shell
-    // running the check itself.
-    crate::proc::configure(&mut cmd);
 
     let check_timeout = Duration::from_secs(WATCH_CHECK_TIMEOUT_SECS);
-    let child = cmd.spawn()?;
-    let pid = child.id();
-    let group = crate::proc::ProcessGroup::attach(&child)?;
+    // Group-spawned so the timeout path below reaches whatever the check
+    // backgrounded (`some-daemon &`), not just the shell running the check.
+    let (child, group) = crate::proc::spawn_group(&mut cmd)?;
     match tokio::time::timeout(check_timeout, child.wait_with_output()).await {
         Ok(out) => {
             let out = out?;
@@ -194,12 +190,11 @@ async fn run_check(command: &str, ctx: &ToolContext) -> Result<(Option<i32>, Str
             }
             Ok((out.status.code(), text))
         }
-        // The leader is killed as the timed-out future (and the `Child` it
-        // owns) is dropped (`kill_on_drop`) — but that alone only reaps the
-        // leader. Kill the whole group explicitly so anything the check
-        // backgrounded dies with it.
+        // Dropping the timed-out future (and the `Child` it owns) reaps the
+        // leader; kill the group so anything the check backgrounded dies too,
+        // without waiting for the guard's own drop.
         Err(_) => {
-            group.kill(pid);
+            group.kill();
             Ok((
                 None,
                 format!("[check exceeded {WATCH_CHECK_TIMEOUT_SECS}s and was killed]"),

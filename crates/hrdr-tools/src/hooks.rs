@@ -103,26 +103,19 @@ pub async fn run_file_hooks(hooks: &[Hook], tool: &str, path: &Path, cwd: &Path)
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
-        // Own process group / job object, so a hook that forks something
-        // (a formatter shelling out) can be killed in full on timeout.
-        crate::proc::configure(&mut cmd);
         let timeout = Duration::from_millis(hook.timeout_ms);
         // `Ok(Ok(out))` / `Ok(Err(spawn_err))` / `Err(Elapsed)` — same shape
         // `tokio::time::timeout(timeout, cmd.output()).await` produced, so the
         // match below is unchanged; spawning is just pulled out in front so we
-        // can hold the pid/group needed to kill the whole tree on timeout.
-        let ran = match cmd.spawn() {
-            Ok(child) => {
-                let pid = child.id();
-                let group = crate::proc::ProcessGroup::attach(&child);
+        // can hold the group needed to kill the whole tree on timeout.
+        // Best-effort: a hook whose group couldn't be set up still runs.
+        let ran = match crate::proc::spawn_group_best_effort(&mut cmd) {
+            Ok((child, group)) => {
                 let ran = tokio::time::timeout(timeout, child.wait_with_output()).await;
-                if ran.is_err()
-                    && let Ok(group) = &group
-                {
-                    // The timer won: kill the whole tree, not just the
-                    // direct child — `kill_on_drop` (already set above)
-                    // reaps only the pid tokio spawned.
-                    group.kill(pid);
+                if ran.is_err() {
+                    // The timer won: kill in full, so a formatter that shelled
+                    // out to something goes with it.
+                    group.kill();
                 }
                 ran
             }
@@ -273,18 +266,13 @@ pub async fn run_event_hooks(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        // Own process group / job object, so a hung hook that forked
-        // something (a background watcher, say) is fully killed on timeout,
-        // not just the hook's own shell.
-        crate::proc::configure(&mut cmd);
         let timeout = Duration::from_millis(hook.timeout_ms);
         // `Ok(Ok(out))` / `Ok(Err(spawn_err))` / `Err(Elapsed)` — same shape
-        // as before; spawning is pulled out in front of the timed race so we
-        // can hold the pid/group needed to kill the whole tree on timeout.
-        let ran = match cmd.spawn() {
-            Ok(mut child) => {
-                let pid = child.id();
-                let group = crate::proc::ProcessGroup::attach(&child);
+        // as before; spawning is pulled out in front of the timed race (which
+        // also feeds the payload to stdin) so we can hold the group needed to
+        // kill the whole tree on timeout. Best-effort, as in `run_file_hooks`.
+        let ran = match crate::proc::spawn_group_best_effort(&mut cmd) {
+            Ok((mut child, group)) => {
                 let ran = tokio::time::timeout(timeout, async {
                     if let Some(mut stdin) = child.stdin.take() {
                         use tokio::io::AsyncWriteExt;
@@ -296,13 +284,10 @@ pub async fn run_event_hooks(
                     child.wait_with_output().await
                 })
                 .await;
-                if ran.is_err()
-                    && let Ok(group) = &group
-                {
-                    // The timer won: kill the whole tree, not just the
-                    // direct child — `kill_on_drop` (already set above)
-                    // reaps only the pid tokio spawned.
-                    group.kill(pid);
+                if ran.is_err() {
+                    // The timer won: kill in full, so a hung hook that forked
+                    // something (a background watcher, say) goes with it.
+                    group.kill();
                 }
                 ran
             }

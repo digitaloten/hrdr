@@ -95,12 +95,9 @@ pub(crate) async fn run_capped_output(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    // Own process group / job object, so overflow below kills the whole tree
-    // the child forked, not just the direct pid.
-    crate::proc::configure(&mut cmd);
-    let mut child = cmd.spawn()?;
-    let pid = child.id();
-    let group = crate::proc::ProcessGroup::attach(&child)?;
+    // Group-spawned so the overflow kill below reaches the whole tree the
+    // child forked, not just the direct pid.
+    let (mut child, group) = crate::proc::spawn_group(&mut cmd)?;
     let mut out = child.stdout.take().expect("stdout was piped");
     let mut err = child.stderr.take().expect("stderr was piped");
 
@@ -148,10 +145,10 @@ pub(crate) async fn run_capped_output(
         }
     }
     if over_cap {
-        // Kill the whole tree, not just the direct child: a wrapper that
-        // forks a long-lived descendant must not keep it running (or keep
-        // writing into a pipe we've stopped reading) after we bail.
-        group.kill(pid);
+        // A wrapper that forked a long-lived descendant must not keep it
+        // running (or keep writing into a pipe we've stopped reading) after we
+        // bail — hence the tree kill, not just the direct child below.
+        group.kill();
         let _ = child.start_kill();
     }
     let status = child.wait().await?;

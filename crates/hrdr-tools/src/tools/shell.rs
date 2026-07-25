@@ -258,13 +258,7 @@ async fn run_streamed_command(
     cmd.stdin(Stdio::null());
     // Cancelled future → child must not linger.
     cmd.kill_on_drop(true);
-    // Own process group / job object, so the timeout path below can kill the
-    // whole tree the command forked, not just its own pid — `kill_on_drop`
-    // and a bare `child.kill()` only ever reach the leader.
-    crate::proc::configure(&mut cmd);
-    let mut child = cmd.spawn().context("spawning command")?;
-    let pid = child.id();
-    let group = crate::proc::ProcessGroup::attach(&child).context("attaching process group")?;
+    let (mut child, group) = crate::proc::spawn_group(&mut cmd).context("spawning command")?;
     let stdout = child.stdout.take().context("capturing stdout")?;
     let stderr = child.stderr.take().context("capturing stderr")?;
     let mut out_reader = BufReader::new(stdout);
@@ -416,9 +410,9 @@ async fn run_streamed_command(
         Ok(inner) => Some(inner?),
         Err(_) => {
             // Kill the whole process tree, not just `child`: `bash -c "npm
-            // run dev"` forks `node`, and `child.kill()` alone only reaps
-            // `bash` — `node` would keep holding its port forever.
-            group.kill(pid);
+            // run dev"` forks `node`, and the `child.kill()` below alone only
+            // reaps `bash` — `node` would keep holding its port forever.
+            group.kill();
             let _ = child.kill().await;
             let msg = format!(
                 "[command timed out after {}ms; process killed — raise timeout_ms or \
