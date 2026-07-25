@@ -39,7 +39,7 @@ worth a trait, and is recorded as DAMP rather than as a finding.
 
 ---
 
-## 1. `HRDR_LOG_REQUESTS` only instruments the OpenAI backend — WET ⚠️ (live gap)
+## 1. `HRDR_LOG_REQUESTS` only instruments the OpenAI backend — FIXED ✅ (`579e286`)
 
 **Concern:** wire-level debug logging — request body, non-2xx error body, raw
 SSE lines. **Should be owned by:** `log_wire` (`hrdr-llm/src/client.rs:187`),
@@ -92,7 +92,19 @@ it in the other two — one concern implemented three times, and two of them
 wrong. Worth assuming there are more: **any invariant that lives in
 `client.rs`'s streaming path should be checked against the other two.**
 
-## 2. Process-group kill invariant repeated at five spawn sites — WET ⚠️
+**Fixed** (`579e286`): `log_wire` is `pub(crate)`, and both native backends emit
+the same three records the OpenAI path does, with the request logged _before_
+the send. The post-hoc logging in `client.rs` is gone — it would have
+double-logged every success — and since the returned body existed only to feed
+it, `chat_stream` now returns `ChatStream` rather than `(Value, ChatStream)`.
+Bodies never see the credential (it is a header, applied after the body is
+built); `crates/hrdr-llm/tests/wire_log_native_backends.rs` pins both the
+request records and the absence of the key, and fails with "the wire log was
+created: NotFound" against the pre-fix code. `error_response` and `sse` for the
+native backends stay uncovered by tests — backend selection keys on the host, so
+a mock server on `127.0.0.1` cannot reach those paths.
+
+## 2. Process-group kill invariant repeated at five spawn sites — FIXED ✅ (`3fb99b5`)
 
 **Concern:** "spawn a child, and kill its whole process tree rather than just
 the direct pid." **Should be owned by:** a helper in `hrdr-tools/src/proc.rs`,
@@ -133,6 +145,22 @@ This is a real but modest win — five call sites shed ~8 lines each and the
 sequence stops being folklore. Note it is _not_ a full unification: the timeout
 race stays with the caller, because collapsing that too would mean a generic
 over the body future for little gain.
+
+**Fixed** (`3fb99b5`), with two departures from the sketch above. `GroupKill`
+carries the pid, so `kill()` takes no argument and no caller holds a pid across
+the point where the `Child` is consumed — which was the awkward part the sketch
+left in place. And there are two entry points, because one `Result` cannot
+express both attach policies: hooks run their child even when attach failed, so
+`spawn_group_best_effort` keeps that (its `kill()` no-ops) while `spawn_group`
+treats a failed attach as fatal, as `watch`/`shell`/`mod` already did. Attach
+only fails on Windows, where it creates a Job Object.
+
+`lsp.rs` and `mcp/client.rs` were left alone deliberately: they hold
+`Option<ProcessGroup>` in long-lived struct fields, rely purely on the guard's
+`Drop` with documented field ordering (`lsp.rs:400`), and never kill explicitly
+— a `GroupKill` they would never call. One error-message nuance: `shell.rs` had
+separate contexts for spawn and attach failure, and one call means one context,
+so a Windows attach failure now surfaces under `"spawning command"`.
 
 ## 3. `find.rs` and `grep.rs` build a byte-identical `WalkBuilder` — WET ⚠️
 
@@ -279,20 +307,20 @@ so a future dialect finds it.
 
 ## Summary
 
-| #   | Concern                                     | Verdict         |
-| --- | ------------------------------------------- | --------------- |
-| 1   | `HRDR_LOG_REQUESTS` OpenAI-only             | WET ⚠️ live gap |
-| 2   | Process-group kill at 5 spawn sites         | WET ⚠️          |
-| 3   | `find.rs`/`grep.rs` identical `WalkBuilder` | WET ⚠️          |
-| 4   | `is_anthropic_native` string dispatch       | WET ⚠️          |
+| #   | Concern                                     | Verdict            |
+| --- | ------------------------------------------- | ------------------ |
+| 1   | `HRDR_LOG_REQUESTS` OpenAI-only             | FIXED ✅ `579e286` |
+| 2   | Process-group kill at 5 spawn sites         | FIXED ✅ `3fb99b5` |
+| 3   | `find.rs`/`grep.rs` identical `WalkBuilder` | WET ⚠️             |
+| 4   | `is_anthropic_native` string dispatch       | WET ⚠️             |
 
 Verdict: **the seams are in better shape than the shell case suggested.** Four
 of the seven concerns with real variants already own their differences properly,
 and two more (`GrepBackend`, `Transport`) are enum-dispatched without
-catch-alls. The one finding that matters is #1, and it matters because it is a
-feature that silently does nothing on two thirds of its surface — the same
-three-parallel- implementations shape that produced security finding O4. The
-remaining three are maintenance hygiene: worth doing, none urgent.
+catch-alls. The one finding that mattered was #1 — a feature that silently did
+nothing on two thirds of its surface, the same three-parallel-implementations
+shape that produced security finding O4 — and it is fixed, along with #2. **#3
+and #4 remain open**; both are maintenance hygiene, neither urgent.
 
 The recurring lesson from both O4 and #1 is narrower than "unify the backends":
 **`hrdr-llm` has three streaming paths, and an invariant added to one of them
