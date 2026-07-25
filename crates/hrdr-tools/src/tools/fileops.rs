@@ -30,7 +30,7 @@ async fn guard_victim(
     verb: &str,
     strict: bool,
 ) -> Result<()> {
-    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+    if !super::path_exists(path).await {
         bail!(
             "{} does not exist — relative paths resolve against the project root ({}); \
              use ls or find to locate it",
@@ -126,18 +126,14 @@ impl Tool for MoveTool {
             reject_descendant_destination(&from, &to)?;
         }
 
-        let dest_exists = tokio::fs::try_exists(&to).await.unwrap_or(false);
+        let dest_exists = super::path_exists(&to).await;
         if dest_exists && !a.overwrite {
             bail!(
                 "{} already exists — pass overwrite: true to replace it",
                 to.display()
             );
         }
-        if let Some(parent) = to.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
+        super::ensure_parent_dir(&to).await?;
         guard_victim(ctx, &from, "move", false).await?;
         rename_or_copy(&from, &to)
             .await
@@ -218,7 +214,7 @@ async fn remove_path(path: &std::path::Path) -> std::io::Result<()> {
 async fn staged_copy_dir(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
     validate_copy_tree(from).await?;
     let stage = staging_path(to);
-    if tokio::fs::try_exists(&stage).await.unwrap_or(false) {
+    if super::path_exists(&stage).await {
         remove_path(&stage).await?;
     }
     if let Err(error) = copy_dir(from, &stage).await {
@@ -231,9 +227,9 @@ async fn staged_copy_dir(from: &std::path::Path, to: &std::path::Path) -> Result
     // failed, `to` was already gone. Instead, move the existing destination
     // *aside* first, swap the stage in, then delete the aside copy — and on a
     // failed swap, put the original straight back.
-    if tokio::fs::try_exists(to).await.unwrap_or(false) {
+    if super::path_exists(to).await {
         let aside = aside_path(to);
-        if tokio::fs::try_exists(&aside).await.unwrap_or(false) {
+        if super::path_exists(&aside).await {
             remove_path(&aside).await?;
         }
         tokio::fs::rename(to, &aside).await.with_context(|| {
@@ -425,7 +421,7 @@ impl Tool for CopyTool {
                 from.display()
             );
         }
-        if !tokio::fs::try_exists(&from).await.unwrap_or(false) {
+        if !super::path_exists(&from).await {
             bail!(
                 "{} does not exist — relative paths resolve against the project root ({}); \
                  use ls or find to locate it",
@@ -437,18 +433,14 @@ impl Tool for CopyTool {
             reject_descendant_destination(&from, &to)?;
         }
 
-        let dest_exists = tokio::fs::try_exists(&to).await.unwrap_or(false);
+        let dest_exists = super::path_exists(&to).await;
         if dest_exists && !a.overwrite {
             bail!(
                 "{} already exists — pass overwrite: true to replace it",
                 to.display()
             );
         }
-        if let Some(parent) = to.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
+        super::ensure_parent_dir(&to).await?;
         if from.is_dir() {
             staged_copy_dir(&from, &to).await?;
             Ok(format!("Copied {}/ → {}/", from.display(), to.display()))

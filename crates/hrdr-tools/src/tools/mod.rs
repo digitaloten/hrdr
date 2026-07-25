@@ -46,6 +46,8 @@ pub(crate) const DEFAULT_SHELL_TIMEOUT_MS: u64 = 300_000;
 /// Hard cap on a single output line accumulated from the shell; prevents
 /// a minified-file line from blowing the per-turn context.
 pub(crate) const BASH_LINE_CAP: usize = 8_192;
+/// What a search tool reports when nothing matched.
+pub(crate) const NO_MATCHES: &str = "(no matches)";
 
 /// How long `watch` sleeps between checks when the model doesn't say.
 ///
@@ -155,6 +157,35 @@ pub(crate) async fn run_capped_output(
     let status = child.wait().await?;
     let stderr_buf = stderr_task.await.unwrap_or_default();
     Ok((status, stdout_buf, stderr_buf, over_cap))
+}
+
+/// Create `path`'s parent directory (and any missing ancestors), so a write to a
+/// path in a directory that doesn't exist yet succeeds. A path with no parent
+/// (a bare root) is a no-op.
+pub(crate) async fn ensure_parent_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+/// Whether `path` exists, reading any error (a permission-denied ancestor, a
+/// broken symlink) as "no" — the callers all want a plain yes/no.
+pub(crate) async fn path_exists(path: &std::path::Path) -> bool {
+    tokio::fs::try_exists(path).await.unwrap_or(false)
+}
+
+/// `path` displayed relative to `cwd`, falling back to the full path when it
+/// lies outside — the short form the tools show the model.
+pub(crate) fn rel_display<'a>(
+    path: &'a std::path::Path,
+    cwd: &std::path::Path,
+) -> std::path::Display<'a> {
+    path.strip_prefix(cwd).unwrap_or(path).display()
 }
 
 pub use edit::EditTool;

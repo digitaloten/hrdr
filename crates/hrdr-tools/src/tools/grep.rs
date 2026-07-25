@@ -241,7 +241,7 @@ async fn run_search_cmd(
                 regex_error_hint(&stderr, literal)
             );
         }
-        return Ok("(no matches)".to_string());
+        return Ok(super::NO_MATCHES.to_string());
     }
     // Drop any match lines that name a secret file (e.g. a `.env` in the tree),
     // so a broad `grep KEY .` can't surface credentials the `read` deny-list
@@ -252,7 +252,7 @@ async fn run_search_cmd(
         .collect::<Vec<_>>()
         .join("\n");
     if stdout.is_empty() {
-        return Ok("(no matches)".to_string());
+        return Ok(super::NO_MATCHES.to_string());
     }
     // Cap by match count first (with a "narrow the pattern" nudge), then by
     // bytes as the backstop.
@@ -406,7 +406,7 @@ pub(crate) fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
         }
     }
     if out.is_empty() {
-        Ok("(no matches)".to_string())
+        Ok(super::NO_MATCHES.to_string())
     } else {
         Ok(truncate_saved(
             out.trim_end(),
@@ -508,7 +508,7 @@ fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
         }
     }
     if out.is_empty() {
-        Ok("(no matches)".to_string())
+        Ok(super::NO_MATCHES.to_string())
     } else {
         Ok(truncate_saved(
             out.trim_end(),

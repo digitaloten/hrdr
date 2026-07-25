@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
@@ -49,7 +49,7 @@ impl Tool for WriteTool {
                 path.display()
             );
         }
-        let existed = tokio::fs::try_exists(&path).await.unwrap_or(false);
+        let existed = super::path_exists(&path).await;
         if existed {
             // A `write` replaces the whole file, so the model must have seen the
             // whole current content: not unread, not a partial page, and not a
@@ -82,18 +82,11 @@ impl Tool for WriteTool {
         } else {
             String::new()
         };
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
+        super::ensure_parent_dir(&path).await?;
         let bytes = a.content.len();
         let fc = super::mutation::apply_file_change(ctx, &path, "write", &a.content).await?;
         ctx.mark_read(&path); // the model authored (or just saw) this content
-        let mut warn = fc.notes.join("\n");
-        if !warn.is_empty() {
-            warn.insert(0, '\n');
-        }
+        let warn = fc.formatted_notes();
         if existed {
             let diff = unified_diff(&path.display().to_string(), &old, &fc.content_after);
             let body = if diff.is_empty() {

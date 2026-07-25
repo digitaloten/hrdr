@@ -84,7 +84,7 @@ impl Tool for FindTool {
         }
         paths.sort();
         if paths.is_empty() {
-            return Ok("(no matches)".to_string());
+            return Ok(super::NO_MATCHES.to_string());
         }
         Ok(truncate(&paths.join("\n"), ctx.max_output))
     }

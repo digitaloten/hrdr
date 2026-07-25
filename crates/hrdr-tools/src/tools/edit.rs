@@ -213,10 +213,7 @@ impl Tool for EditTool {
         // Re-record with the post-edit (post-hook) signature, so a follow-up
         // edit/write this turn sees Fresh rather than a false Stale.
         ctx.mark_read(&path);
-        let mut warn = fc.notes.join("\n");
-        if !warn.is_empty() {
-            warn.insert(0, '\n');
-        }
+        let warn = fc.formatted_notes();
         let diff = unified_diff(&path.display().to_string(), &text, &fc.content_after);
         Ok(truncate(
             &format!(

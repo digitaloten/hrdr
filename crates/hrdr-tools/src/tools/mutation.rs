@@ -9,6 +9,18 @@ pub struct FileChange {
     pub notes: Vec<String>,
 }
 
+impl FileChange {
+    /// The notes as one block ready to splice into a tool's success message: one
+    /// per line behind a leading newline, or empty when there are none.
+    pub fn formatted_notes(&self) -> String {
+        let mut out = self.notes.join("\n");
+        if !out.is_empty() {
+            out.insert(0, '\n');
+        }
+        out
+    }
+}
+
 /// RAII guard that removes the temp file on drop unless kept.
 struct TempFile {
     path: std::path::PathBuf,

@@ -439,7 +439,7 @@ impl Tool for RenameTool {
         let mut summary = Vec::with_capacity(planned.len());
         for (plan, fc) in planned.iter().zip(applied.iter()) {
             let (path, edit_count) = (&plan.path, plan.edit_count);
-            let rel = path.strip_prefix(&ctx.cwd).unwrap_or(path).display();
+            let rel = super::rel_display(path, &ctx.cwd);
             let mut line = format!("{rel} ({edit_count} edit(s))");
             if !fc.notes.is_empty() {
                 line.push_str(&format!("  [{}]", fc.notes.join("; ")));

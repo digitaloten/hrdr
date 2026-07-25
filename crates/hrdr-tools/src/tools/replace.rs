@@ -150,7 +150,7 @@ impl Tool for ReplaceTool {
                         "replacing {:?} in {} would produce ~{len}+ bytes; narrow `find` or \
                          the sweep",
                         a.find,
-                        path.strip_prefix(&ctx.cwd).unwrap_or(&path).display()
+                        super::rel_display(&path, &ctx.cwd)
                     ),
                 }
             } else {
@@ -163,7 +163,7 @@ impl Tool for ReplaceTool {
                             "replacing {:?} in {} would produce ~{projected} bytes; narrow `find` \
                              or the sweep",
                             a.find,
-                            path.strip_prefix(&ctx.cwd).unwrap_or(&path).display()
+                            super::rel_display(&path, &ctx.cwd)
                         );
                     }
                 }
