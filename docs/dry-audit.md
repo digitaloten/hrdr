@@ -123,7 +123,16 @@ The trait itself is the DRY mechanism; each impl is a different kind of host.
 state the dispatch test host doesn't need. A shared `TestHost` base could
 eliminate the duplicate no-op bodies, but the overhead is tiny.
 
-## 8. TUI selector draw functions — WET ⚠️
+## 8. TUI selector draw functions — DRY ✅
+
+**Fixed** (`aa09f5b`): the shared scaffolding is now two helpers in
+`crates/hrdr-tui/src/ui.rs` — `modal_frame` (centered frame + block + small-area
+early-return, returning the inner `Rect`) and `draw_pick_body` (the two-column
+search/hint/list body). All six draw functions call `modal_frame`; the five
+two-column pickers (model, skill, login-providers, effort, theme) share
+`draw_pick_body`; `draw_session_selector` keeps its bespoke four-column body on
+top of the shared frame. ~408 lines of duplicated scaffolding removed, one place
+to change selector chrome. The historical duplication is described below.
 
 **Six nearly identical modal-drawing functions in `crates/hrdr-tui/src/ui.rs`,
 each ~100-150 lines:**
@@ -251,7 +260,7 @@ cleaner.
 | 5   | Session layering                   | DRY ✅    |
 | 6   | Project-dir walk                   | DAMP ✅   |
 | 7   | CommandHost impls                  | DAMP ✅   |
-| 8   | TUI selector draw functions        | WET ⚠️    |
+| 8   | TUI selector draw functions        | DRY ✅    |
 | 9   | File-attach flows                  | DRY ✅    |
 | 10  | Post-edit notes formatting         | WET ⚠️    |
 | 11  | `create_dir_all` + context         | WET ⚠️    |
@@ -263,17 +272,18 @@ cleaner.
 
 **Actionable items (ranked by impact):**
 
-1. Extract `draw_selector_modal<T>` for 6 TUI selector draw functions (#8) —
-   ~500 lines consolidated, one place to change selector chrome.
-2. Dedup `cfg()`/`cfg_with()` across `validate.rs`/`resolve.rs` and consolidate
+1. Dedup `cfg()`/`cfg_with()` across `validate.rs`/`resolve.rs` and consolidate
    the ~60 inline `AgentConfig { … }` test constructions (#4) —
    `fn r()`/`fn spec()` and the `Default` impls (#4a–#4d) already landed in
    `56b76ab`.
-3. Fix post-edit notes formatting (#10) — `fn formatted_notes()` on
+2. Fix post-edit notes formatting (#10) — `fn formatted_notes()` on
    `FileChange`.
-4. Extract `ensure_parent_dir()` (#11) — 3 call sites → 1.
-5. Low-hanging fruit: `NO_MATCHES` const (#14), `path_exists` helper (#13),
+3. Extract `ensure_parent_dir()` (#11) — 3 call sites → 1.
+4. Low-hanging fruit: `NO_MATCHES` const (#14), `path_exists` helper (#13),
    `rel_display` helper (#16).
+
+The biggest item — the six TUI selector draw functions (#8) — is done
+(`aa09f5b`).
 
 ---
 
