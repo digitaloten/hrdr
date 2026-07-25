@@ -222,20 +222,27 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// The `/model` selector modal: a search line, a hint, and a two-column list
-/// (friendly model name · friendly provider name) of every model across the
-/// configured providers, narrowed by the fuzzy filter. Same chrome as the
-/// blocks and the completion popup — solid background, 1×2 padding, no border.
-fn draw_model_selector(
+/// One row of a two-column picker: a left label and a right-aligned detail.
+struct PickRow {
+    left: String,
+    right: String,
+}
+
+/// The shared, centered picker-modal frame: solid background, 1×2 padding, no
+/// border — the same chrome as the blocks and the completion popup. Clears the
+/// region, draws the block, and returns the inner drawing rect, or `None` when
+/// the terminal is too small (inner height `< min_h` or width `< 6`) to draw
+/// into. `width_max`/`height_max` clamp the modal against the available area.
+fn modal_frame(
     f: &mut Frame,
     theme: &Theme,
-    sel: &crate::app::ModelSelector,
-    loading: bool,
-    source: Option<hrdr_agent::CatalogSource>,
-) {
+    width_max: u16,
+    height_max: u16,
+    min_h: u16,
+) -> Option<Rect> {
     let area = f.area();
-    let width = area.width.saturating_sub(4).clamp(1, 92);
-    let height = area.height.saturating_sub(2).clamp(1, 32);
+    let width = area.width.saturating_sub(4).clamp(1, width_max);
+    let height = area.height.saturating_sub(2).clamp(1, height_max);
     let rect = Rect {
         x: (area.width.saturating_sub(width)) / 2,
         y: (area.height.saturating_sub(height)) / 2,
@@ -248,17 +255,114 @@ fn draw_model_selector(
         .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
-    if inner.height < 3 || inner.width < 6 {
-        return;
+    if inner.height < min_h || inner.width < 6 {
+        return None;
     }
+    Some(inner)
+}
 
-    let rows: Vec<&hrdr_agent::ModelChoice> = sel.rows().collect();
+/// Render the shared two-column picker body into `inner`: an optionally-prefixed
+/// search line, a dim hint line, a blank, an empty-state message when there are
+/// no rows, then the scrolled, right-aligned two-column list. The right column
+/// is capped at `right_frac` (numerator, denominator) of the inner width before
+/// the left column fills the remainder; a selected row highlights end to end.
+#[allow(clippy::too_many_arguments)]
+fn draw_pick_body(
+    f: &mut Frame,
+    theme: &Theme,
+    inner: Rect,
+    prefix: Option<(&str, Color)>,
+    filter: &str,
+    hint: String,
+    empty: &str,
+    selected: usize,
+    rows: &[PickRow],
+    right_frac: (usize, usize),
+) {
     // Search line + a dim hint, then a blank row, then the list.
-    let search = Line::from(vec![
-        Span::styled("Search  ", Style::default().fg(theme.dim)),
-        Span::styled(sel.filter.clone(), Style::default().fg(theme.user)),
-        Span::styled("▌", Style::default().fg(theme.accent)),
-    ]);
+    let mut search_spans = Vec::new();
+    if let Some((text, color)) = prefix {
+        search_spans.push(Span::styled(text.to_string(), Style::default().fg(color)));
+    }
+    search_spans.push(Span::styled("Search  ", Style::default().fg(theme.dim)));
+    search_spans.push(Span::styled(
+        filter.to_string(),
+        Style::default().fg(theme.user),
+    ));
+    search_spans.push(Span::styled("▌", Style::default().fg(theme.accent)));
+    let search = Line::from(search_spans);
+    let hint = Line::from(Span::styled(hint, Style::default().fg(theme.dim)));
+
+    let list_height = inner.height.saturating_sub(3) as usize; // search + hint + blank
+    let inner_w = inner.width as usize;
+    // Scroll so the selected row stays visible.
+    let start = if selected >= list_height {
+        (selected + 1).saturating_sub(list_height)
+    } else {
+        0
+    };
+
+    let mut lines = vec![search, hint, Line::from("")];
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            empty.to_string(),
+            Style::default().fg(theme.dim),
+        )));
+    }
+    let right_cap = (inner_w * right_frac.0 / right_frac.1).max(1);
+    for (i, r) in rows.iter().enumerate().skip(start).take(list_height) {
+        let is_selected = i == selected;
+        // Left label, right detail right-aligned; the row fills the full inner
+        // width so a selected row highlights end to end.
+        let right = truncate_chars(&r.right, right_cap);
+        let avail = inner_w.saturating_sub(right.chars().count() + 1).max(1);
+        let left = truncate_chars(&r.left, avail);
+        let pad = inner_w
+            .saturating_sub(left.chars().count() + right.chars().count())
+            .max(1);
+        let line = if is_selected {
+            Line::from(Span::styled(
+                format!("{left}{}{right}", " ".repeat(pad)),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.user)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Line::from(vec![
+                Span::styled(left, Style::default().fg(theme.user)),
+                Span::styled(
+                    format!("{}{right}", " ".repeat(pad)),
+                    Style::default().fg(theme.dim),
+                ),
+            ])
+        };
+        lines.push(line);
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The `/model` selector modal: a search line, a hint, and a two-column list
+/// (friendly model name · friendly provider name) of every model across the
+/// configured providers, narrowed by the fuzzy filter. Same chrome as the
+/// blocks and the completion popup — solid background, 1×2 padding, no border.
+fn draw_model_selector(
+    f: &mut Frame,
+    theme: &Theme,
+    sel: &crate::app::ModelSelector,
+    loading: bool,
+    source: Option<hrdr_agent::CatalogSource>,
+) {
+    let Some(inner) = modal_frame(f, theme, 92, 32, 3) else {
+        return;
+    };
+    let rows: Vec<PickRow> = sel
+        .rows()
+        .map(|c| PickRow {
+            left: c.model_label.clone(),
+            right: c.provider_label.clone(),
+        })
+        .collect();
     // ChatGPT catalog provenance / loading, rendered on the hint line — kept
     // separate from the startup guidance so the two never share a block.
     let status = if loading {
@@ -271,150 +375,60 @@ fn draw_model_selector(
             None => "",
         }
     };
-    let hint = Line::from(Span::styled(
-        format!(
-            "{} model{} · ↑↓ select · Enter switch · ^D default · Esc cancel{status}",
-            rows.len(),
-            if rows.len() == 1 { "" } else { "s" },
-        ),
-        Style::default().fg(theme.dim),
-    ));
-
-    let list_height = inner.height.saturating_sub(3) as usize; // search + hint + blank
-    let inner_w = inner.width as usize;
-    // Scroll so the selected row stays visible.
-    let start = if sel.selected >= list_height {
-        (sel.selected + 1).saturating_sub(list_height)
-    } else {
-        0
-    };
-
-    let mut lines = vec![search, hint, Line::from("")];
-    if rows.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "no models match",
-            Style::default().fg(theme.dim),
-        )));
-    }
-    for (i, c) in rows.iter().enumerate().skip(start).take(list_height) {
-        let selected = i == sel.selected;
-        // Model name on the left, provider right-aligned; the row fills the full
-        // inner width so a selected row highlights end to end.
-        let provider = truncate_chars(&c.provider_label, (inner_w / 2).max(1));
-        let avail = inner_w.saturating_sub(provider.chars().count() + 1).max(1);
-        let model = truncate_chars(&c.model_label, avail);
-        let pad = inner_w
-            .saturating_sub(model.chars().count() + provider.chars().count())
-            .max(1);
-        let line = if selected {
-            Line::from(Span::styled(
-                format!("{model}{}{provider}", " ".repeat(pad)),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(theme.user)
-                    .add_modifier(Modifier::BOLD),
-            ))
-        } else {
-            Line::from(vec![
-                Span::styled(model, Style::default().fg(theme.user)),
-                Span::styled(
-                    format!("{}{provider}", " ".repeat(pad)),
-                    Style::default().fg(theme.dim),
-                ),
-            ])
-        };
-        lines.push(line);
-    }
-    f.render_widget(Paragraph::new(lines), inner);
+    let hint = format!(
+        "{} model{} · ↑↓ select · Enter switch · ^D default · Esc cancel{status}",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+    );
+    draw_pick_body(
+        f,
+        theme,
+        inner,
+        None,
+        &sel.filter,
+        hint,
+        "no models match",
+        sel.selected,
+        &rows,
+        (1, 2),
+    );
 }
 
 /// The `/skills` picker modal: a search line, a hint, and a two-column list
 /// (`:name` · description [source]); Enter inserts the invocation into the
 /// input. Same chrome as the other pickers.
 fn draw_skill_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::SkillSelector) {
-    let area = f.area();
-    let width = area.width.saturating_sub(4).clamp(1, 92);
-    let height = area.height.saturating_sub(2).clamp(1, 24);
-    let rect = Rect {
-        x: (area.width.saturating_sub(width)) / 2,
-        y: (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .style(Style::default().bg(theme.user_bg))
-        .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    if inner.height < 3 || inner.width < 6 {
+    let Some(inner) = modal_frame(f, theme, 92, 24, 3) else {
         return;
-    }
-
-    let rows: Vec<&hrdr_app::Skill> = sel.rows().collect();
-    let search = Line::from(vec![
-        Span::styled("Search  ", Style::default().fg(theme.dim)),
-        Span::styled(sel.filter.clone(), Style::default().fg(theme.user)),
-        Span::styled("▌", Style::default().fg(theme.accent)),
-    ]);
-    let hint = Line::from(Span::styled(
-        format!(
-            "{} skill{} · ↑↓ select · Enter insert · Esc cancel",
-            rows.len(),
-            if rows.len() == 1 { "" } else { "s" },
-        ),
-        Style::default().fg(theme.dim),
-    ));
-
-    let list_height = inner.height.saturating_sub(3) as usize;
-    let inner_w = inner.width as usize;
-    let start = if sel.selected >= list_height {
-        (sel.selected + 1).saturating_sub(list_height)
-    } else {
-        0
     };
-
-    let mut lines = vec![search, hint, Line::from("")];
-    if rows.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "no skills match",
-            Style::default().fg(theme.dim),
-        )));
-    }
-    for (i, sk) in rows.iter().enumerate().skip(start).take(list_height) {
-        let selected = i == sel.selected;
-        let right = if sk.description.is_empty() {
-            sk.source.clone()
-        } else {
-            sk.description.clone()
-        };
-        let right = truncate_chars(&right, (inner_w * 2 / 3).max(1));
-        let name = format!(":{}", sk.name);
-        let avail = inner_w.saturating_sub(right.chars().count() + 1).max(1);
-        let name = truncate_chars(&name, avail);
-        let pad = inner_w
-            .saturating_sub(name.chars().count() + right.chars().count())
-            .max(1);
-        let line = if selected {
-            Line::from(Span::styled(
-                format!("{name}{}{right}", " ".repeat(pad)),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(theme.user)
-                    .add_modifier(Modifier::BOLD),
-            ))
-        } else {
-            Line::from(vec![
-                Span::styled(name, Style::default().fg(theme.user)),
-                Span::styled(
-                    format!("{}{right}", " ".repeat(pad)),
-                    Style::default().fg(theme.dim),
-                ),
-            ])
-        };
-        lines.push(line);
-    }
-    f.render_widget(Paragraph::new(lines), inner);
+    let rows: Vec<PickRow> = sel
+        .rows()
+        .map(|sk| PickRow {
+            left: format!(":{}", sk.name),
+            right: if sk.description.is_empty() {
+                sk.source.clone()
+            } else {
+                sk.description.clone()
+            },
+        })
+        .collect();
+    let hint = format!(
+        "{} skill{} · ↑↓ select · Enter insert · Esc cancel",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+    );
+    draw_pick_body(
+        f,
+        theme,
+        inner,
+        None,
+        &sel.filter,
+        hint,
+        "no skills match",
+        sel.selected,
+        &rows,
+        (2, 3),
+    );
 }
 
 /// The `/login` modal. Provider phase: the same two-column picker chrome as
@@ -422,84 +436,36 @@ fn draw_skill_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::SkillSele
 /// under the plaintext-storage warning — the key never touches the editor,
 /// history, or transcript.
 fn draw_login_modal(f: &mut Frame, theme: &Theme, modal: &crate::app::LoginModal) {
-    let area = f.area();
-    let width = area.width.saturating_sub(4).clamp(1, 76);
+    let width = f.area().width.saturating_sub(4).clamp(1, 76);
     match modal {
         crate::app::LoginModal::Providers(sel) => {
-            let height = area.height.saturating_sub(2).clamp(1, 16);
-            let rect = Rect {
-                x: (area.width.saturating_sub(width)) / 2,
-                y: (area.height.saturating_sub(height)) / 2,
-                width,
-                height,
-            };
-            f.render_widget(Clear, rect);
-            let block = Block::default()
-                .style(Style::default().bg(theme.user_bg))
-                .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
-            let inner = block.inner(rect);
-            f.render_widget(block, rect);
-            if inner.height < 3 || inner.width < 6 {
+            let Some(inner) = modal_frame(f, theme, 76, 16, 3) else {
                 return;
-            }
-            let rows: Vec<&hrdr_app::LoginProviderChoice> = sel.rows().collect();
-            let search = Line::from(vec![
-                Span::styled("🔑 /login  ", Style::default().fg(theme.warn)),
-                Span::styled("Search  ", Style::default().fg(theme.dim)),
-                Span::styled(sel.filter.clone(), Style::default().fg(theme.user)),
-                Span::styled("▌", Style::default().fg(theme.accent)),
-            ]);
-            let hint = Line::from(Span::styled(
-                format!(
-                    "{} provider{} · ↑↓ select · Enter continue · Esc cancel",
-                    rows.len(),
-                    if rows.len() == 1 { "" } else { "s" },
-                ),
-                Style::default().fg(theme.dim),
-            ));
-            let list_height = inner.height.saturating_sub(3) as usize;
-            let inner_w = inner.width as usize;
-            let start = if sel.selected >= list_height {
-                (sel.selected + 1).saturating_sub(list_height)
-            } else {
-                0
             };
-            let mut lines = vec![search, hint, Line::from("")];
-            if rows.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "no providers match",
-                    Style::default().fg(theme.dim),
-                )));
-            }
-            for (i, c) in rows.iter().enumerate().skip(start).take(list_height) {
-                let selected = i == sel.selected;
-                let detail = truncate_chars(&c.detail, (inner_w / 2).max(1));
-                let label = c.label.clone();
-                let avail = inner_w.saturating_sub(detail.chars().count() + 1).max(1);
-                let label = truncate_chars(&label, avail);
-                let pad = inner_w
-                    .saturating_sub(label.chars().count() + detail.chars().count())
-                    .max(1);
-                let line = if selected {
-                    Line::from(Span::styled(
-                        format!("{label}{}{detail}", " ".repeat(pad)),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(theme.user)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                } else {
-                    Line::from(vec![
-                        Span::styled(label, Style::default().fg(theme.user)),
-                        Span::styled(
-                            format!("{}{detail}", " ".repeat(pad)),
-                            Style::default().fg(theme.dim),
-                        ),
-                    ])
-                };
-                lines.push(line);
-            }
-            f.render_widget(Paragraph::new(lines), inner);
+            let rows: Vec<PickRow> = sel
+                .rows()
+                .map(|c| PickRow {
+                    left: c.label.clone(),
+                    right: c.detail.clone(),
+                })
+                .collect();
+            let hint = format!(
+                "{} provider{} · ↑↓ select · Enter continue · Esc cancel",
+                rows.len(),
+                if rows.len() == 1 { "" } else { "s" },
+            );
+            draw_pick_body(
+                f,
+                theme,
+                inner,
+                Some(("🔑 /login  ", theme.warn)),
+                &sel.filter,
+                hint,
+                "no providers match",
+                sel.selected,
+                &rows,
+                (1, 2),
+            );
         }
         crate::app::LoginModal::Key {
             label,
@@ -511,22 +477,9 @@ fn draw_login_modal(f: &mut Frame, theme: &Theme, modal: &crate::app::LoginModal
             let warn_rows = (warning.chars().count() / (width.saturating_sub(6) as usize).max(1)
                 + warning.matches('\n').count()
                 + 1) as u16;
-            let height = (warn_rows + 6).min(area.height.saturating_sub(2).max(1));
-            let rect = Rect {
-                x: (area.width.saturating_sub(width)) / 2,
-                y: (area.height.saturating_sub(height)) / 2,
-                width,
-                height,
-            };
-            f.render_widget(Clear, rect);
-            let block = Block::default()
-                .style(Style::default().bg(theme.user_bg))
-                .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
-            let inner = block.inner(rect);
-            f.render_widget(block, rect);
-            if inner.height < 4 || inner.width < 6 {
+            let Some(inner) = modal_frame(f, theme, 76, warn_rows + 6, 4) else {
                 return;
-            }
+            };
             let masked: String = std::iter::repeat_n('•', input.chars().count())
                 .take(inner.width.saturating_sub(2) as usize)
                 .collect();
@@ -556,22 +509,9 @@ fn draw_login_modal(f: &mut Frame, theme: &Theme, modal: &crate::app::LoginModal
         crate::app::LoginModal::Authorizing { label, .. }
         | crate::app::LoginModal::Switching { label, .. } => {
             let switching = matches!(modal, crate::app::LoginModal::Switching { .. });
-            let height = 5u16.min(area.height.saturating_sub(2).max(1));
-            let rect = Rect {
-                x: (area.width.saturating_sub(width)) / 2,
-                y: (area.height.saturating_sub(height)) / 2,
-                width,
-                height,
-            };
-            f.render_widget(Clear, rect);
-            let block = Block::default()
-                .style(Style::default().bg(theme.user_bg))
-                .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
-            let inner = block.inner(rect);
-            f.render_widget(block, rect);
-            if inner.height < 2 || inner.width < 6 {
+            let Some(inner) = modal_frame(f, theme, 76, 5, 2) else {
                 return;
-            }
+            };
             let (title, hint) = if switching {
                 (
                     format!("🔑 {label} — switching…"),
@@ -598,84 +538,33 @@ fn draw_login_modal(f: &mut Frame, theme: &Theme, modal: &crate::app::LoginModal
 /// highest first with "Default" on top, narrowed by the fuzzy filter. Same
 /// chrome as the other pickers.
 fn draw_effort_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::EffortSelector) {
-    let area = f.area();
-    let width = area.width.saturating_sub(4).clamp(1, 64);
-    let height = area.height.saturating_sub(2).clamp(1, 20);
-    let rect = Rect {
-        x: (area.width.saturating_sub(width)) / 2,
-        y: (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .style(Style::default().bg(theme.user_bg))
-        .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    if inner.height < 3 || inner.width < 6 {
+    let Some(inner) = modal_frame(f, theme, 64, 20, 3) else {
         return;
-    }
-
-    let rows: Vec<&hrdr_app::EffortChoice> = sel.rows().collect();
-    let search = Line::from(vec![
-        Span::styled("Search  ", Style::default().fg(theme.dim)),
-        Span::styled(sel.filter.clone(), Style::default().fg(theme.user)),
-        Span::styled("▌", Style::default().fg(theme.accent)),
-    ]);
-    let hint = Line::from(Span::styled(
-        format!(
-            "{} level{} · ↑↓ select · Enter apply · Esc cancel",
-            rows.len(),
-            if rows.len() == 1 { "" } else { "s" },
-        ),
-        Style::default().fg(theme.dim),
-    ));
-
-    let list_height = inner.height.saturating_sub(3) as usize; // search + hint + blank
-    let inner_w = inner.width as usize;
-    let start = if sel.selected >= list_height {
-        (sel.selected + 1).saturating_sub(list_height)
-    } else {
-        0
     };
-
-    let mut lines = vec![search, hint, Line::from("")];
-    if rows.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "no levels match",
-            Style::default().fg(theme.dim),
-        )));
-    }
-    for (i, c) in rows.iter().enumerate().skip(start).take(list_height) {
-        let selected = i == sel.selected;
-        // Label on the left, detail right-aligned — the pickers' shared layout.
-        let detail = truncate_chars(&c.detail, (inner_w / 2).max(1));
-        let avail = inner_w.saturating_sub(detail.chars().count() + 1).max(1);
-        let label = truncate_chars(&c.label, avail);
-        let pad = inner_w
-            .saturating_sub(label.chars().count() + detail.chars().count())
-            .max(1);
-        let line = if selected {
-            Line::from(Span::styled(
-                format!("{label}{}{detail}", " ".repeat(pad)),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(theme.user)
-                    .add_modifier(Modifier::BOLD),
-            ))
-        } else {
-            Line::from(vec![
-                Span::styled(label, Style::default().fg(theme.user)),
-                Span::styled(
-                    format!("{}{detail}", " ".repeat(pad)),
-                    Style::default().fg(theme.dim),
-                ),
-            ])
-        };
-        lines.push(line);
-    }
-    f.render_widget(Paragraph::new(lines), inner);
+    let rows: Vec<PickRow> = sel
+        .rows()
+        .map(|c| PickRow {
+            left: c.label.clone(),
+            right: c.detail.clone(),
+        })
+        .collect();
+    let hint = format!(
+        "{} level{} · ↑↓ select · Enter apply · Esc cancel",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+    );
+    draw_pick_body(
+        f,
+        theme,
+        inner,
+        None,
+        &sel.filter,
+        hint,
+        "no levels match",
+        sel.selected,
+        &rows,
+        (1, 2),
+    );
 }
 
 /// The `/theme` picker modal: a search line, a hint, and a two-column list
@@ -684,109 +573,44 @@ fn draw_effort_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::EffortSe
 /// since the highlighted theme is live-previewed, the modal itself repaints in
 /// the candidate's colors as the highlight moves.
 fn draw_theme_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ThemeSelector) {
-    let area = f.area();
-    let width = area.width.saturating_sub(4).clamp(1, 92);
-    let height = area.height.saturating_sub(2).clamp(1, 32);
-    let rect = Rect {
-        x: (area.width.saturating_sub(width)) / 2,
-        y: (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .style(Style::default().bg(theme.user_bg))
-        .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    if inner.height < 3 || inner.width < 6 {
+    let Some(inner) = modal_frame(f, theme, 92, 32, 3) else {
         return;
-    }
-
-    let rows: Vec<&hrdr_app::ThemeChoice> = sel.rows().collect();
-    let search = Line::from(vec![
-        Span::styled("Search  ", Style::default().fg(theme.dim)),
-        Span::styled(sel.filter.clone(), Style::default().fg(theme.user)),
-        Span::styled("▌", Style::default().fg(theme.accent)),
-    ]);
-    let hint = Line::from(Span::styled(
-        format!(
-            "{} theme{} · ↑↓ preview · Enter apply · Esc cancel",
-            rows.len(),
-            if rows.len() == 1 { "" } else { "s" },
-        ),
-        Style::default().fg(theme.dim),
-    ));
-
-    let list_height = inner.height.saturating_sub(3) as usize; // search + hint + blank
-    let inner_w = inner.width as usize;
-    let start = if sel.selected >= list_height {
-        (sel.selected + 1).saturating_sub(list_height)
-    } else {
-        0
     };
-
-    let mut lines = vec![search, hint, Line::from("")];
-    if rows.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "no themes match",
-            Style::default().fg(theme.dim),
-        )));
-    }
-    for (i, c) in rows.iter().enumerate().skip(start).take(list_height) {
-        let selected = i == sel.selected;
-        // Theme name on the left, source right-aligned — the same two-column
-        // layout as the `/model` selector.
-        let source = truncate_chars(&c.source, (inner_w / 2).max(1));
-        let avail = inner_w.saturating_sub(source.chars().count() + 1).max(1);
-        let name = truncate_chars(&c.name, avail);
-        let pad = inner_w
-            .saturating_sub(name.chars().count() + source.chars().count())
-            .max(1);
-        let line = if selected {
-            Line::from(Span::styled(
-                format!("{name}{}{source}", " ".repeat(pad)),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(theme.user)
-                    .add_modifier(Modifier::BOLD),
-            ))
-        } else {
-            Line::from(vec![
-                Span::styled(name, Style::default().fg(theme.user)),
-                Span::styled(
-                    format!("{}{source}", " ".repeat(pad)),
-                    Style::default().fg(theme.dim),
-                ),
-            ])
-        };
-        lines.push(line);
-    }
-    f.render_widget(Paragraph::new(lines), inner);
+    let rows: Vec<PickRow> = sel
+        .rows()
+        .map(|c| PickRow {
+            left: c.name.clone(),
+            right: c.source.clone(),
+        })
+        .collect();
+    let hint = format!(
+        "{} theme{} · ↑↓ preview · Enter apply · Esc cancel",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+    );
+    draw_pick_body(
+        f,
+        theme,
+        inner,
+        None,
+        &sel.filter,
+        hint,
+        "no themes match",
+        sel.selected,
+        &rows,
+        (1, 2),
+    );
 }
 
 /// The `/resume` session picker modal: a search line, a hint, and a
 /// four-column list (id · name · age · cwd) of every saved session, newest
 /// first, narrowed by the fuzzy filter. Same chrome as the `/model` selector.
 fn draw_session_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::SessionSelector) {
-    let area = f.area();
-    let width = area.width.saturating_sub(4).clamp(1, 110);
-    let height = area.height.saturating_sub(2).clamp(1, 32);
-    let rect = Rect {
-        x: (area.width.saturating_sub(width)) / 2,
-        y: (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .style(Style::default().bg(theme.user_bg))
-        .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    if inner.height < 3 || inner.width < 6 {
+    // A wider modal than the two-column pickers, and a custom four-column body,
+    // so it keeps its own layout on top of the shared `modal_frame` chrome.
+    let Some(inner) = modal_frame(f, theme, 110, 32, 3) else {
         return;
-    }
+    };
 
     // Pre-render each visible row's cells: id · name · age · cwd · error.
     let rows: Vec<(String, String, String, String, Option<String>)> = sel
