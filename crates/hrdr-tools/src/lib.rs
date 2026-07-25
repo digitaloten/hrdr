@@ -544,14 +544,18 @@ fn path_identity(path: &std::path::Path) -> std::io::Result<FileIdentity> {
     Ok((md.dev(), md.ino()))
 }
 
-/// [`FileIdentity`] of an already-open handle.
+/// Everything Windows will tell us about an open handle in one call.
 ///
-/// `GetFileInformationByHandle` is the Windows analogue of `fstat` for this
-/// purpose: `dwVolumeSerialNumber` plays `st_dev` and the 64-bit file index
-/// (`nFileIndexHigh`/`Low`) plays `st_ino`. It has to be a raw call — std
-/// exposes both only through the unstable `windows_by_handle` feature.
+/// `GetFileInformationByHandle` is the Windows analogue of `fstat`, and it is the
+/// answer to two different questions asked in this file — which object is this
+/// ([`file_identity`]) and how many names does it have
+/// ([`hardlink_count`]) — so the raw call lives once. It has to be a raw call:
+/// std exposes these fields only through the unstable `windows_by_handle`
+/// feature.
 #[cfg(windows)]
-fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
+fn by_handle_info(
+    file: &std::fs::File,
+) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
@@ -564,6 +568,16 @@ fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
     if ok == 0 {
         return Err(std::io::Error::last_os_error());
     }
+    Ok(info)
+}
+
+/// [`FileIdentity`] of an already-open handle.
+///
+/// `dwVolumeSerialNumber` plays `st_dev` and the 64-bit file index
+/// (`nFileIndexHigh`/`Low`) plays `st_ino`.
+#[cfg(windows)]
+fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
+    let info = by_handle_info(file)?;
     let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
     Ok((u64::from(info.dwVolumeSerialNumber), index))
 }
@@ -576,6 +590,40 @@ fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
 #[cfg(windows)]
 fn path_identity(path: &std::path::Path) -> std::io::Result<FileIdentity> {
     file_identity(&std::fs::File::open(path)?)
+}
+
+/// How many directory entries name the object at `path` — its hard-link count.
+///
+/// Deliberately *not* folded into [`FileIdentity`]: "which object is this" and
+/// "how many names does it have" are different questions, and a caller asking one
+/// must not have to reason about the other. The one caller is `atomic_write`,
+/// which uses `> 1` to mean "a rename here would detach this name from its
+/// siblings, so write in place instead".
+///
+/// `path` is followed, so a symlink reports its target's count. Callers that care
+/// about the difference must handle the symlink case *before* asking — which is
+/// exactly the order `atomic_write` uses.
+#[cfg(unix)]
+pub(crate) fn hardlink_count(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata(path)?.nlink())
+}
+
+/// How many directory entries name the object at `path` — its hard-link count.
+///
+/// Windows has hard links too (`CreateHardLinkW`, NTFS), and reports the count as
+/// `nNumberOfLinks` in the same `BY_HANDLE_FILE_INFORMATION` that
+/// [`file_identity`] reads. It is only available per *handle*, so unlike the unix
+/// `stat` this has to open the path — which also means it can fail where the unix
+/// version would not (a sharing violation, no read access), and a caller must
+/// decide what an error means for it.
+///
+/// The open follows links, as on unix; see the unix twin for why that is the
+/// caller's problem to sequence.
+#[cfg(windows)]
+pub(crate) fn hardlink_count(path: &std::path::Path) -> std::io::Result<u64> {
+    let info = by_handle_info(&std::fs::File::open(path)?)?;
+    Ok(u64::from(info.nNumberOfLinks))
 }
 
 /// Resolve lexical `..` and `.` path components so the returned `PathBuf`
@@ -1651,6 +1699,27 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert!(guard_not_swapped(&file, &path).is_err());
+    }
+
+    /// The link count is 1 for a lone file and rises with each extra name — the
+    /// only distinction `atomic_write` asks it to make. (Unix-only as a test
+    /// because `hard_link` is the portable part; the count itself is read on both
+    /// platforms.)
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_count_sees_the_extra_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, "x").unwrap();
+        assert_eq!(hardlink_count(&a).unwrap(), 1);
+
+        let b = dir.path().join("b.txt");
+        std::fs::hard_link(&a, &b).unwrap();
+        assert_eq!(hardlink_count(&a).unwrap(), 2);
+        assert_eq!(hardlink_count(&b).unwrap(), 2, "either name reports both");
+
+        std::fs::remove_file(&b).unwrap();
+        assert_eq!(hardlink_count(&a).unwrap(), 1);
     }
 
     // ---- untrusted-content envelope ----

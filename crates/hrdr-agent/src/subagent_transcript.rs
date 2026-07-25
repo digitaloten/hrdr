@@ -14,7 +14,7 @@
 //! never-saved session has no id yet, so the very first sub-agent spawned
 //! before the first autosave is not persisted (the dir cell is still empty).
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
@@ -205,13 +205,11 @@ impl SubagentTranscript {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
         }
-        let mut opts = OpenOptions::new();
+        // Owner-only too, not just the directory: a transcript is a verbatim
+        // prompt/output log ([`hrdr_llm::owner_only_options`] documents what that
+        // buys on each platform).
+        let mut opts = hrdr_llm::owner_only_options();
         opts.create_new(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
         let path = dir.join(format!("{id}.jsonl"));
         let file = opts.open(&path)?;
         Ok(Self { file, path })
@@ -237,13 +235,10 @@ impl SubagentTranscript {
                 let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
             }
         }
-        let mut opts = OpenOptions::new();
+        // Same owner-only policy as [`create`](Self::create) — see
+        // [`hrdr_llm::owner_only_options`].
+        let mut opts = hrdr_llm::owner_only_options();
         opts.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
         let file = opts.open(path)?;
         Ok(Self {
             file,

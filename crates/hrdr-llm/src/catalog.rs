@@ -317,13 +317,12 @@ fn write_cache(path: &std::path::Path, v: &Value) {
     let Some(s) = serde_json::to_string(v).ok() else {
         return;
     };
-    let mut opts = std::fs::OpenOptions::new();
+    // Owner-only: the cached catalog is fetched with the user's credentials and
+    // can name provider/model entitlements that are theirs to know, so it gets
+    // the same treatment as the rest of hrdr's on-disk state
+    // ([`crate::fs::owner_only_options`] states what that is worth per platform).
+    let mut opts = crate::fs::owner_only_options();
     opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
     if opts
         .open(&tmp)
         .ok()

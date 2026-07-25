@@ -10,9 +10,6 @@ use anyhow::{Context, Result, bail};
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-
 use crate::capped_read::{MAX_DIAGNOSTIC_BYTES, MAX_LOG_FILE_BYTES, MAX_STRUCTURED_JSON_BYTES};
 use crate::sse::SseDecoder;
 use crate::types::{CacheMode, ChatChunk, ChatMessage, ChatRequest, ToolDef};
@@ -70,13 +67,13 @@ fn request_log() -> Option<&'static WireLog> {
 /// initial open and for the fresh active file created on rotation, so both
 /// share the same 0600 discipline.
 ///
-/// Confidentiality is platform-dependent and stated honestly: on Unix the file
-/// is forced to `0600` (owner-only). On Windows hrdr sets **no** explicit ACL —
-/// the file inherits the ACLs of whatever directory `HRDR_LOG_REQUESTS` points
-/// at. Because that path is caller-chosen (unlike the credential store, which
-/// lives under the user profile), pointing it at a world-readable directory
-/// leaks the logged request/response data on **any** platform; callers should
-/// keep it under a directory only they can read.
+/// Confidentiality is platform-dependent — see [`crate::fs::owner_only_options`]
+/// for what "owner-only" is worth on each platform. One caveat specific to this
+/// file: its path is caller-chosen (unlike the credential store, which lives
+/// under the user profile), so on Windows it inherits the ACLs of whatever
+/// directory `HRDR_LOG_REQUESTS` points at, and pointing it at a world-readable
+/// directory leaks the logged request/response data on **any** platform. Callers
+/// should keep it under a directory only they can read.
 fn open_wire_log(path: &Path) -> Option<std::fs::File> {
     // Preflight: reject a pre-existing symlink or a non-regular file before
     // opening.  This gives a clean early rejection for the ordinary
@@ -102,22 +99,13 @@ fn open_wire_log(path: &Path) -> Option<std::fs::File> {
         Err(_) => return None,
     }
 
-    let mut opts = std::fs::OpenOptions::new();
+    // Owner-only so local users cannot read the API request/response data, and
+    // no-follow so the open itself refuses a symlinked final component — that is
+    // what closes the check→open TOCTOU window the preflight above cannot: an
+    // attacker cannot swap a symlink in between the two.  Both guarantees, and
+    // what each is worth per platform, live on the helper.
+    let mut opts = crate::fs::owner_only_options_no_follow();
     opts.create(true).append(true);
-    // Restrict permissions to owner-only on Unix (0600) so local users cannot
-    // read API request/response data from the log.
-    #[cfg(unix)]
-    opts.mode(0o600);
-    // Close the check→open TOCTOU window atomically on Unix: with O_NOFOLLOW,
-    // if the final path component is a symlink at open time the open itself
-    // fails with ELOOP rather than following it, so the open *is* the check —
-    // an attacker cannot swap a symlink in between the preflight above and
-    // this open to redirect the append.  Residual (not closed by O_NOFOLLOW):
-    // it only affects the final component, so a symlinked *parent directory*
-    // is still traversed and followed.  No O_NOFOLLOW equivalent is applied on
-    // non-Unix; there behavior is unchanged and only the preflight guards.
-    #[cfg(unix)]
-    opts.custom_flags(libc::O_NOFOLLOW);
     let file = opts.open(path).ok()?;
     #[cfg(unix)]
     {
@@ -1475,10 +1463,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("requests.log");
 
-        // Replicate the open options request_log() uses.
-        let mut opts = std::fs::OpenOptions::new();
+        // The same open options open_wire_log() uses.
+        let mut opts = crate::fs::owner_only_options_no_follow();
         opts.create(true).append(true);
-        opts.mode(0o600);
         let file = opts.open(&path).unwrap();
         drop(file);
 

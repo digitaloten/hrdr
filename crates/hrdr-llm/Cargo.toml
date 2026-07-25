@@ -17,9 +17,10 @@ futures-util.workspace = true
 async-stream.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-# O_NOFOLLOW on the wire-log open (`open_wire_log` in src/client.rs) so a
-# final-component symlink swapped in at open time fails with ELOOP instead of
-# being followed — closing the check→open TOCTOU window atomically.
+# O_NOFOLLOW for `owner_only_options_no_follow` (src/fs.rs, used by the wire-log
+# open in src/client.rs) so a final-component symlink swapped in at open time
+# fails with ELOOP instead of being followed — closing the check→open TOCTOU
+# window atomically.
 libc = "0.2"
 
 [dev-dependencies]

@@ -87,33 +87,53 @@ pub async fn apply_file_change(
 /// `open(O_TRUNC)+write` in place could.
 ///
 /// Falls back to an in-place write when a rename would change the file's
-/// identity rather than its contents: a hardlinked target (`nlink > 1`) — where
-/// rename would detach this name from its siblings — or a symlink — where rename
-/// would replace the link with a regular file instead of updating its target.
+/// identity rather than its contents: a symlink — where rename would replace the
+/// link with a regular file instead of updating its target — or a hardlinked
+/// target (link count `> 1`) — where rename would detach this name from its
+/// siblings. Both cases are detected on every platform: symlinks and hard links
+/// exist on Windows too, and silently converting one into a regular file is the
+/// same data loss there as anywhere else.
 pub(crate) async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    #[cfg(unix)]
+    // `symlink_metadata` is an lstat and portable: it describes the symlink
+    // itself, not its destination, and `is_symlink` reports Windows symlinks as
+    // well. Ask it first — it is one cheap call that needs no open, and it must
+    // come before the link count because reading that count *does* open the path
+    // (on Windows) and an open would follow the very link we are looking for.
+    let existing = tokio::fs::symlink_metadata(path).await.ok();
+    // `is_ok_and`, not `?`, on the link count: one we cannot read (a Windows
+    // sharing violation, say) must not fail the write — fall through to the
+    // temp+rename path, which is what a single-linked file wants anyway. The `||`
+    // also short-circuits, which is what keeps the count from being asked for a
+    // symlink.
+    if let Some(meta) = &existing
+        && (meta.file_type().is_symlink() || crate::hardlink_count(path).is_ok_and(|n| n > 1))
     {
-        use std::os::unix::fs::MetadataExt;
-        // `symlink_metadata` is an lstat: it describes the symlink itself, not
-        // its destination, so the symlink case is detectable here.
-        let existing = tokio::fs::symlink_metadata(path).await.ok();
-        if let Some(meta) = &existing
-            && (meta.file_type().is_symlink() || meta.nlink() > 1)
-        {
-            return tokio::fs::write(path, content).await;
-        }
-        // Carry the target's mode onto the replacement; a brand-new file keeps
-        // whatever mode the temp file was created with.
-        let perms = existing.map(|m| m.permissions());
-        write_via_temp(path, content, perms).await
+        return tokio::fs::write(path, content).await;
     }
-    #[cfg(not(unix))]
-    {
-        // No portable `nlink`/symlink identity check without unix metadata; on
-        // these targets hardlinks/symlinks are rare and temp+rename is still
-        // atomic on the same filesystem for the common case.
-        write_via_temp(path, content, None).await
-    }
+    write_via_temp(path, content, preserved_permissions(existing.as_ref())).await
+}
+
+/// The permissions to carry from an existing target onto its replacement, or
+/// `None` to leave the temp file's own.
+///
+/// On unix that is the target's mode, so an executable script stays executable
+/// across an edit; a brand-new file keeps whatever mode the temp was created
+/// with.
+#[cfg(unix)]
+fn preserved_permissions(existing: Option<&std::fs::Metadata>) -> Option<std::fs::Permissions> {
+    existing.map(|m| m.permissions())
+}
+
+/// The permissions to carry from an existing target onto its replacement.
+///
+/// Always `None` on Windows: the only bit `Permissions` carries there is
+/// read-only, and copying that onto the temp file would make the temp
+/// un-renameable — the write would fail on exactly the files it was trying to
+/// preserve something about. Access is governed by the ACL, which the rename
+/// leaves to the containing directory's inheritance either way.
+#[cfg(not(unix))]
+fn preserved_permissions(_existing: Option<&std::fs::Metadata>) -> Option<std::fs::Permissions> {
+    None
 }
 
 /// Write `content` to a sibling temp file, fsync it, apply `perms` (if any), and
@@ -213,6 +233,37 @@ mod tests {
             tokio::fs::read_to_string(&b).await.unwrap(),
             "shared new",
             "the hardlinked twin must see the update too"
+        );
+    }
+
+    /// A symlinked target keeps being a symlink: the in-place fallback writes
+    /// *through* the link to its destination, where a temp+rename would have
+    /// replaced the link itself with a regular file and orphaned the real file.
+    /// (Unix-only as a test — creating a symlink on Windows needs a privilege the
+    /// CI runner may not have — but the guard itself now runs on both.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_write_writes_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.txt");
+        let link = dir.path().join("link.txt");
+        tokio::fs::write(&target, "old").await.unwrap();
+        tokio::fs::symlink(&target, &link).await.unwrap();
+
+        atomic_write(&link, "through the link").await.unwrap();
+
+        assert!(
+            tokio::fs::symlink_metadata(&link)
+                .await
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive the write, not be replaced by a file"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "through the link",
+            "the link's destination must have received the content"
         );
     }
 

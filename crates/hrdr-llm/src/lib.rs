@@ -25,7 +25,7 @@ pub use client::{
     ChatError, ChatErrorKind, ChatStream, Client, is_anthropic_backend, take_client_warning,
     url_host, wire_protocol,
 };
-pub use fs::unique_sibling_path;
+pub use fs::{owner_only_options, owner_only_options_no_follow, unique_sibling_path};
 pub use sse::{SseDecoder, SseEvent, SseOverflow};
 pub use types::{
     Accumulator, CacheMode, ChatChunk, ChatMessage, ChatRequest, ChunkChoice, Delta, FunctionCall,

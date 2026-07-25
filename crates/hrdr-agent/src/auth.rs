@@ -71,20 +71,19 @@ pub fn save_auth_token(provider: &str, token: &str) -> anyhow::Result<PathBuf> {
 
 /// Write `data` to `path` atomically: write to a temp file in the same
 /// directory, fsync, then rename over the target — a concurrent reader never
-/// sees a partial write. On unix the temp file is created with `0o600`
-/// permissions from the start so there is no window where it exists with
+/// sees a partial write. The temp file is created owner-only from the start (see
+/// [`hrdr_llm::owner_only_options`]) so there is no window where it exists with
 /// broader permissions.
 ///
 /// Confidentiality guarantee, stated honestly: on Unix the file is owner-only
-/// (`0600`), enforced on every write. On Windows hrdr sets **no** explicit ACL
-/// — it relies on the default ACLs of the containing directory. In practice the
-/// credential files land under `~/.config/hrdr` (see [`crate::config_dir`]),
+/// (`0600`), enforced on every write. On Windows hrdr sets **no** explicit ACL —
+/// [`hrdr_llm::owner_only_options`] documents that stance in full. In practice
+/// the credential files land under `~/.config/hrdr` (see [`crate::config_dir`]),
 /// which on Windows resolves to the per-user profile (`%USERPROFILE%`, not
-/// `%APPDATA%`) and is user-scoped by default. hrdr does not add per-user ACLs
-/// itself, so the guarantee is the platform default, not something enforced
-/// here.
+/// `%APPDATA%`) and is user-scoped by default — so the inherited default ACL
+/// that hrdr relies on there is a per-user one.
 ///
-/// The parent directory is fsynced after a successful rename so that the
+/// On unix the parent directory is fsynced after a successful rename so that the
 /// rename is crash-durable (the directory entry change is flushed to media).
 /// A directory sync failure is **not** reported as an error: the rename
 /// itself is atomic and the data is already on disk — a lost sync only
@@ -99,33 +98,21 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     // shared sibling-temp scheme instead.
     let tmp = hrdr_llm::unique_sibling_path(path, "hrdr-tmp");
 
-    #[cfg(unix)]
-    let create_file = || -> std::io::Result<std::fs::File> {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-    };
-    #[cfg(not(unix))]
-    let create_file = || -> std::io::Result<std::fs::File> {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-    };
-
     // `create_new` guarantees we own `tmp`; a failure here means someone else's
     // temp collided, so we must not clean it up. Everything after gets a
     // cleanup-on-error guard so a failed save never leaves a stray temp behind
     // (notably: a rename that fails still removes the temp we wrote).
-    let mut f = create_file()?;
+    let mut f = hrdr_llm::owner_only_options()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
     let result = (|| -> std::io::Result<()> {
         f.write_all(data)?;
-        // Flush + fsync so the data is on disk before the rename.
+        // Flush + fsync so the data is on disk before the rename. `sync_all` is
+        // portable — it is `FlushFileBuffers` on Windows — so a crash right
+        // after the rename cannot lose a freshly saved credential on any
+        // platform.
         f.flush()?;
-        #[cfg(unix)]
         f.sync_all()?;
         Ok(())
     })();
@@ -136,24 +123,20 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
         return result;
     }
     // After a successful rename, sync the parent directory so the directory
-    // entry change (the rename) is crash-durable on Unix.  A sync failure is
-    // silently swallowed: the write is atomic and the data is on disk — the
-    // only thing a lost directory sync risks is losing the rename itself in a
-    // crash before the directory metadata flushes.
+    // entry change (the rename) is crash-durable.  Unix-only, and genuinely so:
+    // this needs a *directory* handle, and Windows cannot `File::open` a
+    // directory at all (it wants `CreateFile` with
+    // FILE_FLAG_BACKUP_SEMANTICS).  Unlike the file `sync_all` above — which is
+    // portable and now runs everywhere — there is no std equivalent to reach
+    // for here.  A sync failure is silently swallowed either way: the write is
+    // atomic and the data is on disk, so a lost directory sync risks only the
+    // rename itself in a crash before the directory metadata flushes.
     #[cfg(unix)]
     if let Some(parent) = path.parent()
         && let Ok(dir) = std::fs::File::open(parent)
     {
         let _ = dir.sync_all();
     }
-    // No non-unix permission tightening: the Windows read-only *attribute*
-    // doesn't restrict reads (access is by ACL) and would make the file
-    // un-replaceable by the next atomic rename. Unix already got 0600 above.
-    // On Windows we deliberately set no explicit ACL and rely on the default
-    // ACLs of the containing per-user profile directory (~/.config/hrdr under
-    // %USERPROFILE%), which is user-scoped by default. Setting a per-user ACL
-    // would need the `windows`/`winapi` crate (a new dependency); the honest
-    // documented guarantee is the platform default (see the doc comment above).
     Ok(())
 }
 
