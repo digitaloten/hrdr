@@ -1,9 +1,14 @@
 # Security & Correctness Audit
 
-**Date:** 2026-07-22 · **Remediated & re-reviewed:** 2026-07-23 · **Depth:**
-High · **Scope:** Full codebase — all crates (`hrdr-tools`, `hrdr-llm`,
-`hrdr-agent`, `hrdr-app`, `hrdr-editor`, `hrdr-tui`, `hrdr` binary) and all
-source files.
+**Audited:** 2026-07-22 · **Re-reviewed:** 2026-07-23 · **Last finding closed:**
+2026-07-26 · **Depth:** High · **Scope:** Full codebase — all crates
+(`hrdr-tools`, `hrdr-llm`, `hrdr-agent`, `hrdr-app`, `hrdr-editor`, `hrdr-tui`,
+`hrdr` binary) and all source files.
+
+Remediation ran past the re-review: O4, O5 and O3 were closed on 2026-07-25/26,
+after the re-review date. **Nothing from this audit is open.** The file is kept
+for its methodology and its record of what the security-critical paths get right
+— not as a live worklist.
 
 ## Methodology
 
@@ -16,35 +21,21 @@ memory/resource, crypto, AuthZ/AuthN, data integrity, error handling, and
 concurrency.
 
 Findings were verified by re-reading surrounding code, tracing callers, and
-constructing concrete trigger scenarios. The original pass found 16 issues; the
-remediation and this re-review track them below.
+constructing concrete trigger scenarios. The original pass found 16 issues, all
+since fixed.
 
 ---
 
 ## Open findings
 
-One LOW residual remains from the 2026-07-23 remediation re-review. The resolved
-findings (2 HIGH, 4 MEDIUM, 12 LOW) have been pruned — see `git log` for the
-commits that closed them.
+**None.** All 16 findings are closed; O3, the last one, was fixed in `1794c5a`.
+The resolved findings have been pruned — `git log` has the commits.
 
----
-
-### O3 — LOW: `read` TOCTOU dev/ino re-check is Unix-only (M1 residual)
-
-**`crates/hrdr-tools/src/tools/read.rs`** — the `#[cfg(unix)]` dev/ino block
-
-The M1 fix opens the file first and reads through the handle, then re-checks the
-opened descriptor's `dev`/`ino` against the canonical path — but only under
-`#[cfg(unix)]`. On Windows there is no such re-check, so the narrow
-open-secret-then-swap-to-non-secret race (open resolves to a secret, the path is
-then repointed at a non-secret before `guard_secret_read` canonicalizes it) is
-not caught, and the tool reads the pre-swap handle (the secret). Low: swapping a
-file that is already open is much harder on Windows, and the audit's concrete
-scenario was Unix symlinks.
-
-**Fix:** add a Windows identity re-check (e.g. `BY_HANDLE_FILE_INFORMATION`
-volume-serial + file-index via `GetFileInformationByHandle`), or document the
-platform limitation.
+The one platform caveat left on record: `hrdr-llm`'s wire-debug log
+(`HRDR_LOG_REQUESTS`) sets `0600` + `O_NOFOLLOW` only on unix and no explicit
+ACL on Windows. Disclosed in its own doc comment, gated behind an opt-in env
+var, and not a finding — pointing the log at a world-readable directory leaks on
+any platform.
 
 ---
 
@@ -55,8 +46,8 @@ platform limitation.
 | Critical  | 0     | 0        |
 | High      | 0     | 2        |
 | Medium    | 0     | 4        |
-| Low       | 1     | 12       |
-| **Total** | **1** | **16**   |
+| Low       | 0     | 13       |
+| **Total** | **0** | **16**   |
 
 **Overall risk: Low.** The security-critical paths are well-built: `fetch`/SSRF
 guard uses a TOCTOU-free DNS resolver; `SseDecoder` is memory-bounded; the
@@ -68,5 +59,12 @@ prevents `..` path escapes. No critical pathologies: no MD5/SHA1, no hardcoded
 secrets, no panics on untrusted SSE input, no buffer overflows, no data races,
 no unbounded allocation in hot paths.
 
-Everything except O3 is fixed. O3 is a Windows-only gap in the `read` TOCTOU
-identity check; hrdr targets UNIX workflows, so the practical exposure is small.
+Everything found by this audit is fixed. The last to close, O3, was the `read`
+TOCTOU identity check running only on unix; it is now enforced on both platforms
+through one helper (`guard_not_swapped`), so the guard cannot silently regress
+on one of them again (`1794c5a`).
+
+A deeper Windows-drift pass over the ~40 other `cfg(unix)`-only blocks was never
+run — O3 was found by hand, not by that sweep. It is tracked in
+`deferred-improvements.md`, with `store_lock.rs`, `auth.rs` and `auth_store.rs`
+named as the next places to look.
