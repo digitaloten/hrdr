@@ -2,10 +2,9 @@
 
 Status: **design** (not yet implemented). Motivated by a delegated non-Claude
 sub-agent that `cd`'d out of its worktree into the parent repo and committed to
-`main` (see `docs/agent-logic-migration.md` lineage / the worktree-escape
-investigation). Guidance alone only reaches models inclined to obey; hrdr runs
-arbitrary models, so it needs an **enforced** boundary — what Codex has by
-default and Claude Code has opt-in.
+`main`. Guidance alone only reaches models inclined to obey; hrdr runs arbitrary
+models, so it needs an **enforced** boundary — what Codex has by default and
+Claude Code has opt-in.
 
 ## Resume plan (start here — refinements from review)
 

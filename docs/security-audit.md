@@ -21,35 +21,11 @@ remediation and this re-review track them below.
 
 ---
 
-## Resolved
+## Open findings
 
-Detailed entries pruned — each original finding is recorded here with the commit
-that fixed it. Items with a residual left after the fix are tracked in **Open**.
-
-| ID  | Finding                                                       | Fixed in  | Residual |
-| --- | ------------------------------------------------------------- | --------- | -------- |
-| H1  | MCP SSE `endpoint` SSRF — host validated against the base     | `ab2f1b7` | —        |
-| H2  | LSP `check_confined` `..` escape — canonicalized fallback     | `98a86b3` | —        |
-| M1  | `read` secret-denylist TOCTOU — open → dev/ino verify → read  | `e314853` | O3       |
-| M2  | Guardrail depth cap — replaced with a 64 KiB cumulative bound | `e314853` | —        |
-| L1  | `write`/`edit` didn't reject secret _targets_                 | `e314853` | —        |
-| L2  | OAuth expiry overflow — `saturating_add`/`saturating_mul`     | `65a425d` | —        |
-| L3  | Catalog fetch unbounded — `read_capped_json`                  | `910ccee` | —        |
-| L4  | `extra_headers` auth precedence — applied before auth header  | `910ccee` | O4       |
-| L5  | LLM client had no default timeout — 300 s fallback            | `910ccee` | —        |
-| L6  | JWT claims unverified — documented as a routing hint only     | `65a425d` | —        |
-| L7  | OAuth `state` non-constant-time — `constant_time_eq`          | `65a425d` | —        |
-| L8  | Catalog cache not `0600` — `OpenOptionsExt::mode(0o600)`      | `910ccee` | —        |
-| L9  | Hooks docs misleading — noted they bypass the guardrails      | `e314853` | —        |
-| L10 | Windows hook path quotes unescaped — `"` → `""`               | `e314853` | O5       |
-| O1  | Force-push guardrail bypass via `'"--force` mid-command quote | `5a2f644` | —        |
-| O2  | `AuthEntry` derived `Debug` over live tokens (M4 residual)    | `c135d05` | —        |
-| O4  | `extra_headers` could duplicate the auth header (L4 residual) | `483fa42` | —        |
-| O5  | Windows hooks ran `cmd /C` — now bash/sh like everything else | `d009d80` | —        |
-
----
-
-## Open findings (from the 2026-07-23 remediation re-review, most-severe first)
+One LOW residual remains from the 2026-07-23 remediation re-review. The resolved
+findings (2 HIGH, 4 MEDIUM, 12 LOW) have been pruned — see `git log` for the
+commits that closed them.
 
 ---
 
@@ -70,6 +46,8 @@ scenario was Unix symlinks.
 volume-serial + file-index via `GetFileInformationByHandle`), or document the
 platform limitation.
 
+---
+
 ## Summary
 
 | Severity  | Open  | Resolved |
@@ -80,19 +58,15 @@ platform limitation.
 | Low       | 1     | 12       |
 | **Total** | **1** | **16**   |
 
-**Overall risk: Low.** The security-critical paths remain well-built:
-`fetch`/SSRF guard uses a TOCTOU-free DNS resolver; `SseDecoder` is properly
-memory-bounded; the credential store uses atomic write + `0600` + cross-process
-locking; PKCE uses a CSPRNG-backed verifier with SHA-256 S256; the untrusted
-content envelope uses a verified-absent nonce; secret-denylist coverage is broad
-(`read`, `grep`, `git`, `replace`, `fileops`, `lsp_nav`, and now
-`write`/`edit`); `canonicalize_nearest` prevents `..` path escapes. No critical
-pathologies: no MD5/SHA1, no hardcoded secrets, no panics on untrusted SSE
-input, no buffer overflows, no data races, no unbounded allocation in hot paths.
+**Overall risk: Low.** The security-critical paths are well-built: `fetch`/SSRF
+guard uses a TOCTOU-free DNS resolver; `SseDecoder` is memory-bounded; the
+credential store uses atomic write + `0600` + cross-process locking; PKCE uses a
+CSPRNG-backed verifier with SHA-256 S256; the untrusted content envelope uses a
+verified-absent nonce; secret-denylist coverage is broad (`read`, `grep`, `git`,
+`replace`, `fileops`, `lsp_nav`, `write`/`edit`); `canonicalize_nearest`
+prevents `..` path escapes. No critical pathologies: no MD5/SHA1, no hardcoded
+secrets, no panics on untrusted SSE input, no buffer overflows, no data races,
+no unbounded allocation in hot paths.
 
-Both HIGH findings and the entire Medium set are fixed — including O1 (the
-force-push guardrail quote-bypass, `5a2f644`), O2 (M4 — `AuthEntry` no longer
-derives `Debug`, `c135d05`), O4 (`extra_headers` can no longer carry an auth
-header at all, `483fa42`) and O5 (hooks run through bash/sh on every platform,
-so there is no `cmd.exe` quoting to get wrong, `d009d80`). What remains is one
-LOW residual, O3 — a Windows-only gap in the `read` TOCTOU identity check.
+Everything except O3 is fixed. O3 is a Windows-only gap in the `read` TOCTOU
+identity check; hrdr targets UNIX workflows, so the practical exposure is small.

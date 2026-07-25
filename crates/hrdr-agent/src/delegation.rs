@@ -1882,7 +1882,7 @@ impl hrdr_tools::Tool for TaskOutputTool {
 
 /// `task_revive`: re-engage a finished, orphaned, or crashed sub-agent with a
 /// follow-up — the counterpart to `task_steer`, which only reaches a *running*
-/// turn. Resolution is live-first, disk-fallback (see `docs/task-revive.md`):
+/// turn. Resolution is live-first, disk-fallback:
 ///
 /// * **Live** — the sub-agent is still retained in [`LiveSubagents`] (finished but
 ///   not yet pruned): reuse its in-memory conversation directly (the freshest
