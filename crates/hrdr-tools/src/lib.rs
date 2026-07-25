@@ -490,6 +490,94 @@ pub fn canonicalize_nearest(path: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Prove `file` is still the object `path` names, closing the TOCTOU window
+/// between opening a file and validating where its path points.
+///
+/// A path-based guard (`guard_secret_read`) and an already-open handle can
+/// disagree: a caller opens `notes.txt` while it resolves to `.env`, then the
+/// path is repointed at something harmless before the guard canonicalizes it.
+/// The guard clears the *new* target while the read proceeds through the handle
+/// on the *old* one. Comparing the opened object's identity against the identity
+/// the path resolves to now catches that — whatever the swap was made of
+/// (symlink, rename, directory substitution).
+///
+/// Callers must open first, guard second, then call this. The order matters: it
+/// is what makes the handle the fixed point and the path the thing under
+/// suspicion.
+pub fn guard_not_swapped(file: &std::fs::File, path: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let canon = canonicalize_nearest(path);
+    let opened = file_identity(file)
+        .with_context(|| format!("identifying the opened {}", path.display()))?;
+    let named = path_identity(&canon)
+        .with_context(|| format!("identifying the canonical {}", canon.display()))?;
+    if opened != named {
+        anyhow::bail!(
+            "{} changed while it was being validated — re-read the file",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// A filesystem object's identity, as `(volume, object)`: the pair that is
+/// stable across paths and unique per object. `(st_dev, st_ino)` on unix,
+/// `(dwVolumeSerialNumber, nFileIndex)` on Windows — the same idea, and the
+/// reason [`guard_not_swapped`] can compare a handle against a path at all.
+type FileIdentity = (u64, u64);
+
+/// [`FileIdentity`] of an already-open handle — read from the descriptor, never
+/// from the path, so it names the object the caller actually holds.
+#[cfg(unix)]
+fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let md = file.metadata()?;
+    Ok((md.dev(), md.ino()))
+}
+
+/// [`FileIdentity`] of whatever `path` resolves to right now.
+#[cfg(unix)]
+fn path_identity(path: &std::path::Path) -> std::io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(path)?;
+    Ok((md.dev(), md.ino()))
+}
+
+/// [`FileIdentity`] of an already-open handle.
+///
+/// `GetFileInformationByHandle` is the Windows analogue of `fstat` for this
+/// purpose: `dwVolumeSerialNumber` plays `st_dev` and the 64-bit file index
+/// (`nFileIndexHigh`/`Low`) plays `st_ino`. It has to be a raw call — std
+/// exposes both only through the unstable `windows_by_handle` feature.
+#[cfg(windows)]
+fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` keeps the handle alive across the call, and `info` is a
+    // live, correctly aligned out-parameter of exactly the expected type.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok((u64::from(info.dwVolumeSerialNumber), index))
+}
+
+/// [`FileIdentity`] of whatever `path` resolves to right now.
+///
+/// Windows has no path-based stat that reports the file index, so this opens the
+/// path and asks the handle. That second open is itself resolved fresh, which is
+/// exactly what the comparison needs.
+#[cfg(windows)]
+fn path_identity(path: &std::path::Path) -> std::io::Result<FileIdentity> {
+    file_identity(&std::fs::File::open(path)?)
+}
+
 /// Resolve lexical `..` and `.` path components so the returned `PathBuf`
 /// contains no unprocessed parent-directory or current-directory components.
 ///
@@ -1501,6 +1589,69 @@ pub fn floor_char_boundary(s: &str, max: usize) -> usize {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    // ---- open-handle identity guard ----
+
+    /// The guard passes for an ordinary file: the handle and the path name the
+    /// same object, so nothing is rejected on the happy path.
+    #[test]
+    fn guard_not_swapped_accepts_an_unswapped_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "hello").unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        assert!(guard_not_swapped(&file, &path).is_ok());
+    }
+
+    /// The TOCTOU case the guard exists for: open resolves to one object, then
+    /// the path is repointed at another before the check runs. The handle still
+    /// holds the *original* — reading through it would hand back content the
+    /// path-based secret guard never saw — so the identities disagree and the
+    /// read is rejected.
+    ///
+    /// Unix-only because it swaps via symlink; the Windows arm compares the same
+    /// identity pair (volume serial + file index) through
+    /// `GetFileInformationByHandle`.
+    #[cfg(unix)]
+    #[test]
+    fn guard_not_swapped_rejects_a_path_repointed_after_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        let decoy = dir.path().join("decoy");
+        std::fs::write(&secret, "TOKEN=sk-live").unwrap();
+        std::fs::write(&decoy, "nothing to see").unwrap();
+
+        // `link` points at the secret; open it and hold that handle.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let file = std::fs::File::open(&link).unwrap();
+
+        // Now repoint it at the harmless file — the swap a path-based guard
+        // would be fooled by.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&decoy, &link).unwrap();
+
+        let err = guard_not_swapped(&file, &link).expect_err("the swap must be caught");
+        assert!(
+            err.to_string()
+                .contains("changed while it was being validated"),
+            "{err}"
+        );
+    }
+
+    /// A path that no longer resolves at all is also a failure, not a silent
+    /// pass: the comparison cannot be made, so the read does not proceed.
+    #[test]
+    fn guard_not_swapped_errors_when_the_path_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transient.txt");
+        std::fs::write(&path, "x").unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(guard_not_swapped(&file, &path).is_err());
+    }
 
     // ---- untrusted-content envelope ----
 

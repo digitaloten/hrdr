@@ -101,23 +101,11 @@ impl Tool for ReadTool {
         // Validate the path is not a secret file.
         crate::guard_secret_read(&path)?;
 
-        // On Unix, prove the opened descriptor is the same object that
-        // canonicalization validated. If any path component was swapped between
-        // open and validation, reject it.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let opened = file.metadata()?;
-            let canon = crate::canonicalize_nearest(&path);
-            let validated = std::fs::metadata(&canon)
-                .with_context(|| format!("statting canonical {}", canon.display()))?;
-            if opened.dev() != validated.dev() || opened.ino() != validated.ino() {
-                bail!(
-                    "{} changed while it was being validated — re-read the file",
-                    path.display()
-                );
-            }
-        }
+        // Prove the handle we opened is still the object this path names — if any
+        // component was swapped between the open and the guard above, reject it.
+        // Enforced on every platform (unix via dev/ino, Windows via the file
+        // index), so the guard is not quietly weaker on one of them.
+        crate::guard_not_swapped(&file, &path)?;
 
         // Check file size from the open handle (not a separate stat).
         let file_len = file
