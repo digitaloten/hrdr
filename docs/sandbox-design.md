@@ -2,7 +2,9 @@
 
 Status: **implementation-ready spec** (2026-07-26). Supersedes the earlier
 design/discussion version of this document; every seam below has been verified
-against the code as of commit `6649de4`.
+against the code as of commit `6649de4`, and re-verified in an adversarial
+second pass (2026-07-26) that also **runtime-validated the bwrap invocations on
+Arch Linux (bubblewrap 0.11.2)** — see the validation notes in §3.6.1.
 
 Target implementer: **a weaker model driven through hrdr's own task
 delegation**, one slice per delegated task. This document makes every design
@@ -48,30 +50,30 @@ scope v1). Codex pins `landlock = "0.4.4"`.
 Everything in this table was read from the code on 2026-07-26. Line numbers
 drift; symbol names are the anchor.
 
-| Seam                        | Crate / file                                               | Verified symbol / signature                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | What this spec adds there                                                                                               |
-| --------------------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| Tool execution context      | `crates/hrdr-tools/src/lib.rs`                             | `pub struct ToolContext` (~line 165), fields `cwd`, `guardrails`, `lsp`, `hooks`, …; `ToolContext::new(cwd)`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | new field `pub sandbox: std::sync::Arc<SandboxPolicy>` (unconfined in `new()`)                                          |
-| Path resolution chokepoint  | `crates/hrdr-tools/src/lib.rs`                             | `ToolContext::resolve(&self, path: &str) -> PathBuf` (~255) → `pub fn resolve_under(base, path)` (~453); `pub fn canonicalize_nearest(path) -> PathBuf` (~472) — already symlink/`..`-escape-safe                                                                                                                                                                                                                                                                                                                                                                                                   | new `ToolContext::resolve_read` / `resolve_write` (resolve + canonicalize + root check)                                 |
-| Secret guard (pattern)      | `crates/hrdr-tools/src/lib.rs`                             | `pub(crate) fn guard_secret_read(path) -> Result<()>` (~892), `secret_file_reason` (~767)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | nothing changed; the sandbox guard sits beside it and follows its error style                                           |
-| Removed cwd-confinement     | git history, commit `f0d903a`                              | `restrict_to_cwd`, `ensure_within_cwd`, `ensure_inside_cwd`, `ensure_read_inside_cwd`, `ensure_no_symlink_components`, `allow_outside_cwd`, `$HRDR_ALLOW_OUTSIDE_CWD` — **all deleted**. Only `canonicalize_nearest` and `secret_file_reason` survive.                                                                                                                                                                                                                                                                                                                                              | **write the guard fresh** in `sandbox.rs`; do NOT try to restore the deleted functions (pre-1.0: no resurrection)       |
-| Shell tool spawn site       | `crates/hrdr-tools/src/tools/shell.rs`                     | `enum Shell { Bash, Posix }`; `Shell::command(self, command) -> tokio::process::Command` (builds `bash -c`/`sh -c`); `ShellTool::execute` (~185): `self.shell.command(&a.command)` → `cmd.current_dir(&ctx.cwd)` → `run_streamed_command` → `proc::spawn_group`                                                                                                                                                                                                                                                                                                                                     | replace the `Shell::command` call with `sandbox::sandboxed_shell_command(shell, cmd_str, ctx)`                          |
-| Second shell spawn site     | `crates/hrdr-tools/src/tools/watch.rs`                     | `run_check` (~164): `Shell::detect()` → `shell.command(command)` → `current_dir(&ctx.cwd)`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | same wrapper as `shell` — model-supplied commands both times                                                            |
-| Git tool                    | `crates/hrdr-tools/src/tools/git.rs`                       | `GitTool` spawns `git` directly but `read_only() == true` — its subcommands are an ALLOW-list of non-mutating ones                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | **nothing** in v1 (it cannot write); noted as a Read-mode leak in §5                                                    |
-| Group kill                  | `crates/hrdr-tools/src/proc.rs`                            | `pub(crate) fn spawn_group(&mut tokio::process::Command) -> io::Result<(Child, GroupKill)>`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | unchanged — the bwrap wrapper is just a different `Command`, group-kill still applies                                   |
-| Overflow spill dir          | `crates/hrdr-tools/src/lib.rs`                             | `pub fn tool_output_dir() -> PathBuf` (~1320): `$XDG_RUNTIME_DIR/hrdr-tool-output`, else `temp_dir()/hrdr-tool-output-<user>`; `ensure_private_dir` chmods 0700                                                                                                                                                                                                                                                                                                                                                                                                                                     | listed as a writable/readable root in every mode that confines                                                          |
-| Session scratch             | — (does not exist yet)                                     | no scratch dir exists in the code today                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | new `pub fn session_scratch_dir() -> &'static Path` in `sandbox.rs`, mirroring `tool_output_dir`'s style                |
-| Worktrees                   | `crates/hrdr-agent/src/delegation.rs`                      | `Worktree::create` (~3060): path `<git toplevel>/.hrdr/worktrees/wt-<stamp>-<pid>-<seq>`, branch `hrdr/task-<uniq>`; `cfg.cwd = wt.path` (~1423); revive repoints too (~2031); `is_hrdr_worktree` (~1490)                                                                                                                                                                                                                                                                                                                                                                                           | nothing — the sandbox reads `cwd` and detects a linked worktree generically via the `.git` **file** (§3.3)              |
-| Sub-agent config derivation | `crates/hrdr-agent/src/delegation.rs`                      | `config_for_agent_profile` (~1201) sets `cfg.read_only`/`cfg.allowed_tools`; `SubagentTool::execute` clones the base config, `let write_capable = !cfg.read_only;` (~1354)                                                                                                                                                                                                                                                                                                                                                                                                                          | nothing here — mode derivation happens once, in `Agent::new` (shared codepath, §2.3)                                    |
-| Agent construction          | `crates/hrdr-agent/src/lib.rs`                             | `Agent::new`: `let mut ctx = ToolContext::new(config.cwd.clone()); ctx.lsp = …; ctx.max_output = …` (~1287–1294) — the pattern for populating `ToolContext` from config                                                                                                                                                                                                                                                                                                                                                                                                                             | `ctx.sandbox = Arc::new(SandboxPolicy::for_agent(mode, &config.cwd, &config.sandbox_writable_roots));`                  |
-| Config struct               | `crates/hrdr-agent/src/config.rs`                          | `pub struct AgentConfig` (~196), `impl Default for AgentConfig` (~819), fields incl. `read_only` (bool), `allowed_tools`, `is_subagent`                                                                                                                                                                                                                                                                                                                                                                                                                                                             | `pub sandbox: SandboxMode`, `pub sandbox_writable_roots: Vec<PathBuf>`                                                  |
-| Config-file parsing         | `crates/hrdr-agent/src/config.rs`                          | `pub(crate) struct FileConfig` (~673, serde), `FileConfig::validate` (~728, hard errors), `AgentConfig::apply_file(&mut self, fc: FileConfig)` (~1435, `if let Some(v) = fc.x { self.x = v }` per field)                                                                                                                                                                                                                                                                                                                                                                                            | `sandbox: Option<SandboxMode>` (serde enum → invalid spelling is a hard TOML error), `sandbox_writable_roots`           |
-| Env plumbing                | `crates/hrdr-agent/src/config.rs`                          | `ENV_SETTERS: &[(&str, EnvSetter)]` (~1666) — one row per knob, `Err(reason)` → warning, value kept; helpers `parse_env_bool`, `env_parse`                                                                                                                                                                                                                                                                                                                                                                                                                                                          | one `("HRDR_SANDBOX", …)` row using `SandboxMode::from_str`                                                             |
-| CLI plumbing                | `apps/hrdr/src/main.rs`                                    | `struct Cli` (~44) with `#[arg(long, global = true)]` fields; override block ~495–515 (`if let Some(n) = cli.max_write_subagents { config.max_write_subagents = n; }`)                                                                                                                                                                                                                                                                                                                                                                                                                              | `--sandbox <write\|read\|none>` and `--no-sandbox`, applied in the same block                                           |
-| Prompt sections             | `crates/hrdr-agent/src/prompt.rs`                          | `SystemPrompt { sections: Vec<(&'static str, String)> }` with `push` (drops empty bodies), `names()`, `prefix_len_before(name)`, `render()`; section constants `SECTION_BASE … SECTION_PERSONA, SECTION_ENVIRONMENT`; runtime-built sections follow `environment_section(cwd, tools) -> String`                                                                                                                                                                                                                                                                                                     | `pub const SECTION_SANDBOX: &str = "sandbox";` + `pub fn sandbox_section(policy) -> String`                             |
-| Prompt assembly + cache     | `crates/hrdr-agent/src/lib.rs`                             | `build_system_prompt_sections(tools, cwd, docs, memory, persona, is_subagent)` (~1019) pushes sections in the documented least-volatile-first order; `build_system_prompt` (~1072) computes the cache split as `p.prefix_len_before(SECTION_ENVIRONMENT)`; sole real call site in `Agent::new` (~1350). **The old doc's `system.j2` is GONE** — the prompt is ten `include_str!` markdown fragments in `crates/hrdr-agent/src/templates/*.md` plus runtime-built sections; interpolation into the static fragments is impossible. The worktree guidance now lives in `templates/subagent_write.md`. | push `SECTION_SANDBOX` **after** `SECTION_ENVIRONMENT` (dead last — see §4 slice 7 for why that is the cache-safe spot) |
-| Prompt-order test           | `crates/hrdr-agent/src/lib.rs`                             | `system_prompt_is_ordered_least_volatile_first` (~4242) asserts `p.names().last() == Some(&SECTION_ENVIRONMENT)` (~4308); two more tests build sections at ~4248/~4292                                                                                                                                                                                                                                                                                                                                                                                                                              | update to expect `SECTION_SANDBOX` last, `SECTION_ENVIRONMENT` second-to-last                                           |
-| Degradation notice channel  | `crates/hrdr-llm/src/client.rs`, `hrdr-agent/turn_loop.rs` | `pub fn take_client_warning() -> Option<String>` (OnceLock<Mutex<Option<String>>> drain, client.rs ~41) → drained in `turn_loop.rs` (~507): `if let Some(warning) = hrdr_llm::take_client_warning() { on_event(AgentEvent::Notice(warning)); }`; `AgentEvent::Notice(String)` (lib.rs ~622)                                                                                                                                                                                                                                                                                                         | mirror it: `hrdr_tools::take_sandbox_notice()` + one drain line beside the existing one                                 |
-| Test skip pattern           | `crates/hrdr-tools/src/tools/grep.rs`                      | `if which::which("rg").is_err() { return; } // best-effort: exercise the real backend when available` (~653)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | the exact pattern for skipping bwrap/seatbelt tests (§6)                                                                |
+| Seam                        | Crate / file                                               | Verified symbol / signature                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | What this spec adds there                                                                                               |
+| --------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Tool execution context      | `crates/hrdr-tools/src/lib.rs`                             | `pub struct ToolContext` (~line 165), fields `cwd`, `guardrails`, `lsp`, `hooks`, …; `ToolContext::new(cwd)`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | new field `pub sandbox: std::sync::Arc<SandboxPolicy>` (unconfined in `new()`)                                          |
+| Path resolution chokepoint  | `crates/hrdr-tools/src/lib.rs`                             | `ToolContext::resolve(&self, path: &str) -> PathBuf` (~255) → `pub fn resolve_under(base, path)` (~453); `pub fn canonicalize_nearest(path) -> PathBuf` (~472) — already symlink/`..`-escape-safe                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | new `ToolContext::resolve_read` / `resolve_write` (resolve + canonicalize + root check)                                 |
+| Secret guard (pattern)      | `crates/hrdr-tools/src/lib.rs`                             | `pub(crate) fn guard_secret_read(path) -> Result<()>` (~892), `secret_file_reason` (~767)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | nothing changed; the sandbox guard sits beside it and follows its error style                                           |
+| Removed cwd-confinement     | git history, commit `f0d903a`                              | `restrict_to_cwd`, `ensure_within_cwd`, `ensure_inside_cwd`, `ensure_read_inside_cwd`, `ensure_no_symlink_components`, `allow_outside_cwd`, `$HRDR_ALLOW_OUTSIDE_CWD` — **all deleted**. Only `canonicalize_nearest` and `secret_file_reason` survive.                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | **write the guard fresh** in `sandbox.rs`; do NOT try to restore the deleted functions (pre-1.0: no resurrection)       |
+| Shell tool spawn site       | `crates/hrdr-tools/src/tools/shell.rs`                     | `enum Shell { Bash, Posix }`; `Shell::command(self, command) -> tokio::process::Command` (builds `bash -c`/`sh -c`); `ShellTool::execute` (~185): `self.shell.command(&a.command)` → `cmd.current_dir(&ctx.cwd)` → `run_streamed_command` → `proc::spawn_group`                                                                                                                                                                                                                                                                                                                                                                                                                                                           | replace the `Shell::command` call with `sandbox::sandboxed_shell_command(shell, cmd_str, &ctx.sandbox, &ctx.cwd)`       |
+| Second shell spawn site     | `crates/hrdr-tools/src/tools/watch.rs`                     | `run_check` (~164): `Shell::detect()` → `shell.command(command)` → `current_dir(&ctx.cwd)`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | same wrapper as `shell` — model-supplied commands both times                                                            |
+| Git tool                    | `crates/hrdr-tools/src/tools/git.rs`                       | `GitTool` spawns `git` directly but `read_only() == true` — its subcommands are an ALLOW-list of non-mutating ones                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | **nothing** in v1 (it cannot write); noted as a Read-mode leak in §5                                                    |
+| Group kill                  | `crates/hrdr-tools/src/proc.rs`                            | `pub(crate) fn spawn_group(&mut tokio::process::Command) -> io::Result<(Child, GroupKill)>`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | unchanged — the bwrap wrapper is just a different `Command`, group-kill still applies                                   |
+| Overflow spill dir          | `crates/hrdr-tools/src/lib.rs`                             | `pub fn tool_output_dir() -> PathBuf` (~1320): `$XDG_RUNTIME_DIR/hrdr-tool-output`, else `temp_dir()/hrdr-tool-output-<user>`; `ensure_private_dir` chmods 0700                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | listed as a writable/readable root in every mode that confines                                                          |
+| Session scratch             | — (does not exist yet)                                     | no scratch dir exists in the code today                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | new `pub fn session_scratch_dir() -> &'static Path` in `sandbox.rs`, mirroring `tool_output_dir`'s style                |
+| Worktrees                   | `crates/hrdr-agent/src/delegation.rs`                      | `Worktree::create` (~3060): path `<git toplevel>/.hrdr/worktrees/wt-<stamp>-<pid>-<seq>`, branch `hrdr/task-<uniq>`; `cfg.cwd = wt.path` (~1423); revive repoints too (~2031); `is_hrdr_worktree` (~1490)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | nothing — the sandbox reads `cwd` and detects a linked worktree generically via the `.git` **file** (§3.3)              |
+| Sub-agent config derivation | `crates/hrdr-agent/src/delegation.rs`                      | `config_for_agent_profile` (~1021) sets `cfg.read_only`/`cfg.allowed_tools`; `SubagentTool::execute` clones the base config, `let write_capable = !cfg.read_only;` (~1354)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | nothing here — mode derivation happens once, in `Agent::new` (shared codepath, §2.3)                                    |
+| Agent construction          | `crates/hrdr-agent/src/lib.rs`                             | `Agent::new`: `let mut ctx = ToolContext::new(config.cwd.clone()); ctx.lsp = …; ctx.max_output = …` (~1287–1294) — the pattern for populating `ToolContext` from config                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `ctx.sandbox = Arc::new(SandboxPolicy::for_agent(mode, &config.cwd, &config.sandbox_writable_roots));`                  |
+| Config struct               | `crates/hrdr-agent/src/config.rs`                          | `pub struct AgentConfig` (~196), `impl Default for AgentConfig` (~819), fields incl. `read_only` (bool), `allowed_tools`, `is_subagent`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `pub sandbox: SandboxMode`, `pub sandbox_writable_roots: Vec<PathBuf>`                                                  |
+| Config-file parsing         | `crates/hrdr-agent/src/config.rs`                          | `pub(crate) struct FileConfig` (~673, serde), `FileConfig::validate` (~728, hard errors), `AgentConfig::apply_file(&mut self, fc: FileConfig)` (~1435, `if let Some(v) = fc.x { self.x = v }` per field)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | `sandbox: Option<SandboxMode>` (serde enum → invalid spelling is a hard TOML error), `sandbox_writable_roots`           |
+| Env plumbing                | `crates/hrdr-agent/src/config.rs`                          | `ENV_SETTERS: &[(&str, EnvSetter)]` (~1666) — one row per knob, `Err(reason)` → warning, value kept; helpers `parse_env_bool`, `env_parse`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | one `("HRDR_SANDBOX", …)` row using `SandboxMode::from_str`                                                             |
+| CLI plumbing                | `apps/hrdr/src/main.rs`                                    | `struct Cli` (~44) with `#[arg(long, global = true)]` fields; override block ~495–515 (`if let Some(n) = cli.max_write_subagents { config.max_write_subagents = n; }`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `--sandbox <write\|read\|none>` and `--no-sandbox`, applied in the same block                                           |
+| Prompt sections             | `crates/hrdr-agent/src/prompt.rs`                          | `SystemPrompt { sections: Vec<(&'static str, String)> }` with `push` (drops empty bodies), `names()`, `prefix_len_before(name)`, `render()`; section constants `SECTION_BASE … SECTION_PERSONA, SECTION_ENVIRONMENT`; runtime-built sections follow `environment_section(cwd, tools) -> String`                                                                                                                                                                                                                                                                                                                                                                                                                           | `pub const SECTION_SANDBOX: &str = "sandbox";` + `pub fn sandbox_section(policy) -> String`                             |
+| Prompt assembly + cache     | `crates/hrdr-agent/src/lib.rs`                             | `build_system_prompt_sections(tools, cwd, docs, memory, persona, is_subagent)` (~1019) pushes sections in the documented least-volatile-first order; `build_system_prompt` (~1072) computes the cache split as `p.prefix_len_before(SECTION_ENVIRONMENT)`; **three** call sites: `Agent::new` (~1350), `refresh_system_prompt_in_place` (~1575), `refresh_system` (~1619) — slice 7 must thread the policy through all three. **The old doc's `system.j2` is GONE** — the prompt is ten `include_str!` markdown fragments in `crates/hrdr-agent/src/templates/*.md` plus runtime-built sections; interpolation into the static fragments is impossible. The worktree guidance now lives in `templates/subagent_write.md`. | push `SECTION_SANDBOX` **after** `SECTION_ENVIRONMENT` (dead last — see §4 slice 7 for why that is the cache-safe spot) |
+| Prompt-order test           | `crates/hrdr-agent/src/lib.rs`                             | `system_prompt_is_ordered_least_volatile_first` (~4242) asserts `p.names().last() == Some(&SECTION_ENVIRONMENT)` (~4308); it builds sections at ~4248, and two more tests do at ~4292/~4319                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | update to expect `SECTION_SANDBOX` last, `SECTION_ENVIRONMENT` second-to-last                                           |
+| Degradation notice channel  | `crates/hrdr-llm/src/client.rs`, `hrdr-agent/turn_loop.rs` | `pub fn take_client_warning() -> Option<String>` (OnceLock<Mutex<Option<String>>> drain, client.rs ~41) → drained in `turn_loop.rs` (~507): `if let Some(warning) = hrdr_llm::take_client_warning() { on_event(AgentEvent::Notice(warning)); }`; `AgentEvent::Notice(String)` (lib.rs ~622)                                                                                                                                                                                                                                                                                                                                                                                                                               | mirror it: `hrdr_tools::take_sandbox_notice()` + one drain line beside the existing one                                 |
+| Test skip pattern           | `crates/hrdr-tools/src/tools/grep.rs`                      | `if which::which("rg").is_err() { return; } // best-effort: exercise the real backend when available` (~653)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | the exact pattern for skipping bwrap/seatbelt tests (§6)                                                                |
 
 **Stale claims in the old doc, corrected here:** (1) "guidance clause in
 `system.j2`" — that file is deleted; the guidance is `subagent_write.md`, and
@@ -144,11 +146,11 @@ are errors while env values are warnings (see the module docs at the top of
 
 ### 2.2 Root sets per mode
 
-| Mode  | Readable                                                                                     | Writable                                                                                                                                            |
-| ----- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| None  | everything                                                                                   | everything                                                                                                                                          |
-| Write | everything¹                                                                                  | `cwd` + `std::env::temp_dir()` + `session_scratch_dir()` + `tool_output_dir()` + git metadata roots (§3.3) + `sandbox_writable_roots` config extras |
-| Read  | `cwd` + `session_scratch_dir()` + `tool_output_dir()` (+ system dirs for the OS layer, §3.5) | — (none)                                                                                                                                            |
+| Mode  | Readable                                                                                       | Writable                                                                                                                                            |
+| ----- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| None  | everything                                                                                     | everything                                                                                                                                          |
+| Write | everything¹                                                                                    | `cwd` + `std::env::temp_dir()` + `session_scratch_dir()` + `tool_output_dir()` + git metadata roots (§3.3) + `sandbox_writable_roots` config extras |
+| Read  | `cwd` + `session_scratch_dir()` + `tool_output_dir()` (+ system dirs for the OS layer, §3.6.1) | — (none)                                                                                                                                            |
 
 ¹ Broad reads in `Write` are a **deliberate, decided tradeoff** (matches Codex
 `workspace-write`): builds read all over the FS. Cost: a shell command can read
@@ -193,10 +195,14 @@ read-only sub-agents; for a write-capable agent it is not an error, it just
 floors at `write`.
 
 Sub-agents inherit `config.sandbox` automatically because
-`SubagentTool::execute` clones the base `AgentConfig` (delegation.rs ~1246
+`SubagentTool::execute` clones the base `AgentConfig` (delegation.rs ~1237
 `let mut cfg = self.base.clone();`) — `cfg.read_only` is already final before
 `Agent::new` runs, so `effective_sandbox` in `Agent::new` needs no
-delegation-side code at all.
+delegation-side code at all. **Revived sub-agents** (`task_revive`,
+delegation.rs ~2004) are covered by the same rows: revive also clones the base
+config (`read_only` stays `false` — a revived run takes a write slot) and
+repoints `cfg.cwd` at the reused worktree (~2031), so it derives exactly like a
+write sub-agent, through the same `Agent::new` call — no extra code.
 
 ### 2.4 Configuration surface
 
@@ -325,19 +331,24 @@ fn git_metadata_roots(cwd: &Path) -> Vec<PathBuf> {
 Deliberately NOT writable: `common` itself, `common/index`,
 `common/refs/heads/<anything else>`, `common/packed-refs`, `common/config` —
 that is what keeps `git -C <parent> commit` and `update-ref refs/heads/main`
-blocked. Known cosmetic consequence: `git gc --auto` fired by a commit inside
-the worktree may print a warning when it cannot prune/pack refs; the commit
-itself has already succeeded. Accept the warning.
+blocked. Known cosmetic consequence: ref maintenance fired by a commit inside
+the worktree may print
+`error: Unable to create '<common>/packed-refs.lock': Read-only file system`
+(observed verbatim in the runtime validation) while the commit itself exits 0
+and has already landed. Accept the message; do not widen the roots for it.
 
 ### 3.4 Degradation notice cell
 
-Mirror `hrdr_llm::take_client_warning` exactly
-(OnceLock<Mutex<Option<String>>>):
+Mirror the drain shape of `hrdr_llm::take_client_warning`, but with one
+addition: §5 requires each notice **at most once per process**, and a plain
+`Option<String>` cell would re-fill (and re-notice) on every shell call after
+each drain. So the cell keeps a seen-set beside the pending slot —
+`OnceLock<Mutex<(HashSet<String>, Option<String>)>>`:
 
 ```rust
-pub fn take_sandbox_notice() -> Option<String>;      // drain
-pub(crate) fn set_sandbox_notice(msg: String);       // first writer wins; later calls with the SAME
-                                                     // message are dropped (don't re-notice every shell call)
+pub fn take_sandbox_notice() -> Option<String>;      // drain the pending slot (seen-set untouched)
+pub(crate) fn set_sandbox_notice(msg: String);       // insert into the seen-set; only a message
+                                                     // seen for the FIRST time becomes pending
 ```
 
 Drained in `crates/hrdr-agent/src/turn_loop.rs` right beside the existing drain
@@ -367,7 +378,9 @@ pub fn detect_backend() -> OsSandboxBackend {
     //      bwrap --unshare-user --unshare-pid --ro-bind / / --proc /proc --dev /dev -- /bin/true
     //    with stdin/stdout/stderr null and a 500 ms wait (std::process, spawn
     //    + poll try_wait in a 50 ms loop, kill on deadline — this mirrors
-    //    Codex's SYSTEM_BWRAP_PROBE_TIMEOUT). Exit 0 → Backend::Bwrap.
+    //    Codex's SYSTEM_BWRAP_PROBE_TIMEOUT / _POLL_INTERVAL in
+    //    sandboxing/src/bwrap.rs). Exit 0 → Backend::Bwrap.
+    //    (Probe line runtime-validated on Arch — exits 0. §3.6.1.)
     //    Non-zero or timeout → user namespaces are disabled → step 3.
     // 3. `std::fs::read_to_string("/sys/kernel/security/lsm")` contains
     //    "landlock" → Backend::Landlock.
@@ -389,6 +402,7 @@ pub fn sandboxed_shell_command(
     shell: crate::tools::Shell,   // re-exported as crate::Shell
     cmd_str: &str,
     policy: &SandboxPolicy,
+    cwd: &std::path::Path,        // for `--chdir` — the policy holds roots, not the cwd
 ) -> tokio::process::Command
 ```
 
@@ -407,6 +421,21 @@ the explicit `--chdir` below makes the child's cwd deterministic even if the
 inherited one is a symlink alias.
 
 #### 3.6.1 bwrap argument lists — VERBATIM
+
+> **Runtime-validated 2026-07-26 on Arch Linux, bubblewrap 0.11.2** (usr-merged:
+> `/bin → usr/bin`, `/sbin → usr/bin`, `/lib`/`/lib64 → usr/lib`). Confirmed
+> with the literal argv below: write inside an rw root succeeds; a write outside
+> — via redirect, `cd <parent> && …`, or `python -c "open(…,'w')"` — fails with
+> `Read-only file system` (EROFS) and creates nothing; exit status propagates
+> (`bash -c 'exit 7'` → 7); stdout/stderr flow through untouched;
+> `--die-with-parent` is accepted; killing the spawn group kills every
+> descendant; `git commit` inside a linked worktree **succeeds** with only the
+> §3.3 metadata roots bound rw while `git -C <parent> commit` and
+> `git -C <parent> update-ref refs/heads/main …` both **fail** on
+> `index.lock`/`packed-refs.lock` EROFS; in Read mode `/home` is ENOENT,
+> `--tmpfs /tmp` is writable, and `python -c` and a `cc hello.c` compile both
+> work from `/usr` + the compat symlinks. The §3.5 probe line was also run
+> verbatim and exits 0.
 
 Environment passthrough policy: **full inheritance, no `--clearenv`** —
 PATH/HOME/CARGO_HOME must survive; env secrets are explicitly not hidden in v1
@@ -443,7 +472,7 @@ This matches Codex's `create_bwrap_flags` skeleton
 `--unshare-user --unshare-pid` + `--proc /proc`), minus its network/tmpfs-mask
 machinery.
 
-**Read mode**:
+**Read mode** (order is load-bearing — see the `--tmpfs /tmp` note):
 
 ```
 bwrap
@@ -452,10 +481,10 @@ bwrap
   --ro-bind /usr /usr
   --ro-bind /etc /etc
   <compat entries for /bin /sbin /lib /lib64>   # see below
+  --tmpfs /tmp              # BEFORE the root binds — see note
   --ro-bind <cwd> <cwd>
   --ro-bind <session_scratch_dir()> <same>
   --ro-bind <tool_output_dir()> <same>
-  --tmpfs /tmp              # child-private tmp so mktemp/compilers work; its writes vanish (fine: read mode)
   --dev /dev
   --proc /proc
   --unshare-user
@@ -465,15 +494,28 @@ bwrap
   <shell.program()> -c <cmd_str>
 ```
 
+`--tmpfs /tmp` gives the child a private tmp so mktemp/compilers work; its
+writes vanish (fine: read mode). It MUST precede the cwd/scratch/tool-output
+binds: bwrap applies mounts in argv order and later mounts shadow earlier ones,
+and `session_scratch_dir()` (always) and `tool_output_dir()` (in its
+no-`$XDG_RUNTIME_DIR` fallback) live **under `/tmp`** — with the tmpfs mounted
+after them they vanish behind it. (Runtime-confirmed: with the tmpfs last, a cwd
+under `/tmp` made even `--chdir` fail with "Can't chdir … No such file or
+directory"; with the tmpfs first, all three binds punch through it correctly.)
+
 Compat entries: for each `p` in `["/bin", "/sbin", "/lib", "/lib64"]`, if
-`std::fs::symlink_metadata(p)` says symlink (usr-merged distro), emit
-`--symlink usr/<basename> <p>`; if it is a real directory, emit
-`--ro-bind <p> <p>`; if absent, emit nothing. (Bind-mounting a symlink source
-creates a real dir at the target and breaks usr-merge — this is the trap.)
-Everything else (`/home`, `/root`, `/opt`, `/var`, …) simply does not exist in
-the child, so reads outside the roots fail with **ENOENT**, stronger than EROFS.
-A tool living outside `/usr` (`/opt/homebrew`-style installs) is "command not
-found" in Read mode — acceptable, documented in §5.
+`std::fs::symlink_metadata(p)` says symlink (usr-merged distro), read the real
+target with `std::fs::read_link(p)` and emit `--symlink <target> <p>` — do NOT
+guess `usr/<basename>`: on Arch, `/sbin → usr/bin` and `/lib64 → usr/lib`, so
+the guessed `usr/sbin`/`usr/lib64` only resolve where `/usr` happens to carry
+extra compat links. If `p` is a real directory, emit `--ro-bind <p> <p>`; if
+absent, emit nothing. (Bind-mounting a symlink source creates a real dir at the
+target and breaks usr-merge — this is the trap.) `/usr` and `/etc` remain
+readable by design (interpreters, libc, DNS/ca-certs); everything else (`/home`,
+`/root`, `/opt`, `/var`, …) simply does not exist in the child, so reads there
+fail with **ENOENT**, stronger than EROFS. A tool living outside `/usr`
+(`/opt/homebrew`-style installs) is "command not found" in Read mode —
+acceptable, documented in §5.
 
 #### 3.6.2 Landlock fallback — VERBATIM ruleset
 
@@ -570,18 +612,28 @@ byte-for-byte from §5.
   calls; exists; on unix mode is 0700; path starts with `env::temp_dir()`.
 - `policy_write_roots_cover_cwd_temp_scratch_and_tool_output` —
   `for_agent(Write, tmpdir, &[])` allows writes under all four defaults, refuses
-  `/etc/passwd` and a `<cwd>/../sibling` path, and the refusal message contains
-  every writable root.
+  `/etc/passwd` and `/nonexistent-outside/f`, and the refusal message contains
+  every writable root. **Trap:** a `<cwd>/../sibling` path is NOT a refusal case
+  — the test cwd is a tempdir, so its sibling sits under `env::temp_dir()`,
+  which is itself a writable root; assert that path is **allowed** (it pins the
+  deliberate temp-dir tradeoff). Only paths outside the temp tree (like the two
+  above) exercise refusal.
 - `read_mode_refuses_reads_outside_roots_and_allows_cwd` — self-explanatory;
   also asserts `check_read` is a no-op in `Write` and `None` modes.
-- `symlink_and_dotdot_escapes_are_caught` — create `<cwd>/link -> <outside>`;
-  `check_write` on `<cwd>/link/f` and on `<cwd>/a/../../outside/f` both refuse
-  (this is `canonicalize_nearest` doing its job — assert through the policy, not
-  the helper).
+- `symlink_and_dotdot_escapes_are_caught` — create `<cwd>/link -> /etc` (the
+  target must be OUTSIDE the temp tree — another tempdir would be under the
+  writable `env::temp_dir()` root and not refused); `check_write` on
+  `<cwd>/link/passwd` and on `<cwd>/a/` + `"../".repeat(40)` + `"etc/passwd"`
+  (enough `..` to guarantee escaping to `/`) both refuse (this is
+  `canonicalize_nearest` doing its job — assert through the policy, not the
+  helper).
 - `git_metadata_roots_for_a_linked_worktree` — build a real repo in a tempdir
   (`git init`, one commit — skip with
   `if which::which("git").is_err() { return; }`), `git worktree add`; assert the
-  four roots of §3.3 and that a plain checkout yields `vec![]`.
+  four roots of §3.3 and that a plain checkout yields `vec![]`. Run BOTH sides
+  of each path assertion through `canonicalize_nearest` before comparing — macOS
+  tempdirs live behind the `/var → /private/var` symlink and a raw comparison
+  fails only on the mac CI runner.
 - `sandbox_notice_is_take_once` — set, take → Some; take again → None; set twice
   with the same string → one notice total.
 
@@ -609,16 +661,33 @@ nothing enforces anything yet.
   - `apply_file`: copy the `if let Some(v) = fc.x { self.x = v }` pattern; map
     the root strings to `PathBuf`.
   - `ENV_SETTERS`: add
-    `("HRDR_SANDBOX", |c, v| { c.sandbox = v.parse().map_err(|e: String| e)?; Ok(()) })`.
+    `("HRDR_SANDBOX", |c, v| { c.sandbox = v.parse()?; Ok(()) })` (the setter
+    type is `fn(&mut AgentConfig, &str) -> Result<(), String>` and
+    `SandboxMode::from_str`'s error is already `String`, so `?` just works).
   - add `pub fn effective_sandbox(session, read_only) -> SandboxMode` exactly as
     §2.3.
 - `apps/hrdr/src/main.rs`: `Cli` fields
   `#[arg(long, global = true, value_name = "write|read|none")] sandbox: Option<String>`
   and
   `#[arg(long = "no-sandbox", global = true, conflicts_with = "sandbox")] no_sandbox: bool`;
-  in the override block (beside `max_write_subagents`): parse `cli.sandbox` via
-  `FromStr` (invalid value → same warning style as the neighbors, keep current),
-  then `if cli.no_sandbox { config.sandbox = hrdr_tools::SandboxMode::None; }`.
+  in the override block (beside `max_write_subagents`) — note the neighboring
+  overrides silently drop invalid values, but a mistyped sandbox mode must not
+  be silent, so:
+
+  ```rust
+  if let Some(s) = cli.sandbox.as_deref() {
+      match s.parse::<hrdr_tools::SandboxMode>() {
+          Ok(m) => config.sandbox = m,
+          Err(e) => eprintln!("warning: --sandbox: {e} — keeping {}", config.sandbox),
+      }
+  }
+  if cli.no_sandbox {
+      config.sandbox = hrdr_tools::SandboxMode::None;
+  }
+  ```
+
+  (`hrdr-tools` is already a dependency of `apps/hrdr`, and `Display` renders
+  the kept mode.)
 
 **Tests:**
 
@@ -626,9 +695,10 @@ nothing enforces anything yet.
   `toml::from_str::<FileConfig>` with `sandbox = "read"` works; with
   `sandbox = "wrote"` errors.
 - config.rs: `hrdr_sandbox_env_sets_mode_and_garbage_warns` — drive the
-  `ENV_SETTERS` row directly (find an existing env-setter test to copy the
-  harness from; the table entries are plain fns, callable without touching the
-  process env).
+  `ENV_SETTERS` row directly; copy the harness from
+  `subagent_caps_read_from_config_and_env` (`crates/hrdr-agent/src/lib.rs` ~4909
+  — it looks the row up in `ENV_SETTERS` by name and calls the fn pointer on a
+  config, no process env involved).
 - config.rs: `relative_sandbox_writable_roots_are_rejected` — validate() error.
 - config.rs: `effective_sandbox_matches_the_decision_table` — assert all six
   `(session, read_only)` combinations from §2.3.
@@ -676,8 +746,15 @@ default still `None`, nothing observable changes for users.
     `resolve_write`
   - `tools/read.rs:94` → `resolve_read`
   - `tools/grep.rs:132` and the two `.map(|p| ctx.resolve(p))` sites (~315/~413)
-    → `resolve_read` (the closures become fallible — collect into
-    `Result<Vec<_>, _>?`)
+    → `resolve_read`. The ~315/~413 sites map over an **`Option`** (the optional
+    `path` arg), not a list — the mechanical transform is
+    ```rust
+    let root = match a.path.as_ref() {
+        Some(p) => ctx.resolve_read(p)?,
+        None => ctx.cwd.clone(),
+    };
+    ```
+    (replacing the `.map(…).unwrap_or_else(…)` chain).
   - `tools/ls.rs:42` → `resolve_read`
   - `tools/tree.rs:90` → `resolve_read`
   - `tools/lsp_nav.rs:134` → `resolve_read`
@@ -687,11 +764,26 @@ default still `None`, nothing observable changes for users.
   allow-list; its Read-mode leak is documented, §5).
 
 **Tests** (put policy-driven tool tests in the affected tool files, building
-`ToolContext` then overwriting `ctx.sandbox` with a real policy):
+`ToolContext` then overwriting `ctx.sandbox` with a real policy). **Policy
+construction for every "outside" case:** a `for_agent` policy makes
+`env::temp_dir()` writable, so a second tempdir is INSIDE the roots and never
+refused. Build the confining policy as a struct literal instead — the fields are
+`pub`:
+
+```rust
+let policy = SandboxPolicy {
+    mode: SandboxMode::Write, // or Read
+    writable_roots: vec![canonicalize_nearest(dir.path())],
+    readable_roots: vec![canonicalize_nearest(dir.path())],
+};
+ctx.sandbox = std::sync::Arc::new(policy);
+```
+
+Then a sibling tempdir really is outside and the assertions below hold.
 
 - `write_outside_roots_is_refused_and_names_the_roots` (write.rs) — Write mode,
-  target under a second tempdir → Err containing "you may write only under" and
-  the cwd path; target under cwd → Ok.
+  target under a second tempdir → Err containing "You may write only under"
+  (capital Y — the exact §5 casing) and the cwd path; target under cwd → Ok.
 - `edit_outside_roots_is_refused` (edit.rs).
 - `move_copy_delete_are_guarded_on_the_mutating_side` (fileops.rs) — move
   out-of-roots destination refused; copy with out-of-roots SOURCE is allowed in
@@ -702,7 +794,9 @@ default still `None`, nothing observable changes for users.
   grep/ls/tree with an outside `path` arg refused (one assertion each, can live
   in their files).
 - `scratch_and_tool_output_stay_writable_under_write_mode` (write.rs) — writes
-  under `session_scratch_dir()` and `tool_output_dir()` succeed.
+  under `session_scratch_dir()` and `tool_output_dir()` succeed. (This one has
+  no outside case — build its policy with `for_agent(Write, cwd, &[])`, which
+  includes both dirs.)
 - `mode_none_changes_nothing` (write.rs) — unconfined policy, write to a sibling
   tempdir succeeds (pins the default behavior until slice 4).
 
@@ -777,8 +871,11 @@ Commit: `feat(agent): enforce sandbox policy per agent; default write`
   ```
 - `crates/hrdr-tools/src/tools/shell.rs` (~190):
   `let mut cmd = self.shell.command(&a.command);` →
-  `let mut cmd = crate::sandbox::sandboxed_shell_command(self.shell, &a.command, &ctx.sandbox);`
-- `crates/hrdr-tools/src/tools/watch.rs` (~168): same swap in `run_check`.
+  `let mut cmd = crate::sandbox::sandboxed_shell_command(self.shell, &a.command, &ctx.sandbox, &ctx.cwd);`
+  (`&ctx.sandbox` deref-coerces from `&Arc<SandboxPolicy>`; the
+  `cmd.current_dir(&ctx.cwd)` line below it stays.)
+- `crates/hrdr-tools/src/tools/watch.rs` (~168): same swap in `run_check`
+  (`sandboxed_shell_command(shell, command, &ctx.sandbox, &ctx.cwd)`).
 
 **Tests** (in `sandbox.rs`; arg-builder tests are pure and run everywhere,
 end-to-end tests are gated):
@@ -787,10 +884,13 @@ end-to-end tests are gated):
   verbatim for a policy with two writable roots (order included: `--ro-bind / /`
   precedes every `--bind`).
 - `bwrap_read_args_omit_rw_binds_and_private_tmp` — pure: Read argv has no
-  `--bind`, has `--tmpfs /tmp`, and the /bin compat entry matches this machine's
-  symlink-ness.
+  `--bind`, has `--tmpfs /tmp` **positioned before the cwd/scratch/tool-output
+  `--ro-bind`s** (assert the index ordering — a tmpfs mounted after them shadows
+  any of them living under `/tmp`, §3.6.1), and the /bin compat entry matches
+  this machine's `read_link("/bin")`.
 - End-to-end, all `#[cfg(target_os = "linux")]` `#[tokio::test]`, each starting
   with the repo's canonical skip guard (mirrors grep.rs:653):
+
   ```rust
   if crate::sandbox::detect_backend() != crate::sandbox::OsSandboxBackend::Bwrap {
       return; // best-effort: exercise the real backend when available
@@ -799,15 +899,26 @@ end-to-end tests are gated):
 
   - `shell_write_outside_roots_hits_a_readonly_fs` — Write mode, run `ShellTool`
     with `echo x > <other_tempdir>/f`; output contains `Read-only file system`
-    and the file does not exist.
-  - `shell_write_in_cwd_and_tmp_succeeds_under_bwrap` — both writes land.
+    and the file does not exist. **Policy: struct-literal with
+    `writable_roots: vec![cwd]` only** — a `for_agent` policy binds
+    `env::temp_dir()` rw and the other tempdir would then be writable (same trap
+    as slice 3; the argv builder iterates `policy.writable_roots`, so the
+    hand-built policy emits no `/tmp` bind).
+  - `shell_write_in_cwd_and_tmp_succeeds_under_bwrap` — both writes land
+    (`for_agent` policy — this one wants the real default root set).
   - `worktree_commit_succeeds_but_parent_commit_is_blocked` — build repo +
-    linked worktree (skip if no git); policy for the worktree cwd; inside the
-    worktree `git add -A && git commit -m x` **succeeds** (proves §3.3);
+    linked worktree (skip if no git); **struct-literal policy: `writable_roots`
+    = `[worktree]` + `git_metadata_roots(worktree)`, each
+    `canonicalize_nearest`-ed** (the repo lives in a tempdir, so a `for_agent`
+    policy's `/tmp` root would make the parent writable and void the test);
+    inside the worktree `git add -A && git commit -m x` **succeeds** (proves
+    §3.3 — set `user.email`/`user.name` via `-c` flags);
     `git -C <parent> commit --allow-empty -m x` **fails** (EROFS on the parent
-    index/refs).
-  - `read_mode_cannot_even_see_outside_paths` — Read mode, `cat /etc/hostname`
-    fails (ENOENT/No such file), `ls <cwd>` works.
+    `index.lock`). Both outcomes runtime-confirmed with exactly these roots.
+  - `read_mode_cannot_even_see_outside_paths` — Read mode, `ls /home` fails with
+    `No such file or directory` (ENOENT — `/home` is unmounted; do NOT probe
+    under `/etc` or `/usr`, those are deliberately readable in Read mode),
+    `ls <cwd>` works.
   - `timeout_kill_reaches_through_bwrap` — copy the existing
     `timeout_kills_the_whole_process_tree_not_just_the_leader` shape (shell.rs
     ~679) but with a confined ctx; the grandchild must die.
@@ -831,7 +942,7 @@ degradation says so exactly once, in the agent event stream.
   `sandboxed_shell_command` (§3.6.2), notice emission per §5 at each degrade
   point. To make the Landlock path testable on machines where bwrap exists,
   factor the arm as
-  `fn shell_command_with_backend(backend, shell, cmd_str, policy) -> Command`
+  `fn shell_command_with_backend(backend, shell, cmd_str, policy, cwd) -> Command`
   and have `sandboxed_shell_command` call it with `detect_backend()`.
 - `crates/hrdr-agent/src/turn_loop.rs`: the drain line (§3.4) beside the
   existing `take_client_warning` drain.
@@ -840,7 +951,9 @@ degradation says so exactly once, in the agent event stream.
 
 - `landlock_blocks_writes_outside_roots` — `#[cfg(target_os = "linux")]`, guard:
   `if !std::fs::read_to_string("/sys/kernel/security/lsm").unwrap_or_default().contains("landlock") { return; }`
-  — call `shell_command_with_backend(Landlock, …)` directly, run
+  — call `shell_command_with_backend(Landlock, …)` directly with a
+  struct-literal policy (`writable_roots: vec![cwd]` only — the slice-3/5 temp
+  trap again: a `for_agent` policy makes a sibling tempdir writable), run
   `echo x > <outside>/f`: fails (EACCES); write under cwd succeeds.
 - `read_mode_under_landlock_degrades_with_a_notice` — forced-Landlock command in
   Read mode → `take_sandbox_notice()` returns the §5 string.
@@ -901,9 +1014,18 @@ prefix and cost the cache everything below them (see the ordering doc-comment on
   - `build_system_prompt_sections` / `build_system_prompt`: add a
     `sandbox: &hrdr_tools::SandboxPolicy` parameter; push
     `p.push(SECTION_SANDBOX, prompt::sandbox_section(sandbox));` immediately
-    after the `SECTION_ENVIRONMENT` push (~1061). Thread the policy from
-    `Agent::new`'s call site (~1350) — the `ctx.sandbox` Arc built in slice 4 is
-    in scope; pass `&ctx.sandbox`.
+    after the `SECTION_ENVIRONMENT` push (~1061). `build_system_prompt` has
+    **three** call sites and the policy must be threaded through every one:
+    `Agent::new` (~1350 — the `ctx.sandbox` Arc built in slice 4 is in scope;
+    pass `&ctx.sandbox`), `refresh_system_prompt_in_place` (~1575) and
+    `refresh_system` (~1619) — both methods on `Agent`, so pass
+    `&self.ctx.sandbox` there (the resume/`/clear`/`set_cwd` rebuild paths; miss
+    one and the sandbox section silently drops out of the prompt after a
+    resume).
+  - also update the assembly-order doc-comment on `render_system` (`prompt.rs`,
+    the numbered list ending "8. **Environment** … dead last"): add "9.
+    **Sandbox**" and move the "dead last" wording — otherwise the doc-comment
+    contradicts the shipped order.
   - update the three tests that call `build_system_prompt_sections`
     (~4248/~4292/~4319) to pass `&SandboxPolicy::unconfined()` (or a real one
     where the test asserts sandbox content).
@@ -1006,18 +1128,18 @@ instead of it); `git` tool Read-mode subprocess confinement.
 
 ### What blocking looks like, per layer
 
-| Scenario                                                           | Layer             | What the model sees                                                                                                     |
-| ------------------------------------------------------------------ | ----------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `write`/`edit`/`move`/`copy`-dest/`delete` outside roots           | software guard    | tool error, the write-refusal string below                                                                              |
-| `read`/`grep`/`ls`/`tree`/`lsp` outside roots in `Read` mode       | software guard    | tool error, the read-refusal string below                                                                               |
-| shell `echo x > /parent/f`, `git -C /parent commit` (Write, bwrap) | kernel (bwrap)    | the command's own stderr: `…: Read-only file system` (EROFS, os error 30); nonzero `[exit status: …]` appended as usual |
-| shell `cat /etc/passwd` (Read, bwrap)                              | kernel (bwrap)    | `No such file or directory` — the path is not mounted at all (ENOENT beats EROFS)                                       |
-| shell write outside roots (Landlock fallback)                      | kernel (Landlock) | `…: Permission denied` (EACCES)                                                                                         |
-| shell read outside cwd (Read mode, Landlock fallback)              | — (leak)          | succeeds; the degradation notice below was emitted                                                                      |
-| `git` tool with a path outside cwd (Read mode)                     | — (leak, v1)      | succeeds (subprocess, read-only subcommands only) — documented, follow-up                                               |
-| cold `cargo build`/`npm install` in a worktree (Write)             | kernel            | EROFS on `~/.cargo`/`~/.npm` — user remedy: `sandbox_writable_roots = ["~/.cargo", …]` (absolute) or `--sandbox none`   |
-| tool binary outside `/usr` in Read mode                            | kernel (bwrap)    | `command not found`                                                                                                     |
-| `git commit` inside the worktree (Write)                           | —                 | **succeeds** (via §3.3 metadata roots); a trailing `gc --auto` warning is possible and harmless                         |
+| Scenario                                                           | Layer             | What the model sees                                                                                                                                                                       |
+| ------------------------------------------------------------------ | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `write`/`edit`/`move`/`copy`-dest/`delete` outside roots           | software guard    | tool error, the write-refusal string below                                                                                                                                                |
+| `read`/`grep`/`ls`/`tree`/`lsp` outside roots in `Read` mode       | software guard    | tool error, the read-refusal string below                                                                                                                                                 |
+| shell `echo x > /parent/f`, `git -C /parent commit` (Write, bwrap) | kernel (bwrap)    | the command's own stderr: `…: Read-only file system` (EROFS, os error 30); nonzero `[exit status: …]` appended as usual                                                                   |
+| shell `cat /home/<u>/.ssh/id_rsa` (Read, bwrap)                    | kernel (bwrap)    | `No such file or directory` — `/home` is not mounted at all (ENOENT beats EROFS). NB `/usr` and `/etc` ARE readable in Read mode (§3.6.1)                                                 |
+| shell write outside roots (Landlock fallback)                      | kernel (Landlock) | `…: Permission denied` (EACCES)                                                                                                                                                           |
+| shell read outside cwd (Read mode, Landlock fallback)              | — (leak)          | succeeds; the degradation notice below was emitted                                                                                                                                        |
+| `git` tool with a path outside cwd (Read mode)                     | — (leak, v1)      | succeeds (subprocess, read-only subcommands only) — documented, follow-up                                                                                                                 |
+| cold `cargo build`/`npm install` in a worktree (Write)             | kernel            | EROFS on `~/.cargo`/`~/.npm` — user remedy: `sandbox_writable_roots = ["/home/<user>/.cargo", …]` (must be absolute — a literal `~` is rejected by validate) or `--sandbox none`          |
+| tool binary outside `/usr` in Read mode                            | kernel (bwrap)    | `command not found`                                                                                                                                                                       |
+| `git commit` inside the worktree (Write)                           | —                 | **succeeds** (via §3.3 metadata roots); a trailing `error: Unable to create '….git/packed-refs.lock': Read-only file system` from ref maintenance is possible and harmless (exit stays 0) |
 
 ### Software-guard error strings (byte-exact; positive allow-list)
 
@@ -1118,13 +1240,16 @@ sandbox-exec existence guard; "all" = no cfg, no guard.
    above it or above persona/memory — the roots contain the per-agent worktree
    path; putting them earlier bills every agent for a cold cache. The cache
    split anchor stays `SECTION_ENVIRONMENT`.
-8. **bwrap argv order is semantics:** `--ro-bind / /` must precede the rw
-   `--bind`s (later mounts shadow earlier ones), and the terminal `--` must
-   precede the shell argv.
+8. **bwrap argv order is semantics** (later mounts shadow earlier ones): in
+   Write mode `--ro-bind / /` must precede the rw `--bind`s; in Read mode
+   `--tmpfs /tmp` must precede the cwd/scratch/tool-output `--ro-bind`s (the
+   scratch dir lives under `/tmp` — a tmpfs mounted after it hides it,
+   runtime-confirmed); and the terminal `--` must precede the shell argv.
 9. **/bin is a symlink on usr-merged distros** — Read mode must emit
-   `--symlink usr/bin /bin`, not `--ro-bind /bin /bin` (which manufactures a
-   real directory and breaks the merge). Detect per-path with
-   `symlink_metadata`.
+   `--symlink <read_link(p)> <p>`, not `--ro-bind /bin /bin` (which manufactures
+   a real directory and breaks the merge) and not a guessed `usr/<basename>` (on
+   Arch `/sbin → usr/bin`, not `usr/sbin`). Detect per-path with
+   `symlink_metadata`, read the target with `fs::read_link`.
 10. **`ToolContext::new` stays unconfined.** Only `Agent::new` installs a real
     policy. Do not "helpfully" default the bare constructor to `Write` — it will
     break hundreds of unrelated tool tests and violate the wiring plan.
