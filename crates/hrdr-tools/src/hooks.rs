@@ -55,14 +55,23 @@ impl Hook {
 }
 
 /// Substitute `{path}` with the shell-quoted file path.
+///
+/// POSIX single-quote escaping (`'` -> `'\''`) on every platform, because hooks
+/// run through the same shell the `shell` tool resolves (`bash`, then `sh`) —
+/// on Windows that means WSL or Git Bash. There is no `cmd.exe` path to quote
+/// for, which is what makes this airtight: single quotes neutralize everything,
+/// where `cmd`'s double quotes still expand `%VAR%` and honour `^`.
 fn render_command(template: &str, path: &Path) -> String {
-    let quoted = if cfg!(windows) {
-        format!("\"{}\"", path.display().to_string().replace('"', "\"\""))
-    } else {
-        // POSIX single-quote escaping: ' -> '\''.
-        format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
-    };
+    let quoted = format!("'{}'", path.display().to_string().replace('\'', r"'\''"));
     template.replace("{path}", &quoted)
+}
+
+/// The shell every hook runs through — the same one the `shell` tool and `watch`
+/// use, so a hook can't end up in a different interpreter than the commands the
+/// model writes. `None` when the machine has neither `bash` nor `sh`, which is
+/// reported to the model rather than silently skipping the hook.
+fn hook_shell() -> Option<(String, Vec<String>)> {
+    crate::tools::shell::user_shell()
 }
 
 /// Run every hook matching (`tool`, `path`) sequentially, returning one
@@ -73,15 +82,15 @@ pub async fn run_file_hooks(hooks: &[Hook], tool: &str, path: &Path, cwd: &Path)
     let mut notes = Vec::new();
     for hook in hooks.iter().filter(|h| h.matches(tool, path, cwd)) {
         let cmd_line = render_command(&hook.run, path);
-        let mut cmd = if cfg!(windows) {
-            let mut c = tokio::process::Command::new("cmd");
-            c.args(["/C", &cmd_line]);
-            c
-        } else {
-            let mut c = tokio::process::Command::new("bash");
-            c.arg("-c").arg(&cmd_line);
-            c
+        let Some((program, shell_args)) = hook_shell() else {
+            notes.push(format!(
+                "hook `{}` skipped: no shell available to run it",
+                hook.run
+            ));
+            continue;
         };
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(shell_args).arg(&cmd_line);
         cmd.current_dir(cwd);
         // A file hook (a formatter, mostly) never reads stdin; leaving it
         // inherited would let it block on the TUI's terminal. Null it — the
@@ -243,15 +252,15 @@ pub async fn run_event_hooks(
     });
     let payload = payload.to_string();
     for hook in matching {
-        let mut cmd = if cfg!(windows) {
-            let mut c = tokio::process::Command::new("cmd");
-            c.args(["/C", &hook.run]);
-            c
-        } else {
-            let mut c = tokio::process::Command::new("bash");
-            c.arg("-c").arg(&hook.run);
-            c
+        let Some((program, shell_args)) = hook_shell() else {
+            out.notes.push(format!(
+                "hook `{}` skipped: no shell available to run it",
+                hook.run
+            ));
+            continue;
         };
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(shell_args).arg(&hook.run);
         cmd.current_dir(cwd)
             .env("HRDR_HOOK_EVENT", event.as_str())
             .env("HRDR_HOOK_TOOL", tool.unwrap_or(""))
@@ -374,11 +383,26 @@ mod tests {
     #[test]
     fn command_rendering_quotes_path() {
         let cmd = render_command("fmt {path} && check {path}", Path::new("/tmp/a b.rs"));
-        if cfg!(windows) {
-            assert_eq!(cmd, "fmt \"/tmp/a b.rs\" && check \"/tmp/a b.rs\"");
-        } else {
-            assert_eq!(cmd, "fmt '/tmp/a b.rs' && check '/tmp/a b.rs'");
-        }
+        // POSIX quoting on every platform — hooks always run through bash/sh.
+        assert_eq!(cmd, "fmt '/tmp/a b.rs' && check '/tmp/a b.rs'");
+    }
+
+    /// Single quotes make the path inert: an embedded quote is escaped, and the
+    /// characters that would have been live under `cmd.exe` (`%VAR%` expansion,
+    /// `^` escaping) are just literal bytes inside the quotes.
+    #[test]
+    fn command_rendering_neutralizes_shell_metacharacters() {
+        let cmd = render_command("fmt {path}", Path::new("/tmp/a %PATH% ^ b.rs"));
+        assert_eq!(cmd, "fmt '/tmp/a %PATH% ^ b.rs'");
+
+        // `'` -> `'\''`: close the quote, escaped literal quote, reopen.
+        let cmd = render_command("fmt {path}", Path::new("/tmp/it's.rs"));
+        assert_eq!(cmd, r"fmt '/tmp/it'\''s.rs'");
+
+        // A path that tries to close the quote and append a command stays one
+        // argument — the injected `;` and `rm` are inside the quotes.
+        let cmd = render_command("fmt {path}", Path::new("/tmp/a'; rm -rf /; '.rs"));
+        assert_eq!(cmd, r"fmt '/tmp/a'\''; rm -rf /; '\''.rs'");
     }
 
     #[cfg(unix)]

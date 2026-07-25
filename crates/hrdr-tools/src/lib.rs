@@ -897,8 +897,9 @@ impl ToolRegistry {
         r.register(Arc::new(CopyTool));
         r.register(Arc::new(ReplaceTool));
         r.register(Arc::new(GitTool));
-        // Shell tools are presence-gated so the model is only offered a shell it
-        // can actually use (bash on unix; PowerShell where installed, incl. Linux).
+        // The shell tool is presence-gated so the model is only offered a shell
+        // it can actually use (`bash`, then POSIX `sh`; on Windows that means
+        // WSL or Git Bash — there is no PowerShell path).
         for shell in available_shell_tools() {
             r.register(shell);
         }
