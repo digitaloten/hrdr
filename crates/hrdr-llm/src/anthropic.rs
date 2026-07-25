@@ -35,8 +35,9 @@ pub(crate) const API_VERSION: &str = "2023-06-01";
 
 /// Build the native `/v1/messages` request body from hrdr's OpenAI-shaped
 /// history. When `cache == Ephemeral`, `cache_control` breakpoints are placed on
-/// the last system block, the last tool, and the last content block of the last
-/// message (Anthropic allows ≤4; we use ≤3).
+/// the last tool, the last system block, the last content block of the last
+/// message, and — when `system_cache_split` gives a boundary — the end of the
+/// system prompt's stable prefix (Anthropic allows ≤4; with a split we use all 4).
 ///
 /// `top_p` and `stop` map the corresponding [`crate::RequestParams`] fields onto
 /// the Messages API's `top_p` / `stop_sequences`. `seed` has no equivalent on
