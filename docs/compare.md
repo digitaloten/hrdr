@@ -65,8 +65,6 @@ guardrails, no OS sandbox (issue #13), no evals.
 
 ---
 
-<!-- Findings are appended per harness as each comparison lands. -->
-
 ## codex
 
 Comparison run 2026-07-26. Two of my five preliminary claims were **refuted** —
@@ -283,6 +281,16 @@ tools. **Do it if MCP tool counts get large, not now.**
    persisted on disk from _earlier sessions_ by `NNN-slug` stem.
 8. **Three MCP transports vs two** — hrdr adds legacy HTTP+SSE; codex has only
    Stdio and StreamableHttp (`config/src/mcp_types.rs:433-463`).
+   > **Correction (from the opencode pass, verified).** This is a lead over
+   > **codex specifically, not a general one.** Opencode has all three
+   > transports (`mcp/index.ts:7-9`) **plus MCP OAuth**
+   > (`mcp/oauth-provider.ts`, `oauth-callback.ts`, `auth.ts`, and a
+   > `TransportWithAuth` type at `:110`). hrdr's MCP auth is **static headers
+   > only** (`mcp/types.rs:46`, `:56`), so on MCP authentication hrdr is
+   > _behind_. Also: hrdr exposes MCP **prompts** (`prompts/list`/`prompts/get`,
+   > `mcp/client.rs:604`) where opencode has zero references to them — resources
+   > are at parity. Net: hrdr ahead on prompts, behind on auth, level on
+   > transports against opencode.
 
 ### Deliberate differences, not gaps
 
@@ -999,10 +1007,373 @@ construction, not observed on the wire.
 
 ## opencode
 
-_Pending._
+Comparison run 2026-07-26 against `sst/opencode` v1.17.13. **hrdr's closest peer
+in kind** — multi-provider, terminal-first, TUI plus a web/desktop surface.
+Three of five claims came back partly wrong, and the pass corrected the
+MCP-transport claim in the codex section (see the callout above).
+
+### Corrections to the shallow reading
+
+**Prompt selection keys on the model id string only — never the provider.**
+`session/system.ts:26-40` is a substring cascade on `model.api.id`:
+`gpt-4|o1|o3 → beast`, `gpt+codex → codex`, `gpt → gpt`, `gemini- → gemini`,
+`claude → anthropic`, `trinity → trinity`, `kimi → kimi`, else `default`. So
+Claude on Bedrock, Vertex and Anthropic all get the same file, and an
+unrecognised local model gets `default.txt`.
+
+**One of the nine is dead code — the codex trap generalises.**
+`copilot-gpt-5.txt` (143 lines) has **zero references** anywhere. So do
+`session/prompt/plan-reminder-anthropic.txt` (which was my claimed evidence for
+per-model plan reinforcement — **refuted**) and `tool/plan-enter.txt`. Only
+`plan-exit.txt` is imported. **Assume any per-model prompt directory contains
+dead code until you grep for the import** — codex 5-of-6, opencode 1-of-9 plus
+two more dead prompt files.
+
+**They are genuinely divergent, not drifted copies** — this is what survives and
+matters. Sorted-unique-line overlap: `anthropic` vs `default` shares 13 of ~65
+lines; `gpt` vs `codex` 7 of 63; `gpt` vs `copilot-gpt-5` **0**.
+`gpt.txt:81-107` carries a GPT-5-specific `## Response channels` section
+(`commentary`/`final`) found nowhere else; `kimi.txt` has a wholly different
+section skeleton. **Blast-radius caveat:** an agent with its own `prompt`
+replaces the per-model prompt entirely (`session/llm/request.ts:60`), and
+`explore`/`compaction`/`title`/ `summary` all set one — so per-model selection
+only fires for `build`, `plan` and user agents.
+
+**Plan mode: the enforcement is real and better designed than I described, but
+the flag is off by default and the mechanism has a hole.**
+`agent/agent.ts:156-181` gives the `plan` agent
+`edit: { "*": "deny", ".opencode/plans/*.md": "allow", … }` — a **path-scoped
+write allowlist**, evaluated `findLast`-wins (`permission/index.ts:28-38`).
+Because the last `edit` rule is a _path_ not `*`, the tool stays **visible** to
+the model (`Permission.disabled` requires `pattern === "*"`, `:210-211`) and is
+denied per-call on the actual path. That is better than hiding the tool: the
+model sees `edit` exists and gets a targeted denial. **But**
+`experimentalPlanMode` is `enabledByExperimental`, i.e. off
+(`effect/runtime-flags.ts:49`), and the deny covers only the `edit` permission —
+`shell` inherits `"*": "allow"` from defaults. Which is exactly why
+`plan.txt:4-6` screams _"Do NOT use sed, tee, echo, cat, or ANY other bash
+command to manipulate files"_. **The prompt exists because the mechanism doesn't
+reach the shell.** Worth knowing before copying it. `plan_exit` is itself
+interesting: it calls `question.ask` for approval and on "Yes" writes a
+synthetic user message with `agent: "build"` into the session
+(`tool/plan.ts:53-69`) — the mode switch is a real state transition in the
+transcript, not a prompt suggestion.
+
+**The `lsp` tool is experimental, and it has no `rename`.** Nine operations
+(`goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, prepareCallHierarchy, incomingCalls, outgoingCalls`,
+`tool/lsp.ts:11-21`) — but gated on `experimentalLspTool`, off by default
+(`tool/registry.ts:233`). **hrdr's `rename`, the one operation with no shell
+equivalent, has no opencode counterpart.** Conversely hrdr lacks `hover`,
+`documentSymbol`, `workspaceSymbol`, `implementation` and the call-hierarchy
+ops. _Judgment on one-vs-three:_ the enum wins on token cost and extensibility,
+but opencode had to make `line`/`character` **required** even for
+`workspaceSymbol`, which ignores them (`:26-31`, `:50-55`) — the concrete cost
+of collapsing. **Don't merge hrdr's three; add ops as new tools if wanted.** The
+enum only pays past ~6 operations. And the LSP _client_ is the bigger story:
+`lsp/server.ts` is 53.5 KB with auto-download, and diagnostics aren't in the
+tool at all — they're pushed back on every mutation (`edit.ts:197-205`,
+`write.ts:75-79`, `apply_patch.ts:265-300`), which is exactly what hrdr does at
+`mutation.rs:48-72`. **Parity on the mechanism that matters.**
+
+**`.txt` descriptions: confirmed, but my implied judgment was wrong.** Opencode
+composes at runtime on top of the `.txt` — `task` appends the live sub-agent
+list (`tool/registry.ts:251-264`), `shell` renders `shell.txt` as a template
+with per-dialect blocks for bash/pwsh/PowerShell 5.1/cmd
+(`tool/shell/prompt.ts`), and plugins can rewrite any description per turn. All
+three harnesses converge on "description is a runtime `String`"; the only
+disagreement is where the static base lives. **Moving hrdr's text to `.txt` buys
+nothing on its own** — `include_str!` would be a lateral move. Changing the
+return type to `String` is the change that matters, and that's already filed in
+the codex section. Not re-filed.
+
+### Findings hrdr should act on
+
+**1. Parse shell commands instead of regex-matching them. Strongest
+cross-harness signal in this whole comparison.** Opencode parses every command
+with a **tree-sitter grammar** (bash and PowerShell), walks the command nodes,
+and derives two things: out-of-project path arguments for file-touching commands
+(`tool/shell.ts:392-405`), and a permission pattern plus an **arity-truncated
+"always" prefix** (`:406-409`, table at `permission/arity.ts`) — so
+`git checkout main -b foo` generalises to `git checkout *` rather than being
+either an exact string or `git *`. hrdr matches 14 hand-written regexes against
+the raw command line (`guardrails.rs:44-120`), with in-tree comments admitting
+the cost: _"the regex crate has no lookaround — `--force` must not also match
+`--force-with-lease`, so it's anchored to a non-word boundary manually"_
+(`:46-48`), and every rule carrying `[^&|;]*` to avoid crossing a separator — a
+hand-rolled tokeniser spelled in regex. **codex reached the same conclusion
+independently** (`shell-command/src/parse_command.rs`, 82 KB, plus a Starlark
+`execpolicy` DSL). hrdr is the outlier. _Cost:_ large — `tree-sitter-bash` plus
+rewriting `default_guardrails` to match parsed nodes. A week. _Or maybe not:_
+hrdr's guardrails are deliberately a **small deny list on an autonomous agent**,
+not an approval system — there's no human to ask, so a parse buys precision
+without buying a new capability. If the goal is only "stop `rm -rf /` and
+force-push", 14 tested regexes are defensible and cheaper to maintain than a
+grammar dependency. **The parse becomes clearly worth it only if hrdr adopts
+finding 2 or 4.**
+
+**2. `doom_loop` — repeated-identical-tool-call detection. Cheapest real win
+here.** `session/processor.ts:350-376`: on every tool call, if the last 3 parts
+are the same tool with byte-identical `JSON.stringify(input)`, raise a
+`doom_loop` permission ask. **hrdr has nothing equivalent** — grep for
+`doom|loop_detect|repeated_call` across `crates/` returns zero (verified).
+hrdr's only backstop is a _count_ cap: `max_steps` rounds with a wrap-up nudge
+and a final tool-less round (`turn_loop.rs:632-656`). A model stuck re-running
+the same failing `cargo test` burns the entire round budget **and the entire
+cost cap** before anything notices. _Cost:_ half a day. hrdr already keeps
+`self.messages`; the check is "last 3 tool calls have equal name and equal
+serialised args". For hrdr the action should be an injected `Notice` ("you have
+called X with identical arguments 3 times — change approach"), not an approval
+prompt — fits the autonomy posture, needs no new plumbing. _Caveat:_ three
+identical calls are legitimate for `watch`-style polling and `task_output` on a
+running sub-agent. Needs a per-tool opt-out list; opencode has the same problem
+and dodges it only by making the whole thing an _ask_.
+
+**3. Out-of-project access as _ask_, not as _removed_.**
+`tool/external-directory.ts:15-44`: any tool touching a path outside the
+project/worktree raises an `external_directory` permission keyed on the
+containing **directory glob**, with an allow-list pre-seeded from the overflow
+dir, temp, skill dirs and reference dirs (`agent/agent.ts:108-124`) — so
+legitimate paths are pre-approved and everything else prompts once per
+directory. Called from `read`, `edit`, `write`, `glob`, `grep`, `lsp`, `shell`
+and `apply_patch`. hrdr **removed cwd confinement entirely** (`f0d903a`), and
+the tracked "sub-agent isolation guard" item is the acknowledgement that
+something was lost. Opencode shows the middle position hrdr skipped: full access
+retained, but **crossing the boundary is an observable event**. This is a design
+for a tracked gap, not a new gap — and opencode's granularity (directory glob +
+pre-seeded allow list) is the part to copy. _Caveat:_ hrdr's write sub-agents
+legitimately read the parent repo (shared `Cargo.lock`, `~/.cargo`, `/usr/lib`),
+so the allow-list may need to be large enough that signal-to-noise doesn't
+justify it.
+
+**4. One permission evaluator instead of three unrelated mechanisms.** Opencode
+has a single primitive — an ordered list of `{permission, pattern, action}`
+evaluated `findLast`-wins with globbing on both fields
+(`permission/index.ts:28-38`) — and from it gets plan mode, sub-agent
+restriction, read-only agents, out-of-project confinement, `.env` gating, loop
+detection and headless mode, all as **data**. hrdr has three mechanisms that
+don't compose: `guardrails` (shell only, terminal `bail!`), `read_only` (a
+registry-level name filter), and per-tool secret-file `bail!`s (which
+`deferred-improvements.md` records as _deliberately_ not shared). Adding a
+fourth restriction means writing a fourth mechanism. _Caveat, and it's the real
+objection:_ opencode's three actions are `allow|ask|deny`; hrdr's autonomy
+posture collapses that to `allow|deny`, and a two-valued evaluator over globs is
+worth much less than a three-valued one. **The honest MVP:** keep the
+mechanisms, express _what they check_ as one rule list so `read_only` and
+`guardrails` stop being independent. A refactor, not a feature — wait until hrdr
+actually wants a second path-scoped restriction (finding 3, or codex's `.git`
+protection).
+
+**5. Per-provider tool-JSON-schema rewriting.**
+`provider/transform.ts:1419-1490` rewrites every tool schema per model before it
+goes on the wire, with three quirks and the reason in a comment each:
+OpenAI/Azure sanitisation; Moonshot/Kimi strip every sibling key of a `$ref`
+(_"Moonshot expands `$ref` before validation and rejects sibling keywords"_) and
+collapse tuple-style `items`; Gemini converts integer enums to string enums.
+hrdr ships one schema shape to every provider — grep for
+`sanitize|additionalProperties|\$ref` across `hrdr-llm/src/` returns nothing
+relevant — and hrdr targets a **wider** provider spread than opencode's default
+set. _Caveat, strongest in this section:_ **there is no evidence hrdr is
+currently broken on any provider.** This is where to put a seam _when a bug
+arrives_, not a speculative port. File as "known-good design for when a provider
+rejects a schema", not as work.
+
+### Where hrdr is ahead
+
+1. **Sub-agent filesystem isolation — opencode has none.**
+   `tool/task.ts:142-158` creates a child session in the **same directory** with
+   the same tree; the only isolation is a permission ruleset
+   (`agent/subagent-permissions.ts:14-27`). Two concurrent opencode sub-agents
+   editing one file race with no lock, no worktree, no branch.
+   `packages/opencode/src/worktree/index.ts` (22.6 KB) exists but is a
+   _user-facing_ feature, **not referenced from `task.ts`**. Same shape as
+   hrdr's lead over codex and hermes — **all three peers lack it.**
+2. **Pruned tool output stays recoverable.** Opencode replaces content with the
+   literal `"[Old tool result content cleared]"`
+   (`session/message-v2.ts:293-296`) with **no re-read path** — the bytes are in
+   SQLite but the model is never told where. hrdr saves the body to
+   `tool_output_dir()` and substitutes a pointer with recovery instructions
+   (`compaction.rs:415-425`). And opencode's prune is **opt-in, off by default**
+   (`session/compaction.ts:245`) with a flat `PRUNE_MINIMUM = 20_000` gate,
+   where hrdr's runs by default behind an ROI gate.
+3. **USD cost budgeting.** Opencode computes per-session USD with tiered pricing
+   and `Decimal` arithmetic — but grep for
+   `budget|spendLimit|costLimit|max_cost` yields **only token budgets**. No
+   monetary cap, warning or stop anywhere. **Three of three peers lack this**,
+   which makes it hrdr's most distinctive feature, not an oddity.
+4. **`watch`** — no opencode equivalent; waiting on CI is a sleep-and-recheck
+   loop costing a round trip per look.
+5. **A structured `git` tool** — 44.8 KB, 14 subcommands, output through the
+   same bounded path as every other tool. Opencode's git surface is `shell` plus
+   the snapshot shadow-repo.
+6. **Semantic `rename`** — `lsp_nav.rs:362-400`, with apply/rollback. Opencode's
+   `lsp` has no rename op; codex and hermes have no LSP at all. **The single
+   capability no other harness in this comparison has.**
+7. **LSP on by default vs experimental.**
+8. **MCP prompts** — hrdr exposes `prompts/list`/`prompts/get`; opencode has
+   zero references. (But see the MCP correction above: hrdr is _behind_ on MCP
+   OAuth.)
+9. **Skill frontmatter fails closed for agents.** Opencode's skill loading fails
+   _open_ — a YAML parse error logs and skips (`skill/index.ts:111-121`), and a
+   file that parses but fails the shape check is **silently dropped** at `:123`;
+   `InvalidError`/`NameMismatchError` are declared and never thrown in
+   production.
+10. **Built-in skills: 10 vs 1.** Opencode ships exactly one
+    (`customize-opencode`); everything else is disk-discovered, including
+    reading `~/.claude/skills/`.
+11. **Session retention** — `grep -n "retention|expire|vacuum|compress|purge"`
+    over opencode's session and storage modules returns **0**. Sessions never
+    expire. **Three of three peers lack this too.**
+
+### Agrees / disagrees with codex
+
+**Agreements — two independent harnesses, strong signal:**
+
+- **Parse shell commands, don't regex them.** Codex: 82 KB parser + Starlark
+  DSL. Opencode: tree-sitter + arity table. Different implementations, same
+  conclusion. **The single strongest cross-harness signal here; hrdr is the
+  outlier.**
+- **`apply_patch` is a per-model tool, mutually exclusive with structured
+  editing.** Codex gates it on `apply_patch_tool_type` from its catalog;
+  opencode gates on model id and makes it exclusive —
+  `usePatch = modelID.includes("gpt-") && !oss && !gpt-4`, and `edit`/`write`
+  are **excluded** when it's on (`tool/registry.ts:272-277`). Both concluded
+  GPT-5-class models want a diff envelope and everyone else wants string
+  replacement. hrdr sends `edit`/`write` to all models.
+- **Descriptions are runtime `String`s.** Corroboration of the codex finding,
+  not a new item.
+- **Per-model prompt variation is real, and dead prompt files are common.**
+- **Interactive approvals as a posture**, both explicitly disabled headless.
+
+**Disagreements:**
+
+- **Enforced plan mode: opencode yes, codex no.** So the tracked hrdr gap is
+  **one-for-two among peers, not universal** — but opencode's path-scoped
+  write-allowlist design is the better of the two if hrdr ever builds it.
+- **Code mode: codex shipped it as mandatory on its newest models; opencode's is
+  unshipped and narrower.** `CodeModeTool` is **not** in opencode's builtin
+  registry (referenced only from tests) and exposes **MCP/CodeMode tools only,
+  explicitly not top-level tools** (`tool/code-mode.ts:30`) — the opposite of
+  codex's `code_mode_only`, which replaces the entire surface. **Not the same
+  idea; hrdr should ignore both.**
+- **Sandboxing: codex has an OS sandbox on by default; opencode has none** — its
+  only confinement is the `external_directory` ask, a userspace convention.
+  Issue #13 has one peer that solved it and one that didn't.
+
+### Deliberate differences, not gaps
+
+- **Server-first architecture, and it's the best reference for
+  `docs/web-ui-plan.md` in this set.** One Effect `HttpApi` route table (~140
+  endpoints), SSE for events, WebSockets for PTY only. Every frontend is an HTTP
+  client of it — **including the TUI, which by default routes through an
+  in-process worker fetch** (`cli/cmd/tui.ts:229-245`) rather than a socket,
+  with identical HTTP semantics. Two generated clients, one from OpenAPI and one
+  from the `HttpApi` contract, with a `git diff --exit-code` drift check. **That
+  in-process-transport trick is the transferable idea:** it gets you a web UI
+  without a second codepath and without forcing a socket in the single-process
+  case. But it's a whole-architecture commitment and opencode's TUI is
+  TypeScript/SolidJS on OpenTUI (~27 kLOC), so the ergonomics don't transfer to
+  Ratatui directly.
+- **Runtime npm install of provider SDKs** (`provider/provider.ts:1751-1769`) —
+  a Bun affordance with no Rust equivalent, and one hrdr shouldn't want.
+- **Config as JSONC with a published JSON Schema**, 35 top-level keys, 9-layer
+  merge ending in macOS MDM managed preferences. Enterprise surface.
+- **Filesystem snapshots via a shadow git repo** with `objects/info/alternates`
+  pointed at the real object DB so blob hashes are reused, powering
+  `session/revert.ts`. hrdr deliberately removed checkpoints/undo (`ba07063`) —
+  a reversed decision, not a gap.
+- **No Anthropic OAuth** — opencode has OAuth for ChatGPT/Codex, Copilot, xAI,
+  Snowflake, DigitalOcean, GitLab and its own console, but **not** Claude
+  Pro/Max. hrdr's Codex OAuth is at parity; neither has Anthropic subscription
+  auth.
+- **Effect-TS throughout** — not portable, not a lesson.
+
+**One number flagged as an open question, not a finding.** Truncation caps:
+opencode 50 KB / 2000 lines (`tool/truncate.ts:15-16`); hrdr **5120 bytes / 50
+lines** (`hrdr-tools/src/lib.rs:62`, `:68`). A 10× / 40× gap. Both spill to a
+re-readable file so nothing is lost, but hrdr's 50-line default means a
+`cargo test` failure or a 60-line diff costs a second round trip that opencode
+wouldn't pay. **Not measured in hrdr's traces — worth one experiment.**
+
+### What could not be verified
+
+The clone is **1 commit deep**, so no history evidence for anything — whether
+`copilot-gpt-5.txt` was ever wired, or whether the dead prompts are recently
+orphaned. Whether `experimentalPlanMode` is on in _shipped_ builds (only the
+source default was verified). Whether the plan-agent shell hole is exploitable
+in practice — traced statically, not executed. Whether the three schema quirks
+apply to hrdr's schema shapes. `agent/prompt/summary.txt` has no production
+consumer either agent could find — possibly a fourth dead prompt, unproven. Real
+assembled per-turn context size for either tool: **same caveat as every other
+pass — nothing was instrumented, so no "X sends less than Y" claim in this
+document is measured.**
 
 ---
 
 ## Cross-harness synthesis
 
-_Written once all four are in._
+### Where hrdr is the outlier — ranked by how many peers disagree with us
+
+| #   | Thing                                | codex             | hermes                            | opencode          | pi  | hrdr                   |
+| --- | ------------------------------------ | ----------------- | --------------------------------- | ----------------- | --- | ---------------------- |
+| 1   | Per-model prompt/behaviour variation | ✅ remote catalog | ✅ substring list + family blocks | ✅ 9 prompt files | ✗   | **✗**                  |
+| 2   | Model-invocable skills               | ✅                | ✅                                | ✅                | ✅  | **✗**                  |
+| 3   | Shell commands parsed, not regexed   | ✅                | —                                 | ✅                | ✗   | **✗**                  |
+| 4   | Runtime-composed tool descriptions   | ✅                | ✅                                | ✅                | ✅  | **✗ (`&'static str`)** |
+| 5   | Ask-the-user affordance              | ✅                | ✅                                | ✅                | ✗   | **✗ (tracked)**        |
+| 6   | Repeated-call / loop detection       | —                 | —                                 | ✅                | ✗   | **✗**                  |
+| 7   | Deferred tool loading                | ✅                | ✅                                | —                 | ✗   | **✗**                  |
+
+**Items 1, 2 and 4 are three-of-four or four-of-four against us** — those are
+the ones where being the outlier is most likely to be a mistake rather than a
+deliberate stance. Item 2 is the cheapest of the three and closes a defect this
+comparison found.
+
+### Where hrdr leads all four
+
+- **Sub-agent filesystem isolation.** codex has two generations of sub-agent
+  tooling and no worktrees; hermes' children share the parent's cwd while its
+  tool description claims otherwise; opencode's share the directory; pi's exists
+  only as an example. **hrdr's git-worktree isolation is unique across all four,
+  and `task_cleanup`'s merge verification has no peer.**
+- **Semantic `rename`.** No LSP at all in codex or hermes; opencode's `lsp` tool
+  has no rename op and is experimental.
+- **USD cost budgeting.** Absent in all four.
+- **Session retention/compression.** Absent in all four.
+- **ROI-gated mid-history pruning with recoverable pointers.** Codex has only
+  truncate-or-compact with no rung between; opencode's prune is off by default
+  and destroys the content.
+- **Guardrails with no off switch.** hermes has `HERMES_YOLO_MODE`, a default
+  `"smart"` mode that lets an aux LLM auto-approve, and a headless path that
+  auto-approves **without running the scanners** (plus a CVE for a contextvar
+  race onto that path). hrdr's are compiled in, read no env var, and apply to
+  sub-agents.
+
+### What every peer got wrong that we should not copy
+
+- **Dead prompt files that look live.** codex 5-of-6, opencode 1-of-9 plus two
+  more. If we ever ship per-model prompts, wire them with a test that every file
+  in the directory is reachable.
+- **Read-before-write that warns instead of blocking.** hermes detects staleness
+  and its own docstring says _"Does not block — the write still proceeds"_; pi's
+  `write` overwrites unconditionally. hrdr's `ReadState` refusal is right, and
+  it is a lead over **two** peers independently.
+- **Sub-agent self-reports treated as facts.** hermes' answer is a prompt
+  telling the model that summaries _"are SELF-REPORTS, not verified facts"_,
+  having popped `files_written` before the model sees it. hrdr's `task_diff` is
+  the mechanical answer.
+
+### The four things I'd actually do, in order
+
+1. **Model-invocable skills** (pi + hermes + opencode agree; closes a defect
+   found here; low cost).
+2. **Cache breakpoint at hrdr's own stable/volatile boundary** + re-gather
+   memory at compaction (hermes; ~30 lines each; the memory freeze is a live
+   defect).
+3. **`doom_loop` detection** (opencode; half a day; currently a stuck model
+   burns the whole cost cap).
+4. **Protect `.git` inside the worktree** (codex; independent of issue #13;
+   closes the `.git/hooks` escalation our own sandbox design misses).
+
+Then the two prompt defects found by the pi pass — the unconditional preamble
+naming tools some agents lack, and unscanned/silently-dropped `AGENTS.md` — both
+of which are small and neither of which needed a peer to justify.
