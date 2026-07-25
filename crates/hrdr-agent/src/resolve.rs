@@ -315,33 +315,9 @@ pub(crate) fn derived_context_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{cfg, cfg_with, provider_config};
     use crate::model_ref::r;
-    use crate::{ProviderConfig, builtin_provider, context_window_for};
-
-    /// A config with no `[providers.*]` entries: every name resolves to a built-in.
-    fn cfg() -> AgentConfig {
-        AgentConfig::default()
-    }
-
-    /// A config carrying one `[providers.<name>]` entry.
-    fn cfg_with(name: &str, p: ProviderConfig) -> AgentConfig {
-        let mut c = AgentConfig::default();
-        c.providers.insert(name.to_string(), p);
-        c
-    }
-
-    fn provider_config(base_url: &str) -> ProviderConfig {
-        ProviderConfig {
-            base_url: base_url.to_string(),
-            key_env: None,
-            api_key: None,
-            model: None,
-            remote: None,
-            context_window: None,
-            headers: HashMap::new(),
-            api_version: None,
-        }
-    }
+    use crate::{builtin_provider, context_window_for};
 
     /// PARITY: every built-in resolves to exactly what `builtin_provider` says —
     /// endpoint, trust kind, API version, headers. `resolve()` adds no opinion of

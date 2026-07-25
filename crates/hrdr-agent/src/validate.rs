@@ -333,33 +333,10 @@ pub fn validate_placeholder_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-
+    use crate::config::{cfg, cfg_with, provider_config};
     use crate::model_ref::r;
-    use crate::{CHATGPT_CODEX_BASE_URL, ProviderConfig, resolve};
+    use crate::{CHATGPT_CODEX_BASE_URL, resolve};
     use serde_json::json;
-
-    fn cfg() -> AgentConfig {
-        AgentConfig::default()
-    }
-
-    fn cfg_with(name: &str, base_url: &str) -> AgentConfig {
-        let mut c = AgentConfig::default();
-        c.providers.insert(
-            name.to_string(),
-            ProviderConfig {
-                base_url: base_url.to_string(),
-                key_env: None,
-                api_key: None,
-                model: None,
-                remote: None,
-                context_window: None,
-                headers: HashMap::new(),
-                api_version: None,
-            },
-        );
-        c
-    }
 
     fn resolved(spec: &str, cfg: &AgentConfig) -> ResolvedModel {
         // Apply the auth-derived switch with the OAuth store treated as READY, so
@@ -542,7 +519,7 @@ mod tests {
     /// the user's own server.
     #[tokio::test]
     async fn a_shadowed_chatgpt_provider_is_never_refused_by_the_account_catalog() {
-        let cfg = cfg_with("chatgpt", "http://localhost:9099/v1");
+        let cfg = cfg_with("chatgpt", provider_config("http://localhost:9099/v1"));
         let m = resolved("chatgpt://gpt-4o", &cfg);
         assert!(!m.is_codex_oauth());
         let rows = entitlements(&["gpt-5.5"]);
@@ -601,7 +578,7 @@ mod tests {
             );
         }
         // A custom `[providers.*]`: models.dev describes somebody else's server.
-        let custom = cfg_with("mygateway", "https://gw.internal/v1");
+        let custom = cfg_with("mygateway", provider_config("https://gw.internal/v1"));
         let m = resolved("mygateway://whatever-v9", &custom);
         assert_eq!(
             validate_identity_with(&custom.providers, &m, None, Some(&catalog)),

@@ -2326,10 +2326,7 @@ mod tests {
     /// `prompt::tests::an_agent_without_task_is_not_told_how_to_delegate`.
     #[test]
     fn the_delegation_guidance_reaches_an_agent_that_can_delegate() {
-        let agent = Agent::new(AgentConfig {
-            ..Default::default()
-        })
-        .unwrap();
+        let agent = Agent::new(AgentConfig::default()).unwrap();
         let system = agent
             .messages()
             .first()
@@ -2368,10 +2365,7 @@ mod tests {
     /// be pinned together, or the prompt drifts back.
     #[test]
     fn the_prompt_never_tells_the_model_to_pass_a_provider_to_task() {
-        let agent = Agent::new(AgentConfig {
-            ..Default::default()
-        })
-        .unwrap();
+        let agent = Agent::new(AgentConfig::default()).unwrap();
         let system = agent
             .messages()
             .first()
@@ -4097,9 +4091,7 @@ mod tests {
         use super::{builtin_subagent_profiles, config_for_agent_profile, subagent_base_config};
         // A read-only profile (like `explore`) drops the mutating tools and
         // appends its persona to the system prompt.
-        let base = AgentConfig {
-            ..Default::default()
-        };
+        let base = AgentConfig::default();
         let prof = &builtin_subagent_profiles()[0]; // explore
         let cfg = config_for_agent_profile(&subagent_base_config(&base), prof).unwrap();
         assert!(cfg.read_only);
@@ -4119,9 +4111,7 @@ mod tests {
     #[test]
     fn plan_agent_is_read_only() {
         use super::{builtin_subagent_profiles, config_for_agent_profile, subagent_base_config};
-        let base = AgentConfig {
-            ..Default::default()
-        };
+        let base = AgentConfig::default();
         let plan = builtin_subagent_profiles()
             .into_iter()
             .find(|p| p.name == "plan")
@@ -4567,9 +4557,7 @@ mod tests {
 
     #[test]
     fn drain_background_delivers_finished_and_prunes() {
-        let cfg = AgentConfig {
-            ..Default::default()
-        };
+        let cfg = AgentConfig::default();
         let mut agent = Agent::new(cfg).unwrap();
         let before = agent.message_count();
         {
@@ -4713,9 +4701,7 @@ mod tests {
     /// cancelled task is discarded without delivery.
     #[test]
     fn drain_background_worktree_delivery_and_cancelled_skip() {
-        let cfg = AgentConfig {
-            ..Default::default()
-        };
+        let cfg = AgentConfig::default();
         let mut agent = Agent::new(cfg).unwrap();
         {
             let reg = agent.background_tasks();
@@ -4846,10 +4832,7 @@ mod tests {
                 turn: TurnStats::default(),
                 kind: SubagentKind::Background,
                 agent: Arc::new(tokio::sync::Mutex::new(
-                    Agent::new(AgentConfig {
-                        ..Default::default()
-                    })
-                    .unwrap(),
+                    Agent::new(AgentConfig::default()).unwrap(),
                 )),
                 steering: steering_queue(),
                 running: true,
@@ -5883,9 +5866,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_steering_injects_messages_and_signals() {
-        let cfg = AgentConfig {
-            ..Default::default()
-        };
+        let cfg = AgentConfig::default();
         let mut agent = Agent::new(cfg).unwrap();
         let steering = steering_queue();
         {
@@ -6070,9 +6051,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let cfg = AgentConfig {
-                ..Default::default()
-            };
+            let cfg = AgentConfig::default();
             let mut agent = Agent::new(cfg).unwrap();
             // Inject a fake long-running handle.
             {
@@ -6153,9 +6132,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let cfg = AgentConfig {
-                ..Default::default()
-            };
+            let cfg = AgentConfig::default();
             let mut agent = Agent::new(cfg).unwrap();
             let id: u64 = 42;
             // Inject a fake handle.
@@ -6200,10 +6177,7 @@ mod tests {
                     turn: TurnStats::default(),
                     kind: SubagentKind::Background,
                     agent: Arc::new(tokio::sync::Mutex::new(
-                        Agent::new(AgentConfig {
-                            ..Default::default()
-                        })
-                        .unwrap(),
+                        Agent::new(AgentConfig::default()).unwrap(),
                     )),
                     steering: steering_queue(),
                     running: true,
@@ -6217,10 +6191,7 @@ mod tests {
             // Also register the main entry so we can verify it survives.
             agent.live_subagents.register_main(
                 Arc::new(tokio::sync::Mutex::new(
-                    Agent::new(AgentConfig {
-                        ..Default::default()
-                    })
-                    .unwrap(),
+                    Agent::new(AgentConfig::default()).unwrap(),
                 )),
                 steering_queue(),
                 String::new(),
@@ -6267,9 +6238,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let cfg = AgentConfig {
-                ..Default::default()
-            };
+            let cfg = AgentConfig::default();
             let mut agent = Agent::new(cfg).unwrap();
             // Inject several background entries at different lifecycle stages.
             // Also register the main entry so we can verify it survives.
@@ -6332,10 +6301,7 @@ mod tests {
                     turn: TurnStats::default(),
                     kind: SubagentKind::Background,
                     agent: Arc::new(tokio::sync::Mutex::new(
-                        Agent::new(AgentConfig {
-                            ..Default::default()
-                        })
-                        .unwrap(),
+                        Agent::new(AgentConfig::default()).unwrap(),
                     )),
                     steering: steering_queue(),
                     running: bg_id == id1,
@@ -6354,10 +6320,7 @@ mod tests {
             // Register the main entry.
             agent.live_subagents.register_main(
                 Arc::new(tokio::sync::Mutex::new(
-                    Agent::new(AgentConfig {
-                        ..Default::default()
-                    })
-                    .unwrap(),
+                    Agent::new(AgentConfig::default()).unwrap(),
                 )),
                 steering_queue(),
                 String::new(),
@@ -8013,9 +7976,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let cfg = AgentConfig {
-                ..Default::default()
-            };
+            let cfg = AgentConfig::default();
             let agent = Agent::new(cfg).unwrap();
             // Inject a handle that finishes immediately.
             {

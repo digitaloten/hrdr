@@ -1966,6 +1966,30 @@ pub(crate) fn write_config_doc(path: &std::path::Path, doc: &toml_edit::Document
     Ok(())
 }
 
+/// Shorthand: a config with no `[providers.*]` entries — every provider name
+/// resolves to a built-in.
+#[cfg(test)]
+pub(crate) fn cfg() -> AgentConfig {
+    AgentConfig::default()
+}
+
+/// Shorthand: a config carrying one `[providers.<name>]` entry.
+#[cfg(test)]
+pub(crate) fn cfg_with(name: &str, p: ProviderConfig) -> AgentConfig {
+    let mut c = AgentConfig::default();
+    c.providers.insert(name.to_string(), p);
+    c
+}
+
+/// Shorthand: a `[providers.*]` entry that defines nothing but its endpoint.
+#[cfg(test)]
+pub(crate) fn provider_config(base_url: &str) -> ProviderConfig {
+    ProviderConfig {
+        base_url: base_url.to_string(),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod env_source_tests {
     use super::*;

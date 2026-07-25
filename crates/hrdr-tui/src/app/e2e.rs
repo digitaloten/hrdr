@@ -3120,10 +3120,7 @@ async fn the_input_pane_matches_the_user_prompt_block() {
 #[tokio::test]
 async fn switching_agents_keeps_each_ones_place_and_draft() {
     let mut h = Harness::new(vec![]).await;
-    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-        ..Default::default()
-    })
-    .unwrap();
+    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
     h.app.live_subagents.register(hrdr_agent::LiveSubagent {
         key: 1,
         bg_id: None,
@@ -3192,10 +3189,7 @@ async fn switching_agents_keeps_each_ones_place_and_draft() {
 async fn the_input_box_routes_to_the_focused_agent() {
     let mut h = Harness::new(vec![]).await;
 
-    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-        ..Default::default()
-    })
-    .unwrap();
+    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
     let steering = hrdr_agent::steering_queue();
     h.app.live_subagents.register(hrdr_agent::LiveSubagent {
         key: 1,
@@ -3296,10 +3290,7 @@ async fn the_agent_list_switches_the_focused_agent() {
     // Delegate: the parent's `task` block, and a live sub-agent behind it.
     h.app
         .push_entry(Entry::tool_running("call-1", "task", "{}"));
-    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-        ..Default::default()
-    })
-    .unwrap();
+    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
     h.app.live_subagents.register(hrdr_agent::LiveSubagent {
         key: 1,
         bg_id: None,
@@ -3440,10 +3431,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
         a.set_context_window(Some(200_000));
     }
 
-    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-        ..Default::default()
-    })
-    .unwrap();
+    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
     h.app.live_subagents.register(hrdr_agent::LiveSubagent {
         key: 1,
         bg_id: None,
@@ -4076,10 +4064,7 @@ async fn the_loader_stops_while_the_models_tools_run() {
 #[tokio::test]
 async fn the_loader_belongs_to_the_agent_on_screen() {
     let mut h = Harness::new(vec![]).await;
-    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-        ..Default::default()
-    })
-    .unwrap();
+    let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
     h.app.live_subagents.register(hrdr_agent::LiveSubagent {
         key: 1,
         bg_id: None,
@@ -5733,10 +5718,7 @@ async fn the_todo_panel_shows_the_active_agents_list() {
         content: "sub task".to_string(),
         status: "pending".to_string(),
     }]));
-    let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-        ..Default::default()
-    })
-    .unwrap();
+    let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
     h.app.live_subagents.register(hrdr_agent::LiveSubagent {
         key: sub_key,
         bg_id: None,
@@ -5807,10 +5789,7 @@ async fn the_todo_panel_hides_while_a_sub_agent_is_running() {
         content: "sub task".to_string(),
         status: "in_progress".to_string(),
     }]));
-    let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig {
-        ..Default::default()
-    })
-    .unwrap();
+    let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
     h.app.live_subagents.register(hrdr_agent::LiveSubagent {
         key: sub_key,
         bg_id: None,
