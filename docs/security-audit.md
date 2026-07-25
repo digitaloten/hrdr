@@ -42,7 +42,7 @@ that fixed it. Items with a residual left after the fix are tracked in **Open**.
 | L8  | Catalog cache not `0600` — `OpenOptionsExt::mode(0o600)`      | `910ccee` | —        |
 | L9  | Hooks docs misleading — noted they bypass the guardrails      | `e314853` | —        |
 | L10 | Windows hook path quotes unescaped — `"` → `""`               | `e314853` | O5       |
-| O1  | Force-push guardrail bypass via `'"--force` mid-command quote  | `5a2f644` | —        |
+| O1  | Force-push guardrail bypass via `'"--force` mid-command quote | `5a2f644` | —        |
 
 ---
 
@@ -139,11 +139,10 @@ content envelope uses a verified-absent nonce; secret-denylist coverage is broad
 pathologies: no MD5/SHA1, no hardcoded secrets, no panics on untrusted SSE
 input, no buffer overflows, no data races, no unbounded allocation in hot paths.
 
-Both HIGH findings and the bulk of the Medium/Low set are fixed. What remains
+Both HIGH findings and the bulk of the Medium/Low set are fixed (including O1 —
+the force-push guardrail quote-bypass, resolved in `5a2f644`). What remains
 after the remediation re-review:
 
-1. **O1 (M3) — the guardrail quote-bypass fix is ineffective** and must be
-   redone (strip all quotes, not just edges) with a test for the real example.
-2. **O2 (M4) — `AuthEntry` still leaks tokens via `Debug`**; the fix must extend
+1. **O2 (M4) — `AuthEntry` still leaks tokens via `Debug`**; the fix must extend
    to it.
-3. Three low residuals (O3–O5) left by otherwise-correct fixes.
+2. Three low residuals (O3–O5) left by otherwise-correct fixes.
