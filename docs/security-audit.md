@@ -44,6 +44,7 @@ that fixed it. Items with a residual left after the fix are tracked in **Open**.
 | L10 | Windows hook path quotes unescaped — `"` → `""`               | `e314853` | O5       |
 | O1  | Force-push guardrail bypass via `'"--force` mid-command quote | `5a2f644` | —        |
 | O2  | `AuthEntry` derived `Debug` over live tokens (M4 residual)    | `c135d05` | —        |
+| O4  | `extra_headers` could duplicate the auth header (L4 residual) | `483fa42` | —        |
 
 ---
 
@@ -70,23 +71,6 @@ platform limitation.
 
 ---
 
-### O4 — LOW: `extra_headers` can still emit a duplicate `Authorization` (L4 residual)
-
-**`crates/hrdr-llm/src/client.rs`** — `auth()`
-
-The L4 fix now applies `extra_headers` **before** the auth header, so the real
-credential is the _last_ `Authorization`/`x-api-key`. But
-`RequestBuilder::header` **appends**, so if `extra_headers` itself contains an
-auth-type header the request still carries two — and which one a server/proxy
-honors (first vs last) is undefined. The audit's second option (filter
-`Authorization` / `x-api-key` / `api-key` names out of `extra_headers`) removes
-the ambiguity entirely. Low — `extra_headers` is operator-configured, not
-LLM-influenced.
-
-**Fix:** skip auth-header names when applying `extra_headers`.
-
----
-
 ### O5 — LOW: Windows hook path escaping omits `%` and `^` (L10 residual)
 
 **`crates/hrdr-tools/src/hooks.rs`** — `render_command` (Windows arm, ~L57-60)
@@ -108,8 +92,8 @@ the rendered command or expand an environment variable. Low.
 | Critical  | 0     | 0        |
 | High      | 0     | 2        |
 | Medium    | 0     | 4        |
-| Low       | 3     | 10       |
-| **Total** | **3** | **16**   |
+| Low       | 2     | 11       |
+| **Total** | **2** | **16**   |
 
 **Overall risk: Low.** The security-critical paths remain well-built:
 `fetch`/SSRF guard uses a TOCTOU-free DNS resolver; `SseDecoder` is properly
@@ -122,6 +106,7 @@ pathologies: no MD5/SHA1, no hardcoded secrets, no panics on untrusted SSE
 input, no buffer overflows, no data races, no unbounded allocation in hot paths.
 
 Both HIGH findings and the entire Medium set are fixed — including O1 (the
-force-push guardrail quote-bypass, `5a2f644`) and O2 (M4 — `AuthEntry` no longer
-derives `Debug`, `c135d05`). What remains after the remediation re-review is
-three LOW residuals (O3–O5) left by otherwise-correct fixes.
+force-push guardrail quote-bypass, `5a2f644`), O2 (M4 — `AuthEntry` no longer
+derives `Debug`, `c135d05`) and O4 (`extra_headers` can no longer carry an auth
+header at all, `483fa42`). What remains is two LOW residuals (O3, O5), both
+platform-specific gaps on Windows.
