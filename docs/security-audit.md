@@ -45,6 +45,7 @@ that fixed it. Items with a residual left after the fix are tracked in **Open**.
 | O1  | Force-push guardrail bypass via `'"--force` mid-command quote | `5a2f644` | —        |
 | O2  | `AuthEntry` derived `Debug` over live tokens (M4 residual)    | `c135d05` | —        |
 | O4  | `extra_headers` could duplicate the auth header (L4 residual) | `483fa42` | —        |
+| O5  | Windows hooks ran `cmd /C` — now bash/sh like everything else | `d009d80` | —        |
 
 ---
 
@@ -69,22 +70,6 @@ scenario was Unix symlinks.
 volume-serial + file-index via `GetFileInformationByHandle`), or document the
 platform limitation.
 
----
-
-### O5 — LOW: Windows hook path escaping omits `%` and `^` (L10 residual)
-
-**`crates/hrdr-tools/src/hooks.rs`** — `render_command` (Windows arm, ~L57-60)
-
-The L10 fix escapes embedded `"` → `""` (closing the command-splice vector), but
-a file path containing `%` (cmd.exe env-var expansion) or `^` (escape char) is
-still substituted verbatim. Not a command-injection splice, but it can corrupt
-the rendered command or expand an environment variable. Low.
-
-**Fix:** also neutralize `%` and `^` (e.g. via delayed-expansion-safe quoting or
-`CreateProcess`-style argument construction).
-
----
-
 ## Summary
 
 | Severity  | Open  | Resolved |
@@ -92,8 +77,8 @@ the rendered command or expand an environment variable. Low.
 | Critical  | 0     | 0        |
 | High      | 0     | 2        |
 | Medium    | 0     | 4        |
-| Low       | 2     | 11       |
-| **Total** | **2** | **16**   |
+| Low       | 1     | 12       |
+| **Total** | **1** | **16**   |
 
 **Overall risk: Low.** The security-critical paths remain well-built:
 `fetch`/SSRF guard uses a TOCTOU-free DNS resolver; `SseDecoder` is properly
@@ -107,6 +92,7 @@ input, no buffer overflows, no data races, no unbounded allocation in hot paths.
 
 Both HIGH findings and the entire Medium set are fixed — including O1 (the
 force-push guardrail quote-bypass, `5a2f644`), O2 (M4 — `AuthEntry` no longer
-derives `Debug`, `c135d05`) and O4 (`extra_headers` can no longer carry an auth
-header at all, `483fa42`). What remains is two LOW residuals (O3, O5), both
-platform-specific gaps on Windows.
+derives `Debug`, `c135d05`), O4 (`extra_headers` can no longer carry an auth
+header at all, `483fa42`) and O5 (hooks run through bash/sh on every platform,
+so there is no `cmd.exe` quoting to get wrong, `d009d80`). What remains is one
+LOW residual, O3 — a Windows-only gap in the `read` TOCTOU identity check.
