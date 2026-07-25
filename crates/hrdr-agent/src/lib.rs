@@ -1001,9 +1001,16 @@ fn build_system_prompt_sections(
         SECTION_AGENTS_MD, SECTION_BASE, SECTION_ENVIRONMENT, SECTION_MEMORY, SECTION_PERSONA,
     };
     let mut p = prompt::SystemPrompt::default();
-    p.push(SECTION_BASE, render_system(tools, is_subagent)?);
+    p.push(SECTION_BASE, prompt::base_section());
     p.push(SECTION_AGENTS_MD, prompt::agent_docs_section(docs));
     p.push(SECTION_MEMORY, memory_section(memory));
+    // The capability-gated group, each fragment its own named section so which
+    // ones an agent got is inspectable. After the project content on purpose: a
+    // read-only `explore` and a write `coder` in the same project then share every
+    // byte above this line and diverge only here.
+    for (name, body) in prompt::capability_sections(tools, is_subagent) {
+        p.push(name, prompt::section_text(body));
+    }
     p.push(SECTION_PERSONA, persona_section(persona));
     p.push(SECTION_ENVIRONMENT, prompt::environment_section(cwd, tools));
     Ok(p)
@@ -4094,6 +4101,11 @@ mod tests {
                 SECTION_BASE,
                 SECTION_AGENTS_MD,
                 SECTION_MEMORY,
+                // the capability group: differs by tool set / main-vs-sub
+                "write",
+                "shell",
+                "committing",
+                "committing_main",
                 SECTION_PERSONA,
                 SECTION_ENVIRONMENT,
             ],
@@ -4119,7 +4131,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(p.names(), [SECTION_BASE, SECTION_ENVIRONMENT]);
+        // No persona and no memory -> those sections are simply absent; the
+        // capability group still applies (this is a write agent).
+        assert!(!p.names().contains(&"memory"));
+        assert!(!p.names().contains(&"persona"));
+        assert!(!p.names().contains(&"agents_md"));
+        assert_eq!(p.names().first(), Some(&SECTION_BASE));
+        assert_eq!(p.names().last(), Some(&SECTION_ENVIRONMENT));
         assert!(!p.render().contains("# Memory"));
         assert!(!p.render().contains("# Your role"));
     }

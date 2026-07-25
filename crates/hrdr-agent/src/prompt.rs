@@ -1,16 +1,49 @@
-//! System-prompt assembly via minijinja.
+//! System-prompt assembly.
 //!
-//! hrdr uses Jinja for its *own* prompt templating only — the model wire-format
-//! chat template is applied server-side (e.g. by infr). Keep that boundary:
-//! we emit structured messages, the server renders the model prompt.
+//! The prompt is a **list of ordered, named sections** ([`SystemPrompt`]) that
+//! get concatenated — no template engine. Each static section is a plain
+//! markdown file compiled in with `include_str!`; only genuinely dynamic content
+//! (AGENTS.md, the memory index, the environment) is read at runtime. Assembling
+//! a prompt is then a straight sequence of conditional pushes, and *which*
+//! sections an agent got is inspectable rather than implied.
+//!
+//! The order is the cache strategy — see [`render_system`].
+//!
+//! Note the boundary this keeps: hrdr renders its *own* prompt only. The model
+//! wire-format chat template is applied server-side (e.g. by infr) — we emit
+//! structured messages, the server renders the model prompt.
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use hrdr_tools::ToolRegistry;
-use minijinja::{Environment, context};
 
-const SYSTEM_TEMPLATE: &str = include_str!("templates/system.j2");
+/// Static prompt sections, compiled in. Order of declaration mirrors assembly
+/// order; the gate each one needs is in [`capability_sections`].
+mod frag {
+    /// Unconditional: identity, cardinal rules, workflow, reporting, untrusted
+    /// content, safety. Byte-identical for every agent hrdr runs — main or sub,
+    /// read-only or write — which is what makes it the shared cache prefix.
+    pub const BASE: &str = include_str!("templates/base.md");
+    /// `can_write`: memory-saving, scope, editing, tests, debugging, git.
+    pub const WRITE: &str = include_str!("templates/write.md");
+    /// `can_write` + a shell on PATH.
+    pub const SHELL: &str = include_str!("templates/shell.md");
+    /// …and that shell is plain POSIX `sh`, not bash.
+    pub const SHELL_POSIX: &str = include_str!("templates/shell_posix.md");
+    /// `can_write`: commit discipline shared by main and sub agents.
+    pub const COMMITTING: &str = include_str!("templates/committing.md");
+    /// `can_write` and NOT a sub-agent: changelog ownership, push rules.
+    pub const COMMITTING_MAIN: &str = include_str!("templates/committing_main.md");
+    /// `can_write` and a sub-agent: hand-back discipline.
+    pub const COMMITTING_SUBAGENT: &str = include_str!("templates/committing_subagent.md");
+    /// `can_delegate`: how to use `task`, pick a model, and not duplicate work.
+    pub const DELEGATE: &str = include_str!("templates/delegate.md");
+    /// A sub-agent: what it can and cannot see, and that it cannot delegate on.
+    pub const SUBAGENT: &str = include_str!("templates/subagent.md");
+    /// A *write* sub-agent: worktree isolation and the parent-directory trap.
+    pub const SUBAGENT_WRITE: &str = include_str!("templates/subagent_write.md");
+}
 
 /// Render the static, cache-shareable body of the agent system prompt: every
 /// section that depends only on the tool set and the sub-agent flag. Nothing that
@@ -49,61 +82,120 @@ const SYSTEM_TEMPLATE: &str = include_str!("templates/system.j2");
 /// which differ only in the gated sections — share that whole preamble, diverging
 /// only when the first capability gate opens. Keep new shared guidance above the
 /// gates, and put anything a gate could suppress inside one.
-pub fn render_system(tools: &ToolRegistry, is_subagent: bool) -> Result<String> {
-    let mut env = Environment::new();
-    env.add_template("system", SYSTEM_TEMPLATE)
-        .context("loading system template")?;
-    let tmpl = env.get_template("system")?;
+/// The capability-gated sections for an explicit set of flags — the assembly
+/// half, with no policy in it.
+///
+/// Separated from [`capability_sections`] (which derives the flags from a tool
+/// set) so a caller — notably a test — can ask for any combination without
+/// having to construct a registry that happens to produce it.
+pub fn capability_sections_for(
+    can_write: bool,
+    can_delegate: bool,
+    is_subagent: bool,
+    shell: Option<hrdr_tools::Shell>,
+) -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<(&'static str, &'static str)> = Vec::new();
+    if can_write {
+        out.push((SECTION_WRITE, frag::WRITE));
+        if let Some(shell) = shell {
+            out.push((SECTION_SHELL, frag::SHELL));
+            if shell.needs_posix_caveat() {
+                out.push((SECTION_SHELL_POSIX, frag::SHELL_POSIX));
+            }
+        }
+        out.push((SECTION_COMMITTING, frag::COMMITTING));
+        out.push(if is_subagent {
+            (SECTION_COMMITTING_SUBAGENT, frag::COMMITTING_SUBAGENT)
+        } else {
+            (SECTION_COMMITTING_MAIN, frag::COMMITTING_MAIN)
+        });
+    }
+    if can_delegate {
+        out.push((SECTION_DELEGATE, frag::DELEGATE));
+    }
+    if is_subagent {
+        out.push((SECTION_SUBAGENT, frag::SUBAGENT));
+        if can_write {
+            out.push((SECTION_SUBAGENT_WRITE, frag::SUBAGENT_WRITE));
+        }
+    }
+    out
+}
 
+/// The capability-gated sections for `tools` — the policy half: which gates a
+/// tool set opens. Assembly itself is [`capability_sections_for`].
+pub fn capability_sections(
+    tools: &ToolRegistry,
+    is_subagent: bool,
+) -> Vec<(&'static str, &'static str)> {
+    // Gate the edit/git guidance: a purely read-only sub-agent has no mutating
+    // tools, so those sections would be dead weight (and mildly contradict its
+    // persona).
+    let can_write = tools.has_write_tool();
     let has = |name: &str| tools.defs().iter().any(|d| d.function.name == name);
+    // Delegation guidance is for an agent that can actually delegate — a sub-agent
+    // has no `task` tool, and telling it how to pick a model for one would be
+    // instructions for a tool it cannot call.
+    let can_delegate = has("task") && has("models");
     // The shell the `shell` tool runs, or `None` when the agent has no shell
-    // (read-only, or no shell on PATH). Read from the tool set itself so the
-    // prompt agrees with what was actually registered.
-    let shell = tools.shell();
+    // (read-only, or no shell on PATH). Read from the tool set itself so the prompt
+    // agrees with what was actually registered.
+    capability_sections_for(can_write, can_delegate, is_subagent, tools.shell())
+}
 
-    let rendered = tmpl
-        .render(context! {
-            // Gate the edit/git guidance: a purely read-only sub-agent has no
-            // mutating tools, so those sections would be dead weight (and mildly
-            // contradict its persona).
-            can_write => tools.has_write_tool(),
-            // Delegation guidance is for an agent that can actually delegate — a
-            // sub-agent has no `task` tool, and telling it how to pick a model for one
-            // would be instructions for a tool it cannot call.
-            can_delegate => has("task") && has("models"),
-            // A sub-agent gets extra discipline the main agent doesn't: it works in
-            // an isolated worktree and must hand back a clean, properly-committed
-            // git history (see the sub-agent commit section).
-            is_subagent => is_subagent,
-            // The shell section only renders when the `shell` tool is present (a
-            // write agent on a machine with a shell on PATH). `shell_posix` gates
-            // an extra pitfall note shown only when the shell needs it (plain
-            // POSIX `sh`) — the general shell guidance assumes bash. Both come
-            // from `Shell`, so a new dialect answers for itself instead of
-            // falling through a program-name comparison here.
-            has_shell => shell.is_some(),
-            shell_posix => shell.is_some_and(|s| s.needs_posix_caveat()),
-        })
-        .context("rendering system template")?;
+/// The base body plus the capability sections, concatenated — the whole
+/// hrdr-authored part of the prompt, with nothing project- or session-specific.
+///
+/// Kept as one function because most callers (and every test that asserts on
+/// prompt *content*) want the whole thing; [`crate::build_system_prompt_sections`]
+/// instead pushes the pieces separately so the volatile content can be
+/// interleaved between them.
+pub fn render_system(tools: &ToolRegistry, is_subagent: bool) -> Result<String> {
+    let mut out = String::from(base_section().as_str());
+    for (_, body) in capability_sections(tools, is_subagent) {
+        out.push_str(&section_text(body));
+    }
+    Ok(out)
+}
 
-    // The prompt is LF, whatever the checkout did to the template.
-    //
-    // `SYSTEM_TEMPLATE` is `include_str!`d, so whatever line endings the file had
-    // when the binary was compiled are baked into it — and git's Windows default
-    // (`core.autocrlf=true`) rewrites LF to CRLF on checkout. A Windows build
-    // therefore shipped a prompt whose every line ended `\r\n`: different bytes to
-    // the model than every other platform sends, for no reason a user could see.
-    // `.gitattributes` now pins the checkout to LF, but that only helps a fresh
-    // clone — this makes it true of the string we actually send, always.
-    Ok(rendered.replace("\r\n", "\n"))
+/// A fragment as it appears in the prompt: separated from what precedes it by a
+/// blank line, with trailing whitespace trimmed so the separator is exact.
+///
+/// Also normalizes CRLF. The fragments are `include_str!`d, so whatever line
+/// endings the files had when the binary was compiled are baked in — and git's
+/// Windows default (`core.autocrlf=true`) rewrites LF to CRLF on checkout. A
+/// Windows build therefore shipped a prompt whose every line ended `\r\n`:
+/// different bytes to the model than every other platform sends, for no reason a
+/// user could see. `.gitattributes` pins the checkout to LF, but that only helps a
+/// fresh clone — this makes it true of the string we actually send, always.
+pub fn section_text(raw: &str) -> String {
+    format!("\n\n{}", raw.replace("\r\n", "\n").trim_end())
+}
+
+/// The unconditional base body: identical bytes for every agent hrdr runs.
+pub fn base_section() -> String {
+    frag::BASE.replace("\r\n", "\n").trim_end().to_string()
 }
 
 /// Section names, in assembly order. Constants rather than string literals so
-/// the builder and anything asserting on the order refer to the same thing.
+/// the builder and anything asserting on the order refer to the same thing —
+/// which is how the order is tested (see [`SystemPrompt::names`]).
 pub const SECTION_BASE: &str = "base";
-pub const SECTION_PERSONA: &str = "persona";
 pub const SECTION_AGENTS_MD: &str = "agents_md";
 pub const SECTION_MEMORY: &str = "memory";
+// The capability-gated group: everything that differs by tool set or by
+// main-vs-sub. Sits after the project content so a read-only `explore` and a
+// write `coder` in the same project share every byte above it.
+pub const SECTION_WRITE: &str = "write";
+pub const SECTION_SHELL: &str = "shell";
+pub const SECTION_SHELL_POSIX: &str = "shell_posix";
+pub const SECTION_COMMITTING: &str = "committing";
+pub const SECTION_COMMITTING_MAIN: &str = "committing_main";
+pub const SECTION_COMMITTING_SUBAGENT: &str = "committing_subagent";
+pub const SECTION_DELEGATE: &str = "delegate";
+pub const SECTION_SUBAGENT: &str = "subagent";
+pub const SECTION_SUBAGENT_WRITE: &str = "subagent_write";
+pub const SECTION_PERSONA: &str = "persona";
 pub const SECTION_ENVIRONMENT: &str = "environment";
 
 /// The system prompt as an ordered list of named sections.
@@ -365,6 +457,23 @@ pub fn gather_agent_docs(cwd: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Assemble the hrdr-authored prompt for an explicit gate combination — the
+    /// test-side counterpart of [`capability_sections_for`]. Lets a test ask for
+    /// any combination (a write agent with no shell, say) without constructing a
+    /// registry that happens to produce it.
+    fn render_flags(
+        can_write: bool,
+        can_delegate: bool,
+        is_subagent: bool,
+        shell: Option<hrdr_tools::Shell>,
+    ) -> String {
+        let mut out = base_section();
+        for (_, body) in capability_sections_for(can_write, can_delegate, is_subagent, shell) {
+            out.push_str(&section_text(body));
+        }
+        out
+    }
+
     #[test]
     fn system_prompt_inlines_names_only_and_rules() {
         let tools = ToolRegistry::with_defaults();
@@ -618,18 +727,13 @@ mod tests {
     /// sections back up among the coding guidance would shorten that shared prefix.
     #[test]
     fn write_agents_with_and_without_a_shell_share_everything_but_the_shell_tail() {
-        let mut env = Environment::new();
-        env.add_template("system", SYSTEM_TEMPLATE).unwrap();
         let render = |has_shell: bool| {
-            env.get_template("system")
-                .unwrap()
-                .render(context! {
-                    cwd => "/tmp/x", os => "test", tool_names => "read, write",
-                    can_write => true, can_delegate => false, is_subagent => false,
-                    has_shell => has_shell,
-                    instructions => None::<&str>,
-                })
-                .unwrap()
+            render_flags(
+                true,
+                false,
+                false,
+                has_shell.then_some(hrdr_tools::Shell::Bash),
+            )
         };
         let with_shell = render(true);
         let without_shell = render(false);
@@ -805,18 +909,7 @@ mod tests {
         // default registry has no `task`/`models` tools) is told to record the
         // entry itself at integration, and does NOT get the sub-agent's
         // don't-touch rule.
-        let mut env = Environment::new();
-        env.add_template("system", SYSTEM_TEMPLATE).unwrap();
-        let main = env
-            .get_template("system")
-            .unwrap()
-            .render(context! {
-                cwd => "/tmp/x", os => "test", tool_names => "task, models",
-                can_write => true, can_delegate => true, is_subagent => false,
-                has_shell => true,
-                instructions => None::<&str>,
-            })
-            .unwrap();
+        let main = render_flags(true, true, false, Some(hrdr_tools::Shell::Bash));
         assert!(
             main.contains("Record the changelog entries yourself, batched"),
             "the integrating agent adds the entries the sub-agents skipped"
@@ -875,21 +968,12 @@ mod tests {
         // shell: `has_shell` (is there a shell at all) and `shell_posix` (is it
         // plain POSIX `sh`).
         let render = |has_shell: bool, shell_posix: bool| -> String {
-            let mut env = Environment::new();
-            env.add_template("system", SYSTEM_TEMPLATE).unwrap();
-            env.get_template("system")
-                .unwrap()
-                .render(context! {
-                    cwd => "/tmp/x",
-                    os => "test",
-                    tool_names => "read, write",
-                    can_write => true,
-                    can_delegate => false,
-                    has_shell => has_shell,
-                    shell_posix => shell_posix,
-                    instructions => None::<&str>,
-                })
-                .unwrap()
+            let shell = match (has_shell, shell_posix) {
+                (false, _) => None,
+                (true, false) => Some(hrdr_tools::Shell::Bash),
+                (true, true) => Some(hrdr_tools::Shell::Posix),
+            };
+            render_flags(true, false, false, shell)
         };
 
         // bash shell: the Shell section and the run-raw rule (once), and NO
@@ -1044,34 +1128,20 @@ mod tests {
     /// shell, no write) never sees it.
     #[test]
     fn the_verify_loop_needs_a_shell() {
-        let mut env = Environment::new();
-        env.add_template("system", SYSTEM_TEMPLATE).unwrap();
-        // A write agent with/without a shell: the loop follows `has_shell`.
+        // A write agent with/without a shell: the loop follows shell presence.
         let write = |has_shell: bool| {
-            env.get_template("system")
-                .unwrap()
-                .render(context! {
-                    cwd => "/tmp/x", os => "test", tool_names => "read",
-                    can_write => true, can_delegate => false,
-                    has_shell => has_shell,
-                    instructions => None::<&str>,
-                })
-                .unwrap()
+            render_flags(
+                true,
+                false,
+                false,
+                has_shell.then_some(hrdr_tools::Shell::Bash),
+            )
         };
         assert!(write(true).contains("Close the loop before you call it done"));
         assert!(!write(false).contains("Close the loop before you call it done"));
 
         // A read-only agent has neither write tools nor a shell, so no verify loop.
-        let read_only = env
-            .get_template("system")
-            .unwrap()
-            .render(context! {
-                cwd => "/tmp/x", os => "test", tool_names => "read",
-                can_write => false, can_delegate => false,
-                has_shell => false,
-                instructions => None::<&str>,
-            })
-            .unwrap();
+        let read_only = render_flags(false, false, false, None);
         assert!(!read_only.contains("Close the loop before you call it done"));
     }
 
@@ -1307,18 +1377,7 @@ mod tests {
     /// findings that don't sound right.
     #[test]
     fn the_delegation_guidance_scopes_and_verifies() {
-        let mut env = Environment::new();
-        env.add_template("system", SYSTEM_TEMPLATE).unwrap();
-        let p = env
-            .get_template("system")
-            .unwrap()
-            .render(context! {
-                cwd => "/tmp/x", os => "test", tool_names => "task, models",
-                can_write => true, can_delegate => true, is_subagent => false,
-                has_shell => true,
-                instructions => None::<&str>,
-            })
-            .unwrap();
+        let p = render_flags(true, true, false, Some(hrdr_tools::Shell::Bash));
         // Explain the ownership split to the user as soon as delegation starts.
         assert!(p.contains("Tell the user what you delegated"), "{p}");
         assert!(
@@ -1457,24 +1516,15 @@ mod tests {
     /// must NOT be told to commit or pointed at a Git section that never renders.
     #[test]
     fn read_only_subagent_is_not_told_to_commit() {
-        let mut env = Environment::new();
-        env.add_template("system", SYSTEM_TEMPLATE).unwrap();
-        let sub = env
-            .get_template("system")
-            .unwrap()
-            .render(context! {
-                cwd => "/tmp/x", os => "test", date => "2026-07-16",
-                tool_names => "read, grep",
-                can_write => false, can_delegate => false, is_subagent => true,
-                has_shell => false,
-                instructions => None::<&str>,
-            })
-            .unwrap();
+        let sub = render_flags(false, false, true, None);
         assert!(
             sub.contains("You are a sub-agent"),
             "still identifies as one"
         );
-        assert!(sub.contains("report your findings"), "{sub}");
+        // Reworded to be capability-neutral when the inline `can_write` branch
+        // was removed: the write-only "hand back a clean, committed result"
+        // requirement now lives in `subagent_write.md`, the section that needs it.
+        assert!(sub.contains("report the result clearly"), "{sub}");
         assert!(
             !sub.contains("committed result"),
             "a read-only sub-agent must not be told to commit: {sub}"
