@@ -43,29 +43,11 @@ that fixed it. Items with a residual left after the fix are tracked in **Open**.
 | L9  | Hooks docs misleading — noted they bypass the guardrails      | `e314853` | —        |
 | L10 | Windows hook path quotes unescaped — `"` → `""`               | `e314853` | O5       |
 | O1  | Force-push guardrail bypass via `'"--force` mid-command quote | `5a2f644` | —        |
+| O2  | `AuthEntry` derived `Debug` over live tokens (M4 residual)    | `c135d05` | —        |
 
 ---
 
 ## Open findings (from the 2026-07-23 remediation re-review, most-severe first)
-
----
-
-### O2 — MEDIUM: `AuthEntry` still derives `Debug` over live tokens (M4 incomplete)
-
-**`crates/hrdr-agent/src/auth_store.rs:40`**
-
-The M4 fix (commit `65a425d`) removed `Debug` from `OpenAiTokens` and
-`OAuthCreds`, but `AuthEntry` — the **persisted** credential enum — still
-`#[derive(Debug, …)]`, and its `Oauth` variant holds the same live secrets
-(`access: String`, `refresh: String`). A `{:?}` on an `AuthEntry` (or `anyhow`
-context / `unwrap` on a `Result<AuthEntry>`) leaks the bearer + refresh tokens —
-the exact latent foot-gun the fix set out to remove. The original audit named
-only the two `oauth.rs` structs and missed this one, so the fix's intent (no
-token-bearing struct derives `Debug`) is not achieved.
-
-**Fix:** drop `Debug` from `AuthEntry` too, or give it a manual `Debug` that
-redacts `access`/`refresh` (mirroring `OAuthAccess`, which omits `Debug`
-deliberately).
 
 ---
 
@@ -125,9 +107,9 @@ the rendered command or expand an environment variable. Low.
 | --------- | ----- | -------- |
 | Critical  | 0     | 0        |
 | High      | 0     | 2        |
-| Medium    | 2     | 2        |
+| Medium    | 0     | 4        |
 | Low       | 3     | 10       |
-| **Total** | **5** | **14**   |
+| **Total** | **3** | **16**   |
 
 **Overall risk: Low.** The security-critical paths remain well-built:
 `fetch`/SSRF guard uses a TOCTOU-free DNS resolver; `SseDecoder` is properly
@@ -139,10 +121,7 @@ content envelope uses a verified-absent nonce; secret-denylist coverage is broad
 pathologies: no MD5/SHA1, no hardcoded secrets, no panics on untrusted SSE
 input, no buffer overflows, no data races, no unbounded allocation in hot paths.
 
-Both HIGH findings and the bulk of the Medium/Low set are fixed (including O1 —
-the force-push guardrail quote-bypass, resolved in `5a2f644`). What remains
-after the remediation re-review:
-
-1. **O2 (M4) — `AuthEntry` still leaks tokens via `Debug`**; the fix must extend
-   to it.
-2. Three low residuals (O3–O5) left by otherwise-correct fixes.
+Both HIGH findings and the entire Medium set are fixed — including O1 (the
+force-push guardrail quote-bypass, `5a2f644`) and O2 (M4 — `AuthEntry` no longer
+derives `Debug`, `c135d05`). What remains after the remediation re-review is
+three LOW residuals (O3–O5) left by otherwise-correct fixes.
