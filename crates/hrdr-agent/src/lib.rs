@@ -101,7 +101,7 @@ pub(crate) use delegation::{
 };
 pub(crate) use delegation::{
     BgHandles, SteerTool, SubagentTool, TaskCancelTool, TaskCleanupTool, TaskDiffTool,
-    TaskListTool, TaskOutputTool, bg_handles, gc_worktrees, subagent_base_config,
+    TaskListTool, TaskOutputTool, TaskReviveTool, bg_handles, gc_worktrees, subagent_base_config,
 };
 pub use delegation::{
     builtin_subagent_profiles, config_for_agent_profile, in_git_repo, list_provider_models,
@@ -1104,7 +1104,7 @@ impl Agent {
         if config.subagents {
             let profiles = resolve_agent_profiles(&config)?;
             agent_names = profiles.iter().map(|p| p.name.clone()).collect();
-            tools.register(Arc::new(SubagentTool::new(
+            let subagent_tool = SubagentTool::new(
                 subagent_base_config(&config),
                 Arc::clone(&delegation_runtime),
                 profiles,
@@ -1114,18 +1114,38 @@ impl Agent {
                 lsp.clone(),
                 config.subagent_transcript_dir.clone(),
                 live_subagents.clone(),
-            )));
+            );
+            // `task_revive` shares the `task` tool's concurrency slots so a revive
+            // counts against the same write cap, not an uncounted extra sub-agent.
+            let revive_tool = TaskReviveTool::new(
+                subagent_base_config(&config),
+                Arc::clone(&delegation_runtime),
+                Arc::clone(&bg_handles),
+                Arc::clone(&subagent_tool.slots),
+                Arc::clone(&cost_total),
+                Arc::clone(&cost_partial),
+                lsp.clone(),
+                config.subagent_transcript_dir.clone(),
+                live_subagents.clone(),
+            );
+            tools.register(Arc::new(subagent_tool));
             // Management tools for the background sub-agents `task` spawns: check
-            // on them, peek their output, steer or cancel one. They read the shared
-            // background-task registry (via the tool context) and, for cancel,
-            // the same `bg_handles` the owning agent aborts on reset.
-            tools.register(Arc::new(TaskListTool));
+            // on them, peek their output, steer, revive or cancel one. They read the
+            // shared background-task registry (via the tool context) and, for cancel,
+            // the same `bg_handles` the owning agent aborts on reset. `task_list` /
+            // `task_output` also read the on-disk sub-agent snapshots, so a
+            // finished/orphaned run survives a `/resume` (they take the dir cell).
+            tools.register(Arc::new(TaskListTool {
+                transcript_dir: config.subagent_transcript_dir.clone(),
+            }));
             tools.register(Arc::new(TaskOutputTool {
                 live: live_subagents.clone(),
+                transcript_dir: config.subagent_transcript_dir.clone(),
             }));
             tools.register(Arc::new(SteerTool {
                 live: live_subagents.clone(),
             }));
+            tools.register(Arc::new(revive_tool));
             tools.register(Arc::new(TaskCancelTool {
                 bg_handles: Arc::clone(&bg_handles),
                 live: live_subagents.clone(),
@@ -4841,10 +4861,12 @@ mod tests {
             });
         });
 
-        let list = TaskListTool
-            .execute(serde_json::json!({}), &ctx)
-            .await
-            .unwrap();
+        let list = TaskListTool {
+            transcript_dir: None,
+        }
+        .execute(serde_json::json!({}), &ctx)
+        .await
+        .unwrap();
         assert!(list.contains("#1") && list.contains("running"), "{list}");
         assert!(list.contains("/tmp/wt-1"), "worktree shown: {list}");
         assert!(
@@ -4928,6 +4950,7 @@ mod tests {
         // Empty live store → falls through to the registry entry.
         let out = TaskOutputTool {
             live: LiveSubagents::new(),
+            transcript_dir: None,
         }
         .execute(serde_json::json!({"id": 7}), &ctx)
         .await
@@ -4965,6 +4988,7 @@ mod tests {
             });
         let out = TaskOutputTool {
             live: LiveSubagents::new(),
+            transcript_dir: None,
         }
         .execute(serde_json::json!({"id": 9}), &ctx)
         .await

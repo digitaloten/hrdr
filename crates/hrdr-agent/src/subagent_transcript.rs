@@ -263,10 +263,8 @@ impl SubagentTranscript {
 }
 
 /// Whether a transcript file ends in an `End` record. A file with no `End` line
-/// is an orphan: the sub-agent crashed or is still running.
-// Used by tests now; the crash-recovery UI (a later WISHLIST item) is its
-// non-test consumer.
-#[allow(dead_code)]
+/// is an orphan: the sub-agent crashed or is still running. The disk-aware
+/// `task_list` reads this to report a resumable run as `done` vs `orphaned`.
 pub fn is_complete(path: &Path) -> bool {
     let Ok(file) = File::open(path) else {
         return false;
@@ -281,6 +279,25 @@ pub fn is_complete(path: &Path) -> bool {
         Some(l) => matches!(serde_json::from_str::<Record>(&l), Ok(Record::End { .. })),
         None => false,
     }
+}
+
+/// The opening [`Record::Start`] of a transcript, if it has one. The disk-aware
+/// `task_list` uses it to label a run whose `.json` snapshot is absent (a run
+/// that crashed before its first `History`-triggered save). `Start` is always
+/// the first record a sub-agent run writes, so only the first non-empty line is
+/// inspected.
+pub fn read_start(path: &Path) -> Option<Record> {
+    let file = File::open(path).ok()?;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        return match serde_json::from_str::<Record>(&line) {
+            Ok(rec @ Record::Start { .. }) => Some(rec),
+            _ => None,
+        };
+    }
+    None
 }
 
 /// Read a sub-agent transcript file and fold it into a Vec<Entry> using the

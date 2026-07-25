@@ -96,6 +96,38 @@ pub(crate) fn bg_handles() -> BgHandles {
 /// a pointer at the transcript for the rest.
 pub(crate) const BACKGROUND_REPORT_MAX_BYTES: usize = 24_000;
 
+/// The git worktree a background sub-agent run operates in.
+pub(crate) enum SpawnWorktree {
+    /// A freshly created worktree (a `task` spawn): its automatic cleanup is
+    /// *detached* here so it outlives the run for the parent to review and merge
+    /// (removed only by `task_cancel` / reset). `cfg.cwd` is already pointed at it.
+    Fresh(Worktree),
+    /// An existing worktree reused by `task_revive`: it is already on disk from
+    /// the original run, so it is neither created nor torn down here — the
+    /// follow-up's commits stack on the same branch. `repo` is the parent
+    /// checkout, where the completion-time size summary's git commands run.
+    Existing {
+        repo: PathBuf,
+        path: PathBuf,
+        branch: String,
+    },
+    /// No worktree — a read-only sub-agent, or a writer sharing the main dir.
+    None,
+}
+
+/// A sub-agent's prior conversation, restored by `task_revive` into the fresh
+/// agent so a follow-up turn continues rather than restarts.
+///
+/// The persisted `messages` carry the Anthropic signed thinking blocks a Claude
+/// sub-agent that died mid-`tool_use` needs to resume byte-exact (the whole
+/// reason revive loads the `.json` snapshot, not the display transcript), and the
+/// spend/usage seed the run so its cost and gauge count on from where it left off.
+pub(crate) struct RestoredContext {
+    pub(crate) messages: Vec<ChatMessage>,
+    pub(crate) session_cost: f64,
+    pub(crate) usage: AgentUsage,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_background(
     cfg: AgentConfig,
@@ -110,11 +142,12 @@ fn spawn_background(
     lsp: Option<Arc<hrdr_tools::LspRegistry>>,
     transcript_dir: SubagentDirCell,
     live: LiveSubagents,
-    // Present for a write-capable sub-agent: its isolated worktree. `cfg.cwd` is
-    // already set to the worktree by the caller; here we record its path/branch
-    // on the registry entry and *detach* its cleanup, so it survives the run for
-    // the parent to review and merge (removed only by `task_cancel` / reset).
-    worktree: Option<Worktree>,
+    // A write-capable sub-agent's isolated worktree (`Fresh` for a new `task`,
+    // `Existing` for a `task_revive` continuation), or `None`.
+    worktree: SpawnWorktree,
+    // A prior conversation to restore before the run (`task_revive`); `None` for a
+    // fresh `task`, which starts from an empty context.
+    restore: Option<RestoredContext>,
 ) -> Result<String> {
     use std::sync::atomic::Ordering;
     let id = BG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
@@ -127,7 +160,12 @@ fn spawn_background(
     let model_for_live = cfg.model.model().to_string();
     let provider_for_live = Some(cfg.model.provider().to_string());
     let base_url_for_live = cfg.base_url.clone();
-    let usage_for_live = subagent_usage(&cfg);
+    // A revived run seeds the pane with its restored counters (so its gauge and
+    // cost count on from where it left off); a fresh task starts from zero.
+    let usage_for_live = restore
+        .as_ref()
+        .map(|r| r.usage)
+        .unwrap_or_else(|| subagent_usage(&cfg));
     // The sub-agent's own identity for its `SessionState` snapshot, captured
     // before `cfg` is moved into `Agent::new` below. Persisting this state file
     // is the same core save the main agent uses — only the destination differs.
@@ -137,21 +175,41 @@ fn spawn_background(
     // Build and register synchronously so `task_steer` can address the id as soon as
     // `task` returns; registration inside the spawned future races the caller.
     let mut sub = Agent::new(cfg)?;
-    // The parent's cwd, captured before `keep()` below discards it — needed at
-    // completion time to compute the size summary (`git diff`/`git log` run from
-    // here, like `task_diff`, since worktrees share the parent's object store).
-    let repo_cwd = worktree.as_ref().map(|w| w.repo.clone());
-    // Detach the worktree's automatic cleanup only now that the agent exists — so
-    // if `Agent::new` fails above, the still-un-kept worktree is torn down by its
-    // `Drop` instead of being orphaned (it is not yet on any registry). It must
-    // outlive the run from here on; its path/branch go onto the registry entry.
-    let worktree = worktree.map(|w| w.keep());
+    // A revived sub-agent continues its prior conversation: restore the persisted
+    // messages (with the signed thinking blocks a pending tool_use needs) and its
+    // running spend, so the follow-up turn stacks on the original run instead of
+    // starting from an empty context.
+    if let Some(r) = restore {
+        sub.set_messages(r.messages);
+        sub.set_session_cost(r.session_cost);
+    }
+    // Resolve the worktree AFTER the agent is built — so if `Agent::new` fails
+    // above, a `Fresh` worktree (still owned by `worktree`) is torn down by its
+    // `Drop` rather than being orphaned before it reached any registry. A `Fresh`
+    // worktree's automatic cleanup is detached (`keep()`) so it outlives the run
+    // for review; an `Existing` one reused by `task_revive` is already persistent
+    // — neither created nor removed here, so follow-ups stack on its branch.
+    //
+    // `repo_cwd` (the parent checkout) is needed at completion time to compute the
+    // size summary (`git diff`/`git log` run from there, like `task_diff`, since
+    // worktrees share the parent's object store); `worktree` is the (path, branch)
+    // recorded on the registry entry.
+    let (repo_cwd, worktree): (Option<PathBuf>, Option<(PathBuf, String)>) = match worktree {
+        SpawnWorktree::Fresh(w) => {
+            let repo = w.repo.clone();
+            let kept = w.keep();
+            (Some(repo), Some((kept.path, kept.branch)))
+        }
+        SpawnWorktree::Existing { repo, path, branch } => (Some(repo), Some((path, branch))),
+        SpawnWorktree::None => (None, None),
+    };
     // (repo cwd, branch) for the completion-time size summary — `None` for a
     // read-only task, which has no worktree/branch to diff.
     let size_summary_target: Option<(PathBuf, String)> = worktree
         .as_ref()
+        .map(|(_, branch)| branch.clone())
         .zip(repo_cwd)
-        .map(|(w, repo)| (repo, w.branch.clone()));
+        .map(|(branch, repo)| (repo, branch));
     sub.cost_total = cost_total;
     sub.cost_partial = cost_partial;
     sub.attach_live(live.clone(), live_key);
@@ -228,8 +286,8 @@ fn spawn_background(
             result: None,
             delivered: false,
             cancelled: false,
-            worktree: worktree.as_ref().map(|w| w.path.clone()),
-            branch: worktree.as_ref().map(|w| w.branch.clone()),
+            worktree: worktree.as_ref().map(|(path, _)| path.clone()),
+            branch: worktree.as_ref().map(|(_, branch)| branch.clone()),
             size_summary: None,
             model: model_for_live.clone(),
             started: Some(std::time::Instant::now()),
@@ -1362,7 +1420,7 @@ impl hrdr_tools::Tool for SubagentTool {
                 .context("creating an isolated worktree for a write-capable sub-agent")?;
             cfg.cwd = wt.path.clone();
             ctx.emit(format!("  · isolated worktree: {}\n", wt.path.display()));
-            Some(wt)
+            SpawnWorktree::Fresh(wt)
         } else {
             // Read-only, or a writer with no git repo to isolate into: share the
             // main dir. A shared-dir writer's edits land directly in the working
@@ -1373,7 +1431,7 @@ impl hrdr_tools::Tool for SubagentTool {
                     "  · no git repo — sub-agent works directly in the working dir\n".to_string(),
                 );
             }
-            None
+            SpawnWorktree::None
         };
 
         let ack = spawn_background(
@@ -1390,6 +1448,7 @@ impl hrdr_tools::Tool for SubagentTool {
             self.transcript_dir.clone(),
             self.live.clone(),
             worktree,
+            None,
         )?;
         // Surface any path rewrite to the delegating model alongside the ack.
         Ok(match path_rewrite_note {
@@ -1422,10 +1481,176 @@ fn fmt_elapsed(d: std::time::Duration) -> String {
     }
 }
 
+/// Whether `path` is one of hrdr's own sub-agent worktrees (`.hrdr/worktrees/…`),
+/// so the disk-aware task tools can tell a write run's isolated checkout from a
+/// read-only run that just shared the main dir. Mirrors `gc_worktrees`'s inline
+/// `.hrdr` + `worktrees` component test.
+fn is_hrdr_worktree(path: &std::path::Path) -> bool {
+    path.components().any(|c| c.as_os_str() == ".hrdr")
+        && path.components().any(|c| c.as_os_str() == "worktrees")
+}
+
+/// The branch a worktree checkout is on (`git rev-parse --abbrev-ref HEAD`), so a
+/// revive can stack its follow-up on the same branch the original run committed
+/// to. `None` on any git failure or a detached HEAD (nothing to continue onto).
+async fn current_branch(worktree: &std::path::Path) -> Option<String> {
+    tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "HEAD")
+}
+
+/// One sub-agent run found on disk under `subagents/<main-id>/`: the pair of a
+/// `<stem>.jsonl` crash-trail and its (optional) `<stem>.json` snapshot.
+struct DiskRun {
+    /// The `NNN-slug` file stem — the id `task_revive` / `task_output` address it by.
+    stem: String,
+    /// The run's label (its snapshot's session name, else the jsonl `Start` record).
+    label: String,
+    /// The recorded cwd — an isolated worktree for a write run, else the main dir.
+    cwd: Option<String>,
+    /// The run reached a terminal `End` record (`done` vs `running`/`orphaned`).
+    done: bool,
+}
+
+/// Scan `dir` (`subagents/<main-id>/`) for the sub-agent runs persisted there:
+/// one per `<stem>.jsonl`, with its label/cwd taken from the sibling `<stem>.json`
+/// snapshot when present (a run that reached its first `History` save) or the
+/// Whether `stem` is a well-formed run id — the `NNN-slug` shape
+/// [`subagent_transcript_id`] mints and [`scan_subagent_runs`] surfaces. A
+/// `task_output` / `task_revive` id comes from the model, which joins it onto the
+/// snapshot dir; rejecting a path separator, `..`, or empty string keeps that
+/// lookup inside `subagents/<main-id>/` instead of escaping it.
+fn valid_run_stem(stem: &str) -> bool {
+    !stem.is_empty()
+        && !stem.contains("..")
+        && !stem.contains(['/', '\\'])
+        && !std::path::Path::new(stem)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+}
+
+/// jsonl's opening `Start` record otherwise. Best-effort: an unreadable dir
+/// yields nothing, so the disk fallback silently degrades to the in-memory list.
+fn scan_subagent_runs(dir: &std::path::Path) -> Vec<DiskRun> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let done = subagent_transcript::is_complete(&path);
+        // Label + cwd: prefer the snapshot (its name IS the label; its cwd is the
+        // worktree), else fall back to the jsonl's opening `Start` record.
+        let json = path.with_extension("json");
+        let (label, cwd) = match crate::Session::load_path(&json) {
+            Ok(s) => (s.state.name, Some(s.state.cwd)),
+            Err(_) => match subagent_transcript::read_start(&path) {
+                Some(subagent_transcript::Record::Start { label, .. }) => (label, None),
+                _ => (String::new(), None),
+            },
+        };
+        out.push(DiskRun {
+            stem,
+            label,
+            cwd,
+            done,
+        });
+    }
+    out.sort_by(|a, b| a.stem.cmp(&b.stem));
+    out
+}
+
+/// A sub-agent conversation resolved for `task_revive`: the messages/identity to
+/// hydrate a fresh agent from, plus the existing worktree/branch to continue on.
+/// Produced live-first (from a retained [`LiveSubagent`]) or from disk
+/// ([`revive_target_from_disk`]).
+struct RevivedState {
+    messages: Vec<ChatMessage>,
+    /// The identity the run was on — re-resolved to its own endpoint/key on spawn
+    /// (it may be a different provider than the parent is on now).
+    reference: ModelRef,
+    /// The recorded working dir — the run's isolated worktree, or the main dir.
+    cwd: PathBuf,
+    usage: AgentUsage,
+    session_cost: f64,
+    /// `(worktree, branch)` when the run had an isolated worktree still on disk.
+    worktree: Option<(PathBuf, String)>,
+    label: String,
+}
+
+/// Resolve a `task_revive` id to its persisted state, hydrating from the
+/// `<stem>.json` snapshot under `dir` (`subagents/<main-id>/`). This is the
+/// disk fallback the input-unification's `SessionState` persistence unlocked:
+/// the snapshot carries the real model-facing `messages` (with signed thinking
+/// blocks), so a revive continues losslessly rather than from a lossy transcript
+/// fold. The recorded worktree is reused when it is still on disk; a write run
+/// whose worktree was removed since is refused (its branch and commits are gone)
+/// rather than silently continued somewhere else.
+async fn revive_target_from_disk(dir: &std::path::Path, stem: &str) -> Result<RevivedState> {
+    if !valid_run_stem(stem) {
+        bail!("`{stem}` is not a valid run id (see `task_list`)");
+    }
+    let json = dir.join(format!("{stem}.json"));
+    if !json.exists() {
+        bail!("no sub-agent run `{stem}` on disk (see `task_list`)");
+    }
+    let state = crate::Session::load_path(&json)
+        .with_context(|| format!("loading sub-agent snapshot for `{stem}`"))?
+        .state;
+    let cwd = PathBuf::from(&state.cwd);
+    let worktree = if is_hrdr_worktree(&cwd) {
+        if !cwd.exists() {
+            bail!(
+                "the isolated worktree for `{stem}` was removed ({}) — its branch and committed \
+                 work are gone, so it can't be continued. Nothing was done.",
+                cwd.display()
+            );
+        }
+        current_branch(&cwd).await.map(|b| (cwd.clone(), b))
+    } else {
+        None
+    };
+    Ok(RevivedState {
+        session_cost: state.usage.cost_usd,
+        usage: state.usage,
+        messages: state.messages,
+        reference: state.model,
+        label: state.name,
+        cwd,
+        worktree,
+    })
+}
+
 /// `task_list`: report the background sub-agents `task` spawned — id, label,
 /// status, model, elapsed, and (for a write-capable one) its worktree — so the
-/// parent can check on them without waiting.
-pub(crate) struct TaskListTool;
+/// parent can check on them without waiting. After a `/resume` the in-memory
+/// registry is empty, so it also scans the on-disk `subagents/<main-id>/`
+/// snapshots (deduped against the live rows) — the enumeration `task_revive`
+/// selects a resumable run from.
+pub(crate) struct TaskListTool {
+    /// The parent session's sub-agent snapshot dir cell (see
+    /// [`AgentConfig::subagent_transcript_dir`]); resolved at call time so the
+    /// disk scan survives a resume. `None` (or unresolved) → in-memory list only.
+    pub(crate) transcript_dir: SubagentDirCell,
+}
 
 #[async_trait::async_trait]
 impl hrdr_tools::Tool for TaskListTool {
@@ -1433,10 +1658,13 @@ impl hrdr_tools::Tool for TaskListTool {
         "task_list"
     }
     fn description(&self) -> &'static str {
-        "List the background sub-agents you started with `task`: each one's id, label, status \
-         (running / done / cancelled) and — for a write-capable sub-agent — the isolated git \
-         worktree its changes are in. A finished task's result is delivered to you automatically; \
-         use this only to check progress, not to collect results."
+        "List your background sub-agents: each one's id, label, status (running / done / \
+         cancelled) and — for a write-capable sub-agent — the isolated git worktree its changes \
+         are in. Covers both the ones live in this session and, after a `/resume`, the ones \
+         persisted on disk from earlier sessions (shown by their `NNN-slug` stem id, marked `done` \
+         or `orphaned`) — pass a stem to `task_output` or `task_revive` to read or re-engage one. \
+         A live task's result is delivered to you automatically; use this to check progress, not \
+         to collect results."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({ "type": "object", "properties": {} })
@@ -1449,12 +1677,16 @@ impl hrdr_tools::Tool for TaskListTool {
         _args: serde_json::Value,
         ctx: &hrdr_tools::ToolContext,
     ) -> anyhow::Result<String> {
-        let rows: Vec<String> = {
+        // The in-memory rows, plus the on-disk stems they already cover (a live
+        // task's transcript path names its `<stem>.jsonl`), so the disk scan below
+        // does not list a run twice.
+        let (mut rows, live_stems): (Vec<String>, std::collections::HashSet<String>) = {
             let v = ctx
                 .background_tasks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            v.iter()
+            let rows = v
+                .iter()
                 .map(|t| {
                     let mut row = format!("#{} [{}] {}", t.id, t.status().as_str(), t.label);
                     if !t.model.is_empty() {
@@ -1468,8 +1700,45 @@ impl hrdr_tools::Tool for TaskListTool {
                     }
                     row
                 })
-                .collect()
+                .collect();
+            let stems = v
+                .iter()
+                .filter_map(|t| {
+                    t.transcript
+                        .as_ref()
+                        .and_then(|p| p.file_stem())
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                })
+                .collect();
+            (rows, stems)
         };
+        // On-disk runs from earlier sessions (post-`/resume` the registry above is
+        // empty), deduped against the live rows. A finished/orphaned run is invisible
+        // in memory but recoverable here, and this is what `task_revive` selects from.
+        if let Some(dir) = resolve_subagent_dir(&self.transcript_dir) {
+            let disk: Vec<String> = scan_subagent_runs(&dir)
+                .into_iter()
+                .filter(|r| !live_stems.contains(&r.stem))
+                .map(|r| {
+                    let state = if r.done { "done" } else { "orphaned" };
+                    let label = if r.label.trim().is_empty() {
+                        "sub-task"
+                    } else {
+                        r.label.trim()
+                    };
+                    let mut row = format!("{} [{state}] {label}", r.stem);
+                    if let Some(cwd) = r.cwd.as_deref().filter(|c| is_hrdr_worktree(c.as_ref())) {
+                        row.push_str(&format!("  worktree: {cwd}"));
+                    }
+                    row
+                })
+                .collect();
+            if !disk.is_empty() {
+                rows.push("On disk (from earlier sessions — revive by stem id):".to_string());
+                rows.extend(disk);
+            }
+        }
         if rows.is_empty() {
             return Ok("No background tasks.".to_string());
         }
@@ -1480,6 +1749,10 @@ impl hrdr_tools::Tool for TaskListTool {
 /// `task_output`: peek a background sub-agent's live progress without waiting.
 pub(crate) struct TaskOutputTool {
     pub(crate) live: LiveSubagents,
+    /// The parent session's sub-agent snapshot dir cell, so a finished/orphaned
+    /// run that is no longer in the live registry (post-`/resume`) can be read
+    /// back from its persisted `<stem>.jsonl`. `None` → live/registry only.
+    pub(crate) transcript_dir: SubagentDirCell,
 }
 
 #[async_trait::async_trait]
@@ -1490,14 +1763,19 @@ impl hrdr_tools::Tool for TaskOutputTool {
     fn description(&self) -> &'static str {
         "Peek the current progress of a background sub-agent by its `id` (from `task_list`), \
          without blocking. Returns a snapshot of its output so far — useful if the user asks how \
-         a task is going. The final result is still delivered to you automatically when it \
-         finishes; you do not need to poll."
+         a task is going. Pass a live task's integer id, or the `NNN-slug` stem of an on-disk run \
+         from an earlier session (its persisted transcript is read back). The final result of a \
+         live task is still delivered to you automatically when it finishes; you do not need to \
+         poll."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "id": { "type": "integer", "description": "The task id (see `task_list`)." }
+                "id": {
+                    "type": ["integer", "string"],
+                    "description": "The task id: a live task's integer id, or an on-disk run's `NNN-slug` stem (see `task_list`)."
+                }
             },
             "required": ["id"]
         })
@@ -1510,9 +1788,46 @@ impl hrdr_tools::Tool for TaskOutputTool {
         args: serde_json::Value,
         ctx: &hrdr_tools::ToolContext,
     ) -> anyhow::Result<String> {
-        let id = args.get("id").and_then(|v| v.as_u64()).ok_or_else(|| {
-            anyhow::anyhow!("task_output needs an integer `id` (see `task_list`)")
-        })?;
+        let id_val = args
+            .get("id")
+            .ok_or_else(|| anyhow::anyhow!("task_output needs an `id` (see `task_list`)"))?;
+        // An integer (or an all-digit string) addresses a LIVE / recently-finished
+        // task; a `NNN-slug` stem addresses an on-disk run from an earlier session.
+        let Some(id) = id_val
+            .as_u64()
+            .or_else(|| id_val.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        else {
+            // Disk fallback: read the persisted transcript for the stem.
+            let stem = id_val
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "task_output needs an integer id or a stem id (see `task_list`)"
+                    )
+                })?;
+            if !valid_run_stem(stem) {
+                anyhow::bail!("`{stem}` is not a valid run id (see `task_list`)");
+            }
+            let dir = resolve_subagent_dir(&self.transcript_dir).ok_or_else(|| {
+                anyhow::anyhow!("no session directory yet — cannot read `{stem}` from disk")
+            })?;
+            let jsonl = dir.join(format!("{stem}.jsonl"));
+            if !jsonl.exists() {
+                anyhow::bail!("no sub-agent run `{stem}` (see `task_list`)");
+            }
+            // Fold the persisted record through the SAME reducer the live peek uses,
+            // then keep the tail like the live/registry branches below.
+            let entries = subagent_transcript::read_transcript(&jsonl);
+            let text = crate::transcript_to_text(&entries);
+            let text = if text.trim().is_empty() {
+                format!("(run `{stem}` recorded no output)")
+            } else {
+                text
+            };
+            return Ok(hrdr_tools::truncate_middle(&text, ctx.max_output));
+        };
         // Prefer the live event log; fall back to the registry entry's stored
         // result if the task already finished and its live entry was pruned.
         let peek = self.live.with(|v| {
@@ -1562,6 +1877,287 @@ impl hrdr_tools::Tool for TaskOutputTool {
             }
             None => anyhow::bail!("no background task #{id} (see `task_list`)"),
         }
+    }
+}
+
+/// `task_revive`: re-engage a finished, orphaned, or crashed sub-agent with a
+/// follow-up — the counterpart to `task_steer`, which only reaches a *running*
+/// turn. Resolution is live-first, disk-fallback (see `docs/task-revive.md`):
+///
+/// * **Live** — the sub-agent is still retained in [`LiveSubagents`] (finished but
+///   not yet pruned): reuse its in-memory conversation directly (the freshest
+///   copy) and its recorded worktree.
+/// * **Disk** — otherwise hydrate from the persisted `<stem>.json` snapshot under
+///   `subagents/<main-id>/` ([`revive_target_from_disk`]), which carries the real
+///   model-facing `messages`, and reuse the worktree still on disk.
+///
+/// Either way it builds a FRESH agent from that state, points it at the existing
+/// worktree/branch so the follow-up's commits stack there, and spawns it as a
+/// background run — so the result is delivered exactly like a `task`'s. Building a
+/// fresh agent (rather than resuming the retained object) keeps the two paths one
+/// codepath and is lossless: the persisted `messages` are the conversation.
+pub(crate) struct TaskReviveTool {
+    /// Base policy for the revived sub-agent (endpoint/model overlaid live, then
+    /// moved onto the run's own identity). Same base a `task` spawn uses.
+    base: AgentConfig,
+    runtime: SharedDelegationRuntime,
+    pub(crate) bg_handles: BgHandles,
+    /// The SAME concurrency slots `task` uses, so a revive counts against the
+    /// write cap rather than opening an uncounted extra sub-agent.
+    pub(crate) slots: Arc<SubagentSlots>,
+    max_write: usize,
+    cost_total: Arc<std::sync::Mutex<f64>>,
+    cost_partial: Arc<std::sync::atomic::AtomicBool>,
+    lsp: Option<Arc<hrdr_tools::LspRegistry>>,
+    transcript_dir: SubagentDirCell,
+    live: LiveSubagents,
+}
+
+impl TaskReviveTool {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        base: AgentConfig,
+        runtime: SharedDelegationRuntime,
+        bg_handles: BgHandles,
+        slots: Arc<SubagentSlots>,
+        cost_total: Arc<std::sync::Mutex<f64>>,
+        cost_partial: Arc<std::sync::atomic::AtomicBool>,
+        lsp: Option<Arc<hrdr_tools::LspRegistry>>,
+        transcript_dir: SubagentDirCell,
+        live: LiveSubagents,
+    ) -> Self {
+        let max_write = base.max_write_subagents;
+        Self {
+            base,
+            runtime,
+            bg_handles,
+            slots,
+            max_write,
+            cost_total,
+            cost_partial,
+            lsp,
+            transcript_dir,
+            live,
+        }
+    }
+
+    /// Live-first resolution: the in-memory state of a still-retained sub-agent,
+    /// or `None` if no live entry has that background id. Refuses a still-running
+    /// one — that is `task_steer`'s job, not revive's.
+    async fn revive_from_live(
+        &self,
+        bg: u64,
+        ctx: &hrdr_tools::ToolContext,
+    ) -> Result<Option<RevivedState>> {
+        let found = self.live.with(|v| {
+            v.iter()
+                .find(|e| e.bg_id == Some(bg))
+                .map(|e| (e.key, e.running, Arc::clone(&e.agent), e.label.clone()))
+        });
+        let Some((key, running, agent, label)) = found else {
+            return Ok(None);
+        };
+        if running {
+            bail!(
+                "background task #{bg} is still running — use `task_steer` to add to its current \
+                 turn, not `task_revive`."
+            );
+        }
+        // Its freshest conversation + identity + cwd come from the retained agent;
+        // its worktree/branch from the registry entry that recorded them.
+        let (messages, reference, cwd) = {
+            let a = agent.lock().await;
+            (a.messages_owned(), a.model_ref().clone(), a.cwd())
+        };
+        let usage = self.live.usage(key).unwrap_or_default();
+        let worktree = {
+            let v = ctx
+                .background_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            v.iter()
+                .find(|t| t.id == bg)
+                .and_then(|t| t.worktree.clone().zip(t.branch.clone()))
+        };
+        Ok(Some(RevivedState {
+            session_cost: usage.cost_usd,
+            usage,
+            messages,
+            reference,
+            cwd,
+            worktree,
+            label,
+        }))
+    }
+
+    /// Build a fresh agent from `st` on its existing worktree/branch and spawn it
+    /// as a background run — so the follow-up's result is delivered exactly like a
+    /// `task`'s. Synchronous, like [`spawn_background`] it wraps.
+    fn spawn(
+        &self,
+        ctx: &hrdr_tools::ToolContext,
+        prompt: String,
+        st: RevivedState,
+    ) -> Result<String> {
+        let mut cfg = self.base.clone();
+        // The parent's LIVE resolved endpoint (identity + key), whole — exactly as
+        // `SubagentTool::execute` overlays it, so the revived run inherits an
+        // endpoint that agrees with itself.
+        let runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let live_ep = runtime.endpoint.resolved;
+        cfg.base_url = live_ep.base_url().to_string();
+        cfg.api_key = live_ep.api_key().map(str::to_string);
+        cfg.api_version = live_ep.api_version().map(str::to_string);
+        cfg.headers = live_ep.headers().to_vec();
+        cfg.model = live_ep.reference().clone();
+        cfg.effort = runtime.endpoint.effort;
+        // Move onto the run's OWN identity, re-deriving its endpoint/key (it may be
+        // a different provider than the parent is on now) and inheriting the
+        // parent's key across the same endpoint.
+        let parent_ctx = AuthContext {
+            api_key: live_ep.api_key(),
+            base_url: live_ep.base_url(),
+        };
+        apply_model_ref(&mut cfg, st.reference.clone(), Some(&parent_ctx))
+            .map_err(|e| anyhow::anyhow!("task_revive: {e:#}"))?;
+        cfg.memory_roots = ctx.memory_project.clone().zip(ctx.memory_global.clone());
+        // Run inside the reused worktree (a write run) or the recorded/main dir.
+        cfg.cwd = match &st.worktree {
+            Some((path, _)) => path.clone(),
+            None if st.cwd.exists() => st.cwd.clone(),
+            None => ctx.cwd.clone(),
+        };
+        cfg.context_window = subagent_context_window(
+            cfg.context_window,
+            Some(cfg.model.provider().as_str()),
+            &cfg.base_url,
+            cfg.model.model(),
+        );
+        // A revived run stacks commits on its branch, so it takes a WRITE slot,
+        // counted against the same cap `task`'s writers use.
+        let Some(slot) = self.slots.acquire(true, self.max_write) else {
+            bail!(
+                "too many write sub-agents already running (limit {}). Wait for one to finish — \
+                 you are notified automatically — then revive.",
+                self.max_write
+            );
+        };
+        let label = if st.label.trim().is_empty() {
+            "revived-task".to_string()
+        } else {
+            st.label.clone()
+        };
+        let worktree = match st.worktree {
+            Some((path, branch)) => SpawnWorktree::Existing {
+                repo: ctx.cwd.clone(),
+                path,
+                branch,
+            },
+            None => SpawnWorktree::None,
+        };
+        let restore = RestoredContext {
+            messages: st.messages,
+            session_cost: st.session_cost,
+            usage: st.usage,
+        };
+        spawn_background(
+            cfg,
+            prompt,
+            label,
+            ctx.call_id.clone(),
+            slot,
+            &ctx.background_tasks,
+            &self.bg_handles,
+            Arc::clone(&self.cost_total),
+            Arc::clone(&self.cost_partial),
+            self.lsp.clone(),
+            self.transcript_dir.clone(),
+            self.live.clone(),
+            worktree,
+            Some(restore),
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl hrdr_tools::Tool for TaskReviveTool {
+    fn name(&self) -> &'static str {
+        "task_revive"
+    }
+    fn description(&self) -> &'static str {
+        "Re-engage a finished, orphaned, or crashed sub-agent with a follow-up `prompt`, instead \
+         of re-delegating from scratch. It reuses the sub-agent's full context and — if it was \
+         write-capable — its existing git worktree/branch, so follow-up changes stack on the same \
+         branch. Use it to hand review fixes back to the SAME sub-agent that did the work, or to \
+         continue a run left unfinished when the session was closed. Pass the `id` from \
+         `task_list`: a live task's integer id, or an on-disk run's `NNN-slug` stem. Runs in the \
+         background like `task` — its result is delivered to you automatically."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": ["integer", "string"],
+                    "description": "The sub-agent to revive: a live task's integer id, or an on-disk run's `NNN-slug` stem (see `task_list`)."
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The follow-up for the sub-agent — the next thing for it to do, with any context it needs."
+                }
+            },
+            "required": ["id", "prompt"]
+        })
+    }
+    fn read_only(&self) -> bool {
+        false
+    }
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &hrdr_tools::ToolContext,
+    ) -> anyhow::Result<String> {
+        let id_val = args
+            .get("id")
+            .ok_or_else(|| anyhow::anyhow!("task_revive needs an `id` (see `task_list`)"))?;
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("task_revive needs a non-empty `prompt`"))?
+            .to_string();
+
+        // Live-first: an integer (or all-digit) id names a retained in-memory run.
+        let as_int = id_val
+            .as_u64()
+            .or_else(|| id_val.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
+        if let Some(bg) = as_int {
+            if let Some(st) = self.revive_from_live(bg, ctx).await? {
+                return self.spawn(ctx, prompt, st);
+            }
+            bail!(
+                "no live background task #{bg} to revive — if it is from an earlier session, pass \
+                 the `NNN-slug` stem id shown by `task_list`."
+            );
+        }
+        // Disk fallback: a `NNN-slug` stem from an earlier session.
+        let stem = id_val
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("task_revive needs an integer id or a stem id (see `task_list`)")
+            })?;
+        let dir = resolve_subagent_dir(&self.transcript_dir).ok_or_else(|| {
+            anyhow::anyhow!("no session directory yet — cannot revive `{stem}` from disk")
+        })?;
+        let st = revive_target_from_disk(&dir, stem).await?;
+        self.spawn(ctx, prompt, st)
     }
 }
 
@@ -2944,5 +3540,234 @@ impl Agent {
         } else {
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod revive_tests {
+    use super::*;
+    use crate::subagent_transcript::{EndStatus, Record, SpawnKind, SubagentTranscript};
+    use hrdr_tools::Tool;
+
+    /// A resolved dir cell pointing at `dir`, as the real one resolves post-save.
+    fn cell(dir: &std::path::Path) -> SubagentDirCell {
+        Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+            dir.to_path_buf(),
+        ))))
+    }
+
+    /// Persist one run's transcript (`Start` [+ `Text`] [+ `End`]) at
+    /// `dir/<stem>.jsonl`, as a real sub-agent run writes it.
+    fn write_run(
+        dir: &std::path::Path,
+        stem: &str,
+        label: &str,
+        text: Option<&str>,
+        complete: bool,
+    ) {
+        let mut t = SubagentTranscript::create(dir, stem).unwrap();
+        t.write(&Record::Start {
+            model: "m".into(),
+            label: label.into(),
+            kind: SpawnKind::Background,
+            prompt: "do it".into(),
+        });
+        if let Some(x) = text {
+            t.write(&Record::Text { chunk: x.into() });
+        }
+        if complete {
+            t.write(&Record::End {
+                status: EndStatus::Ok,
+                bytes: 0,
+            });
+        }
+    }
+
+    /// Persist the sibling `<stem>.json` snapshot the revive path hydrates from.
+    fn write_snapshot(
+        dir: &std::path::Path,
+        stem: &str,
+        name: &str,
+        cwd: &str,
+        messages: Vec<ChatMessage>,
+    ) {
+        let state = crate::SessionState {
+            name: name.to_string(),
+            cwd: cwd.to_string(),
+            messages,
+            ..Default::default()
+        };
+        crate::Session::new(state.persisted())
+            .save_to_path(&dir.join(format!("{stem}.json")))
+            .unwrap();
+    }
+
+    /// `task_list` merges the on-disk snapshots with the in-memory registry and
+    /// does NOT list a run that is both live and on disk twice (the live entry's
+    /// transcript path stem identifies its on-disk pair).
+    #[tokio::test]
+    async fn task_list_merges_disk_runs_and_dedupes_live() {
+        let dir = tempfile::tempdir().unwrap();
+        // A completed run that is ALSO live this session (a registry entry whose
+        // transcript names `000-audit.jsonl`) → shown once, as the live row.
+        write_run(dir.path(), "000-audit", "audit task", Some("done"), true);
+        // An orphan with no snapshot → labelled from its `Start` record.
+        write_run(dir.path(), "001-explore", "explore auth", None, false);
+
+        let ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 5,
+                label: "audit task".to_string(),
+                done: true,
+                result: Some("ok".to_string()),
+                transcript: Some(dir.path().join("000-audit.jsonl")),
+                ..Default::default()
+            });
+
+        let out = TaskListTool {
+            transcript_dir: cell(dir.path()),
+        }
+        .execute(serde_json::json!({}), &ctx)
+        .await
+        .unwrap();
+
+        assert!(out.contains("#5"), "the live row is present: {out}");
+        assert!(out.contains("On disk"), "the disk section header: {out}");
+        assert!(
+            out.contains("001-explore [orphaned] explore auth"),
+            "the orphan is listed, labelled from its Start record: {out}"
+        );
+        assert!(
+            !out.contains("000-audit"),
+            "the live-and-on-disk run is not duplicated in the disk section: {out}"
+        );
+    }
+
+    /// A model-supplied stem that tries to escape the snapshot dir (path
+    /// separators, `..`) is rejected before it is joined onto a path.
+    #[test]
+    fn run_stem_rejects_path_traversal() {
+        assert!(valid_run_stem("003-fix"));
+        assert!(valid_run_stem("000-audit"));
+        assert!(!valid_run_stem(""));
+        assert!(!valid_run_stem("../secrets"));
+        assert!(!valid_run_stem("a/b"));
+        assert!(!valid_run_stem("a\\b"));
+        assert!(!valid_run_stem(".."));
+        assert!(!valid_run_stem("/etc/passwd"));
+    }
+
+    /// `task_output` reads a finished/orphaned run's persisted transcript back
+    /// from disk when it is no longer in the live registry (post-`/resume`).
+    #[tokio::test]
+    async fn task_output_reads_a_persisted_run_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        write_run(
+            dir.path(),
+            "003-fix",
+            "fix the bug",
+            Some("HELLO-FROM-DISK"),
+            true,
+        );
+
+        let ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
+        let tool = TaskOutputTool {
+            live: LiveSubagents::new(),
+            transcript_dir: cell(dir.path()),
+        };
+        let out = tool
+            .execute(serde_json::json!({"id": "003-fix"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("HELLO-FROM-DISK"),
+            "the persisted output is folded and read back: {out}"
+        );
+        // An unknown stem is a clean error, not a panic.
+        assert!(
+            tool.execute(serde_json::json!({"id": "999-nope"}), &ctx)
+                .await
+                .is_err()
+        );
+    }
+
+    /// `task_revive`'s disk fallback hydrates from the `<stem>.json` snapshot
+    /// (real persisted messages) and reuses the run's still-on-disk worktree +
+    /// branch. A worktree removed since is refused, not continued elsewhere.
+    #[tokio::test]
+    async fn task_revive_disk_fallback_hydrates_and_reuses_worktree() {
+        // A real repo, so `Worktree::create` works and `current_branch` resolves.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return; // git unavailable — skip
+        }
+        let wt = Worktree::create(repo).await.unwrap().keep();
+        let wt_path = wt.path.clone();
+        let branch = wt.branch.clone();
+
+        // Persist a sub-agent snapshot whose cwd is that worktree, with real
+        // messages the revive must carry forward.
+        let subdir = tempfile::tempdir().unwrap();
+        write_run(
+            subdir.path(),
+            "002-coder",
+            "add feature",
+            Some("did it"),
+            true,
+        );
+        write_snapshot(
+            subdir.path(),
+            "002-coder",
+            "add feature",
+            &wt_path.display().to_string(),
+            vec![
+                ChatMessage::user("the original brief"),
+                ChatMessage::assistant("done"),
+            ],
+        );
+
+        let st = revive_target_from_disk(subdir.path(), "002-coder")
+            .await
+            .unwrap();
+        assert_eq!(st.label, "add feature");
+        assert_eq!(
+            st.worktree,
+            Some((wt_path.clone(), branch.clone())),
+            "reuses the existing worktree + branch"
+        );
+        assert!(
+            st.messages
+                .iter()
+                .any(|m| m.content.as_deref() == Some("the original brief")),
+            "hydrates the persisted messages (with their signed thinking blocks)"
+        );
+
+        // The worktree removed since → refused, not continued somewhere else (and
+        // no crash).
+        remove_worktree(repo, &wt_path, &branch);
+        let gone = revive_target_from_disk(subdir.path(), "002-coder").await;
+        assert!(
+            gone.is_err(),
+            "a removed worktree is refused: {:?}",
+            gone.err()
+        );
     }
 }

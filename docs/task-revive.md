@@ -1,6 +1,8 @@
 # task_revive: re-engage a finished, pruned, or crashed sub-agent
 
-Status: **designed, not implemented.** Unblocked by Phase 1 of the agent-logic
+Status: **implemented.** `task_revive { id, prompt }` ships alongside the
+disk-aware `task_list` / `task_output` (all three in
+`crates/hrdr-agent/src/delegation.rs`). Unblocked by Phase 1 of the agent-logic
 migration (`docs/agent-logic-migration.md`), which made sub-agents persist their
 own `SessionState`.
 
@@ -77,3 +79,23 @@ thinking blocks, so a Claude sub-agent that died mid-`tool_use` couldn't resume
 byte-exact. Because sub-agents now persist their real `messages` (with those
 blocks), revive uses the persisted `SessionState` and is lossless. The
 transcript jsonl is for display; the `.json` snapshot is for revive.
+
+## Known limitations (as shipped)
+
+- **A revive always builds a FRESH agent** from the resolved `messages` (live:
+  the retained agent's `messages_owned()`; disk: the snapshot's persisted
+  `messages`) rather than re-driving the exact retained `Agent` object. This
+  keeps the live and disk paths on one codepath and is lossless — the persisted
+  messages _are_ the conversation, signed thinking blocks included — but the
+  revive run is a NEW background id with its own `<stem>.jsonl`/`.json` (the
+  original transcript is preserved; a run owns its file).
+- **A revived run is treated as write-capable** (takes a write slot, reuses the
+  worktree). Read-only-ness was never persisted in `SessionState`, so a revived
+  former read-only explorer runs write-capable in the recorded/main dir. Not
+  central to the use cases (both target write sub-agents + worktree reuse).
+- **The follow-up `prompt` is passed through as-is** — unlike a fresh `task`
+  brief, no parent-absolute-path rewrite is applied, since the sub-agent is
+  already isolated in its own worktree.
+- A model-supplied stem id is validated (`valid_run_stem`) before it is joined
+  onto the snapshot dir, so a `task_output` / `task_revive` lookup can't escape
+  `subagents/<main-id>/`.
