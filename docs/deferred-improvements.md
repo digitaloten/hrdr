@@ -49,16 +49,24 @@ future work; those are collected under **Standing constraints** at the bottom.
   `guardrails.rs`, outside the `Shell` seam, because `default_guardrails()` has
   no shell in scope. Correct today — the shell is always bash/sh — but it is the
   one place a new shell dialect would have to be threaded through by hand.
-- **Windows-drift audit pass, not done.** Roughly 40 `cfg(unix)`-only blocks
-  across the workspace have no Windows counterpart and were never audited as a
-  set. Most are permission-bit or signal conveniences with no Windows analogue
-  by design rather than drifted dual implementations, and the two most
-  consequential were checked and are clean or honestly documented (`proc.rs`'s
-  `ProcessGroup`, which honours the same contract via a Job Object; the wire
-  log's `0600` + `O_NOFOLLOW`, whose Windows gap is disclosed in its doc
-  comment). If a deeper pass is wanted, `hrdr-agent/src/store_lock.rs`,
-  `auth.rs`, and `auth_store.rs` are the next places to look. Related: security
-  finding O3 is exactly this class (see `security-audit.md`).
+- **Windows-drift audit pass — done, three fixes landed** (`8e5bc9d`). All ~130
+  `cfg` gates were classified. Roughly 25 are `#[cfg(unix)]` on _tests_ (needing
+  bash, python3 or symlinks) and are not findings; `proc.rs`, the pid-liveness
+  probes in `session.rs`/`delegation.rs`, and `prompt.rs`'s package-manager
+  names are deliberate and documented. Three were real and are fixed: the
+  credential `sync_all` gated on unix though it is portable, `atomic_write`'s
+  symlink guard running only on unix though `is_symlink` is portable, and
+  owner-only file creation being re-decided at four sites. What is left is the
+  honest residual: **hrdr sets no Windows ACL on any file it writes** — the
+  guarantee is the containing per-user directory's inherited default, stated
+  once on `hrdr_llm::owner_only_options`. Setting per-user ACLs needs a new
+  dependency in `hrdr-llm` and is a deliberate non-goal until someone runs hrdr
+  on Windows in anger.
+- **`O_NOFOLLOW` covers only the final path component.** A symlinked _parent_
+  directory is still traversed on the wire-log open, and there is no Windows
+  equivalent applied at all, so callers relying on it keep their own preflight
+  check. Recorded on `owner_only_options_no_follow`; closing it properly means
+  resolving the whole path under a directory handle.
 
 ## Test coverage gaps
 
