@@ -709,7 +709,11 @@ impl Client {
     fn body_json(&self, body: &ChatRequest) -> serde_json::Value {
         let mut json = serde_json::to_value(body).unwrap_or_default();
         if self.cache == CacheMode::Ephemeral {
-            crate::types::apply_cache_breakpoints(&mut json, self.cache_1h);
+            crate::types::apply_cache_breakpoints(
+                &mut json,
+                self.cache_1h,
+                self.system_cache_split,
+            );
         }
         json
     }

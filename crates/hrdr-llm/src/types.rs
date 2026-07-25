@@ -280,15 +280,28 @@ pub enum CacheMode {
 
 /// Mark cache breakpoints on a serialized chat-request body (`messages[]`): the
 /// first `system` message and the last message each get a `cache_control`
-/// marker, converting their string `content` into a one-element content-parts
-/// array. A supporting provider (e.g. OpenRouter) caches the prefix up to and
-/// including each marked block (≤4 breakpoints allowed; we use ≤2), so the
-/// stable system+tools prefix and the growing conversation prefix are reused
-/// turn to turn. Only call this for endpoints known to accept the marker — see
+/// marker, converting their string `content` into a content-parts array. A
+/// supporting provider (e.g. OpenRouter) caches the prefix up to and including
+/// each marked block (≤4 breakpoints allowed; we use ≤3), so the stable
+/// system+tools prefix and the growing conversation prefix are reused turn to
+/// turn. Only call this for endpoints known to accept the marker — see
 /// [`CacheMode::Ephemeral`]. No-op when there are no messages, or a target's
 /// `content` isn't a plain string (already parts, or a tool-call-only assistant
 /// turn with no text).
-pub fn apply_cache_breakpoints(body: &mut serde_json::Value, ttl_1h: bool) {
+///
+/// `system_cache_split` is the byte offset where the assembled system prompt's
+/// volatile environment tail begins (see `Agent`'s `system_cache_split`). Given
+/// one, the system message is emitted as **two** marked text parts — stable
+/// prefix, volatile tail — so a tail change (cwd, date) only invalidates the
+/// second. OpenRouter forwards per-part `cache_control` to Anthropic, so this
+/// mirrors the native path (`anthropic::split_system_for_cache`); that takes
+/// the breakpoint count to ≤3 (prefix + tail + rolling last message), still
+/// inside Anthropic's limit of 4.
+pub fn apply_cache_breakpoints(
+    body: &mut serde_json::Value,
+    ttl_1h: bool,
+    system_cache_split: Option<usize>,
+) {
     let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return;
     };
@@ -300,7 +313,7 @@ pub fn apply_cache_breakpoints(body: &mut serde_json::Value, ttl_1h: bool) {
         .iter()
         .position(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"));
     if let Some(i) = system {
-        mark_cache(&mut messages[i], ttl_1h);
+        mark_system_cache(&mut messages[i], ttl_1h, system_cache_split);
     }
     // Rolling breakpoint on the last message (unless it's the system we marked).
     if Some(last) != system {
@@ -316,6 +329,42 @@ pub(crate) fn cache_control(ttl_1h: bool) -> serde_json::Value {
     } else {
         serde_json::json!({ "type": "ephemeral" })
     }
+}
+
+/// Mark the system message, splitting its text at `at` into a stable prefix and
+/// a volatile tail so each carries its own breakpoint.
+///
+/// Falls back to the single-block [`mark_cache`] — as before — when there is no
+/// boundary, when it lands outside the text, or when it is not a char boundary
+/// (it always is: it is a sum of section lengths, but slicing on a bad index
+/// would panic and a mis-cached prompt is not worth that). Content that isn't a
+/// plain string (already parts) is left to `mark_cache`, which no-ops on it.
+fn mark_system_cache(msg: &mut serde_json::Value, ttl_1h: bool, at: Option<usize>) {
+    let Some(at) = at else {
+        return mark_cache(msg, ttl_1h);
+    };
+    let Some(text) = msg
+        .get("content")
+        .and_then(|c| c.as_str())
+        .map(str::to_owned)
+    else {
+        return mark_cache(msg, ttl_1h);
+    };
+    if at == 0 || at >= text.len() || !text.is_char_boundary(at) {
+        return mark_cache(msg, ttl_1h);
+    }
+    msg["content"] = serde_json::json!([
+        {
+            "type": "text",
+            "text": &text[..at],
+            "cache_control": cache_control(ttl_1h),
+        },
+        {
+            "type": "text",
+            "text": &text[at..],
+            "cache_control": cache_control(ttl_1h),
+        },
+    ]);
 }
 
 /// Rewrite a message's string `content` into `[{type:text, text, cache_control}]`.
@@ -753,7 +802,7 @@ mod tests {
                 { "role": "user", "content": "u2" },
             ]
         });
-        apply_cache_breakpoints(&mut body, false);
+        apply_cache_breakpoints(&mut body, false, None);
         let msgs = body["messages"].as_array().unwrap();
         // System marked: content became a one-element parts array with the marker.
         assert_eq!(msgs[0]["content"][0]["text"], "sys");
@@ -769,7 +818,7 @@ mod tests {
     #[test]
     fn cache_breakpoints_single_message_marked_once() {
         let mut body = json!({ "messages": [{ "role": "system", "content": "only" }] });
-        apply_cache_breakpoints(&mut body, false);
+        apply_cache_breakpoints(&mut body, false, None);
         let c = &body["messages"][0]["content"];
         assert_eq!(c.as_array().unwrap().len(), 1);
         assert_eq!(c[0]["cache_control"]["type"], "ephemeral");
@@ -785,7 +834,7 @@ mod tests {
                 { "role": "assistant", "tool_calls": [{ "id": "1" }] },
             ]
         });
-        apply_cache_breakpoints(&mut body, false);
+        apply_cache_breakpoints(&mut body, false, None);
         assert_eq!(
             body["messages"][0]["content"][0]["cache_control"]["type"],
             "ephemeral"
@@ -796,7 +845,7 @@ mod tests {
     #[test]
     fn cache_breakpoints_noop_without_messages() {
         let mut body = json!({ "model": "x" });
-        apply_cache_breakpoints(&mut body, false);
+        apply_cache_breakpoints(&mut body, false, None);
         assert!(body.get("messages").is_none());
     }
 
@@ -808,11 +857,80 @@ mod tests {
             json!({ "type": "ephemeral", "ttl": "1h" })
         );
         let mut body = json!({ "messages": [{ "role": "system", "content": "s" }] });
-        apply_cache_breakpoints(&mut body, true);
+        apply_cache_breakpoints(&mut body, true, None);
         assert_eq!(
             body["messages"][0]["content"][0]["cache_control"]["ttl"],
             "1h"
         );
+    }
+
+    #[test]
+    fn cache_breakpoints_split_system_at_offset() {
+        let sys = "stable prefix|volatile tail";
+        let at = sys.find('|').unwrap();
+        let mut body = json!({
+            "messages": [
+                { "role": "system", "content": sys },
+                { "role": "user", "content": "u1" },
+            ]
+        });
+        apply_cache_breakpoints(&mut body, false, Some(at));
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "text");
+        assert_eq!(parts[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(parts[1]["cache_control"]["type"], "ephemeral");
+        // The two halves reassemble the original system prompt exactly.
+        let joined = format!(
+            "{}{}",
+            parts[0]["text"].as_str().unwrap(),
+            parts[1]["text"].as_str().unwrap()
+        );
+        assert_eq!(joined, sys);
+        // Rolling marker on the last message still applies (≤3 breakpoints).
+        assert_eq!(body["messages"][1]["content"][0]["text"], "u1");
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn cache_breakpoints_split_honors_1h_ttl() {
+        let mut body = json!({ "messages": [{ "role": "system", "content": "ab" }] });
+        apply_cache_breakpoints(&mut body, true, Some(1));
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["cache_control"]["ttl"], "1h");
+        assert_eq!(parts[1]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn cache_breakpoints_bad_split_falls_back_to_one_block() {
+        // "héllo" — byte 2 lands inside the two-byte 'é'.
+        let sys = "héllo";
+        for at in [None, Some(0), Some(sys.len()), Some(sys.len() + 9), Some(2)] {
+            let mut body = json!({ "messages": [{ "role": "system", "content": sys }] });
+            apply_cache_breakpoints(&mut body, false, at);
+            let parts = body["messages"][0]["content"].as_array().unwrap();
+            assert_eq!(parts.len(), 1, "offset {at:?} should not split");
+            assert_eq!(parts[0]["text"], sys);
+            assert_eq!(parts[0]["cache_control"]["type"], "ephemeral");
+        }
+    }
+
+    #[test]
+    fn cache_breakpoints_split_skips_non_string_system_content() {
+        // Already parts: left exactly as-is, split offset or not.
+        let mut body = json!({
+            "messages": [{ "role": "system", "content": [{ "type": "text", "text": "sys" }] }]
+        });
+        apply_cache_breakpoints(&mut body, false, Some(1));
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "sys");
+        assert!(parts[0].get("cache_control").is_none());
     }
 
     /// Build a minimal ChatChunk with optional text content and tool-call deltas.

@@ -19,6 +19,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the split with it. The conversation itself, signed thinking blocks included,
   is installed verbatim; only `messages[0]` is rewritten, and a resume never
   raises the "AGENTS.md reloaded" notice.
+- **OpenRouter-routed models honor the stable/volatile system-prompt cache
+  split.** The native Anthropic path already split the system prompt at the
+  agent's `system_cache_split` boundary, but the OpenAI-shape path used for
+  OpenRouter marked the whole system message as one cached block, so any change
+  to the volatile tail (cwd, date) invalidated the entire system prompt in the
+  cache — costly for sibling sub-agents that share a persona but each have their
+  own worktree `cwd`. `apply_cache_breakpoints` now emits the system message as
+  two `cache_control`-marked text parts, falling back to the previous single
+  block when there is no boundary or it lands outside the text / off a char
+  boundary. Breakpoint count goes from 2 to ≤3, still inside Anthropic's limit
+  of 4.
 
 ## [0.7.1] - 2026-07-23
 
