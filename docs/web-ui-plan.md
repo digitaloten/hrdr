@@ -1,344 +1,936 @@
-# Web UI for hrdr sessions
+# Web UI for hrdr sessions — implementation spec
 
-Status: **planning (living doc — updated as we discuss).** Date: 2026-07-23.
+Status: **implementation-ready spec.** Date: 2026-07-26. Target implementer: a
+weaker model driven through hrdr's own task-delegation harness, one slice per
+delegation.
 
-Serve an hrdr session over a web endpoint so it can be driven from a browser
-(desktop or phone) with full feature parity to the TUI, behind authentication.
+> **RULES FOR THE IMPLEMENTER (read before every slice):**
+>
+> 1. Implement the slices **in order**. Do not start a slice before the previous
+>    one is committed.
+> 2. Every slice must end with `cargo fmt --all`,
+>    `cargo clippy --all-targets -- -D warnings`, and `cargo test` all passing,
+>    and exactly one conventional commit (`feat(web): …`).
+> 3. Make **no design decisions**. Everything is decided in this document. If
+>    something is genuinely unspecified, stop and report — do not invent.
+> 4. Do not modify `hrdr-tui`, `hrdr-editor`, `hrdr-llm`, or `hrdr-tools` in any
+>    slice. `hrdr-agent` and `hrdr-app` are modified **only** where a slice
+>    explicitly says so.
+> 5. Delete each slice's section from this doc in the same commit that completes
+>    it (repo convention: docs for finished work are deleted).
+> 6. Pre-1.0 rule: **no migration or back-compat shims**, in code or protocol.
 
-## Decisions so far
+## Decided architecture (fixed — do not revisit)
 
-- **Deployment:** both, **headless first**. Ship `hrdr serve` (the web is the
-  frontend, no TUI) first; design the internals so _attaching to a live TUI
-  session_ (drive one session from the TUI **and** browser at once) is a later,
-  additive capability.
-- **Network exposure:** **config-gated**. Bind `127.0.0.1` by default; exposing
-  on a non-loopback address requires an explicit flag **and** auth **and** TLS.
-- **Scope target:** **full parity** — every command, picker, pane, todo, and
-  status section the TUI has, adapted to web/mobile idioms (parity of
-  _capability_, not pixel-identity). Built in an internal order (below), but the
-  first release targets parity.
-- **Reuse as a native GUI:** the web frontend + its HTTP/WS protocol is the
-  **single** UI implementation. A future desktop/mobile GUI app is a **thin
-  native shell** (a system webview) that embeds the server and loads the _same_
-  SPA over the _same_ protocol — not a second UI codebase. This is why
-  `hrdr-web` is an **embeddable library** (see below), the transport is plain
-  localhost WS (identical in a browser and a webview), and the client avoids
-  browser-only APIs.
-- **FE = Rust → WASM (decided).** The client is WebAssembly — **Dioxus**
-  recommended, **Leptos** the smaller-WASM alternative — embedded in `hrdr-web`
-  for the web build and reused for the desktop/mobile shells. See _Rust
-  implementation_.
+- **Headless first**: `hrdr serve` hosts one session over HTTP+WS; attaching to
+  a live TUI session is a later, additive capability (out of scope here).
+- **Config-gated exposure**: bind `127.0.0.1` by default; a non-loopback bind
+  requires explicit flag + credential backend + TLS (see Security).
+- **Full parity target**, built incrementally in the slices below.
+- **One UI implementation**: Rust → WASM SPA (**Dioxus**), embedded in the
+  server binary; a future native shell is a webview over the same localhost WS.
+- **`hrdr-web` is an embeddable library** (`serve()` + `RunningServer`), with
+  the `hrdr serve` subcommand as a thin wrapper.
+- **The server owns the fold.** All transcript folding, tool classification,
+  diff classification, and status-segment building happen server-side with the
+  existing shared code. The client only paints (plus markdown + syntax
+  highlighting, which are pure formatting).
+- **Transport is localhost WS + HTTP only.** No native IPC bridge, ever; a
+  native shell speaks the same WS.
 
-## Why this is feasible (the leverage)
+## 1. Verified seam inventory
 
-hrdr's core is already UI-agnostic; the TUI is one frontend. A web UI is a
-**peer** frontend over the same core, not a rewrite:
+Every symbol below was verified against the code on 2026-07-26. Trust this table
+over the old plan's prose. "Add" column = what (if anything) a slice must add
+for the web server; empty = use as-is.
 
-- **Serializable transcript.** `Entry`/`EntryKind` + `apply_event` +
-  `tool_display` live in `hrdr-agent`, TUI-free. The server folds the event
-  stream server-side and pushes `Entry` (or a derived render model) as JSON; the
-  browser only renders.
-- **Event log with per-reader cursors.**
-  `LiveSubagents::events_since(key, cursor)` already supports many readers
-  replaying from their own cursor — a browser is just another reader. This is
-  also **free reconnect/replay** for flaky mobile networks (resume from the last
-  cursor).
-- **Unified input path.** Every user message is a queued `Steer`; the browser
-  injects input exactly as the TUI does — no special path.
-- **Shared command layer.** `CommandHost`/dispatch in `hrdr-app` runs every
-  slash command. The web client calls the same dispatch, so pickers/commands are
-  render + input over shared logic, not reimplemented behavior.
+| Seam                | Path                                                                                     | Verified public symbol / signature                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Add for web                                                              |
+| ------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Transcript entry    | `crates/hrdr-agent/src/transcript.rs`                                                    | `pub struct Entry { kind: EntryKind, time: DateTime<Local>, content_hash: u64 }` — **serde**: flat object `{"kind":…,"data":…,"time":<unix secs>}`; `content_hash` and Tool `expanded` are `#[serde(skip)]`                                                                                                                                                                                                                                                                                                         | nothing (protocol mirrors its JSON; see §4)                              |
+| Entry kinds         | `crates/hrdr-agent/src/transcript.rs:44`                                                 | `pub enum EntryKind { Header, User(String), Assistant(String), Reasoning{text, took_ms: Option<u64>}, Tool{id,name,args,result,ok,done,expanded}, System(String), Notice(String), Stats(String), Diff(String) }`, `#[serde(tag="kind", content="data", rename_all="snake_case")]`                                                                                                                                                                                                                                   | nothing                                                                  |
+| Event fold          | `crates/hrdr-agent/src/transcript.rs:513`                                                | `pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent)`                                                                                                                                                                                                                                                                                                                                                                                                                                                  | nothing — the server never calls it directly; `PaneSet::sync` does       |
+| Tool display        | `crates/hrdr-agent/src/transcript.rs:295`                                                | `pub fn tool_display(name: &str, args: &str) -> ToolDisplay`; `pub struct ToolDisplay { headline: String, body: ToolBody }`; `pub enum ToolBody { Shell{command}, Code{lang,content}, Diff, Read, Details(Vec<(String,String)>), Text }` — **NOT serde** (`Debug, Clone, PartialEq, Eq` only)                                                                                                                                                                                                                       | nothing in core; `hrdr-web` converts to wire types                       |
+| Agent events        | `crates/hrdr-agent/src/lib.rs:571`                                                       | `pub enum AgentEvent { Reasoning(String), Text(String), ToolStart{id,name,args}, ToolOutput{id,chunk}, ToolEnd{id,name,result,ok}, Usage{…}, History(Vec<ChatMessage>), Notice(String), Steered(String), TodoUpdated(Vec<TodoItem>), TurnDone }` — **NOT serde**                                                                                                                                                                                                                                                    | nothing                                                                  |
+| Event log + cursors | `crates/hrdr-agent/src/subagent_live.rs:500`                                             | `LiveSubagents::events_since(&self, key: u64, from: usize) -> Option<(Vec<AgentEvent>, usize)>`; `compact(&self, key: u64, upto: usize)` — cursor is **`usize`**                                                                                                                                                                                                                                                                                                                                                    | nothing — but see the single-reader warning in §5                        |
+| Live registry       | `crates/hrdr-agent/src/subagent_live.rs:220`                                             | `pub struct LiveSubagents(Arc<Mutex<Vec<LiveSubagent>>>)` (`Clone`); `MAIN_KEY: u64 = 0`; `register_main(agent, steering, model, provider, base_url, usage)`; `record(key, &AgentEvent)`; `enqueue(key, Steer)`; `pending(key) -> Vec<String>`; `clear_pending(key) -> usize`; `is_running(key)`; `continue_or_finish(key) -> bool`; `begin_turn/end_turn(key)`; `handle(key) -> Option<(Arc<tokio::sync::Mutex<Agent>>, SteeringQueue)>`; `send_prompt(key, Steer, on_event) -> Option<PromptDelivery>`; `prune()` | nothing                                                                  |
+| Panes               | `crates/hrdr-agent/src/pane.rs`                                                          | `pub enum PaneId { Main, Sub(u64) }` (**NOT serde**); `pub struct PaneSet` with `sync(&mut self, live: &LiveSubagents)`, `focus(PaneId)`, `active() -> PaneId`, `main()/main_mut() -> &Pane`, `subs() -> &[Pane]`, `pane_mut(PaneId)`, `active_pane()`; `pub struct Pane { id, status: PaneStatus, state: SessionState, turn: TurnStats, compacting, pending: Vec<String>, effort, auto_compact, compaction_reserved, todos: Arc<Mutex<Vec<TodoItem>>>, view }`                                                     | nothing                                                                  |
+| Pane rows           | `crates/hrdr-app/src/pane.rs`                                                            | `pub struct PaneRow { id: PaneId, title: String, status: PaneStatus, active: bool }`; `pub fn pane_rows(&PaneSet) -> Vec<PaneRow>`                                                                                                                                                                                                                                                                                                                                                                                  | nothing                                                                  |
+| Steering            | `crates/hrdr-agent/src/lib.rs:646`                                                       | `pub type SteeringQueue = Arc<Mutex<VecDeque<Steer>>>`; `pub struct Steer { sent: String, display: String }`; `Steer::new(sent, display)`, `Steer::plain(text)`; `pub fn steering_queue() -> SteeringQueue`                                                                                                                                                                                                                                                                                                         | nothing                                                                  |
+| Turn loop           | `crates/hrdr-agent/src/turn_loop.rs:403`                                                 | `Agent::run<F: FnMut(AgentEvent)>(&mut self, steering: SteeringQueue, on_event: F) -> anyhow::Result<()>` (async)                                                                                                                                                                                                                                                                                                                                                                                                   | nothing                                                                  |
+| Agent construction  | `crates/hrdr-agent/src/lib.rs`                                                           | `Agent::new(AgentConfig) -> Result<Agent>`; `Agent::attach_live(&mut self, live: LiveSubagents, key: u64)`; `Agent::connect_mcp(&mut self) -> Vec<String>` (async)                                                                                                                                                                                                                                                                                                                                                  | nothing                                                                  |
+| Turn clock          | `crates/hrdr-agent/src/turn.rs:23`                                                       | `pub struct TurnStats` — **NOT serde** (holds `Instant`); read via `inferring()`, `infer_elapsed() -> Duration`, `ttft() -> Option<f64>`, `tok_per_sec() -> f64`, fields `out_tokens`, `started_at: Option<SystemTime>`                                                                                                                                                                                                                                                                                             | nothing — `hrdr-web` snapshots it into a wire type                       |
+| Commands            | `crates/hrdr-app/src/commands/host.rs:17`, `crates/hrdr-app/src/commands/dispatch.rs:12` | `pub trait CommandHost` (a **trait the frontend implements**, ~25 required methods, many defaulted); `pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool`                                                                                                                                                                                                                                                                                                                                             | `hrdr-web` implements the trait (`WebHost`, slice 3)                     |
+| Command registry    | `crates/hrdr-app/src/lib.rs:65`                                                          | `pub const SLASH_COMMANDS: &[(&str,&str)]`; `is_known_command`, `resolve_alias`, `is_quit_command`, `help_body_for`                                                                                                                                                                                                                                                                                                                                                                                                 | nothing                                                                  |
+| Status bar model    | `crates/hrdr-app/src/status.rs`                                                          | `pub struct StatusInputs<'a>`; `pub fn status_sections(&StatusInputs) -> Vec<StatusSeg>`; `status_right_sections`; `StatusSeg { priority: u8, runs: Vec<StatusRun>, gauge: Option<CtxGauge> }`; `StatusRun { text, role: StatusRole }`; `CtxGauge { frac: f64, level: CtxLevel, label }` — **NOT serde**. There is **no `Status` struct** (the old plan's `Status(Status)` message named a type that does not exist).                                                                                               | nothing — `hrdr-web` converts to wire types                              |
+| Diff classification | `crates/hrdr-app/src/format.rs:243`                                                      | `pub enum DiffLineKind { Hunk, Add, Remove, Meta }`; `pub fn classify_diff_line(line: &str) -> DiffLineKind`                                                                                                                                                                                                                                                                                                                                                                                                        | nothing — server classifies, wire carries the class                      |
+| Git branch          | `crates/hrdr-app/src/util.rs:307`                                                        | `pub fn git_branch(cwd: &Path) -> Option<String>`                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | nothing                                                                  |
+| `@file` expansion   | `crates/hrdr-app/src/util.rs`                                                            | `pub fn prepare_outgoing(input: &str, names: &[String], cwd: &Path) -> String`; `prepare_outgoing_via(&Arc<tokio::sync::Mutex<Agent>>, &str) -> String`                                                                                                                                                                                                                                                                                                                                                             | nothing                                                                  |
+| Todos               | `crates/hrdr-tools/src/lib.rs:72`                                                        | `pub struct TodoItem { content: String, status: String }` — **serde** (`status`: `pending\|in_progress\|completed\|cancelled`)                                                                                                                                                                                                                                                                                                                                                                                      | nothing                                                                  |
+| Sessions            | `crates/hrdr-agent/src/session.rs` (re-exported from `hrdr_app`)                         | `pub struct Session { version, created, updated, state: SessionState }` (serde); `SessionState` (serde; fields incl. `name`, `id: Option<String>`, `model: ModelRef`, `base_url`, `cwd`, `messages`, `todos`, `transcript`, `usage`); `resolve_session(cwd: &str, arg: &str) -> Option<(String, Session)>`; `save_session(&SessionState) -> Result<Option<SaveOutcome>>`; `list_sessions() -> Vec<SessionMeta>`                                                                                                     | nothing                                                                  |
+| Config loading      | `crates/hrdr-agent/src/config.rs:1327-1342`                                              | `AgentConfig::load_diagnosed() -> (Self, ConfigDiagnostics)`; `pub fn config_dir() -> Option<PathBuf>`; `config_file_path() -> Option<PathBuf>`; `pub fn read_config_file<T: DeserializeOwned>() -> Option<T>`                                                                                                                                                                                                                                                                                                      | `hrdr-web` parses its own `[web]` table via `read_config_file` (slice 4) |
+| Data dir            | `crates/hrdr-agent/src/session.rs:660`                                                   | `pub fn sessions_dir() -> PathBuf` (`hjkl_xdg::data_dir("hrdr")/sessions`)                                                                                                                                                                                                                                                                                                                                                                                                                                          | web puts its SQLite DB at `hjkl_xdg::data_dir("hrdr")/web/users.sqlite`  |
+| CLI                 | `apps/hrdr/src/main.rs:205`                                                              | `#[derive(Subcommand)] enum Command { Run{…}, Models }`; headless reference loop at `run_headless` (line ~651)                                                                                                                                                                                                                                                                                                                                                                                                      | add `Command::Serve { … }` (slice 3)                                     |
 
-## Architecture
+**Corrections to the old plan (memorize these):**
 
+1. **`hrdr-agent` types cannot be shared with the WASM client.** `hrdr-agent`
+   depends on `tokio` (full), `reqwest`, `notify`, `syntect` — it does not build
+   on `wasm32-unknown-unknown`. Also `PaneId`, `TurnStats`, `AgentEvent`,
+   `ToolBody`, `StatusSeg` have **no serde derives**. Therefore `hrdr-protocol`
+   defines **self-contained wire types** (serde only), and `hrdr-web` converts
+   core types → wire types. A round-trip test pins `WireEntry`'s JSON to
+   `Entry`'s JSON (§4).
+2. **The event log is effectively single-reader.** `events_since` takes a
+   per-reader cursor, but `PaneSet::sync` calls `live.compact(key, next)` after
+   folding — events below the sole PaneSet's cursor are dropped. A second
+   independent reader would silently lose events. So: the **server owns the one
+   `PaneSet`** and fans out to browsers from its own projection with a
+   seq-numbered replay buffer (§5). Browsers never read the event log.
+3. **`CommandHost` is a trait the frontend implements**, not a service the
+   frontend calls. The web server implements it (`WebHost`) and calls
+   `dispatch(&mut host, line)`.
+4. There is **no `Status` type**; the status seam is
+   `StatusInputs`/`status_sections`/`StatusSeg`.
+5. A submitted message is not "text → queue": it is `@file`-expanded via
+   `prepare_outgoing_via`, wrapped in `Steer::new(sent, display)`, and delivered
+   via `LiveSubagents::send_prompt(key, steer, on_event)` — which itself decides
+   steer-vs-new-turn for **any** pane, main included.
+
+## 2. Resolved questions (formerly "open") — do not reopen
+
+| Question              | Decision                                                                                                                                                                                                                          | Rationale (one line)                                                                                         |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Client stack          | **Dioxus 0.6**, web platform, built with `dx build --platform web`                                                                                                                                                                | Already recommended; one Rust codebase → web + future desktop/mobile; shares `hrdr-protocol`.                |
+| Rendering model shape | Server sends `Entry`-shaped JSON **plus** a per-entry display model (tool classification, diff line classes) and pre-built status segments; the client does markdown + syntax highlighting only                                   | Keeps fold/classify single-sourced server-side; markdown/highlighting are pure formatting, safe client-side. |
+| Multi-session         | **One session per `hrdr serve`**. `/new`, `/resume <id>`, `/rename` work through dispatch and swap the hosted session in place. A session-browser UI is deferred (post-parity list at the end)                                    | Smallest correct first cut; the commands already give session switching without new protocol.                |
+| v2 attach concurrency | Deferred entirely. When built, the steering queue already serializes inputs; the blocker to solve then is item 2 above (single-reader compaction)                                                                                 | Not needed for headless-first; recorded so nobody "fixes" compaction prematurely.                            |
+| TLS story             | **Both**: optional built-in rustls (`tls_cert_path`/`tls_key_path` under `[web]`, via `axum-server`), and a documented reverse-proxy path (proxy terminates TLS, hrdr binds loopback). Either satisfies the non-loopback TLS gate | Built-in covers the no-infra user; reverse proxy is the battle-tested path.                                  |
+| GUI shell toolchain   | Localhost WS is the only transport; **no native IPC bridge**. Shell choice (Tauri/`wry` vs Dioxus desktop) is deferred to the post-parity list                                                                                    | The protocol is shell-agnostic by construction; nothing in this spec depends on the choice.                  |
+
+## 3. Workspace changes
+
+Edit the root `Cargo.toml`:
+
+- Add to `[workspace] members`: `"crates/hrdr-protocol"`, `"crates/hrdr-web"`.
+- Add to `[workspace]` an `exclude = ["crates/hrdr-ui"]` key (`hrdr-ui` is a
+  WASM-only crate built by `dx`, kept out of the workspace so
+  `cargo test`/clippy on the host stay green).
+- Add to `[workspace.dependencies]`:
+
+```toml
+# internal (add beside the existing internal entries)
+hrdr-protocol = { path = "crates/hrdr-protocol", version = "0.7.0" }
+hrdr-web = { path = "crates/hrdr-web", version = "0.7.0" }
+
+# web server (used only by hrdr-web)
+axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rust-embed = "8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+argon2 = "0.5"
+subtle = "2"
 ```
-browser (SPA, embedded assets)
-   │  WebSocket (events↓ / input↑) + HTTP (auth, assets)
-   ▼
-hrdr-web  (new crate: axum HTTP+WS server + auth)
-   │  hosts a "Session" = Agent + PaneSet + LiveSubagents + steering + CommandHost
-   ▼
-hrdr-app / hrdr-agent  (the same core the TUI drives)
-```
 
-- **New crate `hrdr-web`** — an **embeddable library** exposing
-  `serve(session, config) -> RunningServer` (axum HTTP + WebSocket), plus a thin
-  `hrdr serve` binary wrapper. Depends on `hrdr-app` (the core) + web/auth deps
-  (isolated here; does not bloat the core or TUI). The library shape is what
-  lets a native GUI shell embed the server in-process (see _Reuse as a native
-  GUI_).
-- **Client FE — a Rust UI** (see _Rust implementation_ below), compiled to WASM
-  for the web build and **embedded in the binary** (e.g. `rust-embed`) so
-  `hrdr serve` is self-contained; the _same_ codebase renders the desktop/mobile
-  apps. Being Rust, it shares the protocol types with the server (no serde
-  drift).
-- **The `Session` abstraction is the seam.** Model the server around a shareable
-  session (event stream + steering queue + command dispatch), decoupled from the
-  TUI's `App` view-state. Headless mode owns the session directly; attach-mode
-  (v2) lets a running TUI expose its session to an embedded server, making the
-  browser a second reader/input-source — additive, no App rewrite for MVP.
+Crate manifests:
 
-### WebSocket protocol (sketch — to refine)
+- **`crates/hrdr-protocol/Cargo.toml`** — deps: `serde` (workspace),
+  `serde_json` (workspace, **dev-dependency** only, for tests). Nothing else.
+  This crate must stay `wasm32`-clean: no tokio, no anyhow, no chrono.
+- **`crates/hrdr-web/Cargo.toml`** — deps (all workspace where listed above):
+  `hrdr-protocol`, `hrdr-app`, `hrdr-agent`, `hrdr-tools`, `anyhow`, `tokio`,
+  `serde`, `serde_json`, `futures-util`, `axum`, `axum-server`, `rust-embed`,
+  `rusqlite`, `argon2`, `subtle`, `rand`, `base64`, `sha2`, `chrono`, `toml`.
+  Dev-deps: `hrdr-test-support` (workspace, and the
+  `#[cfg(test)] extern crate hrdr_test_support;` line in `lib.rs` — copy the
+  comment block from `hrdr-app/src/lib.rs` lines 9–15), `tempfile`. Feature:
+  `ui = []` — when enabled, embeds `crates/hrdr-ui/dist` via `rust-embed`;
+  default **off** (server then serves a minimal built-in HTML page). No feature
+  flags on core crates.
+- **`crates/hrdr-ui/Cargo.toml`** — NOT a workspace member.
+  `dioxus = { version = "0.6", features = ["web"] }`,
+  `hrdr-protocol = { path = "../hrdr-protocol" }`, `serde`, `serde_json`,
+  `pulldown-cmark = "0.12"`, `web-sys`/`gloo` only as Dioxus pulls them. Built
+  exclusively with `dx build --platform web` (output `crates/hrdr-ui/dist`,
+  gitignored).
+- **`apps/hrdr/Cargo.toml`** — add `hrdr-web.workspace = true`.
 
-- **server → client:** `snapshot` (on connect: full transcript, status, panes,
-  todos, model/provider, turn state, cursor); `entries` (Entry deltas as the
-  turn streams); `status` + `turn` (status bar, tok/s, ctx, cost); `panes`
-  (sub-agent list + active); `todos`; `notice`.
-- **client → server:** `submit` (input → steering queue); `command` (slash
-  command → `CommandHost`); `steer` (mid-turn); `cancel`; `switch_pane`. Pickers
-  (model/theme/session) resolve to `command` (`/model …`, `/theme …`,
-  `/resume …`), so no bespoke protocol per picker.
-- **Rendering single-source-of-truth.** To avoid drift, the server computes the
-  display model (reusing `tool_display`/`ToolBody`, diff classification, etc.)
-  and the client renders it dumbly — don't re-implement fold/classify logic in
-  the client.
+## 4. Protocol spec (`crates/hrdr-protocol`)
 
-Concretely, the messages are shared serde types in `hrdr-protocol` (sketch):
+One module, `src/lib.rs`. Every type derives
+`Debug, Clone, PartialEq, Serialize, Deserialize`. **Tag strategy:** all message
+enums are internally tagged `#[serde(tag = "type", rename_all = "snake_case")]`
+and every variant is a **struct variant** (internal tagging cannot represent
+newtype variants of primitives — do not add any). Versioning: pre-1.0 the
+protocol breaks freely; server and client are always built from the same commit;
+there is **no version-negotiation field**.
 
 ```rust
-// server → client
-enum ServerMsg {
-    Snapshot { transcript: Vec<Entry>, status: Status, panes: Vec<PaneMeta>,
-               active: PaneId, todos: Vec<TodoItem>, turn: TurnStats, cursor: u64 },
-    Entries  { pane: PaneId, from: u64, entries: Vec<Entry> }, // fold deltas
-    Status(Status), Turn(TurnStats), Panes { panes: Vec<PaneMeta>, active: PaneId },
-    Todos(Vec<TodoItem>), Notice(String),
+/// Which conversation a message concerns. Mirrors hrdr_agent::PaneId.
+/// External tagging on purpose: serializes as "main" or {"sub": 7}.
+#[derive(..., Serialize, Deserialize, Eq, Hash, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum WirePaneId { Main, Sub(u64) }
+
+/// Byte-for-byte the JSON of hrdr_agent::Entry (flat kind/data + unix time).
+pub struct WireEntry {
+    #[serde(flatten)]
+    pub kind: WireEntryKind,
+    pub time: i64, // unix seconds — Entry serializes DateTime<Local> this way
 }
-// client → server
-enum ClientMsg {
-    Submit { pane: PaneId, text: String },   // → steering queue (a Steer)
-    Command { pane: PaneId, line: String },  // → CommandHost dispatch
-    Cancel { pane: PaneId }, SwitchPane(PaneId),
-    Resume { cursor: u64 },                  // reconnect: replay from cursor
+
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum WireEntryKind {
+    Header,
+    User(String),
+    Assistant(String),
+    Reasoning { text: String, #[serde(default)] took_ms: Option<u64> },
+    Tool { id: String, name: String, args: String, result: String, ok: bool, done: bool },
+    System(String),
+    Notice(String),
+    Stats(String),
+    Diff(String),
 }
 ```
 
-`Entry`/`PaneId`/`TurnStats`/`TodoItem` are re-exported from `hrdr-agent`, so
-the same types serialize on both ends. `Entries` carries `apply_event`-folded
-deltas keyed to the reader cursor — the reconnect/replay primitive.
+(`WireEntryKind` is the one exception to "struct variants only": it must match
+`EntryKind`'s existing externally-shaped serde exactly, newtype variants
+included. A test pins this — below.)
 
-## Reuse as a native GUI app
+```rust
+/// Server-computed display model that rides beside an entry.
+pub struct WireEntryView {
+    pub entry: WireEntry,
+    /// For Tool entries: hrdr_agent::tool_display(name, args), converted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<WireToolDisplay>,
+    /// For Diff entries AND Tool entries whose body is Diff: each line of the
+    /// diff text classified by hrdr_app::classify_diff_line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_lines: Option<Vec<WireDiffLine>>,
+}
+pub struct WireToolDisplay { pub headline: String, pub body: WireToolBody }
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WireToolBody {
+    Shell { command: String },
+    Code { lang: String, content: String },
+    Diff {},
+    Read {},
+    Details { rows: Vec<(String, String)> },
+    Text {},
+}
+pub struct WireDiffLine { pub kind: WireDiffLineKind, pub text: String }
+#[serde(rename_all = "snake_case")]
+pub enum WireDiffLineKind { Hunk, Add, Remove, Meta }
 
-The web UI is the one UI. A native desktop/mobile app is a **shell** around it:
+/// Snapshot of one pane's chrome (list row + status-bar inputs live here).
+pub struct WirePane {
+    pub id: WirePaneId,
+    pub title: String,
+    pub status: WirePaneStatus,   // Running | Idle | Done (snake_case)
+    pub model: String,
+    pub provider: String,
+    pub effort: Option<String>,
+    pub pending: Vec<String>,     // queued-but-undelivered user messages
+    pub compacting: bool,
+    pub turn: WireTurn,
+    pub todos: Vec<WireTodo>,
+}
+pub struct WireTodo { pub content: String, pub status: String }
+pub struct WireTurn {
+    pub running: bool,
+    pub inferring: bool,
+    pub elapsed_ms: u64,          // TurnStats::infer_elapsed().as_millis()
+    pub ttft_secs: Option<f64>,
+    pub tok_per_sec: f64,
+    pub out_tokens: usize,
+    pub started_unix: Option<i64>, // from TurnStats::started_at
+}
 
+/// Pre-built status bar (server ran hrdr_app::status_sections).
+pub struct WireStatus { pub left: Vec<WireStatusSeg>, pub right: Vec<WireStatusSeg> }
+pub struct WireStatusSeg {
+    pub priority: u8,
+    pub runs: Vec<WireStatusRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gauge: Option<WireGauge>,
+}
+pub struct WireStatusRun { pub text: String, pub role: WireStatusRole }
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum WireStatusRole {
+    Dir {}, Branch {}, TokensIn {}, TokensOut {},
+    CtxFill { level: WireCtxLevel }, CtxRest {}, CtxPlain {},
+    Provider {}, Model {}, Effort {}, Ttft {}, Session {},
+}
+#[serde(rename_all = "snake_case")]
+pub enum WireCtxLevel { Ok, Warn, Critical }
+pub struct WireGauge { pub frac: f64, pub level: WireCtxLevel, pub label: String }
 ```
-native shell (window, tray, notifications, OS integration)
-   ├─ embeds hrdr-web (in-process; owns/attaches the Session)
-   └─ system webview → loads the same embedded SPA over localhost WS
+
+The messages. Every server frame carries a global sequence number:
+
+```rust
+pub struct ServerFrame { pub seq: u64, #[serde(flatten)] pub msg: ServerMsg }
+
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerMsg {
+    /// First frame on connect (and after a failed resume): complete state.
+    Snapshot {
+        session_id: Option<String>,
+        session_name: String,
+        cwd: String,
+        panes: Vec<WirePane>,
+        active: WirePaneId,
+        status: WireStatus,
+        transcripts: Vec<PaneTranscript>, // one per pane, full
+        show_thinking: bool,
+    },
+    /// Replace pane's entries from index `from` to the end with `entries`.
+    /// `from == 0` with empty `entries` = the transcript was cleared (/new).
+    Entries { pane: WirePaneId, from: usize, entries: Vec<WireEntryView> },
+    /// Pane list / chrome changed (panes added, released, status, turn, todos).
+    Panes { panes: Vec<WirePane>, active: WirePaneId },
+    Status { status: WireStatus },
+    /// A system line produced outside the fold (async command output).
+    Notice { text: String },
+    /// The server asks the client to replace/augment its input box
+    /// (CommandHost::set_input / prepend_input / insert_input).
+    SetInput { mode: InputSetMode, text: String },
+    /// Resume accepted: client state is current up to `seq`; deltas follow.
+    Resumed {},
+    /// Auth failed / connection refused; the socket closes after this.
+    Error { message: String },
+}
+#[serde(rename_all = "snake_case")]
+pub enum InputSetMode { Replace, Prepend, InsertAtCursor }
+pub struct PaneTranscript { pub pane: WirePaneId, pub entries: Vec<WireEntryView> }
+
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientMsg {
+    /// User pressed send. Routed via LiveSubagents::send_prompt (steer if a
+    /// turn is in flight, new turn if idle). `pane` = the pane on screen.
+    Submit { pane: WirePaneId, text: String },
+    /// A slash command line (leading '/'). Runs through hrdr_app dispatch.
+    Command { pane: WirePaneId, line: String },
+    /// Cancel the active turn on `pane` (abort task + clear_pending).
+    Cancel { pane: WirePaneId },
+    SwitchPane { pane: WirePaneId },
+    /// Reconnect: client last saw `seq`. Server replays buffered frames after
+    /// `seq`, or sends a fresh Snapshot if the buffer no longer reaches back.
+    Resume { seq: u64 },
+}
 ```
 
-- **One transport for both worlds.** The client always talks localhost WS +
-  HTTP. In a browser that's a real socket; in a webview it's the same socket to
-  the embedded server. No separate "desktop" client, no divergent code path — a
-  bug fixed in the web UI is fixed in the GUI app.
-- **`hrdr-web` as a library is the enabler.** The shell calls
-  `hrdr_web::serve(session, config)` on `127.0.0.1:<ephemeral>` and points its
-  webview at it. The `hrdr serve` binary is the same call with a CLI wrapper.
-- **Client portability rules.** No browser-only APIs a webview may lack;
-  feature- detect and degrade (clipboard, notifications, file pickers). Native
-  niceties (real notifications, file dialogs, deep links) are added by the shell
-  and exposed to the client through a small, optional capability bridge — never
-  required for the web-only case.
-- **Auth is simpler in the shell case.** The shell controls both ends, so it can
-  bind loopback-only and inject a per-launch bearer token, skipping a login
-  screen while still authenticating the socket. The same auth backends still
-  apply when the shell chooses to expose on the network.
-- **Candidate shells:** a Rust-native webview (e.g. Tauri/`wry`) keeps
-  everything in one toolchain and can embed `hrdr-web` directly; a mobile app
-  wraps a `WebView`/`WKWebView` over the embedded (or remote) server. Either way
-  the SPA and protocol are unchanged.
+### Exact wire examples (write these into protocol tests verbatim)
 
-## Rust implementation (FE framework + desktop/mobile shell)
+Snapshot (abridged to one pane, one entry):
 
-The FE is a Rust → **WebAssembly** app (**decided**): it compiles to WASM,
-embedded in `hrdr-web` for the web build, and the _same_ codebase renders the
-desktop/mobile apps. It **shares serde protocol types with the server** (no
-client/server drift). Every target runs in the **system webview** — WebKitGTK on
-Linux, WebView2 on Windows, WKWebView on macOS — **not Electron** — so binaries
-stay small (single-digit MB) on Linux/Windows/macOS. The framework choice is
-**Dioxus vs Leptos** (both Rust→WASM); the shell is `dioxus-desktop`/`wry` (with
-Dioxus) or Tauri 2 (with Leptos). Canvas UIs (`egui`/`iced`) are out — a second
-UI, weak for mobile/text.
+```json
+{
+  "seq": 1,
+  "type": "snapshot",
+  "session_id": "fix-parser",
+  "session_name": "fix parser",
+  "cwd": "/home/me/proj",
+  "panes": [
+    {
+      "id": "main",
+      "title": "main",
+      "status": "idle",
+      "model": "gpt-5.5",
+      "provider": "openai",
+      "effort": null,
+      "pending": [],
+      "compacting": false,
+      "turn": {
+        "running": false,
+        "inferring": false,
+        "elapsed_ms": 0,
+        "ttft_secs": null,
+        "tok_per_sec": 0.0,
+        "out_tokens": 0,
+        "started_unix": null
+      },
+      "todos": []
+    }
+  ],
+  "active": "main",
+  "status": { "left": [], "right": [] },
+  "transcripts": [
+    {
+      "pane": "main",
+      "entries": [
+        { "entry": { "kind": "user", "data": "hi", "time": 1753500000 } }
+      ]
+    }
+  ],
+  "show_thinking": true
+}
+```
 
-### Framework: Dioxus (recommended)
+Entry delta (assistant text grew — tail replacement from index 3):
 
-Recommended because it gives **one Rust codebase → web + desktop + mobile** from
-its own `dx` tooling (build, bundle, hot-reload every target) — the direct
-realization of "the web FE is the GUI," with no separate shell project.
+```json
+{
+  "seq": 42,
+  "type": "entries",
+  "pane": "main",
+  "from": 3,
+  "entries": [
+    {
+      "entry": {
+        "kind": "assistant",
+        "data": "Done — it was an off-by-one.",
+        "time": 1753500100
+      }
+    }
+  ]
+}
+```
 
-**Pros**
+A tool entry with its display model:
 
-- One codebase to all targets via `dx`; React-like (RSX + components + signals),
-  low ramp, good hot-reload.
-- Rust end-to-end → shares protocol types with `hrdr-web`, reuses Rust crates.
-- Actively developed and funded.
+```json
+{
+  "entry": {
+    "kind": "tool",
+    "data": {
+      "id": "c1",
+      "name": "shell",
+      "args": "{\"command\":\"ls\"}",
+      "result": "src\n",
+      "ok": true,
+      "done": true
+    },
+    "time": 1753500050
+  },
+  "tool": { "headline": "", "body": { "type": "shell", "command": "ls" } }
+}
+```
 
-**Cons**
+Sub-agent pane id: `{ "sub": 7 }`. Submit / command / resume:
 
-- **Heavier WASM than Leptos** — Dioxus uses a virtual DOM + runtime; Leptos's
-  fine-grained signals compile to smaller bundles and less work per DOM update.
-  This is the "lightweight" tension; needs `wasm-opt` + compression +
-  code-splitting to keep first-load small (esp. mobile), and batching for a fast
-  token stream.
-- **Pre-1.0 churn** (0.4 → 0.5 → 0.6 broke APIs) — expect upgrade friction.
-- **Mobile is its least-mature target** (tooling / signing / deploy).
-- **Smaller ecosystem than JS** — markdown/highlighting/etc. come from Rust
-  crates (`pulldown-cmark`, `syntect`) or JS interop, not off-the-shelf
-  components.
-- **General WASM costs:** JS↔WASM boundary for DOM/browser APIs, harder
-  debugging, and an initial fetch + compile of the WASM binary.
-- **Linux WebKitGTK is the weakest of the three system webviews** (older WebKit,
-  occasional CSS/JS gaps) — the lowest-common-denominator to test against.
+```json
+{"type":"submit","pane":"main","text":"fix the bug"}
+{"type":"command","pane":{"sub":7},"line":"/status"}
+{"type":"resume","seq":41}
+```
 
-### Framework alternative: Leptos (+ Tauri 2 shell)
+## 5. Server internals (normative — implemented across slices 2–3)
 
-Pick Leptos if **smallest/fastest WASM** is the priority — fine-grained
-reactivity → smaller bundles and less per-update work (better for a fast token
-stream). Trade-off: desktop/mobile is **Tauri 2 wrapping the Leptos web build**
-rather than one Dioxus codebase; Tauri is the most battle-tested cross-platform
-shell. (A JS/TS SPA + Tauri is the fastest-to-build fallback but drops Rust
-type-sharing.)
+`hrdr-web`'s core object (slice 2), `src/session.rs`:
 
-**Decision rule:** one-codebase-multiplatform → **Dioxus**; smallest-WASM /
-most-proven-shell → **Leptos + Tauri**. Both share types with the server.
+```rust
+pub struct WebSession { /* fields below are private */ }
+// Owns: agent: Arc<tokio::sync::Mutex<Agent>>, steering: SteeringQueue,
+//        live: LiveSubagents, panes: PaneSet,
+//        broadcast: tokio::sync::broadcast::Sender<ServerFrame>,
+//        seq: u64, replay: VecDeque<ServerFrame> (cap REPLAY_CAP = 1024),
+//        sent: HashMap<WirePaneId, Vec<u64>> (content hashes last broadcast),
+//        show_thinking: bool, session state mirror (id/name/cwd).
+```
 
-### WASM build, size & embedding
+Construction mirrors the TUI at `crates/hrdr-tui/src/app.rs:704-738`
+(`publish_main_agent`): `Agent::new(config)` → `steering_queue()` →
+`LiveSubagents::new()` →
+`register_main(agent, steering, model, provider, base_url, usage)` →
+`attach_live(live, MAIN_KEY)` (lock the agent async, it is not contended at
+startup) → `agent.connect_mcp().await`, each returned notice broadcast as
+`Notice`.
 
-- **Build:** `dx build --platform web` (Dioxus) or `trunk` (Leptos) → `.wasm` +
-  JS glue + assets; embed into `hrdr-web` via `rust-embed` so `hrdr serve` ships
-  one binary.
-- **Size discipline** (matters most on mobile first-load): release +
-  `wasm-opt -Oz`, `opt-level = "z"` + `lto`, strip, serve **Brotli/gzip-
-  compressed** WASM; lazy-load heavy bits (syntax highlighter, rarely-used
-  pickers). Track the gzipped WASM size in CI as a budget.
-- **Rendering deps:** markdown via `pulldown-cmark` → sanitized HTML; code
-  highlighting via a Rust highlighter or a small JS lib through interop. Keep
-  the server as the single source of the _display model_ (fold/classify via
-  `apply_event`/`tool_display`) so the client only formats.
+**The sync tick** (the heart — one method, `WebSession::tick()`):
 
-### Cross-platform webview caveats (document for users + CI)
+1. `live.update(MAIN_KEY, |e| e.running = <is a main turn task alive>)` then
+   `panes.sync(&live)` — exactly what `sync_panes` does in the TUI
+   (`app.rs:1601`). This folds new events into every pane transcript.
+2. For each pane, diff `pane.transcript()` against `sent[pane_id]` using
+   `Entry.content_hash`: find the first index `i` where length or hash differs;
+   if any, emit `Entries { pane, from: i, entries: convert(&transcript[i..]) }`
+   and update `sent`. (Entries can mutate in place — streamed text, tool results
+   — which is why this is hash-diff, not append-only.)
+3. Rebuild `Vec<WirePane>` + `WireStatus`; if changed since last broadcast
+   (compare the serialized value), emit `Panes` / `Status`.
+4. Every emitted `ServerFrame` gets `seq += 1`, is pushed to `replay` (dropping
+   the front past `REPLAY_CAP`), and sent on `broadcast`.
 
-- **Linux:** WebKitGTK (`webkit2gtk`) is a runtime system dependency — package
-  or document it per distro.
-- **Windows:** WebView2 (Evergreen runtime) — ship the bootstrapper or rely on
-  the near-ubiquitous runtime.
-- **macOS:** WKWebView is built in — nothing to ship.
-- hrdr already builds 6 target triples in CI; add the desktop-shell targets.
+Drive `tick()` from a `tokio::time::interval(Duration::from_millis(100))` task,
+plus an immediate tick whenever a turn event callback fires (use a
+`tokio::sync::Notify`). Status inputs are built from the **active** pane's
+`state` (`dir` = `state.cwd`, `branch` = `hrdr_app::git_branch` cached for 5s,
+tokens/ctx from `state.usage`, model/provider from `pane.model()/provider()`,
+`session` = main pane `state.name`, `ttft` = `pane.turn.ttft()`,
+`nerd_icons: false`).
 
-### Shared protocol types
+**Submitting** (`WebSession::submit(pane, text)`): map `WirePaneId` → key
+(`Main` → `MAIN_KEY`);
+`let sent = prepare_outgoing_via(&agent_for(pane), &text)`;
+`live.send_prompt(key, Steer::new(sent, text), on_event)` where `on_event`
+clones a `Notify` handle and pings the tick task (events are already recorded on
+the agent's entry by `send_prompt` itself — do **not** record again, and do
+**not** fold into the transcript by hand; the tick's `sync` does it).
+`send_prompt` returning `None` → broadcast
+`Notice("that agent has finished and been released")`. After a turn ends, the
+tick task checks `!live.is_running(key) && !live.pending(key).is_empty()` and,
+if so, restarts an opener-less run: `live.handle(key)` → `begin_turn(key)` →
+spawn `agent.lock().await.run(steering, cb)` with a `RunGuard`-equivalent
+(`end_turn` on every exit) — this mirrors the undelivered-steer relaunch the TUI
+does.
 
-The WS message enums + a re-export of `Entry` live in one crate
-(`hrdr-protocol`, or a `pub mod` in `hrdr-web`) used by **both** server and
-client, so the JSON contract can't drift.
+**Cancel**: keep the `tokio::task::JoinHandle` of any turn task the server
+spawned; `Cancel` aborts it, then `live.clear_pending(key)` and
+`live.end_turn(key)`; broadcast a `Notice("turn cancelled")`. (For turns started
+inside `send_prompt` the handle is not reachable — for those, `Cancel` on a
+sub-agent pane only clears pending and notices; main-pane turns must therefore
+be spawned by the server itself, not via `send_prompt`'s idle branch.
+Concretely: `submit` on **Main** when idle does the enqueue + spawn itself —
+enqueue the `Steer` via `live.enqueue(MAIN_KEY, steer)`, `begin_turn`, spawn
+`agent.run(steering, cb)` keeping the handle, `cb` = record to
+`live.record(MAIN_KEY, &ev)` + notify tick (this matches TUI
+`spawn_turn`/`launch_turn`, `app.rs:1967` — note the TUI records main events in
+the frontend, `app.rs:2378`). Submit on Main while running → `send_prompt`
+(steer path only). Submit on Sub panes → `send_prompt` always.)
 
-### Workspace layout
+**Persistence**: on `AgentEvent::TurnDone` (observed in `cb`), call
+`hrdr_app::save_session(&panes.main().state)` on a blocking task
+(`tokio::task::spawn_blocking`) after `sync`, mirroring TUI autosave. On
+`AgentEvent::History(msgs)`, update `panes.main_mut().state.messages = msgs`
+before saving (mid-turn durability).
 
-- `hrdr-protocol` — WS message types + `Entry` re-export (tiny, shared).
-- `hrdr-web` — server library (axum HTTP+WS; hosts a `Session`; serves the built
-  WASM FE) + the `hrdr serve` binary.
-- `hrdr-ui` — the Dioxus FE. Build targets: **web** (WASM → embedded in
-  `hrdr-web`) and **desktop/mobile** (native shell that launches embedded
-  `hrdr-web` and opens the UI in the system webview).
+## 6. Security requirements (checklists)
 
-### Desktop/mobile app = `hrdr-ui` + embedded `hrdr-web`
+### Config: `[web]` table (parsed by `hrdr-web` via `hrdr_agent::read_config_file`)
 
-The desktop binary starts `hrdr_web::serve(session, config)` on
-`127.0.0.1:<ephemeral>` and opens the Dioxus UI in the system webview,
-connecting over WS. Native niceties (notifications, file dialogs, tray) come
-from the shell via an optional capability layer — never required for the
-web-only path.
+| Key                   | Type   | Default                        | Env override            | CLI flag (on `hrdr serve`)     |
+| --------------------- | ------ | ------------------------------ | ----------------------- | ------------------------------ |
+| `bind`                | string | `"127.0.0.1"`                  | `HRDR_WEB_BIND`         | `--bind <ADDR>`                |
+| `port`                | u16    | `9911`                         | `HRDR_WEB_PORT`         | `--port <N>`                   |
+| `auth`                | string | `"token"`                      | `HRDR_WEB_AUTH`         | `--auth <basic\|users\|token>` |
+| `basic_user`          | string | none                           | `HRDR_WEB_BASIC_USER`   | —                              |
+| `basic_password_hash` | string | none                           | —                       | —                              |
+| `users_db`            | path   | `<data>/hrdr/web/users.sqlite` | `HRDR_WEB_USERS_DB`     | `--users-db <PATH>`            |
+| `tls_cert_path`       | path   | none                           | `HRDR_WEB_TLS_CERT`     | `--tls-cert <PATH>`            |
+| `tls_key_path`        | path   | none                           | `HRDR_WEB_TLS_KEY`      | `--tls-key <PATH>`             |
+| `allow_remote`        | bool   | `false`                        | `HRDR_WEB_ALLOW_REMOTE` | `--allow-remote`               |
 
-## Authentication & security (primary constraint)
+Precedence: CLI flag > env > file > default (same as the rest of hrdr). Env-var
+problems are warnings; file problems are startup errors (match
+`ConfigDiagnostics` policy).
 
-A web endpoint exposes a **coding agent with full filesystem + shell access as
-the user** — anyone who reaches it can run arbitrary commands. Security is the
-design's spine, not an add-on.
+Auth modes:
 
-- **Two credential backends (config-selected):**
-  - **Basic HTTP auth** — `Authorization: Basic …`, 401 challenge. Simple,
-    browser-native. Credentials from config (store a **hash**, not plaintext).
-    The WS authenticates via the upgrade request's `Authorization` header.
-  - **SQLite user table** — `users(username, password_hash, …)` with
-    **argon2/bcrypt** hashes; a login endpoint mints a **signed session
-    cookie**; the WS authenticates via the cookie. Supports multiple users and
-    rotation.
-- **Config-gated exposure:** default bind `127.0.0.1`. Binding a non-loopback
-  address requires an explicit flag **+** a configured credential backend **+**
-  TLS (own cert or a reverse proxy). Refuse to expose on `0.0.0.0` without all
-  three. Note: **basic auth over plain HTTP is cleartext** — only allowed on
-  loopback/tunnel; network exposure forces TLS.
-- **Hardening:** origin/CSRF checks on the WS upgrade; auth-failure
-  rate-limiting + lockout; constant-time credential comparison; session-cookie
-  `HttpOnly`/`Secure`/`SameSite`; optional per-session bearer token in the URL
-  for quick loopback access. Consider a read-only/observer mode (view, no input)
-  as a lower-risk sharing option.
-- The SQLite DB path, TLS cert/key paths, bind address, and backend choice all
-  live under a `[web]` config section (+ `HRDR_WEB_*` env + CLI flags), matching
-  hrdr's config/env/flag convention.
+- `token` (default): on startup the server generates a 32-byte random URL-safe
+  token, prints `open http://127.0.0.1:9911/?token=…` to stderr, and requires it
+  as `?token=` on `GET /` and on the WS upgrade (or `Authorization: Bearer`).
+  **Loopback only** — `token` mode never satisfies the remote gate.
+- `basic`: HTTP Basic against `basic_user` + `basic_password_hash` (argon2id PHC
+  string; generate with `hrdr serve --hash-password`, which reads the password
+  from stdin, prints the hash, and exits). WS authenticates via the upgrade
+  request's `Authorization` header.
+- `users`: SQLite table
+  `users(username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, created INTEGER NOT NULL)`;
+  `POST /login` (JSON `{username,password}`) verifies argon2id and sets a signed
+  session cookie; WS authenticates via the cookie. Manage with
+  `hrdr serve --add-user <name>` / `--remove-user <name>` (password read from
+  stdin; command exits without serving).
 
-## Feature-parity map (TUI → web)
+### Refuse-to-bind rules (hard errors at startup, checked in `serve()` before binding)
 
-| Capability         | Drives via                                    | Web rendering                              |
-| ------------------ | --------------------------------------------- | ------------------------------------------ |
-| Transcript         | `Entry` stream (server fold)                  | markdown, code highlight, tool/diff blocks |
-| Send / steer input | steering queue (`Steer`)                      | input box; send / cancel                   |
-| Slash commands     | `CommandHost`/dispatch                        | command palette + typed `/…`               |
-| Sub-agent panes    | `LiveSubagents` + `PaneSet`                   | tabs / drawer, live per-pane transcript    |
-| Todos              | the todo list                                 | collapsible panel                          |
-| Pickers (model/…)  | `/model`, `/theme`, `/effort`, `/resume` cmds | bottom sheets / menus                      |
-| Status bar         | status model + turn stats                     | header/footer chips                        |
-| Sessions           | `/new`, `/resume`, session list               | session switcher                           |
-| Reasoning, notices | `Entry` kinds                                 | collapsible thinking, toasts               |
+- [ ] Parse `bind`; **loopback** = `IpAddr::is_loopback()`.
+- [ ] Non-loopback bind AND `allow_remote == false` → error
+      `"refusing to bind <addr>: pass --allow-remote (plus auth and TLS)"`.
+- [ ] Non-loopback AND `auth == "token"` → error (token mode is loopback-only).
+- [ ] Non-loopback AND auth backend unconfigured (basic without user+hash; users
+      with an empty/missing DB) → error.
+- [ ] Non-loopback AND TLS cert/key unset → error naming both the built-in TLS
+      keys and the reverse-proxy alternative (`bind` loopback behind a proxy).
+- [ ] All three present → serve HTTPS via `axum-server`'s rustls binding.
+- [ ] Basic auth over plain HTTP is permitted **only** on loopback.
 
-Terminal-only bits (vim editing, keybinds, the loader animation) become their
-web/mobile equivalents; the underlying capability is preserved because the logic
-is in the shared core.
+### Hardening checklist (slice 4/5)
 
-## Mobile
+- [ ] WS upgrade: reject when an `Origin` header is present and its host is
+      neither the request `Host` nor localhost (CSRF via browser WS).
+- [ ] Credential comparison via `subtle::ConstantTimeEq` (token, cookie MAC);
+      password checks via `argon2::PasswordVerifier` (already constant-time).
+- [ ] Auth-failure rate limit: per-IP sliding window, max 10 failures/minute,
+      then 429 with `Retry-After: 60`; in-memory
+      `HashMap<IpAddr, VecDeque<Instant>>` behind a mutex — no new dependency.
+- [ ] Session cookie: name `hrdr_session`, value
+      `base64(username || ":" || expiry_unix || ":" || hmac_sha256(secret, username:expiry))`,
+      attributes `HttpOnly; SameSite=Strict; Path=/`, plus `Secure` when TLS is
+      on. `secret` = 32 random bytes generated per server start (a restart logs
+      everyone out — acceptable pre-1.0, no persistence shim). Expiry: 7 days.
+- [ ] The token/credentials never appear in any log line.
+- [ ] `/healthz` is the only unauthenticated route (returns `ok`, no state).
 
-Chat maps naturally to mobile: a scrollable transcript + a sticky input.
-Responsive layout, touch targets, virtual-keyboard-aware input; pane switcher →
-tabs/drawer; pickers → bottom sheets; status → compact chips.
-Reconnect-on-resume via the event cursor so backgrounding the browser doesn't
-lose the stream.
+## 7. Slices
 
-## Build order (internal; ship target = full parity)
+> Reminder: one slice = one commit = fmt + clippy + tests green. Titles are the
+> commit subjects.
 
-1. **`hrdr-web` skeleton** — axum server, embedded static client, one WS, the
-   `Session` seam; headless `hrdr serve` on a saved/new session.
-2. **Auth + exposure gating** — basic + SQLite backends, config-gated bind, TLS
-   path, rate-limit. (Land before any non-loopback exposure is possible.)
-3. **Core chat loop** — snapshot + streaming `Entry` deltas + input + steer +
-   cancel; server-side display model; mobile-responsive shell.
-4. **Panes + todos + status** — sub-agent tabs, live per-pane views, todo panel,
-   status/turn chips.
-5. **Commands + pickers + sessions** — command palette over `CommandHost`;
-   model/ theme/effort/session pickers as sheets; session switcher.
-6. **v2 — attach to a live TUI session** — a running TUI exposes its session to
-   the embedded server; browser as second reader/input-source. Concurrency
-   handled at the `Session` seam.
-7. **Native GUI shell** — a thin webview shell (e.g. Tauri/`wry`) that embeds
-   `hrdr-web` and loads the same SPA, plus optional native capabilities
-   (notifications, file dialogs, tray). No new UI code — reuse the web frontend.
-   Keep `hrdr-web` a clean library from step 1 so this is purely additive.
+### Slice 1 — `feat(web): hrdr-protocol wire types`
 
-## Open questions
+**Goal:** the shared wire vocabulary exists, JSON-pinned by tests.
 
-- **Client stack:** recommendation is **Dioxus** (one Rust codebase → web +
-  desktop + mobile via the system webview; shares protocol types with the
-  server). Open sub-decision: Dioxus vs **Tauri 2 + Leptos** (smaller WASM /
-  more-proven shell, but desktop = Tauri wrapping the web build). See _Rust
-  implementation_.
-- **Rendering model shape:** exact JSON the server sends per `EntryKind` (how
-  much the server pre-renders vs the client formats).
-- **Multi-session:** does one `hrdr serve` host a single session or a session
-  browser (list + open)? Full parity implies session management; scope the first
-  cut.
-- **Concurrency for v2 attach:** conflict rules when TUI and browser both send
-  input mid-turn (the steering queue already serializes; confirm the UX).
-- **TLS story:** built-in rustls vs "bring a reverse proxy" as the documented
-  path for network exposure.
-- **GUI shell toolchain:** Tauri/`wry` (Rust-native, embeds `hrdr-web` directly)
-  vs a lighter custom webview vs per-platform mobile wrappers — and whether the
-  shell ever needs a native IPC bridge or the localhost WS is always sufficient
-  (leaning: WS is enough; a bridge is optional sugar for native capabilities).
+- Create `crates/hrdr-protocol/{Cargo.toml,src/lib.rs}` with **every** type in
+  §4, documented. Edit root `Cargo.toml` (members + workspace deps + the
+  `exclude` for the future `hrdr-ui`).
+- Tests (in `src/lib.rs` `#[cfg(test)]`):
+  - `wire_examples_round_trip` — parse each JSON example from §4 into its type,
+    re-serialize, compare `serde_json::Value`s.
+  - `pane_id_wire_shape` — `Main` ⇄ `"main"`, `Sub(7)` ⇄ `{"sub":7}`.
+  - `server_frame_flattens_seq` — a `ServerFrame{seq:1, msg: Notice{..}}`
+    serializes to `{"seq":1,"type":"notice","text":…}`.
+- **Out of scope:** any dependency beyond serde/serde_json; any conversion from
+  core types (that's slice 2 — this crate must not depend on hrdr-agent).
+
+### Slice 2 — `feat(web): WebSession headless host`
+
+**Goal:** a network-free session host that owns the agent, folds panes, and
+emits `ServerFrame` deltas on a broadcast channel.
+
+- Create
+  `crates/hrdr-web/{Cargo.toml,src/lib.rs,src/session.rs,src/convert.rs}`.
+- `src/convert.rs`: `pub fn wire_entry(&Entry) -> WireEntry`,
+  `wire_entry_view(&Entry) -> WireEntryView` (calls `tool_display` for Tool
+  entries; classifies diff text via `classify_diff_line` for `Diff` entries and
+  Tool entries whose `ToolBody` is `Diff` **and** `done`),
+  `wire_pane(&Pane) -> WirePane`,
+  `wire_turn(&TurnStats, running: bool) -> WireTurn`,
+  `wire_status(&StatusInputs) -> WireStatus`, `wire_pane_id`/`core_pane_id`.
+- `src/session.rs`: `WebSession` exactly per §5 —
+  `pub async fn new(config: AgentConfig) -> anyhow::Result<Self>`,
+  `pub fn subscribe(&self) -> (Snapshot as ServerFrame, broadcast::Receiver<ServerFrame>)`
+  (snapshot built on demand, seq-stamped),
+  `pub async fn submit(&mut self, pane: WirePaneId, text: String)`, `cancel`,
+  `switch_pane`, `pub fn tick(&mut self)`,
+  `replay_after(seq) -> Option<Vec<ServerFrame>>`. Wrap the whole thing in
+  `pub struct SharedSession(Arc<tokio::sync::Mutex<WebSession>>)` with the tick
+  task spawned by `SharedSession::start(config)`.
+- Tests (`crates/hrdr-web/src/session.rs` `#[cfg(test)]`, using the mock-server
+  pattern from `hrdr-agent`'s turn-loop tests is NOT required — drive the fold
+  directly):
+  - `tick_broadcasts_entry_deltas` — `live.record(MAIN_KEY, Text("he"))`,
+    `tick()`, expect `Entries{from:0}` with one assistant entry;
+    `record(Text("llo"))`, `tick()`, expect `Entries{from:0}` again (same entry
+    mutated) whose text is `"hello"`; seq strictly increasing.
+  - `tick_is_quiet_when_nothing_changed` — two ticks, one delta.
+  - `tool_entries_carry_display_model` — record ToolStart/ToolEnd for `shell`,
+    assert the broadcast `WireEntryView.tool` is `Shell{command}`.
+  - `replay_after_returns_gap_or_none` — fill past `REPLAY_CAP`, assert old seq
+    → `None`, recent seq → the exact frames.
+  - `wire_entry_matches_core_entry_json` — for one Entry of every `EntryKind`
+    variant:
+    `serde_json::to_value(entry) == serde_json::to_value(wire_entry(entry))`.
+    **This is the drift tripwire — do not skip it.**
+- **Out of scope:** axum, auth, CLI, any HTTP; implementing `CommandHost` (slice
+  3); touching `hrdr-agent`/`hrdr-app` (nothing needs to change there).
+
+### Slice 3 — `feat(web): axum server, WS loop, and hrdr serve (loopback only)`
+
+**Goal:** `hrdr serve` works end-to-end from a WS client on 127.0.0.1.
+
+- `crates/hrdr-web/src/server.rs`:
+  `pub struct ServeConfig { bind: IpAddr, port: u16 }` (auth fields come in
+  slice 4; **hardcode loopback**: `serve()` returns an error if
+  `!bind.is_loopback()` with message "authentication is not implemented yet");
+  `pub async fn serve(session: SharedSession, cfg: ServeConfig) -> anyhow::Result<RunningServer>`;
+  `pub struct RunningServer { pub addr: SocketAddr, /* JoinHandle + shutdown */ }`
+  with `RunningServer::wait(self)` and `shutdown(self)`. Routes: `GET /healthz`
+  → `ok`; `GET /` → embedded placeholder page (a static `const INDEX: &str` with
+  a title and "connect a client to /ws" — replaced in slice 7); `GET /ws` →
+  upgrade.
+- WS handler: on connect send the snapshot frame, subscribe to broadcast,
+  forward frames as JSON text messages; read loop parses `ClientMsg` and calls
+  `submit`/`command`(slice 6 wires dispatch — until then reply
+  `Notice("commands land in a later slice")`)/`cancel`/`switch_pane`/`resume`
+  (`Resume` → `replay_after`; `Some(frames)` → send `Resumed{}` then frames;
+  `None` → send fresh snapshot). A lagged broadcast receiver
+  (`RecvError::Lagged`) → send fresh snapshot.
+- `apps/hrdr/src/main.rs`: add
+  `Command::Serve { bind: Option<String>, port: Option<u16> }`; the match arm
+  builds `AgentConfig` the same way `Run` does (it is already built above the
+  match), constructs `SharedSession::start(config).await?`, `serve(...)`, prints
+  `serving http://<addr>/ (Ctrl-C to stop)`, and `wait()`s.
+- Tests:
+  - `healthz_answers_ok` and `ws_snapshot_then_delta` — integration test in
+    `crates/hrdr-web/tests/server.rs`: start `serve` on port 0, connect with a
+    raw `tokio_tungstenite`-free approach: use `tokio::net::TcpStream` +
+    hand-rolled upgrade is error-prone — instead add dev-dependency
+    `tokio-tungstenite = "0.24"` to `hrdr-web` and use it. Assert first frame is
+    `snapshot`; `live.record`… is not reachable here, so assert a `submit`
+    against an unreachable model endpoint produces an `entries` frame containing
+    the user's message (the `Steered` fold) and eventually a `system` error
+    entry (the agent's error notice) — generous timeout, 30s.
+  - `serve_refuses_non_loopback` — `bind 0.0.0.0` → `Err` containing
+    "authentication".
+- Manual check: `cargo run -- serve` then `websocat ws://127.0.0.1:9911/ws` →
+  snapshot arrives; `{"type":"submit","pane":"main","text":"hi"}` → entries
+  frames stream.
+- **Out of scope:** auth of any kind, TLS, `--allow-remote`, the real UI,
+  dispatch/commands.
+
+### Slice 4 — `feat(web): auth (token + basic), [web] config, bind gating`
+
+**Goal:** every route and the WS upgrade are authenticated; the refuse-to-bind
+matrix is enforced; still no TLS (non-loopback therefore still impossible).
+
+- `crates/hrdr-web/src/config.rs`: `WebConfig` with **all** keys from §6,
+  `WebConfig::load(cli_overrides) -> (WebConfig, Vec<String> /*warnings*/)`
+  implementing file
+  (`#[derive(Deserialize)] struct WebFileConfig { web: Option<…> }` via
+  `hrdr_agent::read_config_file`) + `HRDR_WEB_*` env + CLI precedence.
+- `crates/hrdr-web/src/auth.rs`: token generation, argon2 verify, the rate
+  limiter, the constant-time comparisons, an axum middleware/extractor
+  `RequireAuth` applied to `/` , `/ws`, and every future route except
+  `/healthz`. `--hash-password` helper fn exported for the CLI.
+- Enforce the **entire** refuse-to-bind checklist from §6 in `serve()`
+  (non-loopback now errors on the TLS condition instead of the slice-3
+  placeholder).
+- Extend `Command::Serve` with `--auth`, `--allow-remote`, `--hash-password`
+  (bool flag: read stdin, print PHC hash, exit 0).
+- Tests: `token_auth_gates_ws_and_index` (401 without, 101/200 with);
+  `basic_auth_challenges_then_accepts`; `rate_limiter_locks_out_after_10`;
+  `bind_matrix` — table-driven over (loopback?, allow_remote, auth mode, tls
+  set?) asserting exactly the §6 outcomes (TLS rows expect the error since TLS
+  lands in slice 5).
+- **Out of scope:** SQLite users, cookies, TLS, UI.
+
+### Slice 5 — `feat(web): sqlite users, login cookie, TLS`
+
+**Goal:** the `users` backend and the built-in TLS path; a fully-gated
+non-loopback bind now actually works.
+
+- `crates/hrdr-web/src/users.rs`: DB open/create (`rusqlite`, schema in §6),
+  `add_user`, `remove_user`, `verify(username, password) -> bool`.
+- `POST /login` + cookie mint/verify per the §6 hardening checklist; WS/`/`
+  accept the cookie in `users` mode. `POST /logout` clears it.
+- TLS: when cert+key set, bind via
+  `axum_server::bind_rustls(addr, RustlsConfig::from_pem_file(cert, key).await?)`.
+- CLI: `--add-user`, `--remove-user`, `--users-db`, `--tls-cert`, `--tls-key`.
+- Tests: `login_sets_cookie_and_ws_accepts_it`;
+  `bad_password_401_and_rate_limited`; `cookie_tamper_rejected` (flip one byte
+  of the MAC); `add_then_remove_user`; `tls_serves_when_configured` (self-signed
+  cert generated in the test via `rcgen` dev-dependency, client with cert
+  verification disabled).
+- **Out of scope:** UI, dispatch.
+
+### Slice 6 — `feat(web): WebHost CommandHost + dispatch over WS`
+
+**Goal:** `ClientMsg::Command` runs every shared slash command.
+
+- `crates/hrdr-web/src/host.rs`:
+  `pub struct WebHost<'a> { session: &'a mut WebSession }` implementing
+  `hrdr_app::CommandHost`. Required methods (these have **no** default body —
+  implement all): `info` (broadcast `Notice`), `agent` (active pane's agent —
+  `live.handle(key)` fallback main, mirroring
+  `crates/hrdr-tui/src/app.rs:1666`), `cwd`, `base_url`, `model_ref`,
+  `set_model_ref`, `show_thinking`, `set_show_thinking`, `clear_conversation`
+  (reset main pane state + agent history exactly as the TUI's `/new` does: clear
+  `state.transcript`, `state.messages`, drop session id, broadcast full
+  snapshot), `session_id`, `set_session_label`, `autosave`
+  (`save_session(&panes.main().state)`), `resume` (adopt id + `Session::state`
+  into the main pane, rebuild agent history, broadcast snapshot),
+  `copy_to_clipboard` (return "clipboard isn't available over the web — select
+  the text in your browser"), `last_reply`, `transcript_text`,
+  `nth_message_text`, `line_poster` (clone of a
+  `tokio::sync::mpsc::UnboundedSender<(LineKind,String)>` drained by the tick
+  task into `Notice`/`Diff` entries), `is_busy`
+  (`live.is_running(MAIN_KEY) || live.is_compacting(MAIN_KEY)`), `send_prompt`
+  (route to `WebSession::submit`; `show_as_user=false` → enqueue without
+  display, i.e. `Steer::new(sent, String::new())`), `set_input`/`prepend_input`/
+  `insert_input` (broadcast `SetInput` with the matching mode),
+  `set_tool_expansion` (return "use the expand toggle on each tool block"),
+  `start_compaction` (spawn `hrdr_app` compaction the way
+  `crates/hrdr-tui/src/app.rs` `spawn_compaction` does — find it, copy the
+  pattern, post completion via `line_poster`). Overrides worth setting:
+  `supports_command` — return `false` for
+  `"edit" | "paste" | "copy" | "theme" | "reload"` (terminal-bound; `/help` then
+  hides them), `effort`, `session_label`, `context_usage`, `context_window`,
+  `session_tokens`, `session_cost`, `session_cost_partial` (all read the active
+  pane like the TUI host in `crates/hrdr-tui/src/app/commands.rs:459-482`).
+- WS `Command` handling: if `is_quit_command(line)` →
+  `Notice("use your browser's close button")`; else if it starts with `/` →
+  `dispatch(&mut WebHost{…}, &line)`; unknown command (dispatch returns false) →
+  `Notice("unknown command — /help")`.
+- Tests: `help_lists_only_supported_commands` (no `/edit`);
+  `status_command_reports_over_ws`; `new_clears_and_snapshots`;
+  `model_command_switches_model_ref` (use `/model local://other` against the
+  default provider; assert the pane's model string changes in the next `Panes`
+  frame).
+- **Out of scope:** UI; picker modals (the defaulted `begin_*_selector` methods
+  already degrade to text listings — leave them).
+
+### Slice 7 — `feat(web): dioxus client skeleton (embedded)`
+
+**Goal:** `hrdr serve` (built with `--features ui`) serves a real SPA that
+renders the transcript and sends messages.
+
+- Create `crates/hrdr-ui` (NOT a workspace member; confirm root `exclude`).
+  `dx.toml`/`Dioxus.toml` per Dioxus 0.6 web template; `main.rs` with: WS
+  connect to `ws(s)://<host>/ws` (carry `?token=` from the page URL through to
+  the upgrade), a `ServerFrame` reducer mirroring §4 semantics (`Entries{from}`
+  = truncate-then-extend; `Snapshot` = replace world), a transcript view (plain
+  `<pre>` text per entry kind for now), an input box + send button emitting
+  `Submit`, autoscroll-to-bottom.
+- `hrdr-web`: `ui` feature —
+  `#[derive(rust_embed::Embed)] #[folder = "../hrdr-ui/dist"] struct Assets;`
+  served at `/` and `/assets/*` with correct `Content-Type` (match extension;
+  `wasm` → `application/wasm`) when the feature is on. Document the build in
+  `crates/hrdr-ui/README.md`: `cargo install dioxus-cli --version ^0.6`,
+  `dx build --platform web --release`, then
+  `cargo run --features hrdr-web/ui -- serve`.
+- Acceptance: `cargo test` (workspace, feature off) green; with the feature on
+  and `dist/` built, browser at `http://127.0.0.1:9911/?token=…` shows the
+  transcript and a round-trip message. Client-side reducer logic that is pure
+  (frame → state) lives in `crates/hrdr-ui/src/state.rs` with host-runnable unit
+  tests (`cargo test` inside `crates/hrdr-ui` on the host target must pass —
+  keep DOM types out of `state.rs`).
+- **Out of scope:** styling beyond readable defaults, markdown, panes, status.
+
+### Slice 8 — `feat(web): transcript fidelity (markdown, tools, diffs, reasoning)`
+
+**Goal:** the transcript renders like the TUI's, adapted to HTML.
+
+- In `hrdr-ui`: assistant/user markdown via `pulldown-cmark` (HTML sanitized:
+  render to events, drop raw-HTML events entirely); tool blocks rendered from
+  `WireEntryView.tool` (shell = `$ command` + output, code = `<pre>` with the
+  lang class, details = key/value rows, read = tail of result, spinner while
+  `done == false`, ✓/✗ by `ok`, collapsed result with an expand toggle —
+  client-side state only); diff blocks colored from `diff_lines`; reasoning
+  entries collapsed by default behind "Thought for X s" (`took_ms`), hidden
+  entirely when `show_thinking` is false; `notice`/`system`/`stats` styled as
+  dim lines.
+- Code highlighting: NOT in this slice (post-parity list) — a `<pre>` with the
+  language class is the deliverable.
+- Acceptance: unit tests in `state.rs`/`render.rs` for pure helpers
+  (markdown-sanitize drops `<script>`, diff colors map 1:1 from
+  `WireDiffLineKind`); manual browser pass over a session exercising a shell
+  tool, an edit (diff), and reasoning.
+- **Out of scope:** status bar, panes, todos, pickers.
+
+### Slice 9 — `feat(web): status bar, turn loader, todos`
+
+**Goal:** the chrome reaches parity.
+
+- `hrdr-ui`: header renders `WireStatus` segments (role → CSS class; the ctx
+  gauge from `WireGauge` as a real bar), right side the session badge; a footer
+  loader while the active pane's `WireTurn.running` (spinner + `tok_per_sec` +
+  elapsed, hidden while `!inferring` exactly like the TUI hides it during tool
+  calls); a collapsible todo panel from the active `WirePane.todos`; the
+  pending-message queue rendered under the transcript from `WirePane.pending`.
+- Acceptance: `state.rs` tests: status frame replaces status; todos follow the
+  **active** pane. Manual: watch tok/s tick during a streamed reply.
+- **Out of scope:** panes UI (next slice).
+
+### Slice 10 — `feat(web): sub-agent panes`
+
+**Goal:** delegated sub-agents are visible, switchable, and drivable.
+
+- `hrdr-ui`: pane tab bar (desktop) that collapses to a drawer under 640px
+  width, built from the `Panes` frame (main first — server sends them in
+  `pane_rows` order); marker per `WirePaneStatus` (running spinner / ✓ / ·);
+  switching sends `SwitchPane` AND locally re-renders from the already-held
+  per-pane transcript (all pane transcripts arrive in the snapshot and stay
+  updated by `Entries` frames — the client holds them all); input box submits to
+  the active pane; per-pane draft preserved on switch (client-side map).
+- `hrdr-web`: `switch_pane` calls `panes.focus(core_pane_id(id))` then an
+  immediate `tick()` — focus drives the **pin** that keeps the viewed sub-agent
+  alive (see `PaneSet::sync` pinning), so it must reach the server even though
+  rendering is client-side. Hide the tab bar when only main exists
+  (`PaneSet::show_switcher` semantics — client checks `panes.len() == 1`).
+- Acceptance: `hrdr-web` test `switching_pins_the_viewed_subagent` (register a
+  finished+delivered sub in `LiveSubagents` like
+  `crates/hrdr-agent/src/pane.rs`'s `live_with` test helper does, switch to it
+  over the session API, `prune()`, tick, assert its pane survives in the next
+  `Panes` frame); client `state.rs` test: entries route to the right pane.
+- **Out of scope:** steering UX niceties; per-pane status bar variations (status
+  already follows the active pane from slice 2).
+
+### Slice 11 — `feat(web): command palette + input polish`
+
+**Goal:** every slash command is reachable comfortably.
+
+- `hrdr-ui`: typing `/` at the start of the empty input opens a filterable
+  command palette fed from a `Commands` list — add to the **snapshot** a field
+  `commands: Vec<WireCommand { name: String, desc: String }>` (protocol + server
+  change in the same slice: server filters `SLASH_COMMANDS` through
+  `WebHost::supports_command`); Enter on a palette row inserts the command;
+  lines starting with `/` go out as `Command`, everything else as `Submit`;
+  `SetInput` frames drive the box (replace/prepend/insert); Escape cancels the
+  running turn (sends `Cancel`) after a confirm.
+- Mobile: sticky bottom input, `viewport-fit` + keyboard-aware scroll
+  (`scrollIntoView` on focus), 44px touch targets on tabs/toggles.
+- Acceptance: protocol test updated for the snapshot field; client test: palette
+  filters by substring; manual phone-width pass (devtools) of slices 7–11
+  screens.
+- **Out of scope:** modal pickers (text fallbacks remain), themes.
+
+### Slice 12 — `feat(web): reconnect polish + release wiring`
+
+**Goal:** flaky-network resilience and the release checklist.
+
+- `hrdr-ui`: on WS close — exponential backoff reconnect (1s→30s cap) sending
+  `Resume{seq}`; on `Resumed` continue, on fresh `Snapshot` replace state; a
+  "reconnecting…" banner; page-visibility handler reconnects immediately on
+  foreground (mobile background-resume).
+- `hrdr-web`: idle WS ping every 30s (axum WS ping frame), drop after 2 missed
+  pongs.
+- CI (`.github/workflows/ci.yml`): one new job `web-ui` — install `dx`, build
+  `hrdr-ui` release, record gzipped `.wasm` size in the job summary and fail
+  over a 3 MB gzipped budget; runs only on linux.
+- README: a `## Web UI` section (serve quickstart, auth modes, the reverse-
+  proxy TLS recipe, the webview caveats table from the old plan).
+- Acceptance: kill/restart the server mid-stream → client resumes or resnapshots
+  without duplicated entries (client test on the reducer:
+  `resume_replay_is_idempotent` — applying the same `Entries` frame twice yields
+  the same state); CI job green.
+- **Out of scope:** nothing new — this closes the parity target.
+
+## 8. Deferred (post-parity — keep this list, delete finished slices above)
+
+- Session-browser UI (list + open other sessions from the client; server gains
+  `list_sessions()`-backed message pair).
+- Syntax highlighting in code blocks (syntect-wasm or highlight.js interop).
+- Modal pickers (model/effort/theme/session) as bottom sheets over the
+  `begin_*_selector` hooks.
+- v2: attach to a live TUI session (requires making event-log compaction
+  min-cursor-aware across readers — see correction 2).
+- Native desktop/mobile shell (webview over embedded `hrdr-web`).
+- Read-only/observer auth mode.
+
+## 9. Pitfalls for the implementer
+
+1. **Never re-implement fold/classify client-side.** If you find yourself
+   parsing tool args or diffing text in `hrdr-ui`, stop — the server already
+   sent it in `WireEntryView`.
+2. **Entries mutate in place** (streamed text, tool results, reasoning close).
+   Delta = hash-diff tail replacement (§5), never append-only.
+3. **Do not read the `LiveSubagents` event log from the web layer.**
+   `PaneSet::sync` compacts it; a second reader loses events. All fan-out goes
+   through `WebSession`'s replay buffer.
+4. **Do not fold events into transcripts yourself** on the submit path —
+   `send_prompt`/`record` + the tick's `sync` already do; hand-folding shows
+   every message twice (the TUI comment at `app.rs:1616` explains).
+5. **Do not touch `hrdr-tui`** or add web deps to `hrdr-agent`/`hrdr-app`/
+   `hrdr-tools`/`hrdr-llm`. New deps live in `hrdr-web`/`hrdr-ui` only.
+6. **`hrdr-ui` must stay out of the workspace** (`exclude`), or host-side
+   `cargo clippy --all-targets` breaks on wasm-only deps.
+7. rust-analyzer diagnostics in this repo are often stale — trust only
+   `cargo build`/`clippy`/`test` output.
+8. There is a known ~3s-timeout flake in a background-transcript test
+   (`hrdr-agent`). If an unrelated test with a 3s timeout fails once, rerun
+   before investigating.
+9. Tests that touch `$HOME`/XDG (sessions, config, the users DB default path)
+   need the `hrdr-test-support` ctor — it is wired via the
+   `#[cfg(test)] extern crate hrdr_test_support;` line; do not remove it, and in
+   tests prefer explicit temp paths (`--users-db`) anyway.
+10. `Instant`/`SystemTime` (in `TurnStats`) and `DateTime<Local>` never cross
+    the wire — only the derived numbers in `WireTurn` and unix seconds do.
+11. axum 0.8 route syntax is `/{param}` (not `/:param`), and WS upgrades need
+    the `ws` feature — both are already decided in §3; don't downgrade axum to
+    match an old example.
+12. The steering queue is `Arc<std::sync::Mutex<…>>` (sync mutex, fine to lock
+    briefly in async code); the agent is `Arc<tokio::sync::Mutex<Agent>>` and is
+    held for a **whole turn** — never `lock().await` it from the tick/WS path
+    while a turn may be running; go through `LiveSubagents` accessors, which
+    read the registry, not the agent.
