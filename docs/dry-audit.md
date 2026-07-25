@@ -260,9 +260,16 @@ is legitimate.
 ## 15. `ignore::WalkBuilder` patterns — DAMP ✅
 
 4 files build `ignore::WalkBuilder`: `find.rs`, `grep.rs`, `tree.rs`,
-`replace.rs`. `grep.rs` already extracted its own `ignore_walker` helper;
-`find.rs` has an inline copy differing only in `max_depth` and `parents`.
-`tree.rs` and `replace.rs` use intentionally different configurations.
+`replace.rs`. `tree.rs` and `replace.rs` use intentionally different
+configurations (variable `max_depth` and no ignore toggles in `tree.rs`;
+`hidden(false)` with no `.gitignore` handling at all in `replace.rs`) — the DAMP
+verdict is theirs.
+
+**Correction (2026-07-25):** this entry recorded `find.rs` as holding an inline
+copy "differing only in `max_depth` and `parents`". They had since converged to
+a byte-identical chain, making that WET rather than DAMP — see `seam-audit.md`
+#3, fixed in `19c22cc`: `ignore_walker(root, hidden, no_ignore)` now lives in
+`tools/mod.rs` and serves `find` and both of `grep`'s built-in variants.
 
 ## 16. `strip_prefix(&ctx.cwd).unwrap_or(&path).display()` — DRY ✅
 

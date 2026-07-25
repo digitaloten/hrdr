@@ -162,7 +162,7 @@ only fails on Windows, where it creates a Job Object.
 separate contexts for spawn and attach failure, and one call means one context,
 so a Windows attach failure now surfaces under `"spawning command"`.
 
-## 3. `find.rs` and `grep.rs` build a byte-identical `WalkBuilder` — WET ⚠️
+## 3. `find.rs` and `grep.rs` build a byte-identical `WalkBuilder` — FIXED ✅ (`19c22cc`)
 
 **Concern:** the ignore-aware directory walk. **Should be owned by:**
 `ignore_walker`, which already exists in `grep.rs:309` but is private to that
@@ -194,7 +194,12 @@ and `replace.rs` stay as they are — their configurations are genuinely differe
 no `.gitignore` handling at all in `replace.rs`), so `dry-audit.md` #15's DAMP
 verdict still holds for those two.
 
-## 4. `is_anthropic_native` re-derives a `Backend` decision from a display string — WET ⚠️
+**Fixed** (`19c22cc`): `ignore_walker(root, hidden, no_ignore)` now lives in
+`tools/mod.rs` with the other shared helpers; `grep`'s two built-in variants and
+`find` all call it. `dry-audit.md` #15 has been corrected — it recorded find's
+copy as differing in `max_depth` and `parents`, which had stopped being true.
+
+## 4. `is_anthropic_native` re-derives a `Backend` decision from a display string — FIXED ✅ (`19c22cc`)
 
 **Concern:** "is this endpoint the native Anthropic Messages API." **Should be
 owned by:** `Backend` / `detect_backend` in `hrdr-llm`, which already knows —
@@ -225,6 +230,18 @@ side, and there is no test pinning it — no `config.rs` test exercises an
 `detect_backend`, backed by `detect_backend(base_url) == Backend::Anthropic`
 with no string in the middle, and have `config.rs` call it. Trivial, and it
 gives `wire_protocol` its single documented purpose back.
+
+**Fixed** (`19c22cc`). The local `is_anthropic_native` wrapper was kept rather
+than inlined: it reads in parallel with its peer `is_openrouter` on the same
+`resolve_cache_mode` arm, and its name states the _consequence_ —
+`cache_control` actually caches here — that the generic predicate does not.
+`wire_protocol` now has no caller outside its display purpose.
+
+Correction to the claim above: the path was **not** entirely untested —
+`hrdr-agent/src/lib.rs` already asserted `api.anthropic.com` → `Ephemeral`. The
+new `config.rs` test is still worth having (it sits next to the code and pins
+the negative gateway case plus a `notanthropic.com` lookalike that must not
+satisfy the suffix check), but the behaviour was not unguarded.
 
 ---
 
@@ -311,16 +328,18 @@ so a future dialect finds it.
 | --- | ------------------------------------------- | ------------------ |
 | 1   | `HRDR_LOG_REQUESTS` OpenAI-only             | FIXED ✅ `579e286` |
 | 2   | Process-group kill at 5 spawn sites         | FIXED ✅ `3fb99b5` |
-| 3   | `find.rs`/`grep.rs` identical `WalkBuilder` | WET ⚠️             |
-| 4   | `is_anthropic_native` string dispatch       | WET ⚠️             |
+| 3   | `find.rs`/`grep.rs` identical `WalkBuilder` | FIXED ✅ `19c22cc` |
+| 4   | `is_anthropic_native` string dispatch       | FIXED ✅ `19c22cc` |
 
 Verdict: **the seams are in better shape than the shell case suggested.** Four
 of the seven concerns with real variants already own their differences properly,
 and two more (`GrepBackend`, `Transport`) are enum-dispatched without
 catch-alls. The one finding that mattered was #1 — a feature that silently did
 nothing on two thirds of its surface, the same three-parallel-implementations
-shape that produced security finding O4 — and it is fixed, along with #2. **#3
-and #4 remain open**; both are maintenance hygiene, neither urgent.
+shape that produced security finding O4 — and it is fixed, along with the three
+maintenance findings. **All four are closed**; what remains in this document is
+the precedents, the DAMP verdicts, and the rationale for what was deliberately
+left duplicated.
 
 The recurring lesson from both O4 and #1 is narrower than "unify the backends":
 **`hrdr-llm` has three streaming paths, and an invariant added to one of them
