@@ -176,6 +176,24 @@ pub(crate) async fn path_exists(path: &std::path::Path) -> bool {
     tokio::fs::try_exists(path).await.unwrap_or(false)
 }
 
+/// Build the ignore-aware `ignore::Walk` shared by the search tools (`grep`'s
+/// two built-in walker variants and `find`), honoring `hidden` (dotfiles) and
+/// `no_ignore` (`.gitignore`, `.ignore`, git global/local excludes). Both flags
+/// default to skipping — matching ripgrep's defaults — and are passed through
+/// per call, so `hidden: true` means "also walk dotfiles" and `no_ignore: true`
+/// means "also walk ignored paths".
+pub(crate) fn ignore_walker(root: &std::path::Path, hidden: bool, no_ignore: bool) -> ignore::Walk {
+    ignore::WalkBuilder::new(root)
+        .max_depth(Some(20))
+        .hidden(!hidden)
+        .ignore(!no_ignore)
+        .git_ignore(!no_ignore)
+        .git_global(!no_ignore)
+        .git_exclude(!no_ignore)
+        .parents(!no_ignore)
+        .build()
+}
+
 /// `path` displayed relative to `cwd`, falling back to the full path when it
 /// lies outside — the short form the tools show the model.
 pub(crate) fn rel_display<'a>(

@@ -6827,7 +6827,7 @@ mod tests {
     }
 
     #[test]
-    fn is_anthropic_native_defers_to_hrdr_llm_wire_protocol() {
+    fn is_anthropic_native_defers_to_hrdr_llm_backend_detection() {
         use super::is_anthropic_native;
         assert!(is_anthropic_native("https://api.anthropic.com/v1"));
         assert!(is_anthropic_native("https://eu.anthropic.com/v1"));

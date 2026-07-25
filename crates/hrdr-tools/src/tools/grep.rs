@@ -302,22 +302,6 @@ fn compile_pattern(a: &GrepArgs) -> Result<regex::Regex> {
         .with_context(|| format!("invalid regex: {}", a.pattern))
 }
 
-/// Build the shared `ignore::WalkBuilder` used by both built-in walker
-/// variants, honoring `hidden` (dotfiles) and `no_ignore` (`.gitignore`,
-/// `.ignore`, git global/local excludes). Both default to skipping — matching
-/// ripgrep's defaults — and are overridable per call.
-fn ignore_walker(root: &std::path::Path, a: &GrepArgs) -> ignore::Walk {
-    ignore::WalkBuilder::new(root)
-        .max_depth(Some(20))
-        .hidden(!a.hidden)
-        .ignore(!a.no_ignore)
-        .git_ignore(!a.no_ignore)
-        .git_global(!a.no_ignore)
-        .git_exclude(!a.no_ignore)
-        .parents(!a.no_ignore)
-        .build()
-}
-
 /// Pure-Rust search fallback: walk the tree (honoring `.gitignore`) and match
 /// each line with a regex. Used when neither ripgrep nor grep is installed.
 pub(crate) fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
@@ -339,7 +323,7 @@ pub(crate) fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
 
     let mut out = String::new();
     let mut matches = 0usize;
-    let walker = ignore_walker(&root, a);
+    let walker = super::ignore_walker(&root, a.hidden, a.no_ignore);
     'walk: for entry in walker.flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -437,7 +421,7 @@ fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     let mut out = String::new();
     let mut matches = 0usize;
 
-    'walk: for entry in ignore_walker(&root, a).flatten() {
+    'walk: for entry in super::ignore_walker(&root, a.hidden, a.no_ignore).flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }

@@ -451,6 +451,17 @@ pub fn wire_protocol(base_url: &str) -> &'static str {
     }
 }
 
+/// Whether hrdr will speak the **native Anthropic Messages API** at `base_url`.
+///
+/// The predicate form of [`detect_backend`] for callers outside this crate, which
+/// cannot see the private [`Backend`]. It exists so a caller that needs the
+/// *decision* (does this endpoint consume `cache_control`?) asks for the decision
+/// instead of string-comparing [`wire_protocol`]'s display name — that name is for
+/// showing a human, and a rename there must not silently flip a behaviour.
+pub fn is_anthropic_backend(base_url: &str) -> bool {
+    detect_backend(base_url) == Backend::Anthropic
+}
+
 /// Header names that carry a credential. Only the client's own auth may set one
 /// of these — see [`apply_extra_headers`].
 const AUTH_HEADER_NAMES: [&str; 3] = ["authorization", "x-api-key", "api-key"];

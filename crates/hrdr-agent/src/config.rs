@@ -53,7 +53,7 @@ use crate::models::model_for_provider;
 use crate::oauth::has_oauth_credentials;
 
 use hrdr_llm::CacheMode;
-use hrdr_llm::{url_host, wire_protocol};
+use hrdr_llm::{is_anthropic_backend, url_host};
 use hrdr_tools::{DEFAULT_MAX_OUTPUT, DEFAULT_MAX_OUTPUT_LINES};
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -1796,9 +1796,11 @@ pub fn resolve_cache_mode(setting: Option<&str>, base_url: &str) -> CacheMode {
 
 /// Whether `base_url` is Anthropic's own host — hrdr speaks the native Messages
 /// API there, so `cache_control` breakpoints actually cache (unlike the
-/// OpenAI-compat endpoint, which drops them).
+/// OpenAI-compat endpoint, which drops them). The host-matching itself belongs to
+/// hrdr-llm, which decides the wire protocol; this only names what that decision
+/// means for caching.
 pub(crate) fn is_anthropic_native(base_url: &str) -> bool {
-    wire_protocol(base_url) == "Anthropic"
+    is_anthropic_backend(base_url)
 }
 
 /// Whether `base_url` points at a server on this machine (or an explicitly
@@ -1987,6 +1989,48 @@ pub(crate) fn provider_config(base_url: &str) -> ProviderConfig {
     ProviderConfig {
         base_url: base_url.to_string(),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod cache_mode_tests {
+    use super::*;
+
+    /// The `auto` branch's Anthropic arm, pinned end to end. It is decided by
+    /// hrdr-llm's backend detection (host-keyed), so the assertions below are the
+    /// only thing that would notice if that seam stopped agreeing with what
+    /// `is_anthropic_native` promises — `cache_control` breakpoints emitted only
+    /// where the native Messages API will actually honour them.
+    #[test]
+    fn auto_enables_caching_on_the_anthropic_backend_only() {
+        // Anthropic's own host, and a subdomain of it: native Messages API → on.
+        assert_eq!(
+            resolve_cache_mode(None, "https://api.anthropic.com/v1"),
+            CacheMode::Ephemeral
+        );
+        assert_eq!(
+            resolve_cache_mode(Some("auto"), "https://eu.anthropic.com/v1"),
+            CacheMode::Ephemeral
+        );
+        assert!(is_anthropic_native("https://api.anthropic.com/v1"));
+
+        // An OpenAI-compat gateway is not the Anthropic backend even when it
+        // serves Claude models: the marker would be rejected or ignored → off.
+        assert_eq!(
+            resolve_cache_mode(None, "https://api.together.xyz/v1"),
+            CacheMode::Off
+        );
+        assert_eq!(
+            resolve_cache_mode(Some("auto"), "http://localhost:1234/v1"),
+            CacheMode::Off
+        );
+        assert!(!is_anthropic_native("https://api.together.xyz/v1"));
+
+        // A lookalike host must not satisfy the `.anthropic.com` suffix check.
+        assert_eq!(
+            resolve_cache_mode(None, "https://notanthropic.com/v1"),
+            CacheMode::Off
+        );
     }
 }
 

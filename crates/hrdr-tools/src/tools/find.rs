@@ -52,21 +52,13 @@ impl Tool for FindTool {
         let pat = glob::Pattern::new(&a.pattern)
             .with_context(|| format!("invalid glob pattern: {}", a.pattern))?;
 
-        // Walk with `ignore::WalkBuilder` so `.gitignore` / `.ignore` rules are
-        // honoured by default and build artifacts (`target/`, `node_modules/`, …)
-        // are skipped automatically — same as hidden `.git/` and other dotfiles.
-        // Both are overridable via `hidden` / `no_ignore` — the same flags
-        // `grep` exposes on its identical walker.
+        // Walk with the shared ignore-aware walker so `.gitignore` / `.ignore`
+        // rules are honoured by default and build artifacts (`target/`,
+        // `node_modules/`, …) are skipped automatically — same as hidden `.git/`
+        // and other dotfiles. Both are overridable via `hidden` / `no_ignore` —
+        // the same flags `grep` exposes on the same walker.
         let mut paths: Vec<String> = Vec::new();
-        let walker = ignore::WalkBuilder::new(&ctx.cwd)
-            .max_depth(Some(20))
-            .hidden(!a.hidden)
-            .ignore(!a.no_ignore)
-            .git_ignore(!a.no_ignore)
-            .git_global(!a.no_ignore)
-            .git_exclude(!a.no_ignore)
-            .parents(!a.no_ignore)
-            .build();
+        let walker = super::ignore_walker(&ctx.cwd, a.hidden, a.no_ignore);
         for entry in walker.flatten() {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
