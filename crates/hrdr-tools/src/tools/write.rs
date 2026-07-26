@@ -13,6 +13,17 @@ pub struct WriteTool;
 
 #[derive(Deserialize)]
 struct WriteArgs {
+    // Same path-name synonyms `read` accepts (see `ReadArgs`): a model trained
+    // on `file_path`/`file` shouldn't lose the call to a "missing field `path`".
+    // Only the one path field exists here, so the aliases are unambiguous.
+    #[serde(
+        alias = "file_path",
+        alias = "filepath",
+        alias = "file",
+        alias = "filename",
+        alias = "file_name",
+        alias = "path_to_file"
+    )]
     path: String,
     content: String,
 }
@@ -123,6 +134,17 @@ pub(crate) fn unified_diff(path: &str, old: &str, new: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `read` path-name synonyms work here too — a call spelled `file` (or
+    /// `file_path`) must not die on a "missing field `path`".
+    #[test]
+    fn write_args_accept_path_aliases() {
+        for key in ["file", "file_path", "filename", "path"] {
+            let a: WriteArgs = serde_json::from_value(json!({key: "x", "content": "c"}))
+                .unwrap_or_else(|e| panic!("alias {key:?}: {e}"));
+            assert_eq!(a.path, "x");
+        }
+    }
 
     /// A file with a line over `MAX_LINE` bytes is `Partial` after a normal read
     /// (which clips that line every time), so `write` refuses — but the refusal

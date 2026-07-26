@@ -62,6 +62,16 @@ pub struct EditTool;
 
 #[derive(Deserialize)]
 struct EditArgs {
+    // Same path-name synonyms `read` accepts (see `ReadArgs`) — unambiguous
+    // here, this tool takes exactly one path.
+    #[serde(
+        alias = "file_path",
+        alias = "filepath",
+        alias = "file",
+        alias = "filename",
+        alias = "file_name",
+        alias = "path_to_file"
+    )]
     path: String,
     old_string: String,
     new_string: String,
@@ -229,6 +239,18 @@ impl Tool for EditTool {
 mod tests {
     use super::*;
     use crate::ToolContext;
+
+    /// The `read` path-name synonyms work here too — a call spelled `file` (or
+    /// `file_path`) must not die on a "missing field `path`".
+    #[test]
+    fn edit_args_accept_path_aliases() {
+        for key in ["file", "file_path", "filename", "path"] {
+            let a: EditArgs =
+                serde_json::from_value(json!({key: "x", "old_string": "a", "new_string": "b"}))
+                    .unwrap_or_else(|e| panic!("alias {key:?}: {e}"));
+            assert_eq!(a.path, "x");
+        }
+    }
 
     /// A file over `read`'s size cap is refused before `read_to_string` would
     /// buffer it whole, and the byte count is in the message so the model knows

@@ -296,6 +296,16 @@ pub struct DeleteTool;
 
 #[derive(Deserialize)]
 struct DeleteArgs {
+    // Same path-name synonyms `read` accepts (see `ReadArgs`) — unambiguous
+    // here, unlike `move`/`copy`, which take two paths.
+    #[serde(
+        alias = "file_path",
+        alias = "filepath",
+        alias = "file",
+        alias = "filename",
+        alias = "file_name",
+        alias = "path_to_file"
+    )]
     path: String,
     #[serde(default)]
     recursive: bool,
@@ -457,6 +467,18 @@ impl Tool for CopyTool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `delete` takes exactly one path, so it accepts the same path-name
+    /// synonyms as `read`. `move`/`copy` take two and deliberately don't.
+    #[test]
+    fn delete_args_accept_path_aliases() {
+        for key in ["file", "file_path", "filename", "path"] {
+            let a: DeleteArgs = serde_json::from_value(json!({key: "x"}))
+                .unwrap_or_else(|e| panic!("alias {key:?}: {e}"));
+            assert_eq!(a.path, "x");
+        }
+        assert!(serde_json::from_value::<MoveArgs>(json!({"file": "x", "to": "y"})).is_err());
+    }
 
     /// A context whose files all count as already read, so the read-before-
     /// destroy gate doesn't obscure what a test is actually checking.

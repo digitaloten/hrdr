@@ -238,6 +238,24 @@ mod tests {
         assert!(out.contains("data"), "got: {out}");
     }
 
+    /// The alias set at the deserialization seam, including the `file` spelling
+    /// models reach for most often after `file_path`.
+    #[test]
+    fn read_args_accept_path_aliases_and_reject_a_doubled_path() {
+        let a: ReadArgs = serde_json::from_value(json!({"file": "x"})).unwrap();
+        assert_eq!(a.path, "x");
+        let a: ReadArgs = serde_json::from_value(json!({"path": "x"})).unwrap();
+        assert_eq!(a.path, "x");
+        // Pinned serde behavior: a canonical field *and* one of its aliases in
+        // the same object is a duplicate-field error, not last-wins — so an
+        // ambiguous call fails loudly instead of silently picking one path.
+        let err = match serde_json::from_value::<ReadArgs>(json!({"path": "a", "file": "b"})) {
+            Ok(a) => panic!("a doubled path should not deserialize (got {})", a.path),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("duplicate field"), "{err}");
+    }
+
     /// A model trained on `file_path` (Claude's native Read) — or another common
     /// alias — still lands the call instead of erroring on a missing `path`.
     #[tokio::test]
