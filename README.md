@@ -49,6 +49,96 @@ sudo dpkg -i hrdr_*.deb
 sudo rpm -i hrdr-*.rpm
 ```
 
+## Web UI
+
+`hrdr serve` starts a headless session host with an HTTP+WebSocket API and an
+optional Dioxus SPA (browser UI). Connect a browser, any WS client, or a future
+native desktop shell — they all speak the same protocol.
+
+**Quickstart (loopback only, no setup):**
+
+```bash
+hrdr serve
+# prints: open http://127.0.0.1:9911/?token=<32-char-random>
+```
+
+Open the URL in a browser. Only localhost is allowed by default.
+
+**Serve with the built-in SPA (optional):**
+
+```bash
+# Build the Dioxus WASM app (requires wasm32 target).
+rustup target add wasm32-unknown-unknown
+cargo install --locked dioxus-cli@0.7
+cd crates/hrdr-ui && dx build --platform web --release && cd ../..
+
+# Serve with the UI embedded.
+cargo run --features hrdr-web/ui -- serve
+```
+
+Open `http://127.0.0.1:9911/?token=<token>` in a browser.
+
+**Auth modes (`--auth` / `[web]` table in config.toml):**
+
+| Mode    | How                                       | Loopback only?                            |
+| ------- | ----------------------------------------- | ----------------------------------------- |
+| `token` | 32-byte random URL-safe token (default)   | Yes — refuses non-loopback bind           |
+| `basic` | HTTP Basic against an argon2id hash       | Loopback without TLS; remote requires TLS |
+| `users` | SQLite-backed login, `POST /login` cookie | Loopback without TLS; remote requires TLS |
+
+**Basic setup:**
+
+```bash
+hrdr serve --hash-password          # read password from stdin, print hash
+# Add to config.toml: [web] auth="basic" basic_user="you" basic_password_hash="<hash>"
+hrdr serve
+```
+
+**Users setup:**
+
+```bash
+hrdr serve --add-user alice          # read password from stdin
+hrdr serve --remove-user alice
+hrdr serve --auth users              # POST /login, session cookie
+```
+
+**TLS (required for non-loopback access):**
+
+```toml
+# config.toml
+[web]
+bind = "0.0.0.0"
+allow_remote = true
+auth = "basic"
+basic_user = "you"
+basic_password_hash = "<argon2 hash>"
+tls_cert_path = "/etc/ssl/hrdr.crt"
+tls_key_path = "/etc/ssl/hrdr.key"
+```
+
+```bash
+hrdr serve --allow-remote --auth basic --tls-cert /etc/ssl/hrdr.crt --tls-key /etc/ssl/hrdr.key
+```
+
+**Reverse-proxy path** (battle-tested alternative to built-in TLS): bind
+`127.0.0.1:9911` with token auth and put nginx/Caddy in front terminating TLS.
+
+**Env vars:** `HRDR_WEB_BIND`, `HRDR_WEB_PORT`, `HRDR_WEB_AUTH`,
+`HRDR_WEB_BASIC_USER`, `HRDR_WEB_ALLOW_REMOTE`, `HRDR_WEB_TLS_CERT`,
+`HRDR_WEB_TLS_KEY`, `HRDR_WEB_USERS_DB`.
+
+**Webview caveats (read before picking a shell):**
+
+| Issue                                           | Workaround / Status            |
+| ----------------------------------------------- | ------------------------------ |
+| Dioxus `dx build` needs a pinned CLI (`0.7`)    | `cargo install --locked` above |
+| `hrdr-ui` is not a workspace member             | Built exclusively with `dx`    |
+| Rust-analyzer sees WASM-only deps as unresolved | Ignore — only `cargo` matters  |
+
+**Post-parity list** (deferred to a later release): session-browser UI
+(list/switch), syntax highlighting in code blocks, modal pickers (model/effort),
+native desktop/mobile shell, and read-only observer auth.
+
 ## Design
 
 - **Provider-agnostic client.** Speaks clean OpenAI chat-completions with native

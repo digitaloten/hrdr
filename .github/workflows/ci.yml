@@ -167,6 +167,61 @@ jobs:
           done
           cargo run --locked -q -p hrdr -- --man > /dev/null
 
+  web-ui:
+    name: web-ui (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: wasm32-unknown-unknown
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          cache: false
+      - run: rustup update --no-self-update stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Dioxus CLI
+        run: cargo install --locked dioxus-cli@0.7
+      - name: Build hrdr-ui WASM
+        working-directory: crates/hrdr-ui
+        run: dx build --platform web --release
+      - name: Copy build output to dist/
+        working-directory: crates/hrdr-ui
+        shell: bash
+        run: |
+          # dx prints the output path — capture it.
+          DX_OUT=$(dx build --platform web --release 2>&1 | grep -oE 'target/dx/hrdr-ui/[^ ]+' | head -1 || true)
+          if [ -z "$DX_OUT" ]; then
+            # Fallback: find the newest dir.
+            DX_OUT=$(find target/dx/hrdr-ui -type d -name 'release' | head -1)
+          fi
+          if [ -d "$DX_OUT" ]; then
+            rm -rf dist
+            cp -r "$DX_OUT" dist
+          fi
+      - name: Check gzipped WASM size
+        working-directory: crates/hrdr-ui
+        shell: bash
+        run: |
+          WASM=$(find dist -name '*.wasm' | head -1)
+          if [ -z "$WASM" ]; then
+            echo "::warning::No .wasm file found in dist/"
+            exit 0
+          fi
+          SIZE=$(gzip -c "$WASM" | wc -c)
+          echo "gzipped WASM size: ${SIZE} bytes"
+          echo "gzipped_wasm_bytes=${SIZE}" >> "$GITHUB_STEP_SUMMARY"
+          MAX=$((3 * 1024 * 1024))
+          if [ "$SIZE" -gt "$MAX" ]; then
+            echo "::error::gzipped WASM ${SIZE} bytes exceeds ${MAX} byte budget"
+            exit 1
+          fi
+
   # Runs on every main push (dry-run) and every v* tag / dispatch. Skips
   # PRs. Artifact upload happens always; publishing to the GitHub Release
   # is a separate tag-gated job. This catches packaging breakage before a
