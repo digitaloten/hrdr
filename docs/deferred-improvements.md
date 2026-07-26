@@ -200,3 +200,32 @@ items — they are rules.
   produced security finding O4 (duplicate auth header) and a wire log that
   silently covered only one backend. Anything cross-cutting added to
   `client.rs`'s request path must be checked against the other two.
+- **A new tool picks its interface shape by rule, not by taste** (taxonomy from
+  the 2026-07-27 survey of all 31 tools). The shape is load-bearing: the
+  harness's cross-cutting layer (read-guard, staleness culprit naming, secret
+  guard, LSP-on-edit, spool nudges) keys on JSON-schema'd fields, so a tool the
+  harness cannot introspect is a tool it cannot protect.
+  - _Default_ — one noun-tool, flat args object: one capability, one required
+    primary arg, the rest optional flags (`read`, `edit`, `grep`).
+  - _`action` enum_ — several **mutating** verbs over one resource sharing one
+    field vocabulary (`memory`: view/write/edit/delete/search over
+    name/description/body/scope).
+  - _`mode` enum_ — **read-only** views of one dataset (`models`:
+    current/providers/models).
+  - _Separate prefix-family tools_ — verbs with distinct schemas or distinct
+    read-only gating (`task_*`: spawn takes description/prompt/model, diff takes
+    commit, cleanup takes force). One mega-schema would leave most fields
+    meaningless per action — that is the real hallucination trap.
+  - _CLI args-array passthrough_ — reserved for wrapping an **existing,
+    well-known** CLI behind an allowlist (`git`). Never the shape for a bespoke
+    tool: model CLI fluency comes from CLIs seen in training, so an invented CLI
+    grammar is less familiar than JSON function-calling, gives no field-level
+    guidance, reimports shell-escaping failure modes, and blinds the
+    cross-cutting layer. A model that wants raw CLI already has `shell`.
+  - _Time is seconds, always_ — `timeout_secs`, `interval_secs`; never `_ms` in
+    a model-facing schema (`shell.timeout_ms` renamed 2026-07-27, old name
+    poisoned).
+  - _Shared vocabulary across tools_ — one concept keeps one field name and one
+    default polarity everywhere: `pattern` + `literal: true` opt-out is the
+    matching shape for both `grep` and `replace` (aligned 2026-07-27; their
+    previously inverted regex defaults were a silent trap).
