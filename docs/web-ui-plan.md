@@ -912,7 +912,7 @@ renders the transcript and sends messages.
   `#[derive(rust_embed::Embed)] #[folder = "../hrdr-ui/dist"] struct Assets;`
   served at `/` and `/assets/*` with correct `Content-Type` (match extension;
   `wasm` → `application/wasm`) when the feature is on. Document the build in
-  `crates/hrdr-ui/README.md`: `cargo install --locked dioxus-cli@0.7`,
+  `crates/hrdr-ui/README.md`: `cargo install --locked dioxus-cli@^0.7`,
   `dx build --platform web --release`, then copy the output directory `dx`
   prints at the end of the build (under `target/dx/hrdr-ui/…` — read the real
   path from the build output, don't guess) to `crates/hrdr-ui/dist` (one
@@ -1019,7 +1019,7 @@ renders the transcript and sends messages.
 - `hrdr-web`: idle WS ping every 30s (axum WS ping frame), drop after 2 missed
   pongs.
 - CI (`.github/workflows/ci.yml`): one new job `web-ui` — install the same
-  pinned CLI as the README (`cargo install --locked dioxus-cli@0.7`), build
+  pinned CLI as the README (`cargo install --locked dioxus-cli@^0.7`), build
   `hrdr-ui` release, record gzipped `.wasm` size in the job summary and fail
   over a 3 MB gzipped budget; runs only on linux.
 - README: a `## Web UI` section (serve quickstart, auth modes, the reverse-

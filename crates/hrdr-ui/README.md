@@ -6,7 +6,7 @@ Dioxus WASM single-page application for the hrdr web server.
 
 ```bash
 # Install the Dioxus CLI (once).
-cargo install --locked dioxus-cli@0.7
+cargo install --locked 'dioxus-cli@^0.7'
 
 # Build the WASM app.
 cd crates/hrdr-ui

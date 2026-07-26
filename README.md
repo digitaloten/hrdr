@@ -69,7 +69,7 @@ Open the URL in a browser. Only localhost is allowed by default.
 ```bash
 # Build the Dioxus WASM app (requires wasm32 target).
 rustup target add wasm32-unknown-unknown
-cargo install --locked dioxus-cli@0.7
+cargo install --locked 'dioxus-cli@^0.7'
 cd crates/hrdr-ui && dx build --platform web --release && cd ../..
 
 # Serve with the UI embedded.

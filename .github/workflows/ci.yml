@@ -186,7 +186,7 @@ jobs:
       - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
       - name: Install Dioxus CLI
-        run: cargo install --locked dioxus-cli@0.7
+        run: cargo install --locked 'dioxus-cli@^0.7'
       - name: Build hrdr-ui WASM
         working-directory: crates/hrdr-ui
         run: dx build --platform web --release
