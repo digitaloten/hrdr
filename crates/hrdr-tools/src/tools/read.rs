@@ -91,7 +91,7 @@ impl Tool for ReadTool {
                  The path may also be given as \"file_path\"."
             )
         })?;
-        let path = ctx.resolve(&a.path);
+        let path = ctx.resolve_read(&a.path)?;
 
         // Open the file first so the handle is fixed before any path resolution —
         // this closes the TOCTOU window between secret-file validation and reading.
@@ -424,5 +424,39 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("\"path\""), "names the required field: {msg}");
         assert!(msg.contains("file_path"), "mentions the alias: {msg}");
+    }
+
+    /// In `Read` mode the readable roots are the whole world: a read outside
+    /// them is refused with the read string, one under the cwd goes through.
+    #[tokio::test]
+    async fn read_and_search_refuse_outside_roots_in_read_mode() {
+        let cwd = tempfile::tempdir().unwrap();
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Read);
+
+        let err = ReadTool
+            .execute(serde_json::json!({"path": "/etc/hostname"}), &ctx)
+            .await
+            .expect_err("a read-only agent may not read outside its roots")
+            .to_string();
+        assert!(
+            err.contains("sandbox: refusing to read /etc/hostname"),
+            "{err}"
+        );
+        assert!(err.contains("read-only and may read only under"), "{err}");
+        assert!(
+            err.contains(
+                &crate::canonicalize_nearest(cwd.path())
+                    .display()
+                    .to_string()
+            ),
+            "the refusal must name the readable root: {err}"
+        );
+
+        std::fs::write(cwd.path().join("notes.txt"), "data").unwrap();
+        let out = ReadTool
+            .execute(serde_json::json!({"path": "notes.txt"}), &ctx)
+            .await
+            .expect("reads under the cwd root are allowed");
+        assert!(out.contains("data"), "got: {out}");
     }
 }

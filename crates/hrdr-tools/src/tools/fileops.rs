@@ -119,8 +119,11 @@ impl Tool for MoveTool {
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: MoveArgs = crate::tool_args("move", args)?;
-        let from = ctx.resolve(&a.from);
-        let to = ctx.resolve(&a.to);
+        // Both ends are mutations: the destination is an obvious write, and
+        // moving a file *out of* the roots destroys the source just as surely
+        // as `delete` does.
+        let from = ctx.resolve_write(&a.from)?;
+        let to = ctx.resolve_write(&a.to)?;
         guard_victim(ctx, &from, "move", false).await?;
         if from.is_dir() {
             reject_descendant_destination(&from, &to)?;
@@ -332,7 +335,7 @@ impl Tool for DeleteTool {
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: DeleteArgs = crate::tool_args("delete", args)?;
-        let path = ctx.resolve(&a.path);
+        let path = ctx.resolve_write(&a.path)?;
         guard_victim(ctx, &path, "delete", true).await?;
 
         if path.is_dir() {
@@ -417,8 +420,10 @@ impl Tool for CopyTool {
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: CopyArgs = crate::tool_args("copy", args)?;
-        let from = ctx.resolve(&a.from);
-        let to = ctx.resolve(&a.to);
+        // The source survives a copy, so it is only a read; the destination is
+        // the mutation.
+        let from = ctx.resolve_read(&a.from)?;
+        let to = ctx.resolve_write(&a.to)?;
         // The source survives a copy, so it needs confinement but not the
         // read-before-destroy gate. It does need the secret guard, though:
         // otherwise `copy .env notes.txt` then `read notes.txt` launders a
@@ -857,5 +862,63 @@ mod tests {
                 .unwrap(),
             "x"
         );
+    }
+
+    /// The guard follows the *mutation*, not the argument position: a `move`
+    /// destination, a `copy` destination and a `delete` target are all writes,
+    /// while a `copy` source is only a read and stays free under `Write` mode.
+    #[tokio::test]
+    async fn move_copy_delete_are_guarded_on_the_mutating_side() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Write);
+
+        let inside = cwd.path().join("a.txt");
+        write(&inside, "x").await;
+        let outer = outside.path().join("b.txt");
+        write(&outer, "y").await;
+
+        // move: an out-of-roots destination is refused, and nothing moves.
+        let err = MoveTool
+            .execute(
+                json!({"from": "a.txt", "to": outside.path().join("moved.txt").to_str().unwrap()}),
+                &ctx,
+            )
+            .await
+            .expect_err("moving out of the roots must be refused")
+            .to_string();
+        assert!(err.contains("sandbox: refusing to write"), "{err}");
+        assert!(inside.exists(), "the source stays put");
+
+        // copy: an out-of-roots SOURCE is a read, and reads are free here.
+        CopyTool
+            .execute(
+                json!({"from": outer.to_str().unwrap(), "to": "copied.txt"}),
+                &ctx,
+            )
+            .await
+            .expect("copying *from* outside is a read, allowed under Write mode");
+        assert!(cwd.path().join("copied.txt").exists());
+
+        // copy: the destination is the mutation, and it is guarded.
+        let err = CopyTool
+            .execute(
+                json!({"from": "a.txt", "to": outside.path().join("copied.txt").to_str().unwrap()}),
+                &ctx,
+            )
+            .await
+            .expect_err("copying *to* outside must be refused")
+            .to_string();
+        assert!(err.contains("sandbox: refusing to write"), "{err}");
+        assert!(!outside.path().join("copied.txt").exists());
+
+        // delete: refused outside, before the read-before-destroy gate.
+        let err = DeleteTool
+            .execute(json!({"path": outer.to_str().unwrap()}), &ctx)
+            .await
+            .expect_err("deleting outside the roots must be refused")
+            .to_string();
+        assert!(err.contains("sandbox: refusing to write"), "{err}");
+        assert!(outer.exists(), "the victim survives");
     }
 }

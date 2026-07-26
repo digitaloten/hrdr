@@ -119,8 +119,11 @@ impl Tool for ReplaceTool {
         if a.pattern.is_empty() {
             bail!("`pattern` is empty — that would match at every position in every file");
         }
+        // `replace` rewrites every matching file under `root`, so the scope
+        // argument is a write, not a read: a root outside the writable set is
+        // refused before the sweep collects a single candidate.
         let root = match &a.path {
-            Some(p) => ctx.resolve(p),
+            Some(p) => ctx.resolve_write(p)?,
             None => ctx.cwd.clone(),
         };
 

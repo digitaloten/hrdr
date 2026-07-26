@@ -87,7 +87,7 @@ impl Tool for TreeTool {
         let depth = a.max_depth.min(10);
         let max_entries = a.max_entries;
 
-        let root = ctx.resolve(a.path.as_deref().unwrap_or("."));
+        let root = ctx.resolve_read(a.path.as_deref().unwrap_or("."))?;
 
         // Collect entries from the ignore walker.
         let entries = collect_entries(&root, depth, max_entries, a.hidden)?;
@@ -861,5 +861,24 @@ mod tests {
             out.contains("│   └── y.rs"),
             "nested last child under a non-last dir keeps │: {out}"
         );
+    }
+
+    /// `tree` walks the filesystem, so a read-confined agent may only point it
+    /// inside the readable roots.
+    #[tokio::test]
+    async fn tree_outside_roots_is_refused_in_read_mode() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Read);
+
+        let err = TreeTool
+            .execute(
+                serde_json::json!({"path": outside.path().to_str().unwrap()}),
+                &ctx,
+            )
+            .await
+            .expect_err("walking outside the readable roots must be refused")
+            .to_string();
+        assert!(err.contains("sandbox: refusing to read"), "{err}");
     }
 }

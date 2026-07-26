@@ -242,6 +242,13 @@ pub struct ToolContext {
     /// the file-mutating tools after a write so build-breaking errors ride
     /// back with the tool result. `None` = disabled (`lsp = false` in config).
     pub lsp: Option<Arc<LspRegistry>>,
+    /// Filesystem confinement for this agent: which paths its file tools may
+    /// read and write. [`ToolContext::new`] installs
+    /// [`SandboxPolicy::unconfined`] — only `Agent::new` builds a real policy,
+    /// so a bare context (tests, embedders) behaves exactly as it always did.
+    /// Consulted through [`resolve_read`](Self::resolve_read) /
+    /// [`resolve_write`](Self::resolve_write).
+    pub sandbox: Arc<SandboxPolicy>,
 }
 
 impl ToolContext {
@@ -262,6 +269,7 @@ impl ToolContext {
             background_tasks: Arc::new(Mutex::new(Vec::new())),
             hooks: Arc::new(Vec::new()),
             lsp: None,
+            sandbox: Arc::new(SandboxPolicy::unconfined()),
         }
     }
 
@@ -283,6 +291,30 @@ impl ToolContext {
     /// Resolve a possibly-relative path against `cwd`.
     pub fn resolve(&self, path: &str) -> PathBuf {
         resolve_under(&self.cwd, path)
+    }
+
+    /// Resolve a model-supplied path for a **read**, refusing it in `Read` mode
+    /// when it falls outside the sandbox's readable roots.
+    ///
+    /// A no-op in `Write`/`None` modes: broad reads under `Write` are a
+    /// deliberate tradeoff (builds read all over the filesystem). The returned
+    /// path is the resolved-but-uncanonicalized one the tools have always used
+    /// — canonicalization exists to make the *check* escape-proof, not to
+    /// rewrite the path the model sees in messages.
+    pub fn resolve_read(&self, path: &str) -> anyhow::Result<PathBuf> {
+        let shown = self.resolve(path);
+        self.sandbox
+            .check_read(&canonicalize_nearest(&shown), &shown)?;
+        Ok(shown)
+    }
+
+    /// Resolve a model-supplied path for a **write** or other mutation,
+    /// refusing it when it falls outside the sandbox's writable roots.
+    pub fn resolve_write(&self, path: &str) -> anyhow::Result<PathBuf> {
+        let shown = self.resolve(path);
+        self.sandbox
+            .check_write(&canonicalize_nearest(&shown), &shown)?;
+        Ok(shown)
     }
 
     /// Record that the model has seen `path`'s **whole** current content (a full

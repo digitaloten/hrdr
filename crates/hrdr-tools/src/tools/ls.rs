@@ -39,7 +39,7 @@ impl Tool for LsTool {
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: LsArgs = crate::tool_args("ls", args)?;
-        let dir = ctx.resolve(a.path.as_deref().unwrap_or("."));
+        let dir = ctx.resolve_read(a.path.as_deref().unwrap_or("."))?;
         let mut rd = tokio::fs::read_dir(&dir)
             .await
             .with_context(|| format!("listing {}", dir.display()))?;
@@ -80,5 +80,24 @@ mod tests {
             .await
             .expect("listing outside cwd is allowed");
         assert!(out.contains("a.txt"), "got: {out}");
+    }
+
+    /// …but not for a read-confined agent: `ls` reads the filesystem, so its
+    /// path argument goes through the same guard as `read`.
+    #[tokio::test]
+    async fn ls_outside_roots_is_refused_in_read_mode() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Read);
+
+        let err = LsTool
+            .execute(
+                serde_json::json!({"path": outside.path().to_str().unwrap()}),
+                &ctx,
+            )
+            .await
+            .expect_err("listing outside the readable roots must be refused")
+            .to_string();
+        assert!(err.contains("sandbox: refusing to read"), "{err}");
     }
 }

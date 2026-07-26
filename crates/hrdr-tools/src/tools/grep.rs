@@ -130,7 +130,7 @@ impl Tool for GrepTool {
         // out-of-cwd or secret root is an exfiltration vector like `read`. With
         // no path it searches cwd, which is confined by construction.
         if let Some(p) = &a.path {
-            let root = ctx.resolve(p);
+            let root = ctx.resolve_read(p)?;
             crate::guard_secret_read(&root)?;
         }
         // Look-around needs PCRE2, which only the ripgrep backend can switch on
@@ -352,11 +352,10 @@ pub(crate) fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
         return grep_builtin_multiline(a, ctx);
     }
     let re = compile_pattern(a)?;
-    let root = a
-        .path
-        .as_ref()
-        .map(|p| ctx.resolve(p))
-        .unwrap_or_else(|| ctx.cwd.clone());
+    let root = match a.path.as_ref() {
+        Some(p) => ctx.resolve_read(p)?,
+        None => ctx.cwd.clone(),
+    };
     let glob_pat = a
         .glob
         .as_ref()
@@ -450,11 +449,10 @@ pub(crate) fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
 /// has no portable cross-record matching mode.
 fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     let re = compile_pattern(a)?;
-    let root = a
-        .path
-        .as_ref()
-        .map(|p| ctx.resolve(p))
-        .unwrap_or_else(|| ctx.cwd.clone());
+    let root = match a.path.as_ref() {
+        Some(p) => ctx.resolve_read(p)?,
+        None => ctx.cwd.clone(),
+    };
     let glob_pat = a
         .glob
         .as_ref()
@@ -1077,5 +1075,37 @@ mod tests {
         ci_args.case_insensitive = true;
         let out = grep_builtin(&ci_args, &ctx).unwrap();
         assert!(out.contains("sample.txt:1:NEEDLE here"), "{out}");
+    }
+
+    /// `grep` reads file *contents*, so a read-confined agent may not scope a
+    /// search outside its readable roots — asserted at the tool seam (which
+    /// covers every backend) and again on the built-in walker's own resolve.
+    #[tokio::test]
+    async fn grep_outside_roots_is_refused_in_read_mode() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("a.txt"), "needle here").unwrap();
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Read);
+
+        let err = GrepTool::detect()
+            .execute(
+                serde_json::json!({
+                    "pattern": "needle",
+                    "path": outside.path().to_str().unwrap(),
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("searching outside the readable roots must be refused")
+            .to_string();
+        assert!(err.contains("sandbox: refusing to read"), "{err}");
+
+        // Both built-in walkers resolve the scope themselves — single-line and
+        // the multiline variant it delegates to.
+        for mut a in [plain_args("needle"), multiline_args("needle")] {
+            a.path = Some(outside.path().to_string_lossy().to_string());
+            let err = grep_builtin(&a, &ctx).unwrap_err().to_string();
+            assert!(err.contains("sandbox: refusing to read"), "{err}");
+        }
     }
 }

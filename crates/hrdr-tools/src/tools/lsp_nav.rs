@@ -131,7 +131,7 @@ async fn locate(
     line: u32,
     symbol: Option<&str>,
 ) -> Result<(std::path::PathBuf, String, u32, u32)> {
-    let path = ctx.resolve(path);
+    let path = ctx.resolve_read(path)?;
     guard_secret_read(&path).with_context(|| format!("refusing to navigate {}", path.display()))?;
     let content = tokio::fs::read_to_string(&path)
         .await

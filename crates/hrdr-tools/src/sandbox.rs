@@ -343,6 +343,24 @@ pub(crate) fn set_sandbox_notice(msg: String) {
     }
 }
 
+/// A [`crate::ToolContext`] rooted at `dir` and confined to it *alone*, for
+/// the file-tool guard tests.
+///
+/// Deliberately a struct literal rather than [`SandboxPolicy::for_agent`]:
+/// `for_agent` makes [`std::env::temp_dir`] writable, so a second tempdir
+/// would sit *inside* the roots and no "outside" assertion could ever fire.
+#[cfg(test)]
+pub(crate) fn confined_ctx(dir: &Path, mode: SandboxMode) -> crate::ToolContext {
+    let root = canonicalize_nearest(dir);
+    let mut ctx = crate::ToolContext::new(dir.to_path_buf());
+    ctx.sandbox = std::sync::Arc::new(SandboxPolicy {
+        mode,
+        writable_roots: vec![root.clone()],
+        readable_roots: vec![root],
+    });
+    ctx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

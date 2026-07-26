@@ -52,7 +52,7 @@ impl Tool for WriteTool {
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: WriteArgs = crate::tool_args("write", args)?;
-        let path = ctx.resolve(&a.path);
+        let path = ctx.resolve_write(&a.path)?;
         if let Some(reason) = crate::secret_file_reason(&crate::canonicalize_nearest(&path)) {
             bail!(
                 "refusing to write to {}: {reason} — secret/credential files are off-limits to \
@@ -343,5 +343,93 @@ mod tests {
             )
             .await
             .expect("write succeeds after a full read");
+    }
+
+    /// The software path-guard: a write outside the policy's writable roots is
+    /// refused, and the refusal *names the roots* so the model can retarget
+    /// instead of retrying blind.
+    #[tokio::test]
+    async fn write_outside_roots_is_refused_and_names_the_roots() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Write);
+
+        let target = outside.path().join("escaped.txt");
+        let err = WriteTool
+            .execute(
+                serde_json::json!({"path": target.to_str().unwrap(), "content": "x"}),
+                &ctx,
+            )
+            .await
+            .expect_err("a write outside the roots must be refused")
+            .to_string();
+        assert!(err.contains("sandbox: refusing to write"), "{err}");
+        assert!(err.contains("You may write only under"), "{err}");
+        assert!(
+            err.contains(
+                &crate::canonicalize_nearest(cwd.path())
+                    .display()
+                    .to_string()
+            ),
+            "the refusal must name the writable root: {err}"
+        );
+        assert!(!target.exists(), "nothing may be written");
+
+        WriteTool
+            .execute(
+                serde_json::json!({"path": "inside.txt", "content": "x"}),
+                &ctx,
+            )
+            .await
+            .expect("a write under the cwd root is allowed");
+        assert!(cwd.path().join("inside.txt").exists());
+    }
+
+    /// The scratch and tool-output dirs are writable roots by construction —
+    /// drop either and overflow-spill or throwaway scratch work breaks.
+    #[tokio::test]
+    async fn scratch_and_tool_output_stay_writable_under_write_mode() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut ctx = ToolContext::new(cwd.path().to_path_buf());
+        ctx.sandbox = std::sync::Arc::new(crate::SandboxPolicy::for_agent(
+            crate::SandboxMode::Write,
+            cwd.path(),
+            &[],
+        ));
+
+        for dir in [
+            crate::sandbox::session_scratch_dir().to_path_buf(),
+            crate::tool_output_dir(),
+        ] {
+            let target = dir.join("hrdr-guard-probe.txt");
+            WriteTool
+                .execute(
+                    serde_json::json!({"path": target.to_str().unwrap(), "content": "x"}),
+                    &ctx,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{} should be writable: {e}", target.display()));
+            let _ = std::fs::remove_file(&target);
+        }
+    }
+
+    /// Mode `None` is the shipped default until the policy is wired into
+    /// `Agent::new`: nothing is confined, so this pins "no observable change".
+    #[tokio::test]
+    async fn mode_none_changes_nothing() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf());
+        assert_eq!(ctx.sandbox.mode, crate::SandboxMode::None);
+
+        let target = outside.path().join("free.txt");
+        WriteTool
+            .execute(
+                serde_json::json!({"path": target.to_str().unwrap(), "content": "x"}),
+                &ctx,
+            )
+            .await
+            .expect("an unconfined context writes anywhere");
+        assert!(target.exists());
     }
 }

@@ -134,7 +134,7 @@ impl Tool for EditTool {
                  `replace_all` would corrupt it; pass the exact text to replace"
             );
         }
-        let path = ctx.resolve(&a.path);
+        let path = ctx.resolve_write(&a.path)?;
         if let Some(reason) = crate::secret_file_reason(&crate::canonicalize_nearest(&path)) {
             bail!(
                 "refusing to edit {}: {reason} — secret/credential files are off-limits to \
@@ -510,5 +510,33 @@ mod tests {
         assert!(err.contains("not found"), "{err}");
         // The bytes on disk are exactly what they were.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// `edit` mutates, so its path goes through the write guard — and the
+    /// guard runs *before* the read-state and staleness machinery, so the
+    /// model gets the boundary error rather than a confusing "read it first".
+    #[tokio::test]
+    async fn edit_outside_roots_is_refused() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("victim.rs");
+        std::fs::write(&target, "fn old() {}\n").unwrap();
+
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Write);
+        let err = EditTool
+            .execute(
+                json!({
+                    "path": target.to_str().unwrap(),
+                    "old_string": "old",
+                    "new_string": "new",
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("an edit outside the roots must be refused")
+            .to_string();
+        assert!(err.contains("sandbox: refusing to write"), "{err}");
+        assert!(err.contains("You may write only under"), "{err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "fn old() {}\n");
     }
 }
