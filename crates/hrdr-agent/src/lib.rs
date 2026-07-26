@@ -1153,6 +1153,7 @@ impl Agent {
                     command: s.command.clone(),
                     args: s.args.clone(),
                     extensions: s.extensions.iter().map(|e| e.to_lowercase()).collect(),
+                    initialization_options: s.initialization_options.clone(),
                 })
                 .collect();
             servers.extend(hrdr_tools::default_lsp_servers());
@@ -7099,6 +7100,7 @@ mod tests {
                     command: "zls".to_string(),
                     args: vec![],
                     extensions: vec!["zig".to_string()],
+                    initialization_options: None,
                 }],
             }),
         });

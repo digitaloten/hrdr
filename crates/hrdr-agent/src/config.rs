@@ -594,6 +594,11 @@ pub struct LspServerEntry {
     pub args: Vec<String>,
     /// File extensions (no dot) routed to it.
     pub extensions: Vec<String>,
+    /// Server-specific settings sent as `initializationOptions` in the LSP
+    /// `initialize` request — the server's own config object (e.g.
+    /// `{ cargo = { targetDir = true } }` for rust-analyzer). Omitted: none.
+    #[serde(default)]
+    pub initialization_options: Option<serde_json::Value>,
 }
 
 /// Trust identity stamped onto a [`ResolvedProvider`] by

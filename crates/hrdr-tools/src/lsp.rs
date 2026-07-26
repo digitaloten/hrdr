@@ -38,13 +38,17 @@ const MAX_DIAG_LINES: usize = 8;
 const NAV_TIMEOUT_MS: u64 = 30_000;
 
 /// One language server: which command to run and which files it checks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LspServerConfig {
     /// Executable (must be on PATH; checked at first use).
     pub command: String,
     pub args: Vec<String>,
     /// File extensions (lowercase, no dot) routed to this server.
     pub extensions: Vec<String>,
+    /// Server-specific settings sent as `initializationOptions` in the
+    /// `initialize` request (the server's own config object, e.g.
+    /// `{"cargo": {"targetDir": true}}` for rust-analyzer). `None` sends none.
+    pub initialization_options: Option<Value>,
 }
 
 /// The built-in, presence-aware server registry: a server is only ever
@@ -56,9 +60,20 @@ pub fn default_lsp_servers() -> Vec<LspServerConfig> {
         command: command.to_string(),
         args: args.iter().map(ToString::to_string).collect(),
         extensions: extensions.iter().map(ToString::to_string).collect(),
+        initialization_options: None,
     };
     vec![
-        s("rust-analyzer", &[], &["rs"]),
+        // rust-analyzer builds with cargo, and so does whatever the model runs
+        // in `shell` — in the same tree, on the same `target/` lock. Left
+        // alone the two spend the session blocking on each other ("Blocking
+        // waiting for file lock on package cache") and can outright break a
+        // build ("could not create incremental compilation session
+        // directory"). `cargo.targetDir = true` moves RA's own builds under
+        // `target/rust-analyzer/`, so nothing contends.
+        LspServerConfig {
+            initialization_options: Some(json!({"cargo": {"targetDir": true}})),
+            ..s("rust-analyzer", &[], &["rs"])
+        },
         s(
             "typescript-language-server",
             &["--stdio"],
@@ -404,6 +419,28 @@ struct LspClient {
     _group: Option<crate::proc::ProcessGroup>,
 }
 
+/// The `initialize` params for a workspace at `root_uri`, carrying the
+/// server's `initializationOptions` when its config declares any (omitted
+/// entirely otherwise — a server may reject a null).
+fn initialize_params(root_uri: &str, initialization_options: Option<&Value>) -> Value {
+    let mut params = json!({
+        "processId": std::process::id(),
+        "rootUri": root_uri,
+        "workspaceFolders": [{"uri": root_uri, "name": "workspace"}],
+        "capabilities": {
+            "textDocument": {
+                "synchronization": {},
+                "publishDiagnostics": {"versionSupport": true},
+            },
+            "workspace": {"configuration": true},
+        },
+    });
+    if let (Some(obj), Some(opts)) = (params.as_object_mut(), initialization_options) {
+        obj.insert("initializationOptions".to_string(), opts.clone());
+    }
+    params
+}
+
 impl LspClient {
     /// Spawn + `initialize` + `initialized`.
     async fn start(config: &LspServerConfig, root: &Path, wait_ms: u64) -> Result<Arc<Self>> {
@@ -443,22 +480,10 @@ impl LspClient {
         });
         tokio::spawn(Self::read_loop(Arc::clone(&client), stdout));
 
-        let root_uri = file_uri(root);
         let init = client
             .request(
                 "initialize",
-                json!({
-                    "processId": std::process::id(),
-                    "rootUri": root_uri,
-                    "workspaceFolders": [{"uri": root_uri, "name": "workspace"}],
-                    "capabilities": {
-                        "textDocument": {
-                            "synchronization": {},
-                            "publishDiagnostics": {"versionSupport": true},
-                        },
-                        "workspace": {"configuration": true},
-                    },
-                }),
+                initialize_params(&file_uri(root), config.initialization_options.as_ref()),
                 Duration::from_millis(INIT_TIMEOUT_MS),
             )
             .await?;
@@ -1109,6 +1134,36 @@ fn format_diagnostics(root: &Path, path: &Path, diags: &[Value]) -> Option<Strin
 mod tests {
     use super::*;
 
+    /// The built-in rust-analyzer must build under its own target dir, or it
+    /// fights the model's `cargo` over `target/`'s lock. The option is
+    /// `rust-analyzer.cargo.targetDir`; in `initializationOptions` the
+    /// `rust-analyzer.` prefix is dropped, and the boolean form means
+    /// "`target/rust-analyzer/`".
+    #[test]
+    fn builtin_rust_analyzer_gets_its_own_target_dir() {
+        let ra = default_lsp_servers()
+            .into_iter()
+            .find(|s| s.command == "rust-analyzer")
+            .expect("rust-analyzer is a built-in server");
+        assert_eq!(
+            ra.initialization_options,
+            Some(json!({"cargo": {"targetDir": true}}))
+        );
+        // Every other built-in stays option-less.
+        for s in default_lsp_servers() {
+            if s.command != "rust-analyzer" {
+                assert_eq!(s.initialization_options, None, "{}", s.command);
+            }
+        }
+        // …and the options ride into the `initialize` request.
+        let params = initialize_params("file:///w", ra.initialization_options.as_ref());
+        assert_eq!(params["initializationOptions"]["cargo"]["targetDir"], true);
+        assert_eq!(params["rootUri"], "file:///w");
+        // No options declared → the key is absent, not null.
+        let bare = initialize_params("file:///w", None);
+        assert!(bare.get("initializationOptions").is_none(), "{bare}");
+    }
+
     #[tokio::test]
     async fn oversized_lsp_frame_is_rejected_before_body_read() {
         let input = format!("Content-Length: {}\r\n\r\n", MAX_LSP_FRAME_BYTES + 1);
@@ -1178,6 +1233,7 @@ mod tests {
                 command: "definitely-missing-lsp-server".to_string(),
                 args: vec![],
                 extensions: vec!["xyz".to_string()],
+                initialization_options: None,
             }],
             None,
         );
@@ -1207,6 +1263,7 @@ mod tests {
                 command: "definitely-missing-lsp-server".to_string(),
                 args: vec![],
                 extensions: vec!["xyz".to_string()],
+                initialization_options: None,
             }],
             None,
         );
@@ -1236,6 +1293,7 @@ mod tests {
                 command: "python3".to_string(),
                 args: vec![server.display().to_string()],
                 extensions: vec!["xyz".to_string()],
+                initialization_options: None,
             }],
             Some(5_000),
         );
@@ -1271,6 +1329,7 @@ mod tests {
                 command: "python3".to_string(),
                 args: vec![server.display().to_string()],
                 extensions: vec!["xyz".to_string()],
+                initialization_options: None,
             }],
             Some(5_000),
         ));
@@ -1342,6 +1401,7 @@ mod tests {
                 command: "python3".to_string(),
                 args: vec![server.display().to_string()],
                 extensions: vec!["xyz".to_string()],
+                initialization_options: None,
             }],
             Some(5_000),
         );
@@ -1568,6 +1628,7 @@ mod tests {
                 command: "python3".to_string(),
                 args: vec![server.display().to_string()],
                 extensions: vec!["xyz".to_string()],
+                initialization_options: None,
             }],
             Some(5_000),
         )));
@@ -1642,6 +1703,7 @@ mod tests {
                 command: "python3".to_string(),
                 args: vec![server.display().to_string()],
                 extensions: vec!["xyz".to_string()],
+                initialization_options: None,
             }],
             Some(500), // short write budget so the test is quick
         );

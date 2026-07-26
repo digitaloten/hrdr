@@ -1022,7 +1022,14 @@ wait_ms = 2000   # per-edit diagnostics wait
 [[lsp.servers]]
 command = "zls"
 extensions = ["zig"]
+# Optional server settings, sent as LSP `initializationOptions`:
+# initialization_options = { enable_build_on_save = true }
 ```
+
+The built-in rust-analyzer is started with
+`initializationOptions = { cargo = { targetDir = true } }` so it builds under
+`target/rust-analyzer/` instead of contending with the `cargo` the model runs in
+`shell` over one `target/` lock.
 
 The same warm servers back three **model tools**: `definition` and `references`
 (read-only lookups — the model gives a file, a 1-based line, and the symbol text
