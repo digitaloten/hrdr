@@ -1367,13 +1367,27 @@ mod tests {
         // Bind a real port; no callback ever arrives, so only the caller-chosen
         // deadline ends the wait — proving the timeout is parameterized (ChatGPT
         // passes the 60-minute backstop, OpenRouter the 5-minute default).
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
-        let res = await_oauth_code_within(port, "state", Duration::from_millis(120)).await;
-        assert!(res.is_err(), "expired deadline yields a timeout error");
-        assert!(res.unwrap_err().to_string().contains("timed out"));
+        //
+        // The port comes from a throwaway listener that is DROPPED before
+        // `await_oauth_code_within` rebinds it — a race when the whole suite runs
+        // in one process (the leak-guard job does): a parallel test can grab the
+        // port in the gap, turning the error into "address in use" instead of the
+        // timeout under test. Retry with a fresh port when the bind itself lost.
+        let mut last = None;
+        for _ in 0..3 {
+            let port = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let res = await_oauth_code_within(port, "state", Duration::from_millis(120)).await;
+            assert!(res.is_err(), "expired deadline yields a timeout error");
+            let msg = res.unwrap_err().to_string();
+            if msg.contains("timed out") {
+                return;
+            }
+            last = Some(msg);
+        }
+        panic!("never reached the deadline path; last error: {last:?}");
     }
 
     #[tokio::test]
