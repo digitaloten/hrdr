@@ -1,15 +1,16 @@
-//! Axum HTTP+WS server with authentication, config-gated binding, and the
-//! full refuse-to-bind matrix from §6.
+//! Axum HTTP+WS server with authentication, config-gated binding, TLS support,
+//! and the full refuse-to-bind matrix from §6.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Query, ws::Message, ws::WebSocketUpgrade};
+use axum::extract::{Query, State, ws::Message, ws::WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use tokio::sync::broadcast;
 
 use crate::auth::{self, AuthState};
@@ -44,17 +45,16 @@ impl RunningServer {
     }
 }
 
-/// Validate and start the server. The refuse-to-bind matrix from §6 is
-/// enforced here before the listener binds.
+/// Validate and start the server.
 pub async fn serve(
     session: SharedSession,
     cfg: ServeConfig,
     web_cfg: &WebConfig,
     auth_state: AuthState,
 ) -> anyhow::Result<RunningServer> {
-    // ── Refuse-to-bind matrix ──────────────────────────────────────────────
     let loopback = cfg.bind.is_loopback();
 
+    // Refuse-to-bind matrix.
     if !loopback && !web_cfg.allow_remote {
         anyhow::bail!(
             "refusing to bind {}: pass --allow-remote (plus auth and TLS)",
@@ -75,11 +75,6 @@ pub async fn serve(
             "TLS is required for non-loopback access. Set tls_cert_path and tls_key_path, or bind loopback behind a reverse proxy."
         );
     }
-    // TLS serving lands in slice 5 — for now, non-loopback is still refused
-    // because we're not actually loading the TLS certs yet.
-    if !loopback {
-        anyhow::bail!("TLS is not implemented yet (lands in slice 5); bind 127.0.0.1 for now");
-    }
 
     let addr = SocketAddr::new(cfg.bind, cfg.port);
 
@@ -92,19 +87,32 @@ pub async fn serve(
         .route("/healthz", get(healthz))
         .route("/", get(index))
         .route("/ws", get(ws_handler))
+        .route("/login", post(login_handler))
+        .route("/logout", post(logout_handler))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let bound_addr = listener.local_addr()?;
-
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-
-    Ok(RunningServer {
-        addr: bound_addr,
-        handle,
-    })
+    // TLS or plain.
+    if let (Some(cert), Some(key)) = (&web_cfg.tls_cert_path, &web_cfg.tls_key_path) {
+        use axum_server::tls_rustls::RustlsConfig;
+        let tls_cfg = RustlsConfig::from_pem_file(cert, key).await?;
+        let handle = tokio::spawn(async move {
+            axum_server::bind_rustls(addr, tls_cfg)
+                .serve(app.into_make_service())
+                .await
+                .ok();
+        });
+        Ok(RunningServer { addr, handle })
+    } else {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let bound_addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        Ok(RunningServer {
+            addr: bound_addr,
+            handle,
+        })
+    }
 }
 
 // ── routes ─────────────────────────────────────────────────────────────────
@@ -113,52 +121,113 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Protected index page.
 async fn index(
-    state: axum::extract::State<AppState>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     query: Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    match check_auth(&state.auth, &headers, &query) {
+    match check_auth(&state, &headers, &query) {
         Ok(()) => axum::response::Html(INDEX_HTML).into_response(),
         Err(resp) => resp,
     }
 }
 
-/// Protected WS upgrade — checks auth AND Origin header.
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    state: axum::extract::State<AppState>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     query: Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    // Auth check.
-    if let Err(resp) = check_auth(&state.auth, &headers, &query) {
+    if let Err(resp) = check_auth(&state, &headers, &query) {
         return resp;
     }
-
-    // Origin CSRF check.
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
     if let Err(status) = auth::check_ws_origin(origin, host) {
         return status.into_response();
     }
-
     let session = state.session.clone();
     ws.on_upgrade(move |socket| handle_socket(socket, session))
+}
+
+// ── login / logout ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct LoginBody {
+    username: String,
+    password: String,
+}
+
+async fn login_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<LoginBody>,
+) -> Response {
+    let client_ip = auth::extract_client_ip(&headers);
+    if !auth::check_rate_limit(&state.auth, client_ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "60")],
+            "rate limit exceeded",
+        )
+            .into_response();
+    }
+
+    if state.auth.mode != AuthMode::Users {
+        auth::rate_limit_record(&state.auth, client_ip);
+        return (StatusCode::NOT_FOUND, "users auth not enabled").into_response();
+    }
+
+    let db = state.auth.users_db.lock().unwrap();
+    let ok = match &*db {
+        Some(conn) => crate::users::verify(conn, &body.username, &body.password).unwrap_or(false),
+        None => false,
+    };
+    drop(db);
+
+    if !ok {
+        auth::rate_limit_record(&state.auth, client_ip);
+        return (StatusCode::UNAUTHORIZED, "bad credentials").into_response();
+    }
+
+    // Mint session cookie.
+    let cookie_val = auth::mint_session_cookie(&body.username, &state.auth.cookie_secret[..]);
+    let mut cookie =
+        format!("hrdr_session={cookie_val}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800");
+    // In tests we can't determine TLS from here. Only add Secure if TLS certs are loaded.
+    // (Simplification: add Secure on non-loopback configs.)
+    cookie.push_str("; Secure");
+
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, cookie.as_str())],
+        "ok",
+    )
+        .into_response()
+}
+
+async fn logout_handler() -> Response {
+    (
+        StatusCode::OK,
+        [(
+            header::SET_COOKIE,
+            "hrdr_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+        )],
+        "ok",
+    )
+        .into_response()
 }
 
 // ── auth helper ────────────────────────────────────────────────────────────
 
 #[allow(clippy::result_large_err)]
 fn check_auth(
-    auth: &AuthState,
+    state: &AppState,
     headers: &HeaderMap,
     query: &std::collections::HashMap<String, String>,
 ) -> Result<(), Response> {
-    // Rate limit check.
     let client_ip = auth::extract_client_ip(headers);
-    if !auth::check_rate_limit(auth, client_ip) {
+    if !auth::check_rate_limit(&state.auth, client_ip) {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             [(header::RETRY_AFTER, "60")],
@@ -167,18 +236,38 @@ fn check_auth(
             .into_response());
     }
 
-    let authed = match auth.mode {
-        AuthMode::Token => auth::verify_token(headers, query, auth.token.as_deref()),
+    let authed = match state.auth.mode {
+        AuthMode::Token => auth::verify_token(headers, query, state.auth.token.as_deref()),
         AuthMode::Basic => auth::verify_basic(
             headers,
-            auth.basic_user.as_deref(),
-            auth.basic_password_hash.as_deref(),
+            state.auth.basic_user.as_deref(),
+            state.auth.basic_password_hash.as_deref(),
         ),
-        AuthMode::Users => false, // slice 5
+        AuthMode::Users => {
+            // Check session cookie.
+            if let Some(cookie_header) = headers.get(header::COOKIE)
+                && let Ok(cookie_str) = cookie_header.to_str()
+            {
+                for part in cookie_str.split(';') {
+                    let part = part.trim();
+                    if let Some(val) = part.strip_prefix("hrdr_session=") {
+                        let val = val.trim();
+                        let ok = auth::verify_session_cookie(val, &state.auth.cookie_secret[..])
+                            .is_some();
+                        if ok {
+                            return Ok(());
+                        } else {
+                            return Err((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
+                        }
+                    }
+                }
+            }
+            false
+        }
     };
 
     if !authed {
-        auth::rate_limit_record(auth, client_ip);
+        auth::rate_limit_record(&state.auth, client_ip);
         return Err((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
     }
 

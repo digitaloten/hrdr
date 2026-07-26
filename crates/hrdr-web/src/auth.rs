@@ -13,6 +13,7 @@ use axum::http::StatusCode;
 use axum::http::header;
 use base64::Engine;
 use rand::RngExt;
+use rusqlite::Connection;
 use subtle::ConstantTimeEq;
 
 use crate::config::{AuthMode, WebConfig};
@@ -24,6 +25,8 @@ pub struct AuthState {
     pub basic_user: Option<String>,
     pub basic_password_hash: Option<String>,
     pub token: Option<String>,
+    pub cookie_secret: Arc<[u8; 32]>,
+    pub users_db: Arc<Mutex<Option<Connection>>>,
     pub rate_limiter: Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>,
 }
 
@@ -37,11 +40,16 @@ impl AuthState {
             None
         };
 
+        let mut rng = rand::rng();
+        let cookie_secret: [u8; 32] = rng.random();
+
         Self {
             mode: cfg.auth,
             basic_user: cfg.basic_user.clone(),
             basic_password_hash: cfg.basic_password_hash.clone(),
             token,
+            cookie_secret: Arc::new(cookie_secret),
+            users_db: Arc::new(Mutex::new(None)),
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -197,6 +205,68 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
         .map(|h| h.to_string())
 }
 
+/// Verify a password against an argon2id PHC hash string (for the `users`
+/// and `basic` auth modes — the low-level compare, not the HTTP header parse).
+pub fn verify_basic_password(password: &str, hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
+}
+
+// ── session cookie (users mode) ────────────────────────────────────────────
+
+use sha2::Sha256;
+
+/// Cookie value: `base64(username || ":" || expiry || ":" || hmac(username:expiry, secret))`.
+pub fn mint_session_cookie(username: &str, secret: &[u8]) -> String {
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        + 7 * 24 * 3600; // 7 days
+    let payload = format!("{username}:{expiry}");
+    let mac = hmac_sha256_sign(&payload, secret);
+    let cookie_val = format!("{payload}:{mac}");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cookie_val)
+}
+
+/// Verify a session cookie, returning the username if valid, or `None`.
+pub fn verify_session_cookie(cookie_b64: &str, secret: &[u8]) -> Option<String> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cookie_b64)
+        .ok()?;
+    let cookie_val = std::str::from_utf8(&bytes).ok()?;
+
+    let (payload, mac) = cookie_val.rsplit_once(':')?;
+    let expected_mac = hmac_sha256_sign(payload, secret);
+    if !constant_time_eq(mac.as_bytes(), expected_mac.as_bytes()) {
+        return None;
+    }
+
+    let (username, expiry_str) = payload.split_once(':')?;
+    let expiry: u64 = expiry_str.parse().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if expiry < now {
+        return None;
+    }
+
+    Some(username.to_string())
+}
+
+fn hmac_sha256_sign(msg: &str, key: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC key size");
+    mac.update(msg.as_bytes());
+    let result = mac.finalize();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(result.into_bytes())
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
@@ -210,6 +280,20 @@ fn base64_url_no_pad(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_auth_state(mode: AuthMode) -> AuthState {
+        let mut rng = rand::rng();
+        let cookie_secret: [u8; 32] = rng.random();
+        AuthState {
+            mode,
+            basic_user: None,
+            basic_password_hash: None,
+            token: None,
+            cookie_secret: Arc::new(cookie_secret),
+            users_db: Arc::new(Mutex::new(None)),
+            rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 
     #[test]
     fn token_verify_matches() {
@@ -241,13 +325,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_locks_out_after_10() {
-        let auth = AuthState {
-            mode: AuthMode::Token,
-            basic_user: None,
-            basic_password_hash: None,
-            token: None,
-            rate_limiter: Arc::new(Mutex::new(HashMap::new())),
-        };
+        let auth = test_auth_state(AuthMode::Token);
         let ip = Some("1.2.3.4".parse().unwrap());
         for _ in 0..10 {
             assert!(check_rate_limit(&auth, ip));

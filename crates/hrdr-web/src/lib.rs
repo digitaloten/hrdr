@@ -10,5 +10,6 @@ pub mod config;
 pub mod convert;
 pub mod server;
 pub mod session;
+pub mod users;
 
 pub use session::{SharedSession, WebSession};

@@ -234,21 +234,26 @@ enum Command {
     Models,
     /// Start the web server (HTTP + WebSocket) for the browser UI.
     Serve {
-        /// Bind address (default: 127.0.0.1).
         #[arg(long)]
         bind: Option<String>,
-        /// Port (default: 9911).
         #[arg(long)]
         port: Option<u16>,
-        /// Authentication mode: token, basic, or users (default: token).
         #[arg(long)]
         auth: Option<String>,
-        /// Allow non-loopback binding (requires auth + TLS).
         #[arg(long)]
         allow_remote: bool,
-        /// Read a password from stdin, print an argon2id PHC hash, and exit.
         #[arg(long)]
         hash_password: bool,
+        #[arg(long)]
+        add_user: Option<String>,
+        #[arg(long)]
+        remove_user: Option<String>,
+        #[arg(long)]
+        users_db: Option<String>,
+        #[arg(long)]
+        tls_cert: Option<String>,
+        #[arg(long)]
+        tls_key: Option<String>,
     },
 }
 
@@ -659,20 +664,63 @@ async fn main() -> Result<()> {
             auth,
             allow_remote,
             hash_password,
+            add_user,
+            remove_user,
+            users_db,
+            tls_cert,
+            tls_key,
         }) => {
+            // --hash-password: read stdin, print hash, exit.
             if hash_password {
                 use std::io::Read;
-                let mut password = String::new();
+                let mut pw = String::new();
                 std::io::stdin()
-                    .read_to_string(&mut password)
+                    .read_to_string(&mut pw)
                     .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
-                let password = password.trim();
-                if password.is_empty() {
+                let pw = pw.trim();
+                if pw.is_empty() {
                     anyhow::bail!("no password on stdin");
                 }
-                let hash = hrdr_web::auth::hash_password(password)
+                let hash = hrdr_web::auth::hash_password(pw)
                     .map_err(|e| anyhow::anyhow!("hashing: {e}"))?;
                 println!("{hash}");
+                return Ok(());
+            }
+
+            // --add-user / --remove-user: manage users DB, then exit.
+            let add_or_rm = add_user.clone().or(remove_user.clone());
+            if let Some(username) = add_or_rm {
+                let (web_cfg, warnings) =
+                    hrdr_web::config::WebConfig::load(&hrdr_web::config::CliOverrides {
+                        users_db: users_db.map(std::path::PathBuf::from),
+                        ..Default::default()
+                    });
+                for w in &warnings {
+                    eprintln!("hrdr: {w}");
+                }
+                let db = hrdr_web::users::open_db(&web_cfg.users_db)?;
+                if add_user.is_some() {
+                    use std::io::Read;
+                    let mut pw = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut pw)
+                        .map_err(|e| anyhow::anyhow!("reading password: {e}"))?;
+                    let pw = pw.trim();
+                    if pw.is_empty() {
+                        anyhow::bail!("no password on stdin");
+                    }
+                    let hash = hrdr_web::auth::hash_password(pw)
+                        .map_err(|e| anyhow::anyhow!("hashing: {e}"))?;
+                    hrdr_web::users::add_user(&db, &username, &hash)?;
+                    eprintln!("added user {username}");
+                } else {
+                    let removed = hrdr_web::users::remove_user(&db, &username)?;
+                    if removed {
+                        eprintln!("removed user {username}");
+                    } else {
+                        eprintln!("user {username} not found");
+                    }
+                }
                 return Ok(());
             }
 
@@ -681,7 +729,9 @@ async fn main() -> Result<()> {
                 port,
                 auth,
                 allow_remote,
-                ..Default::default()
+                users_db: users_db.map(std::path::PathBuf::from),
+                tls_cert: tls_cert.map(std::path::PathBuf::from),
+                tls_key: tls_key.map(std::path::PathBuf::from),
             };
             let (web_cfg, warnings) = hrdr_web::config::WebConfig::load(&cli);
             for w in &warnings {
@@ -691,10 +741,13 @@ async fn main() -> Result<()> {
             let bind_addr = web_cfg.bind;
             let port = web_cfg.port;
 
-            // Build the session engine.
             let shared = hrdr_web::SharedSession::start(config).await?;
 
             let auth_state = hrdr_web::auth::AuthState::from_config(&web_cfg);
+            if web_cfg.auth == hrdr_web::config::AuthMode::Users {
+                let db = hrdr_web::users::open_db(&web_cfg.users_db)?;
+                *auth_state.users_db.lock().unwrap() = Some(db);
+            }
             if let Some(token) = auth_state.token_str() {
                 eprintln!("open http://{bind_addr}:{port}/?token={token}");
             }
