@@ -67,6 +67,12 @@ pub const DEFAULT_MAX_OUTPUT: usize = 5_120;
 /// of short entries).
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 50;
 
+/// How many spilled shell commands a session remembers for the "you already ran
+/// this" nudge (see [`ToolContext::note_spooled_command`]). Small on purpose:
+/// the nudge is only useful for the command the model is *currently* iterating
+/// on, and one path per entry keeps the whole history a few hundred bytes.
+pub const SPOOL_MEMORY: usize = 8;
+
 /// A single TODO item tracked by `todo`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
@@ -207,6 +213,17 @@ pub struct ToolContext {
     /// whole file. Bounded by [`read_files`](Self::read_files): only tracked
     /// paths are recorded, one command each, cleared when the file is re-read.
     pub file_modifiers: Arc<Mutex<std::collections::HashMap<PathBuf, String>>>,
+    /// Shell commands whose output was large enough to spill to a file, newest
+    /// first: `(base command, spool path)`, where the *base* is the command
+    /// minus its final pipeline stage (`cargo nextest run` for
+    /// `cargo nextest run | grep FAIL`).
+    ///
+    /// This is what lets `shell` say "you already have this output" instead of
+    /// letting the model re-run a five-minute suite because it forgot the spool
+    /// path and only wanted a different `grep` on the same bytes — an observed
+    /// loop that re-ran one test suite six times. Bounded to
+    /// [`SPOOL_MEMORY`] entries, newest-wins per base.
+    pub spooled_commands: Arc<Mutex<std::collections::VecDeque<(String, PathBuf)>>>,
     /// Storage root for **project-scoped** [`MemoryTool`] notes (this cwd).
     /// `None` disables project memory.
     pub memory_project: Option<PathBuf>,
@@ -237,6 +254,7 @@ impl ToolContext {
             guardrails: Arc::new(default_guardrails()),
             read_files: Arc::new(Mutex::new(std::collections::HashMap::new())),
             file_modifiers: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            spooled_commands: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             memory_project: None,
             memory_global: None,
             background_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -459,6 +477,47 @@ impl ToolContext {
             .lock()
             .map(|m| m.get(&canon).cloned())
             .unwrap_or_else(|e| e.into_inner().get(&canon).cloned())
+    }
+
+    /// Record that `command` spilled its full output to `path`, keyed by the
+    /// command's *base* (everything before its last top-level `|`) so a later
+    /// re-run that differs only in its trailing filter still finds it.
+    ///
+    /// Newest-wins: a fresh run of the same base replaces the older entry (its
+    /// spool is the current one), and the queue is capped at [`SPOOL_MEMORY`].
+    pub fn note_spooled_command(&self, command: &str, path: &std::path::Path) {
+        let base = tools::shell::base_command(command).to_string();
+        if base.is_empty() {
+            return;
+        }
+        let mut q = self
+            .spooled_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        q.retain(|(recorded, _)| *recorded != base);
+        q.push_front((base, path.to_path_buf()));
+        while q.len() > SPOOL_MEMORY {
+            q.pop_back();
+        }
+    }
+
+    /// The spool file an earlier run of `command`'s base left behind, if one is
+    /// still on disk — the thing to `grep`/`read` instead of re-running. A spool
+    /// that has since been cleaned up is reported as absent rather than as a
+    /// path that would fail to open.
+    pub fn spooled_output_for(&self, command: &str) -> Option<PathBuf> {
+        let base = tools::shell::base_command(command);
+        if base.is_empty() {
+            return None;
+        }
+        let q = self
+            .spooled_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        q.iter()
+            .find(|(recorded, _)| recorded == base)
+            .map(|(_, path)| path.clone())
+            .filter(|path| path.exists())
     }
 
     /// Forget why `canon` was stale — it has just been re-read (or authored), so

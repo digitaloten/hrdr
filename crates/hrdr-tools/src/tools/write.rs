@@ -99,7 +99,7 @@ impl Tool for WriteTool {
         ctx.mark_read(&path); // the model authored (or just saw) this content
         let warn = fc.formatted_notes();
         if existed {
-            let diff = unified_diff(&path.display().to_string(), &old, &fc.content_after);
+            let diff = diff_or_summary(&path.display().to_string(), &old, &fc.content_after);
             let body = if diff.is_empty() {
                 "(no changes)".to_string()
             } else {
@@ -119,16 +119,61 @@ impl Tool for WriteTool {
     }
 }
 
+/// Line ceiling on a diff echoed back in a mutation result. Past it the body is
+/// replaced by a one-line summary (see [`diff_or_summary`]).
+///
+/// A small diff is how the model checks its anchor landed where it meant, so it
+/// stays. A large one is the model reading back text it just wrote: measured at
+/// ~170k characters of pure self-echo in a single session, for no decision it
+/// couldn't make from the summary plus a targeted re-read.
+pub(crate) const MAX_DIFF_LINES: usize = 40;
+
+/// `a/<path>` and `b/<path>` diff headers with exactly one separator — an
+/// absolute `path` must not produce `a//home/…`, which is not a path anything
+/// can act on and reads as a rendering bug.
+fn diff_headers(path: &str) -> (String, String) {
+    let joined = path.trim_start_matches('/');
+    (format!("a/{joined}"), format!("b/{joined}"))
+}
+
 /// A unified diff of `old` → `new` for `path`, or empty if unchanged.
 pub(crate) fn unified_diff(path: &str, old: &str, new: &str) -> String {
     if old == new {
         return String::new();
     }
+    let (a, b) = diff_headers(path);
     similar::TextDiff::from_lines(old, new)
         .unified_diff()
         .context_radius(3)
-        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .header(&a, &b)
         .to_string()
+}
+
+/// [`unified_diff`], collapsed to its headers plus a one-line summary once the
+/// body runs past [`MAX_DIFF_LINES`]. The headers stay so a multi-file result
+/// (`replace`) still says *which* file each summary is for.
+pub(crate) fn diff_or_summary(path: &str, old: &str, new: &str) -> String {
+    let diff = unified_diff(path, old, new);
+    if diff.is_empty() || diff.lines().count() <= MAX_DIFF_LINES {
+        return diff;
+    }
+    let (mut added, mut removed, mut hunks) = (0usize, 0usize, 0usize);
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            hunks += 1;
+        } else if line.starts_with("+++") || line.starts_with("---") {
+            // header, not a change
+        } else if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    let (a, b) = diff_headers(path);
+    format!(
+        "--- {a}\n+++ {b}\nedit applied: +{added}/-{removed} lines across {hunks} hunks \
+         (diff omitted — you wrote this change; re-read the file if you need to verify)\n"
+    )
 }
 
 #[cfg(test)]
@@ -144,6 +189,105 @@ mod tests {
                 .unwrap_or_else(|e| panic!("alias {key:?}: {e}"));
             assert_eq!(a.path, "x");
         }
+    }
+
+    /// A diff header for an absolute path joins to exactly one slash: `a//home/x`
+    /// is not a path anything can act on, and it appeared in every single
+    /// edit/write result (models pass absolute paths).
+    #[test]
+    fn a_diff_header_never_doubles_the_slash() {
+        let diff = unified_diff("/home/u/p/f.rs", "one\n", "two\n");
+        assert!(diff.contains("--- a/home/u/p/f.rs"), "{diff}");
+        assert!(diff.contains("+++ b/home/u/p/f.rs"), "{diff}");
+        assert!(!diff.contains("a//"), "no doubled slash: {diff}");
+        assert!(!diff.contains("b//"), "no doubled slash: {diff}");
+        // A relative path is unchanged.
+        assert!(unified_diff("src/f.rs", "one\n", "two\n").contains("--- a/src/f.rs"));
+    }
+
+    /// A short diff is kept verbatim — it is how the model checks its anchor
+    /// landed where it meant. A long one is replaced by its counts: the model
+    /// wrote that text, and echoing it back cost ~170k characters a session.
+    #[test]
+    fn a_long_diff_collapses_to_counts_while_a_short_one_stays_whole() {
+        // 3 changed lines in a 10-line file: well under the cap, kept whole.
+        let old = (1..=10).map(|n| format!("line {n}\n")).collect::<String>();
+        let new = old.replace("line 5", "LINE 5");
+        let short = diff_or_summary("/tmp/f.txt", &old, &new);
+        assert!(
+            short.contains("-line 5") && short.contains("+LINE 5"),
+            "{short}"
+        );
+        assert!(!short.contains("diff omitted"), "{short}");
+        assert!(short.lines().count() <= MAX_DIFF_LINES, "{short}");
+
+        // Every line of a 60-line file rewritten: one hunk, 60 added, 60 removed.
+        let old = (1..=60).map(|n| format!("line {n}\n")).collect::<String>();
+        let new = (1..=60).map(|n| format!("LINE {n}\n")).collect::<String>();
+        let long = diff_or_summary("/tmp/f.txt", &old, &new);
+        assert!(
+            long.contains("edit applied: +60/-60 lines across 1 hunks"),
+            "counts must be exact: {long}"
+        );
+        assert!(long.contains("diff omitted"), "{long}");
+        assert!(!long.contains("-line 1\n"), "the body is gone: {long}");
+        // The headers stay, so a multi-file result still says which file.
+        assert!(long.contains("--- a/tmp/f.txt"), "{long}");
+        assert_eq!(
+            long.lines().count(),
+            3,
+            "headers + one summary line: {long}"
+        );
+
+        // An unchanged file still renders nothing at all.
+        assert!(diff_or_summary("/tmp/f.txt", &old, &old).is_empty());
+    }
+
+    /// The summary replaces only the diff body: a hook warning (and, by the same
+    /// path, an LSP-diagnostics block) still rides back with the result — a long
+    /// edit must not bury a "this no longer builds".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_summarized_diff_still_carries_the_hook_and_edit_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.txt");
+        std::fs::write(
+            &path,
+            (1..=60).map(|n| format!("old {n}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let mut c = ToolContext::new(dir.path());
+        c.hooks = std::sync::Arc::new(vec![crate::Hook {
+            on: "edit".to_string(),
+            glob: None,
+            run: "exit 7".to_string(),
+            timeout_ms: crate::DEFAULT_HOOK_TIMEOUT_MS,
+        }]);
+        c.mark_read(&path);
+
+        let out = crate::EditTool
+            .execute(
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "old ",
+                    "new_string": "new ",
+                    "replace_all": true,
+                }),
+                &c,
+            )
+            .await
+            .unwrap();
+
+        assert!(out.contains("Replaced 60 occurrence(s)"), "{out}");
+        assert!(
+            out.contains("[hook `exit 7` failed"),
+            "hook note lost: {out}"
+        );
+        assert!(
+            out.contains("diff omitted"),
+            "the diff must be summarized: {out}"
+        );
+        assert!(!out.contains("a//"), "no doubled slash: {out}");
     }
 
     /// A file with a line over `MAX_LINE` bytes is `Partial` after a normal read

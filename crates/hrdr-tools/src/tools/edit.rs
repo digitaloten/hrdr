@@ -9,7 +9,7 @@ use crate::{Tool, ToolContext, truncate};
 
 use super::MAX_READ_BYTES;
 use super::mutation::apply_file_change;
-use super::write::unified_diff;
+use super::write::diff_or_summary;
 
 /// Ceiling on the projected output of a `replace_all`. A growing replacement
 /// (`old="e"`, `new=50KB`) across even a modest file can project to gigabytes —
@@ -269,7 +269,7 @@ impl Tool for EditTool {
         // edit/write this turn sees Fresh rather than a false Stale.
         ctx.mark_read(&path);
         let warn = fc.formatted_notes();
-        let diff = unified_diff(&path.display().to_string(), &text, &fc.content_after);
+        let diff = diff_or_summary(&path.display().to_string(), &text, &fc.content_after);
         Ok(truncate(
             &format!(
                 "Replaced {count} occurrence(s) in {}{warn}{stale_note}\n{diff}",

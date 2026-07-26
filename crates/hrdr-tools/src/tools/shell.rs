@@ -140,6 +140,79 @@ const SH_DESC: &str = "Run a shell command via `sh -c` — this session's shell 
      paths (`git add <file> …`); blanket staging, force-push, hook-skipping, and \
      destructive commands are rejected.";
 
+/// Byte index of the last **top-level** `|` in `command`: a pipe that is outside
+/// single/double quotes and is not half of a `||`. Deliberately a lexer-lite
+/// scan rather than a shell parser — but quote-aware, because the motivating
+/// command is `cargo nextest run | grep -E 'Summary|FAIL'`, whose *only* real
+/// pipe precedes a quoted one. A naive `rfind('|')` splits it inside the pattern
+/// and every heuristic built on it misfires. `None` when there is no pipeline.
+fn last_top_level_pipe(command: &str) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut last = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            // A backslash escapes the next byte everywhere except inside single
+            // quotes, where it is literal.
+            b'\\' if !in_single => i += 1,
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'|' if !in_single && !in_double => {
+                if bytes.get(i + 1) == Some(&b'|') {
+                    i += 1; // `||` is an or-operator, not a pipeline stage
+                } else {
+                    last = Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    last
+}
+
+/// The command's final pipeline stage (everything after the last top-level `|`),
+/// trimmed. `None` when the command is not a pipeline.
+fn pipeline_tail(command: &str) -> Option<&str> {
+    last_top_level_pipe(command).map(|at| command[at + 1..].trim())
+}
+
+/// The command with its final pipeline stage stripped — the expensive half of
+/// `cargo nextest run | grep FAIL`. The whole command when there is no pipeline.
+/// Used as the identity for the spool-reuse nudge, so re-running the same work
+/// under a different trailing filter is recognized as the same work.
+pub(crate) fn base_command(command: &str) -> &str {
+    match last_top_level_pipe(command) {
+        Some(at) => command[..at].trim(),
+        None => command.trim(),
+    }
+}
+
+/// True when the command's last pipeline stage is a grep. `grep` exits 1 purely
+/// because nothing matched, which is not a failure of anything upstream — see
+/// [`GREP_TAIL_NOTE`].
+fn has_grep_tail(command: &str) -> bool {
+    let Some(tail) = pipeline_tail(command) else {
+        return false;
+    };
+    let Some(word) = tail.split_whitespace().next() else {
+        return false;
+    };
+    let program = word.rsplit('/').next().unwrap_or(word);
+    matches!(program, "grep" | "egrep" | "fgrep" | "rg")
+}
+
+/// Appended when a pipeline ending in `grep` exits 1 with nothing on stdout.
+///
+/// `[exit status: 1]` on `cargo nextest run … | grep -E 'Summary|FAIL'` means
+/// *grep* found no match — the suite may well have passed. Read as a build
+/// failure it costs the whole suite again: one observed session re-ran 5,289
+/// tests six times, varying only the grep.
+const GREP_TAIL_NOTE: &str = "note: the trailing grep matched nothing (exit 1 is grep's no-match, \
+                              not necessarily a failure of the earlier command)";
+
 /// Arguments for the `shell` tool.
 #[derive(Deserialize)]
 struct ShellArgs {
@@ -197,7 +270,7 @@ impl Tool for ShellTool {
         // hasn't seen what the command wrote, which is exactly what the
         // read-before-mutate guard is for.
         let before = ctx.tracked_sigs();
-        let out = run_streamed_command(cmd, timeout, ctx).await;
+        let out = run_streamed_command(cmd, &a.command, timeout, ctx).await;
         // Also on failure: a command that exited non-zero (or timed out) may
         // still have rewritten files before it died.
         ctx.note_modifying_command(&before, &a.command);
@@ -257,11 +330,19 @@ async fn read_line_capped<R: AsyncBufRead + Unpin>(
 /// UI sink while accumulating a length-bounded view of the output. Full output
 /// is written incrementally to an overflow file so the model can read/grep it
 /// even when the in-memory view is truncated. Used by the `shell` tool.
+///
+/// `command` is the raw command string — the same one `cmd` runs. It is needed
+/// for the result notes (grep-tail exit 1, spool reuse), which are about the
+/// *shape* of the command rather than its output.
 async fn run_streamed_command(
     mut cmd: tokio::process::Command,
+    command: &str,
     timeout: Duration,
     ctx: &ToolContext,
 ) -> Result<String> {
+    // Looked up *before* the run, so this run's own spool (recorded at the end)
+    // can't answer for itself: the note is about output the model already had.
+    let prior_spool = ctx.spooled_output_for(command);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     // A model-supplied command must never read the TUI's terminal: something
     // like `sudo` prompting for a password would block on the user's keystrokes
@@ -289,6 +370,11 @@ async fn run_streamed_command(
     let mut tail_bytes: usize = 0;
     let mut total_bytes: usize = 0;
     let mut total_lines: usize = 0;
+    // stdout alone, tracked separately from the merged view: a pipeline ending
+    // in `grep` that matched nothing produces *no stdout* while its upstream
+    // stage may have written plenty to stderr (`cargo` does), so the merged
+    // total can't tell the two apart. See `GREP_TAIL_NOTE`.
+    let mut stdout_bytes: usize = 0;
 
     // Overflow file: created only once output actually exceeds the display
     // caps — most commands never touch it. Until that point every ingested
@@ -389,6 +475,7 @@ async fn run_streamed_command(
                             if out_buf.last() == Some(&b'\r') { out_buf.pop(); }
                             let capped_len = out_buf.len().min(BASH_LINE_CAP);
                             let line = String::from_utf8_lossy(&out_buf[..capped_len]).into_owned();
+                            stdout_bytes += line.len() + 1;
                             ingest_line!(&line);
                             out_buf.clear();
                             out_over = false;
@@ -444,16 +531,39 @@ async fn run_streamed_command(
     // Flush the overflow file (drop closes it).
     drop(overflow_file);
 
+    // ---- result notes: appended to whichever body is returned below ----
+    let mut notes = String::new();
+    // A grep tail that matched nothing: exit 1 is grep's verdict, not the
+    // upstream command's. Gated on empty *stdout* — if grep printed matches and
+    // something else still failed, exit 1 means what it says.
+    if status.and_then(|s| s.code()) == Some(1) && stdout_bytes == 0 && has_grep_tail(command) {
+        notes.push('\n');
+        notes.push_str(GREP_TAIL_NOTE);
+    }
+    // The same base command already spilled its full output once this session:
+    // point at that file rather than paying for the run again.
+    if let Some(prior) = &prior_spool {
+        notes.push_str(&format!(
+            "\nnote: this command's full output from an earlier run is saved at {} — \
+             grep/read that file instead of re-running, if you only need a different filter",
+            prior.display()
+        ));
+    }
+    // Record this run's own spool for the next re-run (newest wins per base).
+    if let Some(path) = &overflow_path {
+        ctx.note_spooled_command(command, path);
+    }
+
     // Nothing produced.
     if total_lines == 0 {
-        return Ok("(no output)".to_string());
+        return Ok(format!("(no output){notes}"));
     }
 
     // Within both display caps: return the full in-memory view (no pointer needed).
     if total_bytes <= ctx.max_output && total_lines <= ctx.max_output_lines {
         // head holds all lines in this branch.
         let out = head.trim_end();
-        return Ok(out.to_string());
+        return Ok(format!("{out}{notes}"));
     }
 
     // Over the display cap: emit head + overflow pointer + tail, via the shared
@@ -479,13 +589,14 @@ async fn run_streamed_command(
         true,
     );
 
-    Ok(crate::overflow_preview(
+    let body = crate::overflow_preview(
         &head_disp,
         &tail_disp,
         overflow_path.as_deref(),
         total_lines,
         total_bytes,
-    ))
+    );
+    Ok(format!("{body}{notes}"))
 }
 
 /// Trim already-bounded display text down to `max_bytes` and `max_lines`,
@@ -777,6 +888,202 @@ mod tests {
             "truncation marker missing: {result}"
         );
         assert!(result.contains("line 1"), "head not preserved: {result}");
+    }
+
+    /// The pipeline split is quote-aware, so the pattern's own `|` is not
+    /// mistaken for a pipe — the whole point, since the motivating command is
+    /// `cargo nextest run | grep -E 'Summary|FAIL'`. A `||` is an operator, not
+    /// a pipeline stage, and a command with no pipe has no tail at all.
+    #[test]
+    fn the_pipeline_split_ignores_quoted_and_doubled_bars() {
+        // The real pipe, not the one inside the pattern.
+        let cmd = "cargo nextest run | grep -E 'Summary|FAIL'";
+        assert_eq!(base_command(cmd), "cargo nextest run");
+        assert_eq!(pipeline_tail(cmd), Some("grep -E 'Summary|FAIL'"));
+        assert!(has_grep_tail(cmd));
+
+        // Double quotes hide a bar the same way.
+        assert_eq!(
+            base_command("cargo test | rg \"a|b\""),
+            "cargo test",
+            "a double-quoted bar is not a pipe"
+        );
+
+        // `||` is an or, so there is no pipeline here.
+        assert_eq!(last_top_level_pipe("make || echo failed"), None);
+        assert_eq!(base_command("make || echo failed"), "make || echo failed");
+        assert!(!has_grep_tail("make || grep x"));
+
+        // No pipe at all: the base is the whole command, no tail.
+        assert_eq!(base_command("  cargo nextest run  "), "cargo nextest run");
+        assert_eq!(pipeline_tail("cargo nextest run"), None);
+        assert!(!has_grep_tail("cargo nextest run"));
+
+        // A non-grep tail, and a grep reached by path, are both classified right.
+        assert!(!has_grep_tail("cargo test | tail -5"));
+        assert!(has_grep_tail("cargo test | /usr/bin/grep -q foo"));
+    }
+
+    /// A pipeline ending in `grep` that matched nothing exits 1 — and a model
+    /// reading that as "the build failed" re-runs the whole suite. The note says
+    /// which exit 1 this is. The exit status itself is untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_grep_tail_that_matched_nothing_is_annotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ToolContext::new(dir.path());
+        async fn run(c: &ToolContext, cmd: &str) -> String {
+            ShellTool::new(Shell::Bash)
+                .execute(serde_json::json!({"command": cmd}), c)
+                .await
+                .unwrap()
+        }
+
+        // Upstream succeeded and wrote to stderr (as `cargo` does); the grep
+        // matched nothing, so stdout is empty and the pipeline exits 1.
+        let out = run(
+            &c,
+            "printf 'building\\n' >&2; printf 'ok\\n' | grep -E 'Summary|FAIL'",
+        )
+        .await;
+        assert!(
+            out.contains("exit status: 1"),
+            "status still reported: {out}"
+        );
+        assert!(
+            out.contains("the trailing grep matched nothing"),
+            "the no-match note is missing: {out}"
+        );
+
+        // The grep matched, so exit 0 — nothing to explain.
+        let out = run(&c, "printf 'ok\\n' | grep ok").await;
+        assert!(
+            !out.contains("matched nothing"),
+            "a matching grep needs no note: {out}"
+        );
+
+        // Exit 1 from something that isn't a grep tail means what it says.
+        let out = run(&c, "printf 'ok\\n' | tail -1; exit 1").await;
+        assert!(out.contains("exit status: 1"), "{out}");
+        assert!(
+            !out.contains("matched nothing"),
+            "a non-grep tail must not be excused: {out}"
+        );
+
+        // A grep that *did* print matches while something else failed keeps a
+        // plain exit 1: stdout is non-empty, so the no-match story is false.
+        let out = run(&c, "printf 'ok\\n' | grep ok && exit 1").await;
+        assert!(
+            !out.contains("matched nothing"),
+            "grep printed matches — the note would be a lie: {out}"
+        );
+    }
+
+    /// A command whose output spilled to a file is remembered by its base (the
+    /// command minus its trailing filter), so re-running it under a different
+    /// `grep` is answered with the spool path instead of paying for the run
+    /// again. A different command gets no note.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_re_run_of_a_spilled_command_is_pointed_back_at_the_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = ToolContext::new(dir.path());
+        // Tiny caps so a small command overflows and spills.
+        c.max_output = 200;
+        c.max_output_lines = 10;
+        let expensive = "for i in $(seq 1 50); do echo \"line $i: padding text\"; done";
+
+        let out = ShellTool::new(Shell::Bash)
+            .execute(serde_json::json!({"command": expensive}), &c)
+            .await
+            .unwrap();
+        assert!(out.contains("full output"), "the run must spill: {out}");
+        assert!(
+            !out.contains("earlier run"),
+            "the first run has nothing to point back at: {out}"
+        );
+        let spool = c
+            .spooled_output_for(expensive)
+            .expect("the spill was recorded under the command's base");
+
+        // Same work, different trailing filter: the note names the spool file.
+        let out = ShellTool::new(Shell::Bash)
+            .execute(
+                serde_json::json!({"command": format!("{expensive} | grep 'line 7:'")}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.contains("full output from an earlier run is saved at")
+                && out.contains(&spool.display().to_string()),
+            "the re-run must be pointed at the spool: {out}"
+        );
+
+        // A different command is a different question — no note.
+        let out = ShellTool::new(Shell::Bash)
+            .execute(serde_json::json!({"command": "echo unrelated"}), &c)
+            .await
+            .unwrap();
+        assert!(
+            !out.contains("earlier run"),
+            "an unrelated command must not be nudged: {out}"
+        );
+    }
+
+    /// The spool history is bounded and newest-wins: `SPOOL_MEMORY` entries, the
+    /// oldest evicted, and a fresh run of the same base replacing its own older
+    /// path rather than accumulating.
+    #[test]
+    fn the_spool_history_is_bounded_and_newest_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ToolContext::new(dir.path());
+        let spool = |n: usize| {
+            let p = dir.path().join(format!("spool-{n}.txt"));
+            std::fs::write(&p, "x").unwrap();
+            p
+        };
+
+        for n in 0..crate::SPOOL_MEMORY + 2 {
+            c.note_spooled_command(&format!("cmd {n}"), &spool(n));
+        }
+        assert_eq!(
+            c.spooled_commands.lock().unwrap().len(),
+            crate::SPOOL_MEMORY,
+            "history stays bounded"
+        );
+        assert!(
+            c.spooled_output_for("cmd 0").is_none(),
+            "the oldest entry was evicted"
+        );
+        assert!(
+            c.spooled_output_for(&format!("cmd {}", crate::SPOOL_MEMORY + 1))
+                .is_some(),
+            "the newest entry is kept"
+        );
+
+        // Re-running the same base replaces its entry with the newer spool.
+        let newer = spool(99);
+        c.note_spooled_command("cmd 5 | grep x", &newer);
+        assert_eq!(
+            c.spooled_output_for("cmd 5").as_deref(),
+            Some(newer.as_path())
+        );
+        assert_eq!(
+            c.spooled_commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(base, _)| base == "cmd 5")
+                .count(),
+            1,
+            "one entry per base, not one per run"
+        );
+
+        // A spool that has since been cleaned up is reported as absent rather
+        // than as a path that would fail to open.
+        std::fs::remove_file(&newer).unwrap();
+        assert!(c.spooled_output_for("cmd 5").is_none());
     }
 
     /// `cap_display` keeps whole lines within both a byte and a line budget,

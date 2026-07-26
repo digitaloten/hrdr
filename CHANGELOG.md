@@ -45,6 +45,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`… | grep` that matched nothing no longer reads as a failed build.** A
+  pipeline whose trailing `grep` finds nothing exits 1, and one mined session
+  read `[exit status: 1]` on `cargo nextest run … | grep -E 'Summary|FAIL'` as
+  the build failing and re-ran all 5,289 tests **six times**, varying only the
+  grep. When the exit code is 1, the command's last pipeline stage is a
+  `grep`/`rg`, and nothing was written to stdout, the `shell` result now appends
+  `note: the trailing grep matched nothing (exit 1 is grep's no-match, not necessarily a failure of the earlier command)`.
+  The exit status itself is unchanged, stdout is tracked separately from stderr
+  (so an upstream `cargo` writing to stderr doesn't hide the empty stdout), and
+  the pipeline split is quote-aware — the `|` inside `'Summary|FAIL'` is not a
+  pipe.
+- **A re-run of an expensive command is pointed back at its saved output.**
+  `shell` already spills large output to a file and says where, but models
+  forget the path and re-run the whole command to apply a different trailing
+  filter. Each spill is now remembered on the `ToolContext` under the command's
+  _base_ (everything before its last top-level `|`), and a later run with the
+  same base gets
+  `note: this command's full output from an earlier run is saved at <path> — grep/read that file instead of re-running, if you only need a different filter`.
+  Bounded to 8 entries, newest-wins per base, and a spool that has since been
+  cleaned up is treated as absent.
+- **`edit`/`write`/`replace` no longer echo a full diff of what the model just
+  wrote.** One session spent ~170k characters on that self-echo. A diff over 40
+  rendered lines is now replaced by its counts —
+  `edit applied: +N/-M lines across K hunks (diff omitted — you wrote this change; re-read the file if you need to verify)`
+  — keeping the `--- a/… +++ b/…` headers (so a multi-file `replace` still says
+  which file) and everything else in the result: LSP diagnostics, hook warnings,
+  the stale-apply note. Diffs of 40 lines or fewer are unchanged, since that is
+  how the model verifies its anchor landed. Also fixed the doubled slash in diff
+  headers for absolute paths (`--- a//home/u/f.rs` → `--- a/home/u/f.rs`).
 - **A formatter running between read and edit no longer sinks the edit.** The
   read-before-mutate guard tracked the content the model had seen, so a
   `cargo fmt`/`prettier` (in a post-edit hook, or run by the model itself)
