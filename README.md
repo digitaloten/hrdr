@@ -152,23 +152,26 @@ native desktop/mobile shell, and read-only observer auth.
   `delete`, `find`, `ls`, `tree`, `grep`, `git` (read-only:
   status/diff/log/show/blame/…), `todo`, `fetch`, `search`, a shell, and any
   MCP-server tools. The read tools keep **credential/secret files** off-limits —
-  unlike the same access through the shell, which has no such guard. The file
-  tools otherwise have full filesystem access (hrdr runs in a codebase you
-  trust); a process-level sandbox mode is planned. Token-bounded outputs and
-  line-numbered reads for precise edits — and when `shell`/`grep`/`git` output
-  overflows, the **full** result is saved to a temp file and the model is
-  pointed at it (`read`/`grep`) instead of losing the overflow. Tools that shell
-  out are **presence-aware**: the single `shell` tool runs `bash` (falling back
-  to POSIX `sh`), and `grep` uses ripgrep → POSIX grep → a built-in walker — so
-  the model is only ever offered tools it can actually run.
+  unlike the same access through the shell, which has no such guard. Writes are
+  confined by a **sandbox that is on by default** — a path guard on the file
+  tools plus kernel confinement for shell children (bubblewrap/Landlock on
+  Linux, Seatbelt on macOS) — while reads stay broad by design (see "Sandbox").
+  Token-bounded outputs and line-numbered reads for precise edits — and when
+  `shell`/`grep`/`git` output overflows, the **full** result is saved to a temp
+  file and the model is pointed at it (`read`/`grep`) instead of losing the
+  overflow. Tools that shell out are **presence-aware**: the single `shell` tool
+  runs `bash` (falling back to POSIX `sh`), and `grep` uses ripgrep → POSIX grep
+  → a built-in walker — so the model is only ever offered tools it can actually
+  run.
 - **Pluggable input discipline.** Default is a plain, claude-style input (always
   typing; `Enter` sends, `Shift+Enter` / `\`+`Enter` insert a newline, `Ctrl+G`
   opens `$EDITOR`, readline-ish `Ctrl+A`/`Ctrl+E`/`Ctrl+W`). `--vim` swaps in a
   real [hjkl](https://github.com/kryptic-sh/hjkl) vim editor. Both are
   `EditorEngine` impls behind an **FSM-agnostic** seam, so a future hjkl
   VSCode/Helix discipline drops in with zero churn.
-- **Jinja prompt templating.** hrdr's own system prompt is assembled with
-  minijinja templates — editable without a recompile.
+- **Sectioned system prompt.** Assembled from markdown fragments compiled in
+  with `include_str!` plus runtime-built sections (environment, sandbox), pushed
+  least-volatile-first so the cached prompt prefix stays stable across agents.
 
 ## Workspace
 
@@ -176,7 +179,7 @@ native desktop/mobile shell, and read-only observer auth.
 | ------------- | --------------------------------------------------------------- |
 | `hrdr-llm`    | OpenAI-compatible client: types, streaming, tool-call assembly. |
 | `hrdr-tools`  | The tool set + registry.                                        |
-| `hrdr-agent`  | The agent loop + minijinja system prompt.                       |
+| `hrdr-agent`  | The agent loop + system-prompt assembly.                        |
 | `hrdr-editor` | FSM-agnostic hjkl embedding (`EditorEngine` seam).              |
 | `hrdr-app`    | UI-agnostic app core: shared slash commands, sessions, status.  |
 | `hrdr-tui`    | Ratatui UI: transcript + vim input pane, live streaming.        |
@@ -799,7 +802,10 @@ scopes it to the read-only tools; `tools` is an explicit allow-list that takes
 precedence over `read_only`. Every write-capable sub-agent automatically runs in
 a fresh git worktree on a scratch branch — auto-removed if it made no changes,
 otherwise kept with a pointer to the branch to review and merge; there's no
-per-profile setting for this.
+per-profile setting for this. The sandbox backs that isolation with enforcement:
+a write sub-agent's file tools **and** its shell children can only write inside
+that worktree (plus temp/scratch and the git metadata a worktree commit needs) —
+see "Sandbox".
 
 A profile can also tune the sub-agent's runtime knobs, each inheriting the main
 agent's when omitted: `temperature`, `effort` (`minimal`/`low`/`medium`/`high`),
@@ -895,6 +901,62 @@ Disable entirely with `memory = false` in config or `$HRDR_MEMORY=0`. Memory is
 distinct from `AGENTS.md`, which stays the human-authored, read-only project
 instructions.
 
+### Sandbox
+
+Every agent runs confined, by default. hrdr runs arbitrary models and guidance
+only reaches steerable ones: the motivating incident was a delegated write
+sub-agent that `cd`'d out of its worktree and committed to the parent repo's
+`main`. So the boundary is enforced rather than requested.
+
+Each agent derives its mode once, at construction, from the session mode and its
+own permissions:
+
+- **`write`** (the default) — reads are unrestricted; writes are allowed only
+  under the agent's working directory, the temp dir, a per-session scratch dir,
+  the tool-output spill dir, the git metadata a linked worktree needs in order
+  to commit, and any `sandbox_writable_roots` you configure.
+- **`read`** — what a read-only agent or `--agent` profile gets automatically:
+  no writes at all, and reads only under its cwd, scratch and tool-output dirs.
+- **`none`** — no confinement; exactly the pre-sandbox behavior.
+
+Two layers enforce it. The file tools (`write`, `edit`, `replace`, `move`,
+`copy`, `delete`, `read`, `grep`, `ls`, `tree`, `lsp_nav`) check every path the
+model hands them — symlinks and `..` resolved first — and refuse with
+`sandbox: refusing to write <path> — it is outside this agent's writable roots. You may write only under: …`.
+That guard can only see paths a tool is given, so `shell` and `watch` children
+are confined by the OS instead:
+
+| Platform                       | Backend                            | What a violation looks like                                                                                                                                                                               |
+| ------------------------------ | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Linux**                      | `bwrap` (bubblewrap)               | `write`: the filesystem is read-only except the writable roots → `Read-only file system`. `read`: only `/usr`, `/etc`, a private `/tmp` and the readable roots exist at all → `No such file or directory` |
+| **Linux** without bwrap/userns | Landlock                           | writes outside the roots → `Permission denied`; Landlock has no read axis, so a read-only agent's shell is write-confined only                                                                            |
+| **macOS**                      | `/usr/bin/sandbox-exec` (Seatbelt) | write outside the roots → `Operation not permitted`                                                                                                                                                       |
+| **Windows**                    | none                               | file tools stay guarded; shell commands are **not** OS-confined                                                                                                                                           |
+
+hrdr never pretends to confine more than it does: every degradation surfaces
+once per session as a notice —
+`sandbox: bwrap not found — falling back to Landlock: …`,
+`sandbox: no OS-level sandbox is available on this system — shell commands are NOT OS-confined; …`.
+The network is untouched in every mode, and the environment is inherited whole,
+so `PATH`, `HOME`, `CARGO_HOME` and ordinary builds behave as before.
+
+```toml
+sandbox = "write"          # write (default) | read | none
+                           # env HRDR_SANDBOX, flags --sandbox <mode> / --no-sandbox
+sandbox_writable_roots = [ # absolute paths only (a relative entry is a config error)
+  "/home/me/.cargo",       # a cold `cargo build` writes to the registry…
+  "/home/me/.npm",         # …and `npm install` to the npm cache
+]
+```
+
+The narrow escape hatch is `sandbox_writable_roots`: package caches are
+deliberately _not_ writable by default, so a cold `cargo build`/`npm install` in
+a fresh worktree hits a read-only filesystem until you grant them. The blunt one
+is `--no-sandbox` (or `sandbox = "none"`), which restores full access exactly.
+Broad reads in `write` mode are equally deliberate — builds read all over the
+disk — which means a **shell** command can still read `~/.ssh`; the
+credential-file guard below covers the file tools, not the shell.
+
 ### Guardrails
 
 The shell tool mechanically rejects the classic foot-guns before they run —
@@ -909,13 +971,14 @@ more reliable than a prompt rule alone. `sudo` itself is allowed — installing
 system packages at the user's request is the user's call — but it can't launder
 an otherwise-blocked command.
 
-The file tools have full filesystem access — hrdr is meant to run in a codebase
-you trust, and a working directory that also let the model reach a sibling repo
-or a generated file just upstream removes a whole class of needless friction. On
-top of that, the read tools refuse known **credential/secret files** — SSH and
-other private keys, `.env`, cloud credentials (AWS/GCP/kube/Docker),
-`.netrc`/`.npmrc`/ `.pypirc`/`.git-credentials`, keystores, and the like — so
-prompt-injected content can't have the agent read them out. And `fetch` blocks
+Reads are deliberately broad — hrdr is meant to run in a codebase you trust, and
+a working directory that also lets the model reach a sibling repo or a generated
+file just upstream removes a whole class of needless friction; writes are what
+the sandbox above confines. On top of that, the read tools refuse known
+**credential/secret files** — SSH and other private keys, `.env`, cloud
+credentials (AWS/GCP/kube/Docker), `.netrc`/`.npmrc`/
+`.pypirc`/`.git-credentials`, keystores, and the like — so prompt-injected
+content can't have the agent read them out. And `fetch` blocks
 internal/loopback/private and cloud-metadata hosts (SSRF), re-checking on every
 redirect hop and at connect time so a DNS rebind can't slip through.
 
@@ -1100,6 +1163,10 @@ The shell and search tools adapt to the host:
   works). The built-in `grep` fallback means search works with nothing extra;
   add **ripgrep** for speed.
 
+Sandbox coverage also differs by host: bubblewrap (or Landlock) on Linux,
+Seatbelt on macOS, and on Windows the file-tool path guard only — shell commands
+there are not OS-confined, and hrdr says so once per session. See "Sandbox".
+
 ## Status / roadmap
 
 - [x] OpenAI client (streaming + tool calls) + agent loop
@@ -1127,6 +1194,10 @@ The shell and search tools adapt to the host:
       Homebrew, Scoop, Alpine
 - [x] MCP client (stdio + Streamable-HTTP + legacy HTTP+SSE) — `[[mcp]]`
       servers' tools, resources, and prompts join the set
+- [x] OS sandbox, on by default: a path guard on the file tools plus
+      kernel-confined shell children (bubblewrap → Landlock on Linux, Seatbelt
+      on macOS), so a write agent — main, delegated or revived — can only write
+      under its own working directory; `--no-sandbox` opts out
 - [x] LSP diagnostics feedback: post-edit errors from the file's language server
       (presence-aware, lazy-spawned, session-warm) ride back with the tool
       result — see "LSP diagnostics"

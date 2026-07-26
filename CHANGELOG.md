@@ -84,8 +84,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   any configured `sandbox_writable_roots`), a read-only agent gets `read` (no
   writes at all; reads only under its cwd, scratch, and tool-output). The file
   tools (`write`, `edit`, `replace`, `move`, `copy`, `delete`, `read`, `grep`,
-  `ls`, `tree`, `lsp_nav`) enforce it today, with symlink and `..` escapes
-  resolved before the check. A refused write reads
+  `ls`, `tree`, `lsp_nav`) enforce it in-process, with symlink and `..` escapes
+  resolved before the check; the three entries below add kernel enforcement for
+  the shell children a path guard cannot see. A refused write reads
   `sandbox: refusing to write <path> — it is outside this agent's writable roots. You may write only under: …`.
   Escape hatches, in order of bluntness:
   `sandbox_writable_roots = ["/abs/path"]` (the remedy for a cold
@@ -139,7 +140,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Operation not permitted`. cwd, stdio, exit status, timeouts and group-kill
   are untouched, and the network is allowed as on Linux. A Mac without
   `/usr/bin/sandbox-exec` falls back to the software layer and the same "no
-  OS-level sandbox" notice as Windows.
+  OS-level sandbox" notice as Windows. Honest caveat: the profile is generated
+  and unit-tested but has not yet run on real hardware (no Mac was available),
+  and it is a deliberate coarsening of Codex's — a first run that denies
+  something a shell needs (a pty, a write to `/dev/null`) is the profile being
+  too tight, not the sandbox misbehaving.
 - **BREAKING (tool API): every model-facing time parameter is in seconds —
   `shell`'s `timeout_ms` is now `timeout_secs`.** The tool schemas mixed units:
   `watch` took `interval_secs`/`timeout_secs` while `shell` took `timeout_ms`,

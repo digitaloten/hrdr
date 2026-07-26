@@ -154,18 +154,16 @@ non-writable _inside_ a writable root unless explicitly granted
 `forbidden_agent_metadata_write`), with the rationale in-tree at
 `protocol/src/protocol.rs:1058-1062`: folders whose contents _"could be modified
 to escalate the privileges of the agent (e.g. `.codex`, `.git`, notably
-`.git/hooks`)"_. hrdr's `docs/sandbox-design.md` never mentions git metadata,
-and its slice-2 path guard checks only "is this under a writable root" — a
-worktree's `.git` _is_ under the worktree. So even after the full sandbox ships,
-a write sub-agent could install `.git/hooks/pre-commit` that runs on the
-parent's next commit: a worse version of the incident that motivated the design.
-Lands independently of issue #13. Subsumes the tracked "sub-agent isolation
-guard" item with something mechanical rather than telemetry. _Caveat:_ hrdr's
-own `task_*` plumbing legitimately writes git metadata (worktrees, commits,
-cherry-picks), so the rule must be "the **model's** file tools may not; hrdr's
-git plumbing may" — a `ToolContext` distinction hrdr does not currently draw.
-And `git commit` via `shell` writes `.git/index`, so the shell-side half is only
-enforceable by the OS layer.
+`.git/hooks`)"_. hrdr's sandbox (shipped 2026-07-27) has no such notion: its
+path guard asks only "is this under a writable root" — and a worktree's `.git`
+_is_ under the worktree. So even with the sandbox on, a write sub-agent could
+install `.git/hooks/pre-commit` that runs on the parent's next commit: a worse
+version of the incident that motivated the whole design. Lands independently of
+issue #13. _Caveat:_ hrdr's own `task_*` plumbing legitimately writes git
+metadata (worktrees, commits, cherry-picks), so the rule must be "the
+**model's** file tools may not; hrdr's git plumbing may" — a `ToolContext`
+distinction hrdr does not currently draw. And `git commit` via `shell` writes
+`.git/index`, so the shell-side half is only enforceable by the OS layer.
 
 **2. World-state diff fragments instead of silently rewriting the prompt.**
 Codex decomposes mutable model-visible state into typed sections
@@ -210,14 +208,14 @@ which is why `ShellTool` can vary by dialect (a compile-time-enumerable set) but
 cannot interpolate runtime values. Three live consequences: `task`'s description
 can't list the actually-configured models; the guardrail-message duplication
 between `guardrails.rs` and `system.j2` that hrdr already tracks as a drift risk
-could be eliminated by construction; and if the sandbox ships, writable roots
-can't appear in the descriptions of the tools they constrain — which is
-precisely the "positive declaration" lesson `sandbox-design.md:212-220` says to
-copy. _Caveat:_ `&'static str` buys testability and cache-stability;
-interpolating runtime values means the schema changes between turns,
-invalidating caches. If the only real case is "list configured models in
-`task`", putting it in `parameters()` (already a runtime `serde_json::Value`) is
-cheaper and cache-equivalent.
+could be eliminated by construction; and now that the sandbox has shipped, its
+writable roots can't appear in the descriptions of the tools they constrain —
+which is why the "positive declaration" of the boundary had to go into a
+runtime-built prompt section (`SECTION_SANDBOX`) instead. _Caveat:_
+`&'static str` buys testability and cache-stability; interpolating runtime
+values means the schema changes between turns, invalidating caches. If the only
+real case is "list configured models in `task`", putting it in `parameters()`
+(already a runtime `serde_json::Value`) is cheaper and cache-equivalent.
 
 **4. Per-call permission escalation in the tool schema.** Codex's shell schemas
 carry `sandbox_permissions` (`use_default` | `with_additional_permissions` |
@@ -338,35 +336,37 @@ tools. **Do it if MCP tool counts get large, not now.**
 - **Interactive approvals as a posture.** Codex's four-way `AskForApproval`
   exists because a human is usually watching.
 
-### Stale in hrdr's own sandbox design doc
+### Where codex's sandbox has moved past hrdr's
 
-`docs/sandbox-design.md` describes codex accurately on backends (bwrap primary
-with a bundled copy — note `linux-sandbox/src/bwrap.rs` is **102 KB**, not a
-thin wrapper — Landlock, seccomp, seatbelt, Windows crate) and on "on by
-default". It is stale in five ways:
+hrdr's sandbox (specced from codex, shipped 2026-07-27) reads codex accurately
+on backends (bwrap primary with a bundled copy — note
+`linux-sandbox/src/bwrap.rs` is **102 KB**, not a thin wrapper — Landlock,
+seccomp, seatbelt, Windows crate) and on "on by default". Codex has since moved
+on in five ways, none of which hrdr has:
 
-1. **The policy is no longer "writable roots".** It is a precedence-ordered
-   entry list (`FileSystemSandboxPolicy { kind, glob_scan_max_depth, entries }`,
+1. **Codex's policy is no longer "writable roots"** (hrdr's is). It is a
+   precedence-ordered entry list
+   (`FileSystemSandboxPolicy { kind, glob_scan_max_depth, entries }`,
    `protocol/src/permissions.rs:223-228`) of
    `{path, access, missing_path_behavior}` with `Read|Write|Deny`,
    most-specific-wins, and **deny beats write beats read** at equal specificity.
    Paths may be globs or symbolic tokens
    (`Root, Minimal, ProjectRoots{subpath}, Tmpdir, SlashTmp, Unknown`) —
    `Unknown` retained deliberately so newer config degrades to warn-and-ignore.
-2. **Protected workspace metadata is missing entirely** — see finding 1, the
-   item most relevant to hrdr's motivating incident.
+2. **Protected workspace metadata is missing entirely from hrdr** — see finding
+   1, the item most relevant to hrdr's motivating incident.
 3. **Network is a MITM proxy, not a seccomp follow-up**
    (`codex-rs/network-proxy/`: `proxy.rs` 80 KB, `runtime.rs` 71 KB, `socks5.rs`
-   42 KB, `certs.rs` 35 KB, plus netns routing). The doc frames it as seccomp at
-   `:155-157`.
+   42 KB, `certs.rs` 35 KB, plus netns routing). hrdr's deferred network axis is
+   still framed as seccomp.
 4. **Named permission profiles with inheritance** (`[permissions.<id>]` with
    `extends`, built-ins `:read-only` / `:workspace` / `:danger-full-access`)
-   versus the doc's flat three-value enum.
-5. **A fourth mode the doc has no slot for:**
+   versus hrdr's flat three-value `SandboxMode`.
+5. **A fourth mode hrdr has no slot for:**
    `PermissionProfile::External { network }` — "filesystem isolation is enforced
-   by an external caller". hrdr's proposed `SandboxMode::None` conflates
-   "unsandboxed" with "sandboxed by my container", losing the ability to keep
-   the network axis while disabling the FS layer.
+   by an external caller". hrdr's `SandboxMode::None` conflates "unsandboxed"
+   with "sandboxed by my container", losing the ability to keep the network axis
+   while disabling the FS layer.
 
 Also understated: codex's _software_ layer is a real parser, not regexes —
 `shell-command/src/parse_command.rs` (82 KB) producing

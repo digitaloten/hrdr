@@ -1,13 +1,15 @@
 # Deferred improvements / backlog
 
-Smaller items that were identified but not yet done or tracked elsewhere. Larger
-efforts have their own docs: `sandbox-design.md` (implementation-ready spec,
-issue #13) and `compare.md` (harness comparison — its open shortlist: model-
-invocable skills, doom_loop detection, `.git` protection in worktrees, and the
-two prompt defects #2/#3). `security-audit.md` is fully closed (kept as a
-methodology record). The web UI shipped 2026-07-26 (plan doc deleted; its
-leftovers are the **Web UI follow-ups** section below). The Codex catalog pin is
-issue #2.
+Smaller items that were identified but not yet done or tracked elsewhere. The
+one larger effort that still has its own doc is `compare.md` (harness comparison
+— its open shortlist: model-invocable skills, doom_loop detection, `.git`
+protection in worktrees, and the two prompt defects #2/#3). `security-audit.md`
+is fully closed (kept as a methodology record). The web UI shipped 2026-07-26
+(plan doc deleted; its leftovers are the **Web UI follow-ups** section below).
+The OS sandbox (issue #13) shipped 2026-07-27 — its spec doc is deleted, the
+design now lives in `crates/hrdr-tools/src/sandbox.rs`'s doc comments and its
+tests; what still binds is **Sandbox follow-ups** below plus the sandbox rules
+under **Standing constraints**. The Codex catalog pin is issue #2.
 
 Docs for finished work are deleted rather than kept as history — read the code
 and `git log`. What survives from a completed effort is only what still binds
@@ -23,15 +25,57 @@ future work; those are collected under **Standing constraints** at the bottom.
   memory-tool design.
 - **LSP diagnostics dedup.** The same diagnostic can surface more than once
   (overlapping ranges / re-published sets); dedupe before showing the model.
-- **Sub-agent isolation guard.** A defensive check that a write sub-agent's tool
-  operations stay within its worktree — belt-and-suspenders on top of the cwd
-  being set to the worktree (escaping is by design for full-FS access, but an
-  accidental parent-tree write is worth catching/telemetering).
 - **A revived sub-agent always runs write-capable.** `task_revive` reuses the
   worktree and takes a write slot, because read-only-ness was never persisted in
   `SessionState` — so a revived former read-only explorer runs write-capable in
   the recorded/main dir. Not central to the shipped use cases (both target write
   sub-agents), but it is a real gap: persist the flag and honour it on revive.
+
+## Sandbox follow-ups
+
+Declared when the sandbox was specced and deliberately left out of v1, plus what
+bring-up turned up. None are scheduled; the rules that govern any of this work
+are under **Standing constraints**.
+
+- **No network axis.** Every backend leaves the network wide open on purpose
+  (`--unshare-net` unused on bwrap, `(allow network*)` in the Seatbelt profile).
+  The declared route was seccomp on Linux; note Codex has since moved past that
+  to a MITM proxy with netns routing (`codex-rs/network-proxy/`, see
+  `compare.md`), so revisit the mechanism before building the old plan.
+- **Bundled `bwrap`.** Hosts without bubblewrap degrade to Landlock (weaker: no
+  read axis). Codex ships its own copy (`linux-sandbox/src/bundled_bwrap.rs`);
+  doing the same removes the most common degradation.
+- **Curated read allow-list for `write` mode.** Reads are unrestricted there by
+  decision, so a shell command can read `~/.ssh` — the file tools'
+  `guard_secret_read` has no shell-side equivalent. A read allow-list (or a
+  secret-path deny-list applied at the mount level) closes it.
+- **Windows has no OS layer.** Software path-guard only, permanently for v1;
+  AppContainer or a restricted token is the eventual answer (Codex has
+  `windows-sandbox-rs/`). Until then every Windows session gets the "no OS-level
+  sandbox" notice.
+- **No shell-command pre-flight.** A write outside the roots reaches the model
+  as the kernel's `Read-only file system`, not as an explanation. A heuristic
+  parser (Codex's `shell-command/src/parse_command.rs` is the reference) could
+  say "this would write outside your roots" first — in front of the sandbox,
+  never instead of it.
+- **Re-evaluate the `git` tool now that Read mode exists.** The read-only
+  allow-list of git subcommands is currently the only git access a read-only
+  agent has, and it spawns a subprocess the path guard cannot inspect — a
+  `git -C /elsewhere log` succeeds even in `read` mode. With OS confinement
+  shipped, the codex-style alternative is now possible: give read-only agents a
+  sandboxed shell and let the allow-list shrink or disappear.
+- **macOS Seatbelt has never run.** The profile is pure-tested only; the e2e
+  test is `cfg(target_os = "macos")` and no Mac was available. It is also a
+  coarsening of Codex's `seatbelt_base_policy.sbpl` — no `pseudo-tty`, no
+  `/dev/null` write, no `iokit-open`/`user-preference-read` — so the first real
+  run should read a denial as "profile too tight" before "sandbox broken"; pty
+  and `/dev/null` writes are the likely first additions.
+- **The degradation-notice cell is process-global.** `set_sandbox_notice` /
+  `take_sandbox_notice` share one queue for the whole process, so with several
+  agents in flight one agent's turn loop can drain a notice another produced. It
+  is also the cause of the known `sandbox_notice_reaches_the_event_stream` flake
+  (a parallel test swallows the seeded notice). A per-agent channel owned beside
+  the policy fixes both.
 
 ## Consistency / robustness
 
@@ -101,6 +145,18 @@ future work; those are collected under **Standing constraints** at the bottom.
 
 ## Known behaviour to revisit
 
+- **Building a sandbox policy touches the parent repo's `.git`.**
+  `git_metadata_roots` `create_dir_all`s `refs/heads/hrdr` and
+  `logs/refs/heads/hrdr` so they exist to be canonicalized and bind-mounted —
+  which means `Agent::new` with a linked-worktree cwd creates those two dirs in
+  the **parent** repo's `.git` at construction time. Harmless (git ignores empty
+  ref dirs) but worth knowing: constructing an agent is not read-only with
+  respect to the repo.
+- **A worktree commit can print a `packed-refs.lock` EROFS line.** Ref
+  maintenance triggered by a commit inside a sandboxed worktree may fail to
+  create `<parent>/.git/packed-refs.lock` while the commit itself lands and
+  exits 0. Observed during bring-up, asserted by no test — treat it as possible,
+  not guaranteed, and do not widen the roots to silence it.
 - **Input-path unification UX.** After the "every user message is a queued
   `Steer`" refactor, a submitted message renders when its `Steered` event is
   pumped (a beat after submit) rather than synchronously, matching sub-agent
@@ -200,6 +256,41 @@ items — they are rules.
   produced security finding O4 (duplicate auth header) and a wire log that
   silently covered only one backend. Anything cross-cutting added to
   `client.rs`'s request path must be checked against the other two.
+- **The sandbox is a boundary, not a hint** (rules from the shipped OS sandbox;
+  the code is `crates/hrdr-tools/src/sandbox.rs`).
+  - _Never confine the hrdr process itself._ No Landlock `restrict_self`, no
+    prctl, outside a child `pre_exec`. hrdr does its own session/config/memory
+    I/O in-process; confining it breaks the app.
+  - _Never silently pretend to sandbox._ Any path that ends up running a command
+    with less confinement than the mode asks for must set its notice first (each
+    notice at most once per process). `read` degrading to write-confinement
+    under Landlock is decided and allowed — being quiet about it is not.
+  - _The writable set is all of it:_ cwd + `env::temp_dir()` + session scratch +
+    tool-output + the four linked-worktree git metadata roots (worktree gitdir,
+    `objects`, `refs/heads/hrdr`, `logs/refs/heads/hrdr`) + configured extras.
+    Drop temp and compilers die; drop scratch/tool-output and overflow spill
+    breaks; drop the git roots and every write sub-agent's commit fails.
+    Equally: never widen to the whole parent `.git` — that re-opens the escape
+    the sandbox exists to close.
+  - _bwrap argv order is semantics_ (later mounts shadow earlier ones):
+    `--ro-bind / /` before the rw `--bind`s; `--tmpfs /tmp` before the
+    cwd/scratch/tool-output binds (the scratch dir lives under `/tmp`); and
+    `/bin`, `/sbin`, `/lib`, `/lib64` emitted as `--symlink <read_link(p)> <p>`
+    on usr-merged distros, never `--ro-bind` and never a guessed
+    `usr/<basename>`.
+  - _`ToolContext::new` stays unconfined._ Only `Agent::new` installs a real
+    policy; hundreds of tool tests build a bare context against tempdirs.
+  - _Guard model-supplied paths only._ Memory storage, overflow-spill writes and
+    hook/LSP/MCP subprocesses are app infrastructure and bypass
+    `resolve_read`/`resolve_write` by design. The one deliberate widening is
+    `rename`, which also guards the server-returned workspace-edit targets — the
+    guard's contract is _where writes land_, not _who typed the path_.
+  - _`SECTION_SANDBOX` stays after `SECTION_ENVIRONMENT`_ (its roots name the
+    per-agent worktree, so it belongs in the volatile tail), and the
+    prompt-cache split anchor stays `SECTION_ENVIRONMENT`.
+  - _Broad reads in `write` mode and full env passthrough in bwrap_ (no
+    `--clearenv`) are decided v1 tradeoffs, not oversights. Narrowing either is
+    the follow-up work listed above, not a bug fix.
 - **A new tool picks its interface shape by rule, not by taste** (taxonomy from
   the 2026-07-27 survey of all 31 tools). The shape is load-bearing: the
   harness's cross-cutting layer (read-guard, staleness culprit naming, secret
