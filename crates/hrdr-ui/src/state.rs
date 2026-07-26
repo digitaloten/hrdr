@@ -42,7 +42,7 @@ pub fn apply_frame(frame: &ServerFrame, transcript: &mut Vec<ViewEntry>) {
     }
 }
 
-fn entry_to_view(ev: &hrdr_protocol::WireEntryView) -> ViewEntry {
+pub fn entry_to_view(ev: &hrdr_protocol::WireEntryView) -> ViewEntry {
     let entry = &ev.entry;
     let (css_class, html) = match &entry.kind {
         hrdr_protocol::WireEntryKind::Header => (
