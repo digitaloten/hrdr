@@ -56,6 +56,29 @@ fn lf_to_crlf(s: &str) -> String {
     out
 }
 
+/// " — modified by `cargo fmt --all`" when we know which shell command changed
+/// the file, empty when we don't (the user's editor, a background process).
+fn culprit_clause(ctx: &ToolContext, path: &std::path::Path) -> String {
+    match ctx.change_culprit(path) {
+        Some(cmd) => format!(" — modified by `{cmd}`"),
+        None => String::new(),
+    }
+}
+
+/// The refusal for an edit whose file changed on disk since the read *and* whose
+/// anchor no longer pins one spot in it. Names the command that changed the file
+/// when known: an unexplained "changed on disk" reads like a bug in our
+/// bookkeeping, and the observed reaction is to stop using `edit` at all,
+/// whereas a named formatter points straight at "re-read and retry".
+fn stale_error(ctx: &ToolContext, path: &std::path::Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{} changed on disk since you read it{} — re-read it and copy old_string \
+         from the current content",
+        path.display(),
+        culprit_clause(ctx, path)
+    )
+}
+
 // ---- edit ----
 
 pub struct EditTool;
@@ -120,22 +143,23 @@ impl Tool for EditTool {
             );
         }
         // `edit` matches `old_string` against the file's live on-disk content, so
-        // a partial read is fine — but the model must have read it at all, and its
-        // view must not be stale (a change on disk since could move or erase the
-        // text it's matching).
-        match ctx.read_state(&path) {
+        // a partial read is fine — but the model must have read it at all.
+        //
+        // A change on disk since the read does *not* sink the edit by itself: the
+        // dominant cause is a formatter (`cargo fmt`, `prettier`) reflowing lines
+        // the edit doesn't touch, and refusing there taught models to distrust
+        // `edit` and rewrite whole files instead. The verdict is carried down to
+        // the match instead — a unique match against the *current* content means
+        // the anchor is live and the edit is safe (see `stale` below).
+        let stale = match ctx.read_state(&path) {
             crate::ReadState::Unread => bail!(
                 "you haven't read {} yet — call read first, then copy old_string \
                  exactly from its output",
                 path.display()
             ),
-            crate::ReadState::Stale => bail!(
-                "{} changed on disk since you read it — re-read it and copy old_string \
-                 from the current content",
-                path.display()
-            ),
-            crate::ReadState::Partial | crate::ReadState::Fresh => {}
-        }
+            crate::ReadState::Stale => true,
+            crate::ReadState::Partial | crate::ReadState::Fresh => false,
+        };
         // Stat before reading: `read_to_string` buffers the whole file, so a
         // multi-gigabyte target would OOM before a single match is found. Reuse
         // `read`'s cap — an edit to a file larger than `read` can even show is a
@@ -173,6 +197,14 @@ impl Tool for EditTool {
                 count = translated_count;
             }
         }
+        // The stale-read verdict, resolved against the live content: exactly one
+        // match means the model's anchor is current-file text, so apply the edit
+        // (and say so in the result). Anything else — the anchor is gone, or has
+        // become ambiguous — is the old refusal: the model cannot know what the
+        // change did, so it must re-read rather than guess.
+        if stale && count != 1 {
+            return Err(stale_error(ctx, &path));
+        }
         if count == 0 {
             // The #1 retry cause: right text, wrong whitespace. Detect it and
             // say so instead of the generic error.
@@ -200,6 +232,19 @@ impl Tool for EditTool {
                 path.display()
             );
         }
+        // Read the attribution before the write: `mark_read` below clears it (the
+        // file is no longer stale afterwards), so this is the last moment the
+        // reason is still on record.
+        let stale_note = if stale {
+            format!(
+                "\nnote: the file had changed on disk since your last read{}; your anchor \
+                 still matched uniquely, so the edit was applied — the diff below reflects \
+                 the current file",
+                culprit_clause(ctx, &path)
+            )
+        } else {
+            String::new()
+        };
         let updated = if a.replace_all {
             // Bound the allocation before making it: only a growing replacement
             // can blow up, and its output size is exactly computable from the
@@ -227,7 +272,7 @@ impl Tool for EditTool {
         let diff = unified_diff(&path.display().to_string(), &text, &fc.content_after);
         Ok(truncate(
             &format!(
-                "Replaced {count} occurrence(s) in {}{warn}\n{diff}",
+                "Replaced {count} occurrence(s) in {}{warn}{stale_note}\n{diff}",
                 path.display()
             ),
             ctx.max_output,

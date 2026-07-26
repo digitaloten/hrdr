@@ -8,6 +8,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A formatter running between read and edit no longer sinks the edit.** The
+  read-before-mutate guard tracked the content the model had seen, so a
+  `cargo fmt`/`prettier` (in a post-edit hook, or run by the model itself)
+  invalidated the baseline and `edit` refused with "changed on disk since you
+  read it". In two mined sessions this was the majority of all `edit` failures
+  (9/11 and ~10/18) and it taught the model to distrust `edit` altogether — one
+  fell back to whole-file `write` rewrites for 49% of everything it generated.
+  Three changes: (1) `edit` now applies over a stale read **when `old_string`
+  still matches the current on-disk content exactly and uniquely** — the anchor
+  is live content, so the edit is safe — and appends a note saying the file had
+  changed and that the diff reflects the current file; an anchor that is gone or
+  has become ambiguous is still refused, unapplied. (2) `replace` refreshes the
+  read baseline for every file it rewrote (it shows the model the post-hook
+  content, so there is nothing left for the guard to protect). (3) `shell`
+  records which _tracked_ files each command changed (before/after signatures,
+  last command per path, truncated to 80 chars) — deliberately **not** a
+  baseline refresh, since the model never saw what the command wrote — so the
+  staleness refusal now names the culprit: "… changed on disk since you read it
+  — modified by `cargo fmt --all` — re-read it …", which points straight at a
+  re-read instead of at our bookkeeping.
 - **The `hrdr-ui` web client now actually compiles for `wasm32`.** It had been
   written against a partly imagined Dioxus API and never built: `dioxus::launch`
   (not `dioxus::web::launch`), `evt.modifiers().shift()` (not

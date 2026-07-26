@@ -190,7 +190,18 @@ impl Tool for ShellTool {
         let mut cmd = self.shell.command(&a.command);
         cmd.current_dir(&ctx.cwd);
         let timeout = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS));
-        run_streamed_command(cmd, timeout, ctx).await
+        // A command is the usual reason a file the model read goes stale — a
+        // formatter, a codegen step, `git checkout`. Note which tracked files
+        // this one changed (before/after signatures) so a later `edit` refusal
+        // can name it. The baseline is deliberately *not* refreshed: the model
+        // hasn't seen what the command wrote, which is exactly what the
+        // read-before-mutate guard is for.
+        let before = ctx.tracked_sigs();
+        let out = run_streamed_command(cmd, timeout, ctx).await;
+        // Also on failure: a command that exited non-zero (or timed out) may
+        // still have rewritten files before it died.
+        ctx.note_modifying_command(&before, &a.command);
+        out
     }
 }
 

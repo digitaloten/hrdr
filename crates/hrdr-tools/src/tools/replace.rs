@@ -190,6 +190,12 @@ impl Tool for ReplaceTool {
                 diffs.push_str(&unified_diff(&rel, &before, &after));
             } else {
                 let fc = apply_file_change(ctx, &path, "replace", &after).await?;
+                // Refresh the read baseline for every file this rewrote: the diff
+                // below shows the model the post-hook content, so it *has* seen
+                // the current file and a following `edit`/`write` must not be
+                // refused as stale (the guard exists for content the model hasn't
+                // seen). Recorded after the hooks, so the signature is the one on
+                // disk, not this tool's pre-hook substitution.
                 ctx.mark_read(&path);
                 for note in &fc.notes {
                     notes.push_str(&format!("[{rel}] {note}\n"));

@@ -300,7 +300,10 @@ mod tests {
     }
 
     /// `edit` matches against the file's live content, so a partial read is
-    /// enough — but a stale read (file changed on disk since) is still refused.
+    /// enough — but a stale read (file changed on disk since) whose `old_string`
+    /// no longer exists in the new content is still refused. A stale read whose
+    /// anchor *does* still match is applied — see
+    /// `edit_over_a_stale_read_applies_when_the_anchor_still_matches`.
     #[tokio::test]
     async fn edit_accepts_a_partial_read_but_refuses_a_stale_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -323,17 +326,194 @@ mod tests {
             .unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("todo!()"));
 
-        // The file changes underneath; the next edit is refused as stale.
+        // The file changes underneath, taking the anchor with it; the next edit is
+        // refused as stale.
         std::fs::write(&path, "totally different and longer content here\n").unwrap();
         let err = EditTool
             .execute(
-                json!({"path": p, "old_string": "totally", "new_string": "TOTALLY"}),
+                json!({"path": p, "old_string": "fn b() { todo!() }", "new_string": "fn b() {}"}),
                 &c,
             )
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("changed on disk"), "{err}");
+    }
+
+    /// The formatter case, which used to be the top source of `edit` failures: a
+    /// hook/`cargo fmt` rewrites the file between read and edit, but the model's
+    /// `old_string` still matches the *current* content uniquely — so the anchor
+    /// is live and the edit is applied, with a note saying the diff is against
+    /// the changed file. A following edit works too: the baseline moved to the
+    /// post-edit content, so the model isn't pushed into a re-read either way.
+    #[tokio::test]
+    async fn edit_over_a_stale_read_applies_when_the_anchor_still_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code.rs");
+        std::fs::write(&path, "fn a() {}\nfn keep() {}\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let p = path.to_str().unwrap();
+
+        ReadTool.execute(json!({"path": p}), &c).await.unwrap();
+        // A formatter reflows an untouched region (different length → stale
+        // regardless of mtime granularity) but leaves the anchor intact.
+        std::fs::write(&path, "fn a() {\n    // reformatted\n}\nfn keep() {}\n").unwrap();
+
+        let out = EditTool
+            .execute(
+                json!({"path": p, "old_string": "fn keep() {}", "new_string": "fn kept() {}"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("Replaced 1 occurrence"), "{out}");
+        assert!(
+            out.contains("had changed on disk") && out.contains("anchor still matched"),
+            "the result must say the edit was applied over a changed file: {out}"
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "fn a() {\n    // reformatted\n}\nfn kept() {}\n");
+
+        // The baseline followed the edit: no re-read needed for the next one.
+        EditTool
+            .execute(
+                json!({"path": p, "old_string": "reformatted", "new_string": "formatted"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("formatted"),
+            "the follow-up edit must not be refused as stale"
+        );
+    }
+
+    /// A stale read whose anchor became *ambiguous* is refused, not applied: two
+    /// matches means the model can't know which one it is aiming at, which is the
+    /// same reason a fresh non-unique edit is refused.
+    #[tokio::test]
+    async fn edit_over_a_stale_read_refuses_an_ambiguous_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dup.rs");
+        std::fs::write(&path, "fn one() {}\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let p = path.to_str().unwrap();
+
+        ReadTool.execute(json!({"path": p}), &c).await.unwrap();
+        // Something duplicates the anchor underneath us.
+        std::fs::write(&path, "fn one() {}\nfn one() {}\n").unwrap();
+
+        let err = EditTool
+            .execute(
+                json!({"path": p, "old_string": "fn one() {}", "new_string": "fn two() {}"}),
+                &c,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("changed on disk"), "{err}");
+        // Nothing was written.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn one() {}\nfn one() {}\n"
+        );
+    }
+
+    /// `replace` shows the model the new content of every file it rewrote, so the
+    /// stale guard has nothing left to protect: an `edit` to one of those files
+    /// goes through without an intervening re-read.
+    #[tokio::test]
+    async fn edit_after_replace_needs_no_reread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.rs");
+        std::fs::write(&path, "let old_name = 1;\nlet other = 2;\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let p = path.to_str().unwrap();
+
+        ReadTool.execute(json!({"path": p}), &c).await.unwrap();
+        ReplaceTool
+            .execute(
+                json!({"find": "old_name", "replace": "new_name", "path": dir.path().to_str().unwrap()}),
+                &c,
+            )
+            .await
+            .unwrap();
+
+        let out = EditTool
+            .execute(
+                json!({"path": p, "old_string": "let other = 2;", "new_string": "let other = 3;"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("Replaced 1 occurrence"), "{out}");
+        assert!(
+            !out.contains("had changed on disk"),
+            "`replace` refreshed the baseline, so this edit isn't a stale one: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "let new_name = 1;\nlet other = 3;\n"
+        );
+    }
+
+    /// When a `shell` command is what changed a tracked file, the staleness
+    /// refusal names it — "modified by `…`" — so the model re-reads instead of
+    /// suspecting its own bookkeeping (the observed failure mode: distrusting
+    /// `edit` and rewriting whole files with `write`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_edit_error_names_the_shell_command_that_changed_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fmt_me.rs");
+        std::fs::write(&path, "fn a(){}\n").unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let p = path.to_str().unwrap();
+
+        ReadTool.execute(json!({"path": p}), &c).await.unwrap();
+        ShellTool::new(Shell::Bash)
+            .execute(
+                json!({"command": "printf 'fn a() {}\\nfn b() {}\\n' > fmt_me.rs # pretend-fmt"}),
+                &c,
+            )
+            .await
+            .unwrap();
+
+        // Anchor gone (the command rewrote that line) → still refused, but now
+        // the refusal says what did it.
+        let err = EditTool
+            .execute(
+                json!({"path": p, "old_string": "fn a(){}", "new_string": "fn a() { todo!() }"}),
+                &c,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("changed on disk"), "{err}");
+        assert!(
+            err.contains("modified by") && err.contains("pretend-fmt"),
+            "the culprit command must be named: {err}"
+        );
+
+        // A re-read clears the attribution: a later, unexplained change must not
+        // be blamed on that command.
+        ReadTool.execute(json!({"path": p}), &c).await.unwrap();
+        std::fs::write(&path, "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        let err = EditTool
+            .execute(
+                json!({"path": p, "old_string": "fn zzz() {}", "new_string": "x"}),
+                &c,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("changed on disk"), "{err}");
+        assert!(
+            !err.contains("modified by"),
+            "stale attribution kept: {err}"
+        );
     }
 
     /// Two edits in a row are fine: the first re-records the file post-edit, so

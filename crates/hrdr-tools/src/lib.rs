@@ -199,6 +199,14 @@ pub struct ToolContext {
     /// drops the unseen tail, and a `write` over a file that changed on disk
     /// silently clobbers the change.
     pub read_files: Arc<Mutex<std::collections::HashMap<PathBuf, ReadRecord>>>,
+    /// Why a tracked file is stale, when we know: the last shell command observed
+    /// to have changed it (see [`note_modifying_command`](Self::note_modifying_command)).
+    /// `edit` splices this into its staleness error so "changed on disk" names the
+    /// culprit — a `cargo fmt`/`prettier` run, almost always — instead of leaving
+    /// the model to suspect its own bookkeeping and fall back to rewriting the
+    /// whole file. Bounded by [`read_files`](Self::read_files): only tracked
+    /// paths are recorded, one command each, cleared when the file is re-read.
+    pub file_modifiers: Arc<Mutex<std::collections::HashMap<PathBuf, String>>>,
     /// Storage root for **project-scoped** [`MemoryTool`] notes (this cwd).
     /// `None` disables project memory.
     pub memory_project: Option<PathBuf>,
@@ -228,6 +236,7 @@ impl ToolContext {
             call_id: None,
             guardrails: Arc::new(default_guardrails()),
             read_files: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            file_modifiers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             memory_project: None,
             memory_global: None,
             background_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -263,6 +272,7 @@ impl ToolContext {
     pub fn mark_read(&self, path: &std::path::Path) {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let sig = file_sig(&canon);
+        self.clear_modifier(&canon);
         let mut map = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
         // Fully known: seen to the end, no unseen clipped line.
         map.insert(
@@ -283,6 +293,7 @@ impl ToolContext {
     pub fn mark_read_partial(&self, path: &std::path::Path) {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let sig = file_sig(&canon);
+        self.clear_modifier(&canon);
         let mut map = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
         // Seen something, but not to the end (`covered_through` below `total`).
         map.insert(
@@ -315,6 +326,7 @@ impl ToolContext {
     ) {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let sig = file_sig(&canon);
+        self.clear_modifier(&canon);
         // Poison-tolerant, like the readers below.
         let mut map = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.entry(canon).or_insert(ReadRecord {
@@ -392,6 +404,91 @@ impl ToolContext {
             ReadState::Partial
         }
     }
+
+    /// The on-disk signatures of every **tracked** file right now, to be handed
+    /// back to [`note_modifying_command`](Self::note_modifying_command) after a
+    /// shell command runs. Taken before the command so only the files *it*
+    /// changed are attributed to it — a file already stale from the user's
+    /// editor keeps whatever (or no) attribution it had.
+    ///
+    /// Bounded by the tracked-file map: two stats per file the model has read,
+    /// which is what a `read` already costs.
+    pub fn tracked_sigs(&self) -> TrackedSigs {
+        let paths: Vec<PathBuf> = self
+            .read_files
+            .lock()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_else(|e| e.into_inner().keys().cloned().collect());
+        TrackedSigs(paths.into_iter().map(|p| (file_sig(&p), p)).collect())
+    }
+
+    /// Record `command` as the reason every tracked file whose signature moved
+    /// since `before` is now stale.
+    ///
+    /// This is deliberately *not* a baseline refresh: the model never saw what
+    /// the command did to those files, so the read-before-mutate guard must
+    /// still fire. It only makes the refusal say why — an unexplained "changed
+    /// on disk" reads as a bug in our bookkeeping, and the observed reaction is
+    /// to abandon `edit` for whole-file rewrites.
+    pub fn note_modifying_command(&self, before: &TrackedSigs, command: &str) {
+        let changed: Vec<PathBuf> = before
+            .0
+            .iter()
+            .filter(|(then, path)| file_sig(path) != *then)
+            .map(|(_, path)| path.clone())
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        let label = shorten_command(command);
+        let mut map = self
+            .file_modifiers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for path in changed {
+            map.insert(path, label.clone());
+        }
+    }
+
+    /// The shell command last seen to change `path`, if one was — the "why"
+    /// behind a [`ReadState::Stale`] verdict. `None` when the change came from
+    /// somewhere we can't see (the user's editor, a background process).
+    pub fn change_culprit(&self, path: &std::path::Path) -> Option<String> {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.file_modifiers
+            .lock()
+            .map(|m| m.get(&canon).cloned())
+            .unwrap_or_else(|e| e.into_inner().get(&canon).cloned())
+    }
+
+    /// Forget why `canon` was stale — it has just been re-read (or authored), so
+    /// the old attribution no longer describes anything, and keeping it would
+    /// misattribute a *later* change to a command that predates it.
+    fn clear_modifier(&self, canon: &std::path::Path) {
+        let mut map = self
+            .file_modifiers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.remove(canon);
+    }
+}
+
+/// A snapshot of the tracked files' on-disk signatures (see
+/// [`ToolContext::tracked_sigs`]), opaque so the signature representation stays
+/// an implementation detail.
+pub struct TrackedSigs(Vec<(FileSig, PathBuf)>);
+
+/// A shell command shortened for an error message: whitespace collapsed (a
+/// heredoc or line-continuation must not spray across the message) and cut to
+/// 80 characters. The model only needs to recognize *which* command ran.
+fn shorten_command(command: &str) -> String {
+    const MAX: usize = 80;
+    let flat = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX {
+        return flat;
+    }
+    let head: String = flat.chars().take(MAX).collect();
+    format!("{head}…")
 }
 
 /// A file's cheap change-signature — `(byte length, modified time)` — captured
