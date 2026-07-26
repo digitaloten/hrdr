@@ -1581,6 +1581,7 @@ dependencies = [
  "hrdr-test-support",
  "ignore",
  "libc",
+ "rand 0.10.2",
  "regex",
  "reqwest",
  "serde",

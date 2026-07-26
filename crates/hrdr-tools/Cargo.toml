@@ -21,6 +21,9 @@ reqwest.workspace = true
 async-trait = "0.1"
 futures-util = { workspace = true }
 which = "7"
+# Randomizes the per-session scratch-dir name (src/sandbox.rs) so a recycled
+# pid cannot land on a directory another local user created first.
+rand.workspace = true
 serde_path_to_error = "0.1.20"
 shell-words = "1"
 

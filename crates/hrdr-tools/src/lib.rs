@@ -27,6 +27,7 @@ mod lsp;
 mod mcp;
 pub mod memory;
 mod proc;
+pub mod sandbox;
 mod tools;
 mod web;
 
@@ -42,6 +43,7 @@ pub use lsp::{
 };
 pub use mcp::McpClient;
 pub use memory::MemoryTool;
+pub use sandbox::{SandboxMode, SandboxPolicy};
 pub use tools::{
     CopyTool, DefinitionTool, DeleteTool, EditTool, FindTool, GitTool, GrepTool, LsTool, MoveTool,
     ReadTool, ReferencesTool, RenameTool, ReplaceTool, Shell, ShellTool, TodoTool, TreeTool,
