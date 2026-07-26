@@ -20,6 +20,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   longer asserts the snapshot arrives at `seq == 1` — the 100ms tick task emits
   its first panes+status frames before a client can connect, so the test raced
   under load.
+- **Web server rate limiting keys on the real peer address.**
+  `extract_client_ip` read only `X-Forwarded-For`, so a direct connection (the
+  default, no-proxy deployment) had no client IP at all and `check_rate_limit`
+  allowed every request — `/login` and every authenticated route were open to
+  unlimited brute force, and because the header is attacker-controlled a client
+  could also rotate rate-limit buckets at will. The server now serves with
+  `into_make_service_with_connect_info` on both the TLS and plain paths, and
+  `index`/`ws_handler`/`login_handler` thread the connection's peer IP into the
+  auth and rate-limit checks. `X-Forwarded-For` (first hop) is honored only when
+  the peer itself is loopback — i.e. a reverse proxy on this host — and is
+  ignored for every other peer.
+- **The session cookie is marked `Secure` only when the server terminates TLS.**
+  `/login` appended `; Secure` unconditionally, so on the default plain-HTTP
+  loopback deployment browsers dropped the cookie and `users`-mode login
+  silently failed. `AppState` now carries `tls_enabled`, set from the configured
+  TLS cert/key pair.
+- **No user-enumeration timing oracle in the web auth paths.**
+  `auth::verify_basic` returned early on a username mismatch and `users::verify`
+  returned early for a nonexistent user, in both cases skipping the argon2
+  verify and making valid usernames measurably slower. Both now always perform
+  an argon2 verify — against the configured hash, or a constant dummy argon2id
+  hash — before failing.
 - **Resumed and revived sessions rebuild the system prompt**, keeping the
   Anthropic prompt-cache split in step. `Agent::set_messages` used to install
   the session file's saved `messages[0]` while the client still held the cache

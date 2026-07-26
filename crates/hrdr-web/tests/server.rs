@@ -132,7 +132,113 @@ async fn serve_refuses_non_loopback() {
     }
 }
 
-/// Helpers
+/// `/` and `/ws` reject requests that carry no credentials at all.
+#[tokio::test]
+async fn index_and_ws_reject_without_token() {
+    use tokio_tungstenite::connect_async;
+
+    let (server, _session, _token) = start_test_server_with_token().await;
+
+    let response = raw_get(server.addr, "/", &[]).await;
+    assert!(
+        response.contains("401 Unauthorized"),
+        "expected 401, got: {response}"
+    );
+
+    let ws_url = format!("ws://{}/ws", server.addr);
+    let result = connect_async(&ws_url).await;
+    match result {
+        Ok((_ws, resp)) => panic!("ws upgrade should fail, got status {}", resp.status()),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status(), 401, "expected 401 on ws upgrade");
+        }
+        Err(e) => panic!("unexpected ws error: {e}"),
+    }
+
+    drop(server);
+}
+
+/// `/` with a valid Bearer token returns 200.
+#[tokio::test]
+async fn index_accepts_bearer_token() {
+    let (server, _session, token) = start_test_server_with_token().await;
+
+    let auth = format!("Authorization: Bearer {token}");
+    let response = raw_get(server.addr, "/", &[&auth]).await;
+    assert!(response.contains("200 OK"), "expected 200, got: {response}");
+
+    drop(server);
+}
+
+/// Ten failed attempts from the same peer lock the bucket: the eleventh request
+/// is 429 even when it carries the correct token. Proves the rate limiter keys
+/// on the real peer address (loopback here, no `X-Forwarded-For` in play).
+#[tokio::test]
+async fn wrong_token_is_401_and_rate_limited() {
+    let (server, _session, token) = start_test_server_with_token().await;
+
+    for i in 0..10 {
+        let response = raw_get(server.addr, "/", &["Authorization: Bearer wrong-token"]).await;
+        assert!(
+            response.contains("401 Unauthorized"),
+            "attempt {i} should be 401, got: {response}"
+        );
+    }
+
+    let auth = format!("Authorization: Bearer {token}");
+    let response = raw_get(server.addr, "/", &[&auth]).await;
+    assert!(
+        response.contains("429 Too Many Requests"),
+        "11th request should be rate limited even with the right token, got: {response}"
+    );
+
+    drop(server);
+}
+
+/// A WS upgrade from a foreign Origin is 403 even with a valid token.
+#[tokio::test]
+async fn ws_origin_foreign_is_rejected() {
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (server, _session, token) = start_test_server_with_token().await;
+
+    let ws_url = format!("ws://{}/ws?token={token}", server.addr);
+    let mut request = ws_url.into_client_request().expect("build ws request");
+    request
+        .headers_mut()
+        .insert("origin", "https://evil.example".parse().unwrap());
+
+    match connect_async(request).await {
+        Ok((_ws, resp)) => panic!("ws upgrade should fail, got status {}", resp.status()),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status(), 403, "foreign Origin should be forbidden");
+        }
+        Err(e) => panic!("unexpected ws error: {e}"),
+    }
+
+    drop(server);
+}
+
+// ── helpers ────────────────────────────────────────────────────────────────
+
+/// Issue a single `GET` over a fresh connection and return the raw response.
+async fn raw_get(addr: std::net::SocketAddr, path: &str, extra_headers: &[&str]) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+    for header in extra_headers {
+        request.push_str(header);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf).to_string()
+}
+
 async fn start_test_server() -> (server::RunningServer, SharedSession) {
     let (srv, sess, _tok) = start_test_server_with_token().await;
     (srv, sess)

@@ -105,24 +105,22 @@ pub fn verify_basic(headers: &HeaderMap, user: Option<&str>, hash: Option<&str>)
     let Some((u, p)) = creds.split_once(':') else {
         return false;
     };
-    if !constant_time_eq(u.as_bytes(), user.as_bytes()) {
-        return false;
-    }
+    let user_ok = constant_time_eq(u.as_bytes(), user.as_bytes());
     let Ok(parsed_hash) = PasswordHash::new(hash) else {
         return false;
     };
-    Argon2::default()
+    // Always run the argon2 verify, even when the username did not match, so a
+    // wrong username costs the same time as a wrong password (no user oracle).
+    let pw_ok = Argon2::default()
         .verify_password(p.as_bytes(), &parsed_hash)
-        .is_ok()
+        .is_ok();
+    user_ok && pw_ok
 }
 
 // ── rate limiter ───────────────────────────────────────────────────────────
 
 /// Check the rate limiter: max 10 failures per minute per IP.
-pub fn check_rate_limit(auth: &AuthState, ip: Option<IpAddr>) -> bool {
-    let Some(ip) = ip else {
-        return true; // unknown IP, allow
-    };
+pub fn check_rate_limit(auth: &AuthState, ip: IpAddr) -> bool {
     let mut guard = auth.rate_limiter.lock().unwrap();
     let entry = guard.entry(ip).or_default();
     let now = Instant::now();
@@ -131,10 +129,7 @@ pub fn check_rate_limit(auth: &AuthState, ip: Option<IpAddr>) -> bool {
 }
 
 /// Record a failed auth attempt.
-pub fn rate_limit_record(auth: &AuthState, ip: Option<IpAddr>) {
-    let Some(ip) = ip else {
-        return;
-    };
+pub fn rate_limit_record(auth: &AuthState, ip: IpAddr) {
     let mut guard = auth.rate_limiter.lock().unwrap();
     let entry = guard.entry(ip).or_default();
     entry.push(Instant::now());
@@ -144,16 +139,25 @@ pub fn rate_limit_record(auth: &AuthState, ip: Option<IpAddr>) {
 
 // ── client IP extraction ───────────────────────────────────────────────────
 
-/// Extract the client's IP from the request headers (X-Forwarded-For).
-pub fn extract_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+/// The client IP used for rate limiting.
+///
+/// The peer address of the TCP connection is the source of truth. A
+/// `X-Forwarded-For` header is attacker-controlled, so it is honored *only*
+/// when the peer itself is a loopback address — that is, when the request came
+/// from a reverse proxy running on this same host. For any other peer the
+/// header is ignored outright.
+pub fn extract_client_ip(peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+    if !peer.is_loopback() {
+        return peer;
+    }
     if let Some(xff) = headers.get("x-forwarded-for")
         && let Ok(xff_str) = xff.to_str()
-        && let Some(ip) = xff_str.split(',').next().map(|s| s.trim())
-        && let Ok(addr) = ip.parse::<IpAddr>()
+        && let Some(first) = xff_str.split(',').next().map(|s| s.trim())
+        && let Ok(addr) = first.parse::<IpAddr>()
     {
-        return Some(addr);
+        return addr;
     }
-    None
+    peer
 }
 
 // ── WS Origin check (CSRF hardening) ───────────────────────────────────────
@@ -326,7 +330,7 @@ mod tests {
     #[test]
     fn rate_limiter_locks_out_after_10() {
         let auth = test_auth_state(AuthMode::Token);
-        let ip = Some("1.2.3.4".parse().unwrap());
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
         for _ in 0..10 {
             assert!(check_rate_limit(&auth, ip));
             rate_limit_record(&auth, ip);
@@ -360,5 +364,66 @@ mod tests {
         assert!(
             check_ws_origin(Some("https://myapp.local:9911"), Some("myapp.local:9911")).is_ok()
         );
+    }
+
+    fn xff(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", value.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn client_ip_direct_remote_peer_is_peer() {
+        let peer: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(extract_client_ip(peer, &HeaderMap::new()), peer);
+    }
+
+    #[test]
+    fn client_ip_loopback_peer_honors_forwarded_for() {
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        let headers = xff("198.51.100.9, 10.0.0.1");
+        assert_eq!(
+            extract_client_ip(peer, &headers),
+            "198.51.100.9".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn client_ip_loopback_peer_without_forwarded_for_is_loopback() {
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(extract_client_ip(peer, &HeaderMap::new()), peer);
+    }
+
+    #[test]
+    fn client_ip_remote_peer_ignores_spoofed_forwarded_for() {
+        let peer: IpAddr = "203.0.113.7".parse().unwrap();
+        let headers = xff("1.2.3.4");
+        assert_eq!(extract_client_ip(peer, &headers), peer);
+    }
+
+    #[test]
+    fn client_ip_loopback_peer_ignores_garbage_forwarded_for() {
+        let peer: IpAddr = "::1".parse().unwrap();
+        let headers = xff("not-an-ip");
+        assert_eq!(extract_client_ip(peer, &headers), peer);
+    }
+
+    #[test]
+    fn basic_rejects_wrong_username_with_right_password() {
+        let hash = hash_password("s3cret").unwrap();
+        let mut headers = HeaderMap::new();
+        let creds = base64::engine::general_purpose::STANDARD.encode("mallory:s3cret");
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Basic {creds}").parse().unwrap(),
+        );
+        assert!(!verify_basic(&headers, Some("alice"), Some(&hash)));
+
+        let creds = base64::engine::general_purpose::STANDARD.encode("alice:s3cret");
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Basic {creds}").parse().unwrap(),
+        );
+        assert!(verify_basic(&headers, Some("alice"), Some(&hash)));
     }
 }

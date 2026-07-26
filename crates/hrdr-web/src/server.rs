@@ -5,7 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Query, State, ws::Message, ws::WebSocketUpgrade};
+use axum::extract::{ConnectInfo, Query, State, ws::Message, ws::WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -22,6 +22,10 @@ use crate::session::SharedSession;
 pub struct AppState {
     pub session: SharedSession,
     pub auth: Arc<AuthState>,
+    /// Whether this server terminates TLS itself. Gates the `Secure` cookie
+    /// attribute: on plain HTTP (the default loopback deployment) a `Secure`
+    /// cookie is dropped by the browser and login silently fails.
+    pub tls_enabled: bool,
 }
 
 /// Configuration for `serve()` — the resolved config after all precedence layers.
@@ -78,9 +82,15 @@ pub async fn serve(
 
     let addr = SocketAddr::new(cfg.bind, cfg.port);
 
+    let tls = match (&web_cfg.tls_cert_path, &web_cfg.tls_key_path) {
+        (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
+        _ => None,
+    };
+
     let state = AppState {
         session,
         auth: Arc::new(auth_state),
+        tls_enabled: tls.is_some(),
     };
 
     let app = Router::new()
@@ -91,13 +101,14 @@ pub async fn serve(
         .route("/logout", post(logout_handler))
         .with_state(state);
 
-    // TLS or plain.
-    if let (Some(cert), Some(key)) = (&web_cfg.tls_cert_path, &web_cfg.tls_key_path) {
+    // TLS or plain. Both paths serve with connect info so handlers see the real
+    // peer address — the rate limiter keys on it.
+    if let Some((cert, key)) = tls {
         use axum_server::tls_rustls::RustlsConfig;
         let tls_cfg = RustlsConfig::from_pem_file(cert, key).await?;
         let handle = tokio::spawn(async move {
             axum_server::bind_rustls(addr, tls_cfg)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
                 .ok();
         });
@@ -106,7 +117,12 @@ pub async fn serve(
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound_addr = listener.local_addr()?;
         let handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .ok();
         });
         Ok(RunningServer {
             addr: bound_addr,
@@ -123,10 +139,11 @@ async fn healthz() -> &'static str {
 
 async fn index(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     query: Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    if let Err(resp) = check_auth(&state, &headers, &query) {
+    if let Err(resp) = check_auth(&state, peer.ip(), &headers, &query) {
         return resp;
     }
     if let Some(spa) = crate::spa_index_html() {
@@ -138,10 +155,11 @@ async fn index(
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     query: Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    if let Err(resp) = check_auth(&state, &headers, &query) {
+    if let Err(resp) = check_auth(&state, peer.ip(), &headers, &query) {
         return resp;
     }
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
@@ -163,10 +181,11 @@ struct LoginBody {
 
 async fn login_handler(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     axum::Json(body): axum::Json<LoginBody>,
 ) -> Response {
-    let client_ip = auth::extract_client_ip(&headers);
+    let client_ip = auth::extract_client_ip(peer.ip(), &headers);
     if !auth::check_rate_limit(&state.auth, client_ip) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -197,9 +216,9 @@ async fn login_handler(
     let cookie_val = auth::mint_session_cookie(&body.username, &state.auth.cookie_secret[..]);
     let mut cookie =
         format!("hrdr_session={cookie_val}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800");
-    // In tests we can't determine TLS from here. Only add Secure if TLS certs are loaded.
-    // (Simplification: add Secure on non-loopback configs.)
-    cookie.push_str("; Secure");
+    if state.tls_enabled {
+        cookie.push_str("; Secure");
+    }
 
     (
         StatusCode::OK,
@@ -226,10 +245,11 @@ async fn logout_handler() -> Response {
 #[allow(clippy::result_large_err)]
 fn check_auth(
     state: &AppState,
+    peer: IpAddr,
     headers: &HeaderMap,
     query: &std::collections::HashMap<String, String>,
 ) -> Result<(), Response> {
-    let client_ip = auth::extract_client_ip(headers);
+    let client_ip = auth::extract_client_ip(peer, headers);
     if !auth::check_rate_limit(&state.auth, client_ip) {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,

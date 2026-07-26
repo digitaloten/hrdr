@@ -56,9 +56,16 @@ pub fn get_password_hash(db: &Connection, username: &str) -> anyhow::Result<Opti
     Ok(hash)
 }
 
+/// An argon2id hash of a throwaway password, verified against when the
+/// requested user does not exist so a nonexistent username costs the same time
+/// as a wrong password (no user-enumeration oracle).
+const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$aazmAE0OrJxIhK/PgYt4rQ$RoqZSJLzMgRNNLXzLiglcQeIS/jlV+N+GpqmQiDvw2c";
+
 /// Verify a username + password against the database.
 pub fn verify(db: &Connection, username: &str, password: &str) -> anyhow::Result<bool> {
     let Some(hash) = get_password_hash(db, username)? else {
+        // Burn the same argon2 work as a real verify, then fail.
+        let _ = crate::auth::verify_basic_password(password, DUMMY_HASH);
         return Ok(false);
     };
     Ok(crate::auth::verify_basic_password(password, &hash))
@@ -111,5 +118,11 @@ mod tests {
         assert!(remove_user(&db, "alice").unwrap());
         assert!(get_password_hash(&db, "alice").unwrap().is_none());
         assert!(!remove_user(&db, "alice").unwrap());
+    }
+
+    #[test]
+    fn dummy_hash_parses() {
+        use argon2::password_hash::PasswordHash;
+        PasswordHash::new(DUMMY_HASH).expect("DUMMY_HASH must be a valid PHC string");
     }
 }
