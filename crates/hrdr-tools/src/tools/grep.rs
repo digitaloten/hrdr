@@ -132,6 +132,15 @@ impl Tool for GrepTool {
             let root = ctx.resolve(p);
             crate::guard_secret_read(&root)?;
         }
+        // Look-around needs PCRE2, which only the ripgrep backend can switch on
+        // (`--pcre2`). POSIX `grep -E` and the built-in `regex` walker have no
+        // equivalent, so say so instead of surfacing their regex-parse error.
+        if !a.literal && has_lookaround(&a.pattern) && !matches!(self.backend, GrepBackend::Rg) {
+            bail!(
+                "look-around requires ripgrep (--pcre2); this system's grep backend doesn't \
+                 support it\n(hint: to match this pattern as a fixed string, set `literal: true`)"
+            );
+        }
         match self.backend {
             GrepBackend::Rg => grep_ripgrep(&a, ctx).await,
             GrepBackend::Grep => grep_posix(&a, ctx).await,
@@ -140,40 +149,73 @@ impl Tool for GrepTool {
     }
 }
 
-async fn grep_ripgrep(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
-    let mut cmd = tokio::process::Command::new("rg");
-    cmd.arg("--line-number")
-        .arg("--with-filename")
-        .arg("--no-heading")
-        .arg("--color=never")
-        .current_dir(&ctx.cwd);
+/// Whether `pattern` uses a look-around group — `(?=`, `(?!`, `(?<=`, `(?<!`.
+/// Rust's `regex` crate (ripgrep's default engine, and the built-in walker's)
+/// has no look-around at all; ripgrep can switch to PCRE2, which does.
+fn has_lookaround(pattern: &str) -> bool {
+    ["(?=", "(?!", "(?<=", "(?<!"].iter().any(|p| {
+        // A `\(` is a literal paren, not the start of a group.
+        pattern.match_indices(p).any(|(i, _)| {
+            let escapes = pattern[..i]
+                .bytes()
+                .rev()
+                .take_while(|b| *b == b'\\')
+                .count();
+            escapes % 2 == 0
+        })
+    })
+}
+
+/// The full `rg` argument list for these args (pattern and search path last).
+/// Split out from the spawn so the flag wiring is unit-testable.
+fn ripgrep_args(a: &GrepArgs) -> Vec<String> {
+    let mut args: Vec<String> = ["--line-number", "--with-filename", "--no-heading"]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    args.push("--color=never".to_string());
     if a.multiline {
-        cmd.arg("--multiline");
+        args.push("--multiline".to_string());
     }
     if a.hidden {
-        cmd.arg("--hidden");
+        args.push("--hidden".to_string());
     }
     if a.no_ignore {
-        cmd.arg("--no-ignore");
+        args.push("--no-ignore".to_string());
     }
     if a.literal {
-        cmd.arg("-F");
+        args.push("-F".to_string());
+    } else if has_lookaround(&a.pattern) {
+        // Look-around is unsupported by the default engine — `(?!…)` comes back
+        // as a regex parse error. PCRE2 handles it, so switch engines up front
+        // rather than after a failed search. (An `rg` built without PCRE2
+        // rejects the flag, and that error names the cause for the model.)
+        args.push("--pcre2".to_string());
     }
     if a.case_insensitive {
-        cmd.arg("-i");
+        args.push("-i".to_string());
     }
     if a.context() > 0 {
-        cmd.arg("-C").arg(a.context().to_string());
+        args.push("-C".to_string());
+        args.push(a.context().to_string());
     }
     if let Some(g) = &a.glob {
-        cmd.arg("--glob").arg(g);
+        args.push("--glob".to_string());
+        args.push(g.clone());
     }
-    cmd.arg("--").arg(&a.pattern);
+    args.push("--".to_string());
+    args.push(a.pattern.clone());
     // Always pass an explicit path. With none, ripgrep reads STDIN when it isn't
     // a TTY — and under a nulled/redirected stdin every unscoped search would
     // silently return "(no matches)" or hang. Default to cwd, matching the POSIX
     // backend below.
-    cmd.arg(a.path.as_deref().unwrap_or("."));
+    args.push(a.path.as_deref().unwrap_or(".").to_string());
+    args
+}
+
+async fn grep_ripgrep(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
+    let mut cmd = tokio::process::Command::new("rg");
+    cmd.args(ripgrep_args(a)).current_dir(&ctx.cwd);
     run_search_cmd(cmd, "ripgrep", a.literal, a.max_matches(), ctx).await
 }
 
@@ -581,6 +623,80 @@ mod tests {
             schema["properties"]["multiline"]["type"],
             serde_json::Value::String("boolean".into())
         );
+    }
+
+    #[test]
+    fn lookaround_detector_spots_every_form_and_ignores_escaped_parens() {
+        for p in ["a(?=b)", "a(?!b)", "(?<=a)b", "(?<!a)b", "x(?!y)z"] {
+            assert!(has_lookaround(p), "{p}");
+        }
+        for p in ["plain", "(group)", "(?i)ci", "(?s).*", "a\\(?=b", "\\(?!"] {
+            assert!(!has_lookaround(p), "{p}");
+        }
+        // An escaped backslash before the group doesn't escape the paren.
+        assert!(has_lookaround("a\\\\(?!b)"));
+    }
+
+    /// Look-around only works under PCRE2, so the flag goes on the invocation
+    /// up front — without it `rg` fails the search with a regex parse error.
+    #[test]
+    fn ripgrep_args_add_pcre2_only_for_lookaround_patterns() {
+        let args = ripgrep_args(&plain_args("foo(?!bar)"));
+        assert!(args.contains(&"--pcre2".to_string()), "{args:?}");
+        assert!(!ripgrep_args(&plain_args("foo")).contains(&"--pcre2".to_string()));
+        // A literal search never compiles a regex, so `-F` wins and PCRE2 is
+        // pointless (the two are mutually exclusive in `rg` anyway).
+        let mut lit = plain_args("foo(?!bar)");
+        lit.literal = true;
+        let args = ripgrep_args(&lit);
+        assert!(args.contains(&"-F".to_string()), "{args:?}");
+        assert!(!args.contains(&"--pcre2".to_string()), "{args:?}");
+    }
+
+    /// The other two backends have no PCRE2 equivalent, so a look-around
+    /// pattern is refused with a message that names the reason instead of a
+    /// bare regex-parse error from grep or the `regex` crate.
+    #[tokio::test]
+    async fn non_ripgrep_backends_refuse_lookaround_with_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("code.rs"), "let needle = 1;\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+        for backend in [GrepBackend::Grep, GrepBackend::Builtin] {
+            let err = GrepTool { backend }
+                .execute(json!({"pattern": "needle(?! = 2)"}), &ctx)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("look-around requires ripgrep"), "{err}");
+        }
+        // A literal search of the same text is not look-around, so it runs.
+        let out = GrepTool {
+            backend: GrepBackend::Builtin,
+        }
+        .execute(json!({"pattern": "needle", "literal": true}), &ctx)
+        .await
+        .unwrap();
+        assert!(out.contains("code.rs:1:let needle"), "{out}");
+    }
+
+    /// End-to-end against the real binary: with `--pcre2` wired the search
+    /// succeeds; skipped when `rg` is missing or was built without PCRE2.
+    #[tokio::test]
+    async fn ripgrep_matches_a_lookaround_pattern() {
+        if which::which("rg").is_err() {
+            return; // best-effort: exercise the real backend when available
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("code.rs"), "foo_keep\nfoo_skip\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let out = match grep_ripgrep(&plain_args("foo_(?!skip)"), &ctx).await {
+            Ok(out) => out,
+            // `rg` without the PCRE2 feature rejects the flag; nothing to check.
+            Err(e) if e.to_string().contains("pcre2") => return,
+            Err(e) => panic!("{e}"),
+        };
+        assert!(out.contains("code.rs:1:foo_keep"), "{out}");
+        assert!(!out.contains("foo_skip"), "{out}");
     }
 
     #[test]

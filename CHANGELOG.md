@@ -28,6 +28,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   corrupt line is now counted and skipped, records on both sides of it still
   fold, and `is_complete` judges by the last _parsable_ record so a torn tail no
   longer reports a finished run as orphaned.
+- **rust-analyzer no longer fights the model's `cargo` over `target/`.** The
+  built-in rust-analyzer server is started with
+  `initializationOptions = {"cargo": {"targetDir": true}}`, so it builds under
+  `target/rust-analyzer/` instead of contending with the `cargo build`/`test`
+  the model runs in `shell` — a real session logged ten "Blocking waiting for
+  file lock on package cache" stalls and one hard "could not create incremental
+  compilation session directory" failure. `LspServerConfig` gained an optional
+  `initialization_options`, settable per custom server as
+  `initialization_options` under `[[lsp.servers]]` (omitted: no options sent, so
+  existing configs are unaffected).
+- **`write`/`edit`/`delete` accept the same path-name synonyms as `read`.** A
+  call spelled `{"file": "…"}` died on `missing field 'path'` (observed five
+  times in one session); `file`, `file_path`, `filepath`, `filename`,
+  `file_name`, and `path_to_file` now all resolve, as they already did for
+  `read`. The two-path tools (`move`, `copy`) are deliberately left alone, and
+  the schema the model sees still says `path`.
+- **`grep` handles look-around patterns.** A pattern using `(?=`, `(?!`, `(?<=`,
+  or `(?<!` now adds `--pcre2` to the ripgrep invocation up front instead of
+  failing with a regex parse error (the default engine has no look-around). The
+  POSIX and built-in backends have no PCRE2 equivalent, so there the pattern is
+  refused with "look-around requires ripgrep (--pcre2); this system's grep
+  backend doesn't support it" rather than a bare engine error.
 - **`/resume` over the web no longer corrupts the session it restores.** The
   swap set the pane's state, handed the agent its messages from a **detached**
   `tokio::spawn`, and then saved immediately — so the save raced the task, and
