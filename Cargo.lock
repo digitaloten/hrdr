@@ -1482,6 +1482,7 @@ dependencies = [
  "hrdr-llm",
  "hrdr-test-support",
  "hrdr-tools",
+ "ignore",
  "rand 0.10.2",
  "reqwest",
  "serde",

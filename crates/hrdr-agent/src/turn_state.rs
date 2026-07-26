@@ -142,8 +142,10 @@ impl Agent {
                          HEAD...{branch}`). For a large result, pass `commit` (an index from the \
                          listed commits) to review it commit-by-commit instead.\n  2. If it flags \
                          uncommitted/untracked changes, do not re-delegate to another sub-agent — \
-                         review those changes and commit them YOURSELF (a proper Conventional \
-                         Commits message) before merging, or that work is lost. Then review the \
+                         bring them into your working dir with `task_apply {id}` (one call: it \
+                         applies them staged, or names the conflicts and applies nothing), then \
+                         review and commit them YOURSELF (a proper Conventional Commits message), \
+                         or that work is lost. Then review the \
                          diff like a PR — every hunk, not just that commits exist — and fix \
                          anything off before bringing it over.\nThen merge the branch into your \
                          working dir (rebase it onto HEAD in the worktree first if that'd conflict \

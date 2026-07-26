@@ -100,8 +100,9 @@ pub(crate) use delegation::{
     subagent_context_window, subagent_transcript_id, subagent_usage, task_size_summary,
 };
 pub(crate) use delegation::{
-    BgHandles, SteerTool, SubagentTool, TaskCancelTool, TaskCleanupTool, TaskDiffTool,
-    TaskListTool, TaskOutputTool, TaskReviveTool, bg_handles, gc_worktrees, subagent_base_config,
+    BgHandles, SteerTool, SubagentTool, TaskApplyTool, TaskCancelTool, TaskCleanupTool,
+    TaskDiffTool, TaskListTool, TaskOutputTool, TaskReviveTool, bg_handles, gc_worktrees,
+    subagent_base_config,
 };
 pub use delegation::{
     builtin_subagent_profiles, config_for_agent_profile, in_git_repo, list_provider_models,
@@ -1247,6 +1248,10 @@ impl Agent {
                 live: live_subagents.clone(),
             }));
             tools.register(Arc::new(TaskDiffTool));
+            // Landing a sub-agent's UNCOMMITTED work: the missing step between
+            // `task_diff` (which only warns about leftovers) and `task_cleanup`
+            // (which removes the worktree they live in).
+            tools.register(Arc::new(TaskApplyTool));
             tools.register(Arc::new(TaskCleanupTool {
                 live: live_subagents.clone(),
             }));
@@ -5673,8 +5678,10 @@ mod tests {
     }
 
     /// `task_cleanup` removes a merged worktree (committed work, clean tree =
-    /// trusted as merged) and prunes the entry, but REFUSES while the worktree
-    /// still has uncommitted changes — those aren't merged and must not be lost.
+    /// trusted as merged) and prunes the entry, REFUSES while the worktree still
+    /// has uncommitted changes — those aren't merged and must not be lost by
+    /// accident — and, with `force: true`, removes it anyway while naming exactly
+    /// what was discarded.
     #[tokio::test]
     async fn task_cleanup_removes_merged_refuses_uncommitted() {
         use super::{LiveSubagents, TaskCleanupTool, Worktree};
@@ -5778,7 +5785,11 @@ mod tests {
         assert!(msg.contains("Cleaned up"), "force removes it: {msg}");
         assert!(!um_path.exists(), "force removes the unmerged worktree");
 
-        // Case 3 — uncommitted changes → refused, and `force` does NOT override.
+        // Case 3 — uncommitted changes → refused WITHOUT force (and the refusal
+        // points at `task_apply`), but `force: true` honestly forces: the
+        // worktree goes and the result names what was discarded. A `force` that
+        // still refused is what taught a real session to `rm -rf` the worktree
+        // behind the harness's back.
         let wt_dirty = Worktree::create(repo).await.unwrap();
         std::fs::write(wt_dirty.path.join("wip.txt"), "x").unwrap();
         let dirty = wt_dirty.keep();
@@ -5794,12 +5805,13 @@ mod tests {
                 ..Default::default()
             });
         let err = cleanup
-            .execute(serde_json::json!({"id": 2, "force": true}), &ctx)
+            .execute(serde_json::json!({"id": 2}), &ctx)
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("uncommitted changes"),
-            "force does not override uncommitted work: {err}"
+            err.to_string().contains("uncommitted changes")
+                && err.to_string().contains("task_apply 2"),
+            "refuses uncommitted work and names the tool that lands it: {err}"
         );
         assert!(dirty_path.exists(), "the worktree is not removed");
         assert!(
@@ -5810,6 +5822,262 @@ mod tests {
                 .any(|t| t.id == 2),
             "the entry is kept"
         );
+        let msg = cleanup
+            .execute(serde_json::json!({"id": 2, "force": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            msg.contains("Discarded uncommitted changes in 1 file(s)") && msg.contains("wip.txt"),
+            "force removes it and names the discarded file: {msg}"
+        );
+        assert!(!dirty_path.exists(), "force removes the dirty worktree");
+        assert!(
+            !ctx.background_tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t.id == 2),
+            "the entry is pruned"
+        );
+    }
+
+    /// `task_apply` lands a sub-agent's UNCOMMITTED work — a tracked edit and an
+    /// untracked new file — on the parent checkout in one call, refuses a clean
+    /// worktree by pointing at the branch instead, and on conflict reports the
+    /// conflicting files while leaving the parent tree exactly as it was.
+    #[tokio::test]
+    async fn task_apply_lands_uncommitted_work_and_refuses_on_conflict() {
+        use super::{TaskApplyTool, Worktree};
+        use hrdr_tools::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(repo.join("g.txt"), "keep\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return; // git unavailable — skip
+        }
+
+        let ctx = hrdr_tools::ToolContext::new(repo);
+        let apply = TaskApplyTool;
+
+        // (a) a worktree with an uncommitted tracked edit + an untracked file:
+        // both land in the parent tree, staged, and the report says the branch
+        // still carries any committed work.
+        let wt = Worktree::create(repo).await.unwrap();
+        std::fs::write(wt.path.join("f.txt"), "one\nTWO\nthree\n").unwrap();
+        std::fs::create_dir_all(wt.path.join("sub")).unwrap();
+        std::fs::write(wt.path.join("sub/new.txt"), "fresh\n").unwrap();
+        let kept = wt.keep();
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 1,
+                delivered: true,
+                worktree: Some(kept.path.clone()),
+                branch: Some(kept.branch.clone()),
+                ..Default::default()
+            });
+        let out = apply
+            .execute(serde_json::json!({"id": 1}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("f.txt"), "names the patched file: {out}");
+        assert!(
+            out.contains("sub/new.txt") && out.contains("copied"),
+            "names the copied untracked file: {out}"
+        );
+        assert!(
+            out.contains("still merges the normal way"),
+            "reminds that committed work merges via the branch: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("f.txt")).unwrap(),
+            "one\nTWO\nthree\n",
+            "the uncommitted edit landed in the parent tree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("sub/new.txt")).unwrap(),
+            "fresh\n",
+            "the untracked file landed in the parent tree"
+        );
+        let staged = String::from_utf8_lossy(&git(&["diff", "--cached", "--name-only"]).stdout)
+            .trim()
+            .to_string();
+        assert!(
+            staged.contains("f.txt") && staged.contains("sub/new.txt"),
+            "everything applied is staged for review: {staged}"
+        );
+        // Reset the parent tree for the cases below.
+        git(&["reset", "-q", "--hard", "HEAD"]);
+        // `reset --hard` drops the staged copy; belt and braces if it lingers.
+        let _ = std::fs::remove_file(repo.join("sub/new.txt"));
+
+        // (b) a clean worktree: refused, pointing at the branch.
+        let wt_clean = Worktree::create(repo).await.unwrap();
+        let clean = wt_clean.keep();
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 2,
+                delivered: true,
+                worktree: Some(clean.path.clone()),
+                branch: Some(clean.branch.clone()),
+                ..Default::default()
+            });
+        let err = apply
+            .execute(serde_json::json!({"id": 2}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("nothing uncommitted to apply")
+                && err.to_string().contains("merges via the branch"),
+            "a clean worktree is refused with the branch route: {err}"
+        );
+
+        // (c) conflict: the sub-agent and the parent both changed the same line.
+        // The conflicting file is named and NOTHING is applied — the parent's own
+        // version survives untouched.
+        let wt_conf = Worktree::create(repo).await.unwrap();
+        std::fs::write(wt_conf.path.join("f.txt"), "one\nSUB\nthree\n").unwrap();
+        std::fs::write(wt_conf.path.join("g.txt"), "keep\nalso mine\n").unwrap();
+        let conf = wt_conf.keep();
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 3,
+                delivered: true,
+                worktree: Some(conf.path.clone()),
+                branch: Some(conf.branch.clone()),
+                ..Default::default()
+            });
+        std::fs::write(repo.join("f.txt"), "one\nPARENT\nthree\n").unwrap();
+        git(&["commit", "-qam", "parent edit"]);
+        let err = apply
+            .execute(serde_json::json!({"id": 3}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("f.txt") && err.to_string().contains("NOTHING was applied"),
+            "names the conflicting file and applies nothing: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("f.txt")).unwrap(),
+            "one\nPARENT\nthree\n",
+            "the parent's version of the conflicting file is untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("g.txt")).unwrap(),
+            "keep\n",
+            "the non-conflicting hunk of a refused apply is not applied either"
+        );
+
+        // (d) an unknown id, and a read-only (worktree-less) task, both error clearly.
+        let err = apply
+            .execute(serde_json::json!({"id": 999}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no background task"), "{err}");
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 4,
+                delivered: true,
+                worktree: None,
+                branch: None,
+                ..Default::default()
+            });
+        let err = apply
+            .execute(serde_json::json!({"id": 4}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no worktree to apply from"),
+            "a read-only task explains there is nothing to apply: {err}"
+        );
+    }
+
+    /// The workspace map handed to a spawned sub-agent names the real
+    /// directories and the real cargo crate paths (that is the whole point — a
+    /// sub-agent that guesses `crates/keymap` for `crates/hjkl-keymap` burns a
+    /// run on empty greps), and it is hard-capped so it can never crowd out the
+    /// brief itself.
+    #[test]
+    fn workspace_map_names_dirs_and_crates_within_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for crate_dir in ["hjkl-keymap", "hjkl-vim"] {
+            std::fs::create_dir_all(root.join("crates").join(crate_dir).join("src")).unwrap();
+            std::fs::write(
+                root.join("crates").join(crate_dir).join("Cargo.toml"),
+                format!("[package]\nname = \"{crate_dir}\"\n"),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+
+        let map = crate::delegation::workspace_map(root).expect("a project has a layout");
+        assert!(
+            map.starts_with("Workspace layout (verified"),
+            "labelled plainly: {map}"
+        );
+        assert!(
+            map.contains("crates/") && map.contains("docs/"),
+            "names the top-level dirs: {map}"
+        );
+        assert!(
+            map.contains("crates/hjkl-keymap") && map.contains("crates/hjkl-vim"),
+            "names the verified crate paths: {map}"
+        );
+        assert!(
+            map.len() <= crate::delegation::WORKSPACE_MAP_MAX,
+            "within the cap: {} bytes",
+            map.len()
+        );
+
+        // A wide tree is elided, not shipped whole — the cap holds regardless.
+        for n in 0..400 {
+            std::fs::create_dir_all(root.join(format!("dir-{n:03}"))).unwrap();
+        }
+        let big = crate::delegation::workspace_map(root).unwrap();
+        assert!(
+            big.len() <= crate::delegation::WORKSPACE_MAP_MAX,
+            "a wide tree is still capped: {} bytes",
+            big.len()
+        );
+        assert!(
+            big.contains("more top-level dir(s)"),
+            "and says it elided some: {big}"
+        );
+        assert!(
+            big.contains("crates/hjkl-keymap"),
+            "the crate paths survive the elision: {big}"
+        );
+
+        // Nothing worth saying → no section at all.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(crate::delegation::workspace_map(empty.path()).is_none());
     }
 
     /// `task_diff` composes the review the delivery message used to spell out as
@@ -10034,6 +10302,68 @@ mod tests {
             assert!(
                 live.is_empty(),
                 "an unwatched, delivered sub-agent is freed"
+            );
+        }
+
+        /// A spawned sub-agent's opening context carries the verified workspace
+        /// map appended to the brief — it starts cold, so this is the only thing
+        /// standing between it and invented crate paths. The transcript's `Start`
+        /// record IS that opening context (the prompt enqueued as the run's first
+        /// turn), so asserting on it asserts on what the model was handed.
+        #[tokio::test]
+        async fn subagent_prompt_carries_the_workspace_map() {
+            use hrdr_tools::Tool;
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "ok"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let cwd = tempfile::tempdir().unwrap();
+            let ts_dir = tempfile::tempdir().unwrap();
+            // A cargo workspace with one oddly-named crate — exactly the shape a
+            // sub-agent gets wrong when it guesses.
+            std::fs::create_dir_all(cwd.path().join("crates/hjkl-keymap/src")).unwrap();
+            std::fs::write(
+                cwd.path().join("crates/hjkl-keymap/Cargo.toml"),
+                "[package]\nname = \"hjkl-keymap\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                cwd.path().join("Cargo.toml"),
+                "[workspace]\nmembers = [\"crates/*\"]\n",
+            )
+            .unwrap();
+            let tool = transcript_tool(server.base_url(), cwd.path(), ts_dir.path());
+            let ctx = hrdr_tools::ToolContext::new(cwd.path());
+
+            tool.execute(
+                json!({"prompt": "fix the keymap", "description": "probe"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            await_background(&tool, &ctx).await;
+
+            let (_, events) = read_events(ts_dir.path());
+            let subagent_transcript::Record::Start { prompt, .. } = &events[0] else {
+                panic!("first event is a Start: {:?}", events[0]);
+            };
+            assert!(
+                prompt.starts_with("fix the keymap"),
+                "the brief comes first: {prompt}"
+            );
+            assert!(
+                prompt.contains("Workspace layout (verified"),
+                "the layout section is appended: {prompt}"
+            );
+            assert!(
+                prompt.contains("crates/hjkl-keymap"),
+                "with the verified crate path: {prompt}"
+            );
+            assert!(
+                prompt.len() - "fix the keymap".len() <= crate::delegation::WORKSPACE_MAP_MAX + 2,
+                "and it stays within the cap: {prompt}"
             );
         }
 

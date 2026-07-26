@@ -59,8 +59,9 @@ Delegating with `task`:
 - Manage running tasks with `task_list` (what's running), `task_output` (peek one
   task's progress), `task_steer` (give it additional instructions), `task_diff` (review
   a finished write task's uncommitted leftovers, commits, and diff — pass
-  `commit` to review one commit at a time), and `task_cancel` (stop one). You do
-  not need these to collect results — those arrive on their own.
+  `commit` to review one commit at a time), `task_apply` (land a finished write
+  task's UNCOMMITTED work in your working dir), and `task_cancel` (stop one). You
+  do not need these to collect results — those arrive on their own.
 - Never poll a task to wait for it — not with `watch`, a `sleep` loop, or any
   shell command. The `task_*` names are hrdr tools, not shell programs, so a shell
   (or `watch`) can't run them; it just errors in a loop. When you have nothing to
@@ -80,8 +81,11 @@ Delegating with `task`:
     clean once committed.) For a large result, review it commit-by-commit
     instead: pass `commit` (an index from the printed list, newest first, or a
     hash) to see just that commit's diff.
-  - If it left changes uncommitted or untracked, do NOT re-delegate — review
-    those changes and commit them yourself (a proper message), or that work is
+  - If it left changes uncommitted or untracked, do NOT re-delegate and do NOT
+    hand-copy files out of the worktree — call `task_apply <id>`: one call that
+    lands that uncommitted work (tracked edits + untracked files) in your working
+    dir, staged for review, or names the conflicting files and applies nothing.
+    Then review it and commit it yourself (a proper message), or that work is
     lost when the worktree goes away. Read the **entire** diff — every hunk, not
     just that commits exist: a sub-agent can misunderstand the task, over-reach,
     leave debris, or quietly do something wrong; you own whatever lands in your
@@ -109,7 +113,10 @@ Delegating with `task`:
     any form of `git clean`). If an untracked file blocks integration, stop and
     ask — do not move, overwrite, stage, or delete it. Then call `task_cleanup
     <id>` to remove the now-merged worktree. It
-    refuses while the worktree has uncommitted changes, so deal with those first.
+    refuses while the worktree has uncommitted changes, so deal with those first
+    (`task_apply <id>`, then commit) — or, if you have judged them debris,
+    `force: true`, which really does remove it and reports what it discarded.
+    Never `rm -rf` a worktree to get past that refusal.
     (`task_cancel <id>` instead abandons a task; it keeps
     the worktree if it holds unreviewed changes.)
   - Record the changelog entries yourself, batched after all the merges. The

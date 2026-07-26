@@ -6,6 +6,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`task_apply` — land a write sub-agent's UNCOMMITTED work in one call.** A
+  sub-agent that was told not to commit (or that simply forgot) left its entire
+  result uncommitted in its worktree, where the branch carries nothing and
+  `task_diff` could only warn about it; a real session integrated by
+  hand-`cp`ing files out of the worktree and redid one whole task from scratch.
+  `task_apply <id>` takes the worktree's staged + unstaged diff
+  (`git diff HEAD --binary`) plus its untracked files and lands them on the
+  parent checkout with `git apply --3way`, staged for review. All-or-nothing: a
+  dry run (`--check`, whose conflict report goes to stderr with exit code 0, so
+  it is parsed, not trusted) plus a collision check on the copies gate the real
+  apply, so a conflict names the conflicting files and applies **nothing**. It
+  refuses a clean worktree by pointing at the branch route instead, and its
+  report states that committed work still merges the normal way.
+
+### Changed
+
+- **`task_cleanup`'s `force` now honestly forces.** It used to refuse a worktree
+  with uncommitted changes even under `force: true` — and a guardrail that
+  refuses an explicit force flag just teaches the model to bypass it: a real
+  session went straight to `rm -rf` on the worktree path, losing the same work
+  with no record of it. `force: true` now removes the worktree and branch
+  regardless and the result names the cost —
+  `Discarded uncommitted changes in N file(s): …`. Without `force` the refusal
+  is unchanged, except that it now points at `task_apply <id>` as the way to
+  keep that work.
+- **A spawned sub-agent is handed a verified workspace map.** Sub-agents start
+  cold, and one burned 4.2M tokens grepping crate paths it had invented
+  (`crates/keymap` for `crates/hjkl-keymap`), while siblings that ran `tree`
+  first made zero path errors. The `task` payload now ends with a
+  `Workspace layout (verified — don't guess paths):` section: two levels of
+  directories (`.gitignore`-honouring) and, for a cargo workspace, its
+  glob-expanded member crate paths, hard-capped at 1.5KB with the crate list
+  protected from the elision. It rides in the volatile task payload, never the
+  cache-prefixed system prompt.
+
 ### Fixed
 
 - **A formatter running between read and edit no longer sinks the edit.** The
