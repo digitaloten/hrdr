@@ -2373,11 +2373,22 @@ mod sandbox_tests {
 
     /// A relative extra writable root cannot be matched against canonicalized
     /// paths, so the config file is refused rather than silently mis-scoped.
+    ///
+    /// The "valid" fixture has to be absolute *for the platform running the
+    /// test*: `validate` asks [`std::path::Path::is_absolute`], and a config
+    /// file is platform-local, so a drive-letter-less `/abs/ok` is correctly
+    /// **not** absolute on Windows. Spelling it per-platform keeps the subject
+    /// of the test the rejection of relative roots, not path syntax.
+    #[cfg(windows)]
+    const ABSOLUTE_ROOT: &str = r"C:\abs\ok";
+    #[cfg(not(windows))]
+    const ABSOLUTE_ROOT: &str = "/abs/ok";
+
     #[test]
     fn relative_sandbox_writable_roots_are_rejected() {
         let fc = FileConfig {
             sandbox_writable_roots: vec![
-                "/abs/ok".to_string(),
+                ABSOLUTE_ROOT.to_string(),
                 "relative/path".to_string(),
                 "~/.cargo".to_string(),
             ],
@@ -2396,7 +2407,7 @@ mod sandbox_tests {
 
         // Absolute-only roots pass.
         let fc = FileConfig {
-            sandbox_writable_roots: vec!["/abs/ok".to_string()],
+            sandbox_writable_roots: vec![ABSOLUTE_ROOT.to_string()],
             ..Default::default()
         };
         assert!(fc.validate().is_empty());

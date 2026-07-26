@@ -1250,6 +1250,15 @@ mod tests {
         assert!(ro_root < mount_at(&args, "--bind", &two).unwrap());
     }
 
+    /// Linux-only: the Read profile's mount set is built from what the *host*
+    /// filesystem really has — `/usr`, `/etc`, and whatever `/bin` turns out to
+    /// be — through `.exists()`/`symlink_metadata` filters. Off Linux those
+    /// paths are absent (Windows) or shaped differently, so the builder
+    /// correctly emits a different argv and there is nothing to assert against:
+    /// bwrap only ever runs on Linux. Its Write sibling above stays
+    /// cross-platform because every path it names is a tempdir or the literal
+    /// `/` bind the builder emits unconditionally.
+    #[cfg(target_os = "linux")]
     #[test]
     fn bwrap_read_args_omit_rw_binds_and_private_tmp() {
         let dir = tempfile::tempdir().unwrap();

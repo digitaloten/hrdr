@@ -290,6 +290,21 @@ impl Harness {
             cwd: tmp.path().to_path_buf(),
             context_window: Some(1000),
             max_steps,
+            // A TUI e2e test asserts on what the terminal shows, so its
+            // transcript must not depend on what the *host* can confine with.
+            // Under the shipped default (`Write`) the first shell command an
+            // agent runs on a machine with no bwrap — CI's Windows and macOS
+            // runners, any Linux without bubblewrap — queues a degradation
+            // notice, which folds into the transcript as an extra entry and
+            // scrolls the rows these tests assert on out of the viewport. Worse,
+            // that queue is process-global and first-come-first-served, so under
+            // a plain `cargo test` (one process, tests in parallel — what the
+            // leak-guard job runs) the notice earned by one test lands in
+            // whichever *other* test's turn loop drains it first. `None` is the
+            // honest setting here: none of these tests is about OS confinement
+            // (that lives in hrdr-tools' and hrdr-agent's own tests), and it
+            // makes every one of them behave identically on every platform.
+            sandbox: hrdr_tools::SandboxMode::None,
             ..Default::default()
         };
         let ui = hrdr_app::UiConfig {
@@ -466,17 +481,36 @@ async fn tool_call_runs_the_tool_then_finishes() {
     ])
     .await;
     h.submit("make a plan").await;
+    // The tool call and the final text are asserted on the **transcript**, not
+    // on the rendered buffer: by the time this turn settles its tool block has
+    // already scrolled off the top of a 30-row terminal (the same trap
+    // `parallel_tool_calls_in_one_turn_all_run` notes below), so a `contains` on
+    // the screen only ever passed by way of the words in the final assistant
+    // text — and any extra entry the session picks up (a system notice) pushed
+    // that off too, failing the test for a reason that has nothing to do with
+    // the tool round-trip it is checking.
+    let kinds: Vec<&EntryKind> = h.app.transcript().iter().map(|e| &e.kind).collect();
+    let tools: Vec<&str> = kinds
+        .iter()
+        .filter_map(|k| match k {
+            EntryKind::Tool { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tools, ["todo"], "the todo tool ran: {kinds:?}");
+    // The follow-up turn's text — proof the round-trip drove a second call.
+    assert!(
+        kinds
+            .iter()
+            .any(|k| matches!(k, EntryKind::Assistant(t) if t == "Added the todo.")),
+        "final reply missing: {kinds:?}"
+    );
+    // The todo panel is fixed chrome at the bottom of the frame, so it shows
+    // the item whatever the scrollback is doing.
     let screen = h.render();
-    // The tool call is surfaced, the todo panel shows the item, and the final
-    // assistant text lands — proving the full tool round-trip drove two calls.
-    assert!(screen.contains("todo"), "tool call missing:\n{screen}");
     assert!(
         screen.contains("write more tests"),
         "todo item missing:\n{screen}"
-    );
-    assert!(
-        screen.contains("Added the todo."),
-        "final reply missing:\n{screen}"
     );
     assert!(!h.app.running());
 }

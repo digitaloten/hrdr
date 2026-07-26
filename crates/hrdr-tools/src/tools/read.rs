@@ -426,20 +426,35 @@ mod tests {
         assert!(msg.contains("file_path"), "mentions the alias: {msg}");
     }
 
-    /// In `Read` mode the readable roots are the whole world: a read outside
-    /// them is refused with the read string, one under the cwd goes through.
+    /// In `Read` mode the readable roots are the cwd, the scratch dir and the
+    /// tool-output dir: a read outside them is refused with the read string, one
+    /// under the cwd goes through.
+    ///
+    /// The "outside" probe is a *sibling tempdir*, not `/etc/hostname`: a
+    /// unix-style absolute path is not absolute on Windows, so `resolve_under`
+    /// joins it onto the cwd's drive (`C:/etc/hostname`) and the refusal names
+    /// that instead — the check still fires, but the assertion on its text
+    /// cannot be written portably. A sibling tempdir is absolute on every
+    /// platform and outside every readable root (they are all deeper than the
+    /// temp dir), so this exercises the same refusal hermetically.
     #[tokio::test]
     async fn read_and_search_refuse_outside_roots_in_read_mode() {
         let cwd = tempfile::tempdir().unwrap();
         let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Read);
 
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("hostname");
+        std::fs::write(&outside_file, "not yours").unwrap();
         let err = ReadTool
-            .execute(serde_json::json!({"path": "/etc/hostname"}), &ctx)
+            .execute(serde_json::json!({"path": outside_file}), &ctx)
             .await
             .expect_err("a read-only agent may not read outside its roots")
             .to_string();
         assert!(
-            err.contains("sandbox: refusing to read /etc/hostname"),
+            err.contains(&format!(
+                "sandbox: refusing to read {}",
+                outside_file.display()
+            )),
             "{err}"
         );
         assert!(err.contains("read-only and may read only under"), "{err}");
