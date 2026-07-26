@@ -123,15 +123,28 @@ struct RenameArgs {
     new_name: String,
 }
 
+/// What a nav tool does to the file it anchors on, and therefore which sandbox
+/// guard that path goes through: `definition`/`references` only read it,
+/// `rename` rewrites it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Anchor {
+    Read,
+    Write,
+}
+
 /// Resolve (path, line, symbol) to the request inputs: the file's current
 /// content and the 0-based UTF-16 position of the symbol on that line.
 async fn locate(
     ctx: &ToolContext,
+    anchor: Anchor,
     path: &str,
     line: u32,
     symbol: Option<&str>,
 ) -> Result<(std::path::PathBuf, String, u32, u32)> {
-    let path = ctx.resolve_read(path)?;
+    let path = match anchor {
+        Anchor::Read => ctx.resolve_read(path)?,
+        Anchor::Write => ctx.resolve_write(path)?,
+    };
     guard_secret_read(&path).with_context(|| format!("refusing to navigate {}", path.display()))?;
     let content = tokio::fs::read_to_string(&path)
         .await
@@ -216,7 +229,7 @@ impl Tool for DefinitionTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: NavArgs = crate::tool_args("definition", args)?;
         let (path, content, line0, character) =
-            locate(ctx, &a.path, a.line, a.symbol.as_deref()).await?;
+            locate(ctx, Anchor::Read, &a.path, a.line, a.symbol.as_deref()).await?;
         let result = registry(ctx)?
             .nav_request(
                 "textDocument/definition",
@@ -263,7 +276,7 @@ impl Tool for ReferencesTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: NavArgs = crate::tool_args("references", args)?;
         let (path, content, line0, character) =
-            locate(ctx, &a.path, a.line, a.symbol.as_deref()).await?;
+            locate(ctx, Anchor::Read, &a.path, a.line, a.symbol.as_deref()).await?;
         let result = registry(ctx)?
             .nav_request(
                 "textDocument/references",
@@ -304,7 +317,21 @@ impl Tool for ReferencesTool {
 ///   user than why the write failed);
 /// * the future is dropped mid-loop — `RenameRollback`'s `Drop` restores
 ///   synchronously; see its comment for what that path can't do.
+///
+/// The sandbox guard runs first, over *every* target, before the first byte is
+/// written. These paths come from the language server, not the model — but the
+/// guard's contract is about where writes land, not about who named the file,
+/// and a server is free to return edits anywhere it has indexed (a sibling
+/// checkout, a path outside the worktree). One refused target refuses the whole
+/// rename, which is also the atomicity this function already promises.
 async fn commit_planned(ctx: &ToolContext, planned: &[PlannedEdit]) -> Result<Vec<FileChange>> {
+    for plan in planned {
+        let canon = crate::canonicalize_nearest(&plan.path);
+        if let Err(e) = ctx.sandbox.check_write(&canon, &plan.path) {
+            bail!("{e} (the language server's rename would touch this file; nothing was written)");
+        }
+    }
+
     let mut applied: Vec<FileChange> = Vec::new();
     let mut rollback = RenameRollback::new();
     let mut failure: Option<(&std::path::Path, anyhow::Error)> = None;
@@ -389,7 +416,7 @@ impl Tool for RenameTool {
             bail!("new_name must not be empty");
         }
         let (path, content, line0, character) =
-            locate(ctx, &a.path, a.line, Some(&a.symbol)).await?;
+            locate(ctx, Anchor::Write, &a.path, a.line, Some(&a.symbol)).await?;
         // Unlike `definition`/`references`, `rename` writes — so, unlike
         // `locate` (shared with those read-only tools), it must honour a
         // write-scoped sub-agent's allowed extensions for the file the
@@ -581,5 +608,91 @@ mod tests {
         assert_eq!(applied.len(), 2);
         assert_eq!(tokio::fs::read_to_string(&one).await.unwrap(), "one new\n");
         assert_eq!(tokio::fs::read_to_string(&two).await.unwrap(), "two new\n");
+    }
+
+    /// `rename` rewrites the file it anchors on, so its path takes the *write*
+    /// guard — unlike `definition`/`references`, which share `locate` with it.
+    /// The refusal lands before the language server is ever consulted.
+    #[tokio::test]
+    async fn rename_outside_roots_is_refused() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("victim.rs");
+        std::fs::write(&target, "fn old() {}\n").unwrap();
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Write);
+
+        let err = RenameTool
+            .execute(
+                json!({
+                    "path": target.to_str().unwrap(),
+                    "line": 1,
+                    "symbol": "old",
+                    "new_name": "new",
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("renaming a symbol outside the roots must be refused")
+            .to_string();
+        assert!(err.contains("sandbox: refusing to write"), "{err}");
+        assert!(err.contains("You may write only under"), "{err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "fn old() {}\n");
+
+        // The same anchor is fine to *navigate* — `definition` only reads it,
+        // so the split guard must not have confined it too.
+        let err = DefinitionTool
+            .execute(
+                json!({"path": target.to_str().unwrap(), "line": 1, "symbol": "old"}),
+                &ctx,
+            )
+            .await
+            .expect_err("no LSP registry is configured in this test")
+            .to_string();
+        assert!(
+            err.contains("LSP support is disabled"),
+            "definition must get past the guard and fail on the missing registry: {err}"
+        );
+    }
+
+    /// The language server picks the files a rename touches, and it can name
+    /// one outside the roots. Those are still writes, so the guard covers them
+    /// — and it refuses the whole rename before the first byte lands.
+    #[tokio::test]
+    async fn rename_workspace_edit_cannot_write_outside_roots() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside = cwd.path().join("one.rs");
+        let escaped = outside.path().join("two.rs");
+        tokio::fs::write(&inside, "one old\n").await.unwrap();
+        tokio::fs::write(&escaped, "two old\n").await.unwrap();
+
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Write);
+        // The in-roots file is planned *first*: if the guard ran per-write
+        // instead of up front, this one would already be on disk.
+        let planned = vec![
+            plan(&inside, "one old\n", "one new\n"),
+            plan(&escaped, "two old\n", "two new\n"),
+        ];
+
+        let err = commit_planned(&ctx, &planned)
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sandbox: refusing to write"), "{err}");
+        assert!(err.contains("two.rs"), "the refusal names the file: {err}");
+        assert!(
+            err.contains("nothing was written"),
+            "the model must be told the rename was atomic: {err}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&inside).await.unwrap(),
+            "one old\n",
+            "an all-or-nothing refusal writes nothing at all"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&escaped).await.unwrap(),
+            "two old\n"
+        );
     }
 }
