@@ -146,6 +146,7 @@ pub use config::{
     check_config_compat,
     config_dir,
     config_file_path,
+    effective_sandbox,
     env_model_spec,
     is_chatgpt_provider_name,
     is_codex_oauth,
@@ -7803,6 +7804,8 @@ mod tests {
             // Differs from the default (`true`) so this proves the field is
             // actually applied, not just left at its default.
             auto_prune: Some(false),
+            sandbox: Some(hrdr_tools::SandboxMode::Read),
+            sandbox_writable_roots: vec!["/opt/cache".to_string()],
             providers: HashMap::new(),
             guardrails: vec![],
             hooks: vec![],
@@ -7862,6 +7865,11 @@ mod tests {
         assert!(cfg.auto_compact);
         assert_eq!(cfg.compaction_reserved, 12_345);
         assert!(!cfg.auto_prune);
+        assert_eq!(cfg.sandbox, hrdr_tools::SandboxMode::Read);
+        assert_eq!(
+            cfg.sandbox_writable_roots,
+            vec![std::path::PathBuf::from("/opt/cache")]
+        );
     }
 
     #[test]

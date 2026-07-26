@@ -109,6 +109,16 @@ struct Cli {
     #[arg(long = "auto-prune", global = true, value_name = "on|off")]
     auto_prune: Option<String>,
 
+    /// Filesystem confinement for this session: `write` (writes confined to the
+    /// working directory, temp/scratch and tool output), `read` (read-only
+    /// agents read only there), or `none` (no confinement).
+    #[arg(long, global = true, value_name = "write|read|none")]
+    sandbox: Option<String>,
+
+    /// Run without filesystem confinement (alias for `--sandbox none`).
+    #[arg(long = "no-sandbox", global = true, conflicts_with = "sandbox")]
+    no_sandbox: bool,
+
     /// Prompt caching: off, on, or auto (default; on for remote endpoints).
     #[arg(long = "prompt-cache", global = true, value_name = "off|on|auto")]
     prompt_cache: Option<String>,
@@ -546,6 +556,18 @@ async fn main() -> Result<()> {
         .and_then(hrdr_agent::parse_env_bool)
     {
         config.auto_prune = v;
+    }
+    // Unlike the neighbours above, a mistyped sandbox mode is never dropped
+    // silently: quietly running unconfined is the failure this flag exists to
+    // prevent.
+    if let Some(s) = cli.sandbox.as_deref() {
+        match s.parse::<hrdr_tools::SandboxMode>() {
+            Ok(m) => config.sandbox = m,
+            Err(e) => eprintln!("warning: --sandbox: {e} — keeping {}", config.sandbox),
+        }
+    }
+    if cli.no_sandbox {
+        config.sandbox = hrdr_tools::SandboxMode::None;
     }
     if cli.no_auto_resume {
         ui.auto_resume = false;

@@ -54,7 +54,7 @@ use crate::oauth::has_oauth_credentials;
 
 use hrdr_llm::CacheMode;
 use hrdr_llm::{is_anthropic_backend, url_host};
-use hrdr_tools::{DEFAULT_MAX_OUTPUT, DEFAULT_MAX_OUTPUT_LINES};
+use hrdr_tools::{DEFAULT_MAX_OUTPUT, DEFAULT_MAX_OUTPUT_LINES, SandboxMode};
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -415,6 +415,17 @@ pub struct AgentConfig {
     /// Scope this (sub-)agent to the read-only tools (see
     /// [`ToolRegistry::read_only_names`]). Ignored when `allowed_tools` is set.
     pub read_only: bool,
+    /// Filesystem confinement for this *session* (`sandbox`, `$HRDR_SANDBOX`,
+    /// `--sandbox`/`--no-sandbox`). This is the session **default**, not the mode
+    /// any one agent runs under: each agent — main or sub — derives its own from
+    /// this plus its [`read_only`](Self::read_only) flag via
+    /// [`effective_sandbox`], once, in `Agent::new`.
+    pub sandbox: SandboxMode,
+    /// Extra directories a confined agent may write to on top of the built-in
+    /// writable roots (cwd, temp, scratch, tool-output, git metadata) — the
+    /// escape hatch for build caches like `~/.cargo` that a cold build writes.
+    /// Absolute paths only; a relative entry is a config-file error.
+    pub sandbox_writable_roots: Vec<PathBuf>,
     /// Shared cell holding the parent session's sub-agent transcript directory
     /// (`sessions/<slug>/subagents/<id>/`), resolved lazily because the session
     /// id is assigned on first autosave, not at construction. The `task` tool
@@ -705,6 +716,11 @@ pub(crate) struct FileConfig {
     pub(crate) max_readonly_subagents: Option<usize>,
     pub(crate) max_write_subagents: Option<usize>,
     pub(crate) auto_prune: Option<bool>,
+    /// `sandbox = "write" | "read" | "none"`. A misspelling is a hard TOML parse
+    /// error (the enum's serde derive), matching the file-values-are-errors rule.
+    pub(crate) sandbox: Option<SandboxMode>,
+    #[serde(default)]
+    pub(crate) sandbox_writable_roots: Vec<String>,
     #[serde(default)]
     pub(crate) providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
@@ -771,6 +787,16 @@ impl FileConfig {
             "max_tokens",
             "the model could emit no output",
         );
+        // A relative writable root cannot be checked against a canonicalized
+        // path, and `~` never expands here — both would silently widen or
+        // narrow the sandbox, so they are refused outright.
+        for root in &self.sandbox_writable_roots {
+            if !std::path::Path::new(root).is_absolute() {
+                errors.push(format!(
+                    "sandbox_writable_roots entries must be absolute paths: {root:?}"
+                ));
+            }
+        }
         errors
     }
 }
@@ -873,6 +899,8 @@ impl Default for AgentConfig {
             agent_prompt: None,
             allowed_tools: None,
             read_only: false,
+            sandbox: SandboxMode::None,
+            sandbox_writable_roots: Vec::new(),
             subagent_transcript_dir: None,
             lsp: true,
             lsp_wait_ms: None,
@@ -1513,6 +1541,16 @@ impl AgentConfig {
         if let Some(v) = fc.auto_prune {
             self.auto_prune = v;
         }
+        if let Some(v) = fc.sandbox {
+            self.sandbox = v;
+        }
+        if !fc.sandbox_writable_roots.is_empty() {
+            self.sandbox_writable_roots = fc
+                .sandbox_writable_roots
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
+        }
         if !fc.providers.is_empty() {
             // Rekey by the canonical name: `[providers.anthropic]` IS `claude`'s
             // table, and every lookup arrives already folded.
@@ -1585,6 +1623,30 @@ impl AgentConfig {
             self.api_key = Some(k);
         }
         warnings
+    }
+}
+
+// ── Sandbox mode derivation ─────────────────────────────────────────────────
+
+/// The mode this agent actually runs under: the session default
+/// ([`AgentConfig::sandbox`]), floored/capped by what the agent *is*.
+///
+/// Called ONCE, in `Agent::new`, for every agent — main or sub, since both come
+/// through the same constructor and a sub-agent's config is a clone of the base
+/// with `read_only` already final. There is deliberately no delegation-side
+/// branch: a revived sub-agent, a `--agent explore` main agent, and a write
+/// sub-agent all derive here, from the same two inputs.
+///
+/// - Session `none` is an explicit global opt-out and wins everywhere.
+/// - A read-only agent has no write tools, so it takes read confinement.
+/// - A write-capable agent must be able to write, so it floors at `write` even
+///   when the session default is `read` — its writable roots are what confine
+///   it.
+pub fn effective_sandbox(session: SandboxMode, read_only: bool) -> SandboxMode {
+    match (session, read_only) {
+        (SandboxMode::None, _) => SandboxMode::None,
+        (_, true) => SandboxMode::Read,
+        (_, false) => SandboxMode::Write,
     }
 }
 
@@ -1700,6 +1762,11 @@ pub(crate) const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     }),
     ("HRDR_AUTO_PRUNE", |c, v| {
         c.auto_prune = env_bool(v)?;
+        Ok(())
+    }),
+    ("HRDR_SANDBOX", |c, v| {
+        // `SandboxMode::from_str`'s error is already the warning reason.
+        c.sandbox = v.parse()?;
         Ok(())
     }),
     ("HRDR_LSP", |c, v| {
@@ -2212,6 +2279,180 @@ mod persistence_tests {
             std::fs::read_to_string(&path)
                 .unwrap()
                 .contains("# keep me")
+        );
+    }
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+
+    /// The config-file key parses the three spellings, and a misspelling is a
+    /// hard TOML error (file values are errors — see the module docs).
+    #[test]
+    fn sandbox_config_key_parses_and_bad_value_is_a_hard_error() {
+        for (text, want) in [
+            ("sandbox = \"write\"", SandboxMode::Write),
+            ("sandbox = \"read\"", SandboxMode::Read),
+            ("sandbox = \"none\"", SandboxMode::None),
+        ] {
+            let fc: FileConfig = toml::from_str(text).expect("a valid sandbox mode");
+            assert_eq!(fc.sandbox, Some(want));
+            // …and it layers onto the config.
+            let mut cfg = AgentConfig::default();
+            cfg.apply_file(fc);
+            assert_eq!(cfg.sandbox, want);
+        }
+
+        // Unset leaves the default alone.
+        let fc: FileConfig = toml::from_str("").unwrap();
+        assert_eq!(fc.sandbox, None);
+        let mut cfg = AgentConfig::default();
+        cfg.apply_file(fc);
+        assert_eq!(cfg.sandbox, SandboxMode::None, "the slice-2 default");
+
+        // A misspelling never reaches the config: it fails to parse.
+        let err = match toml::from_str::<FileConfig>("sandbox = \"wrote\"") {
+            Ok(_) => panic!("a misspelled sandbox mode must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("wrote"), "{err}");
+
+        // The extra writable roots come through as paths.
+        let fc: FileConfig =
+            toml::from_str("sandbox_writable_roots = [\"/home/me/.cargo\"]").unwrap();
+        let mut cfg = AgentConfig::default();
+        cfg.apply_file(fc);
+        assert_eq!(
+            cfg.sandbox_writable_roots,
+            vec![PathBuf::from("/home/me/.cargo")]
+        );
+    }
+
+    /// `$HRDR_SANDBOX` sets the mode; garbage is a warning that keeps the
+    /// current value (env values are warnings, not errors).
+    #[test]
+    fn hrdr_sandbox_env_sets_mode_and_garbage_warns() {
+        let setter = ENV_SETTERS
+            .iter()
+            .find(|(n, _)| *n == "HRDR_SANDBOX")
+            .map(|(_, f)| *f)
+            .expect("HRDR_SANDBOX is wired into ENV_SETTERS");
+
+        let mut cfg = AgentConfig::default();
+        setter(&mut cfg, "write").unwrap();
+        assert_eq!(cfg.sandbox, SandboxMode::Write);
+        setter(&mut cfg, " READ ").unwrap();
+        assert_eq!(cfg.sandbox, SandboxMode::Read, "trimmed, case-insensitive");
+        setter(&mut cfg, "none").unwrap();
+        assert_eq!(cfg.sandbox, SandboxMode::None);
+
+        setter(&mut cfg, "write").unwrap();
+        let reason = setter(&mut cfg, "wrote").expect_err("garbage is reported");
+        assert!(reason.contains("write, read, or none"), "{reason}");
+        assert_eq!(
+            cfg.sandbox,
+            SandboxMode::Write,
+            "an unparseable value leaves the mode alone"
+        );
+    }
+
+    /// A relative extra writable root cannot be matched against canonicalized
+    /// paths, so the config file is refused rather than silently mis-scoped.
+    #[test]
+    fn relative_sandbox_writable_roots_are_rejected() {
+        let fc = FileConfig {
+            sandbox_writable_roots: vec![
+                "/abs/ok".to_string(),
+                "relative/path".to_string(),
+                "~/.cargo".to_string(),
+            ],
+            ..Default::default()
+        };
+        let errors = fc.validate();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        for entry in ["relative/path", "~/.cargo"] {
+            assert!(
+                errors.iter().any(|e| e
+                    .contains("sandbox_writable_roots entries must be absolute paths")
+                    && e.contains(entry)),
+                "expected a diagnostic naming {entry}; got {errors:?}"
+            );
+        }
+
+        // Absolute-only roots pass.
+        let fc = FileConfig {
+            sandbox_writable_roots: vec!["/abs/ok".to_string()],
+            ..Default::default()
+        };
+        assert!(fc.validate().is_empty());
+    }
+
+    /// Every cell of the decision table: the session default × what the agent
+    /// is. Main agents, write sub-agents and revived sub-agents all arrive here
+    /// as `read_only = false`; read-only profiles and read-only sub-agents as
+    /// `read_only = true` — one shared derivation, no per-caller branch.
+    #[test]
+    fn effective_sandbox_matches_the_decision_table() {
+        // Session `none` is a global opt-out: nothing is confined.
+        assert_eq!(
+            effective_sandbox(SandboxMode::None, false),
+            SandboxMode::None
+        );
+        assert_eq!(
+            effective_sandbox(SandboxMode::None, true),
+            SandboxMode::None
+        );
+
+        // Session `write`: writers get write confinement, readers read.
+        assert_eq!(
+            effective_sandbox(SandboxMode::Write, false),
+            SandboxMode::Write
+        );
+        assert_eq!(
+            effective_sandbox(SandboxMode::Write, true),
+            SandboxMode::Read
+        );
+
+        // Session `read`: a write-capable agent floors at `write` (it cannot
+        // function under `read`, and its writable roots confine it anyway).
+        assert_eq!(
+            effective_sandbox(SandboxMode::Read, false),
+            SandboxMode::Write
+        );
+        assert_eq!(
+            effective_sandbox(SandboxMode::Read, true),
+            SandboxMode::Read
+        );
+
+        // The sub-agent rows are those same two inputs: a sub-agent's config is
+        // a clone of the base (so `sandbox` is inherited) with `read_only`
+        // already final — including a revived sub-agent, which clones the base
+        // the same way and takes a write slot.
+        let base = AgentConfig {
+            sandbox: SandboxMode::Write,
+            ..Default::default()
+        };
+        let write_sub = AgentConfig {
+            read_only: false,
+            ..base.clone()
+        };
+        let read_sub = AgentConfig {
+            read_only: true,
+            ..base.clone()
+        };
+        let revived = write_sub.clone(); // task_revive: same clone, same derivation
+        assert_eq!(
+            effective_sandbox(write_sub.sandbox, write_sub.read_only),
+            SandboxMode::Write
+        );
+        assert_eq!(
+            effective_sandbox(read_sub.sandbox, read_sub.read_only),
+            SandboxMode::Read
+        );
+        assert_eq!(
+            effective_sandbox(revived.sandbox, revived.read_only),
+            SandboxMode::Write
         );
     }
 }
