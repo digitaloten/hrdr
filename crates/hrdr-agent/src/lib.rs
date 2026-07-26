@@ -1187,7 +1187,9 @@ const MEMORY_PREAMBLE: &str = "Durable notes you saved in earlier sessions (via 
 ///   2. agents_md   — changes when the project's docs change on disk
 ///   3. memory      — changes when the agent saves a note
 ///   4. persona     — differs per agent profile
-///   5. environment — cwd and date: the volatile tail, dead last
+///   5. environment — cwd and date: the start of the volatile tail
+///   6. sandbox     — the confinement mode and its roots (which name the cwd),
+///      as volatile as the environment block, so it goes dead last
 ///
 /// Open a new session in a project whose docs and memory are untouched and
 /// everything up to (4) is a cache hit.
@@ -1206,10 +1208,11 @@ fn build_system_prompt_sections(
     memory: &MemoryIndex,
     persona: Option<&str>,
     is_subagent: bool,
+    sandbox: &hrdr_tools::SandboxPolicy,
 ) -> Result<prompt::SystemPrompt> {
     use prompt::{
         SECTION_BASE, SECTION_ENVIRONMENT, SECTION_GLOBAL_AGENTS_MD, SECTION_GLOBAL_MEMORY,
-        SECTION_PERSONA, SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY,
+        SECTION_PERSONA, SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY, SECTION_SANDBOX,
     };
     let mut p = prompt::SystemPrompt::default();
     // 1. identical for every agent hrdr runs
@@ -1239,9 +1242,12 @@ fn build_system_prompt_sections(
     for (name, body) in prompt::capability_sections(tools, is_subagent) {
         p.push(name, prompt::section_text(body));
     }
-    // 7-8. per-agent, then the volatile tail
+    // 7-9. per-agent, then the volatile tail. The sandbox roots name this agent's
+    // cwd, so they sit below the environment block — the cache split is taken
+    // before `SECTION_ENVIRONMENT`, so appending here costs the prefix nothing.
     p.push(SECTION_PERSONA, persona_section(persona));
     p.push(SECTION_ENVIRONMENT, prompt::environment_section(cwd, tools));
+    p.push(SECTION_SANDBOX, prompt::sandbox_section(sandbox));
     Ok(p)
 }
 
@@ -1259,8 +1265,9 @@ fn build_system_prompt(
     memory: &MemoryIndex,
     persona: Option<&str>,
     is_subagent: bool,
+    sandbox: &hrdr_tools::SandboxPolicy,
 ) -> Result<(String, Option<usize>)> {
-    let p = build_system_prompt_sections(tools, cwd, docs, memory, persona, is_subagent)?;
+    let p = build_system_prompt_sections(tools, cwd, docs, memory, persona, is_subagent, sandbox)?;
     let split = p.prefix_len_before(prompt::SECTION_ENVIRONMENT);
     Ok((p.render(), split))
 }
@@ -1572,6 +1579,7 @@ impl Agent {
             &memory,
             config.agent_prompt.as_deref(),
             config.is_subagent,
+            &ctx.sandbox,
         )?;
 
         // Configure the client from the (possibly auth-switched) resolved model,
@@ -1818,6 +1826,7 @@ impl Agent {
             &memory,
             self.agent_prompt.as_deref(),
             self.is_subagent,
+            &self.ctx.sandbox,
         ) else {
             return;
         };
@@ -1862,6 +1871,7 @@ impl Agent {
             &memory,
             self.agent_prompt.as_deref(),
             self.is_subagent,
+            &self.ctx.sandbox,
         ) else {
             return;
         };
@@ -4739,28 +4749,41 @@ mod tests {
     /// session in an unchanged project reuses every byte up to the environment
     /// block. Pinned positionally because a well-meaning reorder is exactly how
     /// this regresses, and nothing else would fail.
+    ///
+    /// The sandbox section is the one thing below environment: its roots name the
+    /// per-agent worktree cwd, and the cache split is taken *before* environment,
+    /// so appending it there costs the shared prefix nothing.
     #[test]
     fn system_prompt_is_ordered_least_volatile_first() {
         use super::prompt::{
             SECTION_BASE, SECTION_ENVIRONMENT, SECTION_GLOBAL_AGENTS_MD, SECTION_GLOBAL_MEMORY,
-            SECTION_PERSONA, SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY,
+            SECTION_PERSONA, SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY, SECTION_SANDBOX,
         };
         let tools = hrdr_tools::ToolRegistry::with_defaults();
-        let p = super::build_system_prompt_sections(
-            &tools,
+        let sections = |sandbox: &hrdr_tools::SandboxPolicy| {
+            super::build_system_prompt_sections(
+                &tools,
+                std::path::Path::new("/tmp/proj"),
+                &super::prompt::AgentDocs {
+                    global: Some("global docs".to_string()),
+                    project: Some("project docs".to_string()),
+                },
+                &super::MemoryIndex {
+                    global: Some("global memory".to_string()),
+                    project: Some("project memory".to_string()),
+                },
+                Some("the persona"),
+                false,
+                sandbox,
+            )
+            .unwrap()
+        };
+        let confined = hrdr_tools::SandboxPolicy::for_agent(
+            hrdr_tools::SandboxMode::Write,
             std::path::Path::new("/tmp/proj"),
-            &super::prompt::AgentDocs {
-                global: Some("global docs".to_string()),
-                project: Some("project docs".to_string()),
-            },
-            &super::MemoryIndex {
-                global: Some("global memory".to_string()),
-                project: Some("project memory".to_string()),
-            },
-            Some("the persona"),
-            false,
-        )
-        .unwrap();
+            &[],
+        );
+        let p = sections(&confined);
 
         assert_eq!(
             p.names(),
@@ -4777,10 +4800,16 @@ mod tests {
                 "committing_main",
                 SECTION_PERSONA,
                 SECTION_ENVIRONMENT,
+                SECTION_SANDBOX,
             ],
             "assembly order is the cache strategy: least-volatile first, so a new session \
              in an unchanged project reuses every byte up to the environment block"
         );
+        // Unconfined: the section body is empty, so `push` drops it and the
+        // environment block is the tail again.
+        let unconfined = sections(&hrdr_tools::SandboxPolicy::unconfined());
+        assert!(!unconfined.names().contains(&SECTION_SANDBOX));
+        assert_eq!(unconfined.names().last(), Some(&SECTION_ENVIRONMENT));
     }
 
     /// An agent with no persona and no memory simply has fewer sections — the
@@ -4797,6 +4826,7 @@ mod tests {
             &super::MemoryIndex::default(),
             None,
             false,
+            &hrdr_tools::SandboxPolicy::unconfined(),
         )
         .unwrap();
 
@@ -4824,6 +4854,7 @@ mod tests {
             &super::MemoryIndex::default(),
             None,
             false,
+            &hrdr_tools::SandboxPolicy::unconfined(),
         )
         .unwrap();
 

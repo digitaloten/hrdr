@@ -68,7 +68,13 @@ mod frag {
 ///    every agent in this project shares.
 /// 7. **Persona** ([`crate::persona_section`]) — differs per agent profile.
 /// 8. **Environment** ([`environment_section`]) — tool list, OS, date, and the
-///    working directory. The volatile tail, **dead last**.
+///    working directory. The start of the volatile tail.
+/// 9. **Sandbox** ([`sandbox_section`]) — the confinement mode and the concrete
+///    writable roots, which name the per-agent worktree `cwd`. Exactly as
+///    volatile as the Environment block's working-directory line, so it sits
+///    below it, **dead last**. The cache split is computed *before* Environment,
+///    so appending here costs the cached prefix nothing; moving it above
+///    Environment would push per-agent bytes into the shared prefix.
 ///
 /// Scopes are split global-before-project (2-3 before 4-5) so switching projects
 /// still reuses the global bytes; joined into one block they would leave the
@@ -208,6 +214,9 @@ pub const SECTION_SUBAGENT: &str = "subagent";
 pub const SECTION_SUBAGENT_WRITE: &str = "subagent_write";
 pub const SECTION_PERSONA: &str = "persona";
 pub const SECTION_ENVIRONMENT: &str = "environment";
+// Below the environment block on purpose: the writable roots name the per-agent
+// cwd, so this is the most volatile section there is. See `sandbox_section`.
+pub const SECTION_SANDBOX: &str = "sandbox";
 
 /// The system prompt as an ordered list of named sections.
 ///
@@ -340,6 +349,46 @@ pub fn environment_section(cwd: &Path, tools: &ToolRegistry) -> String {
         cwd = cwd.display(),
     ));
     system
+}
+
+/// The sandbox declaration — mode plus the concrete roots — as a prompt section.
+/// Empty (→ dropped by [`SystemPrompt::push`]) when the mode is `None`, so an
+/// unconfined agent is told nothing about a boundary it does not have.
+///
+/// Stated **positively**: the roots the agent may write (or, read-only, read),
+/// listed one per line. A model that knows its boundary asks for a different
+/// approach instead of burning turns on writes the kernel is going to refuse.
+///
+/// Volatile tail: the roots name the per-agent `cwd`, so this must stay BELOW
+/// the environment section — see the assembly order on [`render_system`]. The
+/// enforcement itself is not in the prompt (that is `hrdr_tools::sandbox`); this
+/// only tells the model what is already true.
+pub fn sandbox_section(policy: &hrdr_tools::SandboxPolicy) -> String {
+    let roots = |roots: &[std::path::PathBuf]| {
+        roots
+            .iter()
+            .map(|r| format!("- {}", r.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    match policy.mode {
+        hrdr_tools::SandboxMode::None => String::new(),
+        hrdr_tools::SandboxMode::Write => format!(
+            "\n\nSandbox:\n\
+             - Mode: write — reads are unrestricted; writes are enforced by the OS and the tools.\n\
+             - You may write ONLY under:\n{}\n\
+             - Writing anywhere else is refused. If a task appears to require writing outside \
+             these roots, stop and say so instead of attempting it.",
+            roots(&policy.writable_roots)
+        ),
+        hrdr_tools::SandboxMode::Read => format!(
+            "\n\nSandbox:\n\
+             - Mode: read — this agent is read-only.\n\
+             - You may read ONLY under:\n{}\n\
+             - Reads elsewhere and all writes are refused.",
+            roots(&policy.readable_roots)
+        ),
+    }
 }
 
 /// One-line OS description for the system prompt: kernel/family, the distro
@@ -1745,6 +1794,52 @@ mod tests {
         assert!(
             !docs.contains("LEVEL_00"),
             "the farthest ancestor must be dropped when the total exceeds the cap"
+        );
+    }
+
+    /// The model is told its boundary positively, and every writable root is
+    /// named — a root the prompt omits is a refusal the model cannot predict.
+    #[test]
+    fn sandbox_section_names_mode_and_every_writable_root() {
+        let policy = hrdr_tools::SandboxPolicy {
+            mode: hrdr_tools::SandboxMode::Write,
+            writable_roots: vec![
+                std::path::PathBuf::from("/work/wt-1"),
+                std::path::PathBuf::from("/scratch/hrdr"),
+            ],
+            readable_roots: vec![std::path::PathBuf::from("/work/wt-1")],
+        };
+        let s = sandbox_section(&policy);
+        assert!(
+            s.starts_with("\n\nSandbox:"),
+            "the section carries its own separator and header: {s:?}"
+        );
+        assert!(s.contains("Mode: write"));
+        assert!(s.contains("write ONLY under"));
+        assert!(s.contains("- /work/wt-1"));
+        assert!(s.contains("- /scratch/hrdr"));
+
+        // Read mode names the readable roots and the read-only sentence instead.
+        let ro = hrdr_tools::SandboxPolicy {
+            mode: hrdr_tools::SandboxMode::Read,
+            writable_roots: Vec::new(),
+            readable_roots: vec![std::path::PathBuf::from("/work/ro")],
+        };
+        let s = sandbox_section(&ro);
+        assert!(s.contains("Mode: read"));
+        assert!(s.contains("read ONLY under"));
+        assert!(s.contains("- /work/ro"));
+        assert!(s.contains("all writes are refused"));
+    }
+
+    /// An unconfined agent gets no section at all (empty body → dropped by
+    /// `SystemPrompt::push`): describing a boundary that is not enforced would be
+    /// a lie, and it would cost tokens in every unsandboxed session.
+    #[test]
+    fn sandbox_section_is_empty_for_mode_none() {
+        assert!(
+            sandbox_section(&hrdr_tools::SandboxPolicy::unconfined()).is_empty(),
+            "mode None must render nothing"
         );
     }
 }
