@@ -125,9 +125,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `sandbox: unprivileged user namespaces are disabled on this system — falling back to Landlock: …`,
   plus
   `sandbox: Landlock cannot confine reads — this read-only agent's shell commands are write-confined only.`
-  for a read-only agent. With neither backend — and on macOS and Windows — shell
-  commands still run unconfined and still say so:
+  for a read-only agent. With neither backend — and on Windows — shell commands
+  still run unconfined and still say so:
   `sandbox: no OS-level sandbox is available on this system — shell commands are NOT OS-confined; the file tools remain guarded. Use --sandbox none to silence this.`
+- **On macOS, `shell` and `watch` commands now run under Seatbelt.** Each
+  command is wrapped in `/usr/bin/sandbox-exec` (pinned by absolute path, so a
+  poisoned `PATH` cannot swap the confinement for a no-op) with a profile
+  generated from that agent's policy: deny-by-default, the process/signal/IPC
+  allowances a shell needs, reads unrestricted and writes allowed only under the
+  agent's writable roots in `write` mode; in `read` mode reads are narrowed to
+  `/usr`, `/bin`, `/sbin`, `/System`, `/Library`, `/private/etc`, `/dev` and the
+  readable roots, with no writes at all. A write outside the roots fails with
+  `Operation not permitted`. cwd, stdio, exit status, timeouts and group-kill
+  are untouched, and the network is allowed as on Linux. A Mac without
+  `/usr/bin/sandbox-exec` falls back to the software layer and the same "no
+  OS-level sandbox" notice as Windows.
 - **BREAKING (tool API): every model-facing time parameter is in seconds —
   `shell`'s `timeout_ms` is now `timeout_secs`.** The tool schemas mixed units:
   `watch` took `interval_secs`/`timeout_secs` while `shell` took `timeout_ms`,

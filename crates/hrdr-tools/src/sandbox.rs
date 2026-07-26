@@ -344,7 +344,8 @@ pub fn take_sandbox_notice() -> Option<String> {
 }
 
 /// Emitted when a confined agent's shell command runs without any OS-level
-/// confinement — no bwrap and no Landlock, a pre-Seatbelt macOS, or Windows.
+/// confinement — no bwrap and no Landlock, a macOS whose
+/// `/usr/bin/sandbox-exec` is gone, or Windows.
 /// Never silently pretend to sandbox: the file tools stay guarded, the shell
 /// does not.
 const NO_OS_SANDBOX_NOTICE: &str = "sandbox: no OS-level sandbox is available on this system — \
@@ -352,12 +353,18 @@ const NO_OS_SANDBOX_NOTICE: &str = "sandbox: no OS-level sandbox is available on
      silence this.";
 
 /// Emitted when `bwrap(1)` is not installed and Landlock catches the fall.
+///
+/// Linux-only, like the two notices below it: nothing off Linux can fall back
+/// to Landlock, and an unused const is a `-D warnings` failure on the other CI
+/// runners.
+#[cfg(target_os = "linux")]
 const BWRAP_MISSING_NOTICE: &str = "sandbox: bwrap not found — falling back to Landlock: writes \
      are still confined, but reads are not, and read-mode agents degrade to write-mode \
      confinement for shell commands. Install bubblewrap for full confinement.";
 
 /// Emitted when bwrap is installed but the kernel/distro forbids unprivileged
 /// user namespaces, so it cannot build a mount namespace.
+#[cfg(target_os = "linux")]
 const USERNS_DISABLED_NOTICE: &str = "sandbox: unprivileged user namespaces are disabled on this \
      system — falling back to Landlock: writes are still confined, but reads are not, and \
      read-mode agents degrade to write-mode confinement for shell commands.";
@@ -365,6 +372,7 @@ const USERNS_DISABLED_NOTICE: &str = "sandbox: unprivileged user namespaces are 
 /// Emitted in addition to the fallback notice when a *read-mode* agent runs a
 /// shell command on Landlock: the ruleset confines writes only, so this agent
 /// is quietly weaker than its mode claims — say so, loudly.
+#[cfg(target_os = "linux")]
 const READ_DEGRADES_UNDER_LANDLOCK_NOTICE: &str = "sandbox: Landlock cannot confine reads — this \
      read-only agent's shell commands are write-confined only.";
 
@@ -382,14 +390,16 @@ pub fn set_sandbox_notice(msg: String) {
 ///
 /// The file tools are guarded in-process regardless; this is only about the
 /// subprocesses `shell` and `watch` spawn, which the software guard cannot see
-/// inside of. bwrap is primary because it is the only one of the three that
-/// can confine reads as well as writes.
+/// inside of. On Linux bwrap is primary because it is the only mechanism there
+/// that can confine reads as well as writes; on macOS there is one option.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OsSandboxBackend {
     /// `bwrap(1)` — a mount namespace built per command (§3.6.1).
     Bwrap,
     /// Landlock LSM rules the child applies to itself. Writes only.
     Landlock,
+    /// macOS `sandbox-exec(1)` with a generated SBPL profile (§3.7).
+    Seatbelt,
     /// Nothing available: the shell runs unconfined and says so.
     None,
 }
@@ -405,6 +415,12 @@ pub enum OsSandboxBackend {
 struct Detection {
     backend: OsSandboxBackend,
     /// `None` when the primary backend was available and nothing was lost.
+    ///
+    /// Only the Linux Landlock arm consumes it — a step *down* is a Linux-only
+    /// concept, since macOS either has Seatbelt or has nothing — so off Linux
+    /// it is written and never read, and `-D warnings` on the macOS/Windows CI
+    /// runners would otherwise fail the build.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     degraded: Option<&'static str>,
 }
 
@@ -510,9 +526,29 @@ fn without_bwrap(why: &'static str) -> Detection {
     }
 }
 
-/// Every other platform: nothing yet. macOS gets Seatbelt in a later slice;
-/// Windows stays software-layer-only.
-#[cfg(not(target_os = "linux"))]
+/// macOS: Seatbelt whenever the system wrapper is where it belongs (§3.7).
+///
+/// Existence is the whole probe — unlike bwrap there is no kernel switch to
+/// discover, and `sandbox-exec` is deprecated-but-present on every macOS that
+/// still ships it. A machine that has had it removed falls to the software
+/// layer with the blunt "not confined" notice.
+#[cfg(target_os = "macos")]
+fn detect_backend_uncached() -> Detection {
+    if Path::new(SEATBELT_PROGRAM).exists() {
+        Detection {
+            backend: OsSandboxBackend::Seatbelt,
+            degraded: None,
+        }
+    } else {
+        Detection {
+            backend: OsSandboxBackend::None,
+            degraded: Some(NO_OS_SANDBOX_NOTICE),
+        }
+    }
+}
+
+/// Every other platform: nothing. Windows stays software-layer-only in v1.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn detect_backend_uncached() -> Detection {
     Detection {
         backend: OsSandboxBackend::None,
@@ -586,6 +622,19 @@ fn shell_command_with_backend(
         // but the variant exists on every platform, so the arm must too.
         #[cfg(not(target_os = "linux"))]
         OsSandboxBackend::Landlock => {
+            set_sandbox_notice(NO_OS_SANDBOX_NOTICE.to_string());
+            shell.command(cmd_str)
+        }
+        #[cfg(target_os = "macos")]
+        OsSandboxBackend::Seatbelt => {
+            let mut cmd = tokio::process::Command::new(SEATBELT_PROGRAM);
+            cmd.args(seatbelt_args(policy, shell, cmd_str));
+            cmd
+        }
+        // The macOS twin of the Landlock arm above: unreachable off macOS,
+        // still a variant that has to compile there.
+        #[cfg(not(target_os = "macos"))]
+        OsSandboxBackend::Seatbelt => {
             set_sandbox_notice(NO_OS_SANDBOX_NOTICE.to_string());
             shell.command(cmd_str)
         }
@@ -782,6 +831,126 @@ fn usr_merge_compat_args() -> Vec<std::ffi::OsString> {
         }
     }
     args
+}
+
+// The three Seatbelt items below are the macOS backend's building blocks, and
+// they are deliberately **not** `cfg(target_os = "macos")`: profile and argv
+// construction is pure string work, so keeping it compiled everywhere is what
+// lets the tests that pin its exact text run on a Linux developer machine and
+// in Linux CI, where the macOS arm itself cannot. Off macOS nothing but those
+// tests calls them, hence the `dead_code` waiver.
+
+/// macOS's sandbox wrapper, by absolute path.
+///
+/// Pinned rather than looked up on `PATH` — exactly as Codex does
+/// (`MACOS_PATH_TO_SEATBELT_EXECUTABLE`) — so a poisoned `PATH` cannot swap the
+/// confinement for a same-named no-op. If `/usr/bin/sandbox-exec` itself has
+/// been tampered with, whoever did it already had root.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const SEATBELT_PROGRAM: &str = "/usr/bin/sandbox-exec";
+
+/// The full `sandbox-exec` argv (everything after `argv[0]`): the generated
+/// profile, then the shell invocation it applies to.
+///
+/// Unlike bwrap there is no `--chdir` to pass — Seatbelt only filters syscalls,
+/// so the child inherits the cwd the caller sets on the `Command`, and stdio,
+/// exit status, timeouts and group-kill are untouched.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn seatbelt_args(
+    policy: &SandboxPolicy,
+    shell: crate::Shell,
+    cmd_str: &str,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-p".into(),
+        seatbelt_profile(policy.mode, policy).into(),
+        "--".into(),
+        shell.program().into(),
+    ];
+    args.extend(shell.invoke_args().iter().map(std::ffi::OsString::from));
+    args.push(cmd_str.into());
+    args
+}
+
+/// The SBPL profile for `mode` (§4 slice 8, verbatim): deny by default, allow
+/// the process machinery a shell needs, then open exactly the file access the
+/// mode grants.
+///
+/// `Write` reads everywhere and writes only under the policy's writable roots;
+/// `Read` narrows reads to the system directories an interpreter or compiler
+/// needs plus the readable roots, and grants no writes at all. Network stays
+/// allowed in both, matching the Linux backends — the network axis is a
+/// declared follow-up, not v1.
+///
+/// **Caveat carried from the spec:** the `Read` variant is author-written and
+/// **unvalidated** — no Mac was available when this landed, so it has never
+/// been run. The `Write` variant is also a coarsening of Codex's
+/// `seatbelt_base_policy.sbpl` (broad `sysctl-read`/`mach-lookup`/`ipc-posix*`
+/// in place of its enumerated names, and none of its `pseudo-tty`/`iokit-open`/
+/// `user-preference-read` allowances), so real-world macOS runs may need
+/// additions here.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn seatbelt_profile(mode: SandboxMode, policy: &SandboxPolicy) -> String {
+    /// `(subpath "…")` per root, space-separated — SBPL's "this directory and
+    /// everything beneath it" filter.
+    ///
+    /// A path is a quoted SBPL string, so a literal backslash or quote in it
+    /// must be escaped or the profile either changes meaning or fails to
+    /// parse (and a profile that fails to parse is a command that does not
+    /// run — never a boundary that silently widens).
+    fn subpaths(roots: &[PathBuf]) -> String {
+        roots
+            .iter()
+            .map(|root| {
+                let escaped = root
+                    .to_string_lossy()
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"");
+                format!("(subpath \"{escaped}\")")
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    let mut profile = String::from(
+        "(version 1)\n\
+         (deny default)\n\
+         (allow process-fork)\n\
+         (allow process-exec*)\n\
+         (allow signal)\n\
+         (allow sysctl-read)\n\
+         (allow mach-lookup)\n\
+         (allow ipc-posix*)\n",
+    );
+    match mode {
+        SandboxMode::Write => {
+            profile.push_str("(allow file-read*)\n");
+            // An empty root list must stay closed: `(allow file-write*)` with
+            // no filter allows every write there is, so the line is omitted
+            // and `(deny default)` answers instead.
+            if !policy.writable_roots.is_empty() {
+                let writes = subpaths(&policy.writable_roots);
+                profile.push_str(&format!("(allow file-write* {writes})\n"));
+            }
+        }
+        SandboxMode::Read => {
+            let reads = subpaths(&policy.readable_roots);
+            let reads = if reads.is_empty() {
+                String::new()
+            } else {
+                format!(" {reads}")
+            };
+            profile.push_str(&format!(
+                "(allow file-read* (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n  \
+                 (subpath \"/System\") (subpath \"/Library\") (subpath \"/private/etc\")\n  \
+                 (subpath \"/dev\"){reads})\n"
+            ));
+        }
+        // Unreachable: `sandboxed_shell_command` returns before it gets here.
+        SandboxMode::None => {}
+    }
+    profile.push_str("(allow network*)\n");
+    profile
 }
 
 /// A [`crate::ToolContext`] rooted at `dir` and confined to it *alone*, for
@@ -1139,6 +1308,158 @@ mod tests {
         }
 
         assert_eq!(args[args.len() - 4..], ["--", "bash", "-c", "echo hi"]);
+    }
+
+    /// The Write profile names every writable root and nothing else, and the
+    /// rest of it is the spec's text byte for byte. Pure string work, so it
+    /// runs on every platform — the macOS arm cannot be exercised off macOS,
+    /// but the profile it would hand to `sandbox-exec` can.
+    #[test]
+    fn seatbelt_profile_lists_every_writable_root() {
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![PathBuf::from("/work/wt"), PathBuf::from("/tmp/scratch")],
+            readable_roots: Vec::new(),
+        };
+        assert_eq!(
+            seatbelt_profile(SandboxMode::Write, &policy),
+            concat!(
+                "(version 1)\n",
+                "(deny default)\n",
+                "(allow process-fork)\n",
+                "(allow process-exec*)\n",
+                "(allow signal)\n",
+                "(allow sysctl-read)\n",
+                "(allow mach-lookup)\n",
+                "(allow ipc-posix*)\n",
+                "(allow file-read*)\n",
+                "(allow file-write* (subpath \"/work/wt\") (subpath \"/tmp/scratch\"))\n",
+                "(allow network*)\n",
+            )
+        );
+
+        // A quote in a path is escaped, not left to break the profile.
+        let odd = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![PathBuf::from("/work/we\"ird")],
+            readable_roots: Vec::new(),
+        };
+        assert!(
+            seatbelt_profile(SandboxMode::Write, &odd)
+                .contains("(allow file-write* (subpath \"/work/we\\\"ird\"))"),
+            "{}",
+            seatbelt_profile(SandboxMode::Write, &odd)
+        );
+
+        // With no writable roots the write line is absent entirely: an
+        // unfiltered `(allow file-write*)` would allow every write there is.
+        let empty = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: Vec::new(),
+            readable_roots: Vec::new(),
+        };
+        assert!(
+            !seatbelt_profile(SandboxMode::Write, &empty).contains("file-write*"),
+            "an empty root set must stay closed, not open"
+        );
+    }
+
+    /// Read mode grants no writes at all and narrows reads to the system
+    /// directories plus the readable roots.
+    #[test]
+    fn seatbelt_read_profile_allows_no_writes_and_only_the_read_roots() {
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Read,
+            writable_roots: Vec::new(),
+            readable_roots: vec![PathBuf::from("/work/wt")],
+        };
+        assert_eq!(
+            seatbelt_profile(SandboxMode::Read, &policy),
+            concat!(
+                "(version 1)\n",
+                "(deny default)\n",
+                "(allow process-fork)\n",
+                "(allow process-exec*)\n",
+                "(allow signal)\n",
+                "(allow sysctl-read)\n",
+                "(allow mach-lookup)\n",
+                "(allow ipc-posix*)\n",
+                "(allow file-read* (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n",
+                "  (subpath \"/System\") (subpath \"/Library\") (subpath \"/private/etc\")\n",
+                "  (subpath \"/dev\") (subpath \"/work/wt\"))\n",
+                "(allow network*)\n",
+            )
+        );
+    }
+
+    /// The Seatbelt argv: `-p <profile> -- <shell> -c <cmd>`, and the wrapper
+    /// is the pinned absolute path, never a `PATH` lookup.
+    #[test]
+    fn seatbelt_args_pass_the_profile_then_the_shell_invocation() {
+        assert_eq!(SEATBELT_PROGRAM, "/usr/bin/sandbox-exec");
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![PathBuf::from("/work/wt")],
+            readable_roots: Vec::new(),
+        };
+        let args = argv(&seatbelt_args(&policy, crate::Shell::Bash, "echo hi"));
+        assert_eq!(args[0], "-p");
+        assert_eq!(args[1], seatbelt_profile(SandboxMode::Write, &policy));
+        assert_eq!(args[2..], ["--", "bash", "-c", "echo hi"]);
+    }
+
+    /// The real thing, on the only platform that has it: a write outside the
+    /// roots is refused by the kernel, a write inside lands.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn shell_write_outside_roots_is_denied_under_seatbelt() {
+        if !Path::new(SEATBELT_PROGRAM).exists() {
+            return; // best-effort: exercise the real backend when available
+        }
+        let Some(shell) = crate::Shell::detect() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // Struct literal, not `for_agent`: a writable `env::temp_dir()` root
+        // would cover the "outside" tempdir too (the slice-3/5/6 trap).
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![canonicalize_nearest(dir.path())],
+            readable_roots: Vec::new(),
+        };
+
+        let target = canonicalize_nearest(outside.path()).join("escaped");
+        let mut cmd = shell_command_with_backend(
+            OsSandboxBackend::Seatbelt,
+            shell,
+            &format!("echo x > {}", target.display()),
+            &policy,
+            dir.path(),
+        );
+        cmd.current_dir(dir.path());
+        let out = cmd.output().await.unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(!out.status.success(), "the write was allowed: {stderr}");
+        assert!(stderr.contains("Operation not permitted"), "{stderr}");
+        assert!(!target.exists(), "the write landed anyway");
+
+        let inside = canonicalize_nearest(dir.path()).join("mine");
+        let mut cmd = shell_command_with_backend(
+            OsSandboxBackend::Seatbelt,
+            shell,
+            &format!("echo x > {}", inside.display()),
+            &policy,
+            dir.path(),
+        );
+        cmd.current_dir(dir.path());
+        let out = cmd.output().await.unwrap();
+        assert!(
+            out.status.success(),
+            "the cwd write was blocked: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&inside).unwrap().trim(), "x");
     }
 
     /// The canonical skip guard for the end-to-end tests: the real backend
