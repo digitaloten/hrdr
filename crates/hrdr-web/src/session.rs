@@ -458,9 +458,15 @@ impl WebSession {
         }
     }
 
+    #[allow(dead_code)]
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.seq
+    }
+
+    /// Public version — used by the server when it holds the lock.
+    pub fn next_seq_internal(&mut self) -> u64 {
+        self.next_seq()
     }
 
     fn emit_raw(&mut self, frame: ServerFrame) {
@@ -469,6 +475,11 @@ impl WebSession {
             self.replay.pop_front();
         }
         let _ = self.broadcast.send(frame);
+    }
+
+    /// Public version — used by the server when it holds the lock.
+    pub fn emit_internal(&mut self, frame: ServerFrame) {
+        self.emit_raw(frame);
     }
 
     fn transcript_clone(&self, id: PaneId) -> Vec<Entry> {

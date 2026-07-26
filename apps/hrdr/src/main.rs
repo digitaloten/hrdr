@@ -232,6 +232,15 @@ enum Command {
     },
     /// List available models from the configured endpoint.
     Models,
+    /// Start the web server (HTTP + WebSocket) for the browser UI.
+    Serve {
+        /// Bind address (default: 127.0.0.1).
+        #[arg(long)]
+        bind: Option<String>,
+        /// Port (default: 9911).
+        #[arg(long)]
+        port: Option<u16>,
+    },
 }
 
 /// The identity this process runs on, from the sources that can name it.
@@ -635,6 +644,26 @@ async fn main() -> Result<()> {
             run_headless(config, prompt.join(" "), json, quiet).await
         }
         Some(Command::Models) => list_models(config).await,
+        Some(Command::Serve { bind, port }) => {
+            let bind_addr: std::net::IpAddr = bind
+                .as_deref()
+                .unwrap_or("127.0.0.1")
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
+            let port = port.unwrap_or(9911);
+
+            // Build the session engine.
+            let shared = hrdr_web::SharedSession::start(config).await?;
+
+            let server_cfg = hrdr_web::server::ServeConfig {
+                bind: bind_addr,
+                port,
+            };
+            let running = hrdr_web::server::serve(shared, server_cfg).await?;
+            eprintln!("serving http://{}/ (Ctrl-C to stop)", running.addr);
+            running.wait().await;
+            Ok(())
+        }
         // Trailing words are a command for the TUI to run at startup — the same
         // line the input box would take. Joined, so `hrdr /model gpt-5` and
         // `hrdr "/model gpt-5"` mean the same thing.

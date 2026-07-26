@@ -38,3 +38,4 @@ toml.workspace = true
 # Sandboxes $HOME + XDG roots before ANY test in this crate runs (ctor, no opt-in).
 hrdr-test-support.workspace = true
 tempfile.workspace = true
+tokio-tungstenite = "0.30"

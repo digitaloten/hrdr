@@ -10,6 +10,7 @@
 extern crate hrdr_test_support;
 
 pub mod convert;
+pub mod server;
 pub mod session;
 
 pub use session::{SharedSession, WebSession};
