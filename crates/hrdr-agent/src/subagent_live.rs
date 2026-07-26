@@ -1052,6 +1052,50 @@ mod tests {
         );
     }
 
+    /// One writer per file, and one file per agent: a second `attach_transcript`
+    /// while one is open is a no-op (it must not add a second handle to the same
+    /// jsonl), and a session switch — `detach` then `attach` at the new path —
+    /// *replaces* the writer, so no record ever lands in the file we just left.
+    #[test]
+    fn attach_transcript_never_leaves_two_writers_on_one_file() {
+        use crate::subagent_transcript;
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.jsonl");
+        let second = dir.path().join("second.jsonl");
+
+        let live = LiveSubagents::new();
+        live.register(entry(1));
+        live.attach_transcript(1, &first);
+        // Idempotent: this must not open a second handle on `first`.
+        live.attach_transcript(1, &first);
+        live.record(1, &crate::AgentEvent::Text("one".into()));
+
+        // A session switch points the agent at another file.
+        live.detach_transcript(1);
+        live.attach_transcript(1, &second);
+        live.record(1, &crate::AgentEvent::Text("two".into()));
+
+        let body = std::fs::read_to_string(&first).unwrap();
+        assert_eq!(
+            body.lines().filter(|l| !l.trim().is_empty()).count(),
+            1,
+            "the second attach did not duplicate the writer: {body:?}"
+        );
+        assert!(body.contains("one") && !body.contains("two"), "{body:?}");
+        let body2 = std::fs::read_to_string(&second).unwrap();
+        assert!(
+            body2.contains("two") && !body2.contains("one"),
+            "the replaced writer owns the new file alone: {body2:?}"
+        );
+        // And both files are intact, line by line.
+        for p in [&first, &second] {
+            let text = std::fs::read_to_string(p).unwrap();
+            for l in text.lines().filter(|l| !l.trim().is_empty()) {
+                serde_json::from_str::<subagent_transcript::Record>(l).expect("a standalone line");
+            }
+        }
+    }
+
     /// `continue_or_finish` is the delegation loop's turn-boundary decision. With
     /// an EMPTY queue it FINISHES the turn: returns `false`, marks the agent idle,
     /// and stops its clock.

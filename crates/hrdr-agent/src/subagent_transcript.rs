@@ -13,9 +13,16 @@
 //! a transcript must never break the actual sub-agent run. A brand-new,
 //! never-saved session has no id yet, so the very first sub-agent spawned
 //! before the first autosave is not persisted (the dir cell is still empty).
+//!
+//! Best-effort is *not* licence to leave a half-written line behind, though: a
+//! torn line costs two records (the fragment, and whatever is appended onto it)
+//! and breaks every line-by-line reader of the file. So the two sides hold a
+//! line-atomicity contract — [`SubagentTranscript::write`] either lands a whole
+//! record or rolls its bytes back, and the readers here skip a damaged line
+//! instead of stopping at it (a torn file from an older build must still resume).
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -176,6 +183,12 @@ impl Record {
 pub struct SubagentTranscript {
     file: File,
     path: std::path::PathBuf,
+    /// The file ends **mid-record**: a previous append got a partial write that
+    /// could not be rolled back, or the file we opened already ended without a
+    /// newline (a torn tail left by an earlier process). The next record is
+    /// prefixed with `\n` so the fragment stays one broken line instead of
+    /// swallowing the next record too. See [`Self::write`].
+    torn: bool,
 }
 
 impl SubagentTranscript {
@@ -212,7 +225,12 @@ impl SubagentTranscript {
         opts.create_new(true).append(true);
         let path = dir.join(format!("{id}.jsonl"));
         let file = opts.open(&path)?;
-        Ok(Self { file, path })
+        Ok(Self {
+            file,
+            path,
+            // Exclusively created: the file is empty, so it starts on a boundary.
+            torn: false,
+        })
     }
 
     /// Open `path` for appending, creating it (and its parent dirs) if absent.
@@ -243,37 +261,136 @@ impl SubagentTranscript {
         Ok(Self {
             file,
             path: path.to_path_buf(),
+            // A file that does not end in a newline was cut mid-record (a crash
+            // or a full disk during an earlier append). Resuming onto it must not
+            // glue this session's first record onto that fragment.
+            torn: ends_mid_line(path),
         })
     }
 
-    /// Append one record as a JSON line and flush. All errors are swallowed: a
-    /// failed transcript write must never break the sub-agent run.
+    /// Append one record as **one whole line** and flush. All errors are
+    /// swallowed: a failed transcript write must never break the agent's run.
+    ///
+    /// A torn line loses two records, not one — the fragment and whatever gets
+    /// appended after it — and makes the whole line unparsable, so the guarantee
+    /// here is that a record either lands in full or leaves no trace:
+    ///
+    /// * The record is serialized into a single buffer *including* its trailing
+    ///   newline and written with one [`append_all`] loop — never a `write!` per
+    ///   field, never a flush that could split it.
+    /// * A partial write (the real case seen in the wild: `ENOSPC` with 21 bytes
+    ///   of a `Reasoning` record on disk, the next record appended straight onto
+    ///   the fragment) is **rolled back** to the pre-write length, so the file
+    ///   still ends on a record boundary. Only this handle appends to the file,
+    ///   under the `Mutex` its owner holds, so the truncated tail can only ever
+    ///   be our own partial bytes.
+    /// * If even the rollback fails, [`Self::torn`] is set and the next record
+    ///   opens with a newline — the damage stays confined to one line, which
+    ///   [`read_transcript`] skips.
     pub fn write(&mut self, rec: &Record) {
-        if let Ok(mut line) = serde_json::to_string(rec) {
+        let Ok(json) = serde_json::to_string(rec) else {
+            return;
+        };
+        let mut line = String::with_capacity(json.len() + 2);
+        if self.torn {
             line.push('\n');
-            let _ = self.file.write_all(line.as_bytes());
-            let _ = self.file.flush();
+        }
+        line.push_str(&json);
+        line.push('\n');
+        // The record boundary to roll back to if this append tears.
+        let before = self.file.metadata().map(|m| m.len()).ok();
+        match append_all(&mut self.file, line.as_bytes()) {
+            Ok(()) => self.torn = false,
+            // Nothing reached the disk: the file is untouched, so it is exactly as
+            // torn (or not) as it was before.
+            Err(0) => {}
+            Err(_partial) => {
+                let rolled = before.is_some_and(|len| self.file.set_len(len).is_ok());
+                if !rolled {
+                    self.torn = true;
+                }
+            }
+        }
+        let _ = self.file.flush();
+    }
+}
+
+/// [`Write::write_all`], but reporting how many bytes made it out when it fails.
+/// `write_all` collapses that to a bare error, and rolling a partial record back
+/// needs to know whether anything landed at all.
+fn append_all(w: &mut impl Write, buf: &[u8]) -> Result<(), usize> {
+    let mut done = 0;
+    while done < buf.len() {
+        match w.write(&buf[done..]) {
+            // A zero-length write makes no progress; treat it as a stalled write
+            // rather than spinning forever.
+            Ok(0) => return Err(done),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(done),
         }
     }
+    Ok(())
+}
+
+/// Whether `path` ends mid-record — non-empty and not terminated by a newline.
+/// Read through its own handle: the transcript's own handle is append/write-only.
+/// Unreadable or absent counts as "not torn": a fresh file starts on a boundary.
+fn ends_mid_line(path: &Path) -> bool {
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let Ok(len) = f.seek(SeekFrom::End(0)) else {
+        return false;
+    };
+    if len == 0 {
+        return false;
+    }
+    if f.seek(SeekFrom::Start(len - 1)).is_err() {
+        return false;
+    }
+    let mut last = [0u8; 1];
+    f.read_exact(&mut last).is_ok() && last[0] != b'\n'
+}
+
+/// A transcript's lines, as decoded text, in order.
+///
+/// Splits on `\n` over **bytes** rather than using [`BufRead::lines`]: `lines()`
+/// yields `Err` for a line that is not valid UTF-8, and the `map_while(ok)` every
+/// reader here uses would then silently drop the ENTIRE rest of the file. A torn
+/// write can cut a multi-byte character in half (an interrupted append is not
+/// character-aligned), so one damaged line must not be able to truncate a resumed
+/// transcript. Decoded lossily and left for the caller to parse-or-skip.
+fn text_lines(path: &Path) -> Option<impl Iterator<Item = String>> {
+    let file = File::open(path).ok()?;
+    Some(
+        BufReader::new(file)
+            .split(b'\n')
+            .map_while(Result::ok)
+            .map(|b| String::from_utf8_lossy(&b).into_owned()),
+    )
 }
 
 /// Whether a transcript file ends in an `End` record. A file with no `End` line
 /// is an orphan: the sub-agent crashed or is still running. The disk-aware
 /// `task_list` reads this to report a resumable run as `done` vs `orphaned`.
+///
+/// The last *parsable* record decides: a torn fragment at the tail (a full disk
+/// during the final append) must not turn a completed run into an orphan.
 pub fn is_complete(path: &Path) -> bool {
-    let Ok(file) = File::open(path) else {
+    let Some(lines) = text_lines(path) else {
         return false;
     };
     let mut last = None;
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        if !line.trim().is_empty() {
-            last = Some(line);
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(rec) = serde_json::from_str::<Record>(&line) {
+            last = Some(rec);
         }
     }
-    match last {
-        Some(l) => matches!(serde_json::from_str::<Record>(&l), Ok(Record::End { .. })),
-        None => false,
-    }
+    matches!(last, Some(Record::End { .. }))
 }
 
 /// The opening [`Record::Start`] of a transcript, if it has one. The disk-aware
@@ -282,8 +399,7 @@ pub fn is_complete(path: &Path) -> bool {
 /// the first record a sub-agent run writes, so only the first non-empty line is
 /// inspected.
 pub fn read_start(path: &Path) -> Option<Record> {
-    let file = File::open(path).ok()?;
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    for line in text_lines(path)? {
         if line.trim().is_empty() {
             continue;
         }
@@ -302,15 +418,26 @@ pub fn read_start(path: &Path) -> Option<Record> {
 /// The MAIN agent's resume path ([`crate::Session::load_path`]) folds its session
 /// jsonl through here too — the transcript is no longer embedded in the `.json`.
 pub fn read_transcript(path: &Path) -> Vec<crate::Entry> {
+    fold_transcript(path).0
+}
+
+/// [`read_transcript`] plus how many non-empty lines had to be skipped because
+/// they did not parse (a line torn by a full disk or a crash mid-append). Every
+/// intact record before AND after the damage still folds: a resumed transcript is
+/// never truncated by one bad line. The count is not logged — it exists so a
+/// caller (and the tests) can see salvage happened.
+fn fold_transcript(path: &Path) -> (Vec<crate::Entry>, usize) {
     let mut entries = Vec::new();
-    let Ok(file) = File::open(path) else {
-        return entries;
+    let mut skipped = 0usize;
+    let Some(lines) = text_lines(path) else {
+        return (entries, skipped);
     };
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    for line in lines {
         if line.trim().is_empty() {
             continue;
         }
         let Ok(rec) = serde_json::from_str::<Record>(&line) else {
+            skipped += 1;
             continue;
         };
         // Each record folds through the shared event reducer.
@@ -318,7 +445,7 @@ pub fn read_transcript(path: &Path) -> Vec<crate::Entry> {
             crate::apply_event(&mut entries, &ev);
         }
     }
-    entries
+    (entries, skipped)
 }
 
 #[cfg(test)]
@@ -596,6 +723,236 @@ mod tests {
             ),
             "reconstructed in log order: {kinds:?}"
         );
+    }
+
+    /// A partial write must be *reported* as partial: `write_all` collapses "21
+    /// bytes landed, then ENOSPC" into a bare error, and that is exactly the
+    /// information the rollback needs.
+    #[test]
+    fn append_all_reports_how_many_bytes_landed_before_the_error() {
+        /// Accepts `cap` bytes in total, then fails the way a full disk does.
+        struct FullDisk {
+            cap: usize,
+            written: usize,
+        }
+        impl Write for FullDisk {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let room = self.cap.saturating_sub(self.written);
+                if room == 0 {
+                    return Err(std::io::Error::other("No space left on device"));
+                }
+                let n = room.min(buf.len());
+                self.written += n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut disk = FullDisk {
+            cap: 21,
+            written: 0,
+        };
+        // The real shape of the corruption: 21 bytes of the record on disk.
+        assert_eq!(
+            append_all(&mut disk, b"{\"t\":\"reasoning\",\"text\":\"x\"}\n"),
+            Err(21)
+        );
+
+        // Nothing accepted at all is `Err(0)` — the file is still on a boundary.
+        let mut none = FullDisk { cap: 0, written: 0 };
+        assert_eq!(append_all(&mut none, b"abc"), Err(0));
+
+        // A writer with room takes the whole buffer.
+        let mut ok = Vec::new();
+        assert_eq!(append_all(&mut ok, b"abc\n"), Ok(()));
+        assert_eq!(ok, b"abc\n");
+    }
+
+    /// **The bug.** A full disk left 21 bytes of a `Reasoning` record on disk with
+    /// no newline (`{"t":"reasoning","tex`), and the next record was appended
+    /// straight onto that fragment — one unparsable line, two records lost, and a
+    /// line-by-line JSON reader dying on it.
+    ///
+    /// Reopening a transcript that ends mid-record must start the next record on
+    /// its own line, so the damage stays confined to the fragment.
+    #[test]
+    fn a_torn_tail_does_not_swallow_the_next_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("005-torn.jsonl");
+        let mut t = SubagentTranscript::append(&path).unwrap();
+        t.write(&Record::Text {
+            chunk: "before".into(),
+        });
+        drop(t);
+        // Exactly what the ENOSPC append left behind: a record cut mid-key, no
+        // trailing newline.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"{\"t\":\"reasoning\",\"tex").unwrap();
+        }
+
+        let mut t = SubagentTranscript::append(&path).unwrap();
+        t.write(&Record::ToolStart {
+            id: "call-1".into(),
+            name: "shell".into(),
+            args: "{}".into(),
+        });
+        t.write(&Record::Text {
+            chunk: "after".into(),
+        });
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 4, "the fragment is its own line: {body:?}");
+        assert_eq!(
+            lines[1], "{\"t\":\"reasoning\",\"tex",
+            "the fragment stayed a lone broken line"
+        );
+        for good in [lines[0], lines[2], lines[3]] {
+            serde_json::from_str::<Record>(good).expect("every other line is a standalone Record");
+        }
+
+        // Read-back salvage: exactly one line skipped, and BOTH the records before
+        // and after the damage fold.
+        let (entries, skipped) = fold_transcript(&path);
+        assert_eq!(skipped, 1, "only the fragment is lost");
+        let text: String = entries
+            .iter()
+            .filter_map(|e| match &e.kind {
+                crate::EntryKind::Assistant(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains("before") && text.contains("after"),
+            "records on both sides of the tear survive: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(&e.kind, crate::EntryKind::Tool { name, .. } if name == "shell")),
+            "the record that followed the fragment is no longer swallowed: {entries:?}"
+        );
+    }
+
+    /// A tear is not character-aligned, so a torn line can hold half a multi-byte
+    /// character. `BufRead::lines()` yields `Err` for that, and the readers'
+    /// `map_while(ok)` dropped the ENTIRE rest of the file — a resumed session
+    /// silently lost every record after the damage.
+    #[test]
+    fn read_survives_a_line_that_is_not_valid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("006-mojibake.jsonl");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(br#"{"t":"text","chunk":"first"}"#);
+        raw.push(b'\n');
+        // A record cut in the middle of a 3-byte character.
+        raw.extend_from_slice(b"{\"t\":\"text\",\"chunk\":\"\xe2\x82\n");
+        raw.extend_from_slice(br#"{"t":"text","chunk":"second"}"#);
+        raw.push(b'\n');
+        raw.extend_from_slice(br#"{"t":"end","status":"ok","bytes":0}"#);
+        raw.push(b'\n');
+        std::fs::write(&path, &raw).unwrap();
+
+        let (entries, skipped) = fold_transcript(&path);
+        assert_eq!(skipped, 1);
+        let text: String = entries
+            .iter()
+            .filter_map(|e| match &e.kind {
+                crate::EntryKind::Assistant(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains("first") && text.contains("second"),
+            "the read did not stop at the bad line: {entries:?}"
+        );
+        assert!(
+            is_complete(&path),
+            "a run whose End is behind a torn line is still complete"
+        );
+    }
+
+    /// A tear at the very tail must not turn a finished run into an orphan: the
+    /// last *parsable* record decides.
+    #[test]
+    fn is_complete_ignores_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("007-tail.jsonl");
+        let mut t = SubagentTranscript::append(&path).unwrap();
+        t.write(&Record::End {
+            status: EndStatus::Ok,
+            bytes: 1,
+        });
+        drop(t);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"{\"t\":\"reas").unwrap();
+        assert!(is_complete(&path));
+    }
+
+    /// One serialized writer per file: every append goes through the one
+    /// `Mutex`-held handle, so two tasks hammering the same transcript can never
+    /// split each other's lines. Each event is a single buffered write including
+    /// its newline — the invariant a torn line would break.
+    #[test]
+    fn concurrent_writers_on_one_handle_never_tear_a_line() {
+        use std::sync::Arc;
+        const PER_THREAD: usize = 200;
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(std::sync::Mutex::new(
+            SubagentTranscript::create(dir.path(), "008-race").unwrap(),
+        ));
+        let path = dir.path().join("008-race.jsonl");
+
+        let handles: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|tag| {
+                let writer = Arc::clone(&writer);
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        // Long payloads: a big line is what needs more than one
+                        // write syscall, and so what tears.
+                        let chunk = format!("{tag}-{i}-{}", "x".repeat(4096));
+                        let mut w = writer.lock().unwrap_or_else(|p| p.into_inner());
+                        w.write(&Record::Text { chunk });
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            PER_THREAD * 2,
+            "one line per record, no splits"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for l in &lines {
+            match serde_json::from_str::<Record>(l).expect("every line parses standalone") {
+                Record::Text { chunk } => {
+                    seen.insert(chunk);
+                }
+                other => panic!("unexpected record {other:?}"),
+            }
+        }
+        for tag in ["a", "b"] {
+            for i in 0..PER_THREAD {
+                let want = format!("{tag}-{i}-{}", "x".repeat(4096));
+                assert!(seen.contains(&want), "missing {tag}-{i}");
+            }
+        }
     }
 
     #[test]

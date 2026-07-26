@@ -8,6 +8,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A transcript record can no longer be left half-written, gluing two records
+  into one unparsable line.** Seen in the wild in a heavy session: the disk
+  filled mid-append, 21 bytes of a `reasoning` record landed
+  (`{"t":"reasoning","tex`) with no newline, the `write_all` error was
+  swallowed, and the next event was appended straight onto the fragment —
+  `{"t":"reasoning","tex{"t":"tool_start",…}`. One record was lost outright, a
+  second was unreadable, and every line-by-line JSON reader died on that line.
+  `SubagentTranscript::write` now serializes each record into one buffer
+  including its trailing newline, appends it with a loop that reports how many
+  bytes landed, and **rolls a partial append back** to the previous record
+  boundary; if even the rollback fails (or a file opened for append already ends
+  mid-record, e.g. torn by an older build or a crash) the next record starts on
+  a fresh line, so damage stays confined to one line. On the read side the three
+  jsonl readers (`read_transcript`, `is_complete`, `read_start`) split on bytes
+  and decode lossily instead of using `BufRead::lines()` + `map_while(ok)`: a
+  torn line is not character-aligned, so half a multi-byte character used to
+  abort the read and silently drop **every remaining record** on resume. A
+  corrupt line is now counted and skipped, records on both sides of it still
+  fold, and `is_complete` judges by the last _parsable_ record so a torn tail no
+  longer reports a finished run as orphaned.
 - **`/resume` over the web no longer corrupts the session it restores.** The
   swap set the pane's state, handed the agent its messages from a **detached**
   `tokio::spawn`, and then saved immediately — so the save raced the task, and
