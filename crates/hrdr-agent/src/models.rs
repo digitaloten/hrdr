@@ -531,6 +531,108 @@ pub fn available_models(config: &AgentConfig, active: Option<&str>) -> Vec<Avail
     rows
 }
 
+/// The model ids hrdr knows **locally** that `provider` serves — the models.dev
+/// index for its catalog key, minus the [`PLACEHOLDER_MODEL`](crate::PLACEHOLDER_MODEL).
+///
+/// `None` means *unknowable from here*, which is a different thing from "serves
+/// nothing": no catalog has been cached, the provider has no models.dev key at all
+/// (`local`, a custom `[providers.*]`), this index does not carry it, or it carries
+/// it with an empty model set. A caller must read `None` as ignorance and say
+/// nothing — never as absence.
+pub fn known_model_ids(catalog: Option<&Value>, provider: &ProviderName) -> Option<Vec<String>> {
+    let key = provider.catalog_key()?;
+    let (_, models) = hrdr_llm::catalog::provider_models(catalog?, key)?;
+    let ids: Vec<String> = models
+        .into_iter()
+        .map(|(id, _)| id)
+        .filter(|id| id != crate::PLACEHOLDER_MODEL)
+        .collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// **Is this model even a model?** — the zero-network pre-flight run on every
+/// identity hrdr adopts, so a typo is called out before the first request instead of
+/// coming back as a provider error mid-turn.
+///
+/// `Some(notice)` in the one case a local catalog can actually judge: the provider's
+/// model set IS known ([`known_model_ids`]) and this model is not in it. Deliberately
+/// a **notice, not an error** — a proxy or gateway legitimately serves ids models.dev
+/// has never indexed, and a model shipped this morning is in nobody's cache. Silence
+/// everywhere else, because there is nothing to compare against.
+pub fn preflight_model(
+    catalog: Option<&Value>,
+    provider: &ProviderName,
+    model: &str,
+) -> Option<String> {
+    let ids = known_model_ids(catalog, provider)?;
+    if ids.iter().any(|id| id == model) {
+        return None;
+    }
+    let mut notice = format!(
+        "⚠ model '{model}' isn't in provider '{provider}'s known catalog — \
+         if this is a typo it will fail at the first request."
+    );
+    if let Some(closest) = closest_model(&ids, model) {
+        notice.push_str(&format!(" Closest known: '{closest}'."));
+    }
+    Some(notice)
+}
+
+/// The known id most plausibly meant by `model`, in the order the guesses are worth
+/// making:
+///
+/// 1. an id that **contains** what was typed — a truncated or half-typed name
+///    (`gpt-5-min` → `gpt-5-mini`); the shortest such id wins, being the least padded.
+/// 2. an id **contained by** what was typed — an id with something extra glued on;
+///    the longest such id wins, since it explains the most of what was typed.
+/// 3. the smallest edit distance, for a genuine misspelling (`sonet` → `sonnet`).
+///
+/// A "closest" match that shares almost nothing with what was typed is noise, not
+/// help, so a distance over two thirds of the typed length suggests nothing at all.
+fn closest_model<'a>(ids: &'a [String], model: &str) -> Option<&'a str> {
+    let typed = model.to_lowercase();
+    let extends = ids
+        .iter()
+        .filter(|id| id.to_lowercase().contains(&typed))
+        .min_by_key(|id| (id.chars().count(), id.as_str()));
+    if let Some(hit) = extends {
+        return Some(hit.as_str());
+    }
+    let within = ids
+        .iter()
+        .filter(|id| typed.contains(&id.to_lowercase()))
+        .max_by_key(|id| (id.chars().count(), id.as_str()));
+    if let Some(hit) = within {
+        return Some(hit.as_str());
+    }
+    let (best, distance) = ids
+        .iter()
+        .map(|id| (id.as_str(), edit_distance(&id.to_lowercase(), &typed)))
+        .min_by_key(|(id, d)| (*d, *id))?;
+    (distance * 3 <= typed.chars().count() * 2).then_some(best)
+}
+
+/// Levenshtein distance over `char`s, two rows at a time. Hand-rolled: a
+/// suggestion in one warning string is not worth a dependency.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur: Vec<usize> = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substitute = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = substitute.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 /// Case-insensitive fuzzy filter over the choices: the query's characters must
 /// appear in order somewhere within `"model_label provider_label"`. Returns the
 /// matching indices in their original (sorted) order; an empty query matches
@@ -992,6 +1094,112 @@ mod tests {
             .to_string();
         assert!(err.contains("provider 'zen' needs a model"), "{err}");
         assert!(err.contains("--model 'zen://<model>'"), "{err}");
+    }
+
+    /// The models.dev index as cached, keyed the way models.dev keys it
+    /// (`anthropic`, not hrdr's `claude`).
+    fn dev_catalog() -> Value {
+        json!({
+            "anthropic": { "models": {
+                "claude-sonnet-4-5": { "name": "Claude Sonnet 4.5" },
+                "claude-opus-4-8": { "name": "Claude Opus 4.8" },
+            }},
+            "openai": { "models": {
+                "gpt-5": { "name": "GPT-5" },
+                "gpt-5-mini": { "name": "GPT-5 mini" },
+            }},
+        })
+    }
+
+    /// A typo on a provider whose model set we hold is called out **and the id the
+    /// user probably meant is named** — the whole point: "isn't in the catalog" alone
+    /// leaves them to guess the spelling a second time.
+    #[test]
+    fn a_typod_model_on_a_known_provider_is_flagged_with_the_closest_id() {
+        let catalog = dev_catalog();
+        let claude = ProviderName::new("claude");
+        let notice = preflight_model(Some(&catalog), &claude, "claude-sonet-4-5")
+            .expect("a known provider's known model set can judge this");
+        assert!(
+            notice.contains("model 'claude-sonet-4-5' isn't in provider 'claude's known catalog"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("it will fail at the first request"),
+            "it says what happens next: {notice}"
+        );
+        assert!(
+            notice.contains("Closest known: 'claude-sonnet-4-5'."),
+            "and names the spelling that works: {notice}"
+        );
+
+        // A partial id the user half-remembered: containment beats edit distance,
+        // and the shortest containing id wins.
+        let openai = ProviderName::new("openai");
+        let notice = preflight_model(Some(&catalog), &openai, "gpt-5-min").unwrap();
+        assert!(notice.contains("Closest known: 'gpt-5-mini'."), "{notice}");
+
+        // Nothing recognizable → no suggestion at all. A "closest" match that shares
+        // almost nothing with what was typed is noise dressed as help.
+        let notice = preflight_model(Some(&catalog), &openai, "zzzzzzzzzzzz").unwrap();
+        assert!(!notice.contains("Closest known"), "{notice}");
+    }
+
+    /// Silence is the default: the model is real, or nothing local can judge it.
+    #[test]
+    fn the_preflight_says_nothing_it_cannot_know() {
+        let catalog = dev_catalog();
+        // (1) The model IS in the catalog.
+        assert_eq!(
+            preflight_model(
+                Some(&catalog),
+                &ProviderName::new("claude"),
+                "claude-opus-4-8"
+            ),
+            None
+        );
+        // …and the provider is matched through its CATALOG key, so an alias spelling
+        // reaches the same model set rather than falling into "unknown provider".
+        assert_eq!(
+            preflight_model(
+                Some(&catalog),
+                &ProviderName::new("anthropic"),
+                "claude-opus-4-8"
+            ),
+            None
+        );
+        // (2) A provider with no models.dev key (`local`, a custom `[providers.*]`)
+        //     and one this index simply doesn't carry: no model set, no opinion.
+        for provider in ["local", "mygateway", "openrouter"] {
+            assert_eq!(
+                preflight_model(Some(&catalog), &ProviderName::new(provider), "whatever-v9"),
+                None,
+                "{provider}"
+            );
+        }
+        // (3) No cached catalog at all → nothing to say about anyone.
+        assert_eq!(
+            preflight_model(None, &ProviderName::new("claude"), "claude-sonet-4-5"),
+            None
+        );
+        // An empty model set is a fact about the index, not about the model.
+        let empty = json!({ "anthropic": { "models": {} } });
+        assert_eq!(
+            known_model_ids(Some(&empty), &ProviderName::new("claude")),
+            None
+        );
+    }
+
+    #[test]
+    fn edit_distance_counts_single_character_edits() {
+        assert_eq!(edit_distance("", ""), 0);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("abc", ""), 3);
+        assert_eq!(edit_distance("abc", "abc"), 0);
+        assert_eq!(edit_distance("sonnet", "sonet"), 1); // deletion
+        assert_eq!(edit_distance("sonnet", "sonnett"), 1); // insertion
+        assert_eq!(edit_distance("sonnet", "sonnat"), 1); // substitution
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
     }
 
     #[test]

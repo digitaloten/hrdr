@@ -708,10 +708,15 @@ delegations inherit the main agent's current provider, model, and effort,
 including changes made through `/model` or `/effort`.
 
 The read-only `models` tool lets an agent inspect its current provider, model,
-effort and resolved default sub-agent model, and—using
-`{"mode":"available"}`—the models this session can reach, as
-`{provider, model, label, current}` rows. The row the agent is itself running on
-is flagged `current: true`.
+effort and resolved default sub-agent model, and drill down from there into what
+else it could run on: `{"mode":"providers"}` lists each reachable provider with
+its model count (flagging the one the session is on), and `{"mode":"models"}`
+returns `{id, provider, model, label, current}` rows for one provider
+(`"provider":"openai"`) or for a substring search across all of them
+(`"query":"sonnet"`). The row the agent is itself running on is flagged
+`current: true`. `models` mode requires one of the two filters — the full list
+is deliberately not dumpable, because a wall of ids is both costly to carry and
+how a half-remembered name gets matched onto the wrong model.
 
 That is what makes **"delegate this to a model by name"** work: say
 `@explore the codebase using big pickle` and the agent resolves that human name

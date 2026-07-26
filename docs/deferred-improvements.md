@@ -21,9 +21,6 @@ future work; those are collected under **Standing constraints** at the bottom.
   regenerates the pointer index on every change, so the files and index can't
   drift structurally; this is the leftover §G7 thread from the (now-shipped)
   memory-tool design.
-- **Model pre-flight validation.** Verify a configured model actually exists on
-  its provider before starting a turn, so a typo'd/unavailable model fails fast
-  with a clear message instead of mid-turn.
 - **LSP diagnostics dedup.** The same diagnostic can surface more than once
   (overlapping ranges / re-published sets); dedupe before showing the model.
 - **Sub-agent isolation guard.** A defensive check that a write sub-agent's tool

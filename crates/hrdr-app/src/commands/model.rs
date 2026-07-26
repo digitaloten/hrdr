@@ -123,7 +123,7 @@ fn apply_reference(
             Ok(v) => v,
             Err(e) => return format!("{e:#}"),
         };
-        let warnings = match hrdr_agent::confirm_identity(verdict).await {
+        let mut warnings = match hrdr_agent::confirm_identity(verdict).await {
             Ok(w) => w,
             Err(e) => return format!("{e:#}"),
         };
@@ -131,6 +131,15 @@ fn apply_reference(
         // together, under the same lock, so a probe can never see a half-switch.
         if let Err(e) = a.set_model_ref(reference.clone()) {
             return format!("{e:#}");
+        }
+        // The agent pre-flights every identity it adopts and queues what it found for
+        // the next turn. Drain that here: the switch just happened, so this is where
+        // the answer belongs — and taking it now is also what keeps the next turn from
+        // repeating what this line already said.
+        for notice in a.take_pending_notices() {
+            if !warnings.contains(&notice) {
+                warnings.push(notice);
+            }
         }
         show(reference.clone(), endpoint, window);
         if remember {

@@ -194,24 +194,16 @@ fn validate_identity_with(
     //    new release by days; a model shipped this morning must still run. Refusing
     //    on its silence would make hrdr unusable on exactly the models people are
     //    most excited to try.
-    let Some(catalog) = catalog else {
-        return Identity::Known(Vec::new());
-    };
-    let Some(key) = name.catalog_key() else {
-        // `local`, `chatgpt`, a custom name — models.dev covers none of them.
-        return Identity::Known(Vec::new());
-    };
-    // The provider is absent from the cached catalog (a partial or stale index):
-    // that is a fact about the catalog, not about the model. Silence.
-    let Some((_, models)) = hrdr_llm::catalog::provider_models(catalog, key) else {
-        return Identity::Known(Vec::new());
-    };
-    if models.is_empty() || models.iter().any(|(id, _)| id == model) {
-        return Identity::Known(Vec::new());
-    }
-    Identity::Known(vec![format!(
-        "⚠ models.dev doesn't list '{model}' on {name} — it may be new, or a typo"
-    )])
+    //
+    //    The rule itself — which providers can be judged at all, and what the warning
+    //    says — is [`crate::models::preflight_model`]. It lives there because that is
+    //    where model discovery lives, and because the same pre-flight runs on every
+    //    identity an `Agent` adopts, not only the ones that come through here.
+    Identity::Known(
+        crate::models::preflight_model(catalog, name, model)
+            .into_iter()
+            .collect(),
+    )
 }
 
 /// Settle an [`Identity`] — the ONE place a ChatGPT model may be refused.
@@ -540,7 +532,9 @@ mod tests {
         assert_eq!(
             validate_identity_with(&cfg.providers, &m, None, Some(&catalog())),
             Identity::Known(vec![
-                "⚠ models.dev doesn't list 'claude-sonet-4-5' on claude — it may be new, or a typo"
+                "⚠ model 'claude-sonet-4-5' isn't in provider 'claude's known catalog — \
+                 if this is a typo it will fail at the first request. \
+                 Closest known: 'claude-sonnet-4-5'."
                     .to_string()
             ]),
             "models.dev NEVER refuses — it cannot even express a refusal from here",

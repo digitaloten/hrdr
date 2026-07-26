@@ -333,8 +333,19 @@ async fn startup_checks(config: &AgentConfig, listing: bool) -> Result<()> {
     // spuriously warn "no credential" and probe the wrong host.
     let resolved = hrdr_agent::oauth_derived(hrdr_agent::ResolvedModel::from_config(config));
     let verdict = hrdr_agent::validate_identity(&resolved, config);
+    // Whatever the NETWORK-FREE pass already knew, `Agent::new` re-derives and shows
+    // in the session itself (a stderr line is invisible under a TUI). Print only what
+    // the confirmation step adds on top of it, so the two don't say the same thing
+    // twice; `confirm_identity` passes a `Known` verdict straight through, so this is
+    // exactly the set the agent will surface.
+    let already_known = match &verdict {
+        hrdr_agent::Identity::Known(w) => w.clone(),
+        hrdr_agent::Identity::Unconfirmed(_) => Vec::new(),
+    };
     for w in hrdr_agent::confirm_identity(verdict).await? {
-        eprintln!("{w}");
+        if !already_known.contains(&w) {
+            eprintln!("{w}");
+        }
     }
     if !listing && resolved.reference().model() == hrdr_agent::PLACEHOLDER_MODEL {
         let probe = hrdr_llm::Client::new(

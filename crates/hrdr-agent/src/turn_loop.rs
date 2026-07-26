@@ -453,6 +453,11 @@ impl Agent {
     where
         F: FnMut(AgentEvent),
     {
+        // Anything raised when there was no turn to carry it — the model pre-flight,
+        // at construction or on a switch — is said before the turn it might explain.
+        for notice in self.take_pending_notices() {
+            on_event(AgentEvent::Notice(notice));
+        }
         // A previous turn interrupted mid tool-call can leave the history ending
         // with an assistant `tool_calls` message whose results are missing —
         // strict servers reject that. Backfill stubs before the new user turn.

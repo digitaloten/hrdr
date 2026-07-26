@@ -8,6 +8,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A model pre-flight, so a typo'd model fails before the first request.** A
+  mistyped or unavailable model used to surface mid-turn as whatever error the
+  provider chose to return. Every identity an agent adopts — at `Agent::new`,
+  and in `adopt_resolved`, the single writer behind `/model`, `/login`, a
+  session resume and a delegation override — is now checked against the
+  provider's locally known model set (`models::preflight_model`, zero network,
+  models.dev cache only). A model that isn't in it raises
+  `⚠ model 'X' isn't in provider 'Y's known catalog — if this is a typo it will fail at the first request. Closest known: 'Z'.`,
+  with `Z` the nearest id by containment or edit distance (no suggestion when
+  nothing is close enough to be worth naming). Deliberately a **notice, not an
+  error** — a proxy or gateway legitimately serves unlisted ids — and silent
+  wherever nothing local can judge the model (`local`, a custom `[providers.*]`,
+  a provider or index the cache doesn't carry). It reaches the user through
+  `AgentEvent::Notice` (`Agent::take_pending_notices`, drained at the top of the
+  next turn), because an `Agent` is built before a TUI has drawn anything and a
+  line on stderr at that moment is invisible; a `/model` switch drains it
+  immediately instead, so the answer arrives with the keystroke.
+
 - **A soft warning at 80% of the tool-round budget.** The hard cap (`max_steps`,
   default 300) used to arrive with three rounds' notice — enough to write a
   summary, not to salvage a plan; transcripts show an autonomous run cut off
@@ -54,6 +72,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **BREAKING (tool API): the `models` tool is a drill-down, and
+  `mode: "available"` is gone.** That mode returned EVERY reachable model as
+  rows — a large result to carry, and the thing that made mis-resolution easy:
+  handed a wall of ids, a model pattern-matches a half-remembered name onto
+  whichever one looks closest. It is replaced (no compat shim) by two narrower
+  modes. `mode: "providers"` lists one row per reachable provider —
+  `{provider, models, current}` — as the cheap first step. `mode: "models"`
+  returns the same `{id, provider, model, label, source, current}` rows as
+  before, but requires `provider: "<name>"` (that provider's models) or
+  `query: "<substring>"` (a case-insensitive match on provider, id and label
+  across all of them), or both; with neither it refuses, naming both ways to
+  narrow, and an unknown provider is refused with the names this session does
+  list. Output is capped at 50 rows, sampled round-robin across providers so no
+  provider vanishes off the end of the alphabet, with a `models_truncated`
+  warning saying how many are left. `mode: "current"` (the default) is
+  unchanged, and still lists nothing. The delegation prompt and the README teach
+  the new flow.
 - **An `@file` mention counts as having read that file.** `@`-expansion inlines
   a file's whole content into the outgoing message, but the read-before-edit
   guard didn't know — so the model was sent back to re-read a file already

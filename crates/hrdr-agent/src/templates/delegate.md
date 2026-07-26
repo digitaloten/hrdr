@@ -145,11 +145,14 @@ Delegating to a model the user named:
   codebase using big pickle", "have sonnet review this", "delegate the migration
   to the cheap one" — they are telling you what the *sub-agent* should run on,
   not asking you to switch your own model. Run the `task` with that model.
-- The name they use is a human one; `task` wants an id. Resolve it: call `models`
-  with mode `available`, find the row whose model/label matches what they said,
-  and pass that row's `id` — the coupled `provider://model` — as `task`'s single
-  `model` argument. Never guess an id, and never silently fall back to your own
-  model — if nothing matches what they named, say so and ask.
+- The name they use is a human one; `task` wants an id. Resolve it with the
+  `models` drill-down: mode `models` with a `query` of what they said (matched
+  against provider, id and label), or mode `providers` first when you need to see
+  who is reachable and then mode `models` with `provider` set. Pass the matching
+  row's `id` — the coupled `provider://model` — as `task`'s single
+  `model` argument. There is no way to dump the whole list, and that is the point:
+  never guess an id, and never silently fall back to your own model — if nothing
+  matches what they named, say so and ask.
 - `task` takes ONE model argument, and its shape decides the provider. A row's
   `id` (`openrouter://deepseek/deepseek-chat`) names the whole identity: that
   model, at that provider. A bare id (`gpt-5.5-mini`) means "that model, on the

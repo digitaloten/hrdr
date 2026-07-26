@@ -234,14 +234,22 @@ impl hrdr_tools::Tool for ModelsTool {
     }
 
     fn description(&self) -> &'static str {
-        "What you are running on, and what else you could run on. \
+        "What you are running on, and what else you could run on — a drill-down, in three steps: \
+         `current` → `providers` → `models`. \
          `current` (default, free): the active provider, model, reasoning effort, and the model \
          delegated `task` calls use by default. \
-         `available`: every model this session can reach, as {provider, model, label, current} rows \
-         — the row you are running on is flagged `current: true`. \
-         Call it with `available` when the user names a model to delegate to (\"@explore with big \
-         pickle\") and you need the id and provider that name resolves to; the ids are what `task` \
-         accepts. Read-only, and it changes nothing — it cannot switch your model."
+         `providers`: one row per provider this session can reach — its name, how many models it \
+         offers, and `current: true` on the one you are on. Cheap; start here. \
+         `models`: the rows themselves, but only for something you name — `provider: \"openai\"` \
+         for one provider's models, `query: \"sonnet\"` to search provider/id/label across all of \
+         them (case-insensitive substring; pass both to do both). One of the two is REQUIRED: the \
+         full list is deliberately not dumpable, because a wall of ids is how a half-remembered \
+         name gets matched onto the wrong model. \
+         Rows come back as {id, provider, model, label, current}; the `id` is the coupled \
+         `provider://model`, and it is what `task` accepts. \
+         Call it when the user names a model to delegate to (\"@explore with big pickle\"): \
+         `providers` to see who is reachable, then `models` with a `query` of what they said. \
+         Read-only, and it changes nothing — it cannot switch your model."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -250,8 +258,16 @@ impl hrdr_tools::Tool for ModelsTool {
             "properties": {
                 "mode": {
                     "type": "string",
-                    "enum": ["current", "available"],
+                    "enum": ["current", "providers", "models"],
                     "default": "current"
+                },
+                "provider": {
+                    "type": "string",
+                    "description": "mode `models`: list this provider's models (a name from mode `providers`)."
+                },
+                "query": {
+                    "type": "string",
+                    "description": "mode `models`: case-insensitive substring, matched against provider, model id and label across every provider."
                 }
             },
             "additionalProperties": false
@@ -271,9 +287,20 @@ impl hrdr_tools::Tool for ModelsTool {
             .get("mode")
             .and_then(|v| v.as_str())
             .unwrap_or("current");
-        if !matches!(mode, "current" | "available") {
-            bail!("unknown models mode '{mode}' (supported: current, available)");
+        if !matches!(mode, "current" | "providers" | "models") {
+            bail!("unknown models mode '{mode}' (supported: current, providers, models)");
         }
+        // A blank string is not a filter — treated as absent, so `query: ""` cannot
+        // become the full dump this tool exists to not be.
+        let str_arg = |key: &str| {
+            args.get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let provider_arg = str_arg("provider");
+        let query = str_arg("query").map(|q| q.to_lowercase());
         let runtime = self
             .runtime
             .lock()
@@ -306,6 +333,14 @@ impl hrdr_tools::Tool for ModelsTool {
                 "message": "No concrete default sub-agent model is configured."
             }));
         }
+        // Every model this session can reach — built once, for both drill-down modes,
+        // and for neither of them on `current`, which stays free.
+        let reachable = if mode == "current" {
+            Vec::new()
+        } else {
+            self.reachable_models(&runtime, &active_provider, &active_model, &mut warnings)
+                .await
+        };
         let mut value = serde_json::json!({
             "provider": active_provider,
             "model": active_model,
@@ -315,133 +350,58 @@ impl hrdr_tools::Tool for ModelsTool {
             "default_subagent_model": default_model,
             "warnings": warnings
         });
-        // Held outside the `available` branch so the truncation pass below can
-        // re-fit the rows without rebuilding them.
-        let mut available: Vec<AvailableModel> = Vec::new();
-        if mode == "available" {
-            available = self.available.clone();
-            if runtime.endpoint.resolved.is_codex_oauth() {
-                match coordinated_oauth_access(
-                    runtime.endpoint.resolved.kind(),
-                    runtime.endpoint.resolved.base_url(),
-                )
-                .await
-                {
-                    Ok(access) => {
-                        let catalog = chatgpt_model_catalog(&access, false).await;
-                        // On the Codex endpoint the provider in force is the merged
-                        // `openai`. Replace its static preset rows with the live
-                        // account catalog, labelled with that same name so the rows
-                        // match the `provider` field in this payload (a row the model
-                        // reads back must name a provider that resolves).
-                        let openai_name = active_provider.clone();
-                        available.retain(|m| m.provider != openai_name);
-                        available.extend(catalog.models.into_iter().map(|m| AvailableModel {
-                            provider: openai_name.clone(),
-                            model: m.slug,
-                            label: m.label,
-                            source: ModelSource::AccountCatalog,
-                        }));
-                        match catalog.source {
-                            CatalogSource::Fresh => {}
-                            CatalogSource::Stale => value["warnings"]
-                                .as_array_mut()
-                                .expect("array")
-                                .push(serde_json::json!({
-                                    "code": "chatgpt_catalog_stale",
-                                    "message": catalog.warning.unwrap_or_else(|| "Using stale ChatGPT model catalog.".to_string())
-                                })),
-                            CatalogSource::BuiltInFallback => value["warnings"]
-                                .as_array_mut()
-                                .expect("array")
-                                .push(serde_json::json!({
-                                    "code": "chatgpt_catalog_fallback",
-                                    "message": catalog.warning.unwrap_or_else(|| "Using built-in ChatGPT model fallback.".to_string())
-                                })),
-                        }
-                    }
-                    Err(err) => {
-                        value["warnings"]
-                            .as_array_mut()
-                            .expect("array")
-                            .push(serde_json::json!({
-                                "code": "chatgpt_catalog_fallback",
-                                "message": format!("ChatGPT model catalog unavailable: {err}")
-                            }))
-                    }
-                }
-            }
-            if active_model != DEFAULT_MODEL
-                && !available
+        if mode == "providers" {
+            value["providers"] = provider_rows(&reachable, &active_provider);
+        }
+        // Held outside the branch so the truncation pass below can re-fit the rows
+        // without rebuilding them.
+        let mut shown: Vec<AvailableModel> = Vec::new();
+        // Rows the row cap already cut. Carried into the truncation pass so its
+        // message counts everything missing, not just its own share.
+        let mut dropped = 0usize;
+        if mode == "models" {
+            let scoped = scope_models(&reachable, provider_arg.as_deref(), query.as_deref())?;
+            shown = take_fair(&scoped, MODELS_ROW_CAP);
+            dropped = scoped.len() - shown.len();
+            value["models"] = serde_json::Value::Array(
+                shown
                     .iter()
-                    .any(|m| m.provider == active_provider && m.model == active_model)
-            {
-                available.push(AvailableModel {
-                    provider: active_provider.clone(),
-                    label: active_model.clone(),
-                    model: active_model.clone(),
-                    source: ModelSource::Configured,
-                });
-            }
-            available.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
-            available.retain(|m| m.model != DEFAULT_MODEL);
-            let rows: Vec<_> = available
-                .iter()
-                .map(|m| {
-                    // Flag the row the agent is *itself* running on. The same pair
-                    // is in the payload's `provider`/`model` fields, but a caller
-                    // scanning a long list to pick a model for delegation reads the
-                    // rows, not the envelope — and the answer to "which provider
-                    // should I keep the sub-agent on" is right there in the row.
-                    let current = active_provider == m.provider && active_model == m.model;
-                    serde_json::json!({
-                        "id": model_row_id(&m.provider, &m.model),
-                        "provider": m.provider,
-                        "model": m.model,
-                        "label": m.label,
-                        "source": m.source,
-                        "current": current
-                    })
-                })
-                .collect();
-            value["available_models"] = serde_json::Value::Array(rows);
+                    .map(|m| model_row(m, &active_provider, &active_model))
+                    .collect(),
+            );
+        }
+        if dropped > 0 {
+            value["warnings"]
+                .as_array_mut()
+                .expect("array")
+                .push(truncation_warning(dropped));
         }
         let mut out = serde_json::to_string_pretty(&value)?;
-        if out.len() > ctx.max_output && mode == "available" {
+        if out.len() > ctx.max_output && mode == "models" {
             // Trim to fit. Popping from the tail of a (provider, model)-sorted
             // list would delete whole providers off the end of the alphabet, so
             // the model would conclude `zen` offers nothing. Drop round-robin
             // across providers instead, so each keeps its first choices, and say
             // how many rows went — a silent trim reads as a complete list.
-            let total = available.len();
-            value["warnings"]
-                .as_array_mut()
-                .expect("array")
-                .push(truncation_warning(total));
-            // Size the envelope with the worst-case message (dropped == total, so
-            // its digit count is maximal); the real message can only be shorter.
+            let warnings = value["warnings"].as_array_mut().expect("array");
+            if dropped > 0 {
+                // The cap's own count, superseded by the combined one below.
+                warnings.pop();
+            }
+            // Size the envelope with the worst-case message (every row gone, so its
+            // digit count is maximal); the real message can only be shorter.
+            warnings.push(truncation_warning(dropped + shown.len()));
             let mut envelope = value.clone();
-            envelope["available_models"] = serde_json::Value::Array(Vec::new());
+            envelope["models"] = serde_json::Value::Array(Vec::new());
             let base_len = serde_json::to_string_pretty(&envelope)?.len();
             let mut budget = ctx.max_output.saturating_sub(base_len);
             loop {
-                let (kept, dropped) = fit_models_to_budget(&available, budget)?;
+                let (kept, cut) =
+                    fit_models_to_budget(&shown, budget, &active_provider, &active_model)?;
                 let warnings = value["warnings"].as_array_mut().expect("array");
                 warnings.pop();
-                warnings.push(truncation_warning(dropped));
-                // fit_models_to_budget builds bare rows — re-attach `current`
-                // by matching each kept row back to its source AvailableModel.
-                let mut kept_with_current: Vec<serde_json::Value> = Vec::with_capacity(kept.len());
-                for mut r in kept {
-                    if let (Some(provider), Some(model)) =
-                        (r["provider"].as_str(), r["model"].as_str())
-                    {
-                        let is_current = active_provider == provider && active_model == model;
-                        r["current"] = serde_json::Value::Bool(is_current);
-                    }
-                    kept_with_current.push(r);
-                }
-                value["available_models"] = serde_json::Value::Array(kept_with_current);
+                warnings.push(truncation_warning(dropped + cut));
+                value["models"] = serde_json::Value::Array(kept);
                 out = serde_json::to_string_pretty(&value)?;
                 if out.len() <= ctx.max_output {
                     break;
@@ -464,6 +424,181 @@ impl hrdr_tools::Tool for ModelsTool {
     }
 }
 
+impl ModelsTool {
+    /// Every model this session can reach, as the drill-down modes see it: the
+    /// configured/catalog rows, with a live ChatGPT **account** catalog replacing the
+    /// static `openai` presets when the session is on the Codex endpoint (that list is
+    /// the account's own answer to "what may I run"). Sorted by `(provider, model)`,
+    /// with the placeholder model dropped and the session's own model guaranteed
+    /// present — so exactly one row can carry `current: true`.
+    ///
+    /// Catalog-freshness problems are appended to `warnings` rather than raised: a
+    /// stale list is still worth reading, and a caller asking what it can run must not
+    /// be told nothing at all.
+    async fn reachable_models(
+        &self,
+        runtime: &DelegationRuntime,
+        active_provider: &str,
+        active_model: &str,
+        warnings: &mut Vec<serde_json::Value>,
+    ) -> Vec<AvailableModel> {
+        let mut available = self.available.clone();
+        if runtime.endpoint.resolved.is_codex_oauth() {
+            match coordinated_oauth_access(
+                runtime.endpoint.resolved.kind(),
+                runtime.endpoint.resolved.base_url(),
+            )
+            .await
+            {
+                Ok(access) => {
+                    let catalog = chatgpt_model_catalog(&access, false).await;
+                    // On the Codex endpoint the provider in force is the merged
+                    // `openai`. Replace its static preset rows with the live
+                    // account catalog, labelled with that same name so the rows
+                    // match the `provider` field in this payload (a row the model
+                    // reads back must name a provider that resolves).
+                    available.retain(|m| m.provider != active_provider);
+                    available.extend(catalog.models.into_iter().map(|m| AvailableModel {
+                        provider: active_provider.to_string(),
+                        model: m.slug,
+                        label: m.label,
+                        source: ModelSource::AccountCatalog,
+                    }));
+                    match catalog.source {
+                        CatalogSource::Fresh => {}
+                        CatalogSource::Stale => warnings.push(serde_json::json!({
+                            "code": "chatgpt_catalog_stale",
+                            "message": catalog.warning.unwrap_or_else(|| "Using stale ChatGPT model catalog.".to_string())
+                        })),
+                        CatalogSource::BuiltInFallback => warnings.push(serde_json::json!({
+                            "code": "chatgpt_catalog_fallback",
+                            "message": catalog.warning.unwrap_or_else(|| "Using built-in ChatGPT model fallback.".to_string())
+                        })),
+                    }
+                }
+                Err(err) => warnings.push(serde_json::json!({
+                    "code": "chatgpt_catalog_fallback",
+                    "message": format!("ChatGPT model catalog unavailable: {err}")
+                })),
+            }
+        }
+        if active_model != DEFAULT_MODEL
+            && !available
+                .iter()
+                .any(|m| m.provider == active_provider && m.model == active_model)
+        {
+            available.push(AvailableModel {
+                provider: active_provider.to_string(),
+                label: active_model.to_string(),
+                model: active_model.to_string(),
+                source: ModelSource::Configured,
+            });
+        }
+        available.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
+        available.retain(|m| m.model != DEFAULT_MODEL);
+        available
+    }
+}
+
+/// How many `models` rows one call returns before it starts asking for a narrower
+/// query. The tool is a drill-down, not a dump: a wall of ids costs context AND is
+/// exactly what makes a half-remembered name get matched onto the wrong model.
+const MODELS_ROW_CAP: usize = 50;
+
+/// One `models` row: the coupled id `task` takes, the pair it decomposes to, the
+/// friendly label, where it came from — and whether it is the row the agent is
+/// *itself* running on.
+///
+/// The same pair is in the payload's `provider`/`model` fields, but a caller
+/// scanning rows to pick a model for delegation reads the rows, not the envelope —
+/// and the answer to "which provider should I keep the sub-agent on" is right there
+/// in the row.
+fn model_row(m: &AvailableModel, active_provider: &str, active_model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": model_row_id(&m.provider, &m.model),
+        "provider": m.provider,
+        "model": m.model,
+        "label": m.label,
+        "source": m.source,
+        "current": active_provider == m.provider && active_model == m.model
+    })
+}
+
+/// The `providers` mode's answer: who is reachable, how many models each offers, and
+/// which one this session is on — the cheap first step of the drill-down, and the
+/// only way to learn a name `models`' `provider` argument will accept.
+///
+/// `rows` must be sorted by `(provider, model)`, so a provider's rows are adjacent.
+fn provider_rows(rows: &[AvailableModel], active_provider: &str) -> serde_json::Value {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for m in rows {
+        match counts.last_mut() {
+            Some((provider, n)) if *provider == m.provider.as_str() => *n += 1,
+            _ => counts.push((m.provider.as_str(), 1)),
+        }
+    }
+    serde_json::Value::Array(
+        counts
+            .into_iter()
+            .map(|(provider, models)| {
+                serde_json::json!({
+                    "provider": provider,
+                    "models": models,
+                    "current": provider == active_provider
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Narrow `rows` to what the caller asked for — and refuse to answer when they asked
+/// for everything.
+///
+/// The refusal is the feature. `mode: "available"` used to return every reachable
+/// model, which was both a large result to carry and the thing that made
+/// hallucination easy: given a wall of ids, a half-remembered name gets
+/// pattern-matched onto whichever one looks closest. Naming a provider or a query
+/// makes the caller commit to what it is actually looking for.
+fn scope_models(
+    rows: &[AvailableModel],
+    provider: Option<&str>,
+    query: Option<&str>,
+) -> Result<Vec<AvailableModel>> {
+    if provider.is_none() && query.is_none() {
+        bail!(
+            "pass `provider` (see mode: providers) or `query` to search \
+             — the full list is deliberately not dumpable"
+        );
+    }
+    let mut out = rows.to_vec();
+    if let Some(p) = provider {
+        // Canonical, so an alias reaches the rows it folds onto: `anthropic` finds
+        // `claude`'s, rather than reading as a provider that does not exist.
+        let canonical = ProviderName::new(p).as_str().to_string();
+        if !out.iter().any(|m| m.provider == canonical) {
+            // One message for "no such provider" and for "a provider with nothing to
+            // list" (a `local` endpoint whose only model is the placeholder): both are
+            // answered by the same thing — the names this session actually lists.
+            let mut known: Vec<&str> = rows.iter().map(|m| m.provider.as_str()).collect();
+            known.dedup();
+            bail!(
+                "provider '{p}' is not one this session lists models for — \
+                 pick one of: {} (see mode: providers)",
+                known.join(", ")
+            );
+        }
+        out.retain(|m| m.provider == canonical);
+    }
+    if let Some(q) = query {
+        out.retain(|m| {
+            m.provider.to_lowercase().contains(q)
+                || m.model.to_lowercase().contains(q)
+                || m.label.to_lowercase().contains(q)
+        });
+    }
+    Ok(out)
+}
+
 /// A `models` row's **actionable** field: the coupled `provider://model` identity,
 /// exactly as the `task` tool's one `model` argument wants it.
 ///
@@ -478,16 +613,69 @@ fn model_row_id(provider: &str, model: &str) -> String {
         .map_or_else(|_| model.to_string(), |r| r.to_string())
 }
 
-/// The `models_truncated` warning, naming how many rows were dropped so the
-/// caller knows the list is partial rather than exhaustive.
+/// The `models_truncated` warning, naming how many rows were left out and how to see
+/// them: a partial list the caller reads as exhaustive is worse than a short one.
 fn truncation_warning(dropped: usize) -> serde_json::Value {
     serde_json::json!({
         "code": "models_truncated",
         "message": format!(
-            "{dropped} available model row(s) were dropped to fit the tool output limit; \
-             the list is a fair sample across providers, not the full catalog."
+            "{dropped} more model row(s) — narrow with `query` (or scope with `provider`); \
+             the rows shown are a fair sample across providers, not the full list."
         )
     })
+}
+
+/// Row indices grouped by provider, preserving each provider's order. `rows` must be
+/// sorted by `(provider, model)`. Shared by the two fair-selection passes below, so
+/// "fair" means the same thing in both.
+fn provider_groups(rows: &[AvailableModel]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of: HashMap<&str, usize> = HashMap::new();
+    for (i, m) in rows.iter().enumerate() {
+        let g = *group_of.entry(m.provider.as_str()).or_insert_with_key(|_| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[g].push(i);
+    }
+    groups
+}
+
+/// At most `cap` rows, taken **round-robin across providers** rather than off the
+/// head of the sorted list: a `query` that spans providers must not answer "`zen`
+/// offers nothing" just because the alphabet ran out first. Every provider keeps its
+/// first row before any provider gets its second.
+///
+/// `rows` must be sorted by `(provider, model)`; the result keeps that order.
+fn take_fair(rows: &[AvailableModel], cap: usize) -> Vec<AvailableModel> {
+    if rows.len() <= cap {
+        return rows.to_vec();
+    }
+    let groups = provider_groups(rows);
+    let mut keep = vec![false; rows.len()];
+    let mut kept = 0usize;
+    let mut rank = 0usize;
+    while kept < cap {
+        let mut any_at_rank = false;
+        for g in &groups {
+            let Some(&i) = g.get(rank) else { continue };
+            any_at_rank = true;
+            keep[i] = true;
+            kept += 1;
+            if kept == cap {
+                break;
+            }
+        }
+        if !any_at_rank {
+            break;
+        }
+        rank += 1;
+    }
+    rows.iter()
+        .zip(keep)
+        .filter(|(_, keep)| *keep)
+        .map(|(m, _)| m.clone())
+        .collect()
 }
 
 /// Select as many model rows as fit in `budget` bytes, dropping **round-robin
@@ -501,6 +689,8 @@ fn truncation_warning(dropped: usize) -> serde_json::Value {
 fn fit_models_to_budget(
     rows: &[AvailableModel],
     budget: usize,
+    active_provider: &str,
+    active_model: &str,
 ) -> Result<(Vec<serde_json::Value>, usize)> {
     // Serialize each row once: repeated whole-document re-serialization per
     // dropped row is quadratic, and this list can be large.
@@ -508,28 +698,13 @@ fn fit_models_to_budget(
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            let v = serde_json::json!({
-                "id": model_row_id(&m.provider, &m.model),
-                "provider": m.provider,
-                "model": m.model,
-                "label": m.label,
-                "source": m.source
-            });
+            let v = model_row(m, active_provider, active_model);
             let len = serde_json::to_string_pretty(&v).map(|s| s.len())?;
             Ok((i, v, len))
         })
         .collect::<Result<_>>()?;
 
-    // Group row indices by provider, preserving the sorted order within each.
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut group_of: HashMap<&str, usize> = HashMap::new();
-    for (i, m) in rows.iter().enumerate() {
-        let g = *group_of.entry(m.provider.as_str()).or_insert_with_key(|_| {
-            groups.push(Vec::new());
-            groups.len() - 1
-        });
-        groups[g].push(i);
-    }
+    let groups = provider_groups(rows);
 
     // Round-robin: rank 0 of every provider, then rank 1, and so on. A row that
     // does not fit is dropped, but a later (smaller) row may still fit.
@@ -754,6 +929,12 @@ pub struct Agent {
     /// new identity against the user's config. The only part of [`AgentConfig`] the
     /// agent must be able to re-read; everything else it has already unpacked.
     providers: HashMap<String, ProviderConfig>,
+    /// Out-of-band notices raised at a moment with no turn to carry them — the model
+    /// pre-flight, at construction and on every identity change. Drained by
+    /// [`Agent::run`] into [`AgentEvent::Notice`], the one channel every frontend
+    /// already renders; an interactive switch drains it sooner
+    /// ([`Agent::take_pending_notices`]) so the answer arrives with the keystroke.
+    pending_notices: Vec<String>,
     /// Sanitized live model state shared with introspection and delegation tools.
     delegation_runtime: SharedDelegationRuntime,
     /// Sub-agents this agent has delegated to and is still holding — the
@@ -1083,6 +1264,27 @@ fn build_system_prompt(
     Ok((p.render(), split))
 }
 
+/// **Fail fast on a typo'd model.** Everything the local catalogs can already say
+/// about the identity an agent is about to run on — nothing, most of the time, which
+/// is the point.
+///
+/// Zero network, so it is affordable at construction and on every identity change:
+/// [`validate::validate_identity_in`] reads only caches already on disk, and its
+/// models.dev arm is [`models::preflight_model`] (which names the closest known id
+/// when it flags one). An unresolved ChatGPT entitlement question
+/// ([`Identity::Unconfirmed`]) is dropped here rather than settled — settling one
+/// costs a request, and a model switch is not the place to spend one. The launch gate
+/// and the `/model` edge still confirm it.
+fn preflight_notices(
+    providers: &HashMap<String, ProviderConfig>,
+    resolved: &ResolvedModel,
+) -> Vec<String> {
+    match validate::validate_identity_in(providers, resolved) {
+        validate::Identity::Known(warnings) => warnings,
+        validate::Identity::Unconfirmed(_) => Vec::new(),
+    }
+}
+
 /// The initial delegation-runtime projection for `config`. The single place the
 /// live-state cell is built from a config, so `Agent::new` and any other
 /// constructor cannot seed it differently.
@@ -1394,10 +1596,17 @@ impl Agent {
                 .map(std::time::Duration::from_secs),
         );
 
+        // Is the model we are about to run on even a model? Network-free, from the
+        // catalogs already on disk — see `preflight_notices`. Queued rather than
+        // printed: a line on stderr is invisible under a TUI, and a sub-agent has no
+        // stderr anyone reads.
+        let pending_notices = preflight_notices(&config.providers, &resolved);
+
         Ok(Self {
             client,
             resolved,
             providers: config.providers,
+            pending_notices,
             delegation_runtime,
             live_subagents,
             live_home: None,
@@ -1806,6 +2015,15 @@ impl Agent {
     /// does. [`resolve_in`] stays pure; this is where the OAuth store is read.
     fn adopt_resolved(&mut self, resolved: ResolvedModel) {
         let resolved = oauth_derived(resolved);
+        // Pre-flight the identity actually being adopted (post auth-switch), here in
+        // the single writer — so every path that changes what this agent runs on gets
+        // the check, not just the ones that remembered to ask for it. Deduped: bouncing
+        // between two models must not stack the same notice twice.
+        for notice in preflight_notices(&self.providers, &resolved) {
+            if !self.pending_notices.contains(&notice) {
+                self.pending_notices.push(notice);
+            }
+        }
         let cache = resolve_cache_mode(self.prompt_cache.as_deref(), resolved.base_url());
         self.client.set_base_url(resolved.base_url().to_string());
         self.client
@@ -1820,6 +2038,15 @@ impl Agent {
         // A different model has a different window; the old figure is not ours.
         self.invalidate_context_window();
         self.publish_delegation_runtime();
+    }
+
+    /// Take the notices queued outside a turn (see the `pending_notices` field) —
+    /// currently the model pre-flight's. [`Agent::run`] drains this at the top of a
+    /// turn into [`AgentEvent::Notice`]; a frontend that just applied a `/model`
+    /// switch drains it there instead, so the notice lands with the switch rather
+    /// than one turn later.
+    pub fn take_pending_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_notices)
     }
 
     /// What this agent is running on: provider AND model, as one value.
@@ -2484,10 +2711,12 @@ mod tests {
         assert_eq!(value["effective_effort"], "high");
         assert_eq!(value["default_subagent_model"], "new");
         assert!(!out.contains("top-secret"));
-        assert!(value.get("available_models").is_none());
+        // `current` is free: it lists neither providers nor rows.
+        assert!(value.get("models").is_none());
+        assert!(value.get("providers").is_none());
     }
 
-    /// The `available` rows flag the model the agent is itself running on, and the
+    /// The `models` rows flag the model the agent is itself running on, and the
     /// prompt tells it what that flag is for.
     ///
     /// "@explore the codebase using big pickle" names the model the *sub-agent*
@@ -2508,13 +2737,13 @@ mod tests {
             .tools
             .execute(
                 "models",
-                serde_json::json!({"mode": "available"}),
+                serde_json::json!({"mode": "models", "provider": "openai"}),
                 &agent.ctx,
             )
             .await
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-        let rows = value["available_models"].as_array().expect("rows");
+        let rows = value["models"].as_array().expect("rows");
 
         let current: Vec<&serde_json::Value> = rows
             .iter()
@@ -2552,29 +2781,169 @@ mod tests {
         serde_json::from_str::<serde_json::Value>(&current).unwrap();
 
         agent.ctx.max_output = 512;
-        let available = agent
+        let listed = agent
             .tools
             .execute(
                 "models",
-                serde_json::json!({"mode": "available"}),
+                serde_json::json!({"mode": "models", "provider": "openai"}),
                 &agent.ctx,
             )
             .await
             .unwrap();
-        assert!(available.len() <= agent.ctx.max_output, "{available}");
-        serde_json::from_str::<serde_json::Value>(&available).unwrap();
+        assert!(listed.len() <= agent.ctx.max_output, "{listed}");
+        serde_json::from_str::<serde_json::Value>(&listed).unwrap();
 
         agent.ctx.max_output = 1;
         let err = agent
             .tools
             .execute(
                 "models",
-                serde_json::json!({"mode": "available"}),
+                serde_json::json!({"mode": "models", "provider": "openai"}),
                 &agent.ctx,
             )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("too small for valid JSON"));
+    }
+
+    /// The drill-down's shape, end to end: `current` → `providers` →
+    /// `models(provider=…)` / `models(query=…)`, and the refusal that makes it a
+    /// drill-down at all.
+    ///
+    /// The old `available` mode returned EVERY reachable model. That is a large result
+    /// to carry, and — worse — a wall of ids is exactly what turns "delegate to big
+    /// pickle" into a confident match on whichever id looks closest. So the full list
+    /// is not obtainable: name a provider, or say what you are looking for.
+    #[tokio::test]
+    async fn models_drills_down_and_refuses_to_dump_the_whole_list() {
+        let agent = Agent::new(AgentConfig {
+            model: r("openai://gpt-5"),
+            api_key: Some("k".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let call = async |args: serde_json::Value| {
+            agent
+                .tools
+                .execute("models", args, &agent.ctx)
+                .await
+                .map(|out| serde_json::from_str::<serde_json::Value>(&out).expect("valid JSON"))
+        };
+
+        // `providers`: one row each, with a count, and the session's own flagged.
+        let value = call(serde_json::json!({"mode": "providers"}))
+            .await
+            .unwrap();
+        let providers = value["providers"].as_array().expect("provider rows");
+        assert!(!providers.is_empty(), "{value}");
+        for row in providers {
+            assert!(row["provider"].is_string(), "{row}");
+            assert!(row["models"].as_u64().unwrap() >= 1, "{row}");
+            assert!(row["current"].is_boolean(), "{row}");
+        }
+        let current: Vec<&serde_json::Value> =
+            providers.iter().filter(|r| r["current"] == true).collect();
+        assert_eq!(current.len(), 1, "exactly one provider is ours: {value}");
+        assert_eq!(current[0]["provider"], "openai");
+        // Cheap by construction: no rows ride along with the counts.
+        assert!(value.get("models").is_none());
+
+        // `models` with neither filter: refused, and the message says how to narrow.
+        let err = call(serde_json::json!({"mode": "models"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pass `provider`"), "{err}");
+        assert!(err.contains("or `query`"), "{err}");
+        assert!(err.contains("deliberately not dumpable"), "{err}");
+        // A blank string is not a filter — it must not become the dump either.
+        for blank in [
+            serde_json::json!({"mode": "models", "query": "   "}),
+            serde_json::json!({"mode": "models", "provider": ""}),
+        ] {
+            assert!(
+                call(blank)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pass `provider`"),
+                "an empty filter is no filter",
+            );
+        }
+
+        // `models(query=…)`: matched case-insensitively against provider/id/label.
+        // `gpt-5` is the session's own model, so this row exists whatever the cached
+        // models.dev catalog happens to hold.
+        let value = call(serde_json::json!({"mode": "models", "query": "GPT-5"}))
+            .await
+            .unwrap();
+        let rows = value["models"].as_array().expect("rows");
+        assert!(
+            rows.iter()
+                .any(|r| r["model"] == "gpt-5" && r["current"] == true),
+            "{value}"
+        );
+        assert!(
+            rows.iter().all(|r| {
+                ["provider", "model", "label"]
+                    .iter()
+                    .any(|k| r[k].as_str().unwrap().to_lowercase().contains("gpt-5"))
+            }),
+            "every row matches the query: {value}"
+        );
+
+        // A provider this session doesn't list is refused with the ones it does.
+        let err = call(serde_json::json!({"mode": "models", "provider": "ghost"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("provider 'ghost' is not one this session lists models for"),
+            "{err}"
+        );
+        assert!(err.contains("openai"), "it names what IS reachable: {err}");
+
+        // And an unknown mode names the three that exist.
+        let err = call(serde_json::json!({"mode": "available"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown models mode 'available'"), "{err}");
+        assert!(err.contains("current, providers, models"), "{err}");
+    }
+
+    /// The row cap: `models` answers with at most [`MODELS_ROW_CAP`] rows and says how
+    /// many it left out, rather than growing without bound as a provider's catalog does.
+    #[test]
+    fn the_row_cap_takes_a_fair_sample_and_says_what_it_left_out() {
+        use super::{AvailableModel, MODELS_ROW_CAP, ModelSource, take_fair, truncation_warning};
+        let row = |p: &str, i: usize| AvailableModel {
+            provider: p.to_string(),
+            model: format!("{p}-m{i:03}"),
+            label: format!("{p} m{i}"),
+            source: ModelSource::ModelsDev,
+        };
+        // Two providers, well over the cap, sorted by (provider, model) as the
+        // selectors require.
+        let mut rows: Vec<AvailableModel> = (0..80).map(|i| row("alpha", i)).collect();
+        rows.extend((0..80).map(|i| row("zen", i)));
+
+        let kept = take_fair(&rows, MODELS_ROW_CAP);
+        assert_eq!(kept.len(), MODELS_ROW_CAP);
+        let zen = kept.iter().filter(|m| m.provider == "zen").count();
+        assert_eq!(
+            zen,
+            MODELS_ROW_CAP / 2,
+            "the cap is spent evenly, not on whoever sorts first",
+        );
+        // Under the cap, nothing is touched.
+        assert_eq!(take_fair(&rows[..10], MODELS_ROW_CAP).len(), 10);
+
+        let warning = truncation_warning(rows.len() - MODELS_ROW_CAP);
+        assert_eq!(warning["code"], "models_truncated");
+        let message = warning["message"].as_str().unwrap();
+        assert!(message.starts_with("110 more model row(s)"), "{message}");
+        assert!(message.contains("narrow with `query`"), "{message}");
     }
 
     /// The delegation guidance reaches an agent that can actually delegate.
@@ -2595,8 +2964,11 @@ mod tests {
             system.contains("Delegating to a model the user named:"),
             "an agent with `task` + `models` is told how to honour a named model"
         );
-        assert!(system.contains("call `models`"), "resolve, don't guess");
-        assert!(system.contains("Never guess an id"));
+        assert!(
+            system.contains("`models` drill-down"),
+            "resolve through the tool, don't guess"
+        );
+        assert!(system.contains("never guess an id"));
         assert!(
             system.contains("do not duplicate it yourself"),
             "delegated work must not be repeated by the parent"
@@ -2661,8 +3033,11 @@ mod tests {
         assert!(props.contains_key("model"));
     }
 
+    /// `default` is a placeholder, not a model, so it is never a row a caller could
+    /// delegate to — and a session running on it is told it has no concrete default
+    /// sub-agent model rather than being handed the placeholder as one.
     #[tokio::test]
-    async fn models_available_filters_default_and_returns_valid_json() {
+    async fn the_placeholder_model_is_never_offered_as_a_row() {
         let agent = Agent::new(AgentConfig {
             model: r("local://default"),
             ..Default::default()
@@ -2670,21 +3045,10 @@ mod tests {
         .unwrap();
         let out = agent
             .tools
-            .execute(
-                "models",
-                serde_json::json!({"mode": "available"}),
-                &agent.ctx,
-            )
+            .execute("models", serde_json::json!({}), &agent.ctx)
             .await
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert!(
-            value["available_models"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|row| row["model"] != "default")
-        );
         assert!(
             value["warnings"]
                 .as_array()
@@ -2692,6 +3056,52 @@ mod tests {
                 .iter()
                 .any(|warning| warning["code"] == "no_default_subagent_model")
         );
+
+        // Every row of every provider, and none of them is the placeholder.
+        let out = agent
+            .tools
+            .execute(
+                "models",
+                serde_json::json!({"mode": "providers"}),
+                &agent.ctx,
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        for row in value["providers"].as_array().expect("provider rows") {
+            let provider = row["provider"].as_str().unwrap();
+            let out = agent
+                .tools
+                .execute(
+                    "models",
+                    serde_json::json!({"mode": "models", "provider": provider}),
+                    &agent.ctx,
+                )
+                .await
+                .unwrap();
+            let listed: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert!(
+                listed["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row["model"] != "default"),
+                "{provider}: {out}"
+            );
+        }
+        // …and `local`, whose only "model" here IS the placeholder, lists nothing at
+        // all rather than offering it.
+        let err = agent
+            .tools
+            .execute(
+                "models",
+                serde_json::json!({"mode": "models", "provider": "local"}),
+                &agent.ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider 'local' is not one"), "{err}");
     }
 
     /// Truncation must not delete whole providers off the end of the sorted list
@@ -2714,14 +3124,17 @@ mod tests {
             row("zen", "z1"),
             row("zen", "z2"),
         ];
-        let full = fit_models_to_budget(&rows, usize::MAX).unwrap();
+        // The active pair only decides which row carries `current`; here, none.
+        let full = fit_models_to_budget(&rows, usize::MAX, "alpha", "a1").unwrap();
         assert_eq!(full.1, 0, "a huge budget drops nothing");
         assert_eq!(full.0.len(), 5);
+        assert_eq!(full.0[0]["current"], true, "the active row is flagged");
 
         // A budget big enough for ~2 rows must spend it on one row from EACH
         // provider, not two rows of `alpha`.
         let one_row_len = serde_json::to_string_pretty(&full.0[0]).unwrap().len();
-        let (kept, dropped) = fit_models_to_budget(&rows, one_row_len * 2 + 1).unwrap();
+        let (kept, dropped) =
+            fit_models_to_budget(&rows, one_row_len * 2 + 1, "alpha", "a1").unwrap();
         assert_eq!(dropped, 3);
         let providers: Vec<&str> = kept
             .iter()
@@ -2745,7 +3158,7 @@ mod tests {
     /// stable API-key `openai`; the account-catalog path needs a live OAuth login and
     /// is unit-tested separately in `models::merge_chatgpt_choices`.)
     #[tokio::test]
-    async fn models_available_names_the_merged_openai_provider_coherently() {
+    async fn models_names_the_merged_openai_provider_coherently() {
         let agent = Agent::new(AgentConfig {
             model: r("codex://gpt-5.5"),
             api_key: Some("k".to_string()),
@@ -2756,7 +3169,7 @@ mod tests {
             .tools
             .execute(
                 "models",
-                serde_json::json!({"mode": "available"}),
+                serde_json::json!({"mode": "providers"}),
                 &agent.ctx,
             )
             .await
@@ -2764,11 +3177,12 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         let session_provider = value["provider"].as_str().unwrap().to_string();
         assert_eq!(session_provider, "openai", "the alias folded on the way in");
-        let rows = value["available_models"].as_array().unwrap();
+        let rows = value["providers"].as_array().unwrap();
 
-        // No row names a raw OAuth alias — a row the model could not feed back to a
-        // switch is worse than no row. This — with the `openai` fold above — is the
-        // merge-coherence property this test guards, and it is deterministic.
+        // No row names a raw OAuth alias — a name the model could not feed back to
+        // `models`' own `provider` argument (or to a switch) is worse than no name.
+        // This — with the `openai` fold above — is the merge-coherence property this
+        // test guards, and it is deterministic.
         //
         // We deliberately do NOT assert the active model is present in the rows:
         // that depends on `available_models` reading the process-global models.dev
@@ -2782,6 +3196,23 @@ mod tests {
                 Some("chatgpt" | "codex" | "openai-oauth")
             )),
             "no row names a raw alias, got {rows:?}"
+        );
+        // The name the `providers` row hands back is one `models` accepts: what the
+        // drill-down offers as step 2 has to work as step 3's argument.
+        assert!(
+            rows.iter().any(|r| r["provider"] == "openai"),
+            "got {rows:?}"
+        );
+        assert!(
+            agent
+                .tools
+                .execute(
+                    "models",
+                    serde_json::json!({"mode": "models", "provider": "openai"}),
+                    &agent.ctx,
+                )
+                .await
+                .is_ok()
         );
     }
 
@@ -10059,6 +10490,69 @@ mod tests {
             );
         }
 
+        /// A notice raised when there was no turn to carry it — the model pre-flight,
+        /// at construction or on a `/model` switch — reaches the user at the top of
+        /// the next turn, and exactly once.
+        ///
+        /// This is the surface the pre-flight relies on: an `Agent` is built before
+        /// anything is drawn, and under a TUI a line printed to stderr at that moment
+        /// is invisible. `AgentEvent::Notice` is the channel every frontend already
+        /// renders (and every sub-agent transcript already records).
+        #[tokio::test]
+        async fn a_notice_queued_before_the_turn_is_emitted_once_at_its_start() {
+            let dir = tempfile::tempdir().unwrap();
+            let server = MockServer::start(vec![
+                MockResp::Sse(vec![
+                    text_chunk("c1", "sure"),
+                    stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                MockResp::Sse(vec![
+                    text_chunk("c2", "again"),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            agent
+                .pending_notices
+                .push("⚠ pre-flight says so".to_string());
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run_input("hello", |ev| events.push(ev))
+                .await
+                .unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, AgentEvent::Notice(n) if n == "⚠ pre-flight says so"))
+                    .count(),
+                1,
+                "said once, before the turn: {events:?}"
+            );
+            // It is the FIRST thing the turn emits — a notice that explains the reply
+            // has to arrive before it.
+            assert!(
+                matches!(&events[0], AgentEvent::Notice(n) if n == "⚠ pre-flight says so"),
+                "{events:?}"
+            );
+
+            // Taken, not copied: the next turn does not repeat it.
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run_input("hello again", |ev| events.push(ev))
+                .await
+                .unwrap();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("pre-flight"))),
+                "a queued notice is drained, not re-sent every turn: {events:?}"
+            );
+        }
+
         /// A steering message pending when the model answers **without** calling a
         /// tool is not delivered: the turn ends and the frontend re-sends it as a
         /// turn of its own.
@@ -11769,13 +12263,13 @@ mod tests {
             .tools
             .execute(
                 "models",
-                serde_json::json!({"mode": "available"}),
+                serde_json::json!({"mode": "models", "provider": "openai"}),
                 &agent.ctx,
             )
             .await
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-        let rows = value["available_models"].as_array().expect("rows");
+        let rows = value["models"].as_array().expect("rows");
         assert!(!rows.is_empty(), "{out}");
         for row in rows {
             let id = row["id"].as_str().expect("every row carries an id");
