@@ -240,6 +240,15 @@ enum Command {
         /// Port (default: 9911).
         #[arg(long)]
         port: Option<u16>,
+        /// Authentication mode: token, basic, or users (default: token).
+        #[arg(long)]
+        auth: Option<String>,
+        /// Allow non-loopback binding (requires auth + TLS).
+        #[arg(long)]
+        allow_remote: bool,
+        /// Read a password from stdin, print an argon2id PHC hash, and exit.
+        #[arg(long)]
+        hash_password: bool,
     },
 }
 
@@ -644,23 +653,58 @@ async fn main() -> Result<()> {
             run_headless(config, prompt.join(" "), json, quiet).await
         }
         Some(Command::Models) => list_models(config).await,
-        Some(Command::Serve { bind, port }) => {
-            let bind_addr: std::net::IpAddr = bind
-                .as_deref()
-                .unwrap_or("127.0.0.1")
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
-            let port = port.unwrap_or(9911);
+        Some(Command::Serve {
+            bind,
+            port,
+            auth,
+            allow_remote,
+            hash_password,
+        }) => {
+            if hash_password {
+                use std::io::Read;
+                let mut password = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut password)
+                    .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
+                let password = password.trim();
+                if password.is_empty() {
+                    anyhow::bail!("no password on stdin");
+                }
+                let hash = hrdr_web::auth::hash_password(password)
+                    .map_err(|e| anyhow::anyhow!("hashing: {e}"))?;
+                println!("{hash}");
+                return Ok(());
+            }
+
+            let cli = hrdr_web::config::CliOverrides {
+                bind,
+                port,
+                auth,
+                allow_remote,
+                ..Default::default()
+            };
+            let (web_cfg, warnings) = hrdr_web::config::WebConfig::load(&cli);
+            for w in &warnings {
+                eprintln!("hrdr: {w}");
+            }
+
+            let bind_addr = web_cfg.bind;
+            let port = web_cfg.port;
 
             // Build the session engine.
             let shared = hrdr_web::SharedSession::start(config).await?;
+
+            let auth_state = hrdr_web::auth::AuthState::from_config(&web_cfg);
+            if let Some(token) = auth_state.token_str() {
+                eprintln!("open http://{bind_addr}:{port}/?token={token}");
+            }
 
             let server_cfg = hrdr_web::server::ServeConfig {
                 bind: bind_addr,
                 port,
             };
-            let running = hrdr_web::server::serve(shared, server_cfg).await?;
-            eprintln!("serving http://{}/ (Ctrl-C to stop)", running.addr);
+            let running = hrdr_web::server::serve(shared, server_cfg, &web_cfg, auth_state).await?;
+            eprintln!("serving http://{bind_addr}:{port}/ (Ctrl-C to stop)");
             running.wait().await;
             Ok(())
         }

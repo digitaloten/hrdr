@@ -7,6 +7,8 @@ use std::net::Ipv4Addr;
 use futures_util::{SinkExt, StreamExt};
 use hrdr_agent::AgentConfig;
 use hrdr_web::SharedSession;
+use hrdr_web::auth::AuthState;
+use hrdr_web::config::WebConfig;
 use hrdr_web::server::{self, ServeConfig};
 
 /// `/healthz` returns 200 OK with body "ok".
@@ -34,18 +36,17 @@ async fn healthz_answers_ok() {
     drop(server);
 }
 
-/// WebSocket: connect, get snapshot, submit, get entries frames.
+/// WebSocket: connect with token, get snapshot, submit, get entries frames.
 #[tokio::test]
 async fn ws_snapshot_then_delta() {
     use tokio_tungstenite::connect_async;
 
-    let (server, _session) = start_test_server().await;
+    let (server, _session, token) = start_test_server_with_token().await;
 
-    let ws_url = format!("ws://{}/ws", server.addr);
+    let ws_url = format!("ws://{}/ws?token={token}", server.addr);
     let (ws, _resp) = connect_async(&ws_url).await.expect("ws connect");
     let (mut write, mut read) = ws.split();
 
-    // First frame must be a snapshot.
     let first = read.next().await.expect("first frame").expect("ok frame");
     let first_text = first.to_text().unwrap();
     let first_value: serde_json::Value =
@@ -53,8 +54,6 @@ async fn ws_snapshot_then_delta() {
     assert_eq!(first_value["type"], "snapshot");
     assert_eq!(first_value["seq"], serde_json::json!(1));
 
-    // Send a submit — the agent will error but the user message should
-    // appear in the transcript via the Steered fold.
     let submit = serde_json::json!({
         "type": "submit",
         "pane": "main",
@@ -63,7 +62,6 @@ async fn ws_snapshot_then_delta() {
     let msg = tokio_tungstenite::tungstenite::Message::Text(submit.to_string().into());
     write.send(msg).await.unwrap();
 
-    // Wait for entries frames.
     let mut saw_user = false;
     for _ in 0..100 {
         let frame = tokio::time::timeout(std::time::Duration::from_secs(2), read.next())
@@ -92,7 +90,6 @@ async fn ws_snapshot_then_delta() {
             break;
         }
     }
-
     assert!(saw_user, "should see user message in transcript");
 
     drop(server);
@@ -104,18 +101,21 @@ async fn serve_refuses_non_loopback() {
     let config = AgentConfig::default();
     let shared = SharedSession::start(config).await.expect("session");
 
+    let web_cfg = WebConfig::load(&Default::default()).0;
+    let auth_state = AuthState::from_config(&web_cfg);
+
     let cfg = ServeConfig {
         bind: std::net::IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
         port: 0,
     };
-    let result = server::serve(shared, cfg).await;
+    let result = server::serve(shared, cfg, &web_cfg, auth_state).await;
     match result {
         Ok(_) => panic!("expected error for non-loopback bind"),
         Err(e) => {
             let err = e.to_string();
             assert!(
-                err.contains("authentication"),
-                "error should mention auth: {err}"
+                err.contains("allow-remote") || err.contains("TLS"),
+                "error should mention remote/TLS: {err}"
             );
         }
     }
@@ -123,6 +123,11 @@ async fn serve_refuses_non_loopback() {
 
 /// Helpers
 async fn start_test_server() -> (server::RunningServer, SharedSession) {
+    let (srv, sess, _tok) = start_test_server_with_token().await;
+    (srv, sess)
+}
+
+async fn start_test_server_with_token() -> (server::RunningServer, SharedSession, String) {
     let config = AgentConfig {
         cwd: std::path::PathBuf::from("/tmp"),
         api_key: Some("test-key".into()),
@@ -131,11 +136,17 @@ async fn start_test_server() -> (server::RunningServer, SharedSession) {
 
     let shared = SharedSession::start(config).await.expect("session");
 
+    let web_cfg = WebConfig::load(&Default::default()).0;
+    let auth_state = AuthState::from_config(&web_cfg);
+    let token = auth_state.token_str().unwrap().to_string();
+
     let cfg = ServeConfig {
         bind: std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
         port: 0,
     };
-    let running = server::serve(shared.clone(), cfg).await.expect("serve");
+    let running = server::serve(shared.clone(), cfg, &web_cfg, auth_state)
+        .await
+        .expect("serve");
 
-    (running, shared)
+    (running, shared, token)
 }

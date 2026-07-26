@@ -1,18 +1,29 @@
-//! Axum HTTP+WS server that wraps a `SharedSession`. Bound to loopback only
-//! in this slice — auth and config gating land in slices 4/5.
+//! Axum HTTP+WS server with authentication, config-gated binding, and the
+//! full refuse-to-bind matrix from §6.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::ws::{Message, WebSocketUpgrade};
-use axum::response::IntoResponse;
+use axum::extract::{Query, ws::Message, ws::WebSocketUpgrade};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
 
+use crate::auth::{self, AuthState};
+use crate::config::{AuthMode, WebConfig};
 use crate::session::SharedSession;
 
-/// Configuration for `serve()`.
+/// Shared state for all routes.
+#[derive(Clone)]
+pub struct AppState {
+    pub session: SharedSession,
+    pub auth: Arc<AuthState>,
+}
+
+/// Configuration for `serve()` — the resolved config after all precedence layers.
 pub struct ServeConfig {
     pub bind: IpAddr,
     pub port: u16,
@@ -25,33 +36,63 @@ pub struct RunningServer {
 }
 
 impl RunningServer {
-    /// Wait for the server to stop (blocks the calling task).
     pub async fn wait(self) {
         let _ = self.handle.await;
     }
-
-    /// Request graceful shutdown by aborting the server task.
     pub fn shutdown(self) {
         self.handle.abort();
     }
 }
 
-/// Start the axum server on the given config. Hardcodes loopback-only:
-/// returns an error if `bind` is not loopback (auth lands in slice 4).
-pub async fn serve(session: SharedSession, cfg: ServeConfig) -> anyhow::Result<RunningServer> {
-    if !cfg.bind.is_loopback() {
-        anyhow::bail!("authentication is not implemented yet — bind 127.0.0.1 only");
+/// Validate and start the server. The refuse-to-bind matrix from §6 is
+/// enforced here before the listener binds.
+pub async fn serve(
+    session: SharedSession,
+    cfg: ServeConfig,
+    web_cfg: &WebConfig,
+    auth_state: AuthState,
+) -> anyhow::Result<RunningServer> {
+    // ── Refuse-to-bind matrix ──────────────────────────────────────────────
+    let loopback = cfg.bind.is_loopback();
+
+    if !loopback && !web_cfg.allow_remote {
+        anyhow::bail!(
+            "refusing to bind {}: pass --allow-remote (plus auth and TLS)",
+            cfg.bind
+        );
+    }
+    if !loopback && web_cfg.auth == AuthMode::Token {
+        anyhow::bail!("token mode is loopback-only; use --auth basic or users for remote access");
+    }
+    if !loopback
+        && web_cfg.auth == AuthMode::Basic
+        && (web_cfg.basic_user.is_none() || web_cfg.basic_password_hash.is_none())
+    {
+        anyhow::bail!("Basic auth requires basic_user and basic_password_hash in [web] config");
+    }
+    if !loopback && web_cfg.tls_cert_path.is_none() {
+        anyhow::bail!(
+            "TLS is required for non-loopback access. Set tls_cert_path and tls_key_path, or bind loopback behind a reverse proxy."
+        );
+    }
+    // TLS serving lands in slice 5 — for now, non-loopback is still refused
+    // because we're not actually loading the TLS certs yet.
+    if !loopback {
+        anyhow::bail!("TLS is not implemented yet (lands in slice 5); bind 127.0.0.1 for now");
     }
 
     let addr = SocketAddr::new(cfg.bind, cfg.port);
 
+    let state = AppState {
+        session,
+        auth: Arc::new(auth_state),
+    };
+
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/", get(index))
-        .route(
-            "/ws",
-            get(move |ws: WebSocketUpgrade| ws_handler(ws, session.clone())),
-        );
+        .route("/ws", get(ws_handler))
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound_addr = listener.local_addr()?;
@@ -72,10 +113,79 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Placeholder index page (replaced by the Dioxus SPA in slice 7).
-async fn index() -> impl IntoResponse {
-    axum::response::Html(INDEX_HTML)
+/// Protected index page.
+async fn index(
+    state: axum::extract::State<AppState>,
+    headers: HeaderMap,
+    query: Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    match check_auth(&state.auth, &headers, &query) {
+        Ok(()) => axum::response::Html(INDEX_HTML).into_response(),
+        Err(resp) => resp,
+    }
 }
+
+/// Protected WS upgrade — checks auth AND Origin header.
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    state: axum::extract::State<AppState>,
+    headers: HeaderMap,
+    query: Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    // Auth check.
+    if let Err(resp) = check_auth(&state.auth, &headers, &query) {
+        return resp;
+    }
+
+    // Origin CSRF check.
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    if let Err(status) = auth::check_ws_origin(origin, host) {
+        return status.into_response();
+    }
+
+    let session = state.session.clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, session))
+}
+
+// ── auth helper ────────────────────────────────────────────────────────────
+
+#[allow(clippy::result_large_err)]
+fn check_auth(
+    auth: &AuthState,
+    headers: &HeaderMap,
+    query: &std::collections::HashMap<String, String>,
+) -> Result<(), Response> {
+    // Rate limit check.
+    let client_ip = auth::extract_client_ip(headers);
+    if !auth::check_rate_limit(auth, client_ip) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "60")],
+            "rate limit exceeded",
+        )
+            .into_response());
+    }
+
+    let authed = match auth.mode {
+        AuthMode::Token => auth::verify_token(headers, query, auth.token.as_deref()),
+        AuthMode::Basic => auth::verify_basic(
+            headers,
+            auth.basic_user.as_deref(),
+            auth.basic_password_hash.as_deref(),
+        ),
+        AuthMode::Users => false, // slice 5
+    };
+
+    if !authed {
+        auth::rate_limit_record(auth, client_ip);
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
+    }
+
+    Ok(())
+}
+
+// ── placeholder index ──────────────────────────────────────────────────────
 
 const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
@@ -98,14 +208,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
 // ── WS handler ─────────────────────────────────────────────────────────────
 
-async fn ws_handler(ws: WebSocketUpgrade, session: SharedSession) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, session))
-}
-
 async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSession) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Send snapshot on connect.
     let (snapshot, mut broadcast_rx) = {
         let s = session.lock().await;
         s.subscribe()
@@ -115,7 +220,6 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSess
         return;
     }
 
-    // Spawn broadcast forwarder.
     let forward_handle = tokio::spawn(async move {
         loop {
             match broadcast_rx.recv().await {
@@ -134,7 +238,6 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSess
         }
     });
 
-    // Read loop: parse ClientMsg and dispatch.
     while let Some(Ok(msg)) = receiver.next().await {
         match msg {
             Message::Text(text) => {
