@@ -103,7 +103,8 @@ impl Tool for GrepTool {
          to a `path` and/or filter files with a `glob` (e.g. '*.rs'). Set `context` to lines of \
          surrounding context per match, 0-10 (2-3 is usually enough) to see the lines around each \
          match instead of making a follow-up read call. Set `multiline` to true for patterns that \
-         span line boundaries."
+         span line boundaries. Same matching shape as `replace`: `pattern` is a regex unless \
+         `literal: true`, so a pattern that worked here means the same thing there."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({

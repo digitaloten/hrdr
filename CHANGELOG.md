@@ -89,6 +89,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   timeout.) `watch` is unchanged; the `[[hooks]]` and `[lsp]` config keys
   (`timeout_ms`, `wait_ms`) are user-facing TOML, not tool schema, and keep
   their units.
+- **BREAKING (tool API): `replace` now takes `pattern` with `grep`'s matching
+  shape — a regex by default, `literal: true` to opt out.** `replace` used to
+  take `find`, matched as a LITERAL unless `regex: true` opted in — the exact
+  inverse of `grep`'s `pattern`/`literal` pair, under a different field name. A
+  model that had just run `grep` and reached for `replace` wrote its regex into
+  `find` and got a silent literal match: `\bfoo\b` matched nothing, `a.b`
+  matched only a dot. The two tools now share one shape. `find` → `pattern`
+  (required); `regex: bool` is **removed** and replaced by `literal: bool`
+  (default false). Because regex is the default, capture references in `replace`
+  (`$1`, `${name}`) now expand without a flag; under `literal` the replacement
+  is inserted verbatim (`$1` stays `$1`). No compat shim: both dead fields are
+  **rejected** rather than ignored — passing `find` or `regex` errors with the
+  shape it became, since silently accepting either would flip what a call
+  _means_, not merely fail. A pattern that fails to compile now ends with "if
+  you meant exact text, pass `literal: true`", and a metacharacter-laden pattern
+  that compiles but matches nothing gets the same nudge in its no-match report
+  (now worded "No file matches …", not "No file contains …"). `grep`'s
+  description points at the shared shape.
+
 - **BREAKING (tool API): the `models` tool is a drill-down, and
   `mode: "available"` is gone.** That mode returned EVERY reachable model as
   rows — a large result to carry, and the thing that made mis-resolution easy:

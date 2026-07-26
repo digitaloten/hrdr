@@ -4,10 +4,11 @@
 //! worst mutation path available to it: silent about what it changed — a bad
 //! regex corrupts the tree and the model reports success.
 //!
-//! This tool walks the project respecting `.gitignore`, matches a **literal**
-//! string by default (a regex only when asked), and returns a unified diff per
-//! file so the change is visible in the transcript. `dry_run: true` reports what
-//! *would* change without writing.
+//! This tool walks the project respecting `.gitignore`, matches `pattern` as a
+//! **regex** by default (`literal: true` for exact text) — the same matching
+//! shape as `grep`, so a pattern that worked there means the same thing here —
+//! and returns a unified diff per file so the change is visible in the
+//! transcript. `dry_run: true` reports what *would* change without writing.
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -33,7 +34,9 @@ pub struct ReplaceTool;
 
 #[derive(Deserialize)]
 struct ReplaceArgs {
-    find: String,
+    /// A regular expression (captures usable as `$1` in `replace`) unless
+    /// `literal` is set — the same shape as `grep`'s `pattern`.
+    pattern: String,
     replace: String,
     /// Restrict to paths matching this glob (e.g. `src/**/*.rs`).
     #[serde(default)]
@@ -41,13 +44,42 @@ struct ReplaceArgs {
     /// Directory to search under; defaults to the working directory.
     #[serde(default)]
     path: Option<String>,
-    /// Treat `find` as a regular expression (captures usable as `$1` in
-    /// `replace`). Default false: a literal string.
+    /// Treat `pattern` as a fixed string rather than a regex — and the
+    /// replacement as fixed text, with no `$1` expansion. Default false.
     #[serde(default)]
-    regex: bool,
+    literal: bool,
     /// Report what would change, write nothing. Default false.
     #[serde(default)]
     dry_run: bool,
+}
+
+/// The pre-1.0 rename of `find` → `pattern` inverted the matching polarity as
+/// well (literal-by-default → regex-by-default), so silently accepting the old
+/// field would flip what a call *means* rather than merely failing: `a.b` used
+/// to match a dot, and now matches any character. Both dead fields are rejected
+/// with the shape they became.
+fn reject_removed_args(args: &serde_json::Value) -> Result<()> {
+    let Some(obj) = args.as_object() else {
+        return Ok(());
+    };
+    if obj.contains_key("find") {
+        bail!("`find` is now `pattern` (a regex by default; `literal: true` for exact text)");
+    }
+    if obj.contains_key("regex") {
+        bail!(
+            "`regex` is gone — patterns are regex by default; use `literal: true` for exact text"
+        );
+    }
+    Ok(())
+}
+
+/// Does this look like someone meant exact text but wrote it into a regex
+/// field? Used only to decide whether to append the `literal: true` nudge to an
+/// error or a no-match report — never to change matching.
+fn has_regex_metachars(s: &str) -> bool {
+    s.contains([
+        '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '\\',
+    ])
 }
 
 #[async_trait]
@@ -59,48 +91,61 @@ impl Tool for ReplaceTool {
         "Replace text across many files at once — a project-wide textual substitution. To \
          rename a *code symbol*, prefer the `rename` tool instead: it's scope-aware via the \
          language server, where a textual replace also hits comments, strings, and \
-         substrings of unrelated names. `find` is a literal string unless `regex` is true. \
-         Narrow the sweep with `glob` (e.g. \"src/**/*.rs\") and/or `path`. Files over 2 MiB \
-         are skipped. Returns a unified diff of every file changed. Use `dry_run: true` to \
-         preview first. Prefer this over `bash sed -i`: it shows you exactly what it changed."
+         substrings of unrelated names. Same matching shape as `grep`: `pattern` is a regex \
+         unless `literal: true` — set literal for exact text containing `.` `(` `*` etc. \
+         `replace` may use `$1` capture groups unless `literal`. Narrow the sweep with `glob` \
+         (e.g. \"src/**/*.rs\") and/or `path`. Files over 2 MiB are skipped. Returns a unified \
+         diff of every file changed. Use `dry_run: true` to preview first. Prefer this over \
+         `bash sed -i`: it shows you exactly what it changed."
     }
     fn parameters(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "find": {"type": "string", "description": "Text to find. A literal string unless `regex` is true."},
-                "replace": {"type": "string", "description": "Replacement text. With `regex`, $1/$2 refer to capture groups; brace them (${1}) when a letter, digit or underscore follows, or the group name swallows it."},
+                "pattern": {"type": "string", "description": "Text to match — same matching shape as `grep`: a regex unless `literal` is true. Set `literal` for exact text containing `.` `(` `*` etc."},
+                "replace": {"type": "string", "description": "Replacement text. May use $1/$2 capture groups unless `literal` is true; brace them (${1}) when a letter, digit or underscore follows, or the group name swallows it. With `literal`, it is inserted verbatim ($1 stays $1)."},
                 "glob": {"type": "string", "description": "Only files matching this glob, e.g. \"src/**/*.rs\"."},
                 "path": {"type": "string", "description": "Directory to search under. Defaults to the working directory."},
-                "regex": {"type": "boolean", "description": "Treat `find` as a regular expression. Default false."},
+                "literal": {"type": "boolean", "description": "Treat `pattern` as a fixed string, not a regex — use for exact text like 'foo(bar)', 'a.b', '$var'. Also disables $1 expansion in `replace`. Default false."},
                 "dry_run": {"type": "boolean", "description": "Report the diff without writing. Default false."}
             },
-            "required": ["find", "replace"]
+            "required": ["pattern", "replace"]
         })
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
+        reject_removed_args(&args)?;
         let a: ReplaceArgs = crate::tool_args("replace", args)?;
-        if a.find.is_empty() {
-            bail!("`find` is empty — that would match at every position in every file");
+        if a.pattern.is_empty() {
+            bail!("`pattern` is empty — that would match at every position in every file");
         }
         let root = match &a.path {
             Some(p) => ctx.resolve(p),
             None => ctx.cwd.clone(),
         };
 
-        let re = if a.regex {
-            regex::Regex::new(&a.find).with_context(|| format!("invalid regex: {}", a.find))?
+        let re = if a.literal {
+            regex::Regex::new(&regex::escape(&a.pattern)).expect("an escaped literal is valid")
         } else {
-            regex::Regex::new(&regex::escape(&a.find)).expect("an escaped literal is valid")
+            // A literal-intent string (`foo.bar(x)`) is now compiled as a regex,
+            // so the most likely cause of a compile failure is exactly that
+            // mistake — say so in the error rather than leaving the model to
+            // debug a regex it never meant to write.
+            regex::Regex::new(&a.pattern).with_context(|| {
+                format!(
+                    "invalid regex: {} — if you meant exact text, pass `literal: true`",
+                    a.pattern
+                )
+            })?
         };
-        let pattern = a
+        // Named for what it is — `pattern` alone now means the *match* pattern.
+        let glob_pattern = a
             .glob
             .as_deref()
             .map(|g| glob::Pattern::new(g).with_context(|| format!("invalid glob: {g}")))
             .transpose()?;
 
-        let (candidates, oversized) = collect_files(&root, pattern.as_ref(), ctx)?;
+        let (candidates, oversized) = collect_files(&root, glob_pattern.as_ref(), ctx)?;
 
         // Phase 1 — plan. Every file the sweep would rewrite is checked before
         // any of them is written, so a file this agent may not touch aborts the
@@ -122,52 +167,52 @@ impl Tool for ReplaceTool {
             }
             if planned.len() >= MAX_FILES {
                 bail!(
-                    "more than {MAX_FILES} files contain {:?} — narrow the sweep with `glob` \
+                    "more than {MAX_FILES} files match {:?} — narrow the sweep with `glob` \
                      or `path`",
-                    a.find
+                    a.pattern
                 );
             }
             // Only now is the file a mutation target, so only now must it satisfy
             // this agent's extension allow-list.
             //
-            // Bound output size before it can OOM: `find="e"`, `replace=50KB`
+            // Bound output size before it can OOM: `pattern="e"`, `replace=50KB`
             // could expand even a single sub-2 MB file into gigabytes. The two
             // modes are bounded differently because only one admits an exact
             // pre-projection:
             //   * LITERAL — each hit grows the output by exactly
-            //     `replace.len() - find.len()`, so the projection below is exact
-            //     and can refuse before allocating anything.
+            //     `replace.len() - pattern.len()`, so the projection below is
+            //     exact and can refuse before allocating anything.
             //   * REGEX — the template's capture references (`$1`, `${name}`,
             //     `$0`) expand to matched text of unknown size, so no pre-hoc
             //     estimate off `replace.len()` is safe (it under-counts and would
             //     let a `$1$1$1…` template OOM). It is bounded *incrementally*
             //     while the output is built (`bounded_regex_replace`), aborting
             //     the moment the real output crosses the ceiling.
-            let after = if a.regex {
-                match bounded_regex_replace(&re, &a.replace, &before, MAX_EDIT_OUTPUT_BYTES) {
-                    Ok(after) => after,
-                    Err(len) => bail!(
-                        "replacing {:?} in {} would produce ~{len}+ bytes; narrow `find` or \
-                         the sweep",
-                        a.find,
-                        super::rel_display(&path, &ctx.cwd)
-                    ),
-                }
-            } else {
-                if a.replace.len() > a.find.len() {
+            let after = if a.literal {
+                if a.replace.len() > a.pattern.len() {
                     let projected = before
                         .len()
-                        .saturating_add(hits.saturating_mul(a.replace.len() - a.find.len()));
+                        .saturating_add(hits.saturating_mul(a.replace.len() - a.pattern.len()));
                     if projected > MAX_EDIT_OUTPUT_BYTES {
                         bail!(
-                            "replacing {:?} in {} would produce ~{projected} bytes; narrow `find` \
-                             or the sweep",
-                            a.find,
+                            "replacing {:?} in {} would produce ~{projected} bytes; narrow \
+                             `pattern` or the sweep",
+                            a.pattern,
                             super::rel_display(&path, &ctx.cwd)
                         );
                     }
                 }
-                before.replace(&a.find, &a.replace)
+                before.replace(&a.pattern, &a.replace)
+            } else {
+                match bounded_regex_replace(&re, &a.replace, &before, MAX_EDIT_OUTPUT_BYTES) {
+                    Ok(after) => after,
+                    Err(len) => bail!(
+                        "replacing {:?} in {} would produce ~{len}+ bytes; narrow `pattern` or \
+                         the sweep",
+                        a.pattern,
+                        super::rel_display(&path, &ctx.cwd)
+                    ),
+                }
             };
             if after == before {
                 continue;
@@ -215,7 +260,15 @@ impl Tool for ReplaceTool {
         });
 
         if changed.is_empty() {
-            let mut out = format!("No file contains {:?} — nothing changed.", a.find);
+            let mut out = format!("No file matches {:?} — nothing changed.", a.pattern);
+            // A pattern full of metacharacters that compiled but matched nothing
+            // is the signature of literal intent written into a regex field
+            // (`foo.bar(x)` compiles fine, and matches nothing that isn't also
+            // regex-shaped) — so nudge, but only when there is something to
+            // nudge about.
+            if !a.literal && has_regex_metachars(&a.pattern) {
+                out.push_str(" If you meant exact text, pass `literal: true`.");
+            }
             if let Some(note) = &skip_note {
                 out.push('\n');
                 out.push_str(note);
@@ -253,11 +306,11 @@ impl Tool for ReplaceTool {
     }
 }
 
-/// Every text-sized, non-secret file under `root` that `pattern` admits,
+/// Every text-sized, non-secret file under `root` that `glob_pattern` admits,
 /// honouring `.gitignore` — the same walker `find` uses, so the two agree on
 /// what "the project" is. This is the sweep's *candidate* set, before any
 /// content is inspected — [`MAX_FILES`] is enforced against files that
-/// actually match `find` (see the caller), not against how many candidates
+/// actually match `pattern` (see the caller), not against how many candidates
 /// this turns up, so a large repo with few hits still succeeds.
 ///
 /// The second element is the project-relative paths of files that were
@@ -266,7 +319,7 @@ impl Tool for ReplaceTool {
 /// caller reports this list back.
 fn collect_files(
     root: &std::path::Path,
-    pattern: Option<&glob::Pattern>,
+    glob_pattern: Option<&glob::Pattern>,
     ctx: &ToolContext,
 ) -> Result<(Vec<std::path::PathBuf>, Vec<String>)> {
     let mut out = Vec::new();
@@ -282,7 +335,7 @@ fn collect_files(
         if crate::secret_file_reason(&crate::canonicalize_nearest(&path)).is_some() {
             continue;
         }
-        if let Some(p) = pattern {
+        if let Some(p) = glob_pattern {
             // Match the project-relative path, so `src/**/*.rs` means what it
             // looks like rather than depending on the absolute prefix.
             let rel = path.strip_prefix(&ctx.cwd).unwrap_or(&path);
@@ -384,7 +437,7 @@ mod tests {
         write(&dir.path().join("sub/c.rs"), "old_name()\n").await;
 
         let out = ReplaceTool
-            .execute(json!({"find": "old_name", "replace": "new_name"}), &ctx)
+            .execute(json!({"pattern":"old_name", "replace": "new_name"}), &ctx)
             .await
             .unwrap();
 
@@ -406,15 +459,56 @@ mod tests {
         );
     }
 
-    /// A literal `find` is not a regex: metacharacters match themselves.
+    /// `pattern` is a regex by default — the same shape as `grep` — so
+    /// metacharacters are metacharacters and `$1` in `replace` expands a
+    /// capture, with no flag asked for.
     #[tokio::test]
-    async fn find_is_literal_unless_regex_is_asked_for() {
+    async fn pattern_is_a_regex_by_default_with_capture_groups() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ToolContext::new(dir.path());
         write(&dir.path().join("a.txt"), "a.c and abc\n").await;
 
         ReplaceTool
-            .execute(json!({"find": "a.c", "replace": "X"}), &ctx)
+            .execute(
+                json!({"pattern": "a.c", "replace": "X", "glob": "a.txt"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&dir.path().join("a.txt")).await,
+            "X and X\n",
+            "`.` matched any character — regex is the default"
+        );
+
+        // Captures work without any flag. `${1}` is braced because a bare
+        // `$1_v2` would name the group `1_v2`, which does not exist, and expand
+        // to nothing.
+        write(&dir.path().join("b.txt"), "fn foo() {}\n").await;
+        ReplaceTool
+            .execute(
+                json!({"pattern": r"fn (\w+)\(", "replace": "fn ${1}_v2(", "glob": "b.txt"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read(&dir.path().join("b.txt")).await, "fn foo_v2() {}\n");
+    }
+
+    /// `literal: true` opts out of regex on both sides: metacharacters in
+    /// `pattern` match themselves, and `$1` in `replace` is inserted verbatim
+    /// rather than expanding a capture that doesn't exist.
+    #[tokio::test]
+    async fn literal_true_matches_exact_text_and_inserts_the_replacement_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        write(&dir.path().join("a.txt"), "a.c and abc\n").await;
+
+        ReplaceTool
+            .execute(
+                json!({"pattern": "a.c", "replace": "X", "literal": true, "glob": "a.txt"}),
+                &ctx,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -423,15 +517,56 @@ mod tests {
             "`.` was literal"
         );
 
-        // As a regex, `.` matches any character — and captures work. `${1}` is
-        // braced because a bare `$1_v2` would name the group `1_v2`, which does
-        // not exist, and expand to nothing.
-        write(&dir.path().join("b.txt"), "fn foo() {}\n").await;
+        // Exact text full of metacharacters — the case that would otherwise be
+        // a regex compile error or a wrong match.
+        write(&dir.path().join("b.txt"), "foo.bar(x) + 1\n").await;
         ReplaceTool
-            .execute(json!({"find": r"fn (\w+)\(", "replace": "fn ${1}_v2(", "regex": true, "glob": "b.txt"}), &ctx)
+            .execute(
+                json!({"pattern": "foo.bar(x)", "replace": "baz($1)", "literal": true, "glob": "b.txt"}),
+                &ctx,
+            )
             .await
             .unwrap();
-        assert_eq!(read(&dir.path().join("b.txt")).await, "fn foo_v2() {}\n");
+        assert_eq!(
+            read(&dir.path().join("b.txt")).await,
+            "baz($1) + 1\n",
+            "`$1` is verbatim under `literal`, not a capture reference"
+        );
+    }
+
+    /// The dead pre-1.0 fields are rejected, not silently ignored: accepting
+    /// them would flip a call's meaning (literal-by-default → regex-by-default)
+    /// rather than fail.
+    #[tokio::test]
+    async fn the_old_find_and_regex_fields_are_refused_with_the_new_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        write(&dir.path().join("a.txt"), "old\n").await;
+
+        let err = ReplaceTool
+            .execute(json!({"find": "old", "replace": "new"}), &ctx)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`find` is now `pattern`"), "{msg}");
+        assert!(msg.contains("literal: true"), "{msg}");
+
+        let err = ReplaceTool
+            .execute(
+                json!({"pattern": "old", "replace": "new", "regex": true}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`regex` is gone"), "{msg}");
+        assert!(msg.contains("literal: true"), "{msg}");
+
+        assert_eq!(
+            read(&dir.path().join("a.txt")).await,
+            "old\n",
+            "a rejected call writes nothing"
+        );
     }
 
     #[tokio::test]
@@ -442,7 +577,7 @@ mod tests {
 
         let out = ReplaceTool
             .execute(
-                json!({"find": "old", "replace": "new", "dry_run": true}),
+                json!({"pattern":"old", "replace": "new", "dry_run": true}),
                 &ctx,
             )
             .await
@@ -468,7 +603,7 @@ mod tests {
 
         ReplaceTool
             .execute(
-                json!({"find": "x", "replace": "y", "glob": "src/**/*.rs"}),
+                json!({"pattern":"x", "replace": "y", "glob": "src/**/*.rs"}),
                 &ctx,
             )
             .await
@@ -482,23 +617,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_empty_find_and_a_bad_regex_are_refused() {
+    async fn an_empty_pattern_and_a_bad_regex_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ToolContext::new(dir.path());
         let err = ReplaceTool
-            .execute(json!({"find": "", "replace": "x"}), &ctx)
+            .execute(json!({"pattern":"", "replace": "x"}), &ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");
 
+        // Regex-by-default means a literal-intent string can now fail to
+        // compile — the error must name the way out.
         let err = ReplaceTool
-            .execute(
-                json!({"find": "(unclosed", "replace": "x", "regex": true}),
-                &ctx,
-            )
+            .execute(json!({"pattern":"(unclosed", "replace": "x"}), &ctx)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("invalid regex"), "{err}");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("invalid regex"), "{msg}");
+        assert!(
+            msg.contains("if you meant exact text, pass `literal: true`"),
+            "the bad-regex error must carry the literal hint: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -507,10 +646,33 @@ mod tests {
         let ctx = ToolContext::new(dir.path());
         write(&dir.path().join("a.txt"), "hello\n").await;
         let out = ReplaceTool
-            .execute(json!({"find": "absent", "replace": "x"}), &ctx)
+            .execute(json!({"pattern":"absent", "replace": "x"}), &ctx)
             .await
             .unwrap();
-        assert!(out.starts_with("No file contains"), "{out}");
+        assert!(out.starts_with("No file matches"), "{out}");
+        assert!(
+            !out.contains("literal: true"),
+            "no metacharacters, so no misleading nudge:\n{out}"
+        );
+    }
+
+    /// A pattern that compiles but matches nothing, full of metacharacters, is
+    /// the signature of literal intent written into a regex field — the
+    /// no-match report says so rather than leaving the model to guess.
+    #[tokio::test]
+    async fn a_metacharacter_pattern_that_matches_nothing_suggests_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        write(&dir.path().join("a.txt"), "hello\n").await;
+        let out = ReplaceTool
+            .execute(json!({"pattern": "foo.bar(x)", "replace": "y"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.starts_with("No file matches"), "{out}");
+        assert!(
+            out.contains("If you meant exact text, pass `literal: true`."),
+            "{out}"
+        );
     }
 
     /// A `.env` (or other secret file) is never rewritten, even when it
@@ -524,7 +686,7 @@ mod tests {
         let ctx = ToolContext::new(dir.path());
 
         let out = ReplaceTool
-            .execute(json!({"find": "old_name", "replace": "new_name"}), &ctx)
+            .execute(json!({"pattern":"old_name", "replace": "new_name"}), &ctx)
             .await
             .unwrap();
 
@@ -558,7 +720,7 @@ mod tests {
         write(&dir.path().join("small.txt"), "needle\n").await;
 
         let out = ReplaceTool
-            .execute(json!({"find": "needle", "replace": "found"}), &ctx)
+            .execute(json!({"pattern":"needle", "replace": "found"}), &ctx)
             .await
             .unwrap();
 
@@ -591,21 +753,21 @@ mod tests {
         write(&dir.path().join("big.txt"), &big).await;
 
         let out = ReplaceTool
-            .execute(json!({"find": "needle", "replace": "found"}), &ctx)
+            .execute(json!({"pattern":"needle", "replace": "found"}), &ctx)
             .await
             .unwrap();
 
-        assert!(out.starts_with("No file contains"), "{out}");
+        assert!(out.starts_with("No file matches"), "{out}");
         assert!(out.contains("1 file over 2 MiB skipped: big.txt"), "{out}");
     }
 
-    /// `MAX_FILES` bounds the files that actually *match* `find`, not every
+    /// `MAX_FILES` bounds the files that actually *match* `pattern`, not every
     /// candidate the walk turns up — a repo with far more than `MAX_FILES`
     /// files but only a few hits must still succeed.
     #[tokio::test]
     async fn max_files_counts_matches_not_candidates() {
         let dir = tempfile::tempdir().unwrap();
-        // Many more candidate files than MAX_FILES, none containing `find`.
+        // Many more candidate files than MAX_FILES, none matching `pattern`.
         for i in 0..(MAX_FILES + 50) {
             write(&dir.path().join(format!("f{i}.txt")), "nothing here\n").await;
         }
@@ -614,7 +776,7 @@ mod tests {
         let ctx = ToolContext::new(dir.path());
 
         let out = ReplaceTool
-            .execute(json!({"find": "needle", "replace": "found"}), &ctx)
+            .execute(json!({"pattern":"needle", "replace": "found"}), &ctx)
             .await
             .unwrap();
         assert!(out.contains("across 1 file"), "{out}");
@@ -638,7 +800,7 @@ mod tests {
         write(&dir.path().join("a.txt"), "old\n").await;
 
         let out = ReplaceTool
-            .execute(json!({"find": "old", "replace": "new"}), &ctx)
+            .execute(json!({"pattern":"old", "replace": "new"}), &ctx)
             .await
             .unwrap();
 
@@ -666,7 +828,7 @@ mod tests {
         write(&dir.path().join("a.txt"), "old\n").await;
 
         let out = ReplaceTool
-            .execute(json!({"find": "old", "replace": "new"}), &ctx)
+            .execute(json!({"pattern":"old", "replace": "new"}), &ctx)
             .await
             .unwrap();
 
@@ -700,7 +862,7 @@ mod tests {
 
         let out = ReplaceTool
             .execute(
-                json!({"find": "old", "replace": "new", "dry_run": true}),
+                json!({"pattern":"old", "replace": "new", "dry_run": true}),
                 &ctx,
             )
             .await
@@ -806,7 +968,7 @@ mod tests {
 
         let err = ReplaceTool
             .execute(
-                json!({"find": "(a)", "replace": "$1".repeat(1_000), "regex": true}),
+                json!({"pattern": "(a)", "replace": "$1".repeat(1_000)}),
                 &ctx,
             )
             .await
@@ -814,7 +976,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("would produce"), "{msg}");
         assert!(msg.contains("+ bytes"), "reports a lower-bound size: {msg}");
-        assert!(msg.contains("narrow `find`"), "{msg}");
+        assert!(msg.contains("narrow `pattern`"), "{msg}");
         assert_eq!(
             read(&dir.path().join("big.txt")).await,
             input,

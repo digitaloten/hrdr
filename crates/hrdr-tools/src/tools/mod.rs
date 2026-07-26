@@ -435,7 +435,7 @@ mod tests {
         ReadTool.execute(json!({"path": p}), &c).await.unwrap();
         ReplaceTool
             .execute(
-                json!({"find": "old_name", "replace": "new_name", "path": dir.path().to_str().unwrap()}),
+                json!({"pattern": "old_name", "replace": "new_name", "path": dir.path().to_str().unwrap()}),
                 &c,
             )
             .await
