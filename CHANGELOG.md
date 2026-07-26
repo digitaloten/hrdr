@@ -85,8 +85,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   writes at all; reads only under its cwd, scratch, and tool-output). The file
   tools (`write`, `edit`, `replace`, `move`, `copy`, `delete`, `read`, `grep`,
   `ls`, `tree`, `lsp_nav`) enforce it today, with symlink and `..` escapes
-  resolved before the check; the OS-level layer for shell children lands next. A
-  refused write reads
+  resolved before the check. A refused write reads
   `sandbox: refusing to write <path> — it is outside this agent's writable roots. You may write only under: …`.
   Escape hatches, in order of bluntness:
   `sandbox_writable_roots = ["/abs/path"]` (the remedy for a cold
@@ -94,6 +93,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `sandbox = "read"`/`"write"` in config.toml, `HRDR_SANDBOX`, and
   `--sandbox none` / `--no-sandbox`, which restores the previous full-access
   behavior exactly.
+- **On Linux, `shell` and `watch` commands now run inside `bwrap` — the kernel
+  enforces the same boundary the file tools do.** A path guard can only see the
+  paths a tool is handed; `echo x > ../../main.rs`, `cd .. && git commit` and
+  every other write a subprocess performs are invisible to it, which is exactly
+  how the escape that motivated this happened. Each command is now a fresh
+  bubblewrap mount namespace: in `write` mode the whole filesystem is read-only
+  and only the agent's writable roots are bound read-write, so a write outside
+  them fails with `Read-only file system` and creates nothing; in `read` mode
+  only `/usr`, `/etc`, a private `/tmp` and the readable roots exist at all, so
+  an outside path is `No such file or directory` rather than merely unwritable.
+  A sub-agent can still `git commit` inside its worktree (the worktree gitdir,
+  the object store, and the `refs/heads/hrdr/` namespaces are writable) while
+  `git -C <parent-repo> commit` fails on the parent's read-only index. The
+  environment is inherited whole (`PATH`, `HOME`, `CARGO_HOME` all survive),
+  stdio/exit status/timeouts/group-kill behave exactly as before, and the
+  network is untouched. `sandbox = "none"` skips the wrapper entirely. Where
+  bubblewrap or unprivileged user namespaces are unavailable — and on macOS and
+  Windows — shell commands run unconfined for now and say so once:
+  `sandbox: no OS-level sandbox is available on this system — shell commands are NOT OS-confined; the file tools remain guarded. Use --sandbox none to silence this.`
 - **BREAKING (tool API): every model-facing time parameter is in seconds —
   `shell`'s `timeout_ms` is now `timeout_secs`.** The tool schemas mixed units:
   `watch` took `interval_secs`/`timeout_secs` while `shell` took `timeout_ms`,

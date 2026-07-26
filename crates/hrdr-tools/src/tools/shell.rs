@@ -55,8 +55,9 @@ impl Shell {
 
     /// The arguments that precede the command string. Separate from
     /// [`Shell::program`] because it is not universally `-c` — PowerShell would
-    /// want `-NoProfile -Command`.
-    fn invoke_args(self) -> &'static [&'static str] {
+    /// want `-NoProfile -Command`. Visible to the crate so the sandbox wrapper
+    /// can rebuild the same invocation behind `bwrap` without hardcoding `-c`.
+    pub(crate) fn invoke_args(self) -> &'static [&'static str] {
         match self {
             Shell::Bash | Shell::Posix => &["-c"],
         }
@@ -287,7 +288,10 @@ impl Tool for ShellTool {
         if let Some(msg) = crate::check_guardrails(&a.command, &ctx.guardrails) {
             bail!("command blocked: {msg}");
         }
-        let mut cmd = self.shell.command(&a.command);
+        // Guardrails first, confinement second: a blocked command never runs,
+        // sandboxed or not.
+        let mut cmd =
+            crate::sandbox::sandboxed_shell_command(self.shell, &a.command, &ctx.sandbox, &ctx.cwd);
         cmd.current_dir(&ctx.cwd);
         let timeout = Duration::from_secs(a.timeout_secs.unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS));
         // A command is the usual reason a file the model read goes stale — a

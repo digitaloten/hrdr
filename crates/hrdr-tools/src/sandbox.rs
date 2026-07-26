@@ -3,9 +3,13 @@
 //! Two layers share one vocabulary. [`SandboxPolicy`] is the resolved boundary
 //! — a mode plus concrete, canonicalized root sets — consulted by the
 //! in-process file tools (software guard) and, on Linux, handed to the OS for
-//! shell children (bwrap/Landlock). This module owns the vocabulary and the
-//! path mechanics; the wiring into `ToolContext`, config, and the shell spawn
-//! lands in later slices, so most of what is here has no caller yet.
+//! shell children (bwrap/Landlock). This module owns the vocabulary, the path
+//! mechanics, and — via [`sandboxed_shell_command`] — the OS wrapper the
+//! `shell` and `watch` tools spawn through.
+//!
+//! The two layers are not redundant: the software guard sees only the paths a
+//! tool is *handed*, and a shell command is opaque to it. Everything a
+//! subprocess writes is the OS layer's job.
 //!
 //! The reason the boundary is *enforced* rather than *asked for*: hrdr runs
 //! arbitrary models, and guidance only reaches steerable ones. A delegated
@@ -331,16 +335,271 @@ pub fn take_sandbox_notice() -> Option<String> {
     notice_cell().lock().ok().and_then(|mut cell| cell.1.take())
 }
 
+/// Emitted when a confined agent's shell command runs without any OS-level
+/// confinement — no bwrap (and, until the Landlock arm lands, no Landlock
+/// either), a pre-Seatbelt macOS, or Windows. Never silently pretend to
+/// sandbox: the file tools stay guarded, the shell does not.
+const NO_OS_SANDBOX_NOTICE: &str = "sandbox: no OS-level sandbox is available on this system — \
+     shell commands are NOT OS-confined; the file tools remain guarded. Use --sandbox none to \
+     silence this.";
+
 /// Record a degradation notice. Only a message seen for the first time this
 /// process becomes pending; repeats are dropped.
-// No caller until the OS layer lands (slice 6 emits these at each degrade point).
-#[allow(dead_code)]
 pub(crate) fn set_sandbox_notice(msg: String) {
     if let Ok(mut cell) = notice_cell().lock()
         && cell.0.insert(msg.clone())
     {
         cell.1 = Some(msg);
     }
+}
+
+/// The OS mechanism available to confine *shell children* on this machine.
+///
+/// The file tools are guarded in-process regardless; this is only about the
+/// subprocesses `shell` and `watch` spawn, which the software guard cannot see
+/// inside of. bwrap is primary because it is the only one of the three that
+/// can confine reads as well as writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsSandboxBackend {
+    /// `bwrap(1)` — a mount namespace built per command (§3.6.1).
+    Bwrap,
+    /// Landlock LSM rules applied in the child. Writes only; wired in slice 6.
+    Landlock,
+    /// Nothing available: the shell runs unconfined and says so.
+    None,
+}
+
+/// The backend this process uses, probed once and cached — the probe spawns a
+/// process, and a shell tool call must not pay for that every time.
+pub fn detect_backend() -> OsSandboxBackend {
+    static BACKEND: OnceLock<OsSandboxBackend> = OnceLock::new();
+    *BACKEND.get_or_init(detect_backend_uncached)
+}
+
+/// Linux: bwrap if it exists *and* unprivileged user namespaces are usable
+/// (a kernel/distro switch — the binary being installed proves nothing), else
+/// Landlock if the LSM is enabled, else nothing.
+#[cfg(target_os = "linux")]
+fn detect_backend_uncached() -> OsSandboxBackend {
+    match which::which("bwrap") {
+        Ok(bwrap) if userns_probe_succeeds(&bwrap) => OsSandboxBackend::Bwrap,
+        _ => landlock_or_none(),
+    }
+}
+
+/// Run the smallest possible sandbox and see whether the kernel allows it.
+/// Mirrors Codex's `SYSTEM_BWRAP_PROBE_TIMEOUT` / `_POLL_INTERVAL` loop: spawn
+/// with null stdio, poll, kill on the deadline. A hung probe must not hang the
+/// session, so a timeout counts as failure.
+#[cfg(target_os = "linux")]
+fn userns_probe_succeeds(bwrap: &Path) -> bool {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    const TIMEOUT: Duration = Duration::from_millis(500);
+    const POLL: Duration = Duration::from_millis(50);
+
+    let Ok(mut child) = std::process::Command::new(bwrap)
+        .args([
+            "--unshare-user",
+            "--unshare-pid",
+            "--ro-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--",
+            "/bin/true",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// The Landlock LSM is only usable when the kernel has it enabled — the list
+/// of active LSMs is the authoritative answer.
+#[cfg(target_os = "linux")]
+fn landlock_or_none() -> OsSandboxBackend {
+    if std::fs::read_to_string("/sys/kernel/security/lsm")
+        .unwrap_or_default()
+        .contains("landlock")
+    {
+        OsSandboxBackend::Landlock
+    } else {
+        OsSandboxBackend::None
+    }
+}
+
+/// Every other platform: nothing yet. macOS gets Seatbelt in a later slice;
+/// Windows stays software-layer-only.
+#[cfg(not(target_os = "linux"))]
+fn detect_backend_uncached() -> OsSandboxBackend {
+    OsSandboxBackend::None
+}
+
+/// The command `shell`/`watch` actually spawn: `cmd_str` run through `shell`,
+/// wrapped in whatever OS confinement the policy's mode demands. Mode `None`
+/// — or a platform/kernel with no backend — returns exactly what
+/// [`crate::Shell::command`] returns today, so the unsandboxed path is
+/// byte-identical to the pre-sandbox behavior.
+///
+/// The caller still owns cwd, stdio, timeouts and process groups: bwrap
+/// inherits the cwd, passes stdio through untouched, propagates the child's
+/// exit status, and `--die-with-parent` plus the pid-namespace init mean the
+/// existing group-kill still reaches every descendant.
+///
+/// `cwd` is passed explicitly (rather than read off the policy) because the
+/// policy holds *roots*, and the roots of a write agent include several
+/// directories that are not where the command should start.
+pub fn sandboxed_shell_command(
+    shell: crate::Shell,
+    cmd_str: &str,
+    policy: &SandboxPolicy,
+    cwd: &Path,
+) -> tokio::process::Command {
+    if policy.mode == SandboxMode::None {
+        return shell.command(cmd_str);
+    }
+    match detect_backend() {
+        OsSandboxBackend::Bwrap => {
+            let mut cmd = tokio::process::Command::new("bwrap");
+            cmd.args(bwrap_args(policy.mode, policy, cwd, shell, cmd_str));
+            cmd
+        }
+        // Landlock confines nothing until its own slice wires the `pre_exec`
+        // ruleset, so for now it degrades exactly like having no backend —
+        // and says so, rather than pretending.
+        OsSandboxBackend::Landlock | OsSandboxBackend::None => {
+            set_sandbox_notice(NO_OS_SANDBOX_NOTICE.to_string());
+            shell.command(cmd_str)
+        }
+    }
+}
+
+/// The full bwrap argv (everything after `argv[0]`) for `mode`.
+///
+/// **Argument order is semantics**: bwrap applies mounts in argv order and a
+/// later mount shadows an earlier one. In `Write` mode the read-only root must
+/// come first so the writable binds layer on top of it; in `Read` mode the
+/// private `/tmp` must come *before* the cwd/scratch/tool-output binds, since
+/// those can live under `/tmp` and a tmpfs mounted after them hides them (a
+/// cwd under `/tmp` then makes even `--chdir` fail). The environment is
+/// inherited whole (no `--clearenv`): PATH/HOME/CARGO_HOME must survive.
+fn bwrap_args(
+    mode: SandboxMode,
+    policy: &SandboxPolicy,
+    cwd: &Path,
+    shell: crate::Shell,
+    cmd_str: &str,
+) -> Vec<std::ffi::OsString> {
+    /// `flags` verbatim.
+    fn push(args: &mut Vec<std::ffi::OsString>, flags: &[&str]) {
+        args.extend(flags.iter().map(std::ffi::OsString::from));
+    }
+    /// `<flag> <path> <path>` — every bwrap mount is source-then-destination,
+    /// and every mount here keeps the path it already has.
+    fn bind(args: &mut Vec<std::ffi::OsString>, flag: &str, path: &Path) {
+        args.push(flag.into());
+        args.push(path.into());
+        args.push(path.into());
+    }
+
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    push(&mut args, &["--new-session", "--die-with-parent"]);
+    match mode {
+        SandboxMode::Write => {
+            // Everything readable, nothing writable…
+            push(
+                &mut args,
+                &["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"],
+            );
+            // …then punch the writable roots through, in policy order.
+            for root in policy.writable_roots.iter().filter(|root| root.exists()) {
+                bind(&mut args, "--bind", root);
+            }
+        }
+        SandboxMode::Read => {
+            // Only the system dirs an interpreter/compiler needs exist at
+            // all; `/home`, `/opt`, `/var`, … are simply absent, so reads
+            // there fail with ENOENT — stronger than EROFS.
+            for system in ["/usr", "/etc"] {
+                let path = Path::new(system);
+                if path.is_dir() {
+                    bind(&mut args, "--ro-bind", path);
+                }
+            }
+            args.extend(usr_merge_compat_args());
+            push(&mut args, &["--tmpfs", "/tmp"]);
+            for root in policy.readable_roots.iter().filter(|root| root.exists()) {
+                bind(&mut args, "--ro-bind", root);
+            }
+            push(&mut args, &["--dev", "/dev", "--proc", "/proc"]);
+        }
+        // Unreachable: `sandboxed_shell_command` returns before it gets here.
+        SandboxMode::None => {}
+    }
+    push(&mut args, &["--unshare-user", "--unshare-pid"]);
+    args.push("--chdir".into());
+    // Canonicalized so the child lands in the directory that was actually
+    // bound, even when the inherited cwd reaches it through a symlink alias.
+    args.push(canonicalize_nearest(cwd).into());
+    args.push("--".into());
+    args.push(shell.program().into());
+    args.extend(shell.invoke_args().iter().map(std::ffi::OsString::from));
+    args.push(cmd_str.into());
+    args
+}
+
+/// `/bin`, `/sbin`, `/lib`, `/lib64` for the Read-mode mount set.
+///
+/// On a usr-merged distro these are symlinks into `/usr`, and bind-mounting a
+/// symlink source manufactures a real directory at the target — which breaks
+/// the merge and hides the real binaries. So: recreate the symlink with
+/// `--symlink`, reading its **actual** target rather than guessing
+/// `usr/<basename>` (on Arch `/sbin → usr/bin` and `/lib64 → usr/lib`, neither
+/// of which the guess produces). A real directory is bound read-only; an
+/// absent path contributes nothing.
+fn usr_merge_compat_args() -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    for compat in ["/bin", "/sbin", "/lib", "/lib64"] {
+        let path = Path::new(compat);
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            continue; // absent
+        };
+        if meta.file_type().is_symlink() {
+            let Ok(target) = std::fs::read_link(path) else {
+                continue;
+            };
+            args.push("--symlink".into());
+            args.push(target.into());
+            args.push(path.into());
+        } else if meta.is_dir() {
+            args.push("--ro-bind".into());
+            args.push(path.into());
+            args.push(path.into());
+        }
+    }
+    args
 }
 
 /// A [`crate::ToolContext`] rooted at `dir` and confined to it *alone*, for
@@ -489,13 +748,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn git_metadata_roots_for_a_linked_worktree() {
-        if which::which("git").is_err() {
-            return; // best-effort: exercise the real backend when available
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
+    /// A real repo with one commit at `<root>/repo` plus a linked worktree at
+    /// `<root>/wt` on branch `hrdr/task-1` — the exact shape a write
+    /// sub-agent runs in, and the one the metadata roots exist for.
+    fn repo_with_linked_worktree(root: &Path) -> (PathBuf, PathBuf) {
+        let repo = root.join("repo");
         std::fs::create_dir(&repo).unwrap();
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")
@@ -517,7 +774,7 @@ mod tests {
             "-m",
             "init",
         ]);
-        let wt = dir.path().join("wt");
+        let wt = root.join("wt");
         git(&[
             "worktree",
             "add",
@@ -526,6 +783,16 @@ mod tests {
             "hrdr/task-1",
             wt.to_str().unwrap(),
         ]);
+        (repo, wt)
+    }
+
+    #[test]
+    fn git_metadata_roots_for_a_linked_worktree() {
+        if which::which("git").is_err() {
+            return; // best-effort: exercise the real backend when available
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, wt) = repo_with_linked_worktree(dir.path());
 
         // A plain checkout needs nothing extra: its `.git` is under the cwd.
         assert!(git_metadata_roots(&repo).is_empty());
@@ -557,6 +824,356 @@ mod tests {
         check_write(&policy, &common.join("index")).unwrap_err();
         check_write(&policy, &common.join("refs").join("heads").join("main")).unwrap_err();
         check_write(&policy, &common.join("objects").join("aa").join("bb")).unwrap();
+    }
+
+    /// The argv as strings, for readable assertions.
+    fn argv(args: &[std::ffi::OsString]) -> Vec<String> {
+        args.iter().map(|a| a.to_string_lossy().into()).collect()
+    }
+
+    /// The index of the mount `<flag> <path> <path>` triple, or `None`.
+    fn mount_at(args: &[String], flag: &str, path: &Path) -> Option<usize> {
+        let shown = path.display().to_string();
+        args.windows(3)
+            .position(|w| w[0] == flag && w[1] == shown && w[2] == shown)
+    }
+
+    #[test]
+    fn bwrap_write_args_are_exactly_the_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let one = dir.path().join("one");
+        let two = dir.path().join("two");
+        std::fs::create_dir(&one).unwrap();
+        std::fs::create_dir(&two).unwrap();
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![one.clone(), two.clone()],
+            readable_roots: Vec::new(),
+        };
+        let args = argv(&bwrap_args(
+            SandboxMode::Write,
+            &policy,
+            dir.path(),
+            crate::Shell::Bash,
+            "echo hi",
+        ));
+
+        let chdir = canonicalize_nearest(dir.path()).display().to_string();
+        let expected: Vec<String> = [
+            "--new-session",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--bind",
+            &one.display().to_string(),
+            &one.display().to_string(),
+            "--bind",
+            &two.display().to_string(),
+            &two.display().to_string(),
+            "--unshare-user",
+            "--unshare-pid",
+            "--chdir",
+            &chdir,
+            "--",
+            "bash",
+            "-c",
+            "echo hi",
+        ]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+        assert_eq!(args, expected);
+
+        // Order is semantics: the read-only root must be mounted before the
+        // writable binds layer over it, or they are shadowed away.
+        let ro_root = args
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == "/" && w[2] == "/")
+            .unwrap();
+        assert!(ro_root < mount_at(&args, "--bind", &one).unwrap());
+        assert!(ro_root < mount_at(&args, "--bind", &two).unwrap());
+    }
+
+    #[test]
+    fn bwrap_read_args_omit_rw_binds_and_private_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy::for_agent(SandboxMode::Read, dir.path(), &[]);
+        let args = argv(&bwrap_args(
+            SandboxMode::Read,
+            &policy,
+            dir.path(),
+            crate::Shell::Bash,
+            "echo hi",
+        ));
+
+        assert!(
+            !args.iter().any(|a| a == "--bind"),
+            "read mode writes nothing: {args:?}"
+        );
+        assert!(
+            mount_at(&args, "--ro-bind", Path::new("/usr")).is_some(),
+            "{args:?}"
+        );
+
+        // `--tmpfs /tmp` must precede every readable-root bind: the scratch
+        // dir (and the tool-output dir in its fallback location) live under
+        // `/tmp`, and a tmpfs mounted after them hides them.
+        let tmpfs = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/tmp")
+            .expect("read mode gets a private /tmp");
+        for root in &policy.readable_roots {
+            let at = mount_at(&args, "--ro-bind", root)
+                .unwrap_or_else(|| panic!("{} is not bound: {args:?}", root.display()));
+            assert!(
+                tmpfs < at,
+                "--tmpfs /tmp ({tmpfs}) must precede {} ({at})",
+                root.display()
+            );
+        }
+
+        // `/bin` is a symlink on usr-merged distros: recreate it as one,
+        // pointing where it really points — a bind would manufacture a real
+        // directory and break the merge.
+        if let Ok(meta) = std::fs::symlink_metadata("/bin") {
+            if meta.file_type().is_symlink() {
+                let target = std::fs::read_link("/bin").unwrap().display().to_string();
+                assert!(
+                    args.windows(3)
+                        .any(|w| w[0] == "--symlink" && w[1] == target && w[2] == "/bin"),
+                    "expected --symlink {target} /bin in {args:?}"
+                );
+            } else if meta.is_dir() {
+                assert!(
+                    mount_at(&args, "--ro-bind", Path::new("/bin")).is_some(),
+                    "{args:?}"
+                );
+            }
+        }
+
+        assert_eq!(args[args.len() - 4..], ["--", "bash", "-c", "echo hi"]);
+    }
+
+    /// The canonical skip guard for the end-to-end tests: the real backend
+    /// when this machine has one, plus a shell to run through it.
+    #[cfg(target_os = "linux")]
+    fn bwrap_shell() -> Option<crate::Shell> {
+        if detect_backend() != OsSandboxBackend::Bwrap {
+            return None; // best-effort: exercise the real backend when available
+        }
+        crate::Shell::detect()
+    }
+
+    /// Run `command` through the real `shell` tool with `ctx`'s policy.
+    #[cfg(target_os = "linux")]
+    async fn run_shell(shell: crate::Shell, ctx: &crate::ToolContext, command: &str) -> String {
+        use crate::Tool as _;
+        crate::ShellTool::new(shell)
+            .execute(
+                serde_json::json!({"command": command, "timeout_secs": 60}),
+                ctx,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A write outside the roots dies in the kernel, not in the guard: the
+    /// mount is read-only, so the redirect fails and nothing is created. This
+    /// is the escape that motivated the whole feature, at the shell layer.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shell_write_outside_roots_hits_a_readonly_fs() {
+        let Some(shell) = bwrap_shell() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // A `for_agent` policy would bind `env::temp_dir()` writable and the
+        // second tempdir with it; confine to the cwd alone.
+        let ctx = confined_ctx(dir.path(), SandboxMode::Write);
+
+        let target = outside.path().join("escaped");
+        let out = run_shell(shell, &ctx, &format!("echo x > {}", target.display())).await;
+        assert!(out.contains("Read-only file system"), "{out}");
+        assert!(!target.exists(), "the write landed anyway");
+
+        // …including the shape actually observed in the wild: `cd` out first.
+        let out = run_shell(
+            shell,
+            &ctx,
+            &format!("cd {} && echo x > escaped2", outside.path().display()),
+        )
+        .await;
+        assert!(out.contains("Read-only file system"), "{out}");
+        assert!(!outside.path().join("escaped2").exists());
+    }
+
+    /// The flip side: everything the default root set covers really is
+    /// writable inside the sandbox, or no build would survive it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shell_write_in_cwd_and_tmp_succeeds_under_bwrap() {
+        let Some(shell) = bwrap_shell() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = crate::ToolContext::new(dir.path().to_path_buf());
+        ctx.sandbox = std::sync::Arc::new(SandboxPolicy::for_agent(
+            SandboxMode::Write,
+            dir.path(),
+            &[],
+        ));
+
+        let in_cwd = dir.path().join("in-cwd");
+        let in_scratch = session_scratch_dir().join("bwrap-write-probe");
+        let out = run_shell(
+            shell,
+            &ctx,
+            &format!(
+                "echo a > {} && echo b > {}",
+                in_cwd.display(),
+                in_scratch.display()
+            ),
+        )
+        .await;
+        assert!(!out.contains("[exit status"), "{out}");
+        assert_eq!(std::fs::read_to_string(&in_cwd).unwrap().trim(), "a");
+        assert_eq!(std::fs::read_to_string(&in_scratch).unwrap().trim(), "b");
+        let _ = std::fs::remove_file(&in_scratch);
+    }
+
+    /// The point of the whole feature: a sub-agent can commit its own work in
+    /// its worktree, and cannot commit to the parent repo — the escape that
+    /// started this. Only the §3.3 metadata roots are writable, never the
+    /// parent `.git` itself.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn worktree_commit_succeeds_but_parent_commit_is_blocked() {
+        let Some(shell) = bwrap_shell() else { return };
+        if which::which("git").is_err() {
+            return; // best-effort: exercise the real backend when available
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, wt) = repo_with_linked_worktree(dir.path());
+
+        // Struct literal, not `for_agent`: the repo lives in a tempdir, and a
+        // writable `env::temp_dir()` root would make the parent writable too
+        // and void the whole test.
+        let mut roots = vec![canonicalize_nearest(&wt)];
+        roots.extend(
+            git_metadata_roots(&wt)
+                .iter()
+                .map(|r| canonicalize_nearest(r)),
+        );
+        let mut ctx = crate::ToolContext::new(wt.clone());
+        ctx.sandbox = std::sync::Arc::new(SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: roots,
+            readable_roots: Vec::new(),
+        });
+
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        let ident = "-c user.email=t@example.com -c user.name=t";
+        let out = run_shell(
+            shell,
+            &ctx,
+            &format!("git add f.txt && git {ident} commit -q -m mine"),
+        )
+        .await;
+        assert!(
+            !out.contains("[exit status"),
+            "the worktree commit failed: {out}"
+        );
+        let log = std::process::Command::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&log.stdout).contains("mine"),
+            "the commit did not land: {log:?}"
+        );
+
+        // The parent repo's index is outside the roots, so committing there
+        // dies before it can touch a ref.
+        let out = run_shell(
+            shell,
+            &ctx,
+            &format!(
+                "git -C {} {ident} commit --allow-empty -m escaped",
+                repo.display()
+            ),
+        )
+        .await;
+        assert!(
+            out.contains("[exit status"),
+            "the parent commit succeeded: {out}"
+        );
+        let log = std::process::Command::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&log.stdout).contains("escaped"),
+            "a commit landed on the parent repo: {log:?}"
+        );
+    }
+
+    /// Read mode does not merely refuse writes — the rest of the filesystem
+    /// is not mounted at all, so an outside path is ENOENT rather than EROFS.
+    /// (`/usr` and `/etc` stay readable by design; probe `/home`.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn read_mode_cannot_even_see_outside_paths() {
+        let Some(shell) = bwrap_shell() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        let ctx = confined_ctx(dir.path(), SandboxMode::Read);
+
+        let out = run_shell(shell, &ctx, "ls /home").await;
+        assert!(out.contains("No such file or directory"), "{out}");
+
+        let out = run_shell(shell, &ctx, "ls").await;
+        assert!(out.contains("visible.txt"), "{out}");
+    }
+
+    /// The timeout still reaps the whole tree through bwrap:
+    /// `--die-with-parent` plus the pid-namespace init mean killing the spawn
+    /// group takes every descendant with it.
+    ///
+    /// The sibling test in `shell.rs` probes the backgrounded grandchild by
+    /// pid; that cannot work here, because `--unshare-pid` makes the pid the
+    /// child records a *namespace* pid that means something else on the host.
+    /// The marker file is the portable proof: it only appears if the
+    /// grandchild outlived the kill.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timeout_kill_reaches_through_bwrap() {
+        let Some(shell) = bwrap_shell() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = confined_ctx(dir.path(), SandboxMode::Write);
+        let marker = dir.path().join("grandchild-finished");
+
+        let command = format!("(sleep 5 && touch {m}) & sleep 5", m = marker.display());
+        use crate::Tool as _;
+        let out = crate::ShellTool::new(shell)
+            .execute(
+                serde_json::json!({"command": command, "timeout_secs": 1}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("timed out"), "{out}");
+
+        // Well past the grandchild's own sleep: if it were alive it would
+        // have touched the marker by now.
+        tokio::time::sleep(std::time::Duration::from_millis(5500)).await;
+        assert!(
+            !marker.exists(),
+            "the backgrounded grandchild survived the group kill"
+        );
     }
 
     #[test]
