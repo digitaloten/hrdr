@@ -106,23 +106,53 @@ pub async fn serve(
     if let Some((cert, key)) = tls {
         use axum_server::tls_rustls::RustlsConfig;
         let tls_cfg = RustlsConfig::from_pem_file(cert, key).await?;
+
+        // `axum_server` binds inside `serve()`, so the real bound address (which
+        // differs from `addr` whenever port 0 was requested) is only reachable
+        // through a `Handle`. A oneshot carries the serve error back out so a
+        // bind failure is reported instead of swallowed.
+        let bind_handle = axum_server::Handle::new();
+        let serve_handle = bind_handle.clone();
+        let (err_tx, err_rx) = tokio::sync::oneshot::channel::<std::io::Error>();
         let handle = tokio::spawn(async move {
-            axum_server::bind_rustls(addr, tls_cfg)
+            if let Err(e) = axum_server::bind_rustls(addr, tls_cfg)
+                .handle(serve_handle)
                 .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
-                .ok();
+                && let Err(e) = err_tx.send(e)
+            {
+                // Nobody is waiting on the bind result any more: the server was
+                // already running and has now died.
+                eprintln!("hrdr web: TLS server error: {e}");
+            }
         });
-        Ok(RunningServer { addr, handle })
+
+        // Resolves once the listener is bound, or `None` if binding failed.
+        match bind_handle.listening().await {
+            Some(bound_addr) => Ok(RunningServer {
+                addr: bound_addr,
+                handle,
+            }),
+            None => {
+                let reason = match err_rx.await {
+                    Ok(e) => e.to_string(),
+                    Err(_) => "unknown error".to_string(),
+                };
+                anyhow::bail!("failed to bind {addr} with TLS: {reason}");
+            }
+        }
     } else {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound_addr = listener.local_addr()?;
         let handle = tokio::spawn(async move {
-            axum::serve(
+            if let Err(e) = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
-            .ok();
+            {
+                eprintln!("hrdr web: server error: {e}");
+            }
         });
         Ok(RunningServer {
             addr: bound_addr,
@@ -327,8 +357,15 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSess
     let (line_tx, mut line_rx) =
         tokio::sync::mpsc::unbounded_channel::<(hrdr_app::LineKind, String)>();
 
+    // Direct channel: frames destined for THIS socket only (resume replays,
+    // per-connection snapshots). They are already sequenced, so the forward task
+    // serializes them as-is — no session lock, no new seq, no replay-buffer push,
+    // and crucially no broadcast to other clients.
+    let (direct_tx, mut direct_rx) =
+        tokio::sync::mpsc::unbounded_channel::<hrdr_protocol::ServerFrame>();
+
     let (snapshot, mut broadcast_rx) = {
-        let s = session.lock().await;
+        let mut s = session.lock().await;
         s.subscribe()
     };
     let snap_json = serde_json::to_string(&snapshot).unwrap();
@@ -349,11 +386,34 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSess
                                 break;
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            eprintln!("broadcast lagged by {n}");
-                            break;
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            // This client fell behind and the missed frames are
+                            // gone from the channel. Resynchronize it with a
+                            // fresh snapshot and keep serving — the receiver has
+                            // already skipped to the oldest retained frame, so
+                            // breaking here would leave the socket open and
+                            // permanently silent.
+                            let snap = {
+                                let mut s = forward_session.lock().await;
+                                s.build_snapshot()
+                            };
+                            let json = serde_json::to_string(&snap).unwrap();
+                            if sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                direct = direct_rx.recv() => {
+                    match direct {
+                        Some(frame) => {
+                            let json = serde_json::to_string(&frame).unwrap();
+                            if sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
                     }
                 }
                 line = line_rx.recv() => {
@@ -381,7 +441,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSess
         }
     });
 
-    while let Some(Ok(msg)) = receiver.next().await {
+    'recv: while let Some(Ok(msg)) = receiver.next().await {
         match msg {
             Message::Text(text) => {
                 let client_msg: hrdr_protocol::ClientMsg = match serde_json::from_str(&text) {
@@ -391,7 +451,13 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSess
                         continue;
                     }
                 };
-                handle_client_msg(client_msg, &session, &line_tx).await;
+                let direct = handle_client_msg(client_msg, &session, &line_tx).await;
+                for frame in direct {
+                    if direct_tx.send(frame).is_err() {
+                        // Forward task is gone — the socket is dead.
+                        break 'recv;
+                    }
+                }
             }
             Message::Close(_) => break,
             _ => {}
@@ -401,16 +467,20 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSess
     forward_handle.abort();
 }
 
+/// Handle one client message. The returned frames (if any) are destined for the
+/// requesting socket ALONE — the caller pushes them down that connection's
+/// direct channel. They must never be broadcast: other clients neither asked for
+/// them nor can make sense of another client's replay.
 async fn handle_client_msg(
     msg: hrdr_protocol::ClientMsg,
     session: &SharedSession,
     line_tx: &tokio::sync::mpsc::UnboundedSender<(hrdr_app::LineKind, String)>,
-) {
+) -> Vec<hrdr_protocol::ServerFrame> {
     match msg {
         hrdr_protocol::ClientMsg::Submit { pane, text } => {
             session.lock().await.submit(pane, text).await;
         }
-        hrdr_protocol::ClientMsg::Command { pane: _, line } => {
+        hrdr_protocol::ClientMsg::Command { pane, line } => {
             // Dispatch via WebHost.
             let mut s = session.lock().await;
             let mut host = crate::host::WebHost {
@@ -423,14 +493,11 @@ async fn handle_client_msg(
                     crate::convert::build_notice(seq, "use your browser's close button".into());
                 host.session.emit_internal(frame);
             } else if !line.starts_with('/') {
-                // Not a command — treat as plain text submit.
+                // Not a command — treat as plain text submit to the pane the
+                // client named (not always Main: sub-panes accept steers).
                 drop(host);
                 drop(s);
-                session
-                    .lock()
-                    .await
-                    .submit(hrdr_protocol::WirePaneId::Main, line)
-                    .await;
+                session.lock().await.submit(pane, line).await;
             } else {
                 let dispatched = hrdr_app::dispatch(&mut host, &line);
                 if !dispatched {
@@ -450,22 +517,28 @@ async fn handle_client_msg(
         }
         hrdr_protocol::ClientMsg::Resume { seq } => {
             let mut s = session.lock().await;
-            match s.replay_after(seq) {
+            return match s.replay_after(seq) {
                 Some(frames) => {
-                    let resumed = hrdr_protocol::ServerFrame {
-                        seq: s.next_seq_internal(),
+                    // The replayed frames keep their ORIGINAL seqs, so `Resumed`
+                    // must not take a fresh (higher) one — that would make this
+                    // client's seq stream jump forward and then back. It carries
+                    // no seq of its own: it reuses the last replayed frame's seq
+                    // (or the client's cursor when there is nothing to replay)
+                    // and is sent last, so the stream stays monotonic and the
+                    // marker means "you are now current at this seq".
+                    let resumed_seq = frames.last().map_or(seq, |f| f.seq);
+                    let mut out = frames;
+                    out.push(hrdr_protocol::ServerFrame {
+                        seq: resumed_seq,
                         msg: hrdr_protocol::ServerMsg::Resumed {},
-                    };
-                    s.emit_internal(resumed);
-                    for frame in frames {
-                        s.emit_internal(frame);
-                    }
+                    });
+                    out
                 }
-                None => {
-                    let snap = s.build_snapshot();
-                    s.emit_internal(snap);
-                }
-            }
+                // Gap: the client's cursor is behind the replay buffer. A fresh
+                // snapshot (which takes its own seq) resynchronizes it.
+                None => vec![s.build_snapshot()],
+            };
         }
     }
+    Vec::new()
 }

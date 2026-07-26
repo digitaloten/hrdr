@@ -184,16 +184,40 @@ impl WebSession {
 
     /// Subscribe to the broadcast — returns the current snapshot and a
     /// receiver for all future frames.
-    pub fn subscribe(&self) -> (ServerFrame, broadcast::Receiver<ServerFrame>) {
+    ///
+    /// Takes `&mut self` because the snapshot consumes a sequence number like
+    /// any other frame (see `build_snapshot`).
+    pub fn subscribe(&mut self) -> (ServerFrame, broadcast::Receiver<ServerFrame>) {
         let rx = self.broadcast.subscribe();
         let snap = self.build_snapshot();
         (snap, rx)
     }
 
-    /// Replay buffered frames after `seq`.
+    /// Replay buffered frames after `seq`, or `None` when the cursor is behind
+    /// the buffer (a gap the client can only recover from with a snapshot).
+    ///
+    /// The cursor need not name a frame that is still in — or ever was in — the
+    /// buffer: seqs are globally monotonic across broadcast and per-connection
+    /// frames, so a client's cursor may be the seq of a snapshot that was never
+    /// buffered (snapshots are per-connection and never pushed to `replay`).
+    /// The rules are therefore stated in terms of ordering, not membership:
+    ///
+    /// 1. cursor at or past the last emitted seq → already current, no frames.
+    /// 2. otherwise, if the buffer holds newer frames and starts no later than
+    ///    `seq + 1` (i.e. nothing between the cursor and the buffer was
+    ///    dropped) → every buffered frame after the cursor.
+    /// 3. otherwise → gap.
     pub fn replay_after(&self, seq: u64) -> Option<Vec<ServerFrame>> {
-        // If the exact seq is in the buffer, return everything after it.
-        if self.replay.iter().any(|f| f.seq == seq) {
+        // 1. Client is current (this also covers an empty buffer at seq 0).
+        if seq >= self.seq {
+            return Some(vec![]);
+        }
+        // 2. Contiguous tail available?
+        let oldest = self.replay.front().map(|f| f.seq);
+        if let Some(oldest) = oldest
+            && oldest <= seq + 1
+            && self.replay.back().is_some_and(|f| f.seq > seq)
+        {
             let frames: Vec<ServerFrame> = self
                 .replay
                 .iter()
@@ -202,19 +226,22 @@ impl WebSession {
                 .collect();
             return Some(frames);
         }
-        // seq not in buffer. If buffer is empty, return Some(empty).
-        // Otherwise the seq is before the buffer start → gap → None.
-        if self.replay.is_empty() {
-            Some(vec![])
-        } else {
-            None
-        }
+        // 3. Gap — the caller must send a fresh snapshot.
+        None
     }
 
     // ── snapshot ───────────────────────────────────────────────────────────
 
-    pub fn build_snapshot(&self) -> ServerFrame {
-        let seq = self.seq + 1; // don't advance seq for snapshot (caller manages)
+    /// Build a full-state snapshot frame.
+    ///
+    /// The snapshot is a frame like any other, so it takes its own sequence
+    /// number: reusing `seq + 1` without advancing would collide with the next
+    /// broadcast frame. It is *not* pushed to the replay buffer and *not*
+    /// broadcast — snapshots are per-connection. Seqs stay globally monotonic
+    /// across broadcast and per-connection frames, so the `last_seq` a client
+    /// learns from a snapshot is always a valid `Resume` cursor.
+    pub fn build_snapshot(&mut self) -> ServerFrame {
+        let seq = self.next_seq();
 
         let panes_vec: Vec<WirePane> = self.wire_panes();
         let active = wire_pane_id(self.panes.active());
@@ -897,6 +924,111 @@ mod tests {
         let result = session.replay_after(last_seq);
         assert!(result.is_some(), "last seq = Some(empty)");
         assert_eq!(result.unwrap().len(), 0);
+    }
+
+    /// The cursor rules: current, mid-buffer tail, and a genuine gap.
+    #[test]
+    fn replay_after_cursor_rules() {
+        let (mut session, _rx) = test_session();
+        for i in 0..5 {
+            let seq = session.next_seq();
+            session.emit_raw(build_notice(seq, format!("msg {i}")));
+        }
+        // Buffer now holds seqs 1..=5, last emitted seq is 5.
+
+        let tail = session
+            .replay_after(5)
+            .expect("cursor at head is not a gap");
+        assert!(tail.is_empty(), "cursor == last seq → nothing to replay");
+
+        let tail = session.replay_after(3).expect("mid-buffer cursor replays");
+        assert_eq!(
+            tail.iter().map(|f| f.seq).collect::<Vec<_>>(),
+            vec![4, 5],
+            "mid-buffer cursor → the frames after it"
+        );
+
+        let tail = session
+            .replay_after(0)
+            .expect("a buffer starting at seq 1 is contiguous with cursor 0");
+        assert_eq!(tail.len(), 5);
+
+        // Drop the two oldest frames: the buffer now starts at seq 3.
+        session.replay.pop_front();
+        session.replay.pop_front();
+        assert!(
+            session.replay_after(0).is_none(),
+            "cursor before the buffer → gap"
+        );
+        assert!(
+            session.replay_after(1).is_none(),
+            "cursor two frames before the buffer start → gap"
+        );
+        assert!(
+            session.replay_after(2).is_some(),
+            "cursor adjacent to the buffer start → contiguous"
+        );
+    }
+
+    /// A snapshot's seq is never in the replay buffer, but it is still a valid
+    /// resume cursor: it is newer than everything buffered, so the client is
+    /// current — a gap response (full snapshot) would be wrong.
+    #[test]
+    fn replay_after_accepts_snapshot_seq() {
+        let (mut session, _rx) = test_session();
+        for i in 0..3 {
+            let seq = session.next_seq();
+            session.emit_raw(build_notice(seq, format!("msg {i}")));
+        }
+        let snap = session.build_snapshot();
+        assert_eq!(snap.seq, 4, "snapshot takes the next seq");
+        assert!(
+            !session.replay.iter().any(|f| f.seq == snap.seq),
+            "snapshots are per-connection and never buffered"
+        );
+
+        let tail = session
+            .replay_after(snap.seq)
+            .expect("a snapshot seq is a valid cursor, not a gap");
+        assert!(tail.is_empty());
+    }
+
+    /// Snapshots consume a seq like every other frame, so the frames a later
+    /// tick broadcasts carry strictly higher seqs — no duplicates on the wire.
+    #[test]
+    fn snapshot_seq_is_monotonic_with_broadcast_frames() {
+        let (mut session, mut rx) = test_session();
+        let live = session.live.clone();
+
+        let snap = session.build_snapshot();
+        assert!(snap.seq >= 1, "snapshot takes a real seq");
+        assert!(rx.try_recv().is_err(), "snapshot is not broadcast");
+        assert!(session.replay.is_empty(), "snapshot is not buffered");
+
+        live.record(MAIN_KEY, &AgentEvent::Text("hi".into()));
+        session.tick();
+        let frames = drain_vec(&mut rx);
+        assert!(!frames.is_empty(), "tick should broadcast frames");
+        for f in &frames {
+            assert!(
+                f.seq > snap.seq,
+                "frame seq {} must exceed the snapshot's {}",
+                f.seq,
+                snap.seq
+            );
+        }
+        for pair in frames.windows(2) {
+            assert!(
+                pair[1].seq > pair[0].seq,
+                "broadcast seqs must strictly increase"
+            );
+        }
+
+        let snap2 = session.build_snapshot();
+        assert!(
+            snap2.seq > frames.last().unwrap().seq,
+            "a later snapshot advances past the broadcast frames"
+        );
     }
 
     #[test]

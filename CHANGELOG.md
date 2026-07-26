@@ -8,6 +8,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A WS `Resume` is answered on the requesting socket alone.** The replayed
+  frames and the `Resumed` marker went out through `WebSession::emit_internal`,
+  which broadcasts to every subscriber and re-pushes to the replay buffer: all
+  other connected clients received a stranger's replay, and the buffer
+  re-accumulated its own contents. `handle_client_msg` now returns the frames
+  destined for that one connection and `handle_socket` forwards them down a
+  per-connection channel — no session lock, no new seq, no replay push, no
+  broadcast. `Resumed` no longer takes a fresh (higher) seq while the replayed
+  frames keep their original lower ones: it reuses the last replayed frame's seq
+  (or the client's cursor when the replay is empty), so the client's seq stream
+  stays monotonic.
+- **Snapshot frames no longer collide with the next broadcast seq.**
+  `build_snapshot` used `self.seq + 1` without advancing the counter, so the
+  following frame reused that number and clients saw two different frames at one
+  seq. Snapshots now take their own seq via `next_seq()` (they are still
+  per-connection: never broadcast, never buffered), and `replay_after` accepts a
+  cursor that no buffered frame carries — a snapshot's seq newer than everything
+  buffered means "current", not "gap".
+- **A lagging web client recovers instead of hanging forever.** On
+  `broadcast::error::RecvError::Lagged` the forward task broke out of its loop,
+  leaving the socket open and permanently silent. It now resynchronizes the
+  client with a fresh snapshot and keeps serving; only `Closed` ends the loop.
+- **`RunningServer::addr` is the real bound address on the TLS path.** The TLS
+  branch returned the _requested_ address, so `port = 0` never revealed the port
+  it actually got, and `serve(...).await.ok()` swallowed bind and runtime
+  errors. It now drives `axum_server::Handle::listening()` for the bound
+  address, fails with the underlying error when binding fails, and reports a
+  serve error on stderr.
+- **A plain-text (non-slash) `Command` submits to the pane the client named**
+  instead of always falling back to the main pane.
 - **The web-UI landing left CI red on every job; all four breakages are fixed.**
   `hrdr-web`'s `#[derive(rust_embed::Embed)]` pointed at the gitignored
   `crates/hrdr-ui/dist`, so `--all-features` could not compile on a fresh

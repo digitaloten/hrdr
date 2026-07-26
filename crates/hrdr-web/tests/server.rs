@@ -220,7 +220,84 @@ async fn ws_origin_foreign_is_rejected() {
     drop(server);
 }
 
+/// A `Resume` is answered on the requesting socket only: the replay (or the
+/// fallback snapshot) must never reach the other connected clients through the
+/// shared broadcast.
+#[tokio::test]
+async fn resume_answers_only_the_requesting_socket() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (server, _session, token) = start_test_server_with_token().await;
+    let ws_url = format!("ws://{}/ws?token={token}", server.addr);
+
+    let (ws_a, _) = connect_async(&ws_url).await.expect("client A connect");
+    let (ws_b, _) = connect_async(&ws_url).await.expect("client B connect");
+    let (_write_a, mut read_a) = ws_a.split();
+    let (mut write_b, mut read_b) = ws_b.split();
+
+    // Drain the startup traffic (snapshot + the first panes/status frames the
+    // 100ms tick emits) so anything arriving later is attributable to `Resume`.
+    drain_quiet(&mut read_a).await;
+    drain_quiet(&mut read_b).await;
+
+    let resume = serde_json::json!({ "type": "resume", "seq": 0 });
+    write_b
+        .send(Message::Text(resume.to_string().into()))
+        .await
+        .expect("send resume");
+
+    // B is answered on its own socket.
+    let mut b_answered = false;
+    for _ in 0..10 {
+        let frame = timeout(Duration::from_secs(2), read_b.next())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.ok());
+        let Some(frame) = frame else { break };
+        let Ok(text) = frame.into_text() else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        // Either a replay tail terminated by `resumed`, or a gap snapshot.
+        if v["type"] == "resumed" || v["type"] == "snapshot" {
+            b_answered = true;
+            break;
+        }
+    }
+    assert!(b_answered, "client B should receive its resume response");
+
+    // A must see nothing at all as a result of B's resume.
+    let leaked = timeout(Duration::from_millis(500), read_a.next()).await;
+    assert!(
+        leaked.is_err(),
+        "client A must not receive B's resume traffic, got {leaked:?}"
+    );
+
+    drop(server);
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
+
+/// Read until the socket goes quiet for 300ms.
+async fn drain_quiet<S>(read: &mut S)
+where
+    S: futures_util::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    while let Ok(Some(Ok(_))) =
+        tokio::time::timeout(std::time::Duration::from_millis(300), read.next()).await
+    {}
+}
 
 /// Issue a single `GET` over a fresh connection and return the raw response.
 async fn raw_get(addr: std::net::SocketAddr, path: &str, extra_headers: &[&str]) -> String {
