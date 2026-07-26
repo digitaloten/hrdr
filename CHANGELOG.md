@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The `hrdr-ui` web client now actually compiles for `wasm32`.** It had been
+  written against a partly imagined Dioxus API and never built: `dioxus::launch`
+  (not `dioxus::web::launch`), `evt.modifiers().shift()` (not
+  `evt.shift_key()`), plus four type mismatches.
 - **A transcript record can no longer be left half-written, gluing two records
   into one unparsable line.** Seen in the wild in a heavy session: the disk
   filled mid-append, 21 bytes of a `reasoning` record landed

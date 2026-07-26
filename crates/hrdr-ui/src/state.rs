@@ -16,8 +16,12 @@ pub struct ViewEntry {
 }
 
 impl ViewEntry {
-    pub fn css_class(&self) -> &str { &self.css_class }
-    pub fn html(&self) -> &str { &self.html }
+    pub fn css_class(&self) -> &str {
+        &self.css_class
+    }
+    pub fn html(&self) -> &str {
+        &self.html
+    }
 }
 
 /// Apply one `ServerFrame` to the client-side transcript state.
@@ -51,12 +55,14 @@ pub fn entry_to_view(ev: &hrdr_protocol::WireEntryView) -> ViewEntry {
         ),
         hrdr_protocol::WireEntryKind::User(text) => (
             "user".into(),
-            format!("<strong style=\"color:#e94560;\">You</strong> <div style=\"margin-top:0.25rem;\">{}</div>", render_markdown(text)),
+            format!(
+                "<strong style=\"color:#e94560;\">You</strong> <div style=\"margin-top:0.25rem;\">{}</div>",
+                render_markdown(text)
+            ),
         ),
-        hrdr_protocol::WireEntryKind::Assistant(text) => (
-            "assistant".into(),
-            render_markdown(text),
-        ),
+        hrdr_protocol::WireEntryKind::Assistant(text) => {
+            ("assistant".into(), render_markdown(text))
+        }
         hrdr_protocol::WireEntryKind::Reasoning { text, took_ms } => {
             let label = match took_ms {
                 Some(ms) => format!("Thought for {:.1}s", *ms as f64 / 1000.0),
@@ -77,8 +83,20 @@ pub fn entry_to_view(ev: &hrdr_protocol::WireEntryView) -> ViewEntry {
             done,
             ..
         } => {
-            let status = if !done { "⏳" } else if *ok { "✓" } else { "✗" };
-            let status_color = if !done { "#888" } else if *ok { "#4ecca3" } else { "#e94560" };
+            let status = if !done {
+                "⏳"
+            } else if *ok {
+                "✓"
+            } else {
+                "✗"
+            };
+            let status_color = if !done {
+                "#888"
+            } else if *ok {
+                "#4ecca3"
+            } else {
+                "#e94560"
+            };
 
             // Tool display model.
             let tool_body_html = if let Some(td) = &ev.tool {
@@ -92,7 +110,10 @@ pub fn entry_to_view(ev: &hrdr_protocol::WireEntryView) -> ViewEntry {
                 if let Some(lines) = &ev.diff_lines {
                     render_diff_lines(lines)
                 } else {
-                    format!("<pre style=\"font-family:monospace; margin:0.25rem 0; white-space:pre-wrap; color:#ccc; font-size:13px;\">{}</pre>", html_escape(result))
+                    format!(
+                        "<pre style=\"font-family:monospace; margin:0.25rem 0; white-space:pre-wrap; color:#ccc; font-size:13px;\">{}</pre>",
+                        html_escape(result)
+                    )
                 }
             } else {
                 String::new()
@@ -111,25 +132,34 @@ pub fn entry_to_view(ev: &hrdr_protocol::WireEntryView) -> ViewEntry {
         ),
         hrdr_protocol::WireEntryKind::Notice(text) => (
             "notice".into(),
-            format!("<div style=\"color:#888; font-style:italic; margin:0.25rem 0;\">{}</div>", html_escape(text)),
+            format!(
+                "<div style=\"color:#888; font-style:italic; margin:0.25rem 0;\">{}</div>",
+                html_escape(text)
+            ),
         ),
         hrdr_protocol::WireEntryKind::Stats(text) => (
             "stats".into(),
-            format!("<div style=\"color:#666; font-size:13px; margin:0.25rem 0;\">{}</div>", html_escape(text)),
+            format!(
+                "<div style=\"color:#666; font-size:13px; margin:0.25rem 0;\">{}</div>",
+                html_escape(text)
+            ),
         ),
-        hrdr_protocol::WireEntryKind::Diff(text) => (
-            "diff".into(),
-            {
-                let lines: Vec<_> = text.lines().map(|line| {
+        hrdr_protocol::WireEntryKind::Diff(text) => ("diff".into(), {
+            let lines: Vec<_> = text
+                .lines()
+                .map(|line| {
                     let cls = classify_line(line);
                     (cls, line)
-                }).collect();
-                let html: String = lines.iter().map(|(cls, line)| {
-                    format!("<span class=\"{cls}\">{}</span>\n", html_escape(line))
-                }).collect();
-                format!("<pre style=\"font-family:monospace; font-size:13px; line-height:1.4;\">{html}</pre>")
-            },
-        ),
+                })
+                .collect();
+            let html: String = lines
+                .iter()
+                .map(|(cls, line)| format!("<span class=\"{cls}\">{}</span>\n", html_escape(line)))
+                .collect();
+            format!(
+                "<pre style=\"font-family:monospace; font-size:13px; line-height:1.4;\">{html}</pre>"
+            )
+        }),
     };
     ViewEntry { css_class, html }
 }
@@ -175,18 +205,16 @@ fn render_markdown(text: &str) -> String {
                     _ => {}
                 }
             }
-            Event::End(tag) => {
-                match tag {
-                    TagEnd::Paragraph => html.push_str("</p>"),
-                    TagEnd::Heading(level) => html.push_str(&format!("</h{level}>")),
-                    TagEnd::BlockQuote(_) => html.push_str("</blockquote>"),
-                    TagEnd::CodeBlock => html.push_str("</code></pre>"),
-                    TagEnd::List(_) => html.push_str("</ul>"),
-                    TagEnd::Item => html.push_str("</li>"),
-                    TagEnd::Link => html.push_str("</a>"),
-                    _ => {}
-                }
-            }
+            Event::End(tag) => match tag {
+                TagEnd::Paragraph => html.push_str("</p>"),
+                TagEnd::Heading(level) => html.push_str(&format!("</h{level}>")),
+                TagEnd::BlockQuote(_) => html.push_str("</blockquote>"),
+                TagEnd::CodeBlock => html.push_str("</code></pre>"),
+                TagEnd::List(_) => html.push_str("</ul>"),
+                TagEnd::Item => html.push_str("</li>"),
+                TagEnd::Link => html.push_str("</a>"),
+                _ => {}
+            },
             Event::Text(t) => {
                 if !in_raw_html {
                     html.push_str(&html_escape(&t));
@@ -208,10 +236,17 @@ fn render_markdown(text: &str) -> String {
 fn render_tool_body(body: &hrdr_protocol::WireToolBody) -> String {
     match body {
         hrdr_protocol::WireToolBody::Shell { command } => {
-            format!("<pre style=\"color:#f0a500; font-family:monospace; margin:0.25rem 0;\">$ {}</pre>", html_escape(command))
+            format!(
+                "<pre style=\"color:#f0a500; font-family:monospace; margin:0.25rem 0;\">$ {}</pre>",
+                html_escape(command)
+            )
         }
         hrdr_protocol::WireToolBody::Code { lang, content } => {
-            format!("<pre style=\"background:#0f3460; padding:0.5rem; border-radius:4px; font-family:monospace; font-size:13px; overflow-x:auto;\" class=\"lang-{}\">{}</pre>", html_escape(lang), html_escape(content))
+            format!(
+                "<pre style=\"background:#0f3460; padding:0.5rem; border-radius:4px; font-family:monospace; font-size:13px; overflow-x:auto;\" class=\"lang-{}\">{}</pre>",
+                html_escape(lang),
+                html_escape(content)
+            )
         }
         hrdr_protocol::WireToolBody::Diff {} => String::new(),
         hrdr_protocol::WireToolBody::Read {} => String::new(),
@@ -226,49 +261,78 @@ fn render_tool_body(body: &hrdr_protocol::WireToolBody) -> String {
 }
 
 fn render_diff_lines(lines: &[hrdr_protocol::WireDiffLine]) -> String {
-    let html: String = lines.iter().map(|l| {
-        let cls = match l.kind {
-            WireDiffLineKind::Add => "diff-add",
-            WireDiffLineKind::Remove => "diff-remove",
-            WireDiffLineKind::Hunk => "diff-hunk",
-            WireDiffLineKind::Meta => "",
-        };
-        format!("<span class=\"{cls}\">{}</span>\n", html_escape(&l.text))
-    }).collect();
-    format!("<pre style=\"font-family:monospace; font-size:13px; line-height:1.4; margin:0.25rem 0;\">{html}</pre>")
+    let html: String = lines
+        .iter()
+        .map(|l| {
+            let cls = match l.kind {
+                WireDiffLineKind::Add => "diff-add",
+                WireDiffLineKind::Remove => "diff-remove",
+                WireDiffLineKind::Hunk => "diff-hunk",
+                WireDiffLineKind::Meta => "",
+            };
+            format!("<span class=\"{cls}\">{}</span>\n", html_escape(&l.text))
+        })
+        .collect();
+    format!(
+        "<pre style=\"font-family:monospace; font-size:13px; line-height:1.4; margin:0.25rem 0;\">{html}</pre>"
+    )
 }
 
 fn classify_line(line: &str) -> &'static str {
-    if line.starts_with("+++") || line.starts_with("---") { "" }
-    else if line.starts_with('@') { "diff-hunk" }
-    else if line.starts_with('+') { "diff-add" }
-    else if line.starts_with('-') { "diff-remove" }
-    else { "" }
+    if line.starts_with("+++") || line.starts_with("---") {
+        ""
+    } else if line.starts_with('@') {
+        "diff-hunk"
+    } else if line.starts_with('+') {
+        "diff-add"
+    } else if line.starts_with('-') {
+        "diff-remove"
+    } else {
+        ""
+    }
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hrdr_protocol::{
-        PaneTranscript, WireEntry, WireEntryKind, WireEntryView, WirePaneId,
-    };
+    use hrdr_protocol::{PaneTranscript, WireEntry, WireEntryKind, WireEntryView, WirePaneId};
 
     #[test]
     fn snapshot_replaces_state() {
         let mut t = vec![];
-        let frame = ServerFrame { seq: 1, msg: ServerMsg::Snapshot {
-            session_id: None, session_name: String::new(), cwd: String::new(),
-            panes: vec![], active: WirePaneId::Main,
-            status: hrdr_protocol::WireStatus { left: vec![], right: vec![] },
-            transcripts: vec![PaneTranscript { pane: WirePaneId::Main, entries: vec![
-                WireEntryView { entry: WireEntry { kind: WireEntryKind::User("hi".into()), time: 0 }, tool: None, diff_lines: None }
-            ]}],
-            show_thinking: true,
-        }};
+        let frame = ServerFrame {
+            seq: 1,
+            msg: ServerMsg::Snapshot {
+                session_id: None,
+                session_name: String::new(),
+                cwd: String::new(),
+                panes: vec![],
+                active: WirePaneId::Main,
+                status: hrdr_protocol::WireStatus {
+                    left: vec![],
+                    right: vec![],
+                },
+                transcripts: vec![PaneTranscript {
+                    pane: WirePaneId::Main,
+                    entries: vec![WireEntryView {
+                        entry: WireEntry {
+                            kind: WireEntryKind::User("hi".into()),
+                            time: 0,
+                        },
+                        tool: None,
+                        diff_lines: None,
+                    }],
+                }],
+                show_thinking: true,
+            },
+        };
         apply_frame(&frame, &mut t);
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].css_class, "user");
@@ -276,12 +340,22 @@ mod tests {
 
     #[test]
     fn entries_truncates_and_extends() {
-        let mut t = vec![entry("user", "a"), entry("assistant", "b"), entry("user", "c")];
-        apply_frame(&ServerFrame { seq: 2, msg: ServerMsg::Entries {
-            pane: WirePaneId::Main, from: 1, entries: vec![
-                view_entry("B"), view_entry("C")
-            ],
-        }}, &mut t);
+        let mut t = vec![
+            entry("user", "a"),
+            entry("assistant", "b"),
+            entry("user", "c"),
+        ];
+        apply_frame(
+            &ServerFrame {
+                seq: 2,
+                msg: ServerMsg::Entries {
+                    pane: WirePaneId::Main,
+                    from: 1,
+                    entries: vec![view_entry("B"), view_entry("C")],
+                },
+            },
+            &mut t,
+        );
         assert_eq!(t.len(), 3);
         assert!(t[0].html.contains("a"));
         assert!(t[1].html.contains("B"));
@@ -296,16 +370,28 @@ mod tests {
         assert!(html.contains("<strong>"), "markdown formatting should work");
         // Raw HTML tags in the input are dropped.
         let html2 = render_markdown("<script>alert(1)</script>");
-        assert!(!html2.contains("<script"), "raw html tags are dropped: {html2}");
+        assert!(
+            !html2.contains("<script"),
+            "raw html tags are dropped: {html2}"
+        );
     }
 
     #[test]
     fn diff_lines_map_1_to_1() {
         use hrdr_protocol::WireDiffLine;
         let lines = vec![
-            WireDiffLine { kind: WireDiffLineKind::Add, text: "+added".into() },
-            WireDiffLine { kind: WireDiffLineKind::Remove, text: "-removed".into() },
-            WireDiffLine { kind: WireDiffLineKind::Hunk, text: "@@ -1 +1 @@".into() },
+            WireDiffLine {
+                kind: WireDiffLineKind::Add,
+                text: "+added".into(),
+            },
+            WireDiffLine {
+                kind: WireDiffLineKind::Remove,
+                text: "-removed".into(),
+            },
+            WireDiffLine {
+                kind: WireDiffLineKind::Hunk,
+                text: "@@ -1 +1 @@".into(),
+            },
         ];
         let html = render_diff_lines(&lines);
         assert!(html.contains("diff-add"));
@@ -316,18 +402,31 @@ mod tests {
     #[test]
     fn resumed_does_nothing() {
         let mut t = vec![entry("user", "x")];
-        apply_frame(&ServerFrame { seq: 5, msg: ServerMsg::Resumed {} }, &mut t);
+        apply_frame(
+            &ServerFrame {
+                seq: 5,
+                msg: ServerMsg::Resumed {},
+            },
+            &mut t,
+        );
         assert_eq!(t.len(), 1);
     }
 
     fn entry(css: &str, html: &str) -> ViewEntry {
-        ViewEntry { css_class: css.into(), html: html.into() }
+        ViewEntry {
+            css_class: css.into(),
+            html: html.into(),
+        }
     }
 
     fn view_entry(text: &str) -> WireEntryView {
         WireEntryView {
-            entry: WireEntry { kind: WireEntryKind::Assistant(text.into()), time: 0 },
-            tool: None, diff_lines: None,
+            entry: WireEntry {
+                kind: WireEntryKind::Assistant(text.into()),
+                time: 0,
+            },
+            tool: None,
+            diff_lines: None,
         }
     }
 }

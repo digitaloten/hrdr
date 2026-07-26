@@ -2,11 +2,11 @@
 
 use dioxus::prelude::*;
 use hrdr_protocol::{ClientMsg, ServerFrame, ServerMsg, WirePane, WirePaneId, WireStatus};
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 use web_sys::{MessageEvent, WebSocket};
 
-mod state;
+use hrdr_ui::state;
 
 static WS: std::sync::Mutex<Option<WebSocket>> = std::sync::Mutex::new(None);
 
@@ -20,6 +20,7 @@ struct UiState {
     connected: bool,
 }
 
+#[allow(non_snake_case)]
 fn App() -> Element {
     let mut ui = use_signal(|| UiState {
         transcript: vec![],
@@ -38,12 +39,16 @@ fn App() -> Element {
         let loc = window.location();
         let search = loc.search().unwrap_or_default();
         let token = search.strip_prefix("?token=").unwrap_or("");
-        let protocol = if loc.protocol().unwrap_or_default() == "https:" { "wss" } else { "ws" };
+        let protocol = if loc.protocol().unwrap_or_default() == "https:" {
+            "wss"
+        } else {
+            "ws"
+        };
         let host = loc.host().unwrap_or_default();
         let ws_url = format!("{protocol}://{host}/ws?token={token}");
 
         let ws = WebSocket::new(&ws_url).unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerFrame>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ServerFrame>();
         *WS.lock().unwrap() = Some(ws.clone());
 
         let onmsg = Closure::<dyn Fn(MessageEvent)>::new(move |e: MessageEvent| {
@@ -69,21 +74,30 @@ fn App() -> Element {
             // Disconnected — attempt reconnect with backoff.
             ui.write().connected = false;
             reconnect_count += 1;
-            let delay = (reconnect_count() * 1000).min(30000) as u64;
+            let delay = (reconnect_count() * 1000).min(30000);
             gloo::timers::callback::Timeout::new(delay, move || {
                 // Reconnect will re-trigger the effect.
-            }).forget();
+            })
+            .forget();
         });
     });
 
     let send_msg = move |text: String| {
         let text = text.trim().to_string();
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
         let pane = ui.read().active;
         let msg = if text.starts_with('/') {
-            ClientMsg::Command { pane, line: text.clone() }
+            ClientMsg::Command {
+                pane,
+                line: text.clone(),
+            }
         } else {
-            ClientMsg::Submit { pane, text: text.clone() }
+            ClientMsg::Submit {
+                pane,
+                text: text.clone(),
+            }
         };
         if let Ok(json) = serde_json::to_string(&msg) {
             if let Some(ws) = WS.lock().unwrap().as_ref() {
@@ -92,11 +106,17 @@ fn App() -> Element {
         }
     };
 
-    let on_send = move |_| { let t = input(); send_msg(t); input.set(String::new()); };
+    let on_send = move |_| {
+        let t = input();
+        send_msg(t);
+        input.set(String::new());
+    };
     let on_key = move |evt: KeyboardEvent| {
-        if evt.key() == Key::Enter && !evt.shift_key() {
+        if evt.key() == Key::Enter && !evt.modifiers().shift() {
             evt.prevent_default();
-            let t = input(); send_msg(t); input.set(String::new());
+            let t = input();
+            send_msg(t);
+            input.set(String::new());
         }
     };
     let switch_pane = move |id: WirePaneId| {
@@ -120,9 +140,9 @@ fn App() -> Element {
     // Status bar
     let status_html = render_status(&s.status);
     // Active pane turn loader
-    let turn_html = render_turn_loader(&s.active_pane());
+    let turn_html = render_turn_loader(s.active_pane());
     // Todo panel
-    let todos_html = render_todos(&s.active_pane());
+    let todos_html = render_todos(s.active_pane());
 
     rsx! {
         div { style: "display:flex;flex-direction:column;height:100dvh;font-family:system-ui;background:#1a1a2e;color:#e0e0e0;",
@@ -179,9 +199,20 @@ fn App() -> Element {
 impl UiState {
     fn apply_frame(&mut self, frame: &ServerFrame) {
         match &frame.msg {
-            ServerMsg::Snapshot { transcripts, panes, active, status, show_thinking, .. } => {
+            ServerMsg::Snapshot {
+                transcripts,
+                panes,
+                active,
+                status,
+                show_thinking,
+                ..
+            } => {
                 self.transcript.clear();
-                for pt in transcripts { for ev in &pt.entries { self.transcript.push(state::entry_to_view(ev)); } }
+                for pt in transcripts {
+                    for ev in &pt.entries {
+                        self.transcript.push(state::entry_to_view(ev));
+                    }
+                }
                 self.panes = panes.clone();
                 self.active = *active;
                 self.status = Some(status.clone());
@@ -190,13 +221,17 @@ impl UiState {
             }
             ServerMsg::Entries { from, entries, .. } => {
                 self.transcript.truncate(*from);
-                for ev in entries { self.transcript.push(state::entry_to_view(ev)); }
+                for ev in entries {
+                    self.transcript.push(state::entry_to_view(ev));
+                }
             }
             ServerMsg::Panes { panes, active } => {
                 self.panes = panes.clone();
                 self.active = *active;
             }
-            ServerMsg::Status { status } => { self.status = Some(status.clone()); }
+            ServerMsg::Status { status } => {
+                self.status = Some(status.clone());
+            }
             ServerMsg::Resumed { .. } => {}
             _ => {}
         }
@@ -207,7 +242,7 @@ impl UiState {
     }
 }
 
-fn pane_marker(s: &hrdr_protocol::WirePaneStatus) -> &'static str {
+fn pane_marker(s: hrdr_protocol::WirePaneStatus) -> &'static str {
     match s {
         hrdr_protocol::WirePaneStatus::Running => "⏳",
         hrdr_protocol::WirePaneStatus::Idle => "·",
@@ -216,7 +251,9 @@ fn pane_marker(s: &hrdr_protocol::WirePaneStatus) -> &'static str {
 }
 
 fn render_status(status: &Option<WireStatus>) -> (String, String) {
-    let Some(s) = status else { return (String::new(), String::new()) };
+    let Some(s) = status else {
+        return (String::new(), String::new());
+    };
     let left: String = s.left.iter().map(|seg| render_status_seg(seg)).collect();
     let right: String = s.right.iter().map(|seg| render_status_seg(seg)).collect();
     (left, right)
@@ -230,12 +267,22 @@ fn render_status_seg(seg: &hrdr_protocol::WireStatusSeg) -> String {
             hrdr_protocol::WireCtxLevel::Warn => "#f0a500",
             hrdr_protocol::WireCtxLevel::Critical => "#e94560",
         };
-        return format!("<span style=\"background:#333;border-radius:3px;padding:0 4px;\"><span style=\"background:{color};width:{pct}%;display:inline-block;border-radius:2px;\">&nbsp;</span><span style=\"font-size:11px;padding:0 2px;\">{}</span></span>", gauge.label);
+        return format!(
+            "<span style=\"background:#333;border-radius:3px;padding:0 4px;\"><span style=\"background:{color};width:{pct}%;display:inline-block;border-radius:2px;\">&nbsp;</span><span style=\"font-size:11px;padding:0 2px;\">{}</span></span>",
+            gauge.label
+        );
     }
-    let runs: String = seg.runs.iter().map(|r| {
-        let role_style = status_role_style(&r.role);
-        format!("<span style=\"{role_style}\">{}</span>", r.text.replace('<', "&lt;"))
-    }).collect();
+    let runs: String = seg
+        .runs
+        .iter()
+        .map(|r| {
+            let role_style = status_role_style(&r.role);
+            format!(
+                "<span style=\"{role_style}\">{}</span>",
+                r.text.replace('<', "&lt;")
+            )
+        })
+        .collect();
     runs
 }
 
@@ -252,23 +299,30 @@ fn status_role_style(role: &hrdr_protocol::WireStatusRole) -> &'static str {
         hrdr_protocol::WireStatusRole::Model {} => "",
         hrdr_protocol::WireStatusRole::Effort {} => "color:#f0a500;",
         hrdr_protocol::WireStatusRole::Ttft {} => "color:#888;",
-        hrdr_protocol::WireStatusRole::Session {} => "background:#f0a500;color:#1a1a2e;padding:0 4px;border-radius:2px;",
+        hrdr_protocol::WireStatusRole::Session {} => {
+            "background:#f0a500;color:#1a1a2e;padding:0 4px;border-radius:2px;"
+        }
     }
 }
 
 fn render_turn_loader(pane: Option<&WirePane>) -> String {
     let Some(p) = pane else { return String::new() };
-    if !p.turn.running { return String::new() }
+    if !p.turn.running {
+        return String::new();
+    }
     let inferring = if p.turn.inferring { "⚡" } else { "⏳" };
     format!(
         "<div style=\"font-size:13px;color:#888;padding:0.25rem 0.5rem;\">{inferring} {:.1} tok/s · {:.1}s elapsed</div>",
-        p.turn.tok_per_sec, p.turn.elapsed_ms as f64 / 1000.0
+        p.turn.tok_per_sec,
+        p.turn.elapsed_ms as f64 / 1000.0
     )
 }
 
 fn render_todos(pane: Option<&WirePane>) -> String {
     let Some(p) = pane else { return String::new() };
-    if p.todos.is_empty() { return String::new() }
+    if p.todos.is_empty() {
+        return String::new();
+    }
     let items: String = p.todos.iter().map(|t| {
         let icon = match t.status.as_str() {
             "completed" => "✓",
@@ -278,7 +332,11 @@ fn render_todos(pane: Option<&WirePane>) -> String {
         };
         format!("<div style=\"font-size:13px;padding:0.25rem;color:#ccc;\">{icon} {} <span style=\"color:#888;\">({})</span></div>", t.content.replace('<', "&lt;"), t.status)
     }).collect();
-    format!("<div style=\"margin:0.25rem 0;padding:0.25rem 0.5rem;background:#0f3460;border-radius:4px;\"><strong style=\"font-size:13px;color:#f0a500;\">Tasks</strong>{items}</div>")
+    format!(
+        "<div style=\"margin:0.25rem 0;padding:0.25rem 0.5rem;background:#0f3460;border-radius:4px;\"><strong style=\"font-size:13px;color:#f0a500;\">Tasks</strong>{items}</div>"
+    )
 }
 
-fn main() { dioxus::web::launch(App); }
+fn main() {
+    dioxus::launch(App);
+}
