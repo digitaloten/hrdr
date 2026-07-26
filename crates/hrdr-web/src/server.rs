@@ -300,6 +300,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSession) {
     let (mut sender, mut receiver) = socket.split();
 
+    // Line channel: WebHost posts system/diff lines here.
+    let (line_tx, mut line_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(hrdr_app::LineKind, String)>();
+
     let (snapshot, mut broadcast_rx) = {
         let s = session.lock().await;
         s.subscribe()
@@ -309,20 +313,47 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSess
         return;
     }
 
+    // Forward broadcast frames + line-channel messages.
+    let forward_session = session.clone();
     let forward_handle = tokio::spawn(async move {
         loop {
-            match broadcast_rx.recv().await {
-                Ok(frame) => {
-                    let json = serde_json::to_string(&frame).unwrap();
-                    if sender.send(Message::Text(json.into())).await.is_err() {
-                        break;
+            tokio::select! {
+                frame = broadcast_rx.recv() => {
+                    match frame {
+                        Ok(frame) => {
+                            let json = serde_json::to_string(&frame).unwrap();
+                            if sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            eprintln!("broadcast lagged by {n}");
+                            break;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    eprintln!("broadcast lagged by {n} messages, client may need reconnect");
-                    break;
+                line = line_rx.recv() => {
+                    match line {
+                        Some((kind, text)) => {
+                            let mut s = forward_session.lock().await;
+                            match kind {
+                                hrdr_app::LineKind::System => {
+                                    let seq = s.next_seq_internal();
+                                    let frame = crate::convert::build_notice(seq, text);
+                                    s.emit_internal(frame);
+                                }
+                                hrdr_app::LineKind::Diff => {
+                                    // Push a diff entry and let tick broadcast it.
+                                    s.panes_mut().active_pane_mut().transcript_mut()
+                                        .push(hrdr_agent::Entry::diff(text));
+                                    s.notify_tick();
+                                }
+                            }
+                        }
+                        None => break,
+                    }
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
@@ -337,7 +368,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSess
                         continue;
                     }
                 };
-                handle_client_msg(client_msg, &session).await;
+                handle_client_msg(client_msg, &session, &line_tx).await;
             }
             Message::Close(_) => break,
             _ => {}
@@ -347,16 +378,46 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSess
     forward_handle.abort();
 }
 
-async fn handle_client_msg(msg: hrdr_protocol::ClientMsg, session: &SharedSession) {
+async fn handle_client_msg(
+    msg: hrdr_protocol::ClientMsg,
+    session: &SharedSession,
+    line_tx: &tokio::sync::mpsc::UnboundedSender<(hrdr_app::LineKind, String)>,
+) {
     match msg {
         hrdr_protocol::ClientMsg::Submit { pane, text } => {
             session.lock().await.submit(pane, text).await;
         }
-        hrdr_protocol::ClientMsg::Command { .. } => {
+        hrdr_protocol::ClientMsg::Command { pane: _, line } => {
+            // Dispatch via WebHost.
             let mut s = session.lock().await;
-            let seq = s.next_seq_internal();
-            let frame = crate::convert::build_notice(seq, "commands land in a later slice".into());
-            s.emit_internal(frame);
+            let mut host = crate::host::WebHost {
+                session: &mut s,
+                line_tx: line_tx.clone(),
+            };
+            if hrdr_app::is_quit_command(&line) {
+                let seq = host.session.next_seq_internal();
+                let frame =
+                    crate::convert::build_notice(seq, "use your browser's close button".into());
+                host.session.emit_internal(frame);
+            } else if !line.starts_with('/') {
+                // Not a command — treat as plain text submit.
+                drop(host);
+                drop(s);
+                session
+                    .lock()
+                    .await
+                    .submit(hrdr_protocol::WirePaneId::Main, line)
+                    .await;
+            } else {
+                let dispatched = hrdr_app::dispatch(&mut host, &line);
+                if !dispatched {
+                    let seq = host.session.next_seq_internal();
+                    let frame = crate::convert::build_notice(seq, "unknown command — /help".into());
+                    host.session.emit_internal(frame);
+                }
+                // Tick so any state changes (snapshot/panes) are broadcast.
+                host.session.tick();
+            }
         }
         hrdr_protocol::ClientMsg::Cancel { pane } => {
             session.lock().await.cancel(pane);

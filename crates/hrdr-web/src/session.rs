@@ -657,6 +657,18 @@ impl WebSession {
         &self.cwd
     }
 
+    pub fn main_turn_handle(&self) -> &Option<tokio::task::JoinHandle<()>> {
+        &self.main_turn_handle
+    }
+
+    pub fn main_turn_handle_mut(&mut self) -> &mut Option<tokio::task::JoinHandle<()>> {
+        &mut self.main_turn_handle
+    }
+
+    pub fn tick_notify(&self) -> &Arc<Notify> {
+        &self.tick_notify
+    }
+
     pub fn active_lock(&self) -> Option<&hrdr_app::SessionLock> {
         self.active_lock.as_ref()
     }

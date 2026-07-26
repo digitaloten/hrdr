@@ -8,6 +8,7 @@ extern crate hrdr_test_support;
 pub mod auth;
 pub mod config;
 pub mod convert;
+pub mod host;
 pub mod server;
 pub mod session;
 pub mod users;
