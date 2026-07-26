@@ -1,0 +1,6 @@
+[application]
+name = "hrdr-ui"
+default_platform = "web"
+
+[web]
+title = "hrdr web"

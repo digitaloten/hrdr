@@ -126,10 +126,13 @@ async fn index(
     headers: HeaderMap,
     query: Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    match check_auth(&state, &headers, &query) {
-        Ok(()) => axum::response::Html(INDEX_HTML).into_response(),
-        Err(resp) => resp,
+    if let Err(resp) = check_auth(&state, &headers, &query) {
+        return resp;
     }
+    if let Some(spa) = crate::spa_index_html() {
+        return axum::response::Html(spa).into_response();
+    }
+    axum::response::Html(INDEX_HTML).into_response()
 }
 
 async fn ws_handler(

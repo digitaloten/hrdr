@@ -14,3 +14,22 @@ pub mod session;
 pub mod users;
 
 pub use session::{SharedSession, WebSession};
+
+#[cfg(feature = "ui")]
+mod assets {
+    #[derive(rust_embed::Embed)]
+    #[folder = "../hrdr-ui/dist"]
+    pub struct Assets;
+}
+
+/// Serve the SPA index.html when the `ui` feature is enabled.
+#[cfg(feature = "ui")]
+pub fn spa_index_html() -> Option<String> {
+    use assets::Assets;
+    Assets::get("index.html").map(|f| String::from_utf8_lossy(&f.data).to_string())
+}
+
+#[cfg(not(feature = "ui"))]
+pub fn spa_index_html() -> Option<String> {
+    None
+}
