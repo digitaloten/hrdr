@@ -108,9 +108,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `git -C <parent-repo> commit` fails on the parent's read-only index. The
   environment is inherited whole (`PATH`, `HOME`, `CARGO_HOME` all survive),
   stdio/exit status/timeouts/group-kill behave exactly as before, and the
-  network is untouched. `sandbox = "none"` skips the wrapper entirely. Where
-  bubblewrap or unprivileged user namespaces are unavailable — and on macOS and
-  Windows — shell commands run unconfined for now and say so once:
+  network is untouched. `sandbox = "none"` skips the wrapper entirely.
+- **A Landlock fallback for Linux hosts without bubblewrap, and a notice
+  whenever confinement is weaker than it looks.** Where `bwrap` is missing or
+  unprivileged user namespaces are disabled — containers, hardened distros — the
+  shell child now applies a Landlock ruleset to itself between fork and exec
+  instead of running unconfined: everything is readable, and only `/dev/null`
+  plus the agent's writable roots are writable, so a write outside them fails
+  with `Permission denied` and the ruleset is inherited by every process the
+  command goes on to spawn. A kernel that would enforce nothing fails the spawn
+  rather than running the command half-confined. Landlock has no read axis, so
+  this is strictly weaker than bubblewrap, and hrdr never pretends otherwise —
+  each degradation surfaces once per process as a `Notice`, through the same
+  event channel as every other warning:
+  `sandbox: bwrap not found — falling back to Landlock: …` or
+  `sandbox: unprivileged user namespaces are disabled on this system — falling back to Landlock: …`,
+  plus
+  `sandbox: Landlock cannot confine reads — this read-only agent's shell commands are write-confined only.`
+  for a read-only agent. With neither backend — and on macOS and Windows — shell
+  commands still run unconfined and still say so:
   `sandbox: no OS-level sandbox is available on this system — shell commands are NOT OS-confined; the file tools remain guarded. Use --sandbox none to silence this.`
 - **BREAKING (tool API): every model-facing time parameter is in seconds —
   `shell`'s `timeout_ms` is now `timeout_secs`.** The tool schemas mixed units:

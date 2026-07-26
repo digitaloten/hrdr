@@ -16,7 +16,7 @@
 //! sub-agent that `cd`s out of its worktree and commits to the parent repo's
 //! `main` is the concrete failure this exists to make impossible.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -315,41 +315,66 @@ fn git_metadata_roots(cwd: &Path) -> Vec<PathBuf> {
     vec![gitdir, common.join("objects"), refs, logs]
 }
 
-/// One-shot slot for a sandbox degradation notice awaiting delivery through
-/// the agent's event stream, plus the set of notices already delivered.
+/// Sandbox degradation notices awaiting delivery through the agent's event
+/// stream, plus the set of notices already delivered.
 ///
 /// The seen-set is the difference from `hrdr_llm::take_client_warning`'s plain
 /// cell: a degradation is detected on *every* confined shell command, so a
-/// bare `Option` would re-fill after each drain and the user would see the
-/// same warning once per command. Each distinct message is delivered exactly
-/// once per process.
-static SANDBOX_NOTICE: OnceLock<Mutex<(HashSet<String>, Option<String>)>> = OnceLock::new();
+/// bare slot would re-fill after each drain and the user would see the same
+/// warning once per command. Each distinct message is delivered exactly once
+/// per process.
+///
+/// Pending is a *queue* rather than a single slot because one command can
+/// degrade twice — a read-mode agent on the Landlock fallback both loses its
+/// primary backend and loses read confinement — and a single slot would
+/// silently drop the first of the two while still marking it seen.
+static SANDBOX_NOTICE: OnceLock<Mutex<(HashSet<String>, VecDeque<String>)>> = OnceLock::new();
 
-fn notice_cell() -> &'static Mutex<(HashSet<String>, Option<String>)> {
-    SANDBOX_NOTICE.get_or_init(|| Mutex::new((HashSet::new(), None)))
+fn notice_cell() -> &'static Mutex<(HashSet<String>, VecDeque<String>)> {
+    SANDBOX_NOTICE.get_or_init(|| Mutex::new((HashSet::new(), VecDeque::new())))
 }
 
-/// Take the pending sandbox notice for delivery through the caller's normal
-/// event channel (never stderr — a TUI owns the terminal).
+/// Take the next pending sandbox notice for delivery through the caller's
+/// normal event channel (never stderr — a TUI owns the terminal).
 pub fn take_sandbox_notice() -> Option<String> {
-    notice_cell().lock().ok().and_then(|mut cell| cell.1.take())
+    notice_cell()
+        .lock()
+        .ok()
+        .and_then(|mut cell| cell.1.pop_front())
 }
 
 /// Emitted when a confined agent's shell command runs without any OS-level
-/// confinement — no bwrap (and, until the Landlock arm lands, no Landlock
-/// either), a pre-Seatbelt macOS, or Windows. Never silently pretend to
-/// sandbox: the file tools stay guarded, the shell does not.
+/// confinement — no bwrap and no Landlock, a pre-Seatbelt macOS, or Windows.
+/// Never silently pretend to sandbox: the file tools stay guarded, the shell
+/// does not.
 const NO_OS_SANDBOX_NOTICE: &str = "sandbox: no OS-level sandbox is available on this system — \
      shell commands are NOT OS-confined; the file tools remain guarded. Use --sandbox none to \
      silence this.";
 
+/// Emitted when `bwrap(1)` is not installed and Landlock catches the fall.
+const BWRAP_MISSING_NOTICE: &str = "sandbox: bwrap not found — falling back to Landlock: writes \
+     are still confined, but reads are not, and read-mode agents degrade to write-mode \
+     confinement for shell commands. Install bubblewrap for full confinement.";
+
+/// Emitted when bwrap is installed but the kernel/distro forbids unprivileged
+/// user namespaces, so it cannot build a mount namespace.
+const USERNS_DISABLED_NOTICE: &str = "sandbox: unprivileged user namespaces are disabled on this \
+     system — falling back to Landlock: writes are still confined, but reads are not, and \
+     read-mode agents degrade to write-mode confinement for shell commands.";
+
+/// Emitted in addition to the fallback notice when a *read-mode* agent runs a
+/// shell command on Landlock: the ruleset confines writes only, so this agent
+/// is quietly weaker than its mode claims — say so, loudly.
+const READ_DEGRADES_UNDER_LANDLOCK_NOTICE: &str = "sandbox: Landlock cannot confine reads — this \
+     read-only agent's shell commands are write-confined only.";
+
 /// Record a degradation notice. Only a message seen for the first time this
-/// process becomes pending; repeats are dropped.
-pub(crate) fn set_sandbox_notice(msg: String) {
+/// process is queued; repeats are dropped.
+pub fn set_sandbox_notice(msg: String) {
     if let Ok(mut cell) = notice_cell().lock()
         && cell.0.insert(msg.clone())
     {
-        cell.1 = Some(msg);
+        cell.1.push_back(msg);
     }
 }
 
@@ -363,27 +388,50 @@ pub(crate) fn set_sandbox_notice(msg: String) {
 pub enum OsSandboxBackend {
     /// `bwrap(1)` — a mount namespace built per command (§3.6.1).
     Bwrap,
-    /// Landlock LSM rules applied in the child. Writes only; wired in slice 6.
+    /// Landlock LSM rules the child applies to itself. Writes only.
     Landlock,
     /// Nothing available: the shell runs unconfined and says so.
     None,
 }
 
-/// The backend this process uses, probed once and cached — the probe spawns a
-/// process, and a shell tool call must not pay for that every time.
+/// What backend detection concluded: the mechanism to use, plus the §5 notice
+/// owed to the user when that mechanism is a step down from bwrap.
+///
+/// The notice is *stored* here rather than emitted during detection, because
+/// detection is lazy and global while the notice is about a specific confined
+/// command: a session that runs unsandboxed (`--sandbox none`) must never be
+/// told its sandbox degraded.
+#[derive(Clone, Copy, Debug)]
+struct Detection {
+    backend: OsSandboxBackend,
+    /// `None` when the primary backend was available and nothing was lost.
+    degraded: Option<&'static str>,
+}
+
+/// The detection result for this process, probed once and cached — the probe
+/// spawns a process, and a shell tool call must not pay for that every time.
+fn detection() -> Detection {
+    static DETECTION: OnceLock<Detection> = OnceLock::new();
+    *DETECTION.get_or_init(detect_backend_uncached)
+}
+
+/// The backend this process uses (§3.5).
 pub fn detect_backend() -> OsSandboxBackend {
-    static BACKEND: OnceLock<OsSandboxBackend> = OnceLock::new();
-    *BACKEND.get_or_init(detect_backend_uncached)
+    detection().backend
 }
 
 /// Linux: bwrap if it exists *and* unprivileged user namespaces are usable
 /// (a kernel/distro switch — the binary being installed proves nothing), else
 /// Landlock if the LSM is enabled, else nothing.
 #[cfg(target_os = "linux")]
-fn detect_backend_uncached() -> OsSandboxBackend {
+fn detect_backend_uncached() -> Detection {
     match which::which("bwrap") {
-        Ok(bwrap) if userns_probe_succeeds(&bwrap) => OsSandboxBackend::Bwrap,
-        _ => landlock_or_none(),
+        Ok(bwrap) if userns_probe_succeeds(&bwrap) => Detection {
+            backend: OsSandboxBackend::Bwrap,
+            degraded: None,
+        },
+        Ok(_) => without_bwrap(USERNS_DISABLED_NOTICE),
+        Err(_) => without_bwrap(BWRAP_MISSING_NOTICE),
     }
 }
 
@@ -436,25 +484,40 @@ fn userns_probe_succeeds(bwrap: &Path) -> bool {
     }
 }
 
-/// The Landlock LSM is only usable when the kernel has it enabled — the list
-/// of active LSMs is the authoritative answer.
+/// Step 3 of §3.5: bwrap is unusable, so Landlock if the kernel has the LSM
+/// enabled (the list of active LSMs is the authoritative answer), else
+/// nothing.
+///
+/// `why` explains the bwrap failure, and both of its spellings promise a
+/// Landlock fallback — so it is only the right thing to say when Landlock
+/// actually catches the fall. With no backend at all, the blunter "not
+/// confined" notice supersedes it.
 #[cfg(target_os = "linux")]
-fn landlock_or_none() -> OsSandboxBackend {
+fn without_bwrap(why: &'static str) -> Detection {
     if std::fs::read_to_string("/sys/kernel/security/lsm")
         .unwrap_or_default()
         .contains("landlock")
     {
-        OsSandboxBackend::Landlock
+        Detection {
+            backend: OsSandboxBackend::Landlock,
+            degraded: Some(why),
+        }
     } else {
-        OsSandboxBackend::None
+        Detection {
+            backend: OsSandboxBackend::None,
+            degraded: Some(NO_OS_SANDBOX_NOTICE),
+        }
     }
 }
 
 /// Every other platform: nothing yet. macOS gets Seatbelt in a later slice;
 /// Windows stays software-layer-only.
 #[cfg(not(target_os = "linux"))]
-fn detect_backend_uncached() -> OsSandboxBackend {
-    OsSandboxBackend::None
+fn detect_backend_uncached() -> Detection {
+    Detection {
+        backend: OsSandboxBackend::None,
+        degraded: Some(NO_OS_SANDBOX_NOTICE),
+    }
 }
 
 /// The command `shell`/`watch` actually spawn: `cmd_str` run through `shell`,
@@ -480,20 +543,139 @@ pub fn sandboxed_shell_command(
     if policy.mode == SandboxMode::None {
         return shell.command(cmd_str);
     }
-    match detect_backend() {
+    shell_command_with_backend(detect_backend(), shell, cmd_str, policy, cwd)
+}
+
+/// [`sandboxed_shell_command`] with the backend chosen for it.
+///
+/// Split out so the fallback arms are reachable on a machine whose detection
+/// would never pick them: on a host with a working bwrap, Landlock is dead
+/// code that no test could otherwise execute.
+///
+/// Every arm that ends up running a command with less confinement than the
+/// mode asks for sets its §5 notice *first* — the one rule this layer may
+/// never break is pretending to sandbox.
+fn shell_command_with_backend(
+    backend: OsSandboxBackend,
+    shell: crate::Shell,
+    cmd_str: &str,
+    policy: &SandboxPolicy,
+    cwd: &Path,
+) -> tokio::process::Command {
+    match backend {
         OsSandboxBackend::Bwrap => {
             let mut cmd = tokio::process::Command::new("bwrap");
             cmd.args(bwrap_args(policy.mode, policy, cwd, shell, cmd_str));
             cmd
         }
-        // Landlock confines nothing until its own slice wires the `pre_exec`
-        // ruleset, so for now it degrades exactly like having no backend —
-        // and says so, rather than pretending.
-        OsSandboxBackend::Landlock | OsSandboxBackend::None => {
+        #[cfg(target_os = "linux")]
+        OsSandboxBackend::Landlock => {
+            // Why we are down here rather than on bwrap (§3.5 defers this to
+            // the first command that actually needs a backend).
+            if let Some(why) = detection().degraded {
+                set_sandbox_notice(why.to_string());
+            }
+            // Landlock has no read axis, so a read-mode agent gets write
+            // confinement and an explicit admission of the gap.
+            if policy.mode == SandboxMode::Read {
+                set_sandbox_notice(READ_DEGRADES_UNDER_LANDLOCK_NOTICE.to_string());
+            }
+            landlock_command(shell, cmd_str, policy)
+        }
+        // `Landlock` is unreachable off Linux (detection never returns it),
+        // but the variant exists on every platform, so the arm must too.
+        #[cfg(not(target_os = "linux"))]
+        OsSandboxBackend::Landlock => {
+            set_sandbox_notice(NO_OS_SANDBOX_NOTICE.to_string());
+            shell.command(cmd_str)
+        }
+        OsSandboxBackend::None => {
             set_sandbox_notice(NO_OS_SANDBOX_NOTICE.to_string());
             shell.command(cmd_str)
         }
     }
+}
+
+/// The Landlock fallback: the shell is spawned exactly as it would be
+/// unsandboxed, but the child confines *itself* between fork and exec, so the
+/// ruleset covers the shell and every descendant it goes on to spawn.
+///
+/// Weaker than bwrap in two ways, both decided and both noticed: reads are
+/// unrestricted (Landlock's read axis cannot express "everything except…"
+/// without enumerating the filesystem), and a blocked write surfaces as
+/// EACCES rather than a read-only mount.
+///
+/// In `Read` mode the policy's writable roots are empty, which is exactly
+/// right here: the child may then write nowhere at all but `/dev/null`.
+#[cfg(target_os = "linux")]
+fn landlock_command(
+    shell: crate::Shell,
+    cmd_str: &str,
+    policy: &SandboxPolicy,
+) -> tokio::process::Command {
+    let mut cmd = shell.command(cmd_str);
+    // Resolved and cloned *before* the fork: a path that does not exist makes
+    // `path_beneath_rules` fail the whole ruleset, and the closure must not go
+    // touching the filesystem or the allocator's slow paths post-fork.
+    let writable: Vec<PathBuf> = policy
+        .writable_roots
+        .iter()
+        .filter(|root| root.exists())
+        .cloned()
+        .collect();
+    // SAFETY: the closure runs in the forked child before `exec`. It issues
+    // landlock/prctl syscalls and builds the ruleset from data moved in
+    // beforehand; it shares no lock, handle, or global with the parent, and it
+    // never spawns a thread.
+    unsafe {
+        cmd.pre_exec(move || install_landlock_rules(&writable));
+    }
+    cmd
+}
+
+/// Codex's `install_filesystem_landlock_rules_on_current_thread`
+/// (`linux-sandbox/src/landlock.rs`) minus its seccomp: read everything, write
+/// only `/dev/null` and the writable roots.
+///
+/// `BestEffort` compatibility means an older kernel silently enforces the
+/// subset of ABI v5 it understands — but a kernel that enforces *nothing*
+/// fails the spawn rather than running the command unconfined.
+#[cfg(target_os = "linux")]
+fn install_landlock_rules(writable_roots: &[PathBuf]) -> std::io::Result<()> {
+    use landlock::{
+        ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreatedAttr,
+        RulesetStatus, path_beneath_rules,
+    };
+
+    let abi = ABI::V5;
+    let access_rw = AccessFs::from_all(abi);
+    let access_ro = AccessFs::from_read(abi);
+
+    let mut ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(access_rw)
+        .map_err(std::io::Error::other)?
+        .create()
+        .map_err(std::io::Error::other)?
+        .add_rules(path_beneath_rules(["/"], access_ro))
+        .map_err(std::io::Error::other)?
+        .add_rules(path_beneath_rules(["/dev/null"], access_rw))
+        .map_err(std::io::Error::other)?
+        // Codex calls this `set_no_new_privs`, deprecated since its pin.
+        .no_new_privs(true);
+
+    if !writable_roots.is_empty() {
+        ruleset = ruleset
+            .add_rules(path_beneath_rules(writable_roots, access_rw))
+            .map_err(std::io::Error::other)?;
+    }
+
+    let status = ruleset.restrict_self().map_err(std::io::Error::other)?;
+    if status.ruleset == RulesetStatus::NotEnforced {
+        // Half-confined is not confined: refuse the spawn instead.
+        return Err(std::io::Error::other("landlock not enforced"));
+    }
+    Ok(())
 }
 
 /// The full bwrap argv (everything after `argv[0]`) for `mode`.
@@ -1176,8 +1358,148 @@ mod tests {
         );
     }
 
+    /// The notice cell is process-global, so the tests that assert on its
+    /// exact contents must not interleave with each other.
+    fn notice_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Landlock really does block a write outside the roots.
+    ///
+    /// The backend is forced: this machine picks bwrap whenever it can, so the
+    /// fallback would never run under `detect_backend`. The policy is a struct
+    /// literal for the same reason as slice 3/5 — a `for_agent` policy makes
+    /// `env::temp_dir()` writable and the "outside" tempdir with it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn landlock_blocks_writes_outside_roots() {
+        if !std::fs::read_to_string("/sys/kernel/security/lsm")
+            .unwrap_or_default()
+            .contains("landlock")
+        {
+            return; // best-effort: exercise the real backend when available
+        }
+        let Some(shell) = crate::Shell::detect() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![canonicalize_nearest(dir.path())],
+            readable_roots: Vec::new(),
+        };
+
+        let target = outside.path().join("escaped");
+        let mut cmd = shell_command_with_backend(
+            OsSandboxBackend::Landlock,
+            shell,
+            &format!("echo x > {}", target.display()),
+            &policy,
+            dir.path(),
+        );
+        cmd.current_dir(dir.path());
+        let out = cmd.output().await.unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(!out.status.success(), "the write was allowed: {stderr}");
+        assert!(stderr.contains("Permission denied"), "{stderr}");
+        assert!(!target.exists(), "the write landed anyway");
+
+        // …and the cwd stays writable, or no agent could work at all.
+        let inside = dir.path().join("mine");
+        let mut cmd = shell_command_with_backend(
+            OsSandboxBackend::Landlock,
+            shell,
+            &format!("echo x > {}", inside.display()),
+            &policy,
+            dir.path(),
+        );
+        cmd.current_dir(dir.path());
+        let out = cmd.output().await.unwrap();
+        assert!(
+            out.status.success(),
+            "the cwd write was blocked: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&inside).unwrap().trim(), "x");
+    }
+
+    /// Landlock has no read axis, so a read-mode agent's shell commands are
+    /// only write-confined — which must never be silent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_mode_under_landlock_degrades_with_a_notice() {
+        let _guard = notice_lock();
+        while take_sandbox_notice().is_some() {}
+        let dir = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Read,
+            writable_roots: Vec::new(),
+            readable_roots: vec![canonicalize_nearest(dir.path())],
+        };
+
+        let _cmd = shell_command_with_backend(
+            OsSandboxBackend::Landlock,
+            crate::Shell::Bash,
+            "true",
+            &policy,
+            dir.path(),
+        );
+        // Whatever else this host queued first (the reason bwrap was skipped,
+        // on a machine that actually fell back), the read admission is there.
+        let mut notices = Vec::new();
+        while let Some(n) = take_sandbox_notice() {
+            notices.push(n);
+        }
+        assert!(
+            notices
+                .iter()
+                .any(|n| n == READ_DEGRADES_UNDER_LANDLOCK_NOTICE),
+            "{notices:?}"
+        );
+    }
+
+    /// With no backend the command runs unconfined — allowed, but only ever
+    /// once the user has been told, and only told once.
+    #[test]
+    fn no_backend_emits_the_not_confined_notice_once() {
+        let _guard = notice_lock();
+        while take_sandbox_notice().is_some() {}
+        let dir = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+
+        let _cmd = shell_command_with_backend(
+            OsSandboxBackend::None,
+            crate::Shell::Bash,
+            "true",
+            &policy,
+            dir.path(),
+        );
+        assert_eq!(
+            take_sandbox_notice().as_deref(),
+            Some(NO_OS_SANDBOX_NOTICE),
+            "the first unconfined command must say so"
+        );
+
+        let _cmd = shell_command_with_backend(
+            OsSandboxBackend::None,
+            crate::Shell::Bash,
+            "true",
+            &policy,
+            dir.path(),
+        );
+        assert_eq!(
+            take_sandbox_notice(),
+            None,
+            "the same notice must not repeat every command"
+        );
+    }
+
     #[test]
     fn sandbox_notice_is_take_once() {
+        let _guard = notice_lock();
+        while take_sandbox_notice().is_some() {}
         let msg = "sandbox: test notice — take once".to_string();
         set_sandbox_notice(msg.clone());
         assert_eq!(take_sandbox_notice().as_deref(), Some(msg.as_str()));

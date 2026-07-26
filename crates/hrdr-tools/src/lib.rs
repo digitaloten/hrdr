@@ -43,7 +43,7 @@ pub use lsp::{
 };
 pub use mcp::McpClient;
 pub use memory::MemoryTool;
-pub use sandbox::{SandboxMode, SandboxPolicy};
+pub use sandbox::{SandboxMode, SandboxPolicy, set_sandbox_notice, take_sandbox_notice};
 pub use tools::{
     CopyTool, DefinitionTool, DeleteTool, EditTool, FindTool, GitTool, GrepTool, LsTool, MoveTool,
     ReadTool, ReferencesTool, RenameTool, ReplaceTool, Shell, ShellTool, TodoTool, TreeTool,

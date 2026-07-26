@@ -9481,6 +9481,35 @@ mod tests {
             assert!(last.tool_calls.is_none());
         }
 
+        /// A sandbox degradation reaches the user: the turn loop drains the
+        /// notice cell beside the LLM client's warning and republishes it as
+        /// the `Notice` every frontend already renders. Without this drain the
+        /// OS layer could silently stop confining shell commands.
+        #[tokio::test]
+        async fn sandbox_notice_reaches_the_event_stream() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", "ok"),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+
+            hrdr_tools::set_sandbox_notice(
+                "sandbox: pretend degradation for the event stream".to_string(),
+            );
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent.run_input("hi", |ev| events.push(ev)).await.unwrap();
+
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("sandbox:"))),
+                "the sandbox notice must surface as a Notice: {events:?}"
+            );
+        }
+
         /// `max_cost` stops the turn before the first model call once the
         /// session counter has reached the cap (a zero cap trips immediately),
         /// with a Notice explaining why.

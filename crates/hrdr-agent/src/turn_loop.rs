@@ -567,6 +567,13 @@ impl Agent {
             if let Some(warning) = hrdr_llm::take_client_warning() {
                 on_event(AgentEvent::Notice(warning));
             }
+            // The sandbox's own degradation channel: a shell command that ran
+            // with less OS confinement than its mode promised says so here,
+            // once per process, through the same event the frontends already
+            // render.
+            if let Some(warning) = hrdr_tools::take_sandbox_notice() {
+                on_event(AgentEvent::Notice(warning));
+            }
 
             // Emit usage for the status bar + auto-compaction. Prefer the
             // server's reported counts; when it doesn't send any (e.g. a server
