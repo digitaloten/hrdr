@@ -34,7 +34,7 @@ pub(crate) const READ_BUDGET_FACTOR: usize = 20;
 /// before a single line comes back. Generous enough for any real source file.
 pub(crate) const MAX_READ_BYTES: u64 = 50 * 1024 * 1024;
 /// How long a shell command gets before it is killed, unless the model asks for
-/// more with `timeout_ms`. Used by the `shell` tool.
+/// more with `timeout_secs`. Used by the `shell` tool.
 ///
 /// Five minutes, because the commands worth running are the slow ones: a cold
 /// `cargo build`, a full test suite, an `npm install` on a fresh tree. The old
@@ -42,7 +42,7 @@ pub(crate) const MAX_READ_BYTES: u64 = 50 * 1024 * 1024;
 /// killed build teaches the model nothing except to try a narrower command, so the
 /// work is redone rather than finished. A command that hangs is still caught; it
 /// just gets a realistic amount of rope first.
-pub(crate) const DEFAULT_SHELL_TIMEOUT_MS: u64 = 300_000;
+pub(crate) const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 300;
 /// Hard cap on a single output line accumulated from the shell; prevents
 /// a minified-file line from blowing the per-turn context.
 pub(crate) const BASH_LINE_CAP: usize = 8_192;
@@ -1320,7 +1320,7 @@ mod tests {
         let c = ctx(std::path::PathBuf::from("."));
         let out = ShellTool::new(Shell::Bash)
             .execute(
-                serde_json::json!({"command": "echo early; sleep 30", "timeout_ms": 300}),
+                serde_json::json!({"command": "echo early; sleep 30", "timeout_secs": 1}),
                 &c,
             )
             .await

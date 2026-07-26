@@ -39,10 +39,11 @@ Shell:
   that ANY terminal state satisfies it, not just the good one.
   Don't poll it yourself: a `sleep` in the shell tells you nothing until it ends, and
   a check-think-sleep-check loop spends a model round-trip per look.
-- A command gets 5 minutes (`timeout_ms`, default 300000) and is killed after that.
+- A command gets 5 minutes (`timeout_secs`, default 300) and is killed after that.
+  Every time parameter on every tool is in seconds — there is no `timeout_ms`.
   If you *expect* something to run longer — a cold build, a full test suite, a
-  dependency install on an empty cache — raise `timeout_ms` on the call rather than
-  letting it be killed and starting again: a killed command has done the work and
+  dependency install on an empty cache — raise `timeout_secs` on the call rather
+  than letting it be killed and starting again: a killed command has done the work and
   thrown it away. If a command times out unexpectedly, that is a finding (it hung,
   or it is waiting on input) — don't just re-run it with a bigger number.
 - Quote every path you interpolate; assume names contain spaces.

@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 use crate::{Tool, ToolContext};
 
-use super::{BASH_LINE_CAP, DEFAULT_SHELL_TIMEOUT_MS};
+use super::{BASH_LINE_CAP, DEFAULT_SHELL_TIMEOUT_SECS};
 
 // ---- shell ----
 
@@ -218,7 +218,7 @@ const GREP_TAIL_NOTE: &str = "note: the trailing grep matched nothing (exit 1 is
 struct ShellArgs {
     command: String,
     #[serde(default)]
-    timeout_ms: Option<u64>,
+    timeout_secs: Option<u64>,
 }
 
 /// The JSON-Schema for the `shell` tool; only the command description differs by
@@ -228,10 +228,10 @@ fn shell_parameters(command_desc: &str) -> serde_json::Value {
         "type": "object",
         "properties": {
             "command": {"type": "string", "description": command_desc},
-            "timeout_ms": {
+            "timeout_secs": {
                 "type": "integer",
-                "description": "How long to let the command run, in milliseconds. \
-                                Default 300000 (5 minutes). Raise it for something you \
+                "description": "How long to let the command run, in seconds. \
+                                Default 300 (5 minutes). Raise it for something you \
                                 expect to be slow — a cold build, a full test suite, a \
                                 dependency install — rather than letting it be killed \
                                 and starting over."
@@ -239,6 +239,32 @@ fn shell_parameters(command_desc: &str) -> serde_json::Value {
         },
         "required": ["command"]
     })
+}
+
+/// Reject the old millisecond spelling loudly instead of letting it slide.
+///
+/// Every model-facing time parameter is seconds now, but `timeout_ms` was the
+/// spelling for long enough that a model will reach for it from habit. Both
+/// quiet outcomes are bad: serde ignores unknown fields, so an ignored
+/// `timeout_ms` silently runs the command on the default timeout while the
+/// model believes it asked for something else — and a `#[serde(alias)]` would
+/// be *worse*, reinterpreting `30000` as 30,000 **seconds** (over eight hours)
+/// on a command the model wanted killed after thirty. So the field is poison:
+/// name it, say what replaced it, and do the division for the caller.
+fn reject_timeout_ms(args: &serde_json::Value) -> Result<()> {
+    let Some(value) = args.get("timeout_ms") else {
+        return Ok(());
+    };
+    let hint = value
+        .as_f64()
+        .map(|ms| {
+            format!(
+                " (this looks like {} seconds)",
+                (ms / 1000.0).round() as i64
+            )
+        })
+        .unwrap_or_default();
+    bail!("`timeout_ms` is gone — timeouts are seconds now; pass `timeout_secs`{hint}");
 }
 
 #[async_trait]
@@ -256,13 +282,14 @@ impl Tool for ShellTool {
         shell_parameters("Shell command to run.")
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
+        reject_timeout_ms(&args)?;
         let a: ShellArgs = crate::tool_args("shell", args)?;
         if let Some(msg) = crate::check_guardrails(&a.command, &ctx.guardrails) {
             bail!("command blocked: {msg}");
         }
         let mut cmd = self.shell.command(&a.command);
         cmd.current_dir(&ctx.cwd);
-        let timeout = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS));
+        let timeout = Duration::from_secs(a.timeout_secs.unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS));
         // A command is the usual reason a file the model read goes stale — a
         // formatter, a codegen step, `git checkout`. Note which tracked files
         // this one changed (before/after signatures) so a later `edit` refusal
@@ -513,9 +540,9 @@ async fn run_streamed_command(
             group.kill();
             let _ = child.kill().await;
             let msg = format!(
-                "[command timed out after {}ms; process killed — raise timeout_ms or \
+                "[command timed out after {}s; process killed — raise timeout_secs or \
                  run a narrower command]",
-                timeout.as_millis()
+                timeout.as_secs()
             );
             ingest_line!(&msg);
             None
@@ -727,14 +754,14 @@ mod tests {
     /// rather than finished. A genuine hang is still caught; it just gets a
     /// realistic amount of rope first.
     ///
-    /// `timeout_ms` is only useful if the model can *see* what it overrides: a
+    /// `timeout_secs` is only useful if the model can *see* what it overrides: a
     /// default it doesn't know about is a default it won't reason about. So the
     /// number, its unit, and when to raise it all live in the description the model
     /// is handed with every request.
     #[test]
     fn a_shell_command_gets_five_minutes_by_default_and_says_so() {
         assert_eq!(
-            DEFAULT_SHELL_TIMEOUT_MS, 300_000,
+            DEFAULT_SHELL_TIMEOUT_SECS, 300,
             "five minutes: long enough for a cold build, short enough to catch a hang"
         );
 
@@ -744,11 +771,19 @@ mod tests {
             ShellTool::new(Shell::Posix).parameters(),
         ];
         for schema in schemas {
-            let desc = schema["properties"]["timeout_ms"]["description"]
-                .as_str()
-                .expect("timeout_ms is documented");
             assert!(
-                desc.contains("300000"),
+                schema["properties"]["timeout_ms"].is_null(),
+                "the millisecond spelling must not reappear in the schema"
+            );
+            let desc = schema["properties"]["timeout_secs"]["description"]
+                .as_str()
+                .expect("timeout_secs is documented");
+            assert!(
+                desc.contains("seconds"),
+                "the unit is the whole point of the rename: {desc}"
+            );
+            assert!(
+                desc.contains("300"),
                 "the model must see the default it is overriding: {desc}"
             );
             assert!(
@@ -762,28 +797,70 @@ mod tests {
         }
     }
 
-    /// An unset `timeout_ms` means the default, not "no timeout" — and a set one is
+    /// An unset `timeout_secs` means the default, not "no timeout" — and a set one is
     /// honoured. The parse is the only thing standing between a hung command and a
     /// wedged turn.
     #[test]
-    fn timeout_ms_defaults_when_absent_and_is_honoured_when_given() {
+    fn timeout_secs_defaults_when_absent_and_is_honoured_when_given() {
         let default: ShellArgs = serde_json::from_value(serde_json::json!({"command": "true"}))
             .expect("command alone is valid");
-        assert_eq!(default.timeout_ms, None, "absent means absent");
+        assert_eq!(default.timeout_secs, None, "absent means absent");
         assert_eq!(
-            Duration::from_millis(default.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)),
+            Duration::from_secs(default.timeout_secs.unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)),
             Duration::from_secs(300),
             "…and absent resolves to five minutes"
         );
 
         let given: ShellArgs =
-            serde_json::from_value(serde_json::json!({"command": "true", "timeout_ms": 900_000}))
+            serde_json::from_value(serde_json::json!({"command": "true", "timeout_secs": 900}))
                 .expect("an override is valid");
         assert_eq!(
-            Duration::from_millis(given.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)),
+            Duration::from_secs(given.timeout_secs.unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)),
             Duration::from_secs(900),
             "a model that asks for fifteen minutes gets fifteen minutes"
         );
+    }
+
+    /// The old spelling must fail loudly, not quietly.
+    ///
+    /// `ShellArgs` has no `deny_unknown_fields` (no arg struct in the crate
+    /// does), so serde would drop a stray `timeout_ms` on the floor and run the
+    /// command on the five-minute default — the model asked for thirty seconds
+    /// and got five minutes, with nothing said. The guard turns that into an
+    /// error the model can act on, and does the ms→s division in the message so
+    /// the retry is obvious.
+    #[tokio::test]
+    async fn the_old_millisecond_spelling_is_rejected_with_the_converted_value() {
+        // Serde really does ignore it — this is what the guard exists to catch.
+        let slipped: ShellArgs =
+            serde_json::from_value(serde_json::json!({"command": "true", "timeout_ms": 30_000}))
+                .expect("serde ignores unknown fields");
+        assert_eq!(
+            slipped.timeout_secs, None,
+            "silently the default — the hazard"
+        );
+
+        let ctx = ToolContext::new(std::path::PathBuf::from("."));
+        let err = ShellTool::new(Shell::Bash)
+            .execute(json!({"command": "true", "timeout_ms": 30_000}), &ctx)
+            .await
+            .expect_err("the ms spelling is poison")
+            .to_string();
+        assert!(err.contains("`timeout_ms` is gone"), "{err}");
+        assert!(err.contains("timeout_secs"), "{err}");
+        assert!(
+            err.contains("30 seconds"),
+            "the message does the division: {err}"
+        );
+
+        // A non-numeric value still names the field; it just can't convert.
+        let err = ShellTool::new(Shell::Bash)
+            .execute(json!({"command": "true", "timeout_ms": "soon"}), &ctx)
+            .await
+            .expect_err("still poison")
+            .to_string();
+        assert!(err.contains("`timeout_ms` is gone"), "{err}");
+        assert!(!err.contains("looks like"), "no bogus conversion: {err}");
     }
 
     /// The point of the whole `proc` module: a timeout must kill the entire
@@ -806,7 +883,7 @@ mod tests {
         // Background a subshell that sleeps 5s and then touches `marker`
         // (standing in for a long-lived `node` server); record its pid; then
         // block in the foreground on a sleep of our own so `bash` is still
-        // alive when the 300ms timeout below fires.
+        // alive when the one-second timeout below fires.
         let command = format!(
             "(sleep 5 && touch {m}) & echo $! > {p}; sleep 5",
             m = marker.display(),
@@ -815,7 +892,7 @@ mod tests {
 
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let out = ShellTool::new(Shell::Bash)
-            .execute(json!({"command": command, "timeout_ms": 300}), &ctx)
+            .execute(json!({"command": command, "timeout_secs": 1}), &ctx)
             .await
             .unwrap();
         assert!(out.contains("timed out"), "{out}");

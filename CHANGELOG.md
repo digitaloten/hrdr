@@ -72,6 +72,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **BREAKING (tool API): every model-facing time parameter is in seconds —
+  `shell`'s `timeout_ms` is now `timeout_secs`.** The tool schemas mixed units:
+  `watch` took `interval_secs`/`timeout_secs` while `shell` took `timeout_ms`,
+  so the same concept had two spellings and two magnitudes and a model had to
+  remember which tool wanted which. `shell` now takes `timeout_secs: integer`
+  (default `300`, unchanged five minutes) and its timeout message reads
+  `[command timed out after 300s; process killed — raise timeout_secs …]`. No
+  compat shim, and deliberately no `serde(alias)`: an aliased
+  `timeout_ms: 30000` would have been read as 30,000 **seconds** (over eight
+  hours) on a command meant to die after thirty. Instead the old name is poison
+  — `shell` inspects the raw arguments before deserializing and fails with
+  ``timeout_ms` is gone — timeouts are seconds now; pass `timeout_secs` (this looks like 30 seconds)``,
+  doing the conversion in the message. (Serde ignores unknown fields, so without
+  the guard a stray `timeout_ms` would have silently run on the default
+  timeout.) `watch` is unchanged; the `[[hooks]]` and `[lsp]` config keys
+  (`timeout_ms`, `wait_ms`) are user-facing TOML, not tool schema, and keep
+  their units.
 - **BREAKING (tool API): the `models` tool is a drill-down, and
   `mode: "available"` is gone.** That mode returned EVERY reachable model as
   rows — a large result to carry, and the thing that made mis-resolution easy:
