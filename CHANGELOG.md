@@ -72,6 +72,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **BREAKING (behavior): agents are sandboxed by default (`sandbox = "write"`) —
+  writes outside the working directory are refused.** hrdr runs arbitrary
+  models, and guidance only reaches steerable ones: a delegated write sub-agent
+  that `cd`s out of its worktree and commits to the parent repo's `main` is the
+  concrete failure this closes. Every agent — main, delegated, revived — now
+  derives its confinement once, in `Agent::new`, from the session mode and its
+  own permissions: a write-capable agent gets `write` (reads unrestricted;
+  writes allowed only under its cwd, the temp dir, the per-session scratch dir,
+  the tool-output dir, the git metadata a linked worktree needs to commit, and
+  any configured `sandbox_writable_roots`), a read-only agent gets `read` (no
+  writes at all; reads only under its cwd, scratch, and tool-output). The file
+  tools (`write`, `edit`, `replace`, `move`, `copy`, `delete`, `read`, `grep`,
+  `ls`, `tree`, `lsp_nav`) enforce it today, with symlink and `..` escapes
+  resolved before the check; the OS-level layer for shell children lands next. A
+  refused write reads
+  `sandbox: refusing to write <path> — it is outside this agent's writable roots. You may write only under: …`.
+  Escape hatches, in order of bluntness:
+  `sandbox_writable_roots = ["/abs/path"]` (the remedy for a cold
+  `cargo build`/`npm install` that wants `~/.cargo` or `~/.npm`),
+  `sandbox = "read"`/`"write"` in config.toml, `HRDR_SANDBOX`, and
+  `--sandbox none` / `--no-sandbox`, which restores the previous full-access
+  behavior exactly.
 - **BREAKING (tool API): every model-facing time parameter is in seconds —
   `shell`'s `timeout_ms` is now `timeout_secs`.** The tool schemas mixed units:
   `watch` took `interval_secs`/`timeout_secs` while `shell` took `timeout_ms`,

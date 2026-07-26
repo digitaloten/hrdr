@@ -1495,6 +1495,15 @@ impl Agent {
         }
         let mut ctx = ToolContext::new(config.cwd.clone());
         ctx.lsp = lsp;
+        // Filesystem confinement, derived once here for every agent — main, sub,
+        // and revived alike all come through this constructor, so there is no
+        // second place a mode could be decided (see `effective_sandbox`).
+        let sandbox_mode = crate::config::effective_sandbox(config.sandbox, config.read_only);
+        ctx.sandbox = Arc::new(hrdr_tools::SandboxPolicy::for_agent(
+            sandbox_mode,
+            &config.cwd,
+            &config.sandbox_writable_roots,
+        ));
         ctx.max_output = config.tool_max_bytes;
         ctx.max_output_lines = config.tool_max_lines;
         if let Some((proj, glob)) = &mem_dirs {
@@ -3766,6 +3775,46 @@ mod tests {
             !ro.tools.defs().iter().any(|d| d.function.name == "memory"),
             "a read-only agent has no write tools, memory included"
         );
+    }
+
+    /// Confinement is derived in `Agent::new`, from the session default and the
+    /// agent's own permissions: a write-capable agent gets `Write` (its cwd and
+    /// the scratch dirs), a read-only one `Read` (no writes at all, reads only
+    /// under its roots). Sub-agents clone the base config, so this single
+    /// derivation is the only one there is.
+    #[test]
+    fn a_read_only_agent_gets_read_confinement() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let writer = Agent::new(cfg.clone()).unwrap();
+        assert_eq!(writer.ctx.sandbox.mode, hrdr_tools::SandboxMode::Write);
+        writer.ctx.resolve_write("out.txt").unwrap();
+        writer.ctx.resolve_read("/etc/hostname").unwrap();
+        let err = writer
+            .ctx
+            .resolve_write("/etc/hrdr-should-never-write")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("You may write only under"), "{err}");
+
+        let reader = Agent::new(AgentConfig {
+            read_only: true,
+            ..cfg
+        })
+        .unwrap();
+        assert_eq!(reader.ctx.sandbox.mode, hrdr_tools::SandboxMode::Read);
+        reader.ctx.resolve_read("notes.md").unwrap();
+        let err = reader
+            .ctx
+            .resolve_read("/etc/hostname")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("this agent is read-only"), "{err}");
+        reader.ctx.resolve_write("out.txt").unwrap_err();
     }
 
     #[test]

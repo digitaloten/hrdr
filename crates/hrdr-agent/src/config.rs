@@ -899,7 +899,7 @@ impl Default for AgentConfig {
             agent_prompt: None,
             allowed_tools: None,
             read_only: false,
-            sandbox: SandboxMode::None,
+            sandbox: SandboxMode::Write,
             sandbox_writable_roots: Vec::new(),
             subagent_transcript_dir: None,
             lsp: true,
@@ -2287,6 +2287,20 @@ mod persistence_tests {
 mod sandbox_tests {
     use super::*;
 
+    /// Confinement is on unless the user turns it off: an unconfigured session
+    /// runs `write`, so writes outside the working directory are refused by
+    /// default. `--sandbox none` / `sandbox = "none"` is the opt-out.
+    #[test]
+    fn agent_config_defaults_to_write_sandbox() {
+        let cfg = AgentConfig::default();
+        assert_eq!(cfg.sandbox, SandboxMode::Write);
+        assert!(cfg.sandbox_writable_roots.is_empty());
+        // …and a write-capable agent derives `write` from it, a read-only one
+        // `read` — the two rows an unconfigured session can produce.
+        assert_eq!(effective_sandbox(cfg.sandbox, false), SandboxMode::Write);
+        assert_eq!(effective_sandbox(cfg.sandbox, true), SandboxMode::Read);
+    }
+
     /// The config-file key parses the three spellings, and a misspelling is a
     /// hard TOML error (file values are errors — see the module docs).
     #[test]
@@ -2309,7 +2323,7 @@ mod sandbox_tests {
         assert_eq!(fc.sandbox, None);
         let mut cfg = AgentConfig::default();
         cfg.apply_file(fc);
-        assert_eq!(cfg.sandbox, SandboxMode::None, "the slice-2 default");
+        assert_eq!(cfg.sandbox, SandboxMode::Write, "the shipped default");
 
         // A misspelling never reaches the config: it fails to parse.
         let err = match toml::from_str::<FileConfig>("sandbox = \"wrote\"") {
