@@ -194,16 +194,14 @@ jobs:
         working-directory: crates/hrdr-ui
         shell: bash
         run: |
-          # dx prints the output path — capture it.
-          DX_OUT=$(dx build --platform web --release 2>&1 | grep -oE 'target/dx/hrdr-ui/[^ ]+' | head -1 || true)
-          if [ -z "$DX_OUT" ]; then
-            # Fallback: find the newest dir.
-            DX_OUT=$(find target/dx/hrdr-ui -type d -name 'release' | head -1)
-          fi
-          if [ -d "$DX_OUT" ]; then
-            rm -rf dist
-            cp -r "$DX_OUT" dist
-          fi
+          # dx keys the output dir by the BIN name (hrdr-ui-wasm), not the
+          # package name, and the servable bundle is the web/public subdir.
+          SRC=target/dx/hrdr-ui-wasm/release/web/public
+          test -d "$SRC" || { echo "::error::dx output not found at $SRC"; find target/dx -maxdepth 4 -type d; exit 1; }
+          rm -rf dist
+          cp -r "$SRC" dist
+          touch dist/.gitkeep
+          ls -la dist
       - name: Check gzipped WASM size
         working-directory: crates/hrdr-ui
         shell: bash
