@@ -1,9 +1,13 @@
 # Deferred improvements / backlog
 
 Smaller items that were identified but not yet done or tracked elsewhere. Larger
-efforts have their own docs: `sandbox-design.md` (also issue #13),
-`web-ui-plan.md`, `security-audit.md` (one LOW residual left). The Codex catalog
-pin is issue #2.
+efforts have their own docs: `sandbox-design.md` (implementation-ready spec,
+issue #13) and `compare.md` (harness comparison — its open shortlist: model-
+invocable skills, doom_loop detection, `.git` protection in worktrees, and the
+two prompt defects #2/#3). `security-audit.md` is fully closed (kept as a
+methodology record). The web UI shipped 2026-07-26 (plan doc deleted; its
+leftovers are the **Web UI follow-ups** section below). The Codex catalog pin is
+issue #2.
 
 Docs for finished work are deleted rather than kept as history — read the code
 and `git log`. What survives from a completed effort is only what still binds
@@ -67,6 +71,29 @@ future work; those are collected under **Standing constraints** at the bottom.
   equivalent applied at all, so callers relying on it keep their own preflight
   check. Recorded on `owner_only_options_no_follow`; closing it properly means
   resolving the whole path under a directory handle.
+
+## Web UI follow-ups (post-parity; the implemented spec's deferred list + review residuals)
+
+- **Session-browser UI** — list + open other sessions from the client; the
+  server gains a `list_sessions()`-backed message pair.
+- **Syntax highlighting in code blocks** (syntect-wasm or highlight.js interop).
+- **Modal pickers** (model/effort/theme/session) as bottom sheets over the
+  `begin_*_selector` hooks.
+- **v2: attach to a live TUI session** — blocked on making the event-log
+  compaction min-cursor-aware across readers (`PaneSet::sync` calls
+  `live.compact` after folding, so the log is effectively single-reader today).
+- **Native desktop/mobile shell** — webview over embedded `hrdr-web`.
+- **Read-only/observer auth mode.**
+- **Cookie-attempt rate-limiting** — `check_auth`'s Users branch 401s on an
+  invalid session cookie without calling `rate_limit_record` (the cookie is
+  HMAC-signed so not brute-forceable; counting attempts is still cleaner).
+- **WebHost chrome posters** — no `identity_poster`/`context_window_poster`, so
+  an async `/model` switch updates chrome only via the agent's republish; and a
+  failed autosave is silent (no web equivalent of the TUI's
+  `record_session_save` notice).
+- **WS origin check allows any localhost port** — a malicious page served by
+  another local app could open a WS with the victim's cookie; tighten the
+  localhost allowance to the served port.
 
 ## Test coverage gaps
 
