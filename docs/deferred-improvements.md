@@ -24,9 +24,6 @@ future work; those are collected under **Standing constraints** at the bottom.
 - **Model pre-flight validation.** Verify a configured model actually exists on
   its provider before starting a turn, so a typo'd/unavailable model fails fast
   with a clear message instead of mid-turn.
-- **Batched `edits[]` on the `edit` tool.** Let one `edit` call carry an array
-  of `{old_string, new_string}` edits against a file, applied in order — fewer
-  round trips than one call per hunk, and atomic per file.
 - **LSP diagnostics dedup.** The same diagnostic can surface more than once
   (overlapping ranges / re-published sets); dedupe before showing the model.
 - **Sub-agent isolation guard.** A defensive check that a write sub-agent's tool
@@ -126,6 +123,17 @@ both since closed and deleted) examined and deliberately left alone. Recorded so
 the next audit does not re-litigate them — if you disagree, argue with the
 reason, don't just re-file the finding.
 
+- **Batched `edits[]` on the `edit` tool — declined 2026-07-26.** Design was
+  worked through (flat `edits: [{path, old_string, new_string}]`, anchors
+  resolved against as-read content, two-phase all-or-nothing) and rejected on
+  cost/benefit: single edits are what models handle best; with prompt caching
+  the marginal token cost of a second edit call is just its own args + the (now
+  trimmed) result, so the batch's real saving is only round-trip latency — not
+  worth the validation/overlap/error-reporting machinery, which is its own bug
+  surface. The failure-retry cost that motivated batching was fixed instead at
+  the root (formatter-aware staleness + apply-anyway, `da714e1`). Note the wire
+  format constrains any future revival: tool args must be object-rooted, so a
+  bare array can never be the schema.
 - **Slash-command dispatch is mirrored** between `hrdr-tui/src/app/commands.rs`
   and `hrdr-app/src/commands/dispatch.rs`. Intentional: the TUI handler
   intercepts TUI-only commands (`edit`, `reload`, `goto`, `find`, `next`/`prev`)
