@@ -6,6 +6,26 @@ use super::*;
 /// (appended to the last tool result of that round).
 const WRAP_UP_WARNING_ROUNDS: usize = 3;
 
+/// Fraction of the tool-round budget after which the model gets one *soft*
+/// warning — numerator over [`CHECKPOINT_WARNING_DEN`].
+///
+/// [`WRAP_UP_WARNING_ROUNDS`] is far too late to act on: three rounds is enough
+/// to write a summary, not to commit half-finished work and re-plan the rest.
+/// Transcripts show the hard stop landing mid-plan with no warning at all — an
+/// autonomous run died roughly a quarter of the way through its list, leaving
+/// uncommitted edits and nothing sequenced. At 80% there is still real budget
+/// left to checkpoint with.
+const CHECKPOINT_WARNING_NUM: usize = 4;
+const CHECKPOINT_WARNING_DEN: usize = 5;
+
+/// The round after which the soft checkpoint warning fires, or `None` when the
+/// budget is too small for it to be worth anything (the 80% mark lands on the
+/// last round, where [`WRAP_UP_WARNING_ROUNDS`] already speaks).
+pub(crate) fn checkpoint_warning_round(max_steps: usize) -> Option<usize> {
+    let at = (max_steps * CHECKPOINT_WARNING_NUM).div_ceil(CHECKPOINT_WARNING_DEN);
+    (at >= 1 && at < max_steps).then_some(at)
+}
+
 /// Capacity of the per-tool and shared live-output channels used to forward
 /// [`ToolContext::stream`](hrdr_tools::ToolContext::stream) chunks to the UI
 /// (see `run_tool_batch`). This is advisory progress output, not the
@@ -396,7 +416,36 @@ pub(crate) fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
+/// State the turn-end TODO nudge arms so the rounds after it can tell
+/// *reconciliation* from *deletion*.
+///
+/// Transcripts show the failure this catches: nudged about four unfinished
+/// items, the model called `todo` once with a single `completed` item — "all
+/// done" — and the bookkeeping was square by erasure. The todo tool replaces the
+/// whole list, so content strings are the only identity items have; a shrinking
+/// list plus a named item gone missing is the honest signal, and it is checked
+/// only while a nudge is outstanding.
+struct TodoShrinkWatch {
+    /// Contents of the items the nudge named as unfinished.
+    unfinished: Vec<String>,
+    /// Length of the whole list when the nudge was sent.
+    len: usize,
+}
+
 impl Agent {
+    /// The current TODO list's item contents and length, for [`TodoShrinkWatch`].
+    fn todo_snapshot(&self) -> (Vec<String>, usize) {
+        let items = self
+            .ctx
+            .todos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            items.iter().map(|t| t.content.clone()).collect(),
+            items.len(),
+        )
+    }
+
     /// Run one user turn to completion, emitting events as it goes. `steering` is
     /// a shared queue the caller can push to mid-turn (see [`SteeringQueue`]);
     /// pass [`steering_queue()`] when there's no interactive steering.
@@ -430,6 +479,12 @@ impl Agent {
         // At most one turn-end nudge (see below) per turn — a genuinely blocked
         // or deferring model must still be able to stop.
         let mut nudged_this_turn = false;
+        // One soft checkpoint warning per turn at 80% of the round budget.
+        let mut checkpoint_warned = false;
+        // Armed by the turn-end nudge: the unfinished items it named, plus the
+        // list length at that moment. The rounds that follow the nudge are
+        // watched for the list *shrinking* — see `TodoShrinkWatch`.
+        let mut todo_watch: Option<TodoShrinkWatch> = None;
 
         for step in 0..self.max_steps {
             // Deliver any steering messages submitted since the last request — a
@@ -569,6 +624,12 @@ impl Agent {
                         .collect();
                     if !unfinished.is_empty() {
                         nudged_this_turn = true;
+                        // Watch the rounds that follow for the list being
+                        // *emptied* instead of reconciled (see below).
+                        todo_watch = Some(TodoShrinkWatch {
+                            unfinished: unfinished.iter().map(|t| t.content.clone()).collect(),
+                            len: self.todo_snapshot().1,
+                        });
                         on_event(AgentEvent::Notice(format!(
                             "turn ended with {} unfinished TODOs — nudging the model to \
                              finish or defer explicitly",
@@ -578,8 +639,12 @@ impl Agent {
                             format!(
                                 "[Your turn was about to end, but these TODO items are not \
                                  finished:\n{}\nEither continue now and complete them, or \
-                                 update the list — mark items done or remove them — and tell \
-                                 the user plainly why you decided to defer that work.]",
+                                 reconcile the list item by item with the todo tool: send the \
+                                 full list back with every one of these items still in it, \
+                                 each marked `completed` or `cancelled` — and say plainly, to \
+                                 the user, why you cancelled what you cancelled. Do not \
+                                 replace, collapse, or drop items to make the list look \
+                                 finished; a shorter list is not a resolved list.]",
                                 render_unfinished_todos(&unfinished)
                             ),
                             MessageOrigin::Nudge,
@@ -624,10 +689,69 @@ impl Agent {
                 self.run_tool_batch(batch, &mut repeat, &mut on_event).await;
             }
 
+            // Backstop for the turn-end TODO nudge: the model can "satisfy" it by
+            // replacing the list with one collapsed "all done" item instead of
+            // resolving the items it was shown. Fires at most once per turn (the
+            // watch is disarmed either way), and only on the unambiguous shape —
+            // the list got *shorter* and an item the nudge named is gone
+            // altogether, not merely reworded or re-statused.
+            if let Some(watch) = todo_watch.take() {
+                let (current, len) = self.todo_snapshot();
+                let removed: Vec<&String> = watch
+                    .unfinished
+                    .iter()
+                    .filter(|c| !current.contains(c))
+                    .collect();
+                if len < watch.len && !removed.is_empty() {
+                    on_event(AgentEvent::Notice(format!(
+                        "{} nudged TODO items were removed rather than resolved — asking \
+                         the model to restore them",
+                        removed.len()
+                    )));
+                    let list = removed
+                        .iter()
+                        .map(|c| format!("- {c}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.push_user_message(
+                        format!(
+                            "[These TODO items were removed from the list rather than \
+                             resolved:\n{list}\nDeleting an item is not finishing it. Send the \
+                             list back through the todo tool with each of them restored and \
+                             marked `completed` or `cancelled`, and tell the user which ones \
+                             you did not actually do.]"
+                        ),
+                        MessageOrigin::Nudge,
+                    );
+                } else {
+                    // Not a shrink (yet) — keep watching the rest of the turn.
+                    todo_watch = Some(watch);
+                }
+            }
+
             // Mid-turn durability: every result of this round is committed, so
             // hand the frontend a history snapshot to persist. A crash from
             // here on loses at most the next round.
             on_event(AgentEvent::History(self.messages.clone()));
+
+            // 80% of the budget: one soft warning, early enough that the model
+            // can still commit what's done and sequence what's left. Rides the
+            // last tool result of the round, exactly like the wrap-up note below
+            // — the model reads it with that round's results.
+            let used = step + 1;
+            if !checkpoint_warned
+                && checkpoint_warning_round(self.max_steps) == Some(used)
+                && let Some(last) = self.messages.last_mut()
+                && let Some(content) = &mut last.content
+            {
+                checkpoint_warned = true;
+                content.push_str(&format!(
+                    "\n\n[note: you've used {used} of {max} tool rounds this turn — checkpoint \
+                     your work (commit what's done) and sequence what remains; the turn ends \
+                     at {max}]",
+                    max = self.max_steps
+                ));
+            }
 
             // Near the budget: tell the model so it wraps up instead of
             // getting cut off mid-plan.

@@ -1406,6 +1406,61 @@ mod tests {
         );
     }
 
+    /// Deleting something the rest of the ecosystem might import is a
+    /// verify-then-ask job, not a judgement call from inside one repo.
+    ///
+    /// From a transcript: a crate that looked unused *in this workspace* was
+    /// deleted and the deletion pushed; another repo depended on it, and the user
+    /// had to steer a revert. The rule lives in the write-gated `Deleting:` block,
+    /// so a read-only agent — which cannot delete or push anything — never sees it.
+    #[test]
+    fn the_prompt_makes_deleting_a_shared_package_a_verify_first_job() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, false).unwrap();
+
+        // The claim being corrected, named as a claim.
+        assert!(
+            p.contains("\"Unused\" is a claim about the whole ecosystem"),
+            "{p}"
+        );
+        // Push is called out separately: an unpushed deletion is still recoverable.
+        assert!(p.contains("before you push that deletion"), "{p}");
+        // Concrete ways to look, per ecosystem — a rule with no method is ignored.
+        for probe in ["cargo tree -i", "npm ls", "go mod why"] {
+            assert!(
+                p.contains(probe),
+                "the reverse-dependency check must name `{probe}`: {p}"
+            );
+        }
+        // And the escape hatch when the answer isn't visible from here.
+        assert!(p.contains("say exactly that and ask"), "{p}");
+
+        // Write-gated: a read-only agent gets neither the rule nor its block.
+        let read_only = render_flags(false, false, false, None);
+        assert!(!read_only.contains("Unused"), "{read_only}");
+        assert!(!read_only.contains("cargo tree -i"), "{read_only}");
+    }
+
+    /// A compile error about a dependency's API is answered by reading that
+    /// dependency, not by recalling it: the package cache is already on disk.
+    /// (Observed to end a hallucination loop on the first read.)
+    #[test]
+    fn the_prompt_sends_dependency_api_errors_to_the_package_cache() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, false).unwrap();
+
+        assert!(p.contains("read that\n  dependency's own source"), "{p}");
+        // Where to look, spelled out per ecosystem.
+        assert!(p.contains("~/.cargo/registry/src/"), "{p}");
+        assert!(p.contains("node_modules/"), "{p}");
+        assert!(p.contains("GOMODCACHE"), "{p}");
+        // Why: recollection is a guess about a version you may not have seen.
+        assert!(
+            p.contains("two guesses in a row on\n  the same error means stop guessing"),
+            "{p}"
+        );
+    }
+
     /// An agent that *cannot* delegate is not told how to.
     ///
     /// `task` and `models` are registered by `Agent::new`, not by

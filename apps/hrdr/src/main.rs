@@ -778,7 +778,11 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
     let mut agent = Agent::new(config)?;
     // Prepare the outgoing prompt: expand `@file` mentions and route any
     // `@agent` mention to the matching sub-agent (parity with the TUI).
-    let prompt = hrdr_app::prepare_outgoing(&prompt, agent.agent_names(), &agent.cwd());
+    let (prompt, inlined) =
+        hrdr_app::prepare_outgoing_tracked(&prompt, agent.agent_names(), &agent.cwd());
+    // A fully inlined `@file` is content the model has already seen — tell the
+    // read-before-edit guard so it doesn't demand a redundant re-read.
+    agent.mark_files_read(&inlined);
     // Connect any configured MCP servers before the turn (their tools join the
     // set); surface the per-server status on stderr unless quiet.
     for notice in agent.connect_mcp().await {

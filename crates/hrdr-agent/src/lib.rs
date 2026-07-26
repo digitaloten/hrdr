@@ -1444,6 +1444,20 @@ impl Agent {
         &self.agent_names
     }
 
+    /// Record that this agent's context already carries each path's **whole**
+    /// current content, satisfying the read-before-edit guard for it.
+    ///
+    /// The frontend's `@file` expansion inlines referenced files into the
+    /// outgoing message, so the model has genuinely seen them — without this the
+    /// guard would make it re-read a file whose full text is already sitting in
+    /// its context. Full inlines only: a truncated attachment must not license a
+    /// blind overwrite, so callers filter those out before calling.
+    pub fn mark_files_read(&self, paths: &[std::path::PathBuf]) {
+        for path in paths {
+            self.ctx.mark_read(path);
+        }
+    }
+
     /// Connect to the configured `[[mcp]]` servers, registering each server's
     /// tools (namespaced `<name>_<tool>`) into the tool set and re-rendering the
     /// system prompt so they're listed. Resilient: a server that fails to start
@@ -8886,6 +8900,29 @@ mod tests {
             }
         }
 
+        /// `@file` expansion inlines a file's whole content into the outgoing
+        /// message, so the model *has* read it — [`Agent::mark_files_read`] is how
+        /// the frontend tells the read-before-edit guard that. Without it the model
+        /// is sent back to re-read a file already sitting verbatim in its context
+        /// (a transcript's single largest read was a 38 KiB doc it had been handed
+        /// via `@`).
+        #[test]
+        fn mark_files_read_satisfies_the_read_before_edit_guard() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("doc.md");
+            std::fs::write(&file, "# doc\n").unwrap();
+            let agent = Agent::new(test_cfg("http://127.0.0.1:1".to_string(), dir.path())).unwrap();
+
+            assert_eq!(agent.ctx.read_state(&file), hrdr_tools::ReadState::Unread);
+            agent.mark_files_read(std::slice::from_ref(&file));
+            assert_eq!(agent.ctx.read_state(&file), hrdr_tools::ReadState::Fresh);
+
+            // It records the content that was inlined, not the path: a change on
+            // disk afterwards still voids the read, exactly as a real one would.
+            std::fs::write(&file, "# doc\nedited by someone else\n").unwrap();
+            assert_eq!(agent.ctx.read_state(&file), hrdr_tools::ReadState::Stale);
+        }
+
         // ── (a) plain text turn ───────────────────────────────────────────────
 
         /// Agent::run against a mock server that returns a plain text response.
@@ -9237,9 +9274,24 @@ mod tests {
                 body.contains("not finished"),
                 "states the turn was about to end early: {body}"
             );
+            // Per-item reconciliation, not a collapsed rewrite: the transcript
+            // failure was the model replacing the whole list with one "all done"
+            // item, which satisfied the old wording ("remove them") exactly.
             assert!(
-                body.contains("mark items done or remove them"),
-                "carries the defer instruction: {body}"
+                body.contains("reconcile the list item by item"),
+                "carries the per-item reconcile instruction: {body}"
+            );
+            assert!(
+                body.contains("every one of these items still in it"),
+                "the list must come back whole: {body}"
+            );
+            assert!(
+                body.contains("`completed` or `cancelled`"),
+                "names the states the todo tool actually has: {body}"
+            );
+            assert!(
+                body.contains("Do not replace, collapse, or drop items"),
+                "forbids reconciling by deletion: {body}"
             );
             assert_eq!(nudges[0].role, Role::User);
             // Not a genuine user turn.
@@ -9456,6 +9508,267 @@ mod tests {
                     AgentEvent::Notice(n) if n.contains("tool-round limit reached")
                 )),
                 "the wrap-up Notice fires instead: {events:?}"
+            );
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
+        /// Crossing 80% of the tool-round budget earns exactly one soft warning,
+        /// and the turn carries on to the hard cap unchanged.
+        ///
+        /// The hard stop is not something a model can plan around after the fact:
+        /// transcripts show it landing mid-plan with uncommitted work and nothing
+        /// sequenced. `WRAP_UP_WARNING_ROUNDS` (3 left) is only enough to write a
+        /// summary; this one arrives with a fifth of the budget still to spend.
+        /// A 5-round budget puts the mark on round 4, so one turn exercises the
+        /// warning, the rounds after it, and the wrap-up that still follows.
+        #[tokio::test]
+        async fn agent_run_warns_once_at_eighty_percent_of_the_round_budget() {
+            let dir = tempfile::tempdir().unwrap();
+            let test_file = dir.path().join("data.txt");
+            std::fs::write(&test_file, "content").unwrap();
+            let args_json =
+                serde_json::to_string(&json!({"path": test_file.to_string_lossy()})).unwrap();
+            let round = |n: usize| {
+                MockResp::Sse(vec![
+                    tool_start_chunk(&format!("c{n}"), &format!("call_{n}"), "read"),
+                    tool_args_chunk(&format!("c{n}"), &args_json),
+                    tool_calls_stop_chunk(&format!("c{n}")),
+                    "[DONE]".to_string(),
+                ])
+            };
+            let server = MockServer::start(vec![
+                round(1),
+                round(2),
+                round(3),
+                // Round 4 is the 80% mark — the warning rides its results.
+                round(4),
+                // …and the model keeps going: the warning is advice, not a stop.
+                round(5),
+                // The forced wrap-up round once the budget is spent.
+                MockResp::Sse(vec![
+                    text_chunk("c6", "Out of rounds."),
+                    stop_chunk("c6"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.max_steps = 5;
+            let mut agent = Agent::new(cfg).unwrap();
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run_input("do the thing", |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            let warned: Vec<&str> = agent
+                .messages()
+                .iter()
+                .filter_map(|m| m.content.as_deref())
+                .filter(|c| c.contains("checkpoint your work"))
+                .collect();
+            assert_eq!(
+                warned.len(),
+                1,
+                "exactly one checkpoint warning per turn: {warned:?}"
+            );
+            // It names where it is and where the wall is, and what to do with the
+            // remaining budget.
+            assert!(warned[0].contains("used 4 of 5 tool rounds"), "{warned:?}");
+            assert!(warned[0].contains("the turn ends at 5"), "{warned:?}");
+            assert!(warned[0].contains("sequence what remains"), "{warned:?}");
+
+            // Nothing about the hard cap changed: all five rounds ran and the
+            // tools-stripped wrap-up round still closed the turn.
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, AgentEvent::ToolEnd { .. }))
+                    .count(),
+                5,
+                "the warning must not cut the turn short: {events:?}"
+            );
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    AgentEvent::Notice(n) if n.contains("tool-round limit reached")
+                )),
+                "{events:?}"
+            );
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
+        /// A budget too small for the 80% mark to mean anything stays quiet: the
+        /// mark would land on the last round, where the wrap-up note already
+        /// speaks, so a second note there is pure noise.
+        #[test]
+        fn the_checkpoint_warning_needs_a_budget_worth_checkpointing() {
+            use crate::turn_loop::checkpoint_warning_round;
+            for tiny in 1..=4 {
+                assert_eq!(checkpoint_warning_round(tiny), None, "max_steps = {tiny}");
+            }
+            assert_eq!(checkpoint_warning_round(5), Some(4));
+            assert_eq!(checkpoint_warning_round(10), Some(8));
+            assert_eq!(checkpoint_warning_round(300), Some(240));
+        }
+
+        /// The nudge's mechanical backstop: reconciling the TODO list by *deleting*
+        /// the items it named gets one more nudge, naming them.
+        ///
+        /// The transcript failure: nudged about unfinished items, the model called
+        /// `todo` once with a single collapsed "all done" item — the list was square
+        /// and the work was not. Detection is deliberately narrow (the list got
+        /// shorter *and* a named item vanished outright) and fires at most once.
+        #[tokio::test]
+        async fn agent_run_re_nudges_when_nudged_todos_are_deleted_not_resolved() {
+            let collapse = serde_json::to_string(
+                &json!({"todos": [{"content": "all done", "status": "completed"}]}),
+            )
+            .unwrap();
+            let server = MockServer::start(vec![
+                // Round 1: promise-then-stop with two unfinished items → nudge.
+                MockResp::Sse(vec![
+                    text_chunk("c1", "I'll wrap this up."),
+                    stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                // Round 2: "reconciles" by replacing the list with one done item.
+                MockResp::Sse(vec![
+                    tool_start_chunk("c2", "call_1", "todo"),
+                    tool_args_chunk("c2", &collapse),
+                    tool_calls_stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+                // Round 3 (post re-nudge): text-only, so the turn ends. Only three
+                // responses are queued — a second re-nudge would hang here.
+                MockResp::Sse(vec![
+                    text_chunk("c3", "Restored and marked."),
+                    stop_chunk("c3"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            *agent.todos().lock().unwrap() = vec![
+                TodoItem {
+                    content: "write the fix".to_string(),
+                    status: "in_progress".to_string(),
+                },
+                TodoItem {
+                    content: "add a test".to_string(),
+                    status: "pending".to_string(),
+                },
+            ];
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run_input("do the thing", |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            let nudges: Vec<&str> = agent
+                .messages()
+                .iter()
+                .filter(|m| m.origin == MessageOrigin::Nudge)
+                .filter_map(|m| m.content.as_deref())
+                .collect();
+            assert_eq!(
+                nudges.len(),
+                2,
+                "the turn-end nudge, then one backstop: {nudges:?}"
+            );
+            let back = nudges[1];
+            assert!(
+                back.contains("removed from the list rather than resolved"),
+                "{back}"
+            );
+            // Both deleted items are named — the model has to restore *these*, not
+            // guess what it dropped.
+            assert!(back.contains("- write the fix"), "{back}");
+            assert!(back.contains("- add a test"), "{back}");
+            assert!(
+                back.contains("Deleting an item is not finishing it"),
+                "{back}"
+            );
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    AgentEvent::Notice(n) if n.contains("removed rather than resolved")
+                )),
+                "a Notice explains the backstop: {events:?}"
+            );
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
+        /// The backstop is not a tripwire on any `todo` call after a nudge: a model
+        /// that reconciles honestly — every item still there, statuses moved on —
+        /// gets no second nudge, even though it rewrote the whole list (the tool has
+        /// no other mode).
+        #[tokio::test]
+        async fn agent_run_does_not_re_nudge_when_todos_are_resolved_in_place() {
+            let resolved = serde_json::to_string(&json!({"todos": [
+                {"content": "write the fix", "status": "completed"},
+                {"content": "add a test", "status": "cancelled"},
+            ]}))
+            .unwrap();
+            let server = MockServer::start(vec![
+                MockResp::Sse(vec![
+                    text_chunk("c1", "I'll wrap this up."),
+                    stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                MockResp::Sse(vec![
+                    tool_start_chunk("c2", "call_1", "todo"),
+                    tool_args_chunk("c2", &resolved),
+                    tool_calls_stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+                MockResp::Sse(vec![
+                    text_chunk("c3", "Fix done; the test is cancelled because …"),
+                    stop_chunk("c3"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            *agent.todos().lock().unwrap() = vec![
+                TodoItem {
+                    content: "write the fix".to_string(),
+                    status: "in_progress".to_string(),
+                },
+                TodoItem {
+                    content: "add a test".to_string(),
+                    status: "pending".to_string(),
+                },
+            ];
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run_input("do the thing", |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                agent
+                    .messages()
+                    .iter()
+                    .filter(|m| m.origin == MessageOrigin::Nudge)
+                    .count(),
+                1,
+                "an honest in-place reconcile earns no backstop nudge"
+            );
+            assert!(
+                !events.iter().any(|e| matches!(
+                    e,
+                    AgentEvent::Notice(n) if n.contains("removed rather than resolved")
+                )),
+                "{events:?}"
             );
             assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
         }

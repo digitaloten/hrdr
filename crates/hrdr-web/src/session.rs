@@ -394,7 +394,14 @@ impl WebSession {
     pub(crate) fn submit_sync(&mut self, pane_id: PaneId, text: String) {
         let key = pane_id_to_key(pane_id);
 
-        let sent = hrdr_app::prepare_outgoing_via(&self.agent, &text);
+        // Same expansion either way; only the main agent's own read-state is
+        // updated for `@file` inlines, since a sub-agent pane's message is
+        // delivered to that sub-agent, not to this handle.
+        let sent = if key == MAIN_KEY {
+            hrdr_app::prepare_outgoing_via(&self.agent, &text)
+        } else {
+            hrdr_app::prepare_outgoing_relayed(&self.agent, &text)
+        };
         let steer = Steer::new(sent, text);
 
         if key == MAIN_KEY {

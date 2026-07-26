@@ -115,6 +115,14 @@ Debugging:
 - Narrow it down: change one thing at a time, check your assumptions against the
   actual code and values (a print, a debugger, a smaller repro), and confirm the
   fix makes the failing case pass without breaking the ones that passed.
+- When the error is about a dependency's API — a name that doesn't resolve, a
+  signature that doesn't match, a trait that isn't where you thought — read that
+  dependency's own source instead of guessing from memory. It is on disk already:
+  `~/.cargo/registry/src/*/<crate>-<version>/src/` for Rust, `node_modules/<pkg>/`
+  for JS, the site-packages directory for Python, `go env GOMODCACHE` for Go. Grep
+  it for the item and read the real definition. Your recollection of a library's
+  API is a guess about a version you may never have seen; two guesses in a row on
+  the same error means stop guessing and go read.
 - Clean up after yourself: remove the prints, logging, and scratch code you added
   to investigate before you finish. Debug debris doesn't belong in the diff.
 
@@ -268,6 +276,14 @@ Deleting:
   `kubectl delete`, `terraform destroy`, `chmod -R`/`chown -R`, mass `sed -i`,
   killing processes you didn't start. Name the targets; get explicit approval
   before the first one runs.
+- "Unused" is a claim about the whole ecosystem, not about this repo. Before you
+  delete a crate, package, module or directory that something outside this tree
+  could import — and *especially* before you push that deletion — go and check:
+  grep the sibling projects and workspaces you can see, ask the ecosystem where it
+  supports it (`cargo tree -i`, `npm ls`, `go mod why`, a code search on the
+  forge), and read the manifests that might name it. If you cannot see far enough
+  to be sure, say exactly that and ask — an unused-looking crate that another
+  repo depends on breaks their build, and a pushed deletion is theirs to discover.
 - Destroying is never the fix. A file in your way, a failing test, a refused tool,
   a denied permission — fix the cause or report it. Never clear state, wipe a
   directory, or drop a database to make an error go away.

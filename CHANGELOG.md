@@ -8,6 +8,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A soft warning at 80% of the tool-round budget.** The hard cap (`max_steps`,
+  default 300) used to arrive with three rounds' notice — enough to write a
+  summary, not to salvage a plan; transcripts show an autonomous run cut off
+  roughly a quarter of the way through its list with uncommitted edits and
+  nothing sequenced. Once per turn, on crossing 80% of the budget, the round's
+  last tool result now carries
+  `[note: you've used N of M tool rounds this turn — checkpoint your work (commit what's done) and sequence what remains; the turn ends at M]`.
+  Nothing else about the cap changes: the turn runs to M and still gets its
+  tools-stripped wrap-up round. Budgets of four rounds or fewer stay quiet (the
+  mark would land on the last round, where the existing wrap-up note already
+  speaks).
+- **A backstop for the unfinished-TODO nudge.** The turn-end nudge could be
+  "satisfied" by replacing the list with one collapsed `all done` item —
+  bookkeeping reconciled by deletion. If a round after the nudge leaves the list
+  _shorter_ and an item the nudge named gone outright, the model is told once:
+  `[These TODO items were removed from the list rather than resolved: … Deleting an item is not finishing it.]`,
+  naming each one. Deliberately narrow — a reworded or re-statused item is not a
+  removal — and it fires at most once per turn.
+- **The prompt makes deleting a shared package a verify-first job**
+  (`Deleting:`, write-capable agents only). A crate that looked unused _in this
+  workspace_ was deleted and the deletion pushed; another repo depended on it.
+  The rule names the reverse-dependency probes (`cargo tree -i`, `npm ls`,
+  `go mod why`, a forge code search), says to grep visible sibling projects, and
+  says to ask rather than push when the answer isn't visible from here.
+- **The prompt sends dependency-API errors to the local package cache**
+  (`Debugging:`). An unresolved name or mismatched signature from a dependency
+  is answered by reading that dependency's source — `~/.cargo/registry/src/…`,
+  `node_modules/<pkg>/`, site-packages, `go env GOMODCACHE` — not by recalling
+  its API; observed to end a hallucination loop on the first read.
+
 - **`task_apply` — land a write sub-agent's UNCOMMITTED work in one call.** A
   sub-agent that was told not to commit (or that simply forgot) left its entire
   result uncommitted in its worktree, where the branch carries nothing and
@@ -24,6 +54,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **An `@file` mention counts as having read that file.** `@`-expansion inlines
+  a file's whole content into the outgoing message, but the read-before-edit
+  guard didn't know — so the model was sent back to re-read a file already
+  sitting verbatim in its context (a session's single largest read was a 38 KiB
+  doc it had been handed via `@`). The expansion now reports which paths it
+  inlined _completely_ (`prepare_outgoing_tracked` / `expand_mentions_tracked`)
+  and the frontends mark those read on the receiving agent
+  (`Agent::mark_files_read`) — TUI, headless and web through one seam. A file
+  too large to attach is never marked (it never reached the message), and the
+  mark captures the file's signature, so an edit on disk afterwards still voids
+  it. A message prepared with the main agent's cwd but delivered to a sub-agent
+  pane leaves the main agent's read-state alone (`prepare_outgoing_relayed`).
+- **The unfinished-TODO nudge asks for per-item reconciliation.** It used to say
+  "mark items done or remove them", and models took the second half: the list
+  came back as one collapsed item. It now says to send the full list back with
+  every named item still in it, each marked `completed` or `cancelled` (the
+  states the `todo` tool actually has), with the cancellations explained to the
+  user — and that a shorter list is not a resolved list.
 - **`task_cleanup`'s `force` now honestly forces.** It used to refuse a worktree
   with uncommitted changes even under `force: true` — and a guardrail that
   refuses an explicit force flag just teaches the model to bypass it: a real

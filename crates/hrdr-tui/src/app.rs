@@ -1614,7 +1614,9 @@ impl App {
     /// so it lives in `LiveSubagents::send_prompt`. All the frontend does here is
     /// show what was said, and say where the events should be surfaced.
     fn send_to_subagent(&mut self, key: u64, input: String) {
-        let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input);
+        // Expanded with the main agent's cwd/names, but delivered to the
+        // sub-agent — so no `@file` read-state marking on this handle.
+        let sent = hrdr_app::prepare_outgoing_relayed(&self.agent, &input);
         let input = hrdr_agent::Steer::new(sent, input);
         // What was said and everything that comes back is recorded on the agent's
         // own entry; the pane is rebuilt from that record by `sync_panes`. Nothing

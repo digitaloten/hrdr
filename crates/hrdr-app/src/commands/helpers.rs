@@ -190,7 +190,35 @@ pub fn agent_names(agent: &Arc<Mutex<Agent>>) -> Vec<String> {
 
 /// [`crate::prepare_outgoing`] for frontends holding the shared agent handle:
 /// fetches the sub-agent names ([`agent_names`]) and cwd ([`agent_cwd`]) itself.
+///
+/// This is also where `@file` expansion meets the read-before-edit guard: every
+/// file whose *whole* content the expansion inlined is marked read on `agent`
+/// (via [`Agent::mark_files_read`]), so the model isn't sent back to re-read a
+/// file already sitting verbatim in its context. Use it for messages delivered
+/// **to** `agent`; for one merely prepared with its cwd/names and delivered
+/// elsewhere, use [`prepare_outgoing_relayed`] so a file the agent never sees
+/// doesn't disarm its guard.
 pub fn prepare_outgoing_via(agent: &Arc<Mutex<Agent>>, input: &str) -> String {
+    let (sent, inlined) =
+        crate::prepare_outgoing_tracked(input, &agent_names(agent), &agent_cwd(agent));
+    // Best-effort, and deliberately not blocking: a turn in flight holds the
+    // lock, and the same `try_lock` gate already decides whether `@agent`
+    // routing resolves at all (see `agent_names`). Missing the mark costs one
+    // redundant read; waiting here would stall the frontend.
+    if !inlined.is_empty()
+        && let Ok(a) = agent.try_lock()
+    {
+        a.mark_files_read(&inlined);
+    }
+    sent
+}
+
+/// [`prepare_outgoing_via`] for a message expanded with `agent`'s cwd and
+/// sub-agent names but delivered to a *different* agent (a sub-agent pane).
+/// Identical expansion, no read-state change: the inlined content lands in the
+/// recipient's context, not this one's, and marking it here would tell `agent` it
+/// had seen a file it never received.
+pub fn prepare_outgoing_relayed(agent: &Arc<Mutex<Agent>>, input: &str) -> String {
     crate::prepare_outgoing(input, &agent_names(agent), &agent_cwd(agent))
 }
 

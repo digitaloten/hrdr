@@ -76,35 +76,51 @@ pub fn agent_mention_message(agent: &str, body: &str) -> String {
 pub const MAX_ATTACH_BYTES: usize = 100 * 1024;
 
 pub fn expand_mentions(input: &str, cwd: &Path) -> String {
-    let mut attached: Vec<(String, String)> = Vec::new();
+    expand_mentions_tracked(input, cwd).0
+}
+
+/// [`expand_mentions`], plus the paths whose **whole** content was inlined.
+///
+/// The second element is what lets the read-before-edit guard learn what the
+/// model has already seen: an `@doc.md` mention puts the entire file in the
+/// model's context, so forcing a re-read of it before an edit is pure waste
+/// (transcripts show a 38 KiB doc re-read for exactly this reason). Only
+/// complete inlines are listed — a truncated attachment is a partial view, and a
+/// partial view must never license a blind overwrite.
+pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> (String, Vec<PathBuf>) {
+    let mut attached: Vec<(String, String, bool)> = Vec::new();
     for raw in input.split_whitespace() {
         let Some(rel) = raw.strip_prefix('@') else {
             continue;
         };
         let rel = rel.trim_end_matches([',', '.', ';', ':', ')', ']', '}']);
-        if rel.is_empty() || attached.iter().any(|(p, _)| p == rel) {
+        if rel.is_empty() || attached.iter().any(|(p, _, _)| p == rel) {
             continue;
         }
         let Ok(text) = hrdr_tools::read_attach_file(rel, cwd, Some(MAX_ATTACH_BYTES)) else {
             continue;
         };
-        let text = if text.len() > MAX_ATTACH_BYTES {
+        let (text, full) = if text.len() > MAX_ATTACH_BYTES {
             let end = floor_char_boundary(&text, MAX_ATTACH_BYTES);
-            format!("{}\n…[truncated]", &text[..end])
+            (format!("{}\n…[truncated]", &text[..end]), false)
         } else {
-            text
+            (text, true)
         };
-        attached.push((rel.to_string(), text));
+        attached.push((rel.to_string(), text, full));
     }
     if attached.is_empty() {
-        return input.to_string();
+        return (input.to_string(), Vec::new());
     }
+    let mut inlined = Vec::new();
     let mut out = String::from(input);
     out.push_str("\n\n--- Referenced files (via @) ---\n");
-    for (rel, text) in attached {
+    for (rel, text, full) in attached {
+        if full {
+            inlined.push(resolve_under(cwd, &rel));
+        }
         out.push_str(&format!("\n=== {rel} ===\n{text}\n"));
     }
-    out
+    (out, inlined)
 }
 
 /// Prepare an outgoing user message for sending to the model: expand a
@@ -115,6 +131,18 @@ pub fn expand_mentions(input: &str, cwd: &Path) -> String {
 /// "input → sent" transform shared by the TUI and the headless runner; the
 /// display copy keeps the raw input.
 pub fn prepare_outgoing(input: &str, names: &[String], cwd: &Path) -> String {
+    prepare_outgoing_tracked(input, names, cwd).0
+}
+
+/// [`prepare_outgoing`], plus the paths whose whole content the sent message now
+/// carries (see [`expand_mentions_tracked`]) — for the caller to hand to
+/// [`hrdr_agent::Agent::mark_files_read`] so the read-before-edit guard knows the
+/// model has already seen them.
+pub fn prepare_outgoing_tracked(
+    input: &str,
+    names: &[String],
+    cwd: &Path,
+) -> (String, Vec<PathBuf>) {
     // A `:skill` template may itself carry `@file` / `@agent` mentions — they
     // get the same expansion below.
     let expanded;
@@ -130,8 +158,11 @@ pub fn prepare_outgoing(input: &str, names: &[String], cwd: &Path) -> String {
         input
     };
     match extract_agent_mention(input, names) {
-        Some((agent, body)) => agent_mention_message(&agent, &expand_mentions(&body, cwd)),
-        None => expand_mentions(input, cwd),
+        Some((agent, body)) => {
+            let (body, inlined) = expand_mentions_tracked(&body, cwd);
+            (agent_mention_message(&agent, &body), inlined)
+        }
+        None => expand_mentions_tracked(input, cwd),
     }
 }
 
@@ -504,6 +535,61 @@ mod tests {
 
         // A missing mention resolves nothing → unchanged.
         assert_eq!(expand_mentions("@nope.txt", root), "@nope.txt");
+    }
+
+    /// The paths reported alongside the expansion are the ones whose *whole*
+    /// content the message now carries — that list is what disarms the
+    /// read-before-edit guard, so it must contain nothing the model can't see in
+    /// full. Resolved against `cwd`, so the caller can hand them straight to
+    /// `Agent::mark_files_read` regardless of how the mention was spelled.
+    #[test]
+    fn expand_mentions_reports_only_fully_inlined_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "hello from a").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/b.txt"), "hello from b").unwrap();
+
+        // Nothing inlined → nothing to mark.
+        assert!(expand_mentions_tracked("just text", root).1.is_empty());
+        assert!(expand_mentions_tracked("@nope.txt", root).1.is_empty());
+
+        // Two distinct mentions, one repeated: each reported once, resolved.
+        let (out, inlined) =
+            expand_mentions_tracked("see @a.txt and @sub/b.txt, plus @a.txt again", root);
+        assert!(out.contains("hello from b"));
+        assert_eq!(
+            inlined,
+            vec![root.join("a.txt"), root.join("sub/b.txt")],
+            "resolved, deduplicated, in mention order"
+        );
+
+        // Over the attach cap the content never lands in the message at all, so
+        // there is nothing to mark — a partial view must not license an edit.
+        let big = root.join("big.log");
+        std::fs::write(&big, "x".repeat(MAX_ATTACH_BYTES + 1)).unwrap();
+        let (out, inlined) = expand_mentions_tracked("look at @big.log", root);
+        assert_eq!(out, "look at @big.log");
+        assert!(inlined.is_empty(), "an unattached file is not a read file");
+    }
+
+    /// `prepare_outgoing_tracked` carries the inlined-path list out through both
+    /// of its shapes — a plain message and one routed at an `@agent`.
+    #[test]
+    fn prepare_outgoing_tracked_reports_inlined_paths_through_agent_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("note.txt"), "the note").unwrap();
+        let names = vec!["explore".to_string()];
+
+        let (sent, inlined) = prepare_outgoing_tracked("read @note.txt", &names, root);
+        assert!(sent.contains("the note"));
+        assert_eq!(inlined, vec![root.join("note.txt")]);
+
+        // Routed at a sub-agent: same expansion, same report.
+        let (sent, inlined) = prepare_outgoing_tracked("@explore read @note.txt", &names, root);
+        assert!(sent.contains("`explore`") && sent.contains("the note"));
+        assert_eq!(inlined, vec![root.join("note.txt")]);
     }
 
     #[test]
