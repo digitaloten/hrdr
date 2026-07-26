@@ -8,6 +8,65 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`/resume` over the web no longer corrupts the session it restores.** The
+  swap set the pane's state, handed the agent its messages from a **detached**
+  `tokio::spawn`, and then saved immediately — so the save raced the task, and
+  when it won it wrote the OLD conversation into the RESUMED session's file. The
+  whole sequence is now synchronous and ordered, mirroring the TUI's
+  `resume_locked_path`/`apply_session`/`adopt_state`: busy guard → open the file
+  under its own session's cwd (so `/resume` finds a session saved in another
+  directory, as the TUI does) → take the agent lock, and swap **nothing** unless
+  it is in hand → follow the session's cwd (`resume_plan`, applied before the
+  transcript writer re-attaches so the `<id>.jsonl` lands beside the `.json`) →
+  adopt the state (preserving a context window this process already probed,
+  resolving a pre-`provider://model` file's `provider_unset` identity against
+  the provider in force, and reseeding the registry's counters) → set the
+  agent's messages and session spend → repoint the agent at the provider the
+  conversation ran on (`restore_session_provider`, now reachable because
+  `WebHost` implements `resolve_provider`) → emit the plan's notices. The resume
+  no longer saves at all (neither does the TUI's): the file on disk already _is_
+  that state.
+- **The web status bar stopped forking `git` on every tick.**
+  `WebSession::cached_branch` read its cache but never wrote it, so `git_branch`
+  ran on every status rebuild — up to ten times a second while a turn streamed.
+  It now stores the result for five seconds, including the `None` a
+  non-repository directory yields, and invalidates on a cwd change.
+- **`/effort` over the web reaches the model.** It set `pane.effort`, which the
+  next `panes.sync` overwrote from the registry — the chrome flickered and the
+  requests kept going out at the old effort. It now sets the effort on the agent
+  (which publishes it back into the chrome itself), as the TUI does.
+- **Web sessions are persisted mid-turn.** `persist_mid_turn` existed but was
+  never called, and would have saved a stale mirror. The turn task now stashes
+  each `AgentEvent::History` snapshot the agent commits, and the tick saves it
+  at most every 5s while a turn is running — so a crash during a long turn loses
+  at most the round in flight instead of the whole turn.
+- **A reserved web session file has a preview again.** `reserve_session_id`
+  seeded the state with the user's message and then saved through `persist`,
+  whose `sync_from` immediately replaced it with the agent's history — which
+  does not contain the message yet (it is only enqueued). The reserve now saves
+  without syncing (and fills in the cwd + name the first save needs), so the
+  file it mints names the conversation it started.
+- **A web slash command's prompt runs on the pane it is keyed to.**
+  `WebHost::send_prompt` always ran the MAIN agent while keying `begin_turn` and
+  every recorded event to the ACTIVE pane, so on a sub-pane it drove the wrong
+  agent into the wrong transcript, and it spawned a second concurrent `run` even
+  when a turn was already in flight. A visible prompt now takes the same path a
+  client `Submit` does (the pane's own agent, steering a turn in flight instead
+  of racing it); a hidden one (`/init`) is the session's, like the TUI's
+  `launch_hidden`.
+- **A web compaction is busy for as long as it runs.** `start_compaction`
+  announced it with `begin_turn` but kept no handle, and the tick recomputes
+  `running` from that handle — so the pass showed as running for one tick and
+  then went idle, `is_busy()` said no, and a prompt could start a turn on top of
+  the summarizer. The handle now lives in the same slot a turn's does (as the
+  TUI's `turn_handle` does), which also ends the turn clock, saves, and
+  relaunches queued steers when it lands; the stale context reading is dropped
+  on success so the gauge does not immediately re-trigger compaction.
+- **A web client whose transcript got shorter is told to truncate.** The delta
+  diff only emitted a frame when the tail was new or the transcript became
+  empty, so a `/clear`-like shrink (or a `/resume` into an earlier conversation)
+  left stale entries on screen forever.
+
 - **A WS `Resume` is answered on the requesting socket alone.** The replayed
   frames and the `Resumed` marker went out through `WebSession::emit_internal`,
   which broadcasts to every subscriber and re-pushes to the replay buffer: all

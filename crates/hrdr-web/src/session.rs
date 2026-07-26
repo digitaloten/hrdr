@@ -24,6 +24,18 @@ use crate::convert::{
 /// How many frames the replay buffer holds (for resume-after-reconnect).
 const REPLAY_CAP: usize = 1024;
 
+/// How long a `git branch` lookup is reused before it is taken again.
+///
+/// The status bar is rebuilt on every tick (up to 10×/s while a turn streams) and
+/// the branch comes from a subprocess, so the answer — *including a `None` for a
+/// directory that is not a repository* — is cached for this long.
+const BRANCH_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// Minimum gap between mid-turn session saves (see
+/// [`WebSession::persist_mid_turn`]). A long turn is persisted as it goes, but not
+/// on every one of its rounds.
+const MIDTURN_SAVE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Shared, cloneable handle to a `WebSession`.
 #[derive(Clone)]
 pub struct SharedSession(Arc<Mutex<WebSession>>);
@@ -61,6 +73,11 @@ impl SharedSession {
                     if !s.live.pending(MAIN_KEY).is_empty() {
                         s.spawn_pending_main_turn();
                     }
+                } else if s.main_turn_running() {
+                    // Mid-turn durability: a crash during a long turn must not lose
+                    // the rounds the agent has already committed (the turn-end
+                    // `persist` above is otherwise the only save).
+                    s.maybe_persist_mid_turn();
                 }
             }
         });
@@ -100,12 +117,23 @@ pub struct WebSession {
     // ── misc ──
     show_thinking: bool,
     cwd: PathBuf,
-    /// Handle of an in-flight main-pane turn (spawned by the server).
+    /// The config this session was built from — kept so a `/resume` can resolve the
+    /// provider a saved conversation ran on (`AgentConfig::resolve_provider`).
+    cfg: AgentConfig,
+    /// Handle of an in-flight main-pane turn (spawned by the server). A compaction
+    /// pass lives in this slot too, exactly as it does in the TUI's `turn_handle`.
     main_turn_handle: Option<tokio::task::JoinHandle<()>>,
     /// The session's active open-lock (held for lifetime, dropped on /new).
     active_lock: Option<hrdr_app::SessionLock>,
-    /// Branch name, cached for 5s.
-    branch_cache: Option<(String, Instant)>,
+    /// Branch name (or the absence of one), cached for [`BRANCH_CACHE_TTL`].
+    branch_cache: Option<(Option<String>, Instant)>,
+    /// The newest history snapshot the running main turn has committed
+    /// ([`hrdr_agent::AgentEvent::History`]), for [`WebSession::persist_mid_turn`].
+    /// Written from the turn task's event callback, taken by the save.
+    mid_turn_history: Arc<std::sync::Mutex<Option<Vec<hrdr_agent::Message>>>>,
+    /// When the last mid-turn save ran, so they are rate-limited to
+    /// [`MIDTURN_SAVE_INTERVAL`].
+    last_midturn_save: Option<Instant>,
 
     tick_notify: Arc<Notify>,
 }
@@ -121,6 +149,9 @@ impl WebSession {
         config.subagent_transcript_dir = Some(subagent_dir.clone());
 
         let cwd = config.cwd.clone();
+        // Kept for provider resolution on `/resume` (the identity a saved
+        // conversation ran on has to be resolvable to an endpoint here).
+        let cfg = config.clone();
 
         let agent = Arc::new(tokio::sync::Mutex::new(Agent::new(config)?));
         let steering = hrdr_agent::steering_queue();
@@ -175,9 +206,12 @@ impl WebSession {
             last_status_json: String::new(),
             show_thinking: true,
             cwd,
+            cfg,
             main_turn_handle: None,
             active_lock: None,
             branch_cache: None,
+            mid_turn_history: Default::default(),
+            last_midturn_save: None,
             tick_notify: Arc::new(Notify::new()),
         })
     }
@@ -267,10 +301,7 @@ impl WebSession {
     /// The main tick: fold events, diff transcripts, rebuild panes+status.
     pub fn tick(&mut self) {
         // 1. Tell the registry whether the main agent is running.
-        let main_running = self
-            .main_turn_handle
-            .as_ref()
-            .is_some_and(|h| !h.is_finished());
+        let main_running = self.main_turn_running();
         self.live.update(MAIN_KEY, |e| e.running = main_running);
         self.panes.sync(&self.live);
 
@@ -298,9 +329,11 @@ impl WebSession {
                     }
                 });
 
-            if from < transcript.len()
-                || (from == 0 && transcript.is_empty() && !sent_hashes.is_empty())
-            {
+            // Something to send when the tail is new — or when the transcript got
+            // SHORTER than what this client was last told (a `/clear`, or a
+            // `/resume` into an earlier conversation): the frame then carries no
+            // entries and tells the client to truncate at `from`.
+            if from < transcript.len() || sent_hashes.len() > transcript.len() {
                 let entries: Vec<_> = transcript[from..].iter().map(wire_entry_view).collect();
                 changes.push((pane_id, from, entries));
             }
@@ -350,20 +383,22 @@ impl WebSession {
 
     // ── submit ─────────────────────────────────────────────────────────────
 
-    /// Submit a message to a pane.
+    /// Submit a message to a pane (the `async` face the WS handler calls).
     pub async fn submit(&mut self, wire_pane: WirePaneId, text: String) {
-        let pane_id = crate::convert::core_pane_id(wire_pane);
+        self.submit_sync(crate::convert::core_pane_id(wire_pane), text);
+    }
+
+    /// Submit a message to a pane — nothing here awaits, so slash commands
+    /// (`CommandHost::send_prompt`, which is a sync trait method) reach the very
+    /// same routing rule instead of open-coding a second one.
+    pub(crate) fn submit_sync(&mut self, pane_id: PaneId, text: String) {
         let key = pane_id_to_key(pane_id);
 
         let sent = hrdr_app::prepare_outgoing_via(&self.agent, &text);
         let steer = Steer::new(sent, text);
 
         if key == MAIN_KEY {
-            let running = self
-                .main_turn_handle
-                .as_ref()
-                .is_some_and(|h| !h.is_finished());
-            if running {
+            if self.main_turn_running() {
                 self.live.send_prompt(key, steer, |_ev| {});
             } else {
                 self.reserve_session_id(&steer.sent);
@@ -433,44 +468,115 @@ impl WebSession {
             .map(|t| t.clone())
             .unwrap_or_default();
         self.panes.main_mut().state.sync_from(msgs, todos, cwd_str);
-
-        let state = self.panes.main().state.clone();
-        let saved = hrdr_app::save_session(&state);
-
-        if let Ok(Some(o)) = saved {
-            self.panes.main_mut().state.id = Some(o.id.clone());
-            if let Some(lock) = o.open_lock {
-                self.active_lock = Some(lock);
-            }
-            self.refresh_subagent_dir();
-        }
+        self.save_main_state();
     }
 
-    /// Persist mid-turn: the agent lock is held, so just save from pane state.
-    pub fn persist_mid_turn(&mut self) {
-        let state = self.panes.main().state.clone();
-        let saved = hrdr_app::save_session(&state);
-        if let Ok(Some(o)) = saved {
-            self.panes.main_mut().state.id = Some(o.id.clone());
-            if let Some(lock) = o.open_lock {
-                self.active_lock = Some(lock);
-            }
-            self.refresh_subagent_dir();
+    /// Mid-turn durability, mirroring the TUI's `persist_mid_turn`: the running turn
+    /// holds the agent lock, so [`Self::persist`]'s `try_lock` read would skip —
+    /// save the newest history snapshot the agent itself committed
+    /// ([`hrdr_agent::AgentEvent::History`], stashed by the turn task's callback)
+    /// instead. With this, a crash mid-turn loses at most the round in flight.
+    ///
+    /// What such a save can capture: the agent's committed history (so the messages
+    /// on disk are real, not a stale copy), the TODO list, and the cwd. What it
+    /// cannot: anything only the locked agent knows — its live token/cost counters
+    /// come back through the registry, and `state.transcript` is not written to the
+    /// `.json` at all (it is appended to the sibling `<id>.jsonl` as events land, so
+    /// the *displayed* conversation is already durable without this).
+    ///
+    /// Returns whether a snapshot was available and saved.
+    pub fn persist_mid_turn(&mut self) -> bool {
+        let Some(messages) = self
+            .mid_turn_history
+            .lock()
+            .ok()
+            .and_then(|mut cell| cell.take())
+        else {
+            return false;
+        };
+        let todos = self
+            .panes
+            .main()
+            .todos
+            .lock()
+            .map(|t| t.clone())
+            .unwrap_or_default();
+        // `state.cwd` is only synced by the turn-end save; on the very first turn it
+        // would still be empty, which files the session under the wrong cwd slug.
+        let cwd = self.cwd.display().to_string();
+        let state = &mut self.panes.main_mut().state;
+        state.messages = messages;
+        state.todos = todos;
+        state.cwd = cwd;
+        // What the turn-end `sync_from` would name it — this save may be the one that
+        // mints the id (a hidden `/init` turn never reserved one).
+        if state.name.is_empty() {
+            state.name = hrdr_app::session_name_from(&state.messages);
+        }
+        self.save_main_state();
+        true
+    }
+
+    /// Run a mid-turn save if one is due (called from the tick task while a main
+    /// turn is in flight).
+    pub fn maybe_persist_mid_turn(&mut self) {
+        if self
+            .last_midturn_save
+            .is_some_and(|t| t.elapsed() < MIDTURN_SAVE_INTERVAL)
+        {
+            return;
+        }
+        if self.persist_mid_turn() {
+            self.last_midturn_save = Some(Instant::now());
         }
     }
 
     // ── internals ──────────────────────────────────────────────────────────
 
+    /// Write the main pane's state to disk and adopt what the save assigned (the
+    /// freshly-minted id and its open-lock). The one save path — every caller
+    /// decides what the state should say *before* calling it.
+    fn save_main_state(&mut self) {
+        let state = self.panes.main().state.clone();
+        // A failed save is silent here (as it has always been): the frontend has no
+        // "autosave failed" channel yet, and the next save retries.
+        if let Ok(Some(o)) = hrdr_app::save_session(&state) {
+            self.panes.main_mut().state.id = Some(o.id.clone());
+            if let Some(lock) = o.open_lock {
+                self.active_lock = Some(lock);
+            }
+            self.refresh_subagent_dir();
+        }
+    }
+
+    /// Claim this session's id — and with it the sub-agent transcript dir — before
+    /// the turn runs, mirroring the TUI's `reserve_session_id`.
+    ///
+    /// The message is only *enqueued* on the agent at this point, so the agent's
+    /// history does not contain it yet: this save must NOT go through
+    /// [`Self::persist`], whose `sync_from` would replace the seeded mirror with the
+    /// agent's older (here: empty) history and leave a session file with no preview.
     fn reserve_session_id(&mut self, sent: &str) {
         if self.panes.main().state.id.is_some() {
             return;
         }
-        self.panes
-            .main_mut()
-            .state
-            .messages
-            .push(hrdr_agent::Message::user(sent));
-        self.persist();
+        // An *empty* turn carries no message of its own (it hands the agent something
+        // already in its history). Seeding the mirror with an empty user message
+        // would create a session whose first turn is blank.
+        if sent.trim().is_empty() {
+            return;
+        }
+        let cwd = self.cwd.display().to_string();
+        let state = &mut self.panes.main_mut().state;
+        state.messages.push(hrdr_agent::Message::user(sent));
+        // Both are otherwise only filled by `sync_from` at the end of the turn — and
+        // this save is what mints the id, so an unnamed state would file the session
+        // under the wrong cwd slug with a nameless id.
+        state.cwd = cwd;
+        if state.name.is_empty() {
+            state.name = hrdr_app::session_name_from(&state.messages);
+        }
+        self.save_main_state();
     }
 
     fn refresh_subagent_dir(&self) {
@@ -533,12 +639,8 @@ impl WebSession {
     }
 
     fn wire_panes(&self) -> Vec<WirePane> {
-        let main = self.panes.main();
-        let main_running = self
-            .main_turn_handle
-            .as_ref()
-            .is_some_and(|h| !h.is_finished());
-        let mut out = vec![wire_pane(main, main_running)];
+        let main_running = self.main_turn_running();
+        let mut out = vec![wire_pane(self.panes.main(), main_running)];
 
         for sub in self.panes.subs() {
             let key = match sub.id {
@@ -568,12 +670,14 @@ impl WebSession {
             .collect()
     }
 
-    fn build_wire_status(&self) -> hrdr_protocol::WireStatus {
-        let pane = self.panes.active_pane();
+    fn build_wire_status(&mut self) -> hrdr_protocol::WireStatus {
+        // Both before the pane borrow: the branch lookup writes its cache.
         let branch = self.cached_branch();
+        let dir = hrdr_app::display_dir(&self.cwd);
+        let pane = self.panes.active_pane();
 
         let inputs = StatusInputs {
-            dir: &hrdr_app::display_dir(&self.cwd),
+            dir: &dir,
             branch: branch.as_deref(),
             tokens_in: pane.state.usage.tokens_in,
             tokens_out: pane.state.usage.tokens_out,
@@ -596,21 +700,33 @@ impl WebSession {
         wire_status(&inputs)
     }
 
-    fn cached_branch(&self) -> Option<String> {
-        if let Some((b, t)) = &self.branch_cache
-            && t.elapsed() < Duration::from_secs(5)
+    /// The current branch, from a cache that is refreshed at most every
+    /// [`BRANCH_CACHE_TTL`].
+    ///
+    /// `git_branch` forks a subprocess and the status bar is rebuilt on every tick,
+    /// so the *absence* of a branch is cached too — a non-repository cwd must not
+    /// fork git ten times a second either.
+    fn cached_branch(&mut self) -> Option<String> {
+        if let Some((branch, taken)) = &self.branch_cache
+            && taken.elapsed() < BRANCH_CACHE_TTL
         {
-            return Some(b.clone());
+            return branch.clone();
         }
-        hrdr_app::git_branch(&self.cwd)
+        let branch = hrdr_app::git_branch(&self.cwd);
+        self.branch_cache = Some((branch.clone(), Instant::now()));
+        branch
     }
 
-    fn spawn_pending_main_turn(&mut self) {
+    /// Launch a main-pane turn: `run` drains whatever is queued as its opener (an
+    /// opener-less call hands the agent something already in its history).
+    pub(crate) fn spawn_pending_main_turn(&mut self) {
         self.live.begin_turn(MAIN_KEY);
         let agent = self.agent.clone();
         let steering = self.steering.clone();
         let live = self.live.clone();
         let tick_notify = self.tick_notify.clone();
+        let history = self.mid_turn_history.clone();
+        self.last_midturn_save = None;
 
         let handle = tokio::spawn(async move {
             let _guard = hrdr_agent::RunGuard::new(live.clone(), MAIN_KEY);
@@ -621,6 +737,14 @@ impl WebSession {
                     let live = live.clone();
                     let notify = tick_notify.clone();
                     move |ev| {
+                        // The agent committed a round and sent its history: stash it
+                        // for the mid-turn save (the agent lock is held for the whole
+                        // turn, so this is the only way to see it).
+                        if let hrdr_agent::AgentEvent::History(messages) = &ev
+                            && let Ok(mut cell) = history.lock()
+                        {
+                            *cell = Some(messages.clone());
+                        }
                         live.record(MAIN_KEY, &ev);
                         notify.notify_one();
                     }
@@ -646,7 +770,133 @@ impl WebSession {
         self.main_turn_handle = Some(handle);
     }
 
+    // ── session switching (resume) ─────────────────────────────────────────
+
+    /// Swap in a loaded session's state wholesale — the headless twin of the TUI's
+    /// `App::adopt_state`, and the only place a resumed conversation is installed.
+    ///
+    /// The caller must hand in the **locked main agent**: the history swap is part of
+    /// the adoption, not a task that races it. (The web host used to set the messages
+    /// from a detached `tokio::spawn` and then save immediately — whichever won, the
+    /// save could write the OLD conversation into the RESUMED session's file.)
+    ///
+    /// Two fields are not simply overwritten, matching the TUI:
+    ///
+    /// * `context_window` — a saved one is a stand-in until the endpoint is
+    ///   re-probed, so it never clobbers a window this process already knows.
+    /// * `model` / `provider` — the session's identity WINS, and a pre-`provider://model`
+    ///   file (`provider_unset`) means "this model, on the provider in force".
+    ///
+    /// Repointing the agent AT that provider is the caller's last step
+    /// (`hrdr_app::restore_session_provider`), because it needs the whole
+    /// `CommandHost`.
+    pub(crate) fn adopt_state(
+        &mut self,
+        agent: &mut Agent,
+        state: hrdr_app::SessionState,
+        id: Option<String>,
+    ) {
+        let probed_window = self.panes.main().state.usage.context_window;
+        let base_url = std::mem::take(&mut self.panes.main_mut().state.base_url);
+        // The identity in force right now — the provider an OLD session file (one
+        // that named a model but no provider) means by "this model".
+        let in_force = self.panes.main().state.model.clone();
+
+        // The state *is* the main pane's — transcript, counters and all — so adopting
+        // a session is one assignment.
+        self.panes.main_mut().state = state.restored();
+        let state = &mut self.panes.main_mut().state;
+        state.id = id;
+        state.base_url = base_url;
+        state.usage.context_window = probed_window.or(state.usage.context_window);
+        if state.provider_unset {
+            state.model = hrdr_agent::ModelSpec::ModelOnly(state.model.model().to_string())
+                .apply(&in_force)
+                .expect("a bare model id always resolves");
+            state.provider_unset = false;
+        }
+
+        // Drop the outgoing session's transcript writer before pointing the dirs at
+        // the incoming one, so a resumed session doesn't append onto the file we just
+        // left; `refresh_subagent_dir` re-attaches against the adopted id.
+        self.detach_transcript();
+        self.refresh_subagent_dir();
+        // The pane is rebuilt from the registry every tick, main agent included — so
+        // the resumed session's counters have to land there too, or the next tick
+        // quietly restores the ones we just replaced.
+        self.publish_main_agent(agent);
+
+        // Hand the parts whose runtime owners live elsewhere back to them: the chat
+        // history and the session's spend to the agent (so it counts on from there),
+        // the TODOs to the shared list.
+        let (messages, todos, spent) = {
+            let s = &self.panes.main().state;
+            (s.messages.clone(), s.todos.clone(), s.usage.cost_usd)
+        };
+        agent.set_messages(messages);
+        agent.set_session_cost(spent);
+        if let Ok(mut t) = self.panes.main().todos.lock() {
+            *t = todos;
+        }
+        // A mid-turn snapshot from the session we just left must not be saved into
+        // this one.
+        if let Ok(mut cell) = self.mid_turn_history.lock() {
+            *cell = None;
+        }
+        self.last_midturn_save = None;
+    }
+
+    /// Switch the tools' working directory (in-process only — no parent shell is
+    /// involved): the agent's cwd, the one this session reports, and the caches keyed
+    /// to it. Mirrors the TUI's `apply_cwd`.
+    pub(crate) fn apply_cwd(&mut self, agent: &mut Agent, new: PathBuf) {
+        agent.set_cwd(new.clone());
+        self.cwd = new;
+        self.branch_cache = None; // a different directory, a different branch
+        self.panes.main_mut().state.cwd = self.cwd.display().to_string();
+    }
+
+    /// Keep the main agent's registry entry in step with its pane's state — the
+    /// counters half of the TUI's `publish_main_agent`.
+    ///
+    /// `register_main` is idempotent (a no-op once the entry exists), so what this
+    /// actually does after startup is seed the resumed session's usage. What the
+    /// agent is *running on* is deliberately not written here: the agent publishes
+    /// that itself (`Agent::attach_live`), and a copy kept here is a copy that can be
+    /// wrong — which is exactly how a resumed session's provider label used to reach
+    /// the status bar while the agent kept talking to the endpoint it launched with.
+    fn publish_main_agent(&mut self, agent: &mut Agent) {
+        let (reference, base_url, usage) = {
+            let s = &self.panes.main().state;
+            (s.model.clone(), s.base_url.clone(), s.usage)
+        };
+        self.live.register_main(
+            self.agent.clone(),
+            self.steering.clone(),
+            reference.model().to_string(),
+            Some(reference.provider().to_string()),
+            base_url,
+            usage,
+        );
+        self.live.update(MAIN_KEY, |e| e.usage = usage);
+        // Adopt the entry (idempotent) so every later change republishes into it.
+        agent.attach_live(self.live.clone(), MAIN_KEY);
+    }
+
     // ── public accessors ──────────────────────────────────────────────────
+
+    /// Whether a main-pane turn (or a compaction, which occupies the same slot) is
+    /// in flight.
+    pub fn main_turn_running(&self) -> bool {
+        self.main_turn_handle
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
+    }
+
+    /// The config this session was built from (provider resolution).
+    pub fn cfg(&self) -> &AgentConfig {
+        &self.cfg
+    }
 
     pub fn notify_tick(&self) {
         self.tick_notify.notify_one();
@@ -728,39 +978,45 @@ mod tests {
     /// Build a bare WebSession for tests. We create a real (minimal) Agent
     /// so the Mutex holds a valid value — it is never actually run.
     fn test_session() -> (WebSession, broadcast::Receiver<ServerFrame>) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let (broadcast, rx) = broadcast::channel(256);
-        let panes = PaneSet::new();
+        test_session_at(PathBuf::from("/tmp"))
+    }
 
-        let agent = rt.block_on(async {
-            Arc::new(tokio::sync::Mutex::new(
-                Agent::new(AgentConfig {
-                    cwd: PathBuf::from("/tmp"),
-                    ..Default::default()
-                })
-                .expect("minimal test agent"),
-            ))
-        });
+    /// A test session rooted at `cwd` — the session-file tests each want their own
+    /// directory (the file id is derived per cwd slug).
+    ///
+    /// The endpoint is a closed loopback port: a turn these tests start must fail
+    /// immediately rather than reach out over the network.
+    fn test_session_at(cwd: PathBuf) -> (WebSession, broadcast::Receiver<ServerFrame>) {
+        let (broadcast, rx) = broadcast::channel(256);
+        let cfg = AgentConfig {
+            cwd: cwd.clone(),
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            ..Default::default()
+        };
+        let agent = Agent::new(cfg.clone()).expect("minimal test agent");
+        let (model, provider, base_url) = (
+            agent.model_name(),
+            Some(agent.provider_name().to_string()),
+            agent.endpoint_base_url(),
+        );
+        let agent = Arc::new(tokio::sync::Mutex::new(agent));
 
         let live = LiveSubagents::new();
         // Register main so sync() can find it.
-        {
-            let a = agent.blocking_lock();
-            live.register_main(
-                agent.clone(),
-                hrdr_agent::steering_queue(),
-                a.model_name(),
-                Some(a.provider_name().to_string()),
-                a.endpoint_base_url(),
-                hrdr_agent::AgentUsage::default(),
-            );
-        }
+        live.register_main(
+            agent.clone(),
+            hrdr_agent::steering_queue(),
+            model,
+            provider,
+            base_url,
+            hrdr_agent::AgentUsage::default(),
+        );
 
         let session = WebSession {
             agent,
             steering: hrdr_agent::steering_queue(),
             live: live.clone(),
-            panes,
+            panes: PaneSet::new(),
             subagent_dir: Default::default(),
             broadcast,
             seq: 0,
@@ -769,13 +1025,204 @@ mod tests {
             last_panes_json: String::new(),
             last_status_json: String::new(),
             show_thinking: true,
-            cwd: PathBuf::from("/tmp"),
+            cwd,
+            cfg,
             main_turn_handle: None,
             active_lock: None,
             branch_cache: None,
+            mid_turn_history: Default::default(),
+            last_midturn_save: None,
             tick_notify: Arc::new(Notify::new()),
         };
         (session, rx)
+    }
+
+    /// Whether any saved/held message says `text`.
+    fn says(messages: &[hrdr_agent::Message], text: &str) -> bool {
+        messages
+            .iter()
+            .any(|m| m.content.as_deref().is_some_and(|c| c.contains(text)))
+    }
+
+    /// The status bar is rebuilt on every tick; the branch behind it is not looked
+    /// up again within the cache window — not even for a directory that has no
+    /// branch at all (the answer `None` is cached too, or a non-repo cwd would fork
+    /// git ten times a second).
+    #[test]
+    fn branch_lookup_is_cached_between_status_rebuilds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut session, _rx) = test_session_at(tmp.path().to_path_buf());
+        assert!(session.branch_cache.is_none(), "nothing looked up yet");
+
+        let _ = session.build_wire_status();
+        let (branch, taken) = session.branch_cache.clone().expect("the lookup was cached");
+        assert!(branch.is_none(), "a temp dir is not a repository");
+
+        let _ = session.build_wire_status();
+        let (_, taken_again) = session.branch_cache.expect("still cached");
+        assert_eq!(
+            taken, taken_again,
+            "the second rebuild was served from the cache — no second git call"
+        );
+    }
+
+    /// Submitting on a fresh session claims its id *and* its preview: the file is on
+    /// disk with the user's message in it before the turn has produced anything.
+    ///
+    /// Regression: the reserve pushed the message into the mirror and then saved
+    /// through `persist`, whose `sync_from` replaced it with the agent's history —
+    /// which does not contain the message yet (it is only enqueued). The result was a
+    /// session file with an empty preview.
+    #[test]
+    fn submit_reserves_a_session_file_with_the_user_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_path_buf();
+        let (mut session, _rx) = test_session_at(cwd.clone());
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            session
+                .submit(hrdr_protocol::WirePaneId::Main, "reserve me".into())
+                .await;
+        });
+
+        let id = session
+            .panes
+            .main()
+            .state
+            .id
+            .clone()
+            .expect("the submit reserved a session id");
+        let path = hrdr_app::session_file_path(&cwd.display().to_string(), &id);
+        assert!(path.exists(), "no session file at {}", path.display());
+        let saved = hrdr_app::Session::load_path(&path).expect("the reserved session loads");
+        assert!(
+            says(&saved.state.messages, "reserve me"),
+            "the saved session has no preview: {:?}",
+            saved.state.messages
+        );
+    }
+
+    /// A mid-turn save writes the history the AGENT committed (the snapshot its
+    /// `History` event carried), not the stale mirror — and reports whether it had
+    /// anything to write.
+    #[test]
+    fn mid_turn_save_writes_the_committed_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_path_buf();
+        let (mut session, _rx) = test_session_at(cwd.clone());
+
+        assert!(
+            !session.persist_mid_turn(),
+            "no committed round yet → nothing to save"
+        );
+
+        *session.mid_turn_history.lock().unwrap() = Some(vec![
+            hrdr_agent::Message::user("mid turn"),
+            hrdr_agent::Message::assistant("round one"),
+        ]);
+        assert!(session.persist_mid_turn(), "a snapshot was there to save");
+
+        let id = session
+            .panes
+            .main()
+            .state
+            .id
+            .clone()
+            .expect("the mid-turn save minted an id");
+        let path = hrdr_app::session_file_path(&cwd.display().to_string(), &id);
+        let saved = hrdr_app::Session::load_path(&path).expect("the mid-turn save loads");
+        assert!(
+            says(&saved.state.messages, "mid turn"),
+            "the committed round was not persisted: {:?}",
+            saved.state.messages
+        );
+        assert!(
+            session.mid_turn_history.lock().unwrap().is_none(),
+            "the snapshot is consumed by the save"
+        );
+    }
+
+    /// Resuming a session must not destroy it.
+    ///
+    /// Regression: the swap set the pane's state, handed the agent its messages from
+    /// a DETACHED task, and saved immediately — so the save could (and in a
+    /// single-threaded runtime always did) run against an agent that still held the
+    /// previous conversation, and write that over the resumed session's file. The
+    /// history is now applied through a lock taken before anything is swapped, so the
+    /// next save round-trips the same conversation.
+    #[test]
+    fn resume_keeps_the_restored_conversation() {
+        use hrdr_app::CommandHost;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_path_buf();
+        let cwd_str = cwd.display().to_string();
+        let (mut session, _rx) = test_session_at(cwd.clone());
+
+        // Save a session on the identity this process is already on, so the resume
+        // needs no provider repoint (that path is asynchronous by nature).
+        let identity: hrdr_agent::ModelRef = session.live.with(|v| {
+            let e = v
+                .iter()
+                .find(|e| e.key == MAIN_KEY)
+                .expect("main registered");
+            format!("{}://{}", e.provider.clone().unwrap_or_default(), e.model)
+                .parse()
+                .expect("the agent's own identity parses")
+        });
+        let state = hrdr_app::SessionState {
+            name: "known".to_string(),
+            model: identity,
+            cwd: cwd_str.clone(),
+            messages: vec![
+                hrdr_agent::Message::user("keep me"),
+                hrdr_agent::Message::assistant("kept"),
+            ],
+            ..Default::default()
+        };
+        let outcome = hrdr_app::save_session(&state)
+            .expect("the fixture saves")
+            .expect("a user message makes it saveable");
+        let id = outcome.id.clone();
+        // Release the fixture's open-lock so the resume can take it.
+        drop(outcome);
+        let path = hrdr_app::session_file_path(&cwd_str, &id);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (line_tx, _line_rx) = tokio::sync::mpsc::unbounded_channel();
+            let loaded = hrdr_app::Session::load_path(&path).expect("the fixture loads");
+            let mut host = crate::host::WebHost {
+                session: &mut session,
+                line_tx,
+            };
+            host.resume(id.clone(), loaded);
+        });
+
+        assert_eq!(
+            session.panes.main().state.id.as_deref(),
+            Some(id.as_str()),
+            "the resumed session's id is adopted"
+        );
+        assert!(
+            says(&session.panes.main().state.messages, "keep me"),
+            "the restored conversation is in the pane"
+        );
+        assert!(
+            says(&session.agent.blocking_lock().messages_owned(), "keep me"),
+            "the agent was handed the restored history synchronously"
+        );
+
+        // The save that follows a resume (the tick's turn-end `persist`) must write
+        // the SAME conversation back.
+        session.persist();
+        let back = hrdr_app::Session::load_path(&path).expect("the resumed session still loads");
+        assert!(
+            says(&back.state.messages, "keep me"),
+            "the resumed session's file was overwritten: {:?}",
+            back.state.messages
+        );
     }
 
     #[test]
