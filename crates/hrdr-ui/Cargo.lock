@@ -1468,7 +1468,6 @@ dependencies = [
  "hrdr-protocol",
  "js-sys",
  "pulldown-cmark",
- "serde",
  "serde_json",
  "tokio",
  "wasm-bindgen",

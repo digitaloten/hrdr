@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The web-UI landing left CI red on every job; all four breakages are fixed.**
+  `hrdr-web`'s `#[derive(rust_embed::Embed)]` pointed at the gitignored
+  `crates/hrdr-ui/dist`, so `--all-features` could not compile on a fresh
+  checkout — a committed `dist/.gitkeep` (with a `.gitignore` negation) keeps
+  the folder present, and an empty embed still yields the existing placeholder
+  page. The `every_crate_root_links_the_sandbox_ctor` invariant now scans only
+  `[workspace] members`, so the deliberately excluded wasm-only `hrdr-ui` no
+  longer trips it. Unused dependencies are gone: `serde` from `hrdr-ui`,
+  `hrdr-tools` and `toml` from `hrdr-web`. And `ws_snapshot_then_delta` no
+  longer asserts the snapshot arrives at `seq == 1` — the 100ms tick task emits
+  its first panes+status frames before a client can connect, so the test raced
+  under load.
 - **Resumed and revived sessions rebuild the system prompt**, keeping the
   Anthropic prompt-cache split in step. `Agent::set_messages` used to install
   the session file's saved `messages[0]` while the client still held the cache

@@ -52,7 +52,18 @@ async fn ws_snapshot_then_delta() {
     let first_value: serde_json::Value =
         serde_json::from_str(first_text).expect("parse first frame");
     assert_eq!(first_value["type"], "snapshot");
-    assert_eq!(first_value["seq"], serde_json::json!(1));
+    // Not `== 1`: the 100ms tick task that `SharedSession::start` spawns emits its first
+    // panes+status frames as soon as it runs (both `last_*_json` caches start empty), and
+    // that can happen before this client connects — under parallel test load it usually
+    // does, leaving the snapshot at seq 3. The guarantee is a positive, monotonic seq, not
+    // a particular value, so assert only that.
+    let first_seq = first_value["seq"]
+        .as_u64()
+        .expect("snapshot carries a numeric seq");
+    assert!(
+        first_seq >= 1,
+        "snapshot seq must be positive, got {first_seq}"
+    );
 
     let submit = serde_json::json!({
         "type": "submit",

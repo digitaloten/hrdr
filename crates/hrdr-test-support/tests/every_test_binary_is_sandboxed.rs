@@ -73,26 +73,54 @@ fn every_integration_test_binary_links_the_sandbox_ctor() {
     );
 }
 
-/// Every crate directory in the workspace: `crates/*` and `apps/*`.
+/// Every crate directory listed in the root manifest's `[workspace] members`.
+///
+/// Members only, deliberately. A crate outside the workspace (`[workspace] exclude` —
+/// today the wasm-only `hrdr-ui`, which dioxus-cli builds standalone) is never compiled
+/// or run by the workspace `cargo test`, so it has no test binary that could reach the
+/// developer's real $HOME through this harness. The link line buys nothing there, and
+/// demanding it would force a dev-dependency on non-wasm code into a wasm crate.
+///
+/// The flip side: a crate that is missing from `members` is not scanned. That is the same
+/// condition as not being tested at all, so it costs no coverage — but it does mean adding
+/// a crate to the workspace is what enrolls it here.
 fn workspace_crates() -> Vec<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("crates/<crate> sits two levels under the workspace root");
-    let mut out = Vec::new();
-    for group in ["crates", "apps"] {
-        let Ok(entries) = std::fs::read_dir(root.join(group)) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            if e.path().join("Cargo.toml").is_file() {
-                out.push(e.path());
-            }
-        }
-    }
-    assert!(!out.is_empty(), "the workspace has crates");
+    let manifest =
+        std::fs::read_to_string(root.join("Cargo.toml")).expect("the root manifest is readable");
+    let mut out: Vec<PathBuf> = workspace_members(&manifest)
+        .into_iter()
+        .map(|m| root.join(m))
+        .filter(|dir| dir.join("Cargo.toml").is_file())
+        .collect();
+    assert!(!out.is_empty(), "the workspace has member crates");
     out.sort();
     out
+}
+
+/// The `members = [...]` paths from the workspace manifest.
+///
+/// A deliberately small parser instead of a toml dependency: the array is a flat list of
+/// quoted relative paths, so every odd field of a split on `"` is one entry. Globs would
+/// slip through unexpanded — the workspace does not use them, and a stray `*` in a path
+/// simply fails the `Cargo.toml` existence filter above rather than scanning the wrong dir.
+fn workspace_members(manifest: &str) -> Vec<String> {
+    let after = manifest
+        .split_once("members = [")
+        .expect("the root manifest declares [workspace] members")
+        .1;
+    let list = after
+        .split_once(']')
+        .expect("the members array is closed")
+        .0;
+    list.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(String::from)
+        .collect()
 }
 
 fn list(paths: &[PathBuf]) -> String {

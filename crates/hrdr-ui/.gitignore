@@ -1,2 +1,5 @@
 /target
-/dist
+# dist/ is built by dioxus-cli and never committed — except .gitkeep, which keeps the
+# folder present so hrdr-web's #[derive(rust_embed::Embed)] resolves on a fresh checkout.
+/dist/*
+!/dist/.gitkeep
