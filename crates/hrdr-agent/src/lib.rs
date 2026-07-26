@@ -5918,13 +5918,21 @@ mod tests {
             out.contains("still merges the normal way"),
             "reminds that committed work merges via the branch: {out}"
         );
+        // CRLF-normalized: on Windows runners git's default `core.autocrlf=true`
+        // checks text out with CRLF, so the applied file reads back `\r\n` — the
+        // content is what matters here, not the platform's line endings.
+        let normalized = |p: &str| {
+            std::fs::read_to_string(repo.join(p))
+                .unwrap()
+                .replace("\r\n", "\n")
+        };
         assert_eq!(
-            std::fs::read_to_string(repo.join("f.txt")).unwrap(),
+            normalized("f.txt"),
             "one\nTWO\nthree\n",
             "the uncommitted edit landed in the parent tree"
         );
         assert_eq!(
-            std::fs::read_to_string(repo.join("sub/new.txt")).unwrap(),
+            normalized("sub/new.txt"),
             "fresh\n",
             "the untracked file landed in the parent tree"
         );
@@ -5991,12 +5999,12 @@ mod tests {
             "names the conflicting file and applies nothing: {err}"
         );
         assert_eq!(
-            std::fs::read_to_string(repo.join("f.txt")).unwrap(),
+            normalized("f.txt"),
             "one\nPARENT\nthree\n",
             "the parent's version of the conflicting file is untouched"
         );
         assert_eq!(
-            std::fs::read_to_string(repo.join("g.txt")).unwrap(),
+            normalized("g.txt"),
             "keep\n",
             "the non-conflicting hunk of a refused apply is not applied either"
         );
