@@ -1454,14 +1454,14 @@ dependencies = [
 
 [[package]]
 name = "hrdr-protocol"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "hrdr-ui"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "dioxus",
  "gloo",

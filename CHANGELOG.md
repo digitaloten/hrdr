@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-07-27
+
+### Added
+
+- **`@dir` attaches a directory's listing.** `@` previously accepted files only;
+  a directory silently expanded to nothing (the attach path rejects a
+  non-regular file and the failure was swallowed), so the mention reached the
+  model as bare text. A directory now contributes a one-level listing —
+  `/`-suffixed subdirectories, `@` for symlinks, the same shape the `ls` tool
+  returns — under its own labelled block, capped at 200 entries with the
+  remainder counted. Either spelling works (`@src` or `@src/`), and both in one
+  message attach once. Completion offers directories too (slash-suffixed, and
+  accepting one leaves the cursor ready to descend rather than closing the
+  token), because a candidate you cannot select is not a feature. A listing is
+  not content: it never counts as a read for the read-before-edit guard, and a
+  directory `secret_file_reason` recognises (`~/.ssh`, `~/.gnupg`, a password
+  store) is refused rather than enumerated.
+
 ### Changed
 
 - **The prompt now demands a check that can fail.** A review of delegated work
@@ -36,22 +54,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   commit**: a lockfile fix left uncommitted passes locally and fails on what was
   actually pushed. All of it is written per-ecosystem-neutral, so the same
   discipline applies whatever the project is built with.
-
-### Added
-
-- **`@dir` attaches a directory's listing.** `@` previously accepted files only;
-  a directory silently expanded to nothing (the attach path rejects a
-  non-regular file and the failure was swallowed), so the mention reached the
-  model as bare text. A directory now contributes a one-level listing —
-  `/`-suffixed subdirectories, `@` for symlinks, the same shape the `ls` tool
-  returns — under its own labelled block, capped at 200 entries with the
-  remainder counted. Either spelling works (`@src` or `@src/`), and both in one
-  message attach once. Completion offers directories too (slash-suffixed, and
-  accepting one leaves the cursor ready to descend rather than closing the
-  token), because a candidate you cannot select is not a feature. A listing is
-  not content: it never counts as a read for the read-before-edit guard, and a
-  directory `secret_file_reason` recognises (`~/.ssh`, `~/.gnupg`, a password
-  store) is refused rather than enumerated.
+- **Delegating from a dirty working dir now says so.** A write sub-agent's
+  worktree is a fresh checkout of HEAD, so groundwork the delegating agent did
+  itself — a new module, a trait the chunks implement, a rename they extend — is
+  invisible inside it unless it was committed first. The common failure is
+  scaffolding the work, handing out the pieces, and never committing the
+  scaffold: every sub-agent then forks from a HEAD that predates it and codes
+  against a tree where the thing it was told to extend doesn't exist, so it
+  reinvents it or gives up, and its diff won't apply. `task` now checks the
+  parent tree when it spawns a worktree-isolated sub-agent and, when there is
+  uncommitted work, returns a note alongside the task id listing what's
+  uncommitted and pointing at the remedy (`task_cancel`, commit, re-delegate).
+  The task still spawns — most uncommitted work is irrelevant to the brief — and
+  the note fires once per distinct dirty state, so a fan-out of parallel tasks
+  gets one warning rather than one each, while a tree that changed since warns
+  again.
+- **The delegation prompt now leads with committing groundwork.** What was a
+  passing mention of "commit them first" is a step-by-step: inspect
+  `git status --short --untracked-files=all`, commit everything the sub-agents
+  build on (that commit _is_ the interface being delegated against), stash or
+  delete the scratch they don't need, then spawn from a clean tree. It also
+  covers mid-batch groundwork, which is invisible to tasks already running.
 
 ### Fixed
 
@@ -75,30 +98,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the checkout is missing and the lock's owning process is dead. Nothing can be
   lost: there is no directory left to hold work, and orphan-branch reaping still
   goes through `git branch -d`, which refuses an unmerged branch.
-
-### Changed
-
-- **Delegating from a dirty working dir now says so.** A write sub-agent's
-  worktree is a fresh checkout of HEAD, so groundwork the delegating agent did
-  itself — a new module, a trait the chunks implement, a rename they extend — is
-  invisible inside it unless it was committed first. The common failure is
-  scaffolding the work, handing out the pieces, and never committing the
-  scaffold: every sub-agent then forks from a HEAD that predates it and codes
-  against a tree where the thing it was told to extend doesn't exist, so it
-  reinvents it or gives up, and its diff won't apply. `task` now checks the
-  parent tree when it spawns a worktree-isolated sub-agent and, when there is
-  uncommitted work, returns a note alongside the task id listing what's
-  uncommitted and pointing at the remedy (`task_cancel`, commit, re-delegate).
-  The task still spawns — most uncommitted work is irrelevant to the brief — and
-  the note fires once per distinct dirty state, so a fan-out of parallel tasks
-  gets one warning rather than one each, while a tree that changed since warns
-  again.
-- **The delegation prompt now leads with committing groundwork.** What was a
-  passing mention of "commit them first" is a step-by-step: inspect
-  `git status --short --untracked-files=all`, commit everything the sub-agents
-  build on (that commit _is_ the interface being delegated against), stash or
-  delete the scratch they don't need, then spawn from a clean tree. It also
-  covers mid-batch groundwork, which is invisible to tasks already running.
 
 ## [0.8.2] - 2026-07-27
 
@@ -3953,7 +3952,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/kryptic-sh/hrdr/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/kryptic-sh/hrdr/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/kryptic-sh/hrdr/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/kryptic-sh/hrdr/compare/v0.7.1...v0.8.0
