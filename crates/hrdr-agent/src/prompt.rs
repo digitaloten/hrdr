@@ -1636,6 +1636,89 @@ mod tests {
         );
     }
 
+    /// Each built-in guardrail paired with the token(s) the prompt must contain,
+    /// in `default_guardrails()` order. Checked in by hand on purpose: the prompt
+    /// phrasing is deliberately more nuanced than the terse guardrail message, so
+    /// it is written, not derived. A row with an empty token list records a rule
+    /// that needs no prompt guidance.
+    const GUARDRAIL_PROMPT_TOKENS: &[(&str, &[&str])] = &[
+        (
+            "blanket staging is disabled",
+            &["git add -A", "git add --all", "git add ."],
+        ),
+        ("force-push is disabled", &["force-push"]),
+        ("skipping commit hooks is disabled", &["--no-verify"]),
+        ("skipping push hooks is disabled", &["--no-verify"]),
+        ("discards uncommitted work", &["reset --hard"]),
+        ("deletes untracked files", &["clean -f"]),
+        (
+            "discards all uncommitted changes",
+            &["checkout -- .", "restore ."],
+        ),
+        (
+            "interactive git commands need a TTY",
+            &["git rebase -i", "git add -p"],
+        ),
+        ("delete far more than any task needs", &["rm -rf"]),
+        (
+            "stages every tracked change",
+            &["git commit -a", "git commit -am"],
+        ),
+        ("force-deleting a branch", &["branch -D"]),
+        ("force-removing a worktree", &["worktree remove --force"]),
+        ("discards stashed work", &["stash drop", "stash clear"]),
+        (
+            "piping a downloaded script",
+            &["pipe a downloaded script into a shell"],
+        ),
+        (
+            "piping a downloaded script",
+            &["pipe a downloaded script into a shell"],
+        ),
+    ];
+
+    /// The guardrails and the prompt are two encodings of one rule set:
+    /// `default_guardrails()` blocks the command, the fragments tell the model not
+    /// to reach for it. Drift means the model gets rejected by a rule nothing
+    /// warned it about — a wasted round that reads like the harness is broken.
+    ///
+    /// The table is positional, so adding a 16th guardrail fails here until
+    /// whoever added it writes the guidance too (or records that the rule needs
+    /// none). Auto-deriving the prose is explicitly not wanted.
+    #[test]
+    fn every_guardrail_is_explained_in_the_prompt() {
+        let rails = hrdr_tools::default_guardrails();
+        assert_eq!(
+            GUARDRAIL_PROMPT_TOKENS.len(),
+            rails.len(),
+            "default_guardrails() changed without GUARDRAIL_PROMPT_TOKENS: add the guidance to \
+             the prompt fragment and a row here, or add a row with an empty token list and a \
+             reason why this rule needs none"
+        );
+        // Guardrails only fire on shell commands, so the haystack is the prompt a
+        // write agent *with* a shell gets — the variant where the guidance lands.
+        // Spelled out rather than taken from `ToolRegistry::with_defaults()` so a
+        // machine with no shell on PATH tests the same bytes.
+        let prompt = render_flags(true, true, false, Some(hrdr_tools::Shell::Bash));
+        for (rail, (message, tokens)) in rails.iter().zip(GUARDRAIL_PROMPT_TOKENS) {
+            assert!(
+                rail.message.contains(message),
+                "GUARDRAIL_PROMPT_TOKENS is positional and the row for `{message}` no longer \
+                 lines up with guardrail `{}` — reorder the table to match default_guardrails()",
+                rail.message
+            );
+            for token in *tokens {
+                assert!(
+                    prompt.contains(token),
+                    "guardrail `{}` blocks something the prompt never mentions (missing token \
+                     `{token}`) — add the guidance to the prompt fragment, or add this rule to \
+                     the table with a reason",
+                    rail.message
+                );
+            }
+        }
+    }
+
     /// Reverting a wholly agent-owned file diff should use Git's exact tracked
     /// version instead of reconstructing the old text by hand. The prompt must
     /// also protect unrelated work by requiring both tracking and diff checks.
