@@ -296,27 +296,12 @@ fn check_auth(
             state.auth.basic_user.as_deref(),
             state.auth.basic_password_hash.as_deref(),
         ),
-        AuthMode::Users => {
-            // Check session cookie.
-            if let Some(cookie_header) = headers.get(header::COOKIE)
-                && let Ok(cookie_str) = cookie_header.to_str()
-            {
-                for part in cookie_str.split(';') {
-                    let part = part.trim();
-                    if let Some(val) = part.strip_prefix("hrdr_session=") {
-                        let val = val.trim();
-                        let ok = auth::verify_session_cookie(val, &state.auth.cookie_secret[..])
-                            .is_some();
-                        if ok {
-                            return Ok(());
-                        } else {
-                            return Err((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
-                        }
-                    }
-                }
-            }
-            false
-        }
+        // Every arm must yield a bool into the shared `!authed` tail below —
+        // an arm that returns early skips `rate_limit_record` and its failures
+        // go uncounted.
+        AuthMode::Users => session_cookie(headers)
+            .map(|val| auth::verify_session_cookie(val, &state.auth.cookie_secret[..]).is_some())
+            .unwrap_or(false),
     };
 
     if !authed {
@@ -325,6 +310,16 @@ fn check_auth(
     }
 
     Ok(())
+}
+
+/// The `hrdr_session` value out of the `Cookie` header, if the header carries one.
+fn session_cookie(headers: &HeaderMap) -> Option<&str> {
+    let cookie_str = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookie_str
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("hrdr_session="))
+        .map(str::trim)
 }
 
 // ── placeholder index ──────────────────────────────────────────────────────

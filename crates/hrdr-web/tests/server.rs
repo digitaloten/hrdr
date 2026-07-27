@@ -195,6 +195,55 @@ async fn wrong_token_is_401_and_rate_limited() {
     drop(server);
 }
 
+/// A bad `hrdr_session` cookie is counted by the rate limiter like any other
+/// auth failure: ten of them lock the bucket, so the eleventh request is 429
+/// even though it carries a *valid* cookie.
+#[tokio::test]
+async fn bad_session_cookie_is_rate_limited() {
+    let (server, _session, secret) = start_test_server_users_mode().await;
+
+    for i in 0..10 {
+        let response = raw_get(server.addr, "/", &["Cookie: hrdr_session=not-a-cookie"]).await;
+        assert!(
+            response.contains("401 Unauthorized"),
+            "attempt {i} should be 401, got: {response}"
+        );
+    }
+
+    let cookie = format!(
+        "Cookie: hrdr_session={}",
+        hrdr_web::auth::mint_session_cookie("alice", &secret[..])
+    );
+    let response = raw_get(server.addr, "/", &[&cookie]).await;
+    assert!(
+        response.contains("429 Too Many Requests"),
+        "11th request should be rate limited even with a good cookie, got: {response}"
+    );
+
+    drop(server);
+}
+
+/// A valid session cookie authenticates and records nothing: eleven of them in
+/// a row all succeed.
+#[tokio::test]
+async fn good_session_cookie_is_not_rate_limited() {
+    let (server, _session, secret) = start_test_server_users_mode().await;
+
+    let cookie = format!(
+        "Cookie: hrdr_session={}",
+        hrdr_web::auth::mint_session_cookie("alice", &secret[..])
+    );
+    for i in 0..11 {
+        let response = raw_get(server.addr, "/", &[&cookie]).await;
+        assert!(
+            response.contains("200 OK"),
+            "request {i} should be 200, got: {response}"
+        );
+    }
+
+    drop(server);
+}
+
 /// A WS upgrade from a foreign Origin is 403 even with a valid token.
 #[tokio::test]
 async fn ws_origin_foreign_is_rejected() {
@@ -343,4 +392,31 @@ async fn start_test_server_with_token() -> (server::RunningServer, SharedSession
         .expect("serve");
 
     (running, shared, token)
+}
+
+/// A server in `users` auth mode, plus the cookie secret so a test can mint a
+/// session cookie the server will accept.
+async fn start_test_server_users_mode() -> (server::RunningServer, SharedSession, [u8; 32]) {
+    let config = AgentConfig {
+        cwd: std::path::PathBuf::from("/tmp"),
+        api_key: Some("test-key".into()),
+        ..Default::default()
+    };
+
+    let shared = SharedSession::start(config).await.expect("session");
+
+    let mut web_cfg = WebConfig::load(&Default::default()).0;
+    web_cfg.auth = hrdr_web::config::AuthMode::Users;
+    let auth_state = AuthState::from_config(&web_cfg);
+    let secret = *auth_state.cookie_secret;
+
+    let cfg = ServeConfig {
+        bind: std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        port: 0,
+    };
+    let running = server::serve(shared.clone(), cfg, &web_cfg, auth_state)
+        .await
+        .expect("serve");
+
+    (running, shared, secret)
 }
