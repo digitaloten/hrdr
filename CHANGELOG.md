@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The prompt now demands a check that can fail.** A review of delegated work
+  found the same root cause behind three separate findings: work marked complete
+  on the strength of a check that could not fail — a world-state hash that
+  folded in entity counts but no component values (two wildly different states
+  hashed identically), an unimplemented function whose only two tests asserted
+  the empty value the stub returned, and a plan document's test count
+  incremented by hand. Write-capable agents are now told to break the thing a
+  check guards, watch it go red, and restore before trusting it, with the
+  recurring shapes named: a test that asserts what the unfinished code already
+  returns, a hash or snapshot that covers less than it claims, a guard whose
+  scope silently matches nothing, and a no-op under test. Alongside it: a
+  placeholder's name and doc comment must describe what it actually does rather
+  than what it is meant to do one day, work isn't complete until its stated
+  criterion has been demonstrated, and any figure written into a doc, changelog
+  or plan must be pasted from a command that was just run — never estimated,
+  never carried forward by addition.
+- **Verification means the project's whole gate set.** The same review found two
+  required CI jobs failing on pushed-ready work — an API-docs build with
+  warnings as errors, and a frozen-lockfile build — because the agent ran the
+  four commands it runs by habit and never opened the CI config. Agents are now
+  told to enumerate every job there and run each locally, with the
+  easily-forgotten classes called out (docs builds, frozen-lockfile builds,
+  dependency/licence audits, separate type-check steps, spell and link checks),
+  and to say which gates can't run locally rather than skipping them silently. A
+  manifest change now also carries its regenerated lockfile **in the same
+  commit**: a lockfile fix left uncommitted passes locally and fails on what was
+  actually pushed. All of it is written per-ecosystem-neutral, so the same
+  discipline applies whatever the project is built with.
+
 ### Added
 
 - **`@dir` attaches a directory's listing.** `@` previously accepted files only;

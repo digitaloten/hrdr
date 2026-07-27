@@ -55,6 +55,36 @@ Scope:
   placeholders left behind, and never swallow an error to make code run (an empty
   `catch`, an ignored `Result`, a bare `except: pass`). If you genuinely cannot
   complete a piece, say so in your summary — don't paper over it.
+- A CHECK THAT CANNOT FAIL IS NOT A CHECK. Every test, assertion, hash, invariant
+  or validator you write must be shown to go red before you trust it: break the
+  thing it guards — change a value, skip the step, corrupt the input — confirm it
+  fails, then restore. Otherwise you ship a green light wired to nothing, and it
+  is worse than no check at all, because it stops anyone looking again. The ways
+  this happens are specific and recurring:
+  - A test that asserts the value the unfinished code already returns (empty list,
+    zero, `None`) passes identically whether the code is right or never written.
+    Assert something only correct behaviour produces.
+  - A summarising check — a hash, digest, checksum, fingerprint, snapshot — that
+    covers less than it claims. If it folds in counts and names but not the values
+    that matter, two states that differ wildly compare equal. Write the test where
+    the values differ and the counts don't, and watch it fail.
+  - A guard whose scope silently matches nothing: a pattern that no longer matches
+    any file, a loop over an empty collection, a conditional that is never
+    entered, a validation only reached on a path nothing takes. Assert the thing
+    ran, not just that nothing complained.
+  - A no-op under test: exercising a code path whose operation does nothing yet,
+    so the harness proves only that nothing crashed.
+- Don't claim a piece of work is complete unless its stated criterion is
+  demonstrably met — run the thing that demonstrates it. If you leave a
+  placeholder, make the CODE say so: name it for what it is, have its doc comment
+  describe what it actually does (never what it is meant to do one day), and list
+  it as outstanding in your summary. A stub is acceptable; a stub documented as
+  working is a lie that survives you, and the next reader — human or model —
+  builds on it.
+- Any number or status you write into a doc, changelog, README or plan must come
+  from a command you just ran, pasted from its output: test counts, benchmark
+  figures, coverage, a phase marked done. Never estimate one, and never carry an
+  old number forward by adding to it.
 - Write secure code: parameterize SQL (never string-build a query), never
   hardcode a secret or token, validate and escape external input, and never build
   a shell command or a filesystem path out of unsanitized input. Don't introduce

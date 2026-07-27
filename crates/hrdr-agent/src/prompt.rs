@@ -1476,6 +1476,62 @@ mod tests {
             p.contains("already failing before you touched anything"),
             "{p}"
         );
+        // The WHOLE gate set, from the CI config — not the handful of commands the
+        // model runs by habit. A real session ran build/test/fmt/lint and shipped a
+        // state that failed the docs gate and the frozen-lockfile gate, both of
+        // which CI ran and it never did.
+        assert!(
+            p.contains("WHOLE gate set") && p.contains("enumerate every job"),
+            "the prompt sends the model to the CI config for the full list: {p}"
+        );
+        // And the frozen-lockfile trap: a manifest change whose regenerated
+        // lockfile sits uncommitted passes locally and fails on what was pushed.
+        assert!(
+            p.contains("commit it in the same commit as\n  the manifest"),
+            "a regenerated lockfile ships with the manifest change: {p}"
+        );
+    }
+
+    /// The discipline that catches "it's green" when the green light is wired to
+    /// nothing: a check must be shown to fail before it is trusted, a placeholder
+    /// must say what it really does, and figures written into docs come from a
+    /// command that was actually run.
+    ///
+    /// Every one of these was a finding in a real review of delegated work: a state
+    /// hash that ignored the state, an unimplemented function whose only tests
+    /// asserted the empty value it returned, a doc comment describing behaviour
+    /// that did not exist, and a hand-incremented test count in a plan document.
+    #[test]
+    fn the_prompt_demands_a_check_that_can_fail() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, false).unwrap();
+        assert!(p.contains("A CHECK THAT CANNOT FAIL IS NOT A CHECK"), "{p}");
+        assert!(
+            p.contains("confirm it\n  fails, then restore"),
+            "break it, watch it go red, restore: {p}"
+        );
+        // The specific shapes, since the general rule alone didn't catch them.
+        assert!(
+            p.contains("asserts the value the unfinished code already returns"),
+            "a test that passes against a stub: {p}"
+        );
+        assert!(
+            p.contains("covers less than it claims"),
+            "a hash/snapshot that folds in counts but not values: {p}"
+        );
+        assert!(
+            p.contains("silently matches nothing"),
+            "a guard whose scope is empty: {p}"
+        );
+        // An honest placeholder, and figures that came from a real command.
+        assert!(
+            p.contains("never what it is meant to do one day"),
+            "a stub's doc describes what it actually does: {p}"
+        );
+        assert!(
+            p.contains("must come\n  from a command you just ran"),
+            "no estimated or carried-forward numbers in docs: {p}"
+        );
     }
 
     /// The verify loop lives inside the `can_write` block's shell tail: it needs a

@@ -5,6 +5,22 @@ Verifying:
 - Learn the project's own commands before you run anything — its `package.json`
   scripts, a `Makefile`/`justfile`/`Taskfile`, `CONTRIBUTING.md`, the CI workflow
   (`.github/workflows`) — and use those, not a guess.
+- Run the project's WHOLE gate set, not the four commands you habitually run. Open
+  its CI config and enumerate every job, then run each one's command locally. Past
+  build/test/format/lint, projects gate things that are easy to forget and fail
+  loudly in CI: an API-docs build treating warnings as errors, a
+  **frozen-lockfile** build, dependency audits (licences, advisories, unused
+  deps), type checking as a separate step from tests, a spell or link check. Two
+  minutes of running the list beats a red pipeline you find out about later. If a
+  gate can't run locally, say which and why.
+- A frozen-lockfile gate (`--locked`/`--frozen`, `npm ci`,
+  `--frozen-lockfile`, `pip install -r` against a pinned file) fails on any
+  manifest change whose lockfile wasn't regenerated. So when you touch a manifest
+  — a new dependency, a new workspace member, a version bump — regenerate the
+  lockfile with the project's own command and **commit it in the same commit as
+  the manifest**, then verify with the frozen flag yourself. A lockfile fix
+  sitting uncommitted in your working tree is not a fix; CI checks out what you
+  pushed.
 - Let the tools do the mechanical fixes — run the formatter and linter in
   **write/fix mode, not check mode**, so they correct the file themselves:
   `prettier --write <files>`, `eslint --fix`,
