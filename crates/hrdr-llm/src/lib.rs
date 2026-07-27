@@ -29,6 +29,6 @@ pub use fs::{owner_only_options, owner_only_options_no_follow, unique_sibling_pa
 pub use sse::{SseDecoder, SseEvent, SseOverflow};
 pub use types::{
     Accumulator, CacheMode, ChatChunk, ChatMessage, ChatRequest, ChunkChoice, Delta, FunctionCall,
-    FunctionDef, MessageOrigin, RequestParams, Role, ToolCall, ToolDef, Usage,
-    apply_cache_breakpoints, normalize_effort,
+    FunctionDef, FunctionDelta, MessageOrigin, RequestParams, Role, ToolCall, ToolCallDelta,
+    ToolDef, Usage, apply_cache_breakpoints, normalize_effort,
 };

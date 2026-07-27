@@ -102,9 +102,17 @@ impl Agent {
     ) -> (u32, u32, Option<u32>, Option<f64>, Option<f64>) {
         let (prompt_tokens, completion_tokens) = match &acc.usage {
             Some(usage) => (usage.prompt_tokens, usage.completion_tokens),
+            // A server that reports nothing: estimate every channel the model
+            // was billed for, not just the visible text. Reasoning and tool-call
+            // arguments are completion tokens too, and a round that writes a
+            // file is almost entirely the latter — counting content alone put
+            // this figure near zero for exactly the busiest rounds, which then
+            // understated throughput and the compaction trigger alike.
             None => (
                 estimate_tokens_in_messages(&self.messages),
-                estimate_tokens(&acc.content),
+                estimate_tokens(&acc.content)
+                    .saturating_add(estimate_tokens(&acc.reasoning))
+                    .saturating_add(acc.tool_call_tokens()),
             ),
         };
         let cached_prompt_tokens = acc.usage.as_ref().and_then(|usage| usage.cached_tokens());

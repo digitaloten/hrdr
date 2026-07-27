@@ -323,13 +323,23 @@ pub(crate) fn retry_after_hint(e: &anyhow::Error) -> Option<std::time::Duration>
 /// Drain a chat stream into an [`Accumulator`], emitting `Reasoning` and `Text`
 /// deltas as they arrive. Shared by the turn loop, the budget-exhausted wrap-up
 /// round, and (with a no-op sink) the one-off compaction call.
+///
+/// Also times the round's generation window — see [`Drained::decode`].
 pub(crate) async fn drain_stream<F: FnMut(AgentEvent)>(
     stream: &mut ChatStream,
     on_event: &mut F,
-) -> Result<Accumulator> {
+) -> Result<Drained> {
     let mut acc = Accumulator::new();
+    // First chunk that carried a payload of *any* kind. Not `first_token_at`
+    // from the events: a round whose whole output is one tool call streams only
+    // `input_json_delta`s, which are accumulated silently and would leave this
+    // round timed at zero.
+    let mut first_payload: Option<std::time::Instant> = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
+        if first_payload.is_none() && chunk_has_payload(&chunk) {
+            first_payload = Some(std::time::Instant::now());
+        }
         // Empty deltas are dropped rather than forwarded, in BOTH directions.
         // Servers do send them: a Qwen3-style backend keeps emitting
         // `reasoning_content: ""` on every content chunk once it stops thinking
@@ -356,7 +366,40 @@ pub(crate) async fn drain_stream<F: FnMut(AgentEvent)>(
             on_event(AgentEvent::Text(text));
         }
     }
-    Ok(acc)
+    Ok(Drained {
+        decode: first_payload
+            .map(|t| t.elapsed())
+            .unwrap_or(std::time::Duration::ZERO),
+        acc,
+    })
+}
+
+/// One drained round: what the model produced, and how long it took to produce
+/// it.
+pub(crate) struct Drained {
+    pub acc: Accumulator,
+    /// From the round's first streamed payload byte to the end of its stream —
+    /// generation time, with the prefill wait ahead of it excluded. Zero for a
+    /// round that streamed nothing at all.
+    pub decode: std::time::Duration,
+}
+
+/// Whether a chunk carried any of the model's output, as opposed to being the
+/// trailing usage-only chunk (or a keep-alive, or one of the empty deltas a
+/// Qwen3-style backend sprays). Tool-call fragments count: they are output the
+/// model had to generate, and for many rounds they are all of it.
+fn chunk_has_payload(chunk: &hrdr_llm::ChatChunk) -> bool {
+    chunk.choices.first().is_some_and(|c| {
+        c.delta
+            .content
+            .as_ref()
+            .is_some_and(|text| !text.is_empty())
+            || c.delta
+                .reasoning_content
+                .as_ref()
+                .is_some_and(|r| !r.is_empty())
+            || c.delta.tool_calls.as_ref().is_some_and(|c| !c.is_empty())
+    })
 }
 
 /// Repair a history left dangling by an interrupted turn. An assistant message
@@ -613,7 +656,7 @@ impl Agent {
             // connect is retried on transient errors and auto-compacted once on
             // a context-length overflow. Mid-stream failures are retried too
             // (history is unchanged at that point, so re-requesting is safe).
-            let acc = self
+            let Drained { acc, decode } = self
                 .connect_and_drain(&defs, &mut overflow_compacted, &mut on_event)
                 .await?;
             if let Some(warning) = hrdr_llm::take_client_warning() {
@@ -646,6 +689,7 @@ impl Agent {
             on_event(AgentEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
+                decode_ms: decode.as_millis().min(u32::MAX as u128) as u32,
                 cached_prompt_tokens,
                 reasoning_tokens: acc.usage.as_ref().and_then(|u| u.reasoning_tokens()),
                 cost_usd,
@@ -882,16 +926,17 @@ impl Agent {
             return Err(error);
         }
         let real_messages = std::mem::replace(&mut self.messages, flattened);
-        let acc = self
+        let drained = self
             .connect_and_drain(&[], &mut overflow_compacted, &mut on_event)
             .await;
         self.messages = real_messages;
-        let acc = acc?;
+        let Drained { acc, decode } = drained?;
         let (prompt_tokens, completion_tokens, cached_prompt_tokens, cost_usd, session_cost_usd) =
             self.account_usage(&acc).await;
         on_event(AgentEvent::Usage {
             prompt_tokens,
             completion_tokens,
+            decode_ms: decode.as_millis().min(u32::MAX as u128) as u32,
             cached_prompt_tokens,
             reasoning_tokens: acc
                 .usage
@@ -1231,7 +1276,7 @@ impl Agent {
         defs: &[ToolDef],
         overflow_compacted: &mut bool,
         on_event: &mut F,
-    ) -> Result<Accumulator> {
+    ) -> Result<Drained> {
         const MAX_DRAIN_RETRIES: usize = 3;
         let mut drain_attempt = 0usize;
         loop {
@@ -1239,7 +1284,9 @@ impl Agent {
                 .connect_stream(defs, overflow_compacted, on_event)
                 .await?;
             match drain_stream(&mut stream, on_event).await {
-                Ok(acc) => return Ok(acc),
+                // Only the round that actually streamed is timed: the retried
+                // attempts and the backoff between them are not generation.
+                Ok(drained) => return Ok(drained),
                 Err(e) if is_transient(&e) && drain_attempt < MAX_DRAIN_RETRIES => {
                     drain_attempt += 1;
                     let delay =
@@ -1401,13 +1448,65 @@ mod tests {
     }
 
     async fn events_for(chunks: Vec<ChatChunk>) -> (Vec<AgentEvent>, Accumulator) {
+        let (events, drained) = drain(chunks).await;
+        (events, drained.acc)
+    }
+
+    async fn drain(chunks: Vec<ChatChunk>) -> (Vec<AgentEvent>, Drained) {
         let mut stream: ChatStream =
             Box::pin(futures_util::stream::iter(chunks.into_iter().map(Ok)));
         let mut seen = Vec::new();
-        let acc = drain_stream(&mut stream, &mut |ev| seen.push(ev))
+        let drained = drain_stream(&mut stream, &mut |ev| seen.push(ev))
             .await
             .unwrap();
-        (seen, acc)
+        (seen, drained)
+    }
+
+    fn tool_chunk(args: &str) -> ChatChunk {
+        ChatChunk {
+            choices: vec![ChunkChoice {
+                delta: Delta {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![hrdr_llm::ToolCallDelta {
+                        index: 0,
+                        id: Some("c1".into()),
+                        function: Some(hrdr_llm::FunctionDelta {
+                            name: Some("write".into()),
+                            arguments: Some(args.to_string()),
+                        }),
+                    }]),
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+            anthropic_thinking_blocks: vec![],
+        }
+    }
+
+    /// A round that streams only tool-call arguments emits no `Text` and no
+    /// `Reasoning` — the events a clock could hang off — yet the model spent
+    /// that whole round generating. The stream is where those fragments are
+    /// visible, so the stream is where the round gets timed.
+    #[tokio::test]
+    async fn a_tool_call_only_round_is_still_timed() {
+        let (events, drained) = drain(vec![tool_chunk("{\"path\":"), tool_chunk("\"x\"}")]).await;
+        assert!(
+            events.is_empty(),
+            "nothing to render, which is exactly the trap: {events:?}"
+        );
+        assert!(
+            drained.decode > std::time::Duration::ZERO,
+            "but the round is timed all the same"
+        );
+    }
+
+    /// The usage-only trailing chunk is not output, so it must not open the
+    /// generation window — a round that streamed nothing has no window at all.
+    #[tokio::test]
+    async fn a_round_that_streams_nothing_is_timed_at_zero() {
+        let (_, drained) = drain(vec![chunk(Some(""), Some(""))]).await;
+        assert_eq!(drained.decode, std::time::Duration::ZERO);
     }
 
     /// An empty delta is dropped rather than forwarded — in both directions.

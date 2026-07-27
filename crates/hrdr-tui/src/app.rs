@@ -2268,15 +2268,18 @@ impl App {
     fn turn_stats(&self) -> Option<String> {
         let turn = self.live_subagents.turn(hrdr_agent::MAIN_KEY)?;
         turn.started?;
-        hrdr_app::turn_stats_line(
+        hrdr_app::turn_stats_line(hrdr_app::TurnStatsLine {
             // The model's working time, excluding the tool calls it waited on.
-            turn.infer_elapsed().as_secs_f64(),
-            turn.ttft(),
-            turn.out_tokens,
-            self.state().usage.last(),
-            turn.last_cached_tokens,
-            turn.last_reasoning_tokens,
-        )
+            elapsed_secs: turn.infer_elapsed().as_secs_f64(),
+            // The slice of it that was actual generation — what the rate is over.
+            gen_secs: turn.decode_elapsed().as_secs_f64(),
+            ttft_secs: turn.ttft(),
+            out_tokens: turn.out_tokens(),
+            tok_per_sec: turn.tok_per_sec(),
+            usage: self.state().usage.last(),
+            cached_tokens: turn.last_cached_tokens,
+            reasoning_tokens: turn.last_reasoning_tokens,
+        })
     }
 
     /// A detached sub-agent finished while nothing was running: wake the model so

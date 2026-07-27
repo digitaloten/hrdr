@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tok/s` was wrong in both directions, and drifted lower the longer a turn
+  ran.** The numerator counted streamed text and reasoning deltas only, so a
+  round the model spent emitting tool-call arguments — a `write` of a whole file
+  is almost entirely that — contributed nothing; the denominator was the model's
+  whole working time, which also holds every prefill wait, every retry backoff,
+  each turn-end hook and any auto-compaction call. Both errors understate the
+  rate, and both grow as a turn goes on (more rounds, deeper context, longer
+  prefills), which is why a model that was still generating at full speed read
+  as one steadily slowing down. Throughput is now the provider's own
+  output-token count for each round — tool-call arguments and reasoning included
+  — over the measured window from each round's first streamed byte to the end of
+  its stream. Timed where the stream is drained rather than off events, because
+  a round whose entire output is one tool call emits no renderable event at all
+  and would otherwise be counted with no time against it. The finished-turn line
+  also shows the window the rate was measured over
+  (`✓ 4.1k tok · 62.0 tok/s · 94.2s (66.1s generating)`), and no longer computes
+  a second, different rate of its own — the live loader and the final line
+  disagreed by construction.
+- When a server reports no usage at all, the fallback estimate now covers
+  reasoning and tool-call arguments instead of visible text alone. It read near
+  zero for exactly the busiest rounds, which skewed the context bar and the
+  auto-compaction trigger as well as throughput.
+
 ## [0.8.1] - 2026-07-27
 
 ### Fixed

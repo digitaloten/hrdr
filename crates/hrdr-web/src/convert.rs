@@ -191,7 +191,7 @@ pub fn wire_turn(stats: &TurnStats, running: bool) -> WireTurn {
         elapsed_ms: stats.infer_elapsed().as_millis() as u64,
         ttft_secs: stats.ttft(),
         tok_per_sec: stats.tok_per_sec(),
-        out_tokens: stats.out_tokens,
+        out_tokens: stats.out_tokens(),
         started_unix: stats.started_at.map(|t| {
             t.duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

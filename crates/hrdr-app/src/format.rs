@@ -193,26 +193,59 @@ mod tests {
     }
 }
 
+/// What a finished turn cost and how fast it ran — the inputs to
+/// [`turn_stats_line`].
+///
+/// A struct rather than eight positional arguments, half of them
+/// interchangeable `f64`s and `Option<u32>`s: a transposed pair there is a
+/// silently wrong number on screen, not a compile error.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TurnStatsLine {
+    /// The model's working time — the tool calls it waited on excluded.
+    pub elapsed_secs: f64,
+    /// The narrower slice of that spent actually streaming tokens: the window
+    /// `tok_per_sec` is measured over.
+    pub gen_secs: f64,
+    /// Time-to-first-token: provider latency before the first round streamed.
+    pub ttft_secs: Option<f64>,
+    /// Output tokens for the whole turn, every round included.
+    pub out_tokens: usize,
+    /// Throughput, taken rather than derived: [`hrdr_agent::TurnStats::tok_per_sec`]
+    /// owns that definition, and this line computing its own from the elapsed
+    /// figure was how the live loader and the final line came to disagree.
+    pub tok_per_sec: f64,
+    /// The last round's `(prompt, completion)` tokens — the live context size.
+    pub usage: Option<(u32, u32)>,
+    /// Prompt tokens the last round served from cache, when reported.
+    pub cached_tokens: Option<u32>,
+    /// Completion tokens the last round spent reasoning, when reported.
+    pub reasoning_tokens: Option<u32>,
+}
+
 /// The per-turn stats line both frontends append after a completed turn
 /// (`✓ N tok · tok/s · elapsed · ttft · ctx`). `None` when the turn produced
-/// nothing measurable. `ttft_secs` is time-to-first-token; the token rate is
-/// measured from the first token, not the request start.
-pub fn turn_stats_line(
-    elapsed_secs: f64,
-    ttft_secs: Option<f64>,
-    out_tokens: usize,
-    usage: Option<(u32, u32)>,
-    cached_tokens: Option<u32>,
-    reasoning_tokens: Option<u32>,
-) -> Option<String> {
+/// nothing measurable.
+pub fn turn_stats_line(stats: TurnStatsLine) -> Option<String> {
+    let TurnStatsLine {
+        elapsed_secs,
+        gen_secs,
+        ttft_secs,
+        out_tokens,
+        tok_per_sec,
+        usage,
+        cached_tokens,
+        reasoning_tokens,
+    } = stats;
     if out_tokens == 0 && usage.is_none() {
         return None;
     }
-    let speed = match ttft_secs {
-        Some(t0) if out_tokens > 0 && elapsed_secs > t0 => out_tokens as f64 / (elapsed_secs - t0),
-        _ => 0.0,
-    };
-    let mut s = format!("✓ {out_tokens} tok · {speed:.1} tok/s · {elapsed_secs:.1}s");
+    let mut s = format!("✓ {out_tokens} tok · {tok_per_sec:.1} tok/s · {elapsed_secs:.1}s");
+    // What the rate was measured over. Shown whenever it differs from the
+    // working time, so a turn where the model waited far more than it generated
+    // (deep context, many rounds) says so instead of looking like a slow model.
+    if gen_secs > 0.0 && (elapsed_secs - gen_secs).abs() >= 0.1 {
+        s.push_str(&format!(" ({gen_secs:.1}s generating)"));
+    }
     // Time to first token (provider latency before streaming began).
     if let Some(t0) = ttft_secs {
         s.push_str(&format!(" · ttft {t0:.2}s"));
@@ -285,20 +318,60 @@ mod stats_tests {
     #[test]
     fn turn_stats_line_shapes() {
         // Nothing measurable → no line.
-        assert_eq!(turn_stats_line(1.0, None, 0, None, None, None), None);
-        // Full line: rate measured from the first token, with cache + reasoning.
-        let s =
-            turn_stats_line(3.0, Some(1.0), 100, Some((600, 100)), Some(450), Some(30)).unwrap();
+        assert_eq!(
+            turn_stats_line(TurnStatsLine {
+                elapsed_secs: 1.0,
+                ..Default::default()
+            }),
+            None
+        );
+        // Full line: the rate is the caller's, with cache + reasoning.
+        let s = turn_stats_line(TurnStatsLine {
+            elapsed_secs: 3.0,
+            gen_secs: 2.0,
+            ttft_secs: Some(1.0),
+            out_tokens: 100,
+            tok_per_sec: 50.0,
+            usage: Some((600, 100)),
+            cached_tokens: Some(450),
+            reasoning_tokens: Some(30),
+        })
+        .unwrap();
         assert!(s.contains("✓ 100 tok"), "{s}");
         assert!(s.contains("50.0 tok/s"), "{s}");
+        assert!(
+            s.contains("3.0s (2.0s generating)"),
+            "the working time and the window the rate is over: {s}"
+        );
         assert!(s.contains("ttft 1.00s"), "{s}");
         assert!(s.contains("ctx 600 (in/out 600/100, 6.0:1)"), "{s}");
         assert!(s.contains("450 cached"), "{s}");
         assert!(s.contains("30 reasoning"), "{s}");
         // Usage-only turn (no streamed tokens) still reports context; zero
         // cache/reasoning are omitted.
-        let s = turn_stats_line(2.0, None, 0, Some((10, 0)), Some(0), None).unwrap();
+        let s = turn_stats_line(TurnStatsLine {
+            elapsed_secs: 2.0,
+            usage: Some((10, 0)),
+            cached_tokens: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
         assert!(s.contains("0.0 tok/s") && s.contains("ctx 10"), "{s}");
         assert!(!s.contains("cached"), "{s}");
+        assert!(
+            !s.contains("generating"),
+            "a turn that generated nothing claims no window: {s}"
+        );
+        // A turn that spent all its working time generating doesn't say so twice.
+        let s = turn_stats_line(TurnStatsLine {
+            elapsed_secs: 2.0,
+            gen_secs: 2.0,
+            ttft_secs: Some(0.1),
+            out_tokens: 40,
+            tok_per_sec: 20.0,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!s.contains("generating"), "{s}");
     }
 }

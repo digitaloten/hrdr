@@ -1001,6 +1001,7 @@ mod tests {
             &crate::AgentEvent::Usage {
                 prompt_tokens: 120,
                 completion_tokens: 30,
+                decode_ms: 0,
                 cached_prompt_tokens: None,
                 reasoning_tokens: None,
                 cost_usd: None,

@@ -119,6 +119,7 @@ mod tests {
         u.record_event(&crate::AgentEvent::Usage {
             prompt_tokens: 10,
             completion_tokens: 4,
+            decode_ms: 0,
             cached_prompt_tokens: None,
             reasoning_tokens: None,
             cost_usd: None,
@@ -143,6 +144,7 @@ mod tests {
         u.record_event(&crate::AgentEvent::Usage {
             prompt_tokens: 10,
             completion_tokens: 4,
+            decode_ms: 0,
             cached_prompt_tokens: None,
             reasoning_tokens: None,
             cost_usd: Some(0.25),
@@ -155,6 +157,7 @@ mod tests {
         u.record_event(&crate::AgentEvent::Usage {
             prompt_tokens: 5,
             completion_tokens: 2,
+            decode_ms: 0,
             cached_prompt_tokens: None,
             reasoning_tokens: None,
             cost_usd: Some(0.1),

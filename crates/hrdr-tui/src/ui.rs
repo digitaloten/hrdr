@@ -1167,7 +1167,7 @@ fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
         };
         format!(
             " {frame} {phase}  ·  {ctx}  ·  {speed:.1} tok/s ({} out){ttft}  ·  {:.1}s{started}",
-            turn.out_tokens,
+            turn.out_tokens(),
             elapsed.as_secs_f64(),
         )
     };

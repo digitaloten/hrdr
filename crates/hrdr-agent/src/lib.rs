@@ -767,10 +767,23 @@ pub enum AgentEvent {
         result: String,
         ok: bool,
     },
-    /// Token usage reported for the latest model call (when the server sends it).
+    /// Token usage and timing for the model call that just finished — one per
+    /// round, emitted the instant its stream drains. Token counts are the
+    /// server's when it reports any, an estimate otherwise.
     Usage {
         prompt_tokens: u32,
         completion_tokens: u32,
+        /// Milliseconds this round spent *generating*: from its first streamed
+        /// byte of any kind — text, reasoning, or tool-call arguments — to the
+        /// end of its stream. Measured where the stream is drained, because
+        /// that is the only place the tool-call-only rounds are visible: they
+        /// emit no `Text`/`Reasoning` event at all, so a clock driven by events
+        /// alone would count their tokens with none of their time.
+        ///
+        /// The prefill before that first byte is deliberately excluded — it is
+        /// the wait that grows with context and it produces nothing, so leaving
+        /// it in is what makes a long turn look like a slowing model.
+        decode_ms: u32,
         /// Prompt tokens served from the prompt cache (a cache hit), if reported.
         cached_prompt_tokens: Option<u32>,
         /// Completion tokens spent on reasoning/thinking, if reported.

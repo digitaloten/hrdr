@@ -666,6 +666,23 @@ impl Accumulator {
         delta
     }
 
+    /// A rough token count for the tool calls streamed so far — the same
+    /// `len / 4` estimate used for message content, over each call's name and
+    /// arguments.
+    ///
+    /// These are completion tokens the model was billed for and spent time
+    /// generating, but they appear in neither `content` nor `reasoning`, so any
+    /// estimate built from those alone misses a tool-calling round almost
+    /// entirely. Only needed when the server reports no usage of its own.
+    pub fn tool_call_tokens(&self) -> u32 {
+        let bytes: usize = self
+            .calls
+            .iter()
+            .map(|c| c.function.name.len() + c.function.arguments.len())
+            .sum();
+        (bytes / 4) as u32
+    }
+
     /// Whether the reply was cut off at the model's output cap (`finish_reason`
     /// `length`, or Anthropic's `max_tokens`) rather than finishing naturally.
     pub fn truncated(&self) -> bool {

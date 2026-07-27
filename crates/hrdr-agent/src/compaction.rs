@@ -644,7 +644,10 @@ impl Agent {
     /// Silent: the shared [`drain_stream`] gets a no-op event sink.
     async fn plain_completion(&mut self, req: Vec<ChatMessage>) -> Result<String> {
         let mut stream = self.client.chat_stream(&req, &[]).await?;
-        let acc = drain_stream(&mut stream, &mut |_| {}).await?;
+        // The round's generation time is dropped on purpose: a compaction call
+        // emits no `Usage` event, so its tokens never reach the turn's
+        // throughput either. Counting one without the other would skew it.
+        let acc = drain_stream(&mut stream, &mut |_| {}).await?.acc;
         self.account_usage(&acc).await;
         Ok(acc.into_message().content.unwrap_or_default())
     }

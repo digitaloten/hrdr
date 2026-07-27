@@ -950,6 +950,7 @@ fn event_json(ev: &AgentEvent) -> String {
         AgentEvent::Usage {
             prompt_tokens,
             completion_tokens,
+            decode_ms,
             cached_prompt_tokens,
             reasoning_tokens,
             cost_usd,
@@ -960,6 +961,7 @@ fn event_json(ev: &AgentEvent) -> String {
                 "type": "usage",
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "decode_ms": decode_ms,
                 "cached_prompt_tokens": cached_prompt_tokens,
                 "reasoning_tokens": reasoning_tokens,
                 "cost_usd": cost_usd,
