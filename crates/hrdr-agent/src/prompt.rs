@@ -796,13 +796,83 @@ mod tests {
         // workflow it has no way to carry out.
         assert!(!p.contains("Releasing"), "{p}");
         // The read/search workflow and the working-directory safety line remain.
-        assert!(p.contains("grep/find/ls/tree/read"), "{p}");
+        assert!(p.contains("`grep`/`find`/`ls`/`tree`/`read`"), "{p}");
         assert!(p.contains("working directory is your home base"), "{p}");
         // And so do the rules that bind *any* agent, whatever it can reach: a
         // read-only sub-agent still reports its findings (and can still lie about
         // them), and still reads web pages and files that may try to instruct it.
         assert!(p.contains("Reporting:"), "{p}");
         assert!(p.contains("Untrusted content:"), "{p}");
+    }
+
+    /// Every tool the **unconditional** block names must be one a read-only agent
+    /// actually has.
+    ///
+    /// That block goes to every agent hrdr runs — `explore`, `review`, `plan`, and
+    /// any custom profile whose `tools:` allow-list pruned the registry. A tool
+    /// named there but pruned away is an instruction to call something that is not
+    /// in the request's `tools[]`: the model either invents the call and eats an
+    /// error, or plans around a capability it was told it had. That is exactly what
+    /// `todo` was — named in the workflow bullet since the beginning while
+    /// `TodoTool::read_only` returned `false`, so `retain_only` dropped it for the
+    /// three read-only profiles.
+    ///
+    /// The scan is automatic, and rests on the convention the fragments already
+    /// follow: **a tool is named in backticks** (`fetch`, `search`, `watch`,
+    /// `memory`, …). Any backticked span that is also a registered tool name has to
+    /// survive the read-only prune, so naming a *new* tool up there fails this test
+    /// unless that tool is read-only. Backticked spans that are not tool names
+    /// (`.env`, `~/.aws/credentials`) are ignored, and the tail assertion keeps the
+    /// scan from going vacuous if a rewording drops the mentions altogether.
+    #[test]
+    fn the_unconditional_prompt_names_only_tools_a_read_only_agent_has() {
+        let all = ToolRegistry::with_defaults();
+        let read_only = all.read_only_names();
+        let registered: Vec<String> = all.defs().into_iter().map(|d| d.function.name).collect();
+        // Tools `Agent::new` registers that `with_defaults` does not, plus `shell`
+        // — which `with_defaults` only registers when one is on PATH, and a machine
+        // without one must not silently pass a `shell` mention. Named with the
+        // capability they carry, since this side of the registry cannot ask them.
+        let also_known: [(&str, bool); 5] = [
+            ("models", true),
+            ("skill", true),
+            ("shell", false),
+            ("task", false),
+            ("memory", false),
+        ];
+        let is_tool = |n: &str| {
+            registered.iter().any(|r| r == n) || also_known.iter().any(|(name, _)| *name == n)
+        };
+        let is_read_only = |n: &str| {
+            read_only.iter().any(|r| r == n)
+                || also_known.iter().any(|(name, ro)| *name == n && *ro)
+        };
+
+        let base = base_section();
+        // Backticked spans are the odd pieces of a split on the delimiter.
+        let named: Vec<&str> = base.split('`').skip(1).step_by(2).collect();
+        let mut found: Vec<&str> = Vec::new();
+        for span in named {
+            if !is_tool(span) {
+                continue;
+            }
+            found.push(span);
+            assert!(
+                is_read_only(span),
+                "the unconditional prompt block names `{span}`, but a read-only \
+                 agent's tool set does not have it — either reword the line so it \
+                 names no gated tool, or make the tool read-only"
+            );
+        }
+        // Not vacuous: these are the mentions the defect was about. If a rewording
+        // removes them, this fails and whoever reworded reads the paragraph above.
+        for expected in ["grep", "read", "todo"] {
+            assert!(
+                found.contains(&expected),
+                "expected the unconditional block to still name `{expected}`; \
+                 backticked tool mentions found: {found:?}"
+            );
+        }
     }
 
     /// The prefix-cache invariant: every unconditional section precedes the first

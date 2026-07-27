@@ -1165,11 +1165,16 @@ pub trait Tool: Send + Sync {
 
     /// Whether consecutive calls of this tool are safe to run **concurrently**
     /// with each other (and with read-only calls). Read-only tools qualify by
-    /// definition; a mutating tool whose calls are self-contained and don't need
+    /// default; a mutating tool whose calls are self-contained and don't need
     /// to observe each other's effects in order (e.g. `task` sub-agents, each in
     /// its own isolated context) can opt in by overriding this to `true` while
     /// staying non-`read_only`. The parent's own file-mutating tools keep the
     /// default (barrier, sequential).
+    ///
+    /// The inverse override is legal too: a tool that leaves the working tree
+    /// alone (`read_only`) but whose calls are order-sensitive in the agent's own
+    /// state can opt back out — `todo` does, since each call replaces the whole
+    /// list.
     fn concurrent(&self) -> bool {
         self.read_only()
     }

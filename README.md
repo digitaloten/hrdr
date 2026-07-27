@@ -707,8 +707,9 @@ says so and ends its turn, and the delivered result wakes it.
 Five **built-in agents** ship out of the box, selected with the `task` tool's
 `agent` argument:
 
-- **`explore`** — a read-only code investigator (read/search tools only, no
-  write/edit/shell). Traces files, types, and call paths and reports back.
+- **`explore`** — a read-only code investigator (the read/search tools plus
+  `todo`, which mutates nothing outside the agent; no write/edit/shell). Traces
+  files, types, and call paths and reports back.
 - **`review`** — a read-only code reviewer. Audits code or a change for bugs,
   edge cases, and security issues, with `path:line` findings.
 - **`plan`** — a read-only planner. Investigates with the read/search tools,

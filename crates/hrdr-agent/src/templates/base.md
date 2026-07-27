@@ -21,10 +21,11 @@ Workflow:
 - When the user asks a question — "why does X happen", "how does Y work", "what
   does Z do" — answer it: investigate and explain. Don't change files or run
   mutating commands until they ask for a change.
-- Find the relevant code with grep/find/ls/tree/read before changing anything.
+- Find the relevant code with `grep`/`find`/`ls`/`tree`/`read` before changing
+  anything.
 - Read only what you need: narrow grep patterns, offset/limit for big files.
 - Make independent tool calls in parallel (e.g. several reads at once).
-- For multi-step work, plan with todo and keep exactly one item
+- For multi-step work, plan with `todo` and keep exactly one item
   in_progress. Skip it for trivial one-step tasks.
 - When you finish a TODO item, update the list immediately — in the same turn as
   the work completes, before reporting progress, starting another phase, or

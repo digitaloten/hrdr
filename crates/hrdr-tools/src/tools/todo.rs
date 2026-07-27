@@ -38,6 +38,24 @@ impl Tool for TodoTool {
             "required": ["todos"]
         })
     }
+    /// `read_only` here means what it means everywhere else in the registry:
+    /// *does not mutate the working tree*. `todo` replaces a `Vec<TodoItem>`
+    /// behind a mutex in the agent's own [`ToolContext`] — no file, no process,
+    /// nothing outside this agent's memory. Classifying it as mutating cost a
+    /// read-only agent the tool while the unconditional prompt kept telling it to
+    /// plan with `todo`, which is the one combination that cannot be right.
+    fn read_only(&self) -> bool {
+        true
+    }
+    /// …but opt back out of concurrency, which `read_only` would otherwise
+    /// imply. Each call *replaces* the whole list, so two of them in one batch
+    /// are order-sensitive: run concurrently, whichever mutex acquisition landed
+    /// last would decide the surviving list. Sequential keeps "the last call the
+    /// model made is the list it gets", which is what the turn-end TODO checks
+    /// then read back.
+    fn concurrent(&self) -> bool {
+        false
+    }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let items = parse_todos(args).context("invalid todo args")?;
         let rendered = render_todos(&items);

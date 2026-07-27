@@ -5373,6 +5373,13 @@ mod tests {
         // `references`); the mutating `rename` is pruned with the writers.
         // `skill` is here as well: it returns instructions and writes nothing —
         // what a loaded skill can then *do* is bounded by this very tool set.
+        // `todo` likewise: it replaces a list held in this agent's own
+        // `ToolContext` and touches nothing on disk. It is in the set because the
+        // unconditional prompt block tells *every* agent to plan multi-step work
+        // with it, `plan` above all — naming a tool the agent does not have is
+        // how a prompt sends a model after something it cannot call, and
+        // `the_unconditional_prompt_names_only_tools_a_read_only_agent_has`
+        // (in `prompt.rs`) now fails if the two ever drift apart again.
         let readers = [
             "definition",
             "fetch",
@@ -5385,6 +5392,7 @@ mod tests {
             "references",
             "search",
             "skill",
+            "todo",
             "tree",
         ];
         assert_eq!(tools("explore"), readers);
