@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Delegating from a dirty working dir now says so.** A write sub-agent's
+  worktree is a fresh checkout of HEAD, so groundwork the delegating agent did
+  itself — a new module, a trait the chunks implement, a rename they extend — is
+  invisible inside it unless it was committed first. The common failure is
+  scaffolding the work, handing out the pieces, and never committing the
+  scaffold: every sub-agent then forks from a HEAD that predates it and codes
+  against a tree where the thing it was told to extend doesn't exist, so it
+  reinvents it or gives up, and its diff won't apply. `task` now checks the
+  parent tree when it spawns a worktree-isolated sub-agent and, when there is
+  uncommitted work, returns a note alongside the task id listing what's
+  uncommitted and pointing at the remedy (`task_cancel`, commit, re-delegate).
+  The task still spawns — most uncommitted work is irrelevant to the brief — and
+  the note fires once per distinct dirty state, so a fan-out of parallel tasks
+  gets one warning rather than one each, while a tree that changed since warns
+  again.
+- **The delegation prompt now leads with committing groundwork.** What was a
+  passing mention of "commit them first" is a step-by-step: inspect
+  `git status --short --untracked-files=all`, commit everything the sub-agents
+  build on (that commit _is_ the interface being delegated against), stash or
+  delete the scratch they don't need, then spawn from a clean tree. It also
+  covers mid-batch groundwork, which is invisible to tasks already running.
+
 ## [0.8.2] - 2026-07-27
 
 ### Fixed

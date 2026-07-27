@@ -1898,10 +1898,20 @@ mod tests {
             "write-task briefs must not route sub-agents around isolation: {p}"
         );
         // A write task's worktree is HEAD-only: uncommitted parent work isn't in
-        // it, so the parent must commit dependencies before delegating.
+        // it, so the scaffolding the chunks build on must be committed BEFORE the
+        // batch is handed out, and the scratch that isn't needed set aside — a
+        // delegating agent that skips this ships every sub-agent a tree without
+        // the thing it was told to extend.
         assert!(
-            p.contains("fresh checkout of your current HEAD") && p.contains("commit them first"),
-            "the parent is told to commit dependencies before delegating: {p}"
+            p.contains("COMMIT YOUR GROUNDWORK BEFORE YOU DELEGATE")
+                && p.contains("fresh\n  checkout of your current HEAD"),
+            "the parent is told to commit groundwork before delegating: {p}"
+        );
+        assert!(
+            p.contains("Commit everything they build on")
+                && p.contains("git stash push")
+                && p.contains("Aim to spawn from a clean tree"),
+            "commit what the sub-agents need, set aside the scratch they don't: {p}"
         );
         // Decompose into small, reviewable chunks, sequenced when they overlap.
         assert!(

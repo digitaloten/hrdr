@@ -30,12 +30,35 @@ Delegating with `task`:
   guards against this — a parent-checkout path prefix in a write brief is stripped
   to a project-relative path and reported back to you — but write relative paths
   from the start so the sub-agent gets exactly what you meant.
-- A write task's worktree is a fresh checkout of your current HEAD — committed
-  state only. Your uncommitted work (unstaged edits, staged-but-uncommitted
-  changes, untracked new files) is NOT copied into it, so the sub-agent can't see
-  or build on it. If the task depends on changes you have in the working dir,
-  commit them first (`git status --short` to see what's uncommitted); otherwise
-  the sub-agent works against stale code and its result won't apply cleanly.
+- COMMIT YOUR GROUNDWORK BEFORE YOU DELEGATE. A write task's worktree is a fresh
+  checkout of your current HEAD — committed state only. Your uncommitted work
+  (unstaged edits, staged-but-uncommitted changes, untracked new files) is NOT
+  copied into it, so the sub-agent cannot see or build on it. This is the single
+  most common way a delegated batch is wasted: you do the scaffolding yourself —
+  add the module, define the trait or type, rename the symbol, write the config
+  the chunks plug into — then hand out the pieces without committing it. Every
+  sub-agent forks from a HEAD that predates your scaffold, so each one codes
+  against a tree where the thing you told it to extend does not exist. It comes
+  back having reinvented your scaffold its own way, or having failed to find it
+  at all, and its diff won't apply. So before the first `task` of a batch:
+  - `git status --short --untracked-files=all` — look at what's uncommitted, and
+    decide per path whether the sub-agents need it.
+  - Commit everything they build on, in one or more real commits. That commit
+    _is_ the interface you are delegating against; it must exist in history, not
+    just on your disk.
+  - Set the rest aside so it can't confuse the picture: `git stash push` (name
+    the scratch paths) for work in progress you're keeping, or delete what was
+    genuinely throwaway. Scratch files never needed to be committed, but they
+    shouldn't be left where you're about to read `git status` again either.
+  - Then delegate. Aim to spawn from a clean tree — if `git status` is empty, the
+    worktrees are exact forks of what you just built and every brief means what
+    it says.
+
+  The same applies mid-batch: any groundwork you add while tasks are running is
+  invisible to tasks already spawned, and to any task you spawn before committing
+  it. The harness tells you when you delegate from a dirty tree, listing what's
+  uncommitted — treat that as a prompt to `task_cancel`, commit, and re-delegate
+  if the task needed any of it. Don't wait for the warning, though; check first.
 - Scope the work before you hand it off — especially mechanical work (a rote
   rename across many files, applying one known change to every call site). The
   sub-agent can't ask what you meant; it only does as well as your spec. So get

@@ -1096,6 +1096,12 @@ pub(crate) struct SubagentTool {
     /// Every sub-agent spawned here is registered so the frontend can steer it,
     /// display it, and drive further turns on it. See [`LiveSubagents`].
     live: LiveSubagents,
+    /// The parent tree's uncommitted paths as of the last time a spawn warned
+    /// about them (see the dirty-tree note in [`Self::spawn_task`]). Kept so a
+    /// fan-out of four parallel tasks doesn't repeat one warning four times,
+    /// while a *changed* working dir — the model committed some of it, or dirtied
+    /// something new — warns again.
+    dirty_tree_warned: Arc<std::sync::Mutex<Option<Vec<String>>>>,
 }
 
 impl SubagentTool {
@@ -1173,8 +1179,36 @@ impl SubagentTool {
             lsp,
             transcript_dir,
             live,
+            dirty_tree_warned: Arc::new(std::sync::Mutex::new(None)),
         }
     }
+
+    /// Whether this uncommitted-path set is worth warning about again — see
+    /// [`dirty_state_is_news`].
+    fn dirty_state_is_news(&self, dirty: &[String]) -> bool {
+        dirty_state_is_news(&self.dirty_tree_warned, dirty)
+    }
+}
+
+/// Whether `dirty` is news against the last dirty state warned about, recording
+/// it as the new baseline when it is.
+///
+/// One warning per distinct dirty state: a fan-out of four parallel tasks shares
+/// the one working dir, and four copies of the same note is noise the model
+/// learns to skim past — but a tree that *changed* (some of it committed,
+/// something new dirtied) is a fresh fact and says so. A poisoned lock warns
+/// rather than staying quiet: a repeated nudge beats a missed one.
+fn dirty_state_is_news(warned: &std::sync::Mutex<Option<Vec<String>>>, dirty: &[String]) -> bool {
+    warned
+        .lock()
+        .map(|mut seen| {
+            let news = seen.as_deref() != Some(dirty);
+            if news {
+                *seen = Some(dirty.to_vec());
+            }
+            news
+        })
+        .unwrap_or(true)
 }
 
 #[async_trait::async_trait]
@@ -1391,6 +1425,40 @@ impl hrdr_tools::Tool for SubagentTool {
             }
         }
 
+        // A worktree is a fresh checkout of HEAD, so everything uncommitted in the
+        // parent tree is invisible inside it. The failure this catches is a common
+        // and expensive one: the parent lays the groundwork itself — a new module,
+        // a trait, a renamed symbol, a scaffold every delegated chunk builds on —
+        // then delegates without committing it. The sub-agent forks from a HEAD
+        // that predates all of it, so it codes against a tree where the thing it
+        // was told to extend does not exist. It reports back confused, or
+        // reinvents the scaffold, and its diff won't apply cleanly either way.
+        //
+        // The task is spawned regardless — most dirt is genuinely irrelevant to
+        // the brief, and refusing to delegate while a CHANGELOG edit sits unstaged
+        // would be its own kind of wrong — but the note rides back with the ack so
+        // the model can still `task_cancel`, commit, and re-delegate before the
+        // sub-agent has got anywhere.
+        let mut dirty_tree_note: Option<String> = None;
+        if worktrees_available
+            && let Some(dirty) = worktree_dirty_files(&ctx.cwd).await
+            && !dirty.is_empty()
+            && self.dirty_state_is_news(&dirty)
+        {
+            dirty_tree_note = Some(format!(
+                "NOTE: your working dir has {} uncommitted change{} ({}). This sub-agent's \
+                     worktree is a fresh checkout of HEAD, so NONE of it is visible to it. If any \
+                     of that work is groundwork this task builds on — a new file, module, trait, \
+                     or rename it was told to extend — it is now working against a tree where \
+                     that doesn't exist: `task_cancel` it, commit the groundwork, and delegate \
+                     again. Before the next fan-out, get the tree clean: commit what the \
+                     sub-agents need, and stash or set aside the scratch they don't.",
+                dirty.len(),
+                if dirty.len() == 1 { "" } else { "s" },
+                short_file_list(&dirty, 8),
+            ));
+        }
+
         // Bound how many run at once. Read-only agents get the higher cap. A
         // worktree-isolated writer gets the write cap; a shared-dir writer (no git
         // repo) is limited to one at a time so concurrent writers can't collide.
@@ -1470,10 +1538,15 @@ impl hrdr_tools::Tool for SubagentTool {
             worktree,
             None,
         )?;
-        // Surface any path rewrite to the delegating model alongside the ack.
-        Ok(match path_rewrite_note {
-            Some(note) => format!("{ack}\n\n{note}"),
-            None => ack,
+        // Surface anything the spawn wants the delegating model to know — a
+        // rewritten path, an uncommitted parent tree — alongside the ack.
+        let notes: Vec<String> = [path_rewrite_note, dirty_tree_note]
+            .into_iter()
+            .flatten()
+            .collect();
+        Ok(match notes.is_empty() {
+            true => ack,
+            false => format!("{ack}\n\n{}", notes.join("\n\n")),
         })
     }
 }
@@ -4217,6 +4290,86 @@ mod revive_tests {
             tool.execute(serde_json::json!({"id": "999-nope"}), &ctx)
                 .await
                 .is_err()
+        );
+    }
+
+    /// The dirty-tree nudge fires once per distinct working-dir state, so a
+    /// parallel fan-out gets one warning rather than one per task — but a tree
+    /// that changed since (groundwork committed, something new dirtied) is news
+    /// again.
+    #[test]
+    fn the_dirty_tree_nudge_repeats_only_when_the_tree_changed() {
+        let warned = std::sync::Mutex::new(None);
+        let scaffold = vec!["src/new_module.rs".to_string(), "src/lib.rs".to_string()];
+
+        assert!(
+            dirty_state_is_news(&warned, &scaffold),
+            "the first spawn from a dirty tree must warn"
+        );
+        assert!(
+            !dirty_state_is_news(&warned, &scaffold),
+            "three more parallel spawns off the same tree must not repeat it"
+        );
+        assert!(!dirty_state_is_news(&warned, &scaffold));
+
+        // The model committed the scaffold and only scratch is left: a different
+        // state, and one worth saying out loud again.
+        let after_commit = vec!["notes.txt".to_string()];
+        assert!(dirty_state_is_news(&warned, &after_commit));
+        assert!(!dirty_state_is_news(&warned, &after_commit));
+
+        // A clean tree is never warned about at the call site, but it is still a
+        // state change — so dirtying the tree again later warns.
+        assert!(dirty_state_is_news(&warned, &[]));
+        assert!(dirty_state_is_news(&warned, &after_commit));
+    }
+
+    /// The nudge's input: uncommitted work in the parent tree is what a worktree
+    /// spawn cannot see, and it must include untracked files (a brand-new
+    /// scaffold module is untracked, and is exactly what gets forgotten).
+    #[tokio::test]
+    async fn uncommitted_groundwork_is_visible_to_the_spawn_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return; // git unavailable — skip
+        }
+        assert_eq!(
+            worktree_dirty_files(repo).await.as_deref(),
+            Some(&[][..]),
+            "a committed tree is clean, so a spawn from it says nothing"
+        );
+
+        // Groundwork a delegating agent typically leaves behind: a new untracked
+        // module, plus an edit to a tracked file that the chunks build on.
+        std::fs::write(repo.join("scaffold.rs"), "pub trait New {}").unwrap();
+        std::fs::write(repo.join("f.txt"), "changed").unwrap();
+        let dirty = worktree_dirty_files(repo).await.unwrap();
+        assert!(
+            dirty.contains(&"scaffold.rs".to_string()),
+            "an untracked scaffold must be reported: {dirty:?}"
+        );
+        assert!(
+            dirty.contains(&"f.txt".to_string()),
+            "a modified tracked file must be reported: {dirty:?}"
+        );
+        assert!(
+            dirty_state_is_news(&std::sync::Mutex::new(None), &dirty),
+            "and that state warns"
         );
     }
 
