@@ -10,12 +10,11 @@ or listed under
 [Corrections made during the merge](#corrections-made-during-the-merge). Items
 that had shipped are in [Record](#record-closed-efforts), not here.
 
-**Pruned 2026-07-27** after a fourteen-commit pass (`0fae706`..`6d9041c`) that
-cleared everything actionable without a decision from the user — see
-[Cleared in the 2026-07-27 pass](#cleared-in-the-2026-07-27-pass) for what went
-and what each fix turned out to actually be. Two decisions came _out_ of that
-work and are now waiting: **widening the metadata guard** (top of the list) and
-**profile-faithful revive** (under Tooling / agent capability).
+**Pruned 2026-07-27**: a fifteen-commit pass (`0fae706`..`36a7f2b`) cleared
+everything that was actionable without a decision, and those entries are
+**deleted, not annotated** — `git log` is the history. What the pass taught, and
+the two decisions it surfaced, are under
+[Cleared in the 2026-07-27 pass](#cleared-in-the-2026-07-27-pass).
 
 Conventions:
 
@@ -177,15 +176,6 @@ outlier is most likely to be a mistake rather than a stance.
   instead of an array"_. hrdr's tolerance is `serde(alias)` on **path fields
   only** (`read.rs`, `edit.rs`, `fileops.rs`); the payload fields that cost most
   when they fail — `old_string`/`new_string`/`content`/`pattern` — have none.
-- ~~**Don't execute tool calls from a reply that hit the output cap.**~~
-  **Shipped 2026-07-27** (`b57c0bf`). hrdr took the smaller half of pi's answer:
-  the batch still executes (strict `serde_json` means genuinely truncated args
-  fail to parse anyway), but the round's last tool result now carries a note
-  that the reply was cut off and anything intended after that point never ran,
-  so the model re-issues instead of assuming. A truncated reply with no tool
-  calls has no result to ride and ends the turn where it stands — that case
-  stays with the user-facing `Notice`, deliberately.
-
 - **Expose session/model metadata to shell commands.** Verified:
   `Shell::command` configures program + args only, nothing else. pi injects
   `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`,
@@ -198,16 +188,6 @@ outlier is most likely to be a mistake rather than a stance.
   lost, but 50 lines means a `cargo test` failure or a 60-line diff costs a
   second round trip opencode wouldn't pay. **Not measured in hrdr's traces —
   worth one experiment**, not a change.
-- ~~**Grep backend coverage is a test-harness problem.**~~ **Shipped
-  2026-07-27** (`d47d50f`). The shared matching tests now run against every
-  backend the host can execute rather than whichever `detect()` picks, skipping
-  a backend whose binary is absent. One divergence surfaced and is documented,
-  not papered over: POSIX `grep` honours neither `hidden` nor `no_ignore`
-  because it never excluded dotfiles or `.gitignore`d paths to begin with, so
-  those toggles are asserted only for the filtering backends. Regex, literal,
-  `case_insensitive`, `glob` and no-match agreed exactly across all three.
-  (Production selection is untouched; the tests reach the private field because
-  `mod tests` is a child module, the convention the file already used.)
 
 ### Permissions, isolation, and state
 
@@ -368,24 +348,12 @@ work are under [Standing constraints](#standing-constraints).
   `/dev/null` write, no `iokit-open`/`user-preference-read` — so the first real
   run should read a denial as **"profile too tight"** before "sandbox broken";
   pty and `/dev/null` writes are the likely first additions.
-- ~~**The degradation-notice cell is process-global.**~~ **Shipped 2026-07-27**
-  (`9d6f8a1`). The queue and its seen-set moved into `SandboxNotices`, owned per
-  agent as `ToolContext::sandbox_notices` and drained by that agent's own turn
-  loop; the process-global cell and its `set_/take_sandbox_notice` accessors are
-  gone. "Each notice at most once" is now per agent, so a recurrence stays
-  silent while a sibling still hears its own — both directions asserted.
-  `detect_backend` stays process-cached (caching the detection was never the
-  bug); each arm re-reads the cached reason instead of announcing it once at
-  detection time, so no agent can lose its notice to another's cache hit. The
-  `sandbox_notice_reaches_the_event_stream` flake is fixed by construction: it
-  no longer reads a shared cell, so no parallel test can steal its notice.
 
-**Where codex's sandbox has moved past hrdr's\*\***Where codex's sandbox has
-moved past hrdr's** (context for any of the above, not separate items): its
-policy is no longer "writable roots" but a precedence-ordered entry list of
-`{path, access, missing_path_behavior}` with `Read|Write|Deny`,
-most-specific-wins and **deny beats write beats read\*\*, paths as globs or
-symbolic tokens
+**Where codex's sandbox has moved past hrdr's** (context for any of the above,
+not separate items): its policy is no longer "writable roots" but a
+precedence-ordered entry list of `{path, access, missing_path_behavior}` with
+`Read|Write|Deny`, most-specific-wins and **deny beats write beats read**, paths
+as globs or symbolic tokens
 (`Root, Minimal, ProjectRoots{subpath}, Tmpdir, SlashTmp, Unknown` — `Unknown`
 retained so newer config degrades to warn-and-ignore); named permission profiles
 with `extends` inheritance versus hrdr's flat three-value `SandboxMode`; and a
@@ -405,25 +373,6 @@ network axis while disabling the FS layer.
   files and index cannot drift **structurally**; what is missing is semantic
   staleness, plus the external-drift guard and usage-tracking halves recorded
   above.
-- ~~**LSP diagnostics dedup.**~~ **Shipped 2026-07-27** (`34bfd5d`). Identity is
-  `(start line, start character, severity, message, source)` — `source` is in
-  the key on purpose, so rustc and clippy flagging the same line stay two
-  findings, and the full message is used rather than the first-line slice the
-  note prints. End-of-range is excluded: re-published overlapping sets are
-  exactly the case where the end moves while the finding does not. Dedup runs
-  before the errors-only filter and the cap, so `…and N more` counts distinct
-  diagnostics (10 unique published twice used to read "20 errors / …and 12
-  more").
-- ~~**A revived sub-agent always runs write-capable.**~~ **Shipped 2026-07-27**
-  (`e9d03d5`). `SessionState.read_only` now persists the run's scope,
-  `task_revive` rebuilds through `revive_base_config` so `Agent::new` prunes the
-  registry identically, and the slot matches what the run may do — read-only
-  runs take the read-only pool, a writer with a worktree the write cap, a writer
-  without one the cap of 1, mirroring a fresh spawn. `serde(default)` is `false`
-  (write-capable): pre-1.0 there is no migration, and that is the truth for the
-  main session and every write sub-agent, so the only cost is that a read-only
-  run snapshotted before the field existed still revives write-capable — exactly
-  as it did before.
 - **Profile-faithful revive** — the residual the above left. Only _capability_
   is persisted, not the profile: a revived run does not get its original persona
   (`agent_prompt`) or explicit `tools:` allow-list back, because neither was
@@ -501,39 +450,16 @@ verified still open.
   single-reader today.
 - **Native desktop/mobile shell** — webview over embedded `hrdr-web`.
 - **Read-only/observer auth mode.**
-- ~~**Cookie-attempt rate-limiting**~~ **Shipped 2026-07-27** (`f03e962`). The
-  `AuthMode::Users` arm no longer returns early: it yields a bool into the
-  shared `!authed` tail, so failed cookie attempts are counted like every other
-  auth failure and the early-return trap is gone rather than patched. A valid
-  cookie still short-circuits without recording.
 - **WebHost chrome posters** — verified: `WebHost`'s `CommandHost` impl
   overrides **neither** `identity_poster` nor `context_window_poster`, so an
   async `/model` switch updates chrome only via the agent's republish; and a
   failed autosave is silent (no web equivalent of the TUI's
   `record_session_save` notice).
-- ~~**WS origin check allows any localhost port**~~ **Shipped 2026-07-27**
-  (`45004b9`). `check_ws_origin` now parses both Origin and `Host` into (host,
-  port), requires host equality, and allows a loopback origin only when the
-  served port matches (scheme default 80/443 when the origin's port is
-  implicit); an undeterminable port refuses. Non-loopback names are still
-  accepted on hostname alone, which keeps the reverse-proxy case working.
-  Cross-spelling is refused — `127.0.0.1:9911` and `[::1]:9911` are distinct
-  sockets distinct processes can hold, and a browser sends both headers with the
-  same spelling for a same-origin page. Found while fixing it: the old authority
-  split took everything before the first `:`, so `http://[::1]:9911` reduced to
-  a host of `[` and the IPv6 loopback allowance had been dead code all along.
 
 ---
 
 ## Test coverage gaps
 
-- ~~**TUI history up/down fix** shipped without a regression test.~~ **Shipped
-  2026-07-27** (`6d9041c`).
-  `up_after_recalling_a_slash_command_keeps_walking_history` pins all three
-  halves: no popup over the recalled entry, a second `Up` reaches the earlier
-  entry rather than a completion selection, and typing a fresh `/` after that
-  still opens completions (so the flag clears). Verified to fail on both of the
-  first two assertions with the `suppress_completions` guard removed.
 - **Wire log on the native backends.** `error_response` and `sse` records are
   emitted by `anthropic.rs`/`codex.rs` but untested — backend selection keys on
   the host, so a mock server on `127.0.0.1` cannot reach those paths. Verified:
@@ -904,73 +830,34 @@ because a backlog that quietly fixes its own errors teaches nothing.
 
 ## Cleared in the 2026-07-27 pass
 
-Fourteen commits, `0fae706`..`6d9041c`: everything on this list that was
-actionable without a decision from the user. Five delegated agents in isolated
-worktrees, each result reviewed against the code before merge. Kept as a record
-because several of these items **described the fix wrongly**, and the correction
-is the part worth remembering.
+Fifteen commits, `0fae706`..`36a7f2b`, cleared every item that was actionable
+without a decision: the five that were top of this list, plus the LSP dedup,
+revive capability, the notice channel, both web auth holes, the grep-backend and
+guardrail-drift and TUI-history test gaps. Read `git log` for what each did —
+the entries are gone from the sections above, per this file's own convention.
 
-- **`todo` was misclassified, not the prompt miswritten** (`0a67a61`). The item
-  said to reword the two unconditional prompt lines that name
-  `grep`/`find`/`ls`/ `tree`/`read` and `todo`. The honest fix was the other
-  side: `read_only()` in this registry means _does not mutate the working tree_
-  — which is why `git`, `fetch`, `search`, `models` and `skill` all return
-  `true` — and `TodoTool` swaps a `Vec<TodoItem>` behind a mutex in the agent's
-  own context. So `false` was wrong, and the prompt defect was its symptom;
-  rewording would have left `plan`, whose entire job is planning, without a
-  planning tool. It also forced a second override: `concurrent()` defaults to
-  `read_only()`, and two `todo` calls in one batch each replace the _whole_
-  list, so mutex order would have picked the survivor — `concurrent()` is now
-  explicitly `false`.
-  `the_unconditional_prompt_names_only_tools_a_read_only_agent_has` parses the
-  backticked tool names out of `base_section()` and fails if one is not in a
-  read-only agent's set.
-- **`AGENTS.md` skips are audible** (`2bee4bf`). `AgentDocs.skipped` carries
-  `SkippedAgentDoc { path, bytes, reason }` for both caps, queued onto the
-  notice channel at construction and again after a `set_cwd`/`/clear`. The
-  header now states provenance — the files come from the project tree, may not
-  be the user's own, and cannot override the cardinal rules or the user —
-  without weakening the instruction to follow them.
-- **The loop detector had to be outcome-independent** (`19535be`). `RepeatGuard`
-  already caught repeated _failing_ calls; the gap was the call that succeeds
-  and gets nowhere. It gained a `calls` counter, nudging at 3 with the failure
-  path provably unchanged (a success now zeroes `failures` while keeping the
-  key, so the nudge is gated on the streak rather than on "this is a repeat").
-  Polling is exempt through a `Tool::repeatable()` opt-out — `watch`,
-  `task_list`, `task_output` — chosen over a name list in the turn loop, which
-  goes stale. `task_list` takes no arguments at all, so every poll is
-  byte-identical and the exemption is structural, not a nicety. **The item's
-  prescription was wrong:** it said inject a `Notice`, but `AgentEvent::Notice`
-  is user-facing and never reaches the model.
-- **Truncated replies now reach the model** (`b57c0bf`), the WS loopback origin
-  is port-pinned (`45004b9`), failed cookie attempts are counted (`f03e962`),
-  LSP diagnostics are deduped before the filter and cap (`34bfd5d`), every grep
-  backend runs in tests (`d47d50f`), guardrail↔prompt drift has a test
-  (`37edba4`), the sandbox notice queue is per agent (`9d6f8a1`), revive
-  restores the run's capability and takes the matching slot (`e9d03d5`), and the
-  TUI history regression has a test (`6d9041c`). Each is described where it used
-  to live.
-- **`.git` is protected inside writable roots** (`358a256`, narrowed by
-  `0598439`). The guard refuses a model-supplied write whose canonical path
-  contains `.git` anywhere — a root-relative test would let the four
-  deliberately writable roots inside the parent `.git` launder writes straight
-  back in. The seam needed no trusted-caller flag: `resolve_write`/`check_write`
-  callers are only the model-facing file tools, while every `task_*` worktree
-  add, commit, cherry-pick and `git apply` goes through `Command`/`std::fs`, so
-  hrdr's plumbing was never on the guarded path. One existing assertion flipped
-  honestly: `<common>/objects/aa/bb` is still a writable _root_ (the OS layer
-  needs it) and is now refused to the file tools. `shell` is not covered and
-  cannot be — `git commit` legitimately writes `.git/index` — which the doc
-  comment says outright.
-- **Also:** issue #13 closed as shipped, and the CHANGELOG entry for
-  model-invocable skills backfilled (`0fae706`).
+What survives is the part that would otherwise be relearned:
 
-Not attempted, on purpose: anything needing a policy call (the three items at
-the top), anything explicitly wanting evidence first (truncation caps, injection
-scanning), and the big structural ones (shell parsing, per-model data, deferred
-tool loading, one permission evaluator, session search, prompt introspection).
-
----
+- **`AgentEvent::Notice` never reaches the model.** The `doom_loop` entry
+  prescribed injecting one; it would have fixed nothing. The channel that
+  reaches the model is a note appended to the round's last tool result — the
+  shape the round-budget warning, the repeat nudge and the truncation warning
+  all now share.
+- **`read_only()` means "does not mutate the working tree", not "touches no
+  state".** `todo` was classified as mutating and pruned from read-only agents
+  while the prompt told every agent to plan with it. Anything holding state only
+  in the agent's own `ToolContext` belongs in the read-only set — and if its
+  calls are order-sensitive, it opts out of `concurrent()` separately, which
+  defaults to `read_only()`.
+- **An item's proposed fix is a hypothesis.** Three of these described their own
+  fix wrongly (the two above, plus `git -C /elsewhere log`, which was already
+  refused). Verify the claim before implementing the remedy.
+- **A guard's blast radius is the thing to check first.** The metadata guard
+  initially covered `.hrdr`/`.claude`/`.opencode` too, which would have refused
+  every write a sub-agent makes in `<repo>/.hrdr/worktrees/wt-N` had the check
+  been whole-path rather than root-relative, and did block "add a project skill"
+  even when it was correct. Narrowed to `.git`; the rest is a decision at the
+  top of this file.
 
 ## Record: closed efforts
 
