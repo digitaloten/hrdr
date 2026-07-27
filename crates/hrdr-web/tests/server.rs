@@ -269,6 +269,41 @@ async fn ws_origin_foreign_is_rejected() {
     drop(server);
 }
 
+/// The origin the real UI sends — its own `location.host` — is accepted, while
+/// the same loopback host on another port (another local app's page) is 403.
+#[tokio::test]
+async fn ws_origin_loopback_must_match_the_served_port() {
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (server, _session, token) = start_test_server_with_token().await;
+
+    let ws_url = format!("ws://{}/ws?token={token}", server.addr);
+    let with_origin = |origin: String| {
+        let mut request = ws_url.clone().into_client_request().expect("build request");
+        request
+            .headers_mut()
+            .insert("origin", origin.parse().unwrap());
+        request
+    };
+
+    let (_ws, resp) = connect_async(with_origin(format!("http://{}", server.addr)))
+        .await
+        .expect("same-origin upgrade should succeed");
+    assert_eq!(resp.status(), 101);
+
+    let other_port = format!("http://127.0.0.1:{}", server.addr.port().wrapping_add(1));
+    match connect_async(with_origin(other_port)).await {
+        Ok((_ws, resp)) => panic!("ws upgrade should fail, got status {}", resp.status()),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status(), 403, "another local port should be forbidden");
+        }
+        Err(e) => panic!("unexpected ws error: {e}"),
+    }
+
+    drop(server);
+}
+
 /// A `Resume` is answered on the requesting socket only: the replay (or the
 /// fallback snapshot) must never reach the other connected clients through the
 /// shared broadcast.

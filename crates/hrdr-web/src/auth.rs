@@ -162,37 +162,93 @@ pub fn extract_client_ip(peer: IpAddr, headers: &HeaderMap) -> IpAddr {
 
 // ── WS Origin check (CSRF hardening) ───────────────────────────────────────
 
-/// Reject if an Origin header is present and its host is neither the request
-/// Host nor localhost.
+/// Reject if an Origin header is present and does not name this server.
+///
+/// A non-loopback origin is accepted on hostname alone — a reverse proxy
+/// forwards its own `Host` and need not preserve the public port. A loopback
+/// origin is accepted only on the *exact* authority the request was addressed
+/// to, port included: every process on the machine answers to `localhost`, so
+/// without the port a page served by any other local app (a dev server on
+/// :3000, a random local tool) would pass this check and ride the victim's
+/// session cookie.
 pub fn check_ws_origin(origin: Option<&str>, host: Option<&str>) -> Result<(), StatusCode> {
     let Some(origin) = origin else {
         return Ok(());
     };
-    let Some(origin_host) = extract_host_from_url(origin) else {
+    let Some((origin_host, origin_port)) = parse_origin(origin) else {
         return Err(StatusCode::FORBIDDEN);
     };
-    if origin_host == "localhost" || origin_host == "127.0.0.1" || origin_host == "[::1]" {
+    // No Host header, no served port and no served hostname: nothing here can
+    // show the origin is us. Refuse rather than assume.
+    let Some((host_name, host_port)) = host.and_then(split_authority) else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    if host_name != origin_host {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !is_loopback_name(&origin_host) {
         return Ok(());
     }
-    if let Some(host) = host
-        && host.split(':').next().unwrap_or(host) == origin_host
-    {
-        return Ok(());
+    // Loopback: the port is the only thing that distinguishes hrdr from a
+    // hostile neighbour, and an absent one cannot be inferred from the headers
+    // (the scheme of the *request* is not in evidence here), so refuse.
+    match host_port {
+        Some(port) if port == origin_port => Ok(()),
+        _ => Err(StatusCode::FORBIDDEN),
     }
-    Err(StatusCode::FORBIDDEN)
 }
 
-fn extract_host_from_url(url: &str) -> Option<String> {
-    let without_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    without_scheme
-        .split('/')
-        .next()?
-        .split(':')
-        .next()
-        .map(|s| s.to_string())
+/// Split an Origin serialization into its lowercased host and effective port,
+/// defaulting the port from the scheme. Anything that is not `http(s)://` —
+/// including the opaque `null` origin — is rejected: no scheme means no default
+/// port to compare against.
+fn parse_origin(origin: &str) -> Option<(String, u16)> {
+    let (scheme, authority) = origin.split_once("://")?;
+    let default_port = if scheme.eq_ignore_ascii_case("http") {
+        80
+    } else if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        return None;
+    };
+    let (host, port) = split_authority(authority)?;
+    Some((host, port.unwrap_or(default_port)))
+}
+
+/// Split `host[:port]` into a lowercased host (IPv6 literals keep their
+/// brackets) and its port, `None` when none was spelled out. An unparsable port
+/// yields `None` for the whole authority so callers refuse.
+fn split_authority(authority: &str) -> Option<(String, Option<u16>)> {
+    let authority = authority.split('/').next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    // An IPv6 literal's own colons are inside the brackets, so the port can
+    // only be split off after the closing one.
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (inner, after) = rest.split_once(']')?;
+        let host = format!("[{}]", inner.to_ascii_lowercase());
+        let port = match after {
+            "" => None,
+            p => Some(p.strip_prefix(':')?.parse().ok()?),
+        };
+        return Some((host, port));
+    }
+    match authority.rsplit_once(':') {
+        Some((h, p)) => Some((h.to_ascii_lowercase(), Some(p.parse().ok()?))),
+        None => Some((authority.to_ascii_lowercase(), None)),
+    }
+}
+
+fn is_loopback_name(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 // ── utilities ──────────────────────────────────────────────────────────────
@@ -354,16 +410,72 @@ mod tests {
     }
 
     #[test]
-    fn ws_origin_allows_localhost() {
-        assert!(check_ws_origin(Some("http://127.0.0.1:9911"), None).is_ok());
-        assert!(check_ws_origin(Some("http://localhost:8080"), None).is_ok());
-    }
-
-    #[test]
     fn ws_origin_allows_matching_host() {
         assert!(
             check_ws_origin(Some("https://myapp.local:9911"), Some("myapp.local:9911")).is_ok()
         );
+    }
+
+    /// A proxied deployment: the proxy terminates :443 and forwards a `Host`
+    /// without the public port. Non-loopback names are not port-checked.
+    #[test]
+    fn ws_origin_allows_matching_host_without_port() {
+        assert!(check_ws_origin(Some("https://myapp.local"), Some("myapp.local")).is_ok());
+    }
+
+    #[test]
+    fn ws_origin_allows_loopback_on_the_served_port() {
+        assert!(check_ws_origin(Some("http://localhost:9911"), Some("localhost:9911")).is_ok());
+        assert!(check_ws_origin(Some("http://127.0.0.1:9911"), Some("127.0.0.1:9911")).is_ok());
+        assert!(check_ws_origin(Some("http://[::1]:9911"), Some("[::1]:9911")).is_ok());
+    }
+
+    /// The hole: another local app's page must not pass just for being loopback.
+    #[test]
+    fn ws_origin_rejects_other_local_port() {
+        assert!(check_ws_origin(Some("http://localhost:3000"), Some("127.0.0.1:9911")).is_err());
+        assert!(check_ws_origin(Some("http://localhost:3000"), Some("localhost:9911")).is_err());
+        assert!(check_ws_origin(Some("http://[::1]:3000"), Some("[::1]:9911")).is_err());
+    }
+
+    /// Loopback spellings are not interchangeable: `127.0.0.1:9911` and
+    /// `[::1]:9911` are distinct sockets that distinct processes can hold, so a
+    /// matching port alone does not prove the origin is this server.
+    #[test]
+    fn ws_origin_rejects_cross_loopback_spelling() {
+        assert!(check_ws_origin(Some("http://127.0.0.1:9911"), Some("localhost:9911")).is_err());
+        assert!(check_ws_origin(Some("http://localhost:9911"), Some("127.0.0.1:9911")).is_err());
+        assert!(check_ws_origin(Some("http://[::1]:9911"), Some("127.0.0.1:9911")).is_err());
+    }
+
+    /// An origin with no port is :80/:443, not "whatever hrdr is serving".
+    #[test]
+    fn ws_origin_rejects_loopback_implicit_default_port() {
+        assert!(check_ws_origin(Some("http://localhost"), Some("localhost:9911")).is_err());
+        assert!(check_ws_origin(Some("https://localhost"), Some("localhost:9911")).is_err());
+        assert!(check_ws_origin(Some("http://localhost:80"), Some("localhost")).is_err());
+    }
+
+    /// No Host header (or an unparsable one): the served port is undeterminable,
+    /// so refuse.
+    #[test]
+    fn ws_origin_rejects_when_served_port_unknown() {
+        assert!(check_ws_origin(Some("http://127.0.0.1:9911"), None).is_err());
+        assert!(check_ws_origin(Some("http://localhost:9911"), Some("localhost")).is_err());
+        assert!(check_ws_origin(Some("http://localhost:9911"), Some("localhost:bogus")).is_err());
+    }
+
+    /// A non-browser client sends no Origin at all — still allowed.
+    #[test]
+    fn ws_origin_absent_is_allowed() {
+        assert!(check_ws_origin(None, Some("localhost:9911")).is_ok());
+    }
+
+    /// The opaque origin a sandboxed iframe sends has no scheme to default a
+    /// port from.
+    #[test]
+    fn ws_origin_rejects_null_origin() {
+        assert!(check_ws_origin(Some("null"), Some("localhost:9911")).is_err());
     }
 
     fn xff(value: &str) -> HeaderMap {
