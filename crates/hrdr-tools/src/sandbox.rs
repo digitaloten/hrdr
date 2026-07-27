@@ -1728,6 +1728,7 @@ mod tests {
             &format!("echo x > {}", target.display()),
             &policy,
             dir.path(),
+            &notices(),
         );
         cmd.current_dir(dir.path());
         let out = cmd.output().await.unwrap();
@@ -1743,6 +1744,7 @@ mod tests {
             &format!("echo x > {}", inside.display()),
             &policy,
             dir.path(),
+            &notices(),
         );
         cmd.current_dir(dir.path());
         let out = cmd.output().await.unwrap();
@@ -1979,6 +1981,11 @@ mod tests {
     }
 
     /// Everything queued, in order, for the assertions that want the whole set.
+    ///
+    /// Only the Landlock degradation test queues more than one notice, and that
+    /// test is Linux-only — so off Linux this is dead code, and `-D warnings`
+    /// says so (it reached a tag that way once already).
+    #[cfg(target_os = "linux")]
     fn drain(notices: &SandboxNotices) -> Vec<String> {
         std::iter::from_fn(|| notices.take()).collect()
     }
