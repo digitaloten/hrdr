@@ -169,11 +169,11 @@ impl SandboxPolicy {
         if let Some(dir) = protected_metadata_dir(canon, &self.writable_roots) {
             anyhow::bail!(
                 "sandbox: refusing to write {} — it lands inside `{dir}`, and your file tools \
-                 never write repository or agent metadata: a hook, config or skill placed there \
-                 is read back later and runs with the user's full authority, outside this agent's \
-                 boundary. If the change is really wanted, ask the user to make it. To record \
-                 work, commit it — the `git` tool or `shell` reach git through git itself, which \
-                 writes its own metadata; you do not.",
+                 never write repository or agent metadata: a hook placed there runs with the \
+                 user's full authority the next time they commit, outside this agent's boundary. \
+                 If the change is really wanted, ask the user to make it. To record work, commit \
+                 it — the `git` tool or `shell` reach git through git itself, which writes its own \
+                 metadata; you do not.",
                 shown.display(),
             )
         }
@@ -230,19 +230,29 @@ fn is_under_any(canon: &Path, roots: &[PathBuf]) -> bool {
 ///   one extra step, and it is reachable from inside the boundary because a
 ///   write sub-agent's cwd **is** its worktree, so the worktree's `.git` is
 ///   under a writable root.
-/// - `.hrdr`, `.claude`, `.opencode` — the skill and agent-profile trees hrdr's
-///   own loaders discover (`.hrdr/skills`, `.claude/commands`,
-///   `.opencode/command`; `.hrdr/agents`, `.claude/agents`, `.opencode/agent`).
-///   A skill body is instruction, and an agent profile carries a `tools:`
-///   allow-list and a model — so authoring one is the model writing its own, or
-///   a sibling's, next system prompt. The same escalation with a slower fuse,
-///   which is why the harness-agnostic pair is here and not just hrdr's own.
 ///
-/// Deliberately **not** `.agents/`: hrdr reads no such directory (its global
-/// `AGENTS.md` lookup is an XDG config dir, not a repo folder), and a name the
-/// harness never loads as instruction is a refusal that protects nothing and
-/// surprises somebody.
-const PROTECTED_METADATA_DIRS: [&str; 4] = [".git", ".hrdr", ".claude", ".opencode"];
+/// Deliberately **only** `.git`, though the harness-config trees (`.hrdr`,
+/// `.claude`, `.opencode`) are the same shape of hazard on paper — hrdr's own
+/// loaders read `.hrdr/skills` and `.hrdr/agents` back as instruction, so
+/// authoring one is the model writing its own next system prompt. Two reasons
+/// they are not here:
+///
+/// - The cost is certain and the gain is not. "Add a project skill for this
+///   repo" is an ordinary request, and refusing it buys little: `shell` reaches
+///   those paths anyway (the same hole this doc admits for `.git`), so against a
+///   model already following hostile instructions the refusal is a speed bump,
+///   while against an honest one it is a wall.
+/// - `.git` does not have that symmetry. Nothing legitimate makes a model's file
+///   tools write git metadata — git writes its own, through git — and
+///   `hooks/pre-commit` executes with the user's full authority the next time
+///   *they* commit, which no other name on the list can claim.
+///
+/// Widening this to the config trees is a policy call about what a model may
+/// author, recorded in `docs/backlog.md`; it is not this guard's decision to
+/// make quietly. Also deliberately not `.agents/`: hrdr reads no such repo
+/// directory at all (its global `AGENTS.md` lookup is an XDG config dir), so
+/// refusing it would protect nothing and surprise somebody.
+const PROTECTED_METADATA_DIRS: [&str; 1] = [".git"];
 
 /// The protected directory a write to `canon` would land inside, if any.
 ///
@@ -253,11 +263,13 @@ const PROTECTED_METADATA_DIRS: [&str; 4] = [".git", ".hrdr", ".claude", ".openco
 /// `objects/…`, or `worktrees/<wt>/hooks/…`, straight back in. The file tools
 /// need none of it: git writes its own metadata, through git.
 ///
-/// The three agent-config names are refused only *below* a containing root,
-/// never in the root's own path: a write sub-agent's cwd is
-/// `<repo>/.hrdr/worktrees/wt-N`, and a checkout living under `~/.claude/…` is
-/// somebody's real layout — testing the whole path would refuse every write
-/// those agents make.
+/// Any other protected name would be refused only *below* a containing root,
+/// never in the root's own path — a write sub-agent's cwd is
+/// `<repo>/.hrdr/worktrees/wt-N` and a checkout living under `~/.claude/…` is
+/// somebody's real layout, so testing the whole path for those names would refuse
+/// every write those agents make. The root-relative arm is kept for that reason:
+/// the list is one name today, and the next one added must not silently become
+/// whole-path.
 ///
 /// Any containing root refusing is enough (deny beats allow), though
 /// [`canonical_roots`] leaves roots mutually non-nested, so in a policy it built
@@ -273,7 +285,7 @@ fn protected_metadata_dir(canon: &Path, roots: &[PathBuf]) -> Option<&'static st
         .find_map(|component| {
             PROTECTED_METADATA_DIRS
                 .into_iter()
-                .find(|name| component.as_os_str() == *name)
+                .find(|name| *name != ".git" && component.as_os_str() == *name)
         })
 }
 
@@ -1325,9 +1337,6 @@ mod tests {
             ".git/hooks/pre-commit",
             ".git/config",
             ".git/objects/ab/cdef",
-            ".hrdr/skills/helpful.md",
-            ".claude/agents/reviewer.md",
-            ".opencode/command/ship.md",
             // Not just the leading component: a `.git` several levels down is
             // some other repo's hooks, which is the same escalation.
             "vendor/dep/.git/hooks/post-checkout",
@@ -1340,6 +1349,23 @@ mod tests {
                 "{refused}: {err}"
             );
             assert!(err.contains("ask the user"), "{refused}: {err}");
+        }
+
+        // The harness-config trees are the same hazard on paper and are
+        // deliberately NOT refused — see `PROTECTED_METADATA_DIRS`. Authoring a
+        // project skill is an ordinary request, `shell` reaches these paths
+        // regardless, and widening the list is a policy call recorded in the
+        // backlog rather than one this guard makes quietly. Asserted so the
+        // decision is visible the next time somebody reads the list and assumes
+        // an omission.
+        for allowed in [
+            ".hrdr/skills/helpful.md",
+            ".claude/agents/reviewer.md",
+            ".opencode/command/ship.md",
+        ] {
+            check_write(&policy, &dir.path().join(allowed)).unwrap_or_else(|e| {
+                panic!("{allowed} is deliberately writable, see PROTECTED_METADATA_DIRS: {e}")
+            });
         }
 
         // A neighbour of `.git` is ordinary work, and the test is on whole
