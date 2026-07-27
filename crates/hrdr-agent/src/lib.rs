@@ -950,6 +950,11 @@ pub struct Agent {
     /// This is a delegated sub-agent, not the session's agent. Gates every
     /// session-scoped feature — see [`AgentConfig::is_subagent`].
     is_subagent: bool,
+    /// This agent's tool set was pruned to the read-only one
+    /// ([`AgentConfig::read_only`]). Kept so whoever persists or rebuilds this
+    /// agent — `task_revive`, through the sub-agent snapshot — can restore the
+    /// same scope instead of assuming write capability.
+    read_only: bool,
     /// Prompt tokens the last model call actually used — the agent's own view of
     /// how full its context is, so it can compact before the next request rather
     /// than after one has already failed. See [`Agent::maybe_self_compact`].
@@ -1670,6 +1675,7 @@ impl Agent {
             live_subagents,
             live_home: None,
             is_subagent: config.is_subagent,
+            read_only: config.read_only,
             last_prompt_tokens: None,
             prompt_cache: config.prompt_cache,
             tools,
@@ -2240,6 +2246,12 @@ impl Agent {
     /// Working directory the tools operate in.
     pub fn cwd(&self) -> std::path::PathBuf {
         self.ctx.cwd.clone()
+    }
+
+    /// Whether this agent is read-only scoped — its registry was pruned to the
+    /// read-only tool set, so it holds no writers.
+    pub fn read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Change the tools' working directory. Reloads `AGENTS.md` for the new

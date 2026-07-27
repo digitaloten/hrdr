@@ -172,6 +172,9 @@ fn spawn_background(
     let sub_model = cfg.model.clone();
     let sub_cwd = cfg.cwd.display().to_string();
     let sub_base_url = cfg.base_url.clone();
+    // Its capability belongs in that snapshot too: without it a `task_revive` of a
+    // read-only run cannot tell one from a writer, and rebuilds it write-capable.
+    let sub_read_only = cfg.read_only;
     // Build and register synchronously so `task_steer` can address the id as soon as
     // `task` returns; registration inside the spawned future races the caller.
     let mut sub = Agent::new(cfg)?;
@@ -364,6 +367,7 @@ fn spawn_background(
                             let state = crate::SessionState {
                                 name: label_for_state.clone(),
                                 named_by_user: false,
+                                read_only: sub_read_only,
                                 model: sub_model.clone(),
                                 base_url: sub_base_url.clone(),
                                 cwd: sub_cwd.clone(),
@@ -420,6 +424,7 @@ fn spawn_background(
                 let state = crate::SessionState {
                     name: label_for_state.clone(),
                     named_by_user: false,
+                    read_only: sub_read_only,
                     model: sub_model.clone(),
                     base_url: sub_base_url.clone(),
                     cwd: sub_cwd.clone(),
@@ -1739,11 +1744,28 @@ struct RevivedState {
     reference: ModelRef,
     /// The recorded working dir — the run's isolated worktree, or the main dir.
     cwd: PathBuf,
+    /// The run's own tool scope: `true` for a read-only sub-agent, whose revived
+    /// registry must be pruned the same way its original one was.
+    read_only: bool,
     usage: AgentUsage,
     session_cost: f64,
     /// `(worktree, branch)` when the run had an isolated worktree still on disk.
     worktree: Option<(PathBuf, String)>,
     label: String,
+}
+
+/// The config a revived run is rebuilt on: the base a `task` spawn uses (always
+/// write-capable — see [`subagent_base_config`]), narrowed back to the scope the
+/// run actually had.
+///
+/// `read_only` is the same field [`config_for_agent_profile`] sets from a profile
+/// and `Agent::new` resolves into a pruned registry, so a revived `explore` comes
+/// back with the reader set it was spawned with rather than the writers its
+/// profile deliberately withheld.
+fn revive_base_config(base: &AgentConfig, read_only: bool) -> AgentConfig {
+    let mut cfg = base.clone();
+    cfg.read_only = read_only;
+    cfg
 }
 
 /// Resolve a `task_revive` id to its persisted state, hydrating from the
@@ -1784,6 +1806,7 @@ async fn revive_target_from_disk(dir: &std::path::Path, stem: &str) -> Result<Re
         messages: state.messages,
         reference: state.model,
         label: state.name,
+        read_only: state.read_only,
         cwd,
         worktree,
     })
@@ -2063,8 +2086,11 @@ pub(crate) struct TaskReviveTool {
     runtime: SharedDelegationRuntime,
     pub(crate) bg_handles: BgHandles,
     /// The SAME concurrency slots `task` uses, so a revive counts against the
-    /// write cap rather than opening an uncounted extra sub-agent.
+    /// caps rather than opening an uncounted extra sub-agent.
     pub(crate) slots: Arc<SubagentSlots>,
+    /// Both caps, `(read-only, write-capable)` — a revived read-only run belongs
+    /// on the read-only pool, exactly as a fresh one does.
+    max_readonly: usize,
     max_write: usize,
     cost_total: Arc<std::sync::Mutex<f64>>,
     cost_partial: Arc<std::sync::atomic::AtomicBool>,
@@ -2086,12 +2112,14 @@ impl TaskReviveTool {
         transcript_dir: SubagentDirCell,
         live: LiveSubagents,
     ) -> Self {
+        let max_readonly = base.max_readonly_subagents;
         let max_write = base.max_write_subagents;
         Self {
             base,
             runtime,
             bg_handles,
             slots,
+            max_readonly,
             max_write,
             cost_total,
             cost_partial,
@@ -2125,9 +2153,14 @@ impl TaskReviveTool {
         }
         // Its freshest conversation + identity + cwd come from the retained agent;
         // its worktree/branch from the registry entry that recorded them.
-        let (messages, reference, cwd) = {
+        let (messages, reference, cwd, read_only) = {
             let a = agent.lock().await;
-            (a.messages_owned(), a.model_ref().clone(), a.cwd())
+            (
+                a.messages_owned(),
+                a.model_ref().clone(),
+                a.cwd(),
+                a.read_only(),
+            )
         };
         let usage = self.live.usage(key).unwrap_or_default();
         let worktree = {
@@ -2145,6 +2178,7 @@ impl TaskReviveTool {
             messages,
             reference,
             cwd,
+            read_only,
             worktree,
             label,
         }))
@@ -2159,7 +2193,7 @@ impl TaskReviveTool {
         prompt: String,
         st: RevivedState,
     ) -> Result<String> {
-        let mut cfg = self.base.clone();
+        let mut cfg = revive_base_config(&self.base, st.read_only);
         // The parent's LIVE resolved endpoint (identity + key), whole — exactly as
         // `SubagentTool::execute` overlays it, so the revived run inherits an
         // endpoint that agrees with itself.
@@ -2197,13 +2231,21 @@ impl TaskReviveTool {
             &cfg.base_url,
             cfg.model.model(),
         );
-        // A revived run stacks commits on its branch, so it takes a WRITE slot,
-        // counted against the same cap `task`'s writers use.
-        let Some(slot) = self.slots.acquire(true, self.max_write) else {
+        // Slot on the pool that matches what the revived run may DO, with the same
+        // caps a fresh `task` uses: a read-only follow-up needs none of the write
+        // concurrency (it changes nothing and shares the dir), a writer continuing
+        // in its worktree takes the write cap, and a writer with no worktree shares
+        // the main dir — so, like a fresh one, only ever one at a time.
+        let write_capable = !cfg.read_only;
+        let (cap, kind) = match (write_capable, st.worktree.is_some()) {
+            (false, _) => (self.max_readonly, "read-only"),
+            (true, true) => (self.max_write, "write"),
+            (true, false) => (1, "write"),
+        };
+        let Some(slot) = self.slots.acquire(write_capable, cap) else {
             bail!(
-                "too many write sub-agents already running (limit {}). Wait for one to finish — \
-                 you are notified automatically — then revive.",
-                self.max_write
+                "too many {kind} sub-agents already running (limit {cap}). Wait for one to \
+                 finish — you are notified automatically — then revive."
             );
         };
         let label = if st.label.trim().is_empty() {
@@ -4072,11 +4114,13 @@ mod revive_tests {
         name: &str,
         cwd: &str,
         messages: Vec<ChatMessage>,
+        read_only: bool,
     ) {
         let state = crate::SessionState {
             name: name.to_string(),
             cwd: cwd.to_string(),
             messages,
+            read_only,
             ..Default::default()
         };
         crate::Session::new(state.persisted())
@@ -4224,6 +4268,7 @@ mod revive_tests {
                 ChatMessage::user("the original brief"),
                 ChatMessage::assistant("done"),
             ],
+            false,
         );
 
         let st = revive_target_from_disk(subdir.path(), "002-coder")
@@ -4251,5 +4296,84 @@ mod revive_tests {
             "a removed worktree is refused: {:?}",
             gone.err()
         );
+    }
+
+    /// A revived sub-agent comes back with the capability it RAN with: the
+    /// snapshot records `read_only`, and the config the revive rebuilds it on
+    /// prunes the registry the same way its profile did.
+    ///
+    /// Pins the regression where capability was not persisted at all, so a
+    /// revived `explore`/`review`/`plan` silently gained the writers and the shell
+    /// its profile withheld — in the recorded (shared) working dir.
+    #[tokio::test]
+    async fn a_revived_read_only_run_gets_no_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        // A read-only run's cwd is the shared dir, never a worktree — it has none.
+        let cwd = dir.path().display().to_string();
+        write_run(
+            dir.path(),
+            "004-explore",
+            "explore auth",
+            Some("looked"),
+            true,
+        );
+        write_snapshot(
+            dir.path(),
+            "004-explore",
+            "explore auth",
+            &cwd,
+            vec![ChatMessage::user("look around")],
+            true,
+        );
+        write_run(dir.path(), "005-coder", "add feature", Some("did it"), true);
+        write_snapshot(
+            dir.path(),
+            "005-coder",
+            "add feature",
+            &cwd,
+            vec![ChatMessage::user("build it")],
+            false,
+        );
+
+        let base = subagent_base_config(&AgentConfig {
+            model: "local://m".parse().unwrap(),
+            ..Default::default()
+        });
+        // The tool set the revive path actually builds — asserted on the names, the
+        // registry being pruned before the sub-agent runs.
+        let tools = |st: &RevivedState| -> Vec<String> {
+            let agent = Agent::new(revive_base_config(&base, st.read_only)).unwrap();
+            let mut names: Vec<String> = agent.tools().into_iter().map(|(n, _)| n).collect();
+            names.sort();
+            names
+        };
+
+        let ro = revive_target_from_disk(dir.path(), "004-explore")
+            .await
+            .unwrap();
+        assert!(ro.read_only, "the snapshot records the read-only scope");
+        let ro_tools = tools(&ro);
+        assert!(
+            ro_tools.contains(&"read".to_string()) && ro_tools.contains(&"grep".to_string()),
+            "it is still an agent — the readers stay: {ro_tools:?}"
+        );
+        for w in ["write", "edit", "shell", "move", "delete", "copy"] {
+            assert!(
+                !ro_tools.contains(&w.to_string()),
+                "a revived read-only run must not get `{w}`: {ro_tools:?}"
+            );
+        }
+
+        let rw = revive_target_from_disk(dir.path(), "005-coder")
+            .await
+            .unwrap();
+        assert!(!rw.read_only, "a write run is recorded as write-capable");
+        let rw_tools = tools(&rw);
+        for w in ["write", "edit", "shell"] {
+            assert!(
+                rw_tools.contains(&w.to_string()),
+                "a revived write run keeps `{w}`: {rw_tools:?}"
+            );
+        }
     }
 }

@@ -70,6 +70,18 @@ pub struct SessionState {
     /// ones. A pre-feature file has no key → `false` → treated as auto-named.
     #[serde(default)]
     pub named_by_user: bool,
+    /// The run this state records was scoped to the read-only tool set
+    /// ([`AgentConfig::read_only`](crate::AgentConfig::read_only)) — an
+    /// `explore`/`review`/`plan`-style sub-agent. Persisted because capability is
+    /// part of *what this run was*: `task_revive` restores it so a revived run is
+    /// pruned to the same tool set instead of coming back write-capable.
+    ///
+    /// A snapshot written before the field existed has no key → `false` →
+    /// write-capable. That is the truth for the main session and for every write
+    /// sub-agent (the runs revive exists for); the price is that a read-only run
+    /// persisted earlier still revives write-capable, exactly as it did before.
+    #[serde(default)]
+    pub read_only: bool,
     /// The session's file id (stem). Derived from the filename, not stored in it.
     #[serde(skip)]
     pub id: Option<String>,
@@ -120,6 +132,7 @@ impl Default for SessionState {
         Self {
             name: String::new(),
             named_by_user: false,
+            read_only: false,
             id: None,
             model: DEFAULT_MODEL_REF.parse().expect("a valid default identity"),
             provider_unset: false,
@@ -156,6 +169,8 @@ impl<'de> Deserialize<'de> for SessionState {
             name: String,
             #[serde(default)]
             named_by_user: bool,
+            #[serde(default)]
+            read_only: bool,
             /// v2: `provider://model`. v1: a bare model id.
             #[serde(default)]
             model: Option<String>,
@@ -219,6 +234,7 @@ impl<'de> Deserialize<'de> for SessionState {
         Ok(SessionState {
             name: raw.name,
             named_by_user: raw.named_by_user,
+            read_only: raw.read_only,
             id: None,
             model,
             provider_unset,
@@ -2451,6 +2467,7 @@ mod roundtrip_audit {
         let state = SessionState {
             name: "Chat".into(),
             named_by_user: true, // round-trips through the file like any other field
+            read_only: true,     // ditto — a revive reads the run's scope back off it
             id: Some("chat".into()), // NOT persisted: it is the file name
             model: "go://m".parse().unwrap(),
             provider_unset: false,
