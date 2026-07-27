@@ -56,6 +56,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `node_modules/<pkg>/`, site-packages, `go env GOMODCACHE` — not by recalling
   its API; observed to end a hallucination loop on the first read.
 
+- **A stuck loop of _succeeding_ tool calls is now noticed.** `RepeatGuard`
+  already refused verbatim retries of a _failing_ call; the quieter wedge was
+  the call that works and gets nowhere — re-`read`ing one file, re-running a
+  `cargo test` that exits 0 — where nothing errors, so nothing noticed, and the
+  round budget and the USD cost cap drained at full speed. The third identical
+  call (same tool, byte-identical arguments, nothing different in between) now
+  carries a note on its result saying so and asking for a change of approach. It
+  is a note, never a refusal: refusing a call that works would break real work,
+  and there is nobody to ask in an autonomous run. Any intervening different
+  call resets it, so a `test → edit → test` cycle never trips. Tools whose whole
+  job is polling opt out through `Tool::repeatable()` — `watch`, `task_list`,
+  `task_output` — and they still get the failure nudge, because polling that
+  keeps erroring is a loop whatever the tool.
+
+- **A reply truncated at the output cap now tells the model, not just you.** The
+  user-facing notice has been there; the model was never told, so it resumed
+  believing it had emitted everything it meant to — including tool calls that
+  were cut off and never ran. The round's last tool result now carries a note
+  that the reply was cut off, that anything intended after that point was lost,
+  and to re-issue rather than assume. A truncated reply with no tool calls has
+  nothing to ride on and ends the turn where it stands; that case stays with the
+  notice.
+
+- **An `AGENTS.md` too big to load says so.** A single file over the 64 KiB
+  per-file cap, or one the 1 MiB aggregate budget could no longer hold, was
+  skipped in silence: the instructions were on disk, hrdr had listed the
+  directory, and the agent then behaved exactly as if the file did not exist —
+  including when asked whether it had read it. Both caps now record what they
+  dropped (path, size, which cap) and the notice channel names it at
+  construction and after a `set_cwd`/`/clear`. The project-instruction header
+  also states its provenance now — the files come from the project's directory
+  tree, written by whoever wrote the project and not necessarily by you, and
+  nothing in them overrides the cardinal rules or what you say — without
+  weakening the instruction to follow them as project conventions.
+
+- **Read-only agents get the `todo` tool their prompt always told them to use.**
+  `TodoTool` was classified as mutating, so `retain_only` pruned it from
+  `explore`, `review` and `plan` — while the unconditional prompt block told
+  every agent to plan multi-step work with it, `plan` above all. `read_only` in
+  this registry means _does not mutate the working tree_ (which is why `git`,
+  `fetch`, `search` and `models` are in it); `todo` replaces a list held in the
+  agent's own context and touches nothing on disk, so the classification was
+  simply wrong. It opts out of concurrency in exchange, since each call replaces
+  the whole list. A test now parses the tool names out of the unconditional
+  prompt block and fails if one of them is missing from a read-only agent's set.
+
 - **Skills the model can invoke, not just the user.** All ten built-in skills
   and every user or project skill were `:`-only: parsed, offered in the
   completion popup, sent as a user message on invocation — and invisible to the
@@ -262,6 +308,63 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cache-prefixed system prompt.
 
 ### Fixed
+
+- **Your file tools may no longer write `.git`.** "Is it under a writable root"
+  was the only question a write had to answer, and a write sub-agent's cwd
+  **is** its git worktree — so the worktree's `.git` sat under a writable root
+  and `.git/hooks/pre-commit` was a file the model could write and your next
+  commit would execute with your full authority. That is the incident the
+  sandbox was built for, with one extra step. A model-supplied write whose
+  canonical path contains `.git` anywhere is now refused with an explanation and
+  a pointer at the `git` tool or `shell`, which reach git through git itself.
+  hrdr's own plumbing is unaffected — every `task_*` worktree add, commit,
+  cherry-pick and `git apply` goes through `Command`/`std::fs`, never through
+  the guard — so write sub-agents still commit normally, and `shell` is
+  deliberately not covered (`git commit` legitimately writes `.git/index`; that
+  half is the OS layer's job). Reads are untouched: the model must still be able
+  to read a config it may not write.
+
+- **Each agent has its own sandbox degradation notice.** The queue was one
+  process-global cell, so with several agents in flight whichever turn loop
+  drained first told the wrong session its sandbox had degraded. It now lives in
+  `SandboxNotices` beside the policy it describes, per agent; "each notice at
+  most once" is per agent too, so a recurrence stays quiet while a sibling still
+  hears its own.
+
+- **A revived sub-agent comes back with the capability it ran with.**
+  Read-only-ness was never persisted, so `task_revive` of an
+  `explore`/`review`/`plan` run rebuilt it **write-capable** in the recorded
+  directory, and it took a write concurrency slot it did not need. The run's
+  scope now persists on its `SessionState`, revive rebuilds through the same
+  field a fresh spawn sets (so the registry is pruned identically), and the slot
+  matches what the run may do. A snapshot written before the field existed still
+  revives write-capable, which is the truth for the main session and every write
+  sub-agent.
+
+- **Failed web session-cookie attempts are counted.** The `users` auth mode
+  401'd an invalid `hrdr_session` cookie through an early return that skipped
+  the rate limiter, so those attempts went uncounted (the cookie is HMAC-signed,
+  so this was hygiene rather than a hole). The branch now yields into the shared
+  failure tail, which removes the trap rather than patching it.
+
+- **A page served by another local app can no longer open a WebSocket with your
+  session.** The Origin check allowed any loopback origin whatever its port, so
+  a dev server on `:3000` passed. It now requires the origin's port to match the
+  port hrdr is served on, refuses when the port cannot be determined, and
+  refuses cross-spellings (`127.0.0.1` vs `localhost` vs `[::1]`) since those
+  are distinct sockets distinct processes can hold. Non-loopback names are still
+  accepted on hostname alone, so reverse-proxy deployments are unaffected. Found
+  on the way: the old authority split took everything before the first `:`, so
+  `http://[::1]:9911` reduced to a host of `[` — the IPv6 loopback allowance had
+  never worked.
+
+- **A diagnostic is reported once.** Servers re-publish overlapping sets and
+  separate analysis passes report the same error twice, and both reached the
+  model and spent the post-edit note's cap. Repeats — same start position,
+  severity, message and `source` — now collapse before the errors-only filter
+  and the cap, so "…and N more" counts distinct findings. `source` is part of
+  the identity on purpose: rustc and clippy flagging the same line are two
+  findings, not a repeat.
 
 - **`… | grep` that matched nothing no longer reads as a failed build.** A
   pipeline whose trailing `grep` finds nothing exits 1, and one mined session
