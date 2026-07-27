@@ -2,6 +2,10 @@
 name: release
 description: cut a release — bump version, update changelog, commit, tag, push
 args: [patch, minor, major]
+# The last step pushes a tag, which is outward-facing and awkward to reverse:
+# deciding to cut a release is the user's call, so the model may not load this
+# itself. `:release` from the user is the only way in.
+model_invocable: false
 ---
 
 Cut a release.

@@ -150,7 +150,8 @@ native desktop/mobile shell, and read-only observer auth.
 - **Efficient, adaptive tool set.** `read`, `write`, `edit`, `replace`
   (project-wide substitution with a diff and a `dry_run`), `move`, `copy`,
   `delete`, `find`, `ls`, `tree`, `grep`, `git` (read-only:
-  status/diff/log/show/blame/…), `todo`, `fetch`, `search`, a shell, and any
+  status/diff/log/show/blame/…), `todo`, `fetch`, `search`, `skill` (load one of
+  the user's / project's reusable procedures — see "Skills"), a shell, and any
   MCP-server tools. The read tools keep **credential/secret files** off-limits —
   unlike the same access through the shell, which has no such guard. Writes are
   confined by a **sandbox that is on by default** — a path guard on the file
@@ -170,8 +171,9 @@ native desktop/mobile shell, and read-only observer auth.
   `EditorEngine` impls behind an **FSM-agnostic** seam, so a future hjkl
   VSCode/Helix discipline drops in with zero churn.
 - **Sectioned system prompt.** Assembled from markdown fragments compiled in
-  with `include_str!` plus runtime-built sections (environment, sandbox), pushed
-  least-volatile-first so the cached prompt prefix stays stable across agents.
+  with `include_str!` plus runtime-built sections (skills, environment,
+  sandbox), pushed least-volatile-first so the cached prompt prefix stays stable
+  across agents.
 
 ## Workspace
 
@@ -248,17 +250,31 @@ are discovered from `.hrdr/skills/`, `.claude/commands/`, and
 `.opencode/command/` in the project, then `~/.config/hrdr/skills/`,
 `~/.claude/commands/`, and `~/.config/opencode/command/` — first match by name
 wins. Optional YAML frontmatter — `name:`, `description:` (multi-line and block
-scalars both work), and `args:` (a YAML list or a comma-separated string) —
-candidate argument values the completion popup offers after `:name `; the file
-stem names it otherwise. `/skills` opens a picker over what's loaded (Enter
-inserts `:name ` into the input); the transcript shows the raw `:name args` you
-typed while the model receives the expanded prompt.
+scalars both work), `args:` (a YAML list or a comma-separated string) —
+candidate argument values the completion popup offers after `:name `; and
+`model_invocable:` (default `true`, see below); the file stem names it
+otherwise. `/skills` opens a picker over what's loaded (Enter inserts `:name `
+into the input); the transcript shows the raw `:name args` you typed while the
+model receives the expanded prompt.
 
-hrdr ships nine built-in skills that work with zero setup:
+**The model can invoke a skill too.** Every agent's system prompt lists the
+available skills by name and one-line description (bodies excluded — the listing
+is a menu), and a `skill` tool loads the one it names, `$ARGUMENTS` and all. So
+"review what I changed" reaches for `:review`'s checklist without you typing it,
+and a sub-agent does the same — `skill` is read-only, so read-only profiles
+(`explore`, `review`, `plan`) keep it. A profile whose `tools:` allow-list drops
+`skill` loses the listing with it.
+
+`model_invocable: false` in the frontmatter keeps a skill **yours**: unlisted,
+and the tool refuses it, so `:name` is the only way in. Built-in `:release`
+ships marked — its last step pushes a tag, so starting a release is your call.
+
+hrdr ships ten built-in skills that work with zero setup:
 
 - `:audit [low|high]` — audit the codebase for security bugs and correctness
 - `:commit` — commit the working changes with a Conventional Commit message
 - `:fix` — root-cause and fix a pasted error
+- `:perf` — report performance problems: hot paths, allocations, complexity
 - `:plan` — explore read-only and produce an implementation plan
 - `:release [patch|minor|major]` — cut a release: bump version, update
   changelog, commit, tag, push

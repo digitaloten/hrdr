@@ -212,6 +212,11 @@ pub const SECTION_COMMITTING_SUBAGENT: &str = "committing_subagent";
 pub const SECTION_DELEGATE: &str = "delegate";
 pub const SECTION_SUBAGENT: &str = "subagent";
 pub const SECTION_SUBAGENT_WRITE: &str = "subagent_write";
+// The skill listing: names + one-line descriptions of what the `skill` tool can
+// load. After the capability group because it is gated on that tool being
+// registered, and before the persona because every profile in a project sees the
+// same skills. See `skills_section`.
+pub const SECTION_SKILLS: &str = "skills";
 pub const SECTION_PERSONA: &str = "persona";
 pub const SECTION_ENVIRONMENT: &str = "environment";
 // Below the environment block on purpose: the writable roots name the per-agent
@@ -349,6 +354,80 @@ pub fn environment_section(cwd: &Path, tools: &ToolRegistry) -> String {
         cwd = cwd.display(),
     ));
     system
+}
+
+/// Max bytes the skill listing may spend. Names are never dropped (a name the
+/// model cannot see is a skill it cannot load); descriptions are what gives, tail
+/// first, once the budget is gone. Generous next to a real setup — the ten
+/// built-ins list in well under 1 KiB — so this only bites on a directory full of
+/// skills, where names-only is exactly the right degradation.
+const SKILLS_SECTION_MAX_BYTES: usize = 4 * 1024;
+
+/// Longest description rendered per skill; longer ones are cut at a word
+/// boundary. A skill file may carry a paragraph in `description:`, and the
+/// listing is a menu, not the content.
+const SKILL_DESCRIPTION_MAX_CHARS: usize = 120;
+
+/// The skill listing — what the `skill` tool can load, as `name — description`
+/// lines. Bodies are never inlined: that is the whole point of the tool (pay for
+/// one procedure when it applies, not for all ten every turn).
+///
+/// Empty — and so dropped by [`SystemPrompt::push`] — when there are no skills or
+/// when this agent has no `skill` tool (a custom profile's `tools:` allow-list can
+/// drop it). Naming a tool the agent does not have is how a prompt sends a model
+/// after something it cannot call.
+///
+/// Deliberately carries **no source paths**: a write sub-agent runs in its own
+/// worktree, so a `~/proj-hrdr-abc/.hrdr/skills` line would differ per sibling and
+/// push per-agent bytes into the shared cache prefix. The `skill` tool's own
+/// result names the source, where it costs nothing shared.
+pub fn skills_section(tools: &ToolRegistry, skills: &[crate::Skill]) -> String {
+    // `model_invocable: false` skills are the user's alone (`:release` pushes a
+    // tag): not listed, and the tool refuses them. Filtered here rather than at
+    // discovery, because the `:` popup and `/skills` picker must still show them.
+    let skills: Vec<&crate::Skill> = skills.iter().filter(|s| s.model_invocable).collect();
+    if skills.is_empty() || !tools.defs().iter().any(|d| d.function.name == "skill") {
+        return String::new();
+    }
+    let header = "\n\nSkills — reusable procedures for recurring tasks, written by the user, this \
+                  project, or hrdr. Load one with the `skill` tool (by name) when the task matches \
+                  its description, and follow it; that is how the user wants that job done. The \
+                  bodies are not here — the tool returns them.\n";
+    let mut out = String::from(header);
+    let mut budget = SKILLS_SECTION_MAX_BYTES.saturating_sub(header.len());
+    for skill in skills {
+        let desc = truncate_words(skill.description.trim(), SKILL_DESCRIPTION_MAX_CHARS);
+        let full = if desc.is_empty() {
+            format!("\n- {}", skill.name)
+        } else {
+            format!("\n- {} — {}", skill.name, desc)
+        };
+        // Names always; the description is what the budget buys.
+        let line = if full.len() <= budget {
+            full
+        } else {
+            format!("\n- {}", skill.name)
+        };
+        budget = budget.saturating_sub(line.len());
+        out.push_str(&line);
+    }
+    out
+}
+
+/// `text` cut to at most `max` chars, at a word boundary, with an ellipsis when
+/// anything was dropped. Also collapses newlines: a block-scalar `description:`
+/// is legal YAML and would otherwise break the one-line-per-skill shape.
+fn truncate_words(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let cut: String = flat.chars().take(max).collect();
+    let head = match cut.rsplit_once(' ') {
+        Some((head, _)) if !head.is_empty() => head,
+        _ => cut.as_str(),
+    };
+    format!("{}…", head.trim_end_matches([',', '.', ';', ':']))
 }
 
 /// The sandbox declaration — mode plus the concrete roots — as a prompt section.
@@ -1841,5 +1920,141 @@ mod tests {
             sandbox_section(&hrdr_tools::SandboxPolicy::unconfined()).is_empty(),
             "mode None must render nothing"
         );
+    }
+
+    /// A registry that has the `skill` tool — what gates the listing section.
+    fn tools_with_skill() -> ToolRegistry {
+        let mut tools = ToolRegistry::with_defaults();
+        tools.register(std::sync::Arc::new(crate::skills::SkillTool {
+            skills: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }));
+        tools
+    }
+
+    fn test_skill(name: &str, description: &str) -> crate::Skill {
+        crate::Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            body: "THE BODY".to_string(),
+            source: "~/secret/place".to_string(),
+            args: Vec::new(),
+            model_invocable: true,
+        }
+    }
+
+    /// The listing is a menu: one line per skill, name and description only. No
+    /// bodies (that is what the tool is for) and no source paths (they name a
+    /// write sub-agent's own worktree, which would differ per sibling and split
+    /// the shared cache prefix).
+    #[test]
+    fn skills_section_lists_names_and_descriptions_only() {
+        let skills = [test_skill("commit", "stage and commit the working changes")];
+        let s = skills_section(&tools_with_skill(), &skills);
+        assert!(s.starts_with("\n\nSkills"), "own separator + header: {s:?}");
+        assert!(s.contains("`skill` tool"), "names the tool that loads one");
+        assert!(s.contains("\n- commit — stage and commit the working changes"));
+        assert!(!s.contains("THE BODY"), "bodies are never inlined: {s}");
+        assert!(!s.contains("secret/place"), "no source paths: {s}");
+    }
+
+    /// No skills, or no `skill` tool, means no section — the second case is the
+    /// one that matters: a profile whose `tools:` allow-list drops `skill` must
+    /// not be handed a menu it cannot order from.
+    #[test]
+    fn skills_section_is_empty_without_skills_or_without_the_tool() {
+        assert!(skills_section(&tools_with_skill(), &[]).is_empty());
+        let skills = [test_skill("commit", "commit the changes")];
+        assert!(
+            skills_section(&ToolRegistry::with_defaults(), &skills).is_empty(),
+            "the default registry has no `skill` tool, so nothing may be listed"
+        );
+    }
+
+    /// Under budget pressure the descriptions go and the names stay: a name the
+    /// model cannot see is a skill it can never load, while a missing description
+    /// only costs it a guess.
+    #[test]
+    fn skills_section_keeps_every_name_when_the_budget_runs_out() {
+        let long = "d".repeat(SKILL_DESCRIPTION_MAX_CHARS);
+        let skills: Vec<crate::Skill> = (0..200)
+            .map(|i| test_skill(&format!("skill{i:03}"), &long))
+            .collect();
+        let s = skills_section(&tools_with_skill(), &skills);
+        assert!(
+            s.len() < SKILLS_SECTION_MAX_BYTES * 2,
+            "the listing stays bounded: {} bytes",
+            s.len()
+        );
+        for i in 0..200 {
+            assert!(
+                s.contains(&format!("\n- skill{i:03}")),
+                "every name survives; skill{i:03} did not"
+            );
+        }
+        assert!(
+            !s.contains(&format!("skill199 — {long}")),
+            "the tail loses its description, not its name"
+        );
+    }
+
+    /// A `model_invocable: false` skill is not on the menu: listing it would
+    /// invite a call the tool then refuses, and burn tokens describing something
+    /// only the user can start.
+    #[test]
+    fn skills_section_omits_user_only_skills() {
+        let mut release = test_skill("release", "cut a release");
+        release.model_invocable = false;
+        let skills = [release, test_skill("commit", "commit the changes")];
+        let s = skills_section(&tools_with_skill(), &skills);
+        assert!(s.contains("\n- commit — "));
+        assert!(!s.contains("release"), "user-only skill is unlisted: {s}");
+
+        // Nothing invocable at all → no section, same as no skills.
+        let mut only = test_skill("release", "cut a release");
+        only.model_invocable = false;
+        assert!(skills_section(&tools_with_skill(), &[only]).is_empty());
+    }
+
+    /// What the ten built-ins actually cost every agent that has the `skill`
+    /// tool. Pinned because this section sits in the cached prefix of every
+    /// prompt: a built-in whose `description:` grows into a paragraph should
+    /// fail here, not quietly tax every session.
+    #[test]
+    fn the_builtin_listing_stays_cheap() {
+        let s = skills_section(&tools_with_skill(), &crate::builtin_skills());
+        assert!(
+            s.len() < 1600,
+            "the ten built-in skills list in {} bytes:\n{s}",
+            s.len()
+        );
+        for name in [
+            "audit", "commit", "fix", "perf", "plan", "review", "test", "tidy", "todo",
+        ] {
+            assert!(s.contains(&format!("\n- {name} — ")), "{name} is listed");
+        }
+        assert!(
+            !s.contains("release"),
+            "`:release` ships `model_invocable: false` — the user starts a release"
+        );
+    }
+
+    /// A `description:` block scalar is legal YAML, so a description can arrive
+    /// with newlines and be paragraph-long. The listing is one line per skill:
+    /// flatten it and cut at a word boundary.
+    #[test]
+    fn skills_section_flattens_and_trims_a_long_description() {
+        let skills = [test_skill(
+            "verbose",
+            &format!("line one\nline two {}", "word ".repeat(60)),
+        )];
+        let s = skills_section(&tools_with_skill(), &skills);
+        let line = s
+            .lines()
+            .find(|l| l.starts_with("- verbose"))
+            .expect("the skill is listed");
+        assert!(!line.contains('\n'));
+        assert!(line.contains("line one line two"), "flattened: {line}");
+        assert!(line.ends_with('…'), "trimmed with an ellipsis: {line}");
+        assert!(line.chars().count() <= SKILL_DESCRIPTION_MAX_CHARS + 20);
     }
 }

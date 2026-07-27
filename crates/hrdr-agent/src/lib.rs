@@ -39,7 +39,9 @@ pub use chatgpt_models::{
     chatgpt_model_catalog, parse_catalog,
 };
 mod paths;
-pub use paths::cwd_slug;
+pub use paths::{cwd_slug, display_dir};
+mod skills;
+pub use skills::{Skill, builtin_skills, discover_skills, expand_body, expand_skill};
 mod model_ref;
 pub use model_ref::{ModelRef, ModelRefError, ModelSpec, ProviderName, catalog_provider_key};
 mod resolve;
@@ -1010,6 +1012,10 @@ pub struct Agent {
     /// Names of the sub-agents available via the `task` tool (built-ins +
     /// discovered files + config), for `@name` mention routing in the frontend.
     agent_names: Vec<String>,
+    /// The skills this agent can load, shared with the `skill` tool. Re-discovered
+    /// on `clear`/`set_cwd` so a project switch changes both the prompt listing and
+    /// what the tool serves — one cell, so they cannot disagree.
+    skills: skills::SharedSkills,
     /// `JoinHandle`s for all running background sub-agent tasks (`task` with
     /// `background: true`), keyed by task id. Stored so [`Self::clear`] can
     /// abort them and so callers can query the live count.
@@ -1201,11 +1207,16 @@ const MEMORY_PREAMBLE: &str = "Durable notes you saved in earlier sessions (via 
 /// them share everything above it. The reverse case (one profile across
 /// different projects) shares less, but switching projects is far rarer than
 /// switching profiles within one.
+// One parameter per prompt input, deliberately: the argument list is the list of
+// things the prompt is built from, and a bag struct would let a caller forget to
+// fill one without the compiler saying so.
+#[allow(clippy::too_many_arguments)]
 fn build_system_prompt_sections(
     tools: &ToolRegistry,
     cwd: &std::path::Path,
     docs: &prompt::AgentDocs,
     memory: &MemoryIndex,
+    skills: &[Skill],
     persona: Option<&str>,
     is_subagent: bool,
     sandbox: &hrdr_tools::SandboxPolicy,
@@ -1213,6 +1224,7 @@ fn build_system_prompt_sections(
     use prompt::{
         SECTION_BASE, SECTION_ENVIRONMENT, SECTION_GLOBAL_AGENTS_MD, SECTION_GLOBAL_MEMORY,
         SECTION_PERSONA, SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY, SECTION_SANDBOX,
+        SECTION_SKILLS,
     };
     let mut p = prompt::SystemPrompt::default();
     // 1. identical for every agent hrdr runs
@@ -1242,7 +1254,11 @@ fn build_system_prompt_sections(
     for (name, body) in prompt::capability_sections(tools, is_subagent) {
         p.push(name, prompt::section_text(body));
     }
-    // 7-9. per-agent, then the volatile tail. The sandbox roots name this agent's
+    // 7. what the `skill` tool can load — names and one-liners, no bodies. Gated
+    // on that tool being registered (see `prompt::skills_section`), and above the
+    // persona because every profile working this project sees the same skills.
+    p.push(SECTION_SKILLS, prompt::skills_section(tools, skills));
+    // 8-10. per-agent, then the volatile tail. The sandbox roots name this agent's
     // cwd, so they sit below the environment block — the cache split is taken
     // before `SECTION_ENVIRONMENT`, so appending here costs the prefix nothing.
     p.push(SECTION_PERSONA, persona_section(persona));
@@ -1258,16 +1274,27 @@ fn build_system_prompt_sections(
 /// date). The native Anthropic path turns the offset into a second
 /// `cache_control` breakpoint so sibling write sub-agents, which share a persona
 /// but each have their own worktree `cwd`, stop re-sending the shared part.
+#[allow(clippy::too_many_arguments)] // mirrors `build_system_prompt_sections`
 fn build_system_prompt(
     tools: &ToolRegistry,
     cwd: &std::path::Path,
     docs: &prompt::AgentDocs,
     memory: &MemoryIndex,
+    skills: &[Skill],
     persona: Option<&str>,
     is_subagent: bool,
     sandbox: &hrdr_tools::SandboxPolicy,
 ) -> Result<(String, Option<usize>)> {
-    let p = build_system_prompt_sections(tools, cwd, docs, memory, persona, is_subagent, sandbox)?;
+    let p = build_system_prompt_sections(
+        tools,
+        cwd,
+        docs,
+        memory,
+        skills,
+        persona,
+        is_subagent,
+        sandbox,
+    )?;
     let split = p.prefix_len_before(prompt::SECTION_ENVIRONMENT);
     Ok((p.render(), split))
 }
@@ -1488,6 +1515,16 @@ impl Agent {
         if config.memory {
             tools.register(Arc::new(hrdr_tools::MemoryTool));
         }
+        // Skills: discovered here so the model can load one itself. The cell is
+        // shared with the tool, so a `set_cwd` that finds a different project's
+        // skills updates both the listing in the prompt and what the tool serves.
+        // Registered before the read-only scoping below — `skill` is read-only, so
+        // an explorer keeps it; a profile with an explicit `tools:` allow-list that
+        // omits it loses both the tool and the prompt section together.
+        let skills: skills::SharedSkills = Arc::new(Mutex::new(discover_skills(&config.cwd)));
+        tools.register(Arc::new(skills::SkillTool {
+            skills: Arc::clone(&skills),
+        }));
         // Scope the tool set for a restricted sub-agent: an explicit allow-list
         // wins; else, for a read-only agent, the plain read-only set.
         if let Some(allow) = &config.allowed_tools {
@@ -1577,6 +1614,7 @@ impl Agent {
             &config.cwd,
             &project_docs,
             &memory,
+            &skills.lock().unwrap_or_else(|p| p.into_inner()).clone(),
             config.agent_prompt.as_deref(),
             config.is_subagent,
             &ctx.sandbox,
@@ -1655,6 +1693,7 @@ impl Agent {
             memory_enabled: config.memory,
             memory_dir: config.memory_dir,
             agent_names,
+            skills,
             bg_handles,
             cost_total,
             cost_partial,
@@ -1824,6 +1863,7 @@ impl Agent {
             &self.ctx.cwd,
             &self.project_docs,
             &memory,
+            &self.skills_snapshot(),
             self.agent_prompt.as_deref(),
             self.is_subagent,
             &self.ctx.sandbox,
@@ -1838,6 +1878,14 @@ impl Agent {
         } else {
             self.messages.insert(0, ChatMessage::system(system));
         }
+    }
+
+    /// A copy of the shared skill set, for a prompt rebuild.
+    fn skills_snapshot(&self) -> Vec<Skill> {
+        self.skills
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Re-gather `AGENTS.md` for the current cwd and rebuild the system prompt
@@ -1864,11 +1912,20 @@ impl Agent {
         } else {
             MemoryIndex::default()
         };
+        // Re-discover skills for the (possibly changed) cwd, through the cell the
+        // `skill` tool holds — so a project switch moves the listing and the tool's
+        // answer together.
+        let skills = discover_skills(&self.ctx.cwd);
+        *self
+            .skills
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = skills.clone();
         let Ok((system, system_cache_split)) = build_system_prompt(
             &self.tools,
             &self.ctx.cwd,
             &self.project_docs,
             &memory,
+            &skills,
             self.agent_prompt.as_deref(),
             self.is_subagent,
             &self.ctx.sandbox,
@@ -4758,8 +4815,15 @@ mod tests {
         use super::prompt::{
             SECTION_BASE, SECTION_ENVIRONMENT, SECTION_GLOBAL_AGENTS_MD, SECTION_GLOBAL_MEMORY,
             SECTION_PERSONA, SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY, SECTION_SANDBOX,
+            SECTION_SKILLS,
         };
-        let tools = hrdr_tools::ToolRegistry::with_defaults();
+        let mut tools = hrdr_tools::ToolRegistry::with_defaults();
+        // The `skill` tool is registered by `Agent::new`, not by the defaults, and
+        // the listing section is gated on it — so the order assertion below only
+        // sees `SECTION_SKILLS` with it present.
+        tools.register(std::sync::Arc::new(super::skills::SkillTool {
+            skills: std::sync::Arc::new(std::sync::Mutex::new(super::builtin_skills())),
+        }));
         let sections = |sandbox: &hrdr_tools::SandboxPolicy| {
             super::build_system_prompt_sections(
                 &tools,
@@ -4772,6 +4836,7 @@ mod tests {
                     global: Some("global memory".to_string()),
                     project: Some("project memory".to_string()),
                 },
+                &super::builtin_skills(),
                 Some("the persona"),
                 false,
                 sandbox,
@@ -4798,6 +4863,9 @@ mod tests {
                 "shell",
                 "committing",
                 "committing_main",
+                // names + one-liners of what `skill` can load: project-scoped, so
+                // above the persona and out of the volatile tail
+                SECTION_SKILLS,
                 SECTION_PERSONA,
                 SECTION_ENVIRONMENT,
                 SECTION_SANDBOX,
@@ -4824,6 +4892,7 @@ mod tests {
             std::path::Path::new("/tmp/proj"),
             &super::prompt::AgentDocs::default(),
             &super::MemoryIndex::default(),
+            &[],
             None,
             false,
             &hrdr_tools::SandboxPolicy::unconfined(),
@@ -4852,6 +4921,7 @@ mod tests {
             std::path::Path::new("/tmp/proj"),
             &super::prompt::AgentDocs::default(),
             &super::MemoryIndex::default(),
+            &[],
             None,
             false,
             &hrdr_tools::SandboxPolicy::unconfined(),
@@ -5301,6 +5371,8 @@ mod tests {
         // "no network". `git` is here too: its subcommands are an allow-list of
         // read-only ones — and so are the LSP lookups (`definition`/
         // `references`); the mutating `rename` is pruned with the writers.
+        // `skill` is here as well: it returns instructions and writes nothing —
+        // what a loaded skill can then *do* is bounded by this very tool set.
         let readers = [
             "definition",
             "fetch",
@@ -5312,6 +5384,7 @@ mod tests {
             "read",
             "references",
             "search",
+            "skill",
             "tree",
         ];
         assert_eq!(tools("explore"), readers);

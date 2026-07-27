@@ -2,14 +2,15 @@
 
 Smaller items that were identified but not yet done or tracked elsewhere. The
 one larger effort that still has its own doc is `compare.md` (harness comparison
-— its open shortlist: model-invocable skills, doom_loop detection, `.git`
-protection in worktrees, and the two prompt defects #2/#3). `security-audit.md`
-is fully closed (kept as a methodology record). The web UI shipped 2026-07-26
-(plan doc deleted; its leftovers are the **Web UI follow-ups** section below).
-The OS sandbox (issue #13) shipped 2026-07-27 — its spec doc is deleted, the
-design now lives in `crates/hrdr-tools/src/sandbox.rs`'s doc comments and its
-tests; what still binds is **Sandbox follow-ups** below plus the sandbox rules
-under **Standing constraints**. The Codex catalog pin is issue #2.
+— its open shortlist: doom_loop detection, `.git` protection in worktrees, and
+the two prompt defects #2/#3; model-invocable skills shipped 2026-07-27).
+`security-audit.md` is fully closed (kept as a methodology record). The web UI
+shipped 2026-07-26 (plan doc deleted; its leftovers are the **Web UI
+follow-ups** section below). The OS sandbox (issue #13) shipped 2026-07-27 — its
+spec doc is deleted, the design now lives in
+`crates/hrdr-tools/src/sandbox.rs`'s doc comments and its tests; what still
+binds is **Sandbox follow-ups** below plus the sandbox rules under **Standing
+constraints**. The Codex catalog pin is issue #2.
 
 Docs for finished work are deleted rather than kept as history — read the code
 and `git log`. What survives from a completed effort is only what still binds
@@ -25,6 +26,13 @@ future work; those are collected under **Standing constraints** at the bottom.
   memory-tool design.
 - **LSP diagnostics dedup.** The same diagnostic can surface more than once
   (overlapping ranges / re-published sets); dedupe before showing the model.
+- **Skills follow-ups** (the feature shipped 2026-07-27 — `hrdr-agent`'s
+  `skills.rs` plus `prompt::skills_section`). Left out on purpose: no `skill`
+  usage signal (nothing records whether the model ever loads one, so there is no
+  evidence for or against the listing's wording); the listing carries no
+  categories, unlike hermes' category→skills grouping, which only pays off past
+  a few dozen skills; and a skill body still arrives as one tool result, so a
+  procedure longer than 24 KiB spills to a file the model must read.
 - **A revived sub-agent always runs write-capable.** `task_revive` reuses the
   worktree and takes a write slot, because read-only-ness was never persisted in
   `SessionState` — so a revived former read-only explorer runs write-capable in
@@ -291,6 +299,30 @@ items — they are rules.
   - _Broad reads in `write` mode and full env passthrough in bwrap_ (no
     `--clearenv`) are decided v1 tradeoffs, not oversights. Narrowing either is
     the follow-up work listed above, not a bug fix.
+- **A skill the model can load is still the user's procedure.** Rules from the
+  model-invocable skills work (`hrdr-agent/src/skills.rs`,
+  `prompt::skills_section`).
+  - _The listing is a menu, never the content._ Name + one-line description
+    only; bodies come from the `skill` tool when one applies. Under the byte
+    budget descriptions are dropped tail-first and **names always survive** — a
+    name the model cannot see is a skill it can never load.
+  - _No source paths in the listing._ They name the per-agent worktree, so they
+    would differ between sibling sub-agents and push per-agent bytes into the
+    shared cache prefix. The tool's own result names the source, where it costs
+    nothing shared.
+  - _A skill body is instruction, and it is project-authored._ It reaches the
+    model as tool output — which the base prompt otherwise calls data, never a
+    command — so the result frames it explicitly as the user's/project's
+    instructions and names the source. Same trust class as `AGENTS.md`, and the
+    same open exposure (an untrusted clone's `.hrdr/skills`).
+  - _`model_invocable: false` is a boundary._ Such a skill is unlisted **and**
+    refused by the tool, with an error that tells the model to ask the user to
+    run `:name`. Only a literal `false` opts out (a typo fails open, visible,
+    rather than silently hiding a skill). Built-in `:release` carries it because
+    its last step pushes a tag.
+  - _The prompt section is gated on the tool._ A profile whose `tools:`
+    allow-list drops `skill` gets no listing: naming a tool an agent lacks is
+    the defect the pi comparison found, not a pattern to repeat.
 - **A new tool picks its interface shape by rule, not by taste** (taxonomy from
   the 2026-07-27 survey of all 31 tools). The shape is load-bearing: the
   harness's cross-cutting layer (read-guard, staleness culprit naming, secret

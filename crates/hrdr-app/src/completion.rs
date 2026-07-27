@@ -335,6 +335,7 @@ mod tests {
             body: "…".to_string(),
             source: "test".to_string(),
             args: vec!["staging".to_string(), "production".to_string()],
+            model_invocable: true,
         }];
         let vals = |i: &str| {
             arg_completions(i, &skills)

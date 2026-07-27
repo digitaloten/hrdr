@@ -173,29 +173,12 @@ pub use hrdr_tools::floor_char_boundary;
 /// relative ones are joined onto `base`.
 pub use hrdr_tools::resolve_under;
 
-/// Display form of `cwd`, with the home directory collapsed to `~`.
-pub fn display_dir(cwd: &Path) -> String {
-    let s = cwd.to_string_lossy();
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => collapse_home(&s, &home),
-        _ => s.into_owned(),
-    }
-}
-
-/// Collapse `home` at a path boundary in `path` to `~`. A prefix match alone
-/// isn't enough: `home = /home/mx` would strip the `/home/mx` off
-/// `/home/mxaddict/proj` too, collapsing it to the bogus `~addict/proj`. Only
-/// collapse when the match lands on a path boundary — the prefix is the whole
-/// string, or the next char is a separator. Pure, so it's testable without
-/// touching the process-wide `HOME`.
-fn collapse_home(path: &str, home: &str) -> String {
-    if let Some(rest) = path.strip_prefix(home)
-        && (rest.is_empty() || rest.starts_with('/'))
-    {
-        return format!("~{rest}");
-    }
-    path.to_string()
-}
+/// Display form of a directory, with the home directory collapsed to `~`.
+///
+/// Lives in `hrdr-agent` because skill discovery labels each skill's source
+/// with it, and the agent owns skill discovery; re-exported so the frontends
+/// (chrome, pickers) render paths identically.
+pub use hrdr_agent::display_dir;
 
 /// Whether `needle`'s chars appear in order within `haystack` — the fuzzy
 /// match shared by the picker filters (sessions, themes).
@@ -750,27 +733,6 @@ mod tests {
         assert!(
             !files.iter().any(|f| f == "sub/ignored.txt"),
             "nested sub/.gitignore not honored: {files:?}"
-        );
-    }
-
-    // These test the pure `collapse_home` core rather than `display_dir` so they
-    // never touch the process-wide `HOME` — no env mutation, no cross-test race.
-
-    #[test]
-    fn display_dir_collapses_home_at_a_path_boundary() {
-        assert_eq!(collapse_home("/home/mx", "/home/mx"), "~");
-        assert_eq!(collapse_home("/home/mx/proj", "/home/mx"), "~/proj");
-    }
-
-    /// Regression: a bare prefix match turned `/home/mxaddict/proj` (a sibling
-    /// directory that merely starts with the same characters as HOME) into
-    /// the bogus `~addict/proj` — `mx` is not a path component of
-    /// `mxaddict`, so it must not collapse at all.
-    #[test]
-    fn display_dir_does_not_collapse_a_sibling_directory_sharing_a_prefix() {
-        assert_eq!(
-            collapse_home("/home/mxaddict/proj", "/home/mx"),
-            "/home/mxaddict/proj"
         );
     }
 

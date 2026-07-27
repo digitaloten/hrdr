@@ -417,6 +417,15 @@ invocation the body is sent as a user message. So all 10 built-in skills and
 every user skill are user-invocable only — **the model can never decide "this is
 a release, load the release checklist."** See finding 3.
 
+> **Shipped 2026-07-27.** Discovery/parsing/expansion moved to
+> `hrdr-agent/src/skills.rs` (the frontends keep only the completion popup and
+> the picker filter), `prompt::skills_section` renders a name + one-line
+> description menu as `SECTION_SKILLS` — 956 bytes for the ten built-ins, in the
+> cached prefix, bodies excluded and **source paths excluded** so sibling
+> worktree sub-agents still share the prefix — and a read-only `skill` tool
+> returns the expanded body on demand. The section is gated on that tool being
+> registered, so a `tools:` allow-list that drops it drops the menu too.
+
 ### Corrections to the shallow reading
 
 **The prompt-size gap is ~16x, not the 4.3x my file line counts implied.**
@@ -492,11 +501,16 @@ fuzzy match was used; pi tracks `usedFuzzyMatch` (`edit-diff.ts:181-182`) but
 doesn't surface it. Cheapest useful subset: trailing whitespace +
 quotes/dashes/spaces, no NFKC, no new dependency.
 
-**3. Model-invocable skills with progressive disclosure.**
-`formatSkillsForPrompt` (`skills.ts:335-361`) emits a compact
-`<available_skills>` block of name + description + absolute path and tells the
-model to `read` the file when a task matches. The `Skill` struct deliberately
-has **no body field** (`:74-81`) — nothing resident.
+**3. Model-invocable skills with progressive disclosure.** _(Shipped 2026-07-27
+— see the **Shipped** note under defect 2 above. hrdr's listing omits the path
+pi includes: a write sub-agent's worktree path would differ per sibling and
+split the cache prefix, and the tool names the source in its result instead.
+pi's `disable-model-invocation` became `model_invocable: false`, and the
+trust-class caveat below is answered by the tool result framing the body as the
+user's/project's instructions.)_ `formatSkillsForPrompt` (`skills.ts:335-361`)
+emits a compact `<available_skills>` block of name + description + absolute path
+and tells the model to `read` the file when a task matches. The `Skill` struct
+deliberately has **no body field** (`:74-81`) — nothing resident.
 `disable-model-invocation: true` hides a skill so only the explicit
 `/skill:name` route reaches it. This closes defect 2 above. Cost is low: we
 already load, parse and index skills; it's a prompt block plus a frontmatter
@@ -782,20 +796,22 @@ is loaded (naming path and byte count) and reframe the block header to
 distinguish project file from user instruction. Full scanning can wait for
 evidence.
 
-**3. Model-invocable skills — now two of three peers agree.** Hermes'
-`<available_skills>` block (`prompt_builder.py:1738-1766`) emits **category →
-`name: description`** only, never bodies, with `skill_view(name)` to load on
-demand. Two refinements over pi's flat list: category headers carry their own
-descriptions, and a "focus mode" demotes off-context categories to
-`[names only]` — descriptions dropped, names always kept "for recall"
-(`:1700-1722`). The index lives in the **stable** tier, so it's cached. This
-independently confirms pi's finding and closes the defect recorded in the pi
-section (`grep -ci skill` over `system.j2`/`prompt.rs` = 0). _Caveat:_ hermes'
-framing is aggressive ("## Skills (mandatory)… Err on the side of loading") —
-don't copy that verbatim into a coding agent. And hermes' hide-a- skill
-mechanism is **worse** than pi's: an operator config list (`skills.disabled`)
-that hides a skill from everyone, versus pi's per-skill author-declared
-frontmatter. **Take pi's `disable-model-invocation` shape.**
+**3. Model-invocable skills — now two of three peers agree.** _(Shipped
+2026-07-27; hermes' names-always/descriptions-first degradation is what
+`prompt::skills_section` does under its byte budget. Its aggressive framing and
+operator-side disable list were not copied.)_ Hermes' `<available_skills>` block
+(`prompt_builder.py:1738-1766`) emits **category → `name: description`** only,
+never bodies, with `skill_view(name)` to load on demand. Two refinements over
+pi's flat list: category headers carry their own descriptions, and a "focus
+mode" demotes off-context categories to `[names only]` — descriptions dropped,
+names always kept "for recall" (`:1700-1722`). The index lives in the **stable**
+tier, so it's cached. This independently confirms pi's finding and closes the
+defect recorded in the pi section (`grep -ci skill` over `system.j2`/`prompt.rs`
+= 0). _Caveat:_ hermes' framing is aggressive ("## Skills (mandatory)… Err on
+the side of loading") — don't copy that verbatim into a coding agent. And
+hermes' hide-a- skill mechanism is **worse** than pi's: an operator config list
+(`skills.disabled`) that hides a skill from everyone, versus pi's per-skill
+author-declared frontmatter. **Take pi's `disable-model-invocation` shape.**
 
 **4. Refresh memory at the compaction boundary.** hrdr's injected memory is
 frozen for the entire session (verified above). An agent that saves "this
@@ -962,7 +978,7 @@ chart.
 **Agrees with pi** (promotes "consider" to "two of three"):
 
 - Model-invocable skills via a name+description index, bodies read on demand.
-  **hrdr's skill invisibility is now the outlier.**
+  ~~**hrdr's skill invisibility is now the outlier.**~~ **Shipped 2026-07-27.**
 - Progressive disclosure of harness knowledge generally — pi pages in 32
   markdown docs; hermes points at hosted docs plus a `hermes-agent` skill and
   declares the docs authoritative where they differ. **hrdr's knowledge is
@@ -1354,7 +1370,7 @@ document is measured.**
 | #   | Thing                                | codex             | hermes                            | opencode          | pi  | hrdr                   |
 | --- | ------------------------------------ | ----------------- | --------------------------------- | ----------------- | --- | ---------------------- |
 | 1   | Per-model prompt/behaviour variation | ✅ remote catalog | ✅ substring list + family blocks | ✅ 9 prompt files | ✗   | **✗**                  |
-| 2   | Model-invocable skills               | ✅                | ✅                                | ✅                | ✅  | **✗**                  |
+| 2   | Model-invocable skills               | ✅                | ✅                                | ✅                | ✅  | **✅ (shipped)**       |
 | 3   | Shell commands parsed, not regexed   | ✅                | —                                 | ✅                | ✗   | **✗**                  |
 | 4   | Runtime-composed tool descriptions   | ✅                | ✅                                | ✅                | ✅  | **✗ (`&'static str`)** |
 | 5   | Ask-the-user affordance              | ✅                | ✅                                | ✅                | ✗   | **✗ (tracked)**        |
@@ -1363,8 +1379,10 @@ document is measured.**
 
 **Items 1, 2 and 4 are three-of-four or four-of-four against us** — those are
 the ones where being the outlier is most likely to be a mistake rather than a
-deliberate stance. Item 2 is the cheapest of the three and closes a defect this
-comparison found.
+deliberate stance. Item 2 was the cheapest of the three and closed a defect this
+comparison found: **shipped 2026-07-27** (`SECTION_SKILLS` + the `skill` tool,
+with pi's per-skill `model_invocable:` opt-out; see the pi section's defect 2).
+Items 1 and 4 remain open.
 
 ### Where hrdr leads all four
 
@@ -1402,8 +1420,14 @@ comparison found.
 
 ### The four things I'd actually do, in order
 
-1. **Model-invocable skills** (pi + hermes + opencode agree; closes a defect
-   found here; low cost).
+1. ~~**Model-invocable skills** (pi + hermes + opencode agree; closes a defect
+   found here; low cost).~~ **Shipped 2026-07-27** — skill discovery moved into
+   `hrdr-agent`, `prompt::skills_section` lists name + description (956 bytes
+   for the ten built-ins, in the cached prefix, no bodies and no source paths),
+   and a read-only `skill` tool returns the expanded body. Took pi's opt-out
+   shape as `model_invocable: false` (`:release` ships marked — its last step
+   pushes a tag); did **not** take hermes' "err on the side of loading" framing
+   or its operator-side disable list.
 2. ~~**Cache breakpoint at hrdr's own stable/volatile boundary** + re-gather
    memory at compaction (hermes; ~30 lines each; the memory freeze is a live
    defect).~~ **Shipped** — `c5e5ced` (memory unfreeze + ordered sections),
