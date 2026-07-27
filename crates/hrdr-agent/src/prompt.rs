@@ -1626,6 +1626,44 @@ mod tests {
         );
     }
 
+    /// How the answer is worded: terse and direct, with the mechanical payload
+    /// exempt from the cutting.
+    ///
+    /// The two halves have to arrive together. "Be brief" alone buys brevity by
+    /// dropping precision — "fixed a parser bug" instead of the symbol and the
+    /// condition — which costs the user the one thing they needed to act on. So
+    /// the rule is fewer words carrying the same facts, and identifiers, values
+    /// and error text are reproduced exactly.
+    #[test]
+    fn the_prompt_sets_a_terse_voice_that_keeps_mechanical_detail_exact() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, false).unwrap();
+        assert!(p.contains("Voice:"), "{p}");
+        assert!(
+            p.contains("Every word must carry information the user does not already\n  have"),
+            "{p}"
+        );
+        // No preamble, no sign-off, no padding to look thorough.
+        assert!(p.contains("Lead with the answer"), "{p}");
+        assert!(
+            p.contains("Don't pad to look thorough"),
+            "length follows content: {p}"
+        );
+        // The exemption, which is what stops brevity eating the substance.
+        assert!(p.contains("TERSE IS NOT VAGUE"), "{p}");
+        assert!(
+            p.contains("are reproduced EXACTLY and in full"),
+            "identifiers, values, error text survive intact: {p}"
+        );
+        assert!(
+            p.contains("Cutting words must never cut\n  information"),
+            "{p}"
+        );
+        // Voice is base guidance — every agent has it, read-only ones included.
+        let read_only = render_flags(false, false, false, None);
+        assert!(read_only.contains("TERSE IS NOT VAGUE"), "{read_only}");
+    }
+
     /// Tool output is data, not instructions — the prompt-injection rule.
     ///
     /// hrdr can `fetch` a page, `search` the web, read a dependency's README, and

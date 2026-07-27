@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A `Voice` section in the base prompt: terse and direct, with mechanical
+  detail exempt.** Every agent — read-only ones included — is now told to lead
+  with the answer rather than a preamble, to drop filler and hedging that
+  changes nothing ("basically", "simply", "it's worth noting that"), to skip the
+  closing offer and the recap of what the user just read, and to let length
+  follow content instead of effort. The other half is what makes it safe:
+  **terse is not vague**, and it never applies to the payload. Identifiers,
+  paths, commands, code, config keys, versions, numbers, flags, error text and
+  quoted output are reproduced exactly and in full — `parse_header` mishandled a
+  zero-length prefix, not "fixed a parser bug". Fewer words carrying the same
+  facts, never fewer facts.
+
 - **Reaching past the language's checks now has to enforce its contract, not
   document one.** A follow-up review of the same delegated work found the fix
   round had introduced a soundness bug: a state hash over an unconstrained
