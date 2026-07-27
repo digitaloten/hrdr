@@ -8,6 +8,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Reaching past the language's checks now has to enforce its contract, not
+  document one.** A follow-up review of the same delegated work found the fix
+  round had introduced a soundness bug: a state hash over an unconstrained
+  generic read `size_of::<T>() * len` raw bytes, with a safety note assigning
+  the duty to "the caller" — while every call arrived through a dynamic boundary
+  that bounds nothing, so no caller could discharge it. It read uninitialized
+  padding (undefined behaviour, and nondeterministic inside a determinism
+  harness) and hashed pointers for heap-backed values, so identical logical
+  states hashed differently. Write-capable agents are now told to constrain
+  misuse in the type system or validate at the boundary rather than writing a
+  rule callers are trusted to follow, to notice when a generic or dynamic
+  boundary makes an obligation unenforceable, and to run the ecosystem's
+  UB/sanitizer tooling over new escape-hatch code **before** committing it —
+  with the project's own use of such a tool as the signal that it is expected.
+  Applies to any escape hatch, not one language's: `unsafe`, raw pointers, casts
+  and reinterprets, unchecked indexing, FFI, reflection, an `any`-typed hole.
+- **A value's identity is never its memory representation.** Hash, checksum,
+  compare, serialize or fingerprint over the logical value — field by field,
+  through a defined encoding — because raw bytes fold in padding (uninitialized,
+  so both UB and unstable), pointers and handles (equal values differ by
+  address), and multiple encodings of one value (NaN payloads, signed zero).
+- **A hook that defaults to doing nothing reports absence as success.** Added to
+  the check-that-cannot-fail list: when what a check measures is contributed by
+  an overridable method, an empty default means every type that forgot to
+  implement it counts as covered, and nothing says otherwise. Require the
+  implementation, or have the check report what it actually covered.
+- Counts written into docs now have to come from the figure the tool itself
+  reports rather than from counting lines of its output — a line count picks up
+  headers, footers and progress lines, and shifts depending on whether stderr
+  was merged, which is how a test count landed wrong twice in a row.
 - **Dependencies are added with the ecosystem's package manager, not by editing
   the manifest.** A model writing a version number is writing one from training,
   and "the latest version" is stale the day it ships — so the guess lands on a

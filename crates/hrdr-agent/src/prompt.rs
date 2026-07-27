@@ -1930,6 +1930,85 @@ mod tests {
         );
     }
 
+    /// Reaching past the language's checks obliges you to make misuse impossible,
+    /// not to write down a rule callers are trusted to follow — and the ecosystem's
+    /// UB/sanitizer tooling runs before the commit, not after the audit.
+    ///
+    /// From a real review, one round after the "check that cannot fail" findings:
+    /// a `hash_state` over an unconstrained generic read `size_of::<T>() * len`
+    /// raw bytes, with a SAFETY note assigning the duty to "the caller" — while
+    /// every call arrived through a `dyn` boundary that bounds nothing, so no
+    /// caller could comply. Miri found it reading uninitialized padding in
+    /// minutes; the same bytes hashed pointers for heap components, so identical
+    /// logical states hashed differently. Inside a determinism harness.
+    #[test]
+    fn the_prompt_makes_unsafe_contracts_enforceable() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, false).unwrap();
+
+        assert!(p.contains("ENFORCE A CONTRACT, DON'T DOCUMENT ONE"), "{p}");
+        assert!(
+            p.contains("no caller who *can* comply"),
+            "a duty nothing can discharge is the specific trap: {p}"
+        );
+        // Not Rust-only: the escape hatches of several languages, as a class.
+        for hatch in ["unsafe", "transmute", "FFI", "reflection", "`any`-typed"] {
+            assert!(p.contains(hatch), "missing {hatch}: {p}");
+        }
+        // Run the tool that finds it, before committing — examples, not a list.
+        assert!(
+            p.contains("BEFORE you commit it") && p.contains("(Miri,\n  ASan/UBSan/TSan"),
+            "{p}"
+        );
+        assert!(
+            p.contains("already runs one anywhere in its history or CI"),
+            "the project's own usage is the signal it's expected: {p}"
+        );
+        // Value identity is logical, never the bytes an object occupies.
+        assert!(
+            p.contains("Don't derive a value's identity from its memory representation"),
+            "{p}"
+        );
+        for trap in ["padding", "pointers and handles", "signed zero"] {
+            assert!(p.contains(trap), "missing the {trap} trap: {p}");
+        }
+
+        // Write-gated with the rest of the block.
+        let read_only = render_flags(false, false, false, None);
+        assert!(!read_only.contains("ENFORCE A CONTRACT"), "{read_only}");
+    }
+
+    /// A hook whose default does nothing reports absence as success — the same
+    /// root as a check that cannot fail, one layer down. And a count comes from
+    /// the tool's own total, not from counting lines of its output.
+    ///
+    /// Both observed: a `hash_state` defaulting to a no-op, so any system that
+    /// didn't override it contributed nothing to the determinism hash and nothing
+    /// said so; and a test count taken via `… | wc -l`, which moved by one
+    /// depending on whether stderr was merged, and landed wrong twice.
+    #[test]
+    fn the_prompt_catches_silent_abstention_and_line_counted_totals() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, false).unwrap();
+
+        assert!(
+            p.contains("An opt-in hook that defaults to doing nothing"),
+            "{p}"
+        );
+        assert!(
+            p.contains("\"not implemented\" arrives as\n    \"passed\""),
+            "{p}"
+        );
+        assert!(
+            p.contains("report WHAT it covered so an abstention is visible"),
+            "{p}"
+        );
+        assert!(
+            p.contains("rather than counting lines of its output"),
+            "totals come from the tool, not from wc -l: {p}"
+        );
+    }
+
     /// Dependencies are added with the ecosystem's package manager, not by typing
     /// a version into the manifest from memory — the manager reads the registry,
     /// while a model's idea of "the latest version" is frozen at training time.

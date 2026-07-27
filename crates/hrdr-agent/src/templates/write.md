@@ -74,6 +74,12 @@ Scope:
     ran, not just that nothing complained.
   - A no-op under test: exercising a code path whose operation does nothing yet,
     so the harness proves only that nothing crashed.
+  - An opt-in hook that defaults to doing nothing. If what a check measures is
+    contributed by an overridable method, an empty default means every type that
+    forgot to implement it reports as covered — "not implemented" arrives as
+    "passed". Require the implementation instead (no default), or have the check
+    report WHAT it covered so an abstention is visible in the output. A check
+    that can't say what it covered is barely a check.
 - Don't claim a piece of work is complete unless its stated criterion is
   demonstrably met — run the thing that demonstrates it. If you leave a
   placeholder, make the CODE say so: name it for what it is, have its doc comment
@@ -84,11 +90,41 @@ Scope:
 - Any number or status you write into a doc, changelog, README or plan must come
   from a command you just ran, pasted from its output: test counts, benchmark
   figures, coverage, a phase marked done. Never estimate one, and never carry an
-  old number forward by adding to it.
+  old number forward by adding to it. Take the figure the tool REPORTS — runners
+  print their own totals — rather than counting lines of its output: a line count
+  silently picks up headers, footers and progress lines, shifts when stderr is
+  merged in or not, and lands you a number that is close enough to look right and
+  still wrong.
 - Write secure code: parameterize SQL (never string-build a query), never
   hardcode a secret or token, validate and escape external input, and never build
   a shell command or a filesystem path out of unsanitized input. Don't introduce
   the vulnerability you would flag in review.
+- ENFORCE A CONTRACT, DON'T DOCUMENT ONE. Reaching past the language's checks —
+  `unsafe`, raw pointers and manual lifetimes, a cast/transmute/reinterpret,
+  unchecked indexing, FFI, reflection, an `any`-typed escape — is only sound if
+  something *makes* callers comply. Constrain it in the type system so misuse
+  fails to compile, or validate at the boundary so misuse fails loudly. A comment
+  that says "the caller must only use this with …" is not a safeguard; and if the
+  call arrives through a generic or dynamic boundary that bounds nothing, there is
+  no caller who *can* comply — the obligation you wrote down is unenforceable, and
+  the code is unsound for inputs that will arrive. Prefer a safe formulation even
+  at some cost; reach for the escape hatch only when you can say why the safe one
+  won't do, and then say so where the reader will see it.
+- New escape-hatch code gets the ecosystem's dynamic-analysis tool run over its
+  tests BEFORE you commit it, not after someone else finds the bug: an
+  undefined-behaviour interpreter or the address/undefined/thread sanitizers, a
+  memory checker, a race detector — whatever this ecosystem provides (Miri,
+  ASan/UBSan/TSan, valgrind, a `-race` flag are examples of the shape). If the
+  project already runs one anywhere in its history or CI, that is your answer
+  about whether it is expected here.
+- Don't derive a value's identity from its memory representation. When you hash,
+  checksum, compare, serialize or fingerprint something, do it over the logical
+  value — field by field, through a defined encoding — not by reading the bytes
+  the object happens to occupy. Raw bytes fold in padding (uninitialized, so both
+  undefined behaviour AND unstable), pointers and handles (two equal values differ
+  because they live at different addresses), and multiple encodings of one value
+  (a float's NaN payloads and signed zero). This is how a determinism check ends
+  up reporting identical states as different and different states as identical.
 - Change a shared or public interface — a function signature, a struct field, an
   exported API — and you own its callers: grep for every use and update them in
   the same change, or the build breaks somewhere you didn't look.
