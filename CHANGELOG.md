@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-07-27
+
 ### Fixed
 
 - **`tok/s` was wrong in both directions, and drifted lower the longer a turn
