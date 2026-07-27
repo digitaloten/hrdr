@@ -132,19 +132,52 @@ impl SandboxPolicy {
     }
 
     /// Err unless `canon` (already run through [`canonicalize_nearest`]) is
-    /// under a writable root, or the mode is `None`. `shown` is the path as
-    /// the model named it, so the refusal talks about what it asked for.
+    /// under a writable root *and* clear of the protected metadata directories
+    /// ([`PROTECTED_METADATA_DIRS`]). `shown` is the path as the model named
+    /// it, so the refusal talks about what it asked for.
+    ///
+    /// Both questions are answered on the *canonical* path, which is what makes
+    /// a symlink into `.git` — `link/hooks/pre-commit` — refusable at all.
+    ///
+    /// Mode `None` answers neither: an agent with no boundary has nothing to
+    /// escalate out of, and the unconfined path stays byte-identical to the
+    /// pre-sandbox behavior (see the [`ToolContext::new`](crate::ToolContext::new)
+    /// rule).
+    ///
+    /// This guards the **model's file tools** and nothing else. hrdr's own git
+    /// plumbing — worktree creation, the commits `task_*` makes, `task_apply`'s
+    /// copies — reaches the disk through `std::process::Command`/`std::fs` and
+    /// never comes through here, which is the whole reason the metadata rule can
+    /// be absolute without breaking a write sub-agent's commit. `shell` is not
+    /// covered either, and *cannot* be: `git commit` legitimately writes
+    /// `.git/index` and moves a ref, so the git metadata roots stay writable at
+    /// the OS layer by design. The shell half of this is only ever enforceable
+    /// there, and today it is not enforced at all.
     pub fn check_write(&self, canon: &Path, shown: &Path) -> anyhow::Result<()> {
-        if self.mode == SandboxMode::None || is_under_any(canon, &self.writable_roots) {
+        if self.mode == SandboxMode::None {
             return Ok(());
         }
-        anyhow::bail!(
-            "sandbox: refusing to write {} — it is outside this agent's writable roots. \
-             You may write only under: {}. Keep work inside your working directory; \
-             use the scratch dir for throwaway files.",
-            shown.display(),
-            join_roots(&self.writable_roots)
-        )
+        if !is_under_any(canon, &self.writable_roots) {
+            anyhow::bail!(
+                "sandbox: refusing to write {} — it is outside this agent's writable roots. \
+                 You may write only under: {}. Keep work inside your working directory; \
+                 use the scratch dir for throwaway files.",
+                shown.display(),
+                join_roots(&self.writable_roots)
+            )
+        }
+        if let Some(dir) = protected_metadata_dir(canon, &self.writable_roots) {
+            anyhow::bail!(
+                "sandbox: refusing to write {} — it lands inside `{dir}`, and your file tools \
+                 never write repository or agent metadata: a hook, config or skill placed there \
+                 is read back later and runs with the user's full authority, outside this agent's \
+                 boundary. If the change is really wanted, ask the user to make it. To record \
+                 work, commit it — the `git` tool or `shell` reach git through git itself, which \
+                 writes its own metadata; you do not.",
+                shown.display(),
+            )
+        }
+        Ok(())
     }
 
     /// Err iff the mode is `Read` and `canon` (already canonicalized) is
@@ -182,6 +215,66 @@ fn canonical_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
 /// not-yet-existing suffix — that is what makes this check escape-proof.
 fn is_under_any(canon: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| canon.starts_with(root))
+}
+
+/// Directory names a model-supplied write may never land inside, even when the
+/// path is comfortably under a writable root. Every one of them is a folder the
+/// *harness* later reads back as instruction, or hands to something that
+/// executes it — so a write there escalates this agent's privileges past its own
+/// boundary. Codex refuses the same shape for the same stated reason (folders
+/// whose contents _"could be modified to escalate the privileges of the
+/// agent"_), and its list is the ancestor of this one.
+///
+/// - `.git` — `hooks/pre-commit` runs with the user's full authority on the next
+///   commit *in the parent repo*. That is this module's founding incident with
+///   one extra step, and it is reachable from inside the boundary because a
+///   write sub-agent's cwd **is** its worktree, so the worktree's `.git` is
+///   under a writable root.
+/// - `.hrdr`, `.claude`, `.opencode` — the skill and agent-profile trees hrdr's
+///   own loaders discover (`.hrdr/skills`, `.claude/commands`,
+///   `.opencode/command`; `.hrdr/agents`, `.claude/agents`, `.opencode/agent`).
+///   A skill body is instruction, and an agent profile carries a `tools:`
+///   allow-list and a model — so authoring one is the model writing its own, or
+///   a sibling's, next system prompt. The same escalation with a slower fuse,
+///   which is why the harness-agnostic pair is here and not just hrdr's own.
+///
+/// Deliberately **not** `.agents/`: hrdr reads no such directory (its global
+/// `AGENTS.md` lookup is an XDG config dir, not a repo folder), and a name the
+/// harness never loads as instruction is a refusal that protects nothing and
+/// surprises somebody.
+const PROTECTED_METADATA_DIRS: [&str; 4] = [".git", ".hrdr", ".claude", ".opencode"];
+
+/// The protected directory a write to `canon` would land inside, if any.
+///
+/// `.git` is refused wherever it appears in the canonical path, because four
+/// roots *inside* the parent `.git` are deliberately writable (see
+/// [`git_metadata_roots`] — drop them and every write sub-agent's commit dies on
+/// EROFS), and a root-relative test would let those roots launder
+/// `objects/…`, or `worktrees/<wt>/hooks/…`, straight back in. The file tools
+/// need none of it: git writes its own metadata, through git.
+///
+/// The three agent-config names are refused only *below* a containing root,
+/// never in the root's own path: a write sub-agent's cwd is
+/// `<repo>/.hrdr/worktrees/wt-N`, and a checkout living under `~/.claude/…` is
+/// somebody's real layout — testing the whole path would refuse every write
+/// those agents make.
+///
+/// Any containing root refusing is enough (deny beats allow), though
+/// [`canonical_roots`] leaves roots mutually non-nested, so in a policy it built
+/// exactly one root can contain a given path.
+fn protected_metadata_dir(canon: &Path, roots: &[PathBuf]) -> Option<&'static str> {
+    if canon.components().any(|c| c.as_os_str() == ".git") {
+        return Some(".git");
+    }
+    roots
+        .iter()
+        .filter_map(|root| canon.strip_prefix(root).ok())
+        .flat_map(Path::components)
+        .find_map(|component| {
+            PROTECTED_METADATA_DIRS
+                .into_iter()
+                .find(|name| component.as_os_str() == *name)
+        })
 }
 
 /// The roots as the refusal messages list them.
@@ -1174,7 +1267,142 @@ mod tests {
         };
         check_write(&policy, &common.join("index")).unwrap_err();
         check_write(&policy, &common.join("refs").join("heads").join("main")).unwrap_err();
-        check_write(&policy, &common.join("objects").join("aa").join("bb")).unwrap();
+        // `objects` IS a writable root — the OS layer binds it rw or no commit
+        // works — but the *file tools* are refused it all the same: git writes
+        // its own object store, and nothing the model types needs to.
+        let err = check_write(&policy, &common.join("objects").join("aa").join("bb"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(".git"), "{err}");
+    }
+
+    /// "Is it under a writable root" cannot be the only question a write has to
+    /// answer: a write sub-agent's cwd **is** its worktree, so the worktree's
+    /// `.git` is under a writable root and `.git/hooks/pre-commit` would be a
+    /// file the model may write and the user's next commit would execute.
+    #[test]
+    fn metadata_writes_are_refused_inside_a_writable_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonicalize_nearest(dir.path());
+        // Struct literal, not `for_agent`: the subject is paths *inside* the
+        // root, and a writable `env::temp_dir()` root only adds noise.
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![root.clone()],
+            readable_roots: vec![root],
+        };
+
+        for refused in [
+            ".git/hooks/pre-commit",
+            ".git/config",
+            ".git/objects/ab/cdef",
+            ".hrdr/skills/helpful.md",
+            ".claude/agents/reviewer.md",
+            ".opencode/command/ship.md",
+            // Not just the leading component: a `.git` several levels down is
+            // some other repo's hooks, which is the same escalation.
+            "vendor/dep/.git/hooks/post-checkout",
+        ] {
+            let err = check_write(&policy, &dir.path().join(refused))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("never write repository or agent metadata"),
+                "{refused}: {err}"
+            );
+            assert!(err.contains("ask the user"), "{refused}: {err}");
+        }
+
+        // A neighbour of `.git` is ordinary work, and the test is on whole
+        // components — `.gitignore` and `.github` are not `.git`.
+        check_write(&policy, &dir.path().join("src").join("main.rs")).unwrap();
+        check_write(&policy, &dir.path().join(".gitignore")).unwrap();
+        check_write(&policy, &dir.path().join(".github").join("ci.yml")).unwrap();
+
+        // Write-only: the model must still be able to *read* a config it may
+        // not write, or it cannot answer a question about the repo.
+        let read_policy = SandboxPolicy {
+            mode: SandboxMode::Read,
+            writable_roots: Vec::new(),
+            readable_roots: vec![canonicalize_nearest(dir.path())],
+        };
+        check_read(&read_policy, &dir.path().join(".git").join("config")).unwrap();
+
+        // Mode `None` is unaffected: an unconfined agent has no boundary to
+        // escalate out of, and that path stays what it was before the sandbox.
+        check_write(
+            &SandboxPolicy::unconfined(),
+            &dir.path().join(".git").join("hooks").join("pre-commit"),
+        )
+        .unwrap();
+
+        // The symlink shape: the guard decides on canonical paths, which is the
+        // only reason a link *into* `.git` is refusable at all.
+        #[cfg(unix)]
+        {
+            let dot_git = dir.path().join(".git");
+            std::fs::create_dir(&dot_git).unwrap();
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&dot_git, &link).unwrap();
+            check_write(&policy, &link.join("hooks").join("pre-commit")).unwrap_err();
+        }
+    }
+
+    /// The guard's contract is *where writes land*, not who typed the path — and
+    /// what keeps that honest here is the seam: hrdr's own git plumbing reaches
+    /// the disk through `std::process::Command`/`std::fs` and never calls
+    /// `check_write`. So with the policy a write sub-agent really gets, the file
+    /// tools are refused the worktree's `.git` while the commit that same
+    /// sub-agent exists to make still lands.
+    #[test]
+    fn a_write_sub_agent_still_commits_under_the_metadata_guard() {
+        if which::which("git").is_err() {
+            return; // best-effort: exercise the real backend when available
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (_repo, wt) = repo_with_linked_worktree(dir.path());
+        // The sub-agent shape from `for_agent`, minus the temp/scratch roots
+        // that would cover the whole test tree.
+        let mut roots = vec![wt.clone()];
+        roots.extend(git_metadata_roots(&wt));
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: canonical_roots(roots),
+            readable_roots: Vec::new(),
+        };
+
+        // The model's tools: its own source file yes; the worktree's `.git`
+        // pointer, and anything the pointer leads to, no.
+        check_write(&policy, &wt.join("f.txt")).unwrap();
+        check_write(&policy, &wt.join(".git")).unwrap_err();
+        check_write(&policy, &wt.join(".git").join("hooks").join("pre-commit")).unwrap_err();
+
+        // hrdr's plumbing, spelled the way `task_*` spells it.
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&wt)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        git(&["add", "f.txt"]);
+        git(&[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "mine",
+        ]);
+        assert!(
+            git(&["log", "--oneline"]).contains("mine"),
+            "the sub-agent's commit did not land"
+        );
     }
 
     /// The argv as strings, for readable assertions.
