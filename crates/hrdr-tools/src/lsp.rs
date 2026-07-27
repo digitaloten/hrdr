@@ -11,7 +11,7 @@
 //! by command. Anything unexpected — a dead server, a timeout, a malformed
 //! frame — degrades to "no diagnostics", never to a failed edit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -1086,10 +1086,31 @@ async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Resul
 
 /// Format the **errors** among `diags` as one tool-result note. Warnings and
 /// hints are deliberately dropped — they'd bury the signal on lint-heavy
-/// codebases; the model gets what would actually break the build.
+/// codebases; the model gets what would actually break the build. Repeats —
+/// same start position, severity, message and `source` — collapse to one.
 fn format_diagnostics(root: &Path, path: &Path, diags: &[Value]) -> Option<String> {
-    let errors: Vec<&Value> = diags
+    // The same problem reaches us more than once: servers re-publish overlapping
+    // sets, and separate analysis passes report one error twice. Dedupe *before*
+    // the error filter and the cap, so the cap's budget goes to distinct
+    // diagnostics and "…and N more" counts them. `source` is part of the
+    // identity on purpose — two servers flagging the same line are two findings,
+    // not a repeat — and the set only gates membership, so the first occurrence
+    // keeps its place in the server's order.
+    let mut seen = HashSet::new();
+    let unique: Vec<&Value> = diags
         .iter()
+        .filter(|d| {
+            seen.insert((
+                d.pointer("/range/start/line").and_then(Value::as_i64),
+                d.pointer("/range/start/character").and_then(Value::as_i64),
+                d.get("severity").and_then(Value::as_i64),
+                d.get("message").and_then(Value::as_str),
+                d.get("source").and_then(Value::as_str),
+            ))
+        })
+        .collect();
+    let errors: Vec<&Value> = unique
+        .into_iter()
         // Severity 1 = Error; a missing severity is treated as an error per
         // the LSP spec's "up to the client" default.
         .filter(|d| d.get("severity").and_then(Value::as_i64).unwrap_or(1) == 1)
@@ -1220,6 +1241,74 @@ mod tests {
         let note = format_diagnostics(root, path, &many).unwrap();
         assert!(note.contains("12 errors"), "{note}");
         assert!(note.contains("…and 4 more"), "{note}");
+    }
+
+    /// A server that re-publishes an overlapping set must not spend the model's
+    /// attention (or the cap's budget) on the same error twice. Identity is the
+    /// start position + severity + message + `source`: everything the note
+    /// actually shows, plus who reported it.
+    #[test]
+    fn diagnostics_dedupe_repeats_but_keep_distinct_reports() {
+        let root = Path::new("/proj");
+        let path = Path::new("/proj/src/main.rs");
+        let err = |line: i64, character: i64, msg: &str, source: Option<&str>| {
+            let mut d = json!({"range": {"start": {"line": line, "character": character}},
+                               "severity": 1, "message": msg});
+            if let Some(s) = source {
+                d["source"] = json!(s);
+            }
+            d
+        };
+
+        // An exact repeat collapses; same position with a different message, and
+        // same everything from a *different* server, are separate findings.
+        let note = format_diagnostics(
+            root,
+            path,
+            &[
+                err(4, 8, "mismatched types", None),
+                err(4, 8, "mismatched types", None),
+                err(4, 8, "unresolved import", None),
+                err(4, 8, "mismatched types", Some("clippy")),
+                err(4, 8, "mismatched types", Some("rustc")),
+            ],
+        )
+        .unwrap();
+        assert!(note.contains("4 errors"), "{note}");
+        assert_eq!(
+            note.lines()
+                .filter(|l| l.contains("mismatched types"))
+                .count(),
+            3,
+            "one per distinct source, the sourceless pair collapsed: {note}"
+        );
+        assert!(note.contains("unresolved import"), "{note}");
+
+        // First occurrence keeps its place — the order is the server's, not a
+        // hash order.
+        let note = format_diagnostics(
+            root,
+            path,
+            &[
+                err(9, 1, "second", None),
+                err(1, 1, "first", None),
+                err(9, 1, "second", None),
+            ],
+        )
+        .unwrap();
+        let listed: Vec<&str> = note.lines().skip(1).collect();
+        assert_eq!(listed.len(), 2, "{note}");
+        assert!(listed[0].contains("second"), "{note}");
+        assert!(listed[1].contains("first"), "{note}");
+
+        // The cap counts distinct diagnostics: 10 unique errors published twice
+        // each is "10 errors" with 2 omitted, not 20 with 12.
+        let unique: Vec<Value> = (0..10).map(|i| err(i, 0, "boom", None)).collect();
+        let mut doubled = unique.clone();
+        doubled.extend(unique);
+        let note = format_diagnostics(root, path, &doubled).unwrap();
+        assert!(note.contains("10 errors"), "{note}");
+        assert!(note.contains("…and 2 more"), "{note}");
     }
 
     /// `/doctor`'s status rows track the probe lifecycle: unprobed → "not yet
