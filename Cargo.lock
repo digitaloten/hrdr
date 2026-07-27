@@ -1533,7 +1533,6 @@ dependencies = [
  "notify",
  "serde",
  "serde_json",
- "serde_yaml_ng",
  "syntect",
  "tempfile",
  "tokio",
