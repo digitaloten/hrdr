@@ -613,6 +613,24 @@ mod tests {
         }
     }
 
+    /// Every backend this host can actually run, so the shared-behaviour tests
+    /// below exercise all of them instead of whichever one `detect()` would
+    /// pick — a dev machine has ripgrep, so the POSIX and built-in paths used to
+    /// run in CI only (which is how the `--exclude-dir=.*` trap below reached a
+    /// tag). A backend whose binary is absent is skipped rather than failed: a
+    /// machine without `grep` must still pass the suite.
+    fn available_backends() -> Vec<(&'static str, GrepBackend)> {
+        let mut out = Vec::new();
+        if which::which("rg").is_ok() {
+            out.push(("rg", GrepBackend::Rg));
+        }
+        if which::which("grep").is_ok() {
+            out.push(("grep", GrepBackend::Grep));
+        }
+        out.push(("builtin", GrepBackend::Builtin)); // pure Rust: always runnable
+        out
+    }
+
     #[test]
     fn multiline_defaults_to_false_and_is_in_schema() {
         let args: GrepArgs = serde_json::from_value(json!({ "pattern": "x" })).unwrap();
@@ -1106,6 +1124,126 @@ mod tests {
             a.path = Some(outside.path().to_string_lossy().to_string());
             let err = grep_builtin(&a, &ctx).unwrap_err().to_string();
             assert!(err.contains("sandbox: refusing to read"), "{err}");
+        }
+    }
+
+    /// The matching semantics every backend owes the model, run against each of
+    /// them: a regex, `literal`, `case_insensitive`, and a pattern that hits
+    /// nothing. Asserted on the shared invariant rather than byte-identical
+    /// output — the subprocess backends print the search root they were given
+    /// (`./code.rs:1:…`), the walker prints the path relative to cwd.
+    #[tokio::test]
+    async fn every_backend_agrees_on_regex_literal_case_and_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("code.rs"), "let NEEDLE = foo(bar);\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+
+        for (name, backend) in available_backends() {
+            let run = |args| {
+                let tool = GrepTool { backend };
+                let ctx = &ctx;
+                async move { tool.execute(args, ctx).await.unwrap() }
+            };
+
+            let out = run(json!({"pattern": "NE+DLE"})).await;
+            assert!(out.contains("code.rs:1:let NEEDLE"), "{name}: {out}");
+            // As a regex, `foo(bar)` is a group — it matches the text "foobar",
+            // not the parens; only `literal` finds them verbatim.
+            assert_eq!(
+                run(json!({"pattern": "foo(bar)"})).await,
+                "(no matches)",
+                "{name}"
+            );
+            let out = run(json!({"pattern": "foo(bar)", "literal": true})).await;
+            assert!(
+                out.contains("code.rs:1:let NEEDLE = foo(bar)"),
+                "{name}: {out}"
+            );
+
+            assert_eq!(
+                run(json!({"pattern": "needle"})).await,
+                "(no matches)",
+                "{name}"
+            );
+            let out = run(json!({"pattern": "needle", "case_insensitive": true})).await;
+            assert!(out.contains("code.rs:1:let NEEDLE"), "{name}: {out}");
+
+            assert_eq!(
+                run(json!({"pattern": "absent-xyzzy"})).await,
+                "(no matches)",
+                "{name}"
+            );
+        }
+    }
+
+    /// `hidden`/`no_ignore` across the backends. The invariant all three share
+    /// is that the toggle finds the file; only the filtering backends skip it by
+    /// default. POSIX `grep` has no `.gitignore` engine and no notion of
+    /// "hidden", so it never excluded either — see the NB in `grep_posix`, which
+    /// is why emulating the dotfile skip there was abandoned.
+    #[tokio::test]
+    async fn every_backend_finds_hidden_and_ignored_files_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        // The `.git` dir is what makes `.gitignore` apply at all — both ripgrep
+        // and the `ignore` crate only honor git rules inside a repository.
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "gitneedle\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".hidden-dir")).unwrap();
+        std::fs::write(dir.path().join(".hidden-dir/file.txt"), "dotneedle\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+
+        for (name, backend) in available_backends() {
+            let run = |args| {
+                let tool = GrepTool { backend };
+                let ctx = &ctx;
+                async move { tool.execute(args, ctx).await.unwrap() }
+            };
+
+            // Windows paths print with `\` — normalize before asserting.
+            let out = run(json!({"pattern": "dotneedle", "hidden": true}))
+                .await
+                .replace('\\', "/");
+            assert!(
+                out.contains(".hidden-dir/file.txt:1:dotneedle"),
+                "{name}: {out}"
+            );
+            let out = run(json!({"pattern": "gitneedle", "no_ignore": true})).await;
+            assert!(out.contains("ignored.txt:1:gitneedle"), "{name}: {out}");
+
+            if matches!(backend, GrepBackend::Grep) {
+                continue; // filters nothing by default, so nothing to skip
+            }
+            assert_eq!(
+                run(json!({"pattern": "dotneedle"})).await,
+                "(no matches)",
+                "{name}"
+            );
+            assert_eq!(
+                run(json!({"pattern": "gitneedle"})).await,
+                "(no matches)",
+                "{name}"
+            );
+        }
+    }
+
+    /// `glob` reaches every backend through a different mechanism (`--glob`,
+    /// `--include`, `glob::Pattern` on the walk), so pin the one thing they must
+    /// agree on: only the matching files are searched.
+    #[tokio::test]
+    async fn every_backend_scopes_a_search_with_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("code.rs"), "needle in rust\n").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "needle in text\n").unwrap();
+        let ctx = ToolContext::new(dir.path());
+
+        for (name, backend) in available_backends() {
+            let out = GrepTool { backend }
+                .execute(json!({"pattern": "needle", "glob": "*.rs"}), &ctx)
+                .await
+                .unwrap();
+            assert!(out.contains("code.rs:1:needle in rust"), "{name}: {out}");
+            assert!(!out.contains("notes.txt"), "{name}: {out}");
         }
     }
 }
