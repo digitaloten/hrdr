@@ -1656,7 +1656,10 @@ impl Agent {
         // catalogs already on disk — see `preflight_notices`. Queued rather than
         // printed: a line on stderr is invisible under a TUI, and a sub-agent has no
         // stderr anyone reads.
-        let pending_notices = preflight_notices(&config.providers, &resolved);
+        let mut pending_notices = preflight_notices(&config.providers, &resolved);
+        // An `AGENTS.md` hrdr found and did not load is a user instruction silently
+        // missing from the prompt — the same channel carries it, for the same reason.
+        pending_notices.extend(project_docs.skipped.iter().map(|s| s.notice()));
 
         Ok(Self {
             client,
@@ -1897,6 +1900,14 @@ impl Agent {
         // changing a word, and re-announcing a reload that changed nothing is a lie.
         let docs = gather_agent_docs(&self.ctx.cwd);
         self.project_docs_changed = docs != self.project_docs;
+        // A `set_cwd` into a project whose AGENTS.md is over a cap has to say so
+        // too — the file is missing from the prompt this call just rebuilt. Deduped,
+        // since `/clear` re-runs this against the same tree.
+        for notice in docs.skipped.iter().map(|s| s.notice()) {
+            if !self.pending_notices.contains(&notice) {
+                self.pending_notices.push(notice);
+            }
+        }
         self.project_docs = docs;
         // Re-resolve memory roots for the (possibly changed) cwd and reload the
         // index, so `/clear` and `set_cwd` reflect saved notes for this project.
@@ -3884,6 +3895,42 @@ mod tests {
         reader.ctx.resolve_write("out.txt").unwrap_err();
     }
 
+    /// An `AGENTS.md` too large to load reaches the *user*, not just the record.
+    ///
+    /// `gather_agent_docs` decides; `Agent::new` is where that decision has to
+    /// become visible, and it uses the channel already built for exactly this kind
+    /// of thing (the model pre-flight): queued, not printed, because stderr is
+    /// invisible under the TUI. Without this wiring the file is on disk, hrdr saw
+    /// it, and the agent answers as though the project had no instructions.
+    #[test]
+    fn an_oversized_agents_md_queues_a_notice_at_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("AGENTS.md");
+        std::fs::write(&big, format!("Use tabs.\n{}", "x".repeat(70 * 1024))).unwrap();
+
+        let mut agent = Agent::new(AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            ..Default::default()
+        })
+        .unwrap();
+        let notices = agent.take_pending_notices();
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains(&big.display().to_string()) && n.contains("per-file cap")),
+            "the skipped AGENTS.md must be named on the notice channel: {notices:?}"
+        );
+        // And it is not in the prompt — the notice is the only way to learn that.
+        assert!(
+            !agent.messages[0]
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Use tabs."),
+            "the over-cap file must not have been loaded"
+        );
+    }
+
     #[test]
     fn subagent_base_bounds_recursion_and_picks_model() {
         use super::subagent_base_config;
@@ -4831,6 +4878,7 @@ mod tests {
                 &super::prompt::AgentDocs {
                     global: Some("global docs".to_string()),
                     project: Some("project docs".to_string()),
+                    ..Default::default()
                 },
                 &super::MemoryIndex {
                     global: Some("global memory".to_string()),

@@ -339,7 +339,10 @@ Type `/` to see the menu (fuzzy-matched, `Tab` to accept). Highlights:
 
 Sessions auto-save per working directory and auto-resume on reopen. Project
 instructions are read from `AGENTS.md` (the open [agents.md](https://agents.md)
-standard) walking up from the cwd.
+standard) walking up from the cwd. A single file over 64 KiB, or one the 1 MiB
+aggregate budget can no longer hold, is skipped — and **said so**: a notice
+names the path and its size, because instructions dropped in silence are worse
+than instructions that were never there.
 
 ### Model endpoint
 
