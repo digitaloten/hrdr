@@ -8,6 +8,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A growing file is now treated as a defect.** Code lands somewhere and
+  "somewhere" drifts: a 300-line module becomes 5000, a function stops fitting
+  on a screen, one type collects a dozen responsibilities. Write-capable agents
+  are told that monolith is a standing threat — nobody holds it in their head,
+  every change makes a reader (or a model on a token budget) load all of it to
+  touch any of it, reviews thin out as diff context grows, and concurrent
+  changes all collide in the same file — and to split it as part of the work
+  rather than filing it under "later". Split along the seams the code already
+  has, one named responsibility per unit (if you can't name the piece you're
+  extracting, you haven't found the seam); move code in one step and change
+  behaviour in another so a move is reviewable as a move; preserve the public
+  surface so callers don't churn. Scoped deliberately: split what the task
+  already touches, and report a monolith elsewhere instead of turning a bug fix
+  into an unrequested reorganisation.
+- **DRY and YAGNI are now named, with the trap between them spelled out.** The
+  second place that needs the same logic is when the helper gets written — two
+  copies is already the bug, since that's where they drift apart. But nothing
+  gets abstracted ahead of need: a single-caller helper, flexibility nothing
+  exercises, a parameter every call passes the same value for, an interface with
+  one implementation, a hook nothing registers — all indirection shaped by a
+  guess about a second use that never arrived, and better deleted than kept "in
+  case". And the distinction that keeps naive DRY from doing damage: it is about
+  duplicated _knowledge_, not duplicated shape. Two blocks that merely look
+  alike, and would change for different reasons, stay apart — merging them
+  couples unrelated things and the helper grows a flag per caller to pull them
+  back apart.
+- **A pass over the prompt templates for redundancy and vagueness.**
+  `write.md`'s `Scope:` section had become a dumping ground of seventeen
+  unrelated rules, so it is now `Scope` / `Style` / `Correctness` /
+  `Soundness and security` — the rules are unchanged, but a model looking for
+  one can find it. Removed a genuine contradiction (two different rules for
+  adding a dependency: one said ask first, the other said mention it afterwards
+  — ask first wins), the duplicated "say so in your summary" tails in `Tests`,
+  the second copy of the secrets-never-leave-the-machine rule in `base.md`, and
+  the intro line the new `Voice` section superseded. "Don't invent APIs" now
+  points at the Dependencies rule for third-party symbols instead of restating
+  it, and a priority-order rule that opened "when these pull against each other"
+  — with no referent left after the split — names correctness, performance and
+  readability outright.
+
 - **A `Voice` section in the base prompt: terse and direct, with mechanical
   detail exempt.** Every agent — read-only ones included — is now told to lead
   with the answer rather than a preamble, to drop filler and hedging that
