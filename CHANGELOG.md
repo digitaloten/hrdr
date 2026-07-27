@@ -1239,6 +1239,11 @@ backend regression (below), so every publish job was skipped.
   commit — scratch files, a half-finished edit, a file with a secret — so the
   guardrail now refuses them with a corrective error ("stage the files you
   changed by name"). The system prompt names the `-am` spelling explicitly too.
+
+## [0.4.1] - 2026-07-16
+
+### Security
+
 - **External tool output is now wrapped as untrusted data.** A fetched web page,
   a search result, and a third-party MCP server's output are the classic
   prompt-injection vectors — text in them that says "ignore your instructions"
