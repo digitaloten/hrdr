@@ -508,8 +508,25 @@ jobs:
             echo "::error::publish failed for ${crate} after 3 rate-limit retries"
             return 1
           }
-          # Dependency order.
-          for CRATE in hrdr-llm hrdr-tools hrdr-agent hrdr-editor hrdr-app hrdr-tui hrdr; do
+          # Dependency order. `hrdr-protocol` first (no internal deps),
+          # `hrdr-web` after the three it needs (protocol, app, agent), and the
+          # `hrdr` binary last because it depends on every one of them.
+          ORDER="hrdr-protocol hrdr-llm hrdr-tools hrdr-agent hrdr-editor hrdr-app hrdr-tui hrdr-web hrdr"
+          # A crate missing from ORDER fails the release *before* anything is
+          # uploaded, rather than half-publishing and stranding the binary: that
+          # is exactly what v0.8.0 did — `hrdr-web` shipped with the web UI, was
+          # never added here, and `hrdr` (which depends on it) could not publish
+          # once the six libs were already up. `publish = false` members and the
+          # workspace-excluded `hrdr-ui` are not publishable and are not listed.
+          MEMBERS=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.publish != []) | .name' | sort)
+          LISTED=$(printf '%s\n' $ORDER | sort)
+          if [ "$MEMBERS" != "$LISTED" ]; then
+            echo "::error::publish list drift — every publishable workspace member must be in ORDER, in dependency order"
+            diff <(echo "$LISTED") <(echo "$MEMBERS") | sed 's/^/  /' || true
+            exit 1
+          fi
+          for CRATE in $ORDER; do
             publish_if_missing "$CRATE"
           done
 
