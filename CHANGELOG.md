@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-07-27
+
+### Fixed
+
+- **v0.8.0 never reached crates.io in full.** The release workflow's publish
+  list was written before `hrdr-protocol` and `hrdr-web` existed and was never
+  updated when the web UI shipped, so v0.8.0 uploaded the six older libraries,
+  then failed on the `hrdr` binary — which depends on `hrdr-web` — with
+  `no matching package named 'hrdr-web' found`. The binary release (GitHub
+  Release, Homebrew, Scoop, AUR, Alpine) was unaffected and v0.8.0 installs from
+  all of those; only `cargo install hrdr` and the two new libraries were
+  missing. Both crates are in the list now, in dependency order, and a
+  pre-flight check compares it against every publishable workspace member from
+  `cargo metadata` — so a crate added without touching the list fails the
+  release **before** anything is uploaded, instead of half-publishing and
+  stranding the binary.
+
 ## [0.8.0] - 2026-07-27
 
 ### Added
@@ -3810,7 +3827,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/kryptic-sh/hrdr/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/kryptic-sh/hrdr/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/kryptic-sh/hrdr/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/kryptic-sh/hrdr/compare/v0.6.2...v0.7.0
