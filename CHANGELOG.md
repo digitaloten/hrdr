@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependencies are added with the ecosystem's package manager, not by editing
+  the manifest.** A model writing a version number is writing one from training,
+  and "the latest version" is stale the day it ships — so the guess lands on a
+  version that never existed, one with a known advisory, or one whose API isn't
+  the one being coded against. Write-capable agents are now told to find and use
+  the project's own add/upgrade/remove command, with the narrow exception (a
+  workspace layout, a feature selection, a patch/override stanza, a constraint
+  the manager can't express) still routed through the manager for the lockfile
+  and committed together.
+- **A dependency's interface is read from the copy that resolved, not
+  recalled.** Every package manager unpacks its dependencies somewhere local,
+  and that copy is the truth for this build — so the rule is now a general one,
+  applied before the first call rather than only after a signature error, and it
+  includes checking _which_ version resolved: a confidently-remembered API is
+  often from another major. The debugging section points at it instead of
+  repeating it.
+- Both are written so the examples read as examples. Commands and cache paths
+  from several ecosystems are given as the shape to recognise, explicitly "NOT
+  the list of what exists", with a way to find the answer for an ecosystem not
+  named (ask the manager, or search the filesystem) — an unlisted toolchain must
+  not read as an unsupported one.
+
 ## [0.8.3] - 2026-07-27
 
 ### Added

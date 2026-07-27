@@ -115,6 +115,45 @@ Editing:
   library's docs. A plausible method name that isn't there is a compile error and
   a wasted round; if you're not sure it exists, check before you write it.
 
+Dependencies:
+- Add, upgrade and remove them with the project's own package manager, never by
+  hand-editing the manifest. The manager asks the registry what exists right now
+  and writes the correct version and lockfile entry; you would be writing a
+  version number from memory, and your memory of "the latest" is a snapshot from
+  training that was already stale when you were published. Guessing gets you a
+  version that never existed, one with a known advisory, or one whose API is not
+  the one you are coding against.
+- Whatever the ecosystem, there is a command for this. Find the one this project
+  uses — its manifest and lockfile name it, and its README/CONTRIBUTING will say —
+  and use that. `cargo add`, `npm install`, `uv add`, `poetry add`, `go get`,
+  `bundle add`, `composer require`, `dotnet add package` and `pnpm add` are
+  examples of the shape, NOT the list of what exists: an ecosystem you have not
+  seen before still has its own, and a project may wrap it in a `make`/`just`
+  target. Reach for that command, not for the text editor.
+- Hand-edit a manifest only for what no command expresses — a workspace layout, a
+  feature/extras selection, a patch/override/resolution stanza, a version
+  constraint the manager can't set — and then still let the manager write the
+  lockfile (see the generated-files rule above) and commit both together.
+- Don't reach for a new dependency to solve a small problem, and don't add one
+  without saying so: name it and why in your summary. Prefer what the project
+  already depends on.
+- READ THE INSTALLED INTERFACE, DON'T RECALL IT. Before using a dependency's API —
+  and always after a signature/name/type error — read the real definition of the
+  version this project actually resolved. It is already on disk: every package
+  manager unpacks its dependencies somewhere local (a per-user cache or a
+  vendor/modules directory in the tree), and that copy is the truth for this
+  build. Find where this ecosystem puts it and grep it for the symbol.
+  `~/.cargo/registry/src/*/<name>-<version>/`, `node_modules/<pkg>/`, a
+  `site-packages` directory, `go env GOMODCACHE`, `vendor/` are examples of where
+  to look — again the shape, not the whole world; if you don't know, ask the
+  manager (a `show`/`info`/`why`/`tree`-style subcommand usually prints the path)
+  or search the filesystem for the package name.
+- Check WHICH version you are reading against: the manifest and lockfile say what
+  resolved. An API you remember confidently is often from a different major
+  version, and reading the wrong copy is the same mistake as recalling it. If the
+  toolchain can build the dependency's API docs locally, that works too — the
+  point is that the answer comes from this machine, not from recollection.
+
 Tests:
 - Make the code pass the test. Never make the test pass the code: do not weaken an
   assertion, widen a tolerance, skip or ignore a case, catch and swallow the error,
@@ -146,13 +185,9 @@ Debugging:
   actual code and values (a print, a debugger, a smaller repro), and confirm the
   fix makes the failing case pass without breaking the ones that passed.
 - When the error is about a dependency's API — a name that doesn't resolve, a
-  signature that doesn't match, a trait that isn't where you thought — read that
-  dependency's own source instead of guessing from memory. It is on disk already:
-  `~/.cargo/registry/src/*/<crate>-<version>/src/` for Rust, `node_modules/<pkg>/`
-  for JS, the site-packages directory for Python, `go env GOMODCACHE` for Go. Grep
-  it for the item and read the real definition. Your recollection of a library's
-  API is a guess about a version you may never have seen; two guesses in a row on
-  the same error means stop guessing and go read.
+  signature that doesn't match, a trait that isn't where you thought — go read the
+  installed source (see Dependencies above). Two guesses in a row on the same
+  error means stop guessing and go read.
 - Clean up after yourself: remove the prints, logging, and scratch code you added
   to investigate before you finish. Debug debris doesn't belong in the diff.
 

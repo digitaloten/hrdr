@@ -1884,24 +1884,88 @@ mod tests {
         assert!(!read_only.contains("cargo tree -i"), "{read_only}");
     }
 
-    /// A compile error about a dependency's API is answered by reading that
-    /// dependency, not by recalling it: the package cache is already on disk.
-    /// (Observed to end a hallucination loop on the first read.)
+    /// A dependency's API is answered by reading the copy this project resolved,
+    /// not by recalling it: every package manager unpacks its dependencies
+    /// somewhere local. (Observed to end a hallucination loop on the first read.)
+    ///
+    /// The rule is a general one in the Dependencies block, with the debugging
+    /// path pointing at it — a signature error is where it bites hardest, but
+    /// checking before the first call is what avoids the error.
     #[test]
-    fn the_prompt_sends_dependency_api_errors_to_the_package_cache() {
+    fn the_prompt_sends_dependency_api_questions_to_the_installed_copy() {
         let tools = ToolRegistry::with_defaults();
         let p = render_system(&tools, false).unwrap();
 
-        assert!(p.contains("read that\n  dependency's own source"), "{p}");
-        // Where to look, spelled out per ecosystem.
+        assert!(
+            p.contains("READ THE INSTALLED INTERFACE, DON'T RECALL IT"),
+            "{p}"
+        );
+        assert!(
+            p.contains("that copy is the truth for this\n  build"),
+            "{p}"
+        );
+        // Where to look — as examples of the shape, explicitly not a closed list,
+        // so an ecosystem the model hasn't seen doesn't read as unsupported.
         assert!(p.contains("~/.cargo/registry/src/"), "{p}");
         assert!(p.contains("node_modules/"), "{p}");
         assert!(p.contains("GOMODCACHE"), "{p}");
-        // Why: recollection is a guess about a version you may not have seen.
         assert!(
-            p.contains("two guesses in a row on\n  the same error means stop guessing"),
+            p.contains("the shape, not the whole world"),
+            "the paths are examples, and the model is told how to find its own: {p}"
+        );
+        // Which version you're reading matters as much as reading at all.
+        assert!(
+            p.contains("Check WHICH version you are reading against"),
             "{p}"
         );
+        // Why: recollection is a guess about a version you may not have seen — and
+        // the debugging path routes back here rather than repeating itself.
+        assert!(
+            p.contains("go read the\n  installed source (see Dependencies above)"),
+            "{p}"
+        );
+        assert!(
+            p.contains("Two guesses in a row on the same\n  error means stop guessing"),
+            "{p}"
+        );
+    }
+
+    /// Dependencies are added with the ecosystem's package manager, not by typing
+    /// a version into the manifest from memory — the manager reads the registry,
+    /// while a model's idea of "the latest version" is frozen at training time.
+    #[test]
+    fn the_prompt_installs_dependencies_with_the_package_manager() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, false).unwrap();
+
+        assert!(p.contains("never by\n  hand-editing the manifest"), "{p}");
+        assert!(
+            p.contains("already stale when you were published"),
+            "the reason the guess is unreliable, not just that it is discouraged: {p}"
+        );
+        // Commands from several ecosystems, framed as a shape to recognise rather
+        // than the set of ecosystems supported.
+        for cmd in [
+            "cargo add",
+            "npm install",
+            "uv add",
+            "go get",
+            "composer require",
+        ] {
+            assert!(p.contains(cmd), "missing {cmd}: {p}");
+        }
+        assert!(
+            p.contains("NOT the list of what exists"),
+            "an unlisted ecosystem must not read as unsupported: {p}"
+        );
+        // The narrow exception, still routed through the manager for the lockfile.
+        assert!(
+            p.contains("Hand-edit a manifest only for what no command expresses"),
+            "{p}"
+        );
+        // Write-gated, like the rest of the block.
+        let read_only = render_flags(false, false, false, None);
+        assert!(!read_only.contains("cargo add"), "{read_only}");
     }
 
     /// An agent that *cannot* delegate is not told how to.
