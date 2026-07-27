@@ -8849,28 +8849,106 @@ mod tests {
 
     #[test]
     fn repeat_guard_blocks_verbatim_loops_only() {
+        // The failure path, asserted end to end: the success-repeat nudge added
+        // later shares `RepeatGuard`'s state, and none of this may shift.
         let mut g = super::RepeatGuard::default();
         // First failure: no nudge, no refusal.
-        assert!(g.record("edit", "{a}", false).is_none());
+        assert!(g.record("edit", "{a}", false, false).is_none());
         assert!(g.refusal("edit", "{a}").is_none());
         // Second identical failure: nudge; third attempt: refused.
-        assert!(g.record("edit", "{a}", false).is_some());
+        assert!(g.record("edit", "{a}", false, false).is_some());
         assert!(g.refusal("edit", "{a}").is_some());
         // A different call resets the streak — the same call may run again…
-        assert!(g.record("bash", "{fix}", true).is_none());
+        assert!(g.record("bash", "{fix}", true, false).is_none());
         assert!(g.refusal("edit", "{a}").is_none());
         // …so test → edit → test cycles are never blocked.
-        assert!(g.record("bash", "{test}", false).is_none());
-        assert!(g.record("edit", "{fix2}", true).is_none());
+        assert!(g.record("bash", "{test}", false, false).is_none());
+        assert!(g.record("edit", "{fix2}", true, false).is_none());
         assert!(g.refusal("bash", "{test}").is_none());
         // Success of the previously failing call clears it too.
-        assert!(g.record("edit", "{a}", false).is_none());
-        assert!(g.record("edit", "{a}", true).is_none());
+        assert!(g.record("edit", "{a}", false, false).is_none());
+        assert!(g.record("edit", "{a}", true, false).is_none());
+        assert!(g.refusal("edit", "{a}").is_none());
+        // …and the failure *after* that success starts a fresh streak: one
+        // failure is not a loop, so no nudge and no refusal yet.
+        assert!(g.record("edit", "{a}", false, false).is_none());
         assert!(g.refusal("edit", "{a}").is_none());
         // Different args = different call.
-        assert!(g.record("edit", "{x}", false).is_none());
-        assert!(g.record("edit", "{y}", false).is_none());
+        assert!(g.record("edit", "{x}", false, false).is_none());
+        assert!(g.record("edit", "{y}", false, false).is_none());
         assert!(g.refusal("edit", "{y}").is_none());
+        // Escalation still counts up, and the nudge still names the count.
+        assert!(g.record("edit", "{y}", false, false).unwrap().contains('2'));
+        assert!(g.record("edit", "{y}", false, false).unwrap().contains('3'));
+    }
+
+    /// The call that *works* every time and gets nowhere: three identical
+    /// `read`s of the same file, or a `cargo test` re-run that keeps exiting 0.
+    /// `RepeatGuard` used to reset on success, so only the round *count* cap
+    /// noticed — by which point the whole cost cap could be spent too.
+    #[test]
+    fn repeat_guard_nudges_a_succeeding_call_that_goes_nowhere() {
+        let mut g = super::RepeatGuard::default();
+        // Two identical succeeding calls stay quiet: a re-read after an edit is
+        // a real check, not a loop.
+        assert!(g.record("read", "{p}", true, false).is_none());
+        assert!(g.record("read", "{p}", true, false).is_none());
+        // The third earns the nudge, and every one after it escalates.
+        let nudge = g.record("read", "{p}", true, false).unwrap();
+        assert!(nudge.contains("3 times in a row"), "{nudge}");
+        assert!(nudge.contains("read"), "{nudge}");
+        assert!(g.record("read", "{p}", true, false).unwrap().contains('4'));
+        // A succeeding repeat is never refused — only failures are.
+        assert!(g.refusal("read", "{p}").is_none());
+        // Any intervening different call resets the streak.
+        assert!(g.record("grep", "{q}", true, false).is_none());
+        assert!(g.record("read", "{p}", true, false).is_none());
+        assert!(g.record("read", "{p}", true, false).is_none());
+    }
+
+    /// Polling is repetitive by design: `watch`, and `task_output`/`task_list` on
+    /// a still-running sub-agent, are *meant* to be called with identical
+    /// arguments until the answer changes.
+    #[test]
+    fn repeat_guard_leaves_polling_tools_alone() {
+        let mut g = super::RepeatGuard::default();
+        for _ in 0..6 {
+            assert!(g.record("task_output", "{\"id\":1}", true, true).is_none());
+        }
+        // The opt-out covers the success nudge only — a poll that keeps erroring
+        // is a loop like any other.
+        assert!(g.record("watch", "{c}", false, true).is_none());
+        assert!(g.record("watch", "{c}", false, true).is_some());
+        assert!(g.refusal("watch", "{c}").is_some());
+    }
+
+    /// The opt-out lives on the tool, not in a name list the turn loop keeps in
+    /// sync — so this asserts the real registry answers, not a copy of it.
+    #[test]
+    fn only_the_polling_tools_opt_out_of_repeat_detection() {
+        let r = hrdr_tools::ToolRegistry::with_defaults();
+        assert!(r.is_repeatable("watch"));
+        // The tools this whole mechanism exists to catch must not opt out.
+        assert!(!r.is_repeatable("read"));
+        assert!(!r.is_repeatable("grep"));
+        assert!(!r.is_repeatable("shell"));
+        // An unknown name repeats like anything else.
+        assert!(!r.is_repeatable("nonexistent"));
+        // The sub-agent polls live in hrdr-agent's own registry.
+        use hrdr_tools::Tool as _;
+        assert!(
+            crate::delegation::TaskListTool {
+                transcript_dir: None
+            }
+            .repeatable()
+        );
+        assert!(
+            crate::delegation::TaskOutputTool {
+                live: LiveSubagents::new(),
+                transcript_dir: None,
+            }
+            .repeatable()
+        );
     }
 
     // ---- repair_dangling_tool_calls (additional cases) ----
@@ -10297,6 +10375,60 @@ mod tests {
             assert_eq!(checkpoint_warning_round(5), Some(4));
             assert_eq!(checkpoint_warning_round(10), Some(8));
             assert_eq!(checkpoint_warning_round(300), Some(240));
+        }
+
+        /// End to end through the real dispatch: the same `read` three times over,
+        /// succeeding every time, and the third result carries the nudge. Guards
+        /// the wiring (`finish_tool_call` asking the registry for the opt-out) that
+        /// the `RepeatGuard` unit tests can't see.
+        #[tokio::test]
+        async fn agent_run_nudges_an_identical_call_that_keeps_succeeding() {
+            let dir = tempfile::tempdir().unwrap();
+            let test_file = dir.path().join("data.txt");
+            std::fs::write(&test_file, "content").unwrap();
+            let args_json =
+                serde_json::to_string(&json!({"path": test_file.to_string_lossy()})).unwrap();
+            let round = |n: usize| {
+                MockResp::Sse(vec![
+                    tool_start_chunk(&format!("c{n}"), &format!("call_{n}"), "read"),
+                    tool_args_chunk(&format!("c{n}"), &args_json),
+                    tool_calls_stop_chunk(&format!("c{n}")),
+                    "[DONE]".to_string(),
+                ])
+            };
+            let server = MockServer::start(vec![
+                round(1),
+                round(2),
+                round(3),
+                MockResp::Sse(vec![
+                    text_chunk("c4", "Done."),
+                    stop_chunk("c4"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.max_steps = 5;
+            let mut agent = Agent::new(cfg).unwrap();
+            agent.run_input("read it", |_| {}).await.unwrap();
+
+            let nudged: Vec<&str> = agent
+                .messages()
+                .iter()
+                .filter(|m| m.role == Role::Tool)
+                .filter_map(|m| m.content.as_deref())
+                .filter(|c| c.contains("cannot tell you anything new"))
+                .collect();
+            assert_eq!(
+                nudged.len(),
+                1,
+                "only the third identical call is nudged: {nudged:?}"
+            );
+            assert!(
+                nudged[0].contains("this exact read call 3 times"),
+                "{nudged:?}"
+            );
         }
 
         /// The nudge's mechanical backstop: reconciling the TODO list by *deleting*

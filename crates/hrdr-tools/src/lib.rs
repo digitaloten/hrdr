@@ -1179,6 +1179,20 @@ pub trait Tool: Send + Sync {
         self.read_only()
     }
 
+    /// Whether calling this tool repeatedly with *identical* arguments is a
+    /// legitimate use of it, rather than a stuck model.
+    ///
+    /// The agent watches for the same call being made over and over (see
+    /// `RepeatGuard`) and nudges the model that repeating it won't tell it
+    /// anything new. That is wrong for a tool whose whole job is to be asked the
+    /// same question until the answer changes — polling a still-running
+    /// background sub-agent, waiting on an external end state — so those opt out
+    /// here. Default `false`: for everything else, the third identical call is a
+    /// loop.
+    fn repeatable(&self) -> bool {
+        false
+    }
+
     /// If this is the `shell` tool, the [`Shell`] it runs; `None` for every other
     /// tool. Lets the prompt name the session's shell and gate dialect-specific
     /// guidance by asking `Shell` rather than matching on a program name.
@@ -1297,6 +1311,13 @@ impl ToolRegistry {
     /// [`Tool::concurrent`]); unknown names are not.
     pub fn is_concurrent(&self, name: &str) -> bool {
         self.tools.get(name).is_some_and(|t| t.concurrent())
+    }
+
+    /// Whether identical repeated calls of `name` are legitimate (see
+    /// [`Tool::repeatable`]); unknown names are not — an unknown name only ever
+    /// produces the same error, so repeating it is a loop like any other.
+    pub fn is_repeatable(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(|t| t.repeatable())
     }
 
     /// Execute a named tool. Errors from a missing tool are hard; errors from
@@ -2097,6 +2118,13 @@ mod tests {
         assert!(RoTool.concurrent());
         assert!(!WriteTool.concurrent());
         assert!(!EditTool.concurrent());
+        // Nothing is repeat-exempt by default, however it reads or writes — the
+        // agent's repeat detection only skips tools that opt out on purpose.
+        assert!(!RoTool.repeatable());
+        assert!(!WriteTool.repeatable());
+        assert!(!ReadTool.repeatable());
+        // `watch` is asked the same question until the answer changes.
+        assert!(WatchTool.repeatable());
     }
 
     // ---- tool scoping ----

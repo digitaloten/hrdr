@@ -1822,6 +1822,11 @@ impl hrdr_tools::Tool for TaskListTool {
     fn read_only(&self) -> bool {
         true
     }
+    /// Checking on running sub-agents means asking the same question until the
+    /// answer changes — no arguments to vary, so every check is byte-identical.
+    fn repeatable(&self) -> bool {
+        true
+    }
     async fn execute(
         &self,
         _args: serde_json::Value,
@@ -1931,6 +1936,11 @@ impl hrdr_tools::Tool for TaskOutputTool {
         })
     }
     fn read_only(&self) -> bool {
+        true
+    }
+    /// Polling one running task's progress repeats the same `id` by definition —
+    /// the tool is asked again precisely because the output is expected to grow.
+    fn repeatable(&self) -> bool {
         true
     }
     async fn execute(

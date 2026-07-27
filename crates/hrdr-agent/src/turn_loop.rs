@@ -47,20 +47,45 @@ const UI_STREAM_CAP: usize = 1024;
 /// without executing (small models loop on verbatim retries).
 const REPEAT_REFUSE_AFTER: u32 = 2;
 
+/// Consecutive identical calls — **whatever their outcome** — after which the
+/// model is told it is repeating itself (see [`RepeatGuard`]).
+///
+/// Three, not two: the second identical call is often a real check rather than a
+/// loop (re-`read` a file after editing it, re-run the test that just failed).
+/// The third is where the pattern stops being a check — nothing between call two
+/// and call three changed the world, so call three cannot learn anything call two
+/// didn't. Opencode picked the same number independently (`session/processor.ts`
+/// fires on the last 3 tool parts being identical).
+const REPEAT_NUDGE_AFTER: u32 = 3;
+
 /// Byte budget for per-turn **relevance recall** injected alongside the opening
 /// user message (the full text of the most relevant memories). 4 KiB stays small
 /// next to the always-loaded pointer index (~25 KB) while giving the model room
 /// for a few complete facts; recall truncates/drops entries to never exceed it.
 const MEMORY_RECALL_BUDGET: usize = 4 * 1024;
 
-/// Anti-loop breaker: tracks the last failed call and how many times the
-/// *exact same* call (tool + raw args) has failed in a row. Any intervening
-/// different call — or a success — resets it, so a legitimate
-/// `test → edit → test` retry cycle is never blocked; only verbatim
-/// fail-retry-fail loops are.
+/// Anti-loop breaker: tracks the last call (tool + raw args), how many times
+/// that *exact same* call has been made in a row, and how many of those in a row
+/// failed. Any intervening different call resets both counters, so a legitimate
+/// `test → edit → test` cycle never trips anything.
+///
+/// Two failure modes, two answers:
+///
+/// - **Failing** verbatim retries are refused outright after
+///   [`REPEAT_REFUSE_AFTER`] — the call has nothing to offer and small models
+///   will retry it forever.
+/// - **Succeeding** identical calls are the quieter wedge: `read` the same file,
+///   `grep` the same pattern, re-run a `cargo test` that exits 0. Nothing errors,
+///   so nothing notices, and the round budget and cost cap drain at full speed.
+///   Those get a nudge on the result after [`REPEAT_NUDGE_AFTER`] and nothing
+///   more — refusing a call that works would break real work, and hrdr is
+///   autonomous, so there is nobody to ask.
 #[derive(Default)]
 pub(crate) struct RepeatGuard {
     key: Option<u64>,
+    /// Consecutive calls with `key`, successes included.
+    calls: u32,
+    /// Consecutive *failures* with `key`; a success zeroes it but keeps `key`.
     failures: u32,
 }
 
@@ -88,26 +113,52 @@ impl RepeatGuard {
         )
     }
 
-    /// Record a call's outcome; on a repeated failure returns the nudge to
-    /// append to the error the model sees.
-    pub(crate) fn record(&mut self, name: &str, raw_args: &str, ok: bool) -> Option<String> {
+    /// Record a call's outcome; returns the nudge to append to the result the
+    /// model sees, when this call is a repeat worth telling it about.
+    ///
+    /// `repeatable` is the tool's own opt-out (see
+    /// [`Tool::repeatable`](hrdr_tools::Tool::repeatable)): a poll answering the
+    /// same question until the answer changes is *supposed* to be identical, so
+    /// it never earns the success nudge. It still earns the failure nudge —
+    /// polling that keeps erroring is a loop whatever the tool.
+    pub(crate) fn record(
+        &mut self,
+        name: &str,
+        raw_args: &str,
+        ok: bool,
+        repeatable: bool,
+    ) -> Option<String> {
         let k = call_key(name, raw_args);
         if self.key != Some(k) {
             self.key = Some(k);
+            self.calls = 1;
             self.failures = u32::from(!ok);
             return None;
         }
-        if ok {
-            self.key = None;
-            self.failures = 0;
-            return None;
+        self.calls += 1;
+        if !ok {
+            self.failures += 1;
+            // Gated on the streak length rather than "this is a repeat" so a
+            // success in the middle of the streak still costs a full pair of
+            // failures before the nudge returns — the same point the refusal
+            // arms at.
+            return (self.failures >= REPEAT_REFUSE_AFTER).then(|| {
+                format!(
+                    "\n[note: this exact call has failed {} times in a row — change the input \
+                     or approach instead of retrying it verbatim]",
+                    self.failures
+                )
+            });
         }
-        self.failures += 1;
-        Some(format!(
-            "\n[note: this exact call has failed {} times in a row — change the input \
-             or approach instead of retrying it verbatim]",
-            self.failures
-        ))
+        self.failures = 0;
+        (!repeatable && self.calls >= REPEAT_NUDGE_AFTER).then(|| {
+            format!(
+                "\n[note: you have now made this exact {name} call {} times in a row. It \
+                 succeeded and nothing changed in between, so making it again cannot tell you \
+                 anything new — change approach, or stop and report what you have]",
+                self.calls
+            )
+        })
     }
 }
 
@@ -479,7 +530,8 @@ impl Agent {
         let defs = self.tools.defs();
         // Allow one automatic compaction per turn when the context overflows.
         let mut overflow_compacted = false;
-        // Anti-loop breaker for verbatim retries of a failing call.
+        // Anti-loop breaker for verbatim retries — failing (refused) or
+        // succeeding-but-going-nowhere (nudged).
         let mut repeat = RepeatGuard::default();
         // At most one turn-end nudge (see below) per turn — a genuinely blocked
         // or deferring model must still be able to stop.
@@ -924,7 +976,8 @@ impl Agent {
 
     /// Emit the `ToolEnd` event and push the tool-result message for a
     /// completed call (shared by the sequential and concurrent paths). Feeds
-    /// the repeat breaker, appending its nudge to a repeated failure.
+    /// the repeat breaker, appending its nudge to a repeated call — failing or
+    /// succeeding.
     fn finish_tool_call<F: FnMut(AgentEvent)>(
         &mut self,
         call: &hrdr_llm::ToolCall,
@@ -937,7 +990,13 @@ impl Agent {
             Ok(s) => (true, s),
             Err(e) => (false, tool_error_text(&e)),
         };
-        if let Some(nudge) = repeat.record(&call.function.name, &call.function.arguments, ok) {
+        let repeatable = self.tools.is_repeatable(&call.function.name);
+        if let Some(nudge) = repeat.record(
+            &call.function.name,
+            &call.function.arguments,
+            ok,
+            repeatable,
+        ) {
             body.push_str(&nudge);
         }
         on_event(AgentEvent::ToolEnd {

@@ -96,6 +96,12 @@ impl Tool for WatchTool {
         false
     }
 
+    /// Watching the same thing again is the normal way to use this: a watch that
+    /// times out before the condition holds is meant to be re-issued verbatim.
+    fn repeatable(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let a: WatchArgs = crate::tool_args("watch", args)?;
         if let Some(msg) = crate::check_guardrails(&a.command, &ctx.guardrails) {
