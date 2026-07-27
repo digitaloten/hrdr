@@ -9604,6 +9604,16 @@ mod tests {
             .unwrap()
         }
 
+        /// Build a truncated finish chunk (finish_reason = "length"): the reply hit
+        /// the model's output cap mid-emission.
+        fn length_stop_chunk(id: &str) -> String {
+            serde_json::to_string(&json!({
+                "id": id,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+            }))
+            .unwrap()
+        }
+
         /// Minimal agent config pointing at `base_url`, with subagents disabled
         /// for test isolation.
         fn test_cfg(base_url: String, cwd: &std::path::Path) -> AgentConfig {
@@ -10428,6 +10438,82 @@ mod tests {
             assert!(
                 nudged[0].contains("this exact read call 3 times"),
                 "{nudged:?}"
+            );
+        }
+
+        /// A reply cut off at the output cap has to reach the *model*, not just the
+        /// user: the calls it meant to emit after the cut never happened, and next
+        /// round it reads its own truncated message as complete. The note rides the
+        /// round's last tool result; a reply that finished normally gets nothing.
+        #[tokio::test]
+        async fn agent_run_tells_the_model_its_reply_was_truncated() {
+            let dir = tempfile::tempdir().unwrap();
+            let test_file = dir.path().join("data.txt");
+            std::fs::write(&test_file, "content").unwrap();
+            let args = |n: usize| {
+                // Distinct paths so the repeat nudge stays out of this test.
+                let p = dir.path().join(format!("data{n}.txt"));
+                std::fs::write(&p, "content").unwrap();
+                serde_json::to_string(&json!({"path": p.to_string_lossy()})).unwrap()
+            };
+            let server = MockServer::start(vec![
+                // Round 1: a tool call, then the output cap cuts the reply off.
+                MockResp::Sse(vec![
+                    tool_start_chunk("c1", "call_1", "read"),
+                    tool_args_chunk("c1", &args(1)),
+                    length_stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                // Round 2: a normal, complete tool-calling reply.
+                MockResp::Sse(vec![
+                    tool_start_chunk("c2", "call_2", "read"),
+                    tool_args_chunk("c2", &args(2)),
+                    tool_calls_stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+                MockResp::Sse(vec![
+                    text_chunk("c3", "Done."),
+                    stop_chunk("c3"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.max_steps = 5;
+            let mut agent = Agent::new(cfg).unwrap();
+            let mut events: Vec<AgentEvent> = Vec::new();
+            agent
+                .run_input("read them", |ev| events.push(ev))
+                .await
+                .unwrap();
+
+            let results: Vec<&str> = agent
+                .messages()
+                .iter()
+                .filter(|m| m.role == Role::Tool)
+                .filter_map(|m| m.content.as_deref())
+                .collect();
+            assert_eq!(results.len(), 2, "{results:?}");
+            assert!(
+                results[0].contains("cut off at the output limit"),
+                "the truncated round's result carries the note: {results:?}"
+            );
+            assert!(
+                results[0].contains("was lost and never ran"),
+                "…and says what that means for its lost calls: {results:?}"
+            );
+            assert!(
+                !results[1].contains("cut off at the output limit"),
+                "a complete reply gets no note: {results:?}"
+            );
+            // The user still hears about it too — both audiences need it.
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    AgentEvent::Notice(n) if n.contains("response truncated at the output limit")
+                )),
+                "{events:?}"
             );
         }
 

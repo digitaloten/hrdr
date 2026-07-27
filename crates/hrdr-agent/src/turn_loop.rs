@@ -653,8 +653,11 @@ impl Agent {
 
             // The reply hit the output cap — warn so a silently-truncated answer
             // or edit isn't mistaken for a complete one (raise `max_tokens` on the
-            // Anthropic backend, or the model's cap otherwise).
-            if acc.truncated() {
+            // Anthropic backend, or the model's cap otherwise). The *model* is
+            // told too, on this round's last tool result (see below): it otherwise
+            // resumes believing it emitted everything it meant to.
+            let truncated = acc.truncated();
+            if truncated {
                 on_event(AgentEvent::Notice(
                     "⚠ response truncated at the output limit — it may be incomplete \
                      (raise max_tokens if this recurs)"
@@ -751,6 +754,28 @@ impl Agent {
                 // arg parse, streamed output, and in-order results all live in
                 // `run_tool_batch`.
                 self.run_tool_batch(batch, &mut repeat, &mut on_event).await;
+            }
+
+            // A truncated reply is the one thing the model cannot notice itself:
+            // it was cut off, so whatever it meant to emit after this point never
+            // reached us, and next round it reads its own message as complete.
+            // Ride this round's last tool result — the same channel as the budget
+            // notes below — so it re-issues what is missing instead of assuming it
+            // ran. Before the History snapshot, so a resume sees the note too.
+            //
+            // A truncated reply with *no* tool calls has no result to ride on and
+            // ends the turn where it stands; that case is left to the user-facing
+            // Notice above, since there is no next round to correct.
+            if truncated
+                && let Some(last) = self.messages.last_mut()
+                && let Some(content) = &mut last.content
+            {
+                content.push_str(
+                    "\n\n[note: your reply was cut off at the output limit — anything you \
+                     intended after this point, including further tool calls, was lost and \
+                     never ran. Re-issue what is missing rather than assuming it happened, and \
+                     keep the next reply shorter.]",
+                );
             }
 
             // Backstop for the turn-end TODO nudge: the model can "satisfy" it by
