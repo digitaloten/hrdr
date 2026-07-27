@@ -301,7 +301,7 @@ Review the working-tree diff. Focus on: $ARGUMENTS
 | `Enter`                   | Send; **while a reply runs, queues it** (delivered with the next tool result, else sent as its own turn) |
 | `Alt+Enter` / `\`+`Enter` | Insert a newline (`Shift+Enter` too, where supported)                                                    |
 | `Up` / `Down`             | Recall previous inputs (single-line); drive the `/` menu                                                 |
-| `@name` / `@path`         | Mention a sub-agent (routes to it) or attach a file                                                      |
+| `@name` / `@path`         | Mention a sub-agent (routes to it), attach a file, or attach a directory's listing                       |
 | `Ctrl+G`                  | Edit the input in `$EDITOR` / `$VISUAL`                                                                  |
 | `PageUp/Down`, mouse      | Scroll the transcript; `End` follows the newest output                                                   |
 | `Ctrl+L`                  | Clear + repaint the screen                                                                               |

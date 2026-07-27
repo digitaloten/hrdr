@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`@dir` attaches a directory's listing.** `@` previously accepted files only;
+  a directory silently expanded to nothing (the attach path rejects a
+  non-regular file and the failure was swallowed), so the mention reached the
+  model as bare text. A directory now contributes a one-level listing —
+  `/`-suffixed subdirectories, `@` for symlinks, the same shape the `ls` tool
+  returns — under its own labelled block, capped at 200 entries with the
+  remainder counted. Either spelling works (`@src` or `@src/`), and both in one
+  message attach once. Completion offers directories too (slash-suffixed, and
+  accepting one leaves the cursor ready to descend rather than closing the
+  token), because a candidate you cannot select is not a feature. A listing is
+  not content: it never counts as a read for the read-before-edit guard, and a
+  directory `secret_file_reason` recognises (`~/.ssh`, `~/.gnupg`, a password
+  store) is refused rather than enumerated.
+
 ### Fixed
 
 - **A cancelled task's kept worktree is no longer stranded.** `task_cancel`

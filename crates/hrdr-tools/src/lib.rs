@@ -922,6 +922,67 @@ pub fn read_attach_file(
     Ok(text)
 }
 
+/// How many entries an attached directory listing shows before it is cut short.
+///
+/// A directory mention is a *pointer* — enough for the model to know what is
+/// there and read what it wants — not an inventory, so a `node_modules` or a
+/// 5000-file asset dir costs a bounded amount of context.
+pub const ATTACH_DIR_MAX_ENTRIES: usize = 200;
+
+/// List a directory that is safe to attach to a model request: one level, names
+/// only, `/`-suffixed for subdirectories and `@` for symlinks — the same shape
+/// the `ls` tool returns, so the model reads one format either way.
+///
+/// Used for an `@dir` mention, where inlining content makes no sense but the
+/// contents are exactly what the user is pointing at. Refuses a directory that
+/// [`secret_file_reason`] recognises (`~/.ssh`, `~/.gnupg`, a password store):
+/// the file *names* in a key directory are not something to volunteer.
+///
+/// Entries past [`ATTACH_DIR_MAX_ENTRIES`] are dropped and counted in a trailing
+/// line, so a truncated listing always says so.
+pub fn read_attach_dir(path_str: &str, cwd: &std::path::Path) -> anyhow::Result<String> {
+    let resolved = resolve_under(cwd, path_str);
+    if !resolved.is_dir() {
+        anyhow::bail!("not a directory: {}", resolved.display());
+    }
+    let canon = resolved
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("can't resolve {}: {e}", resolved.display()))?;
+    if let Some(reason) = secret_file_reason(&canon) {
+        anyhow::bail!(
+            "refusing to list {}: {reason} — secret/credential paths are off-limits",
+            resolved.display(),
+        );
+    }
+    let mut entries: Vec<String> = Vec::new();
+    for e in std::fs::read_dir(&canon)
+        .map_err(|e| anyhow::anyhow!("can't list {}: {e}", resolved.display()))?
+        .flatten()
+    {
+        let name = e.file_name().to_string_lossy().to_string();
+        let suffix = match e.file_type() {
+            Ok(t) if t.is_dir() => "/",
+            Ok(t) if t.is_symlink() => "@",
+            _ => "",
+        };
+        entries.push(format!("{name}{suffix}"));
+    }
+    if entries.is_empty() {
+        return Ok("(empty directory)".to_string());
+    }
+    entries.sort();
+    let total = entries.len();
+    entries.truncate(ATTACH_DIR_MAX_ENTRIES);
+    let mut out = entries.join("\n");
+    if total > ATTACH_DIR_MAX_ENTRIES {
+        out.push_str(&format!(
+            "\n…[{} more of {total} entries not shown]",
+            total - ATTACH_DIR_MAX_ENTRIES
+        ));
+    }
+    Ok(out)
+}
+
 /// Validate that a file path is safe to attach (read and share with the model).
 ///
 /// `path_str` is the user-provided path (e.g., from `@file.txt` or `/add file.txt`).

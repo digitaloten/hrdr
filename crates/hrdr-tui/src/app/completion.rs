@@ -109,10 +109,14 @@ impl super::App {
             }
             CompletionKind::Mention { token_start } => {
                 let content = self.editor.content();
-                // Replace the partial `@…` token with `@<path> ` (always a space
-                // so the next mention/word is separate).
                 let prefix = content.get(..token_start).unwrap_or("");
-                self.editor.set_content(&format!("{prefix}@{chosen} "));
+                // Replace the partial `@…` token with `@<path> ` — a space so the
+                // next mention/word is separate. A DIRECTORY candidate ends in `/`
+                // and gets no space: `@src/` is a complete mention on its own (it
+                // attaches the listing), but the common next move is to keep typing
+                // to descend into it, and a space would end the token instead.
+                let sep = if chosen.ends_with('/') { "" } else { " " };
+                self.editor.set_content(&format!("{prefix}@{chosen}{sep}"));
             }
         }
     }

@@ -5,13 +5,14 @@
 
 use std::path::{Path, PathBuf};
 
-/// Expand `@file` mentions in `input` by appending the referenced files'
-/// contents (resolved under `cwd`), for sending to the model. Each distinct
-/// readable `@path` is attached once under a trailing "Referenced files"
-/// section, truncated at 100 KiB on a char boundary; unreadable/missing/
-/// duplicate references are skipped. Returns `input` unchanged when nothing
-/// resolves. The display copy should keep the bare `@path`; only the sent copy
-/// carries the expansion.
+/// Expand `@path` mentions in `input` (resolved under `cwd`) for sending to the
+/// model: a **file** contributes its contents, truncated at 100 KiB on a char
+/// boundary; a **directory** contributes a one-level listing of what it holds,
+/// since a directory is a pointer at files to read rather than content itself.
+/// Each distinct path is attached once under a trailing "Referenced paths"
+/// section; unreadable/missing/duplicate references are skipped. Returns `input`
+/// unchanged when nothing resolves. The display copy should keep the bare
+/// `@path`; only the sent copy carries the expansion.
 /// If `input` mentions a known agent via `@name` (matching one of `names`,
 /// case-insensitively), return `(canonical_name, input_without_that_token)`.
 /// `@`-tokens that don't match an agent are left alone (they may be `@file`
@@ -88,13 +89,33 @@ pub fn expand_mentions(input: &str, cwd: &Path) -> String {
 /// complete inlines are listed — a truncated attachment is a partial view, and a
 /// partial view must never license a blind overwrite.
 pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> (String, Vec<PathBuf>) {
+    // (label, body, whole-file-inlined). Only a file's complete content counts as
+    // inlined — a truncated file is a partial view, and a directory listing is not
+    // content at all, so neither may license a blind overwrite.
     let mut attached: Vec<(String, String, bool)> = Vec::new();
     for raw in input.split_whitespace() {
         let Some(rel) = raw.strip_prefix('@') else {
             continue;
         };
+        // A trailing `/` is how a directory is spelled (and what completion
+        // inserts); strip it for resolution but keep the label honest below.
         let rel = rel.trim_end_matches([',', '.', ';', ':', ')', ']', '}']);
-        if rel.is_empty() || attached.iter().any(|(p, _, _)| p == rel) {
+        let rel = rel.strip_suffix('/').unwrap_or(rel);
+        if rel.is_empty()
+            || attached
+                .iter()
+                .any(|(p, _, _)| p.trim_end_matches('/') == rel)
+        {
+            continue;
+        }
+        // A directory is pointed at, not inlined: attach what it contains so the
+        // model can pick what to read, instead of the mention silently doing
+        // nothing (which is what happened before — `read_attach_file` rejects a
+        // directory, and the failure was swallowed).
+        if resolve_under(cwd, rel).is_dir() {
+            if let Ok(listing) = hrdr_tools::read_attach_dir(rel, cwd) {
+                attached.push((format!("{rel}/"), listing, false));
+            }
             continue;
         }
         let Ok(text) = hrdr_tools::read_attach_file(rel, cwd, Some(MAX_ATTACH_BYTES)) else {
@@ -113,12 +134,19 @@ pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> (String, Vec<PathBuf>
     }
     let mut inlined = Vec::new();
     let mut out = String::from(input);
-    out.push_str("\n\n--- Referenced files (via @) ---\n");
+    out.push_str("\n\n--- Referenced paths (via @) ---\n");
     for (rel, text, full) in attached {
         if full {
             inlined.push(resolve_under(cwd, &rel));
         }
-        out.push_str(&format!("\n=== {rel} ===\n{text}\n"));
+        // A directory's block says what it is, so a listing is never mistaken for
+        // the file content the same syntax attaches.
+        let what = if rel.ends_with('/') {
+            " (directory listing, one level)"
+        } else {
+            ""
+        };
+        out.push_str(&format!("\n=== {rel}{what} ===\n{text}\n"));
     }
     (out, inlined)
 }
@@ -423,10 +451,11 @@ const WALK_SKIP_DIRS: &[&str] = &[
     "__pycache__",
 ];
 
-/// Collect relative file paths under `root` for `@file` completion. In a git
-/// repo, honors `.gitignore`/`.ignore` (and parents/global) + `.git/info/exclude`
-/// via the `ignore` crate; outside one, falls back to a manual walk that skips
-/// known VCS/build and hidden directories.
+/// Collect relative paths under `root` for `@` completion — files, plus
+/// **directories with a trailing `/`**, since `@dir/` attaches a listing and so
+/// has to be selectable. In a git repo, honors `.gitignore`/`.ignore` (and
+/// parents/global) + `.git/info/exclude` via the `ignore` crate; outside one,
+/// falls back to a manual walk that skips known VCS/build and hidden directories.
 pub fn walk_files(root: &Path) -> Vec<String> {
     if hrdr_agent::in_git_repo(root) {
         walk_files_gitignore(root)
@@ -450,10 +479,22 @@ pub fn walk_files_gitignore(root: &Path) -> Vec<String> {
         if out.len() >= WALK_MAX_FILES {
             break;
         }
-        if entry.file_type().is_some_and(|t| t.is_file())
-            && let Ok(rel) = entry.path().strip_prefix(root)
-        {
-            out.push(rel.to_string_lossy().replace('\\', "/"));
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        // `root` itself walks first and strips to an empty path — an `@` candidate
+        // of "/" is meaningless.
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if ft.is_file() {
+            out.push(rel);
+        } else if ft.is_dir() {
+            out.push(format!("{rel}/"));
         }
     }
     out.sort();
@@ -480,14 +521,18 @@ fn walk_files_fallback(root: &Path) -> Vec<String> {
                 if name.starts_with('.') || WALK_SKIP_DIRS.contains(&name.as_ref()) {
                     continue;
                 }
+                if let Ok(rel) = path.strip_prefix(root) {
+                    // Selectable itself — `@dir/` attaches its listing.
+                    out.push(format!("{}/", rel.to_string_lossy().replace('\\', "/")));
+                }
                 stack.push((path, depth + 1));
             } else if ft.is_file()
                 && let Ok(rel) = path.strip_prefix(root)
             {
                 out.push(rel.to_string_lossy().replace('\\', "/"));
-                if out.len() >= WALK_MAX_FILES {
-                    break;
-                }
+            }
+            if out.len() >= WALK_MAX_FILES {
+                break;
             }
         }
     }
@@ -512,12 +557,83 @@ mod tests {
         // while the original line is preserved.
         let out = expand_mentions("look at @a.txt, and @a.txt again", root);
         assert!(out.starts_with("look at @a.txt, and @a.txt again"));
-        assert!(out.contains("--- Referenced files (via @) ---"));
+        assert!(out.contains("--- Referenced paths (via @) ---"));
         assert_eq!(out.matches("=== a.txt ===").count(), 1);
         assert!(out.contains("hello from a"));
 
         // A missing mention resolves nothing → unchanged.
         assert_eq!(expand_mentions("@nope.txt", root), "@nope.txt");
+    }
+
+    /// `@dir` attaches what the directory holds, spelled with or without the
+    /// trailing slash. Before this it silently did nothing: the attach path only
+    /// accepted regular files, and the rejection was swallowed, so the mention
+    /// reached the model as bare text.
+    #[test]
+    fn expand_mentions_attaches_a_directory_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "//! lib").unwrap();
+
+        for spelling in ["@src", "@src/"] {
+            let out = expand_mentions(&format!("look at {spelling}"), root);
+            assert!(
+                out.contains("=== src/ (directory listing, one level) ==="),
+                "{spelling} labels the block as a listing: {out}"
+            );
+            assert!(
+                out.contains("main.rs") && out.contains("lib.rs"),
+                "{spelling} lists the files: {out}"
+            );
+            assert!(
+                out.contains("nested/"),
+                "{spelling} marks subdirectories: {out}"
+            );
+            assert!(
+                !out.contains("fn main()"),
+                "a listing is not the files' content: {out}"
+            );
+        }
+
+        // A directory is a pointer, not content, so it never disarms the
+        // read-before-edit guard for the files inside it.
+        let (_, inlined) = expand_mentions_tracked("@src", root);
+        assert!(
+            inlined.is_empty(),
+            "a listing licenses no blind overwrite: {inlined:?}"
+        );
+
+        // Both spellings in one message describe the same directory — attach once.
+        let out = expand_mentions("@src and @src/ again", root);
+        assert_eq!(out.matches("=== src/").count(), 1, "{out}");
+    }
+
+    /// `@` completion offers directories too — a candidate you cannot select is a
+    /// feature that doesn't exist.
+    #[test]
+    fn the_completion_index_offers_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("crates/inner")).unwrap();
+        std::fs::write(root.join("crates/inner/x.rs"), "").unwrap();
+        std::fs::write(root.join("top.txt"), "").unwrap();
+
+        let items = walk_files(root);
+        assert!(items.contains(&"top.txt".to_string()), "{items:?}");
+        assert!(
+            items.contains(&"crates/inner/x.rs".to_string()),
+            "{items:?}"
+        );
+        assert!(
+            items.contains(&"crates/".to_string()) && items.contains(&"crates/inner/".to_string()),
+            "directories are candidates, slash-suffixed: {items:?}"
+        );
+        assert!(
+            !items.iter().any(|i| i == "/" || i.is_empty()),
+            "the root itself is not a candidate: {items:?}"
+        );
     }
 
     /// The paths reported alongside the expansion are the ones whose *whole*
