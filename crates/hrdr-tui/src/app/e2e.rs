@@ -5731,6 +5731,50 @@ async fn completion_popup_caps_at_five_rows_and_scrolls() {
     );
 }
 
+/// Up/Down browse HISTORY, even once a recalled entry is itself a slash command.
+///
+/// The regression (`6ff0172`): recalling `/help` opened the completion popup on
+/// the recalled text, and the popup then swallowed the next Up — so history
+/// browsing was stuck on that entry and everything older than it was
+/// unreachable. `suppress_completions` keeps the popup dormant for the duration
+/// of the browse, and typing clears it, so completions still work.
+#[tokio::test]
+async fn up_after_recalling_a_slash_command_keeps_walking_history() {
+    let mut h = Harness::new(vec![MockReply::Text("answer".to_string())]).await;
+    h.submit("the older message").await;
+    // A bare slash command: recalled into the box, its own text matches.
+    h.submit("/help").await;
+
+    // The first Up recalls the newest entry — the command.
+    h.press(KeyCode::Up);
+    assert_eq!(h.app.editor.content(), "/help", "Up recalls the command");
+    assert!(
+        h.app.active_completions().is_none(),
+        "no popup over a recalled entry — it would take the next Up"
+    );
+
+    // The second Up keeps walking history rather than moving a popup selection.
+    h.press(KeyCode::Up);
+    assert_eq!(
+        h.app.editor.content(),
+        "the older message",
+        "Up walked past the slash command to the earlier entry"
+    );
+
+    // Typing again lifts the suppression: the same text completes normally.
+    h.app.editor.set_content("");
+    h.type_str("/help");
+    let comp = h
+        .app
+        .active_completions()
+        .expect("a freshly typed `/` opens completions again");
+    assert!(
+        comp.items.iter().any(|(name, _)| name == "/help"),
+        "the popup offers the command: {:?}",
+        comp.items
+    );
+}
+
 /// The TODO panel shows the current agent's list — not a global one. Each
 /// agent keeps its own TODO list in its live entry; switching panes switches
 /// which TODOs are rendered below the sub-agent panel. The existing tests
