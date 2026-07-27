@@ -173,7 +173,13 @@ async fn run_check(command: &str, ctx: &ToolContext) -> Result<(Option<i32>, Str
     };
     // Model-supplied, exactly like a `shell` call — so it runs under the same
     // OS confinement.
-    let mut cmd = crate::sandbox::sandboxed_shell_command(shell, command, &ctx.sandbox, &ctx.cwd);
+    let mut cmd = crate::sandbox::sandboxed_shell_command(
+        shell,
+        command,
+        &ctx.sandbox,
+        &ctx.cwd,
+        &ctx.sandbox_notices,
+    );
     cmd.current_dir(&ctx.cwd)
         // A model-supplied check must never block reading the TUI's terminal
         // (e.g. a `sudo` password prompt) — nothing feeds it stdin.

@@ -621,9 +621,11 @@ impl Agent {
             }
             // The sandbox's own degradation channel: a shell command that ran
             // with less OS confinement than its mode promised says so here,
-            // once per process, through the same event the frontends already
-            // render.
-            if let Some(warning) = hrdr_tools::take_sandbox_notice() {
+            // once per agent, through the same event the frontends already
+            // render. The channel is this agent's own — a sibling's degradation
+            // is a sibling's news, and draining a shared queue told whichever
+            // session got here first.
+            if let Some(warning) = self.ctx.sandbox_notices.take() {
                 on_event(AgentEvent::Notice(warning));
             }
 

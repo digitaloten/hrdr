@@ -290,8 +290,13 @@ impl Tool for ShellTool {
         }
         // Guardrails first, confinement second: a blocked command never runs,
         // sandboxed or not.
-        let mut cmd =
-            crate::sandbox::sandboxed_shell_command(self.shell, &a.command, &ctx.sandbox, &ctx.cwd);
+        let mut cmd = crate::sandbox::sandboxed_shell_command(
+            self.shell,
+            &a.command,
+            &ctx.sandbox,
+            &ctx.cwd,
+            &ctx.sandbox_notices,
+        );
         cmd.current_dir(&ctx.cwd);
         let timeout = Duration::from_secs(a.timeout_secs.unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS));
         // A command is the usual reason a file the model read goes stale — a

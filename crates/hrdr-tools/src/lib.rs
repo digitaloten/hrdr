@@ -43,7 +43,7 @@ pub use lsp::{
 };
 pub use mcp::McpClient;
 pub use memory::MemoryTool;
-pub use sandbox::{SandboxMode, SandboxPolicy, set_sandbox_notice, take_sandbox_notice};
+pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
 pub use tools::{
     CopyTool, DefinitionTool, DeleteTool, EditTool, FindTool, GitTool, GrepTool, LsTool, MoveTool,
     ReadTool, ReferencesTool, RenameTool, ReplaceTool, Shell, ShellTool, TodoTool, TreeTool,
@@ -249,6 +249,16 @@ pub struct ToolContext {
     /// Consulted through [`resolve_read`](Self::resolve_read) /
     /// [`resolve_write`](Self::resolve_write).
     pub sandbox: Arc<SandboxPolicy>,
+    /// Degradation notices owed to **this** agent: a shell command that ran with
+    /// less OS confinement than [`sandbox`](Self::sandbox) promised queues its
+    /// admission here, and the agent's own turn loop drains it into a `Notice`.
+    ///
+    /// Per agent rather than per process because the notice describes *this*
+    /// agent's confinement — one shared queue let whichever turn loop drained
+    /// first tell the wrong session its sandbox had degraded. Behind an `Arc` so
+    /// the clone every tool call gets writes into the same queue the agent
+    /// drains.
+    pub sandbox_notices: Arc<SandboxNotices>,
 }
 
 impl ToolContext {
@@ -270,6 +280,7 @@ impl ToolContext {
             hooks: Arc::new(Vec::new()),
             lsp: None,
             sandbox: Arc::new(SandboxPolicy::unconfined()),
+            sandbox_notices: Arc::new(SandboxNotices::default()),
         }
     }
 

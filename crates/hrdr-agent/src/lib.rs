@@ -9730,9 +9730,13 @@ mod tests {
         }
 
         /// A sandbox degradation reaches the user: the turn loop drains the
-        /// notice cell beside the LLM client's warning and republishes it as
+        /// notice channel beside the LLM client's warning and republishes it as
         /// the `Notice` every frontend already renders. Without this drain the
         /// OS layer could silently stop confining shell commands.
+        ///
+        /// Seeded on *this agent's* channel, so the assertion no longer depends
+        /// on test order: with the old process-global cell a parallel test could
+        /// drain the seeded notice before this turn loop got to it.
         #[tokio::test]
         async fn sandbox_notice_reaches_the_event_stream() {
             let server = MockServer::start(vec![MockResp::Sse(vec![
@@ -9744,9 +9748,10 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
 
-            hrdr_tools::set_sandbox_notice(
-                "sandbox: pretend degradation for the event stream".to_string(),
-            );
+            agent
+                .ctx
+                .sandbox_notices
+                .set("sandbox: pretend degradation for the event stream".to_string());
             let mut events: Vec<AgentEvent> = Vec::new();
             agent.run_input("hi", |ev| events.push(ev)).await.unwrap();
 
