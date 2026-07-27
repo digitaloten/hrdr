@@ -56,6 +56,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `node_modules/<pkg>/`, site-packages, `go env GOMODCACHE` — not by recalling
   its API; observed to end a hallucination loop on the first read.
 
+- **Skills the model can invoke, not just the user.** All ten built-in skills
+  and every user or project skill were `:`-only: parsed, offered in the
+  completion popup, sent as a user message on invocation — and invisible to the
+  model, which could never decide "this is a review, load the review checklist".
+  Every agent's system prompt now carries a `Skills` block listing each skill by
+  name and one-line description (956 bytes for the nine listed built-ins), and a
+  read-only `skill` tool returns one's full instructions on demand, `$ARGUMENTS`
+  filled through the same expansion a `:` invocation uses. The listing is a
+  **menu, never the content**: no bodies, and no source paths — those name a
+  write sub-agent's own worktree, so including them would differ per sibling and
+  split the shared prompt-cache prefix (the tool's result names the source
+  instead, where it costs nothing shared). Under a 4 KiB budget descriptions are
+  dropped tail-first while **names always survive**, since a name the model
+  cannot see is a skill it can never load. The block is gated on the `skill`
+  tool actually being registered, so a custom profile whose `tools:` allow-list
+  drops it is not handed a menu it cannot order from. `skill` is read-only —
+  read-only profiles (`explore`, `review`, `plan`) keep it, and what a loaded
+  skill can then do stays bounded by their own tool set.
+
+- **`model_invocable:` in skill frontmatter (default `true`).** `false` keeps a
+  skill the user's alone: unlisted, and refused by the tool with an error
+  telling the model to ask the user to run `:name` themselves. Only a literal
+  `false` opts out, so a typo fails open and visibly rather than silently hiding
+  a skill. Built-in `:release` ships marked — its last step pushes a tag, so
+  starting a release is the user's call.
+
 - **`task_apply` — land a write sub-agent's UNCOMMITTED work in one call.** A
   sub-agent that was told not to commit (or that simply forgot) left its entire
   result uncommitted in its worktree, where the branch carries nothing and
