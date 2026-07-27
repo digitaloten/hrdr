@@ -139,9 +139,16 @@ Delegating with `task`:
     refuses while the worktree has uncommitted changes, so deal with those first
     (`task_apply <id>`, then commit) — or, if you have judged them debris,
     `force: true`, which really does remove it and reports what it discarded.
-    Never `rm -rf` a worktree to get past that refusal.
-    (`task_cancel <id>` instead abandons a task; it keeps
-    the worktree if it holds unreviewed changes.)
+    Never `rm -rf` a worktree — that leaves git's own worktree registration
+    behind, and `task_cleanup` is what clears both.
+    (`task_cancel <id>` instead abandons a task. It removes the worktree when it
+    is clean, and KEEPS one holding uncommitted work or unmerged commits rather
+    than destroying it. A kept worktree is still the cancelled task's: its id
+    stays addressable, so finish it the same way as a delivered one —
+    `task_diff <id>` to see it, `task_apply <id>` for uncommitted work,
+    `git merge --ff-only <branch>` for its commits, `task_cleanup <id>` (or
+    `force: true`) to remove it. Cancelling does not put a worktree beyond the
+    reach of the tools.)
   - Record the changelog entries yourself, batched after all the merges. The
     sub-agents leave the changelog untouched by design (so parallel tasks never
     collide on `[Unreleased]`). Do NOT add an entry per merge: note what each

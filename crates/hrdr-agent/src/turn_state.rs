@@ -88,12 +88,21 @@ impl Agent {
                     size_summary: t.size_summary.clone(),
                 });
             }
-            // Prune cancelled entries and delivered ones that have no worktree
-            // (read-only / shared-dir tasks — nothing left to manage). A delivered
-            // WRITE task is retained: its worktree is still on disk awaiting the
-            // parent's review + merge, and it stays addressable in `task_list` /
-            // `task_cleanup` / `task_cancel` until the parent resolves it.
-            v.retain(|t| !t.cancelled && !(t.delivered && t.worktree.is_none()));
+            // Prune an entry once there is nothing left to manage: no worktree on
+            // disk, and either delivered (read-only / shared-dir task — its answer
+            // is in the conversation) or cancelled.
+            //
+            // An entry that still HAS a worktree is retained either way, so it
+            // stays addressable by id in `task_list` / `task_diff` / `task_apply` /
+            // `task_cleanup` until the parent resolves it. That includes a
+            // **cancelled** task: `task_cancel` keeps a worktree holding
+            // uncommitted work or unmerged commits, and pruning the entry anyway
+            // stranded it — the worktree sat on disk with every tool that could
+            // reach it answering "no background task #N", which left `rm -rf` as
+            // the only way out of a situation the prompt forbids resolving that
+            // way. `task_cancel` clears these fields itself when it removes a
+            // clean worktree, so those entries still prune here.
+            v.retain(|t| t.worktree.is_some() || !(t.delivered || t.cancelled));
             out
         };
         // The main agent now has these answers, so the live entries are no longer

@@ -5851,6 +5851,62 @@ mod tests {
         assert!(v[0].delivered && v[0].worktree.is_some());
     }
 
+    /// A CANCELLED task whose worktree was kept (it held uncommitted work or
+    /// unmerged commits) stays addressable by id.
+    ///
+    /// Regression: every cancelled entry used to be pruned on the next drain,
+    /// while `task_cancel` deliberately leaves such a worktree on disk. The
+    /// worktree then existed with no way to reach it — `task_diff`/`task_apply`/
+    /// `task_cleanup` all answered "no background task #N" — so the only
+    /// remaining move was the `rm -rf` the prompt forbids, and a real session did
+    /// exactly that.
+    #[test]
+    fn a_cancelled_task_that_kept_its_worktree_stays_addressable() {
+        let cfg = AgentConfig::default();
+        let mut agent = Agent::new(cfg).unwrap();
+        {
+            let reg = agent.background_tasks();
+            let mut v = reg.lock().unwrap();
+            // Cancelled, worktree KEPT (it had changes worth reviewing).
+            v.push(hrdr_tools::BackgroundTask {
+                id: 1,
+                label: "cancelled with work".to_string(),
+                done: true,
+                cancelled: true,
+                worktree: Some(std::path::PathBuf::from("/tmp/wt-kept")),
+                branch: Some("hrdr/task-kept".to_string()),
+                ..Default::default()
+            });
+            // Cancelled, worktree already removed by `task_cancel` (it was clean,
+            // so the fields were cleared) — nothing left to address.
+            v.push(hrdr_tools::BackgroundTask {
+                id: 2,
+                label: "cancelled and clean".to_string(),
+                done: true,
+                cancelled: true,
+                ..Default::default()
+            });
+        }
+        let mut events = Vec::new();
+        agent.drain_background(&mut |e| events.push(e));
+
+        let reg = agent.background_tasks();
+        let v = reg.lock().unwrap();
+        assert_eq!(v.len(), 1, "only the entry with a live worktree survives");
+        assert_eq!(v[0].id, 1, "the kept worktree's task is still reachable");
+        assert!(v[0].cancelled, "and it is still marked cancelled");
+        let last = agent
+            .messages()
+            .last()
+            .and_then(|m| m.content.as_deref())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !last.contains("cancelled with work"),
+            "retaining the entry must not deliver a cancelled task's result: {last}"
+        );
+    }
+
     /// `task_list` reports id, status and worktree; `task_steer` queues additional
     /// instructions; `task_cancel` aborts the worker and clears its live row.
     #[tokio::test]
@@ -7140,6 +7196,74 @@ mod tests {
         assert!(
             dirty_path.exists(),
             "gc keeps a worktree with unreviewed changes"
+        );
+    }
+
+    /// A locked registration whose checkout was deleted from under it is cleared
+    /// by the sweep.
+    ///
+    /// Regression: hrdr locks each worktree, and `git worktree prune` refuses
+    /// locked entries — so a directory removed by hand (an `rm -rf`, a cleaned
+    /// `.hrdr/`, a stray `git clean`) left an entry in the USER's
+    /// `git worktree list` that nothing would ever clear. Real repos have this
+    /// debris.
+    #[tokio::test]
+    async fn gc_clears_a_locked_registration_whose_checkout_is_gone() {
+        use super::{Worktree, gc_worktrees};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").exists() {
+            return;
+        }
+
+        // `pid_alive` can only answer on unix; elsewhere it assumes alive, so the
+        // stale-lock path is unix-only by construction. Ungated `cfg!` so the body
+        // still type-checks everywhere.
+        if !cfg!(unix) {
+            return;
+        }
+
+        // A worktree, still LOCKED as hrdr leaves it, whose directory is then
+        // deleted out from under git — exactly what `rm -rf` leaves behind.
+        let wt = Worktree::create(repo).await.unwrap().keep();
+        let path = wt.path.clone();
+        std::fs::remove_dir_all(&path).unwrap();
+        // Re-stamp the lock with a DEAD owner, so this reads as a previous
+        // session's leftover rather than a live sub-agent's worktree (a live
+        // owner is protected, checkout or no checkout).
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+        let dead_pid = child.id();
+        let admin = repo.join(".git/worktrees").join(path.file_name().unwrap());
+        std::fs::write(admin.join("locked"), format!("hrdr:pid={dead_pid}")).unwrap();
+        let listed = |g: &dyn Fn(&[&str]) -> std::process::Output| {
+            String::from_utf8_lossy(&g(&["worktree", "list", "--porcelain"]).stdout).to_string()
+        };
+        assert!(
+            listed(&git).contains(&*path.to_string_lossy()),
+            "the registration outlives the directory"
+        );
+
+        gc_worktrees(repo);
+
+        assert!(
+            !listed(&git).contains(&*path.to_string_lossy()),
+            "the sweep unlocks and prunes a registration with no checkout: {}",
+            listed(&git)
         );
     }
 

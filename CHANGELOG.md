@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A cancelled task's kept worktree is no longer stranded.** `task_cancel`
+  deliberately keeps a worktree holding uncommitted work or unmerged commits
+  instead of destroying it — but the registry entry was pruned on the next round
+  regardless, so `task_diff` / `task_apply` / `task_cleanup` all answered
+  `no background task #N` for a worktree that was still sitting on disk. With
+  every tool path closed and the prompt (rightly) forbidding `rm -rf`, there was
+  no legal way out, and a real session took the illegal one. A cancelled entry
+  now survives exactly as long as its worktree does, so the id stays addressable
+  and the work can be reviewed, applied, or discarded with the tools;
+  `task_cancel` clears the fields itself when it removes a clean worktree, so
+  those entries still prune. Its message now names those tools rather than
+  suggesting a look around with raw `git`.
+- **The startup sweep clears a locked worktree registration whose checkout is
+  gone.** hrdr locks each sub-agent worktree, and `git worktree prune` refuses
+  locked entries — so a directory removed outside hrdr (an `rm -rf`, a wiped
+  `.hrdr/`) left an entry in the user's own `git worktree list` that nothing
+  would ever clean up. The sweep now unlocks such an entry before pruning, when
+  the checkout is missing and the lock's owning process is dead. Nothing can be
+  lost: there is no directory left to hold work, and orphan-branch reaping still
+  goes through `git branch -d`, which refuses an unmerged branch.
+
 ### Changed
 
 - **Delegating from a dirty working dir now says so.** A write sub-agent's

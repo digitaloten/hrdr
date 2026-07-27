@@ -2581,17 +2581,36 @@ impl hrdr_tools::Tool for TaskCancelTool {
         let kept_note = match worktree {
             Some((path, branch)) => {
                 if worktree_has_changes(&ctx.cwd, &path, &branch).await {
+                    // The task id stays addressable precisely so this is
+                    // resolvable with tools — see the retain rule in
+                    // `TurnState::drain_background`. Name them: told only to go
+                    // look at the worktree, a model reaches for `rm -rf` to
+                    // finish the job, which the prompt forbids and which throws
+                    // the work away.
                     Some(format!(
                         " Its worktree has changes (uncommitted files or commits on its branch), \
-                         so it was kept for you to review — review (`git -C {} diff` and `git -C \
-                         {} log`) and merge or discard it yourself:\n  worktree: {}\n  branch:   \
-                         {branch}",
-                        path.display(),
-                        path.display(),
+                         so it was kept rather than thrown away, and task #{id} stays addressable \
+                         for it: `task_diff {id}` to review what it did, `task_apply {id}` to \
+                         bring uncommitted work into your working dir, `git merge --ff-only \
+                         {branch}` to take its commits, then `task_cleanup {id}` (add \
+                         `force: true` to discard the worktree and whatever is left in it). Never \
+                         `rm -rf` it — that leaves a stale git worktree registration \
+                         behind.\n  worktree: {}\n  branch:   {branch}",
                         path.display(),
                     ))
                 } else {
                     remove_worktree(&ctx.cwd, &path, &branch);
+                    // The worktree is gone, so nothing is left to address by id:
+                    // drop the fields that keep the entry alive, letting the next
+                    // drain prune it.
+                    let mut v = ctx
+                        .background_tasks
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(t) = v.iter_mut().find(|t| t.id == id) {
+                        t.worktree = None;
+                        t.branch = None;
+                    }
                     None
                 }
             }
@@ -3919,6 +3938,25 @@ pub(crate) fn gc_worktrees(repo: &std::path::Path) {
                 let live_lock = matches!(lock, Some(Some(pid)) if pid_alive(pid));
                 if ours && p.exists() && !live_lock && !worktree_has_changes_sync(repo, &p, &b) {
                     remove_worktree(repo, &p, &b);
+                } else if ours && !p.exists() && !live_lock && lock.is_some() {
+                    // The checkout is GONE but its registration survives, locked.
+                    // `git worktree prune` below refuses locked entries, so this
+                    // would sit in the user's `git worktree list` forever. Unlock
+                    // it so the prune can clear it. Nothing can be lost: there is
+                    // no directory left to hold work, and the branch is judged
+                    // separately by `git branch -d`, which refuses an unmerged one.
+                    //
+                    // Real sessions get here by `rm -rf`-ing a worktree — which the
+                    // prompt forbids, but which was the only exit from a cancelled
+                    // task whose entry had been pruned (see
+                    // `TurnState::drain_background`). That hole is closed, but the
+                    // debris outlives it, in repos that already have some.
+                    let _ = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(repo)
+                        .args(["worktree", "unlock"])
+                        .arg(&p)
+                        .output();
                 }
             }
             path = None;
