@@ -126,6 +126,13 @@ Correctness:
   it as outstanding in your summary. A stub is acceptable; a stub documented as
   working is a lie that survives you, and the next reader — human or model —
   builds on it.
+- A factual claim in a comment is checkable, so check it or cut it. Writing that a
+  primitive "canonicalises" a value, that an operation is atomic, that an API is
+  thread-safe, that an encoding is stable — each is a property you can confirm in
+  three lines, and each is one the next reader will trust without confirming. Print
+  the values, read the specification, write the one-case test. Overstating what a
+  mechanism gives you is how a correct implementation grows a false guarantee: the
+  comment outlives the checking nobody did.
 - Any number or status you write into a doc, changelog, README or plan must come
   from a command you just ran, pasted from its output: test counts, benchmark
   figures, coverage, a phase marked done. Never estimate one, and never carry an
@@ -242,6 +249,22 @@ Tests:
 - Write the test for the behaviour, not for the implementation you happen to have
   written. A test that passes whatever the code does is worse than no test: it
   reports safety that isn't there.
+- ASSERT WHAT YOU CLAIMED. A test's name, header and doc comment are a contract
+  with the next reader: every property they name must actually be exercised and
+  actually be asserted. Promise "survives loss, reorder and duplication with the
+  state matching" and then assert `count > 0`, and you have written a claim, not a
+  test — it passes with one item out of four and every value wrong, while reading
+  as proof of all three. The tell is an existence check standing in for the real
+  property: `> 0`, non-empty, "no panic", "returns Ok" where the actual
+  requirement is *equality*, an exact value, or a complete set. Assert the
+  strongest property the code genuinely satisfies, and if you cannot assert one you
+  named, cut the claim — a header nobody can rely on is worse than a shorter one.
+- A test named for a seam has to cross that seam. If a test called "integration"
+  builds its own stand-ins for the components it claims to integrate, it is a unit
+  test with a misleading name, and the real wiring — the thing a caller actually
+  links against — stays uncovered while looking covered. Worse, the hand-rolled
+  double and the real code then drift with nothing to notice. Drive the real units,
+  or name the test for what it does exercise.
 - When you fix a bug, add or extend a test that fails on the old code and passes
   on the fix — a fix without a test is unverified and can silently regress.
 - New behaviour ships with its test, in the same change. A feature, a new tool, a
@@ -271,12 +294,15 @@ Debugging:
 Git:
 - Name every path you stage (`git add <file> <file> …`), then `git commit` —
   never `git add -A`, `git add --all`, `git add .`, `git commit -a`, or
-  `git commit -am`. Both `git add -A` and `git commit -a`/`-am` sweep in every
-  change in the tree, and you do not know what else is there: scratch files, a
-  half-finished change of the user's, a stray build artifact, a file with a
-  secret in it. Staging by wildcard commits those into their repo. If you cannot
-  name the files, run `git status --short` and name them. (hrdr also blocks these
-  at the shell, so you'll get a corrective error — but do it right the first time.)
+  `git commit -am`, and never a DIRECTORY (`git add tests/`). All of them sweep in
+  changes you did not choose, and you do not know what else is there: scratch
+  files, a half-finished change of the user's, a stray build artifact, a file with
+  a secret in it. A directory is the easiest one to talk yourself into — you know
+  what you put in it — but it stages whatever else is under it too, including the
+  probe you forgot and anything a sub-agent or the user left. Name the files, one
+  per path, every time; if you cannot, run `git status --short` and name them.
+  (hrdr blocks these at the shell, so you'll get a corrective error — but do it
+  right the first time.)
 - Never force-push, never skip hooks (--no-verify), never rewrite published
   history (rebase/amend/squash of pushed commits).
 - When reverting your own changes, prefer Git over manually editing the old

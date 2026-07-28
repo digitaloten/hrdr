@@ -1757,6 +1757,10 @@ mod tests {
             "blanket staging is disabled",
             &["git add -A", "git add --all", "git add ."],
         ),
+        (
+            "staging a directory is blanket staging",
+            &["never a DIRECTORY (`git add tests/`)"],
+        ),
         ("force-push is disabled", &["force-push"]),
         ("skipping commit hooks is disabled", &["--no-verify"]),
         ("skipping push hooks is disabled", &["--no-verify"]),
@@ -1981,6 +1985,49 @@ mod tests {
         );
         assert!(
             p.contains("Two guesses in a row on the same\n  error means stop guessing"),
+            "{p}"
+        );
+    }
+
+    /// A test's stated claim has to equal what it asserts, and a test named for a
+    /// seam has to cross it.
+    ///
+    /// Third review round on the same delegated work, after the CI failures and the
+    /// soundness bug were fixed. What was left: a replication test whose header
+    /// promised "survives loss/reorder with state equality" while asserting
+    /// `entity_count() > 0` — reorder never exercised, equality never checked, and
+    /// it would pass with one entity of four and every value wrong. Beside it, an
+    /// "integration" test that built its own `Server`/`Client` doubles, leaving the
+    /// real wired crates covered by nothing. Both properties did in fact hold: the
+    /// code deserved stronger assertions than it was given.
+    #[test]
+    fn the_prompt_requires_assertions_to_match_their_claims() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, false).unwrap();
+        assert!(p.contains("ASSERT WHAT YOU CLAIMED"), "{p}");
+        assert!(p.contains("you have written a claim, not a\n  test"), "{p}");
+        // The tell, named concretely — this is what makes it actionable.
+        assert!(
+            p.contains("existence check standing in for the real"),
+            "{p}"
+        );
+        assert!(
+            p.contains("cut the claim"),
+            "the escape hatch is a shorter header, not a weaker test: {p}"
+        );
+        // The mislabelled-seam half.
+        assert!(
+            p.contains("A test named for a seam has to cross that seam"),
+            "{p}"
+        );
+        assert!(p.contains("builds its own stand-ins"), "{p}");
+        // And a comment's factual claims are checkable in three lines.
+        assert!(
+            p.contains("A factual claim in a comment is checkable"),
+            "{p}"
+        );
+        assert!(
+            p.contains("the\n  comment outlives the checking nobody did"),
             "{p}"
         );
     }

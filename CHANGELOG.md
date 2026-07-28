@@ -6,7 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Staging a directory is now blocked at the shell**, alongside `git add -A` /
+  `--all` / `.` and `git commit -a`/`-am`. `git add tests/` sweeps in every file
+  under it — the same hazard one level down, and the easiest one to talk
+  yourself into, since you know what you put there but not what else did. Seen
+  in a real session: two named files followed by the whole directory. Only the
+  unambiguous spelling is caught (a trailing slash); `git add dir` without one
+  is indistinguishable from a file by string matching, so the prompt carries the
+  rest.
+
 ### Changed
+
+- **A test must assert what its name and header claim.** The third review round
+  on the same delegated work found the correctness problems gone and this left:
+  a replication test whose header promised "survives loss, reorder and
+  duplication with state equality" while asserting `entity_count() > 0` —
+  reorder never exercised, equality never checked, and it would pass with one
+  entity out of four and every value wrong. Both properties actually held; the
+  code deserved stronger assertions than it was given. Write-capable agents are
+  now told that a test's name, header and doc comment are a contract, that the
+  tell is an existence check (`> 0`, non-empty, "no panic") standing in for a
+  real requirement of equality or an exact value, and that a claim they cannot
+  assert should be cut rather than left as decoration.
+- **A test named for a seam has to cross it.** The same round found an
+  "integration" test that built its own `Server`/`Client` doubles, so the real
+  wired crates — what a caller actually links — were covered by nothing while
+  appearing covered, with the hand-rolled double free to drift from the real
+  code. Drive the real units, or name the test for what it does exercise.
+- **A factual claim in a comment is checkable, so check it or cut it.** A
+  comment claiming a primitive "canonicalises NaN" was wrong (sign-differing
+  NaNs hash differently) — three lines would have shown it. Claims about
+  atomicity, thread safety, or a stable encoding get the same treatment: the
+  comment outlives the checking nobody did.
 
 - **A growing file is now treated as a defect.** Code lands somewhere and
   "somewhere" drifts: a 300-line module becomes 5000, a function stops fitting

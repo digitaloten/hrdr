@@ -50,6 +50,16 @@ pub fn default_guardrails() -> Vec<Guardrail> {
             r"\bgit\s+add\b[^&|;]*(\s-[a-zA-Z]*A|\s--all\b|\s\.(/)?(\s|$|['\x22;&|]))",
             "blanket staging is disabled — stage the files you actually changed: `git add <path> …`",
         ),
+        // A trailing slash is an unambiguous directory, and staging one sweeps in
+        // whatever else lives under it — same hazard as `git add -A`, one level
+        // down. Only this spelling is caught: `git add dir` (no slash) is
+        // indistinguishable from a file by string matching alone.
+        (
+            r"\bgit\s+add\b[^&|;]*\s[^\s'\x22;&|]+/(\s|$|['\x22;&|])",
+            "staging a directory is blanket staging — it sweeps every file under it, \
+             including anything you did not intend. Name the files: `git add <path> …` \
+             (`git status --short` lists them)",
+        ),
         (
             r"\bgit\s+push\b[^&|;]*\s(--force(\s|$|['\x22;&|])|-[a-zA-Z]*f\b)",
             "force-push is disabled — if the remote rejected the push, reconcile with fetch/rebase instead",
@@ -460,6 +470,26 @@ mod tests {
         assert!(!blocked("git add .github/workflows/ci.yml"));
     }
 
+    /// A directory argument sweeps in every file under it — the `git add -A`
+    /// hazard one level down, and how an unintended file rides along in a commit.
+    ///
+    /// Observed: `git add crates/foo/tests/replication.rs crates/foo/src/x.rs
+    /// crates/foo/tests/` — two named files and then the whole directory.
+    #[test]
+    fn staging_a_directory_is_blocked() {
+        assert!(blocked("git add tests/"));
+        assert!(blocked("git add crates/foo/tests/"));
+        assert!(blocked("git add src/a.rs crates/foo/tests/"));
+        assert!(blocked("git add 'crates/foo/tests/'"));
+        assert!(blocked("cd repo && git add tests/ && git commit -m x"));
+        // A file path is still a file path, slashes and all.
+        assert!(!blocked("git add crates/foo/tests/replication.rs"));
+        assert!(!blocked("git add src/main.rs Cargo.toml"));
+        assert!(!blocked("git add ./src/main.rs"));
+        // Not our business: another command that merely contains a directory.
+        assert!(!blocked("ls crates/foo/tests/"));
+    }
+
     #[test]
     fn blanket_commit_staging_blocked() {
         // `git commit -a`/`--all`/`-am` stages every tracked change — same
@@ -702,7 +732,9 @@ mod tests {
         let cases: &[(&str, &str)] = &[
             // Rule 0: blanket staging (`git add -A / --all / .`)
             ("git add -A", "git add src/main.rs Cargo.toml"),
-            // Rule 1: force-push (--force / -f)
+            // Rule 1: staging a directory (`git add <dir>/`)
+            ("git add tests/", "git add tests/replication.rs"),
+            // Rule 2: force-push (--force / -f)
             ("git push --force", "git push --force-with-lease"),
             // Rule 2: commit hook skip (--no-verify / -n flag)
             ("git commit --no-verify -m x", "git commit -m 'fix: thing'"),
