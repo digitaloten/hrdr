@@ -232,12 +232,22 @@ async fn login_handler(
         return (StatusCode::NOT_FOUND, "users auth not enabled").into_response();
     }
 
+    // Fetch the stored hash under the mutex, then run argon2 outside it.
     let db = state.auth.users_db.lock().unwrap();
-    let ok = match &*db {
-        Some(conn) => crate::users::verify(conn, &body.username, &body.password).unwrap_or(false),
-        None => false,
+    let hash_opt = match &*db {
+        Some(conn) => crate::users::get_password_hash(conn, &body.username).unwrap_or(None),
+        None => None,
     };
     drop(db);
+
+    let ok = match hash_opt {
+        Some(hash) => crate::users::verify_password(&body.password, &hash),
+        None => {
+            // Burn same argon2 work so timing can't leak "user exists".
+            let _ = crate::users::verify_password(&body.password, crate::users::DUMMY_HASH);
+            false
+        }
+    };
 
     if !ok {
         auth::rate_limit_record(&state.auth, client_ip);

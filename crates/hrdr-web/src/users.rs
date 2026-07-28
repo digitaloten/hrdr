@@ -59,16 +59,22 @@ pub fn get_password_hash(db: &Connection, username: &str) -> anyhow::Result<Opti
 /// An argon2id hash of a throwaway password, verified against when the
 /// requested user does not exist so a nonexistent username costs the same time
 /// as a wrong password (no user-enumeration oracle).
-const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$aazmAE0OrJxIhK/PgYt4rQ$RoqZSJLzMgRNNLXzLiglcQeIS/jlV+N+GpqmQiDvw2c";
+pub const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$aazmAE0OrJxIhK/PgYt4rQ$RoqZSJLzMgRNNLXzLiglcQeIS/jlV+N+GpqmQiDvw2c";
+
+/// Low-level argon2id password-vs-hash comparison. Thin wrapper so callers
+/// don't need to reach into `auth` for this.
+pub fn verify_password(password: &str, hash: &str) -> bool {
+    crate::auth::verify_basic_password(password, hash)
+}
 
 /// Verify a username + password against the database.
 pub fn verify(db: &Connection, username: &str, password: &str) -> anyhow::Result<bool> {
     let Some(hash) = get_password_hash(db, username)? else {
         // Burn the same argon2 work as a real verify, then fail.
-        let _ = crate::auth::verify_basic_password(password, DUMMY_HASH);
+        let _ = verify_password(password, DUMMY_HASH);
         return Ok(false);
     };
-    Ok(crate::auth::verify_basic_password(password, &hash))
+    Ok(verify_password(password, &hash))
 }
 
 // Allow `optional()` on rusqlite rows.
