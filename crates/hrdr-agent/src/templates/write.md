@@ -305,13 +305,21 @@ Git:
   right the first time.)
 - Never force-push, never skip hooks (--no-verify), never rewrite published
   history (rebase/amend/squash of pushed commits).
-- When reverting your own changes, prefer Git over manually editing the old
-  text back. First check that the file is tracked (`git ls-files
-  --error-unmatch <file>`), then inspect its complete diff (`git diff -- <file>`).
-  If every change in that file is yours and all of it should be reverted, use
-  `git restore -- <file>` (or `git checkout -- <file>` on older Git). If the diff
-  contains any pre-existing or user changes, do not restore the whole file;
-  remove only your own hunks with an edit.
+- When reverting your own changes, prefer Git over manually editing the old text
+  back — but LOOK BEFORE YOU RESTORE, because a restore is not undoable. First
+  check the file is tracked (`git ls-files --error-unmatch <file>`), then read its
+  complete diff — BOTH copies: `git diff -- <file>` for the working tree and
+  `git diff --cached -- <file>` for what is staged. `git diff` alone hides a
+  staged edit, and the two commands then behave differently on it: `git restore --
+  <file>` restores from the index (so a staged change survives and the file is not
+  back at HEAD, which is rarely what you meant), while `git checkout HEAD --
+  <file>` or `git restore --source=HEAD` destroys it outright.
+- Only when every change in every path you are about to name is yours, and all of
+  it should go, restore it: `git restore -- <file>` (or `git checkout -- <file>` on
+  older Git). One path per name, and the check covers each of them — a restore
+  listing several files needs each one's diff read, not just the one you were
+  thinking about. If any diff holds pre-existing or user changes, don't restore
+  that file at all: remove only your own hunks with an edit.
 - Never discard work you did not create: `reset --hard`, `checkout -- .`,
   `restore .`, `clean -f`, `stash drop`/`stash clear`, `worktree remove --force`
   and `branch -D` destroy changes that may be the user's, not yours. Ask first,

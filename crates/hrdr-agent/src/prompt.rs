@@ -1843,7 +1843,7 @@ mod tests {
         let p = render_system(&tools, false).unwrap();
 
         for required in [
-            "git ls-files\n  --error-unmatch <file>",
+            "git ls-files --error-unmatch <file>",
             "git diff -- <file>",
             "git restore -- <file>",
             "git checkout -- <file>",
@@ -1851,8 +1851,25 @@ mod tests {
             assert!(p.contains(required), "missing revert guidance: {required}");
         }
         assert!(
-            p.contains("every change in that file is yours"),
-            "whole-file restore must require a clean, agent-owned diff"
+            p.contains("LOOK BEFORE YOU RESTORE"),
+            "a restore is not undoable, so the diff is read first: {p}"
+        );
+        // BOTH diffs. `git diff` alone hides a staged edit, and the restore
+        // spellings then disagree about it: `git restore -- <file>` takes the index
+        // (staged change survives, file is NOT at HEAD), while
+        // `git checkout HEAD -- <file>` destroys it.
+        assert!(
+            p.contains("git diff --cached -- <file>"),
+            "the staged copy is inspected too: {p}"
+        );
+        assert!(
+            p.contains("restores from the index") && p.contains("destroys it outright"),
+            "the two spellings differ on a staged change, and the prompt says how: {p}"
+        );
+        // Every named path, not just the one in mind.
+        assert!(
+            p.contains("every change in every path you are about to name is yours"),
+            "a multi-path restore checks each path: {p}"
         );
         assert!(
             p.contains("remove only your own hunks with an edit"),
