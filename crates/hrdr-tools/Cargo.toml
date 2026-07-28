@@ -26,6 +26,10 @@ which = "7"
 rand.workspace = true
 serde_path_to_error = "0.1.20"
 shell-words = "1"
+# CI pipeline configs, for the verification gate (src/gate.rs). Every provider
+# worth reading — GitHub Actions, GitLab, CircleCI, Azure, Drone — writes YAML,
+# so one parse covers them all.
+serde_yaml_ng.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The sandbox fallback for hosts where bwrap or unprivileged user namespaces

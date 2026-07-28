@@ -69,12 +69,17 @@ mod frag {
 /// 7. **Persona** ([`crate::persona_section`]) — differs per agent profile.
 /// 8. **Environment** ([`environment_section`]) — tool list, OS, date, and the
 ///    working directory. The start of the volatile tail.
-/// 9. **Sandbox** ([`sandbox_section`]) — the confinement mode and the concrete
-///    writable roots, which name the per-agent worktree `cwd`. Exactly as
-///    volatile as the Environment block's working-directory line, so it sits
-///    below it, **dead last**. The cache split is computed *before* Environment,
-///    so appending here costs the cached prefix nothing; moving it above
-///    Environment would push per-agent bytes into the shared prefix.
+/// 9. **Verification gate** ([`gate_section`]) — the commands this project
+///    treats as its check, discovered from its CI or from ecosystem convention.
+///    Its own section because it states a requirement rather than a fact, and
+///    below Environment because the cache split is taken there, so nothing from
+///    here down costs the shared prefix anything.
+/// 10. **Sandbox** ([`sandbox_section`]) — the confinement mode and the concrete
+///     writable roots, which name the per-agent worktree `cwd`. Exactly as
+///     volatile as the Environment block's working-directory line, so it sits
+///     below it, **dead last**. The cache split is computed *before* Environment,
+///     so appending here costs the cached prefix nothing; moving it above
+///     Environment would push per-agent bytes into the shared prefix.
 ///
 /// Scopes are split global-before-project (2-3 before 4-5) so switching projects
 /// still reuses the global bytes; joined into one block they would leave the
@@ -219,6 +224,12 @@ pub const SECTION_SUBAGENT_WRITE: &str = "subagent_write";
 pub const SECTION_SKILLS: &str = "skills";
 pub const SECTION_PERSONA: &str = "persona";
 pub const SECTION_ENVIRONMENT: &str = "environment";
+// The project's verification gate — what "done" means here, in commands. Its own
+// section rather than an Environment bullet because it states a REQUIREMENT, not
+// a fact, and requirements folded into a fact list get read as facts. Below the
+// environment block only because the cache split is taken there, so everything
+// from that point down is uncached anyway. See `gate_section`.
+pub const SECTION_GATE: &str = "gate";
 // Below the environment block on purpose: the writable roots name the per-agent
 // cwd, so this is the most volatile section there is. See `sandbox_section`.
 pub const SECTION_SANDBOX: &str = "sandbox";
@@ -467,6 +478,53 @@ fn truncate_words(text: &str, max: usize) -> String {
         _ => cut.as_str(),
     };
     format!("{}…", head.trim_end_matches([',', '.', ';', ':']))
+}
+
+/// The project's verification gate as a prompt section — the concrete commands
+/// that decide whether a change is finished here.
+///
+/// Its own section rather than another Environment bullet, because it is a
+/// different kind of statement. Environment says what is *true* (the OS, the
+/// date, the tool list); this says what is *required*, and it is several lines
+/// of it. Folding a requirement into a list of facts is how it gets read as one.
+///
+/// Discovered by [`hrdr_tools::Gate::detect`] — CI first, ecosystem convention
+/// second — and empty (→ dropped by [`SystemPrompt::push`]) when neither
+/// answered. **Naming a gate we did not find would be the worst outcome
+/// available**: the model would run a command that does not exist here, spend a
+/// turn diagnosing the failure, and trust the next thing the prompt told it
+/// less.
+///
+/// The two sources are worded differently on purpose. A CI-derived gate is a
+/// fact about the project and is stated as one; an ecosystem-derived gate is a
+/// convention hrdr is applying on the project's behalf, and saying so is what
+/// lets the model correct it out loud instead of silently obeying a guess.
+pub fn gate_section(gate: &hrdr_tools::Gate) -> String {
+    if gate.is_empty() {
+        return String::new();
+    }
+    let framing = match gate.source {
+        Some(hrdr_tools::GateSource::Ci) => format!(
+            "These are the checks this project's CI runs ({}). They are what turns a change \
+             red here, so they are what \"done\" means",
+            gate.origin_phrase(),
+        ),
+        _ => format!(
+            "{}. Treat them as the bar unless the project says otherwise",
+            gate.origin_phrase(),
+        ),
+    };
+    format!(
+        "\n\nVerification gate:\n\
+         {framing}. Run them from your working directory, and make them pass, before you \
+         report work finished or commit it:\n\
+         {}\n\
+         A narrower command proves a narrower thing — a green `-p one-crate` or a green single \
+         test file is not this gate, and reporting it as though it were is the failure this \
+         section exists to prevent. If one of these is genuinely wrong for what you changed, \
+         say which and why; do not quietly substitute a smaller one.",
+        gate.command_list(),
+    )
 }
 
 /// The sandbox declaration — mode plus the concrete roots — as a prompt section.
@@ -2767,6 +2825,50 @@ mod tests {
             "{notice}"
         );
         assert!(notice.contains("NOT in the prompt"), "{notice}");
+    }
+
+    /// The gate section names commands, traces them to where they came from,
+    /// and hedges exactly when it is guessing — a guess stated as a fact is a
+    /// command the model runs and then has to debug.
+    #[test]
+    fn the_gate_section_names_every_command_and_where_it_came_from() {
+        let ci = hrdr_tools::Gate {
+            checks: vec![
+                hrdr_tools::GateCheck {
+                    kind: hrdr_tools::CheckKind::Lint,
+                    command: "cargo clippy --all-targets -- -D warnings".to_string(),
+                },
+                hrdr_tools::GateCheck {
+                    kind: hrdr_tools::CheckKind::Test,
+                    command: "cargo test --workspace".to_string(),
+                },
+            ],
+            source: Some(hrdr_tools::GateSource::Ci),
+            origins: vec![".github/workflows/ci.yml".to_string()],
+        };
+        let s = gate_section(&ci);
+        assert!(s.starts_with("\n\nVerification gate:\n"), "{s}");
+        assert!(
+            s.contains("`cargo clippy --all-targets -- -D warnings` (lint)"),
+            "{s}"
+        );
+        assert!(s.contains("`cargo test --workspace` (test)"), "{s}");
+        assert!(s.contains("read from .github/workflows/ci.yml"), "{s}");
+
+        // The ecosystem wording says out loud that it is convention, so the
+        // model can push back on it instead of obeying a guess.
+        let guessed = hrdr_tools::Gate {
+            source: Some(hrdr_tools::GateSource::Ecosystem),
+            origins: vec!["Cargo.toml".to_string()],
+            ..ci.clone()
+        };
+        let s = gate_section(&guessed);
+        assert!(s.contains("no CI configuration found"), "{s}");
+        assert!(s.contains("unless the project says otherwise"), "{s}");
+
+        // Nothing discovered: say nothing. Naming a gate we did not find sends
+        // the model after a command that does not exist here.
+        assert!(gate_section(&hrdr_tools::Gate::default()).is_empty());
     }
 
     /// The model is told its boundary positively, and every writable root is

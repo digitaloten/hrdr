@@ -8,6 +8,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **hrdr reads the project's CI to learn what "done" means here.** The
+  verification ledger below knew a run was partial but had no idea what a
+  complete one would have been. It does now: at startup hrdr discovers the
+  project's gate — the concrete commands that decide whether a change is
+  finished — and states them in their own `Verification gate` section at the
+  tail of the system prompt, traced back to the file they came from. Discovery
+  is provider-agnostic by construction: CI configs are parsed as YAML and walked
+  for the handful of keys that hold shell, so GitHub Actions, GitLab CI,
+  CircleCI, Azure Pipelines, Bitbucket, Drone/Woodpecker, Travis, Cirrus and
+  Buildkite all read out of one pass (Jenkins, being Groovy, gets a small
+  `sh '…'` scanner). With no CI — or CI with nothing recognisable in it — it
+  falls back to what the ecosystem's own tooling would run, and says out loud
+  that it is doing so: `cargo fmt`/`clippy`/`test` for a Cargo.toml (with
+  `--workspace` only when the manifest declares one), the scripts a
+  `package.json` actually declares under the package manager its lockfile names,
+  `pytest` plus whichever of ruff/black/flake8/mypy is configured,
+  `go vet`/`go test ./...`, the phpunit-or-pest and phpstan-or-psalm a
+  `composer.json` requires, rubocop/rspec from a Gemfile, `mix` for Elixir, and
+  the targets a Makefile actually defines. A polyglot repo gates on every
+  ecosystem it has. The ledger measures against the same list, which fixes the
+  wart that motivated this: a project whose CI runs
+  `cargo clippy --all-targets -- -D warnings` — no `--workspace`, so the
+  classifier called it partial — was nagged about lint no matter how many times
+  the exact CI command passed. The commit note now names the commands to run
+  rather than advising that some be run. The classifier also learned a much
+  wider world along the way: deno, biome, mypy/pyright, black, flake8, rubocop,
+  rspec, rake, phpunit/pest/phpstan/psalm/pint, mix, dotnet, maven, gradle,
+  swift, flutter/dart, tox/nox, golangci-lint, ctest, `make`/`just` targets, and
+  `poetry`/`uv`/`pdm`/`bundle`-style runners it now looks through.
 - **A verification ledger, and a word about it at commit time.** hrdr now keeps
   score of what a session has actually verified: every shell command is
   classified (test / lint / format / build / type-check) and scored for whether

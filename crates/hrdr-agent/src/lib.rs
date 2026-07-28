@@ -978,6 +978,13 @@ pub struct Agent {
     /// Environment block. Kept on the agent because the prompt is REBUILT when
     /// memory or skills change, and a rebuild must not quietly drop them.
     subagent_limits: prompt::SubagentLimits,
+    /// The project's verification gate, discovered once from the cwd (CI config
+    /// first, ecosystem convention second). Kept on the agent for the same
+    /// reason as the limits above — a prompt rebuild must not drop it — and
+    /// re-discovered when the cwd changes, since a different project has a
+    /// different gate. Shared with the tool context's ledger, which measures
+    /// against the same commands the prompt names.
+    gate: Arc<hrdr_tools::Gate>,
     /// Prompt tokens the last model call actually used — the agent's own view of
     /// how full its context is, so it can compact before the next request rather
     /// than after one has already failed. See [`Agent::maybe_self_compact`].
@@ -1264,11 +1271,12 @@ fn build_system_prompt_sections(
     delegated: bool,
     sandbox: &hrdr_tools::SandboxPolicy,
     limits: prompt::SubagentLimits,
+    gate: &hrdr_tools::Gate,
 ) -> Result<prompt::SystemPrompt> {
     use prompt::{
-        SECTION_BASE, SECTION_ENVIRONMENT, SECTION_GLOBAL_AGENTS_MD, SECTION_GLOBAL_MEMORY,
-        SECTION_PERSONA, SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY, SECTION_SANDBOX,
-        SECTION_SKILLS,
+        SECTION_BASE, SECTION_ENVIRONMENT, SECTION_GATE, SECTION_GLOBAL_AGENTS_MD,
+        SECTION_GLOBAL_MEMORY, SECTION_PERSONA, SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY,
+        SECTION_SANDBOX, SECTION_SKILLS,
     };
     let mut p = prompt::SystemPrompt::default();
     // 1. identical for every agent hrdr runs
@@ -1310,6 +1318,7 @@ fn build_system_prompt_sections(
         SECTION_ENVIRONMENT,
         prompt::environment_section(cwd, tools, limits),
     );
+    p.push(SECTION_GATE, prompt::gate_section(gate));
     p.push(SECTION_SANDBOX, prompt::sandbox_section(sandbox));
     Ok(p)
 }
@@ -1332,9 +1341,10 @@ fn build_system_prompt(
     delegated: bool,
     sandbox: &hrdr_tools::SandboxPolicy,
     limits: prompt::SubagentLimits,
+    gate: &hrdr_tools::Gate,
 ) -> Result<(String, Option<usize>)> {
     let p = build_system_prompt_sections(
-        tools, cwd, docs, memory, skills, persona, delegated, sandbox, limits,
+        tools, cwd, docs, memory, skills, persona, delegated, sandbox, limits, gate,
     )?;
     let split = p.prefix_len_before(prompt::SECTION_ENVIRONMENT);
     Ok((p.render(), split))
@@ -1696,6 +1706,16 @@ impl Agent {
             read_only: config.max_readonly_subagents,
             write: config.max_write_subagents,
         };
+        // Discover the project's gate once, here, and hand the same value to
+        // both consumers: the prompt section that tells the model what to run,
+        // and the ledger that notices when it did not. Two discoveries could
+        // disagree, and a prompt naming one bar while the note measured another
+        // would be worse than having neither.
+        let gate = Arc::new(hrdr_tools::Gate::detect(&config.cwd));
+        ctx.verification
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_gate((*gate).clone());
         let (system, system_cache_split) = build_system_prompt(
             &tools,
             &config.cwd,
@@ -1706,6 +1726,7 @@ impl Agent {
             config.delegated,
             &ctx.sandbox,
             subagent_limits,
+            &gate,
         )?;
 
         // Configure the client from the (possibly auth-switched) resolved model,
@@ -1771,6 +1792,7 @@ impl Agent {
             delegated: config.delegated,
             read_only: config.read_only,
             subagent_limits,
+            gate,
             last_prompt_tokens: None,
             prompt_cache: config.prompt_cache,
             tools,
@@ -1973,6 +1995,7 @@ impl Agent {
             self.delegated,
             &self.ctx.sandbox,
             self.subagent_limits,
+            &self.gate,
         ) else {
             return;
         };
@@ -2034,6 +2057,15 @@ impl Agent {
             .skills
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = skills.clone();
+        // A different project has a different gate, and the ledger must move with
+        // the prompt — measuring a new project against the old project's CI is
+        // exactly the kind of confident wrong answer the gate exists to remove.
+        self.gate = Arc::new(hrdr_tools::Gate::detect(&self.ctx.cwd));
+        self.ctx
+            .verification
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_gate((*self.gate).clone());
         let Ok((system, system_cache_split)) = build_system_prompt(
             &self.tools,
             &self.ctx.cwd,
@@ -2044,6 +2076,7 @@ impl Agent {
             self.delegated,
             &self.ctx.sandbox,
             self.subagent_limits,
+            &self.gate,
         ) else {
             return;
         };
@@ -4996,9 +5029,9 @@ mod tests {
     #[test]
     fn system_prompt_is_ordered_least_volatile_first() {
         use super::prompt::{
-            SECTION_BASE, SECTION_ENVIRONMENT, SECTION_GLOBAL_AGENTS_MD, SECTION_GLOBAL_MEMORY,
-            SECTION_PERSONA, SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY, SECTION_SANDBOX,
-            SECTION_SKILLS,
+            SECTION_BASE, SECTION_ENVIRONMENT, SECTION_GATE, SECTION_GLOBAL_AGENTS_MD,
+            SECTION_GLOBAL_MEMORY, SECTION_PERSONA, SECTION_PROJECT_AGENTS_MD,
+            SECTION_PROJECT_MEMORY, SECTION_SANDBOX, SECTION_SKILLS,
         };
         let mut tools = hrdr_tools::ToolRegistry::with_defaults();
         // The `skill` tool is registered by `Agent::new`, not by the defaults, and
@@ -5007,6 +5040,16 @@ mod tests {
         tools.register(std::sync::Arc::new(super::skills::SkillTool {
             skills: std::sync::Arc::new(std::sync::Mutex::new(super::builtin_skills())),
         }));
+        // A non-empty gate, so its section is present and its POSITION is what
+        // this test pins. An empty one would let the section move anywhere.
+        let gate = hrdr_tools::Gate {
+            checks: vec![hrdr_tools::GateCheck {
+                kind: hrdr_tools::CheckKind::Test,
+                command: "cargo test --workspace".to_string(),
+            }],
+            source: Some(hrdr_tools::GateSource::Ci),
+            origins: vec![".github/workflows/ci.yml".to_string()],
+        };
         let sections = |sandbox: &hrdr_tools::SandboxPolicy| {
             super::build_system_prompt_sections(
                 &tools,
@@ -5028,6 +5071,7 @@ mod tests {
                     read_only: DEFAULT_MAX_READONLY_SUBAGENTS,
                     write: DEFAULT_MAX_WRITE_SUBAGENTS,
                 },
+                &gate,
             )
             .unwrap()
         };
@@ -5056,6 +5100,9 @@ mod tests {
                 SECTION_SKILLS,
                 SECTION_PERSONA,
                 SECTION_ENVIRONMENT,
+                // what "done" means here, in commands — a requirement, so it gets
+                // its own section rather than another environment bullet
+                SECTION_GATE,
                 SECTION_SANDBOX,
             ],
             "assembly order is the cache strategy: least-volatile first, so a new session \
@@ -5065,7 +5112,7 @@ mod tests {
         // environment block is the tail again.
         let unconfined = sections(&hrdr_tools::SandboxPolicy::unconfined());
         assert!(!unconfined.names().contains(&SECTION_SANDBOX));
-        assert_eq!(unconfined.names().last(), Some(&SECTION_ENVIRONMENT));
+        assert_eq!(unconfined.names().last(), Some(&SECTION_GATE));
     }
 
     /// An agent with no persona and no memory simply has fewer sections — the
@@ -5088,6 +5135,7 @@ mod tests {
                 read_only: DEFAULT_MAX_READONLY_SUBAGENTS,
                 write: DEFAULT_MAX_WRITE_SUBAGENTS,
             },
+            &hrdr_tools::Gate::default(),
         )
         .unwrap();
 
@@ -5121,6 +5169,7 @@ mod tests {
                 read_only: DEFAULT_MAX_READONLY_SUBAGENTS,
                 write: DEFAULT_MAX_WRITE_SUBAGENTS,
             },
+            &hrdr_tools::Gate::default(),
         )
         .unwrap();
 

@@ -19,6 +19,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::gate::Gate;
+
 /// How many classified runs are remembered. The ledger is session-scoped and a
 /// long session runs hundreds of commands, so this is a ring in spirit: the note
 /// only ever names the most recent handful, and the older entries exist for the
@@ -99,9 +101,24 @@ pub struct VerificationLedger {
     passed: BTreeMap<CheckKind, u64>,
     /// Every classified run, oldest first, capped at [`MAX_RUNS`].
     runs: Vec<Run>,
+    /// What this project treats as checked ([`Gate`]), discovered from its CI or
+    /// from ecosystem convention. Empty when nothing could be discovered, in
+    /// which case everything below falls back to the built-in classifier alone.
+    gate: Gate,
 }
 
 impl VerificationLedger {
+    /// Install the project's discovered gate. Called once, when the agent that
+    /// owns this ledger is built.
+    pub fn set_gate(&mut self, gate: Gate) {
+        self.gate = gate;
+    }
+
+    /// The gate this ledger measures against.
+    pub fn gate(&self) -> &Gate {
+        &self.gate
+    }
+
     /// Record that a source file changed. Everything proved before this moment
     /// is now proved about different code.
     pub fn bump_source(&mut self) {
@@ -116,7 +133,11 @@ impl VerificationLedger {
     /// its partial output as a pass is precisely the failure this file exists
     /// to catch.
     pub fn record(&mut self, command: &str, ok: bool) {
-        let Some((kind, scope)) = classify(command) else {
+        // The gate answers first, because it knows things the classifier cannot:
+        // that `cargo clippy --all-targets -- -D warnings` — which names no
+        // workspace, so the classifier calls it partial — is this project's
+        // entire lint bar. See [`Gate::matched`].
+        let Some((kind, scope)) = self.gate.matched(command).or_else(|| classify(command)) else {
             return;
         };
         if ok && scope == Scope::Whole {
@@ -140,16 +161,26 @@ impl VerificationLedger {
     /// whole-tree run at the current `source_epoch`.
     ///
     /// Empty before the first source edit — a session that only read code owes
-    /// nothing — and empty of kinds this session has never touched. The one
-    /// unconditional entry is `test`: a source edit always owes a test run, and
-    /// the whole motivating story is a commit where none had been made. Chasing
-    /// the other three kinds only once the session has shown it uses them keeps
-    /// the note about this project instead of about every project.
+    /// nothing.
+    ///
+    /// The baseline is the project's own [`Gate`]: a repo whose CI runs a
+    /// formatter, a linter and a suite owes all three, and one whose CI runs only
+    /// a suite owes only that. Without a gate the baseline falls back to `test`
+    /// alone — a source edit always owes a test run, and the motivating story was
+    /// a commit where none had been made. Kinds the session has run are added on
+    /// top either way, so a session that chose to lint is held to it whether or
+    /// not CI asked.
     pub fn stale_kinds(&self) -> Vec<CheckKind> {
         if self.source_epoch == 0 {
             return Vec::new();
         }
-        let mut kinds: Vec<CheckKind> = std::iter::once(CheckKind::Test)
+        let baseline = if self.gate.is_empty() {
+            vec![CheckKind::Test]
+        } else {
+            self.gate.kinds()
+        };
+        let mut kinds: Vec<CheckKind> = baseline
+            .into_iter()
             .chain(self.runs.iter().map(|r| r.kind))
             .filter(|kind| self.passed.get(kind) != Some(&self.source_epoch))
             .collect();
@@ -223,9 +254,19 @@ impl VerificationLedger {
                 self.source_epoch
             )
         };
+        // With a gate, the note can end in something the model can act on
+        // without deciding anything — the exact commands, as the project wrote
+        // them. "Run the tests" is advice it has already read and discounted;
+        // "run `cargo test --workspace`" is one tool call away.
+        let owed = self.gate.owed_commands(&stale);
+        let next = if owed.is_empty() {
+            "A green subset is not a green tree.".to_string()
+        } else {
+            format!("A green subset is not a green tree — run {owed}.")
+        };
         Some(format!(
             "[verify] committed, but no project-wide {kinds} run is recorded since your last \
-             source edit ({evidence}). A green subset is not a green tree."
+             source edit ({evidence}). {next}"
         ))
     }
 
@@ -288,7 +329,7 @@ pub(crate) fn is_git_commit(command: &str) -> bool {
 /// One exception overrides everything: a command containing `||` exits 0 on the
 /// *fallback*, so its exit code says nothing about the check. Those are demoted
 /// to partial rather than trusted.
-fn classify(command: &str) -> Option<(CheckKind, Scope)> {
+pub(crate) fn classify(command: &str) -> Option<(CheckKind, Scope)> {
     let strongest = segments(command)
         .filter_map(|segment| classify_segment(&segment))
         .max_by_key(|(kind, scope)| (*scope == Scope::Whole, kind_rank(*kind)))?;
@@ -316,7 +357,7 @@ fn kind_rank(kind: CheckKind) -> u8 {
 /// `;`, `|` and newlines. Splitting on the bare characters (rather than the
 /// operators) also breaks `2>&1` and `|&`, which is harmless — the fragments
 /// classify to nothing.
-fn segments(command: &str) -> impl Iterator<Item = String> + '_ {
+pub(crate) fn segments(command: &str) -> impl Iterator<Item = String> + '_ {
     command
         .split(['&', '|', ';', '\n'])
         .map(|s| s.trim().to_string())
@@ -366,17 +407,52 @@ fn basename(token: &str) -> &str {
     token.rsplit(['/', '\\']).next().unwrap_or(token)
 }
 
+/// One segment reduced to the tokens that decide what it runs — env prefixes,
+/// wrappers and redirections gone, whitespace collapsed.
+///
+/// Shared with [`Gate`](crate::Gate), which both stores gate commands in this
+/// form and compares runs against them in it. Two spellings of the same
+/// normalization would mean a gate that matches nothing the moment either side
+/// learns about a new wrapper.
+pub(crate) fn normalized_tokens(segment: &str) -> Vec<String> {
+    arguments(segment).into_iter().map(String::from).collect()
+}
+
 /// One shell command (no operators left in it), dispatched on the program that
 /// runs it. An unrecognised program is `None` rather than a guess: a check we
 /// cannot read is one the session gets no credit for, which costs an extra ask
 /// — where a guess would cost a false all-clear.
-fn classify_segment(segment: &str) -> Option<(CheckKind, Scope)> {
-    let tokens = arguments(segment);
+pub(crate) fn classify_segment(segment: &str) -> Option<(CheckKind, Scope)> {
+    classify_tokens(&arguments(segment), 0)
+}
+
+/// How deep a `poetry run …` / `bundle exec …` chain is followed. Two is more
+/// than anyone writes; the bound exists so a pathological `uv run uv run …`
+/// cannot recurse without end.
+const MAX_RUNNER_DEPTH: u8 = 2;
+
+fn classify_tokens(tokens: &[&str], depth: u8) -> Option<(CheckKind, Scope)> {
+    /// Environment managers that run the real command as an argument: the kind
+    /// is whatever they are running, not the manager.
+    const RUNNERS: &[&str] = &[
+        "poetry", "uv", "pdm", "hatch", "pipenv", "rye", "bundle", "mise", "asdf",
+    ];
+
     let (program, rest) = tokens.split_first()?;
-    match basename(program) {
+    let program = basename(program);
+    if RUNNERS.contains(&program) && depth < MAX_RUNNER_DEPTH {
+        let tail = match rest.split_first() {
+            Some((&("run" | "exec" | "x"), tail)) => tail,
+            _ => return None,
+        };
+        return classify_tokens(tail, depth + 1);
+    }
+    match program {
         "cargo" => classify_cargo(rest),
-        "npm" | "pnpm" | "yarn" | "bun" => classify_node_script(rest),
+        "npm" | "pnpm" | "yarn" | "bun" | "composer" => classify_node_script(rest),
+        "deno" => classify_deno(rest),
         "pytest" | "py.test" => Some((CheckKind::Test, pytest_scope(rest))),
+        "tox" | "nox" => Some((CheckKind::Test, Scope::Whole)),
         "python" | "python3" => {
             // `python -m pytest …` is the same run under another spelling.
             match rest.split_first() {
@@ -387,12 +463,137 @@ fn classify_segment(segment: &str) -> Option<(CheckKind, Scope)> {
             }
         }
         "go" => classify_go(rest),
+        "golangci-lint" => Some((CheckKind::Lint, Scope::Whole)),
         "ruff" => classify_ruff(rest),
+        "biome" => classify_biome(rest),
+        "black" => Some((CheckKind::Format, path_scope(rest))),
+        "flake8" | "pylint" => Some((CheckKind::Lint, path_scope(rest))),
+        "mypy" | "pyright" | "pyre" => Some((CheckKind::TypeCheck, path_scope(rest))),
         "eslint" => Some((CheckKind::Lint, path_scope(rest))),
         "prettier" => Some((CheckKind::Format, path_scope(rest))),
         "tsc" => Some((CheckKind::TypeCheck, tsc_scope(rest))),
+        "rubocop" => Some((CheckKind::Lint, path_scope(rest))),
+        "rspec" | "minitest" => Some((CheckKind::Test, path_scope(rest))),
+        "rake" => rest.first().and_then(|t| match *t {
+            "test" | "spec" => Some((CheckKind::Test, Scope::Whole)),
+            _ => None,
+        }),
+        "phpunit" | "pest" | "phpspec" => Some((CheckKind::Test, path_scope(rest))),
+        "phpstan" | "psalm" | "phpcs" => Some((CheckKind::Lint, Scope::Whole)),
+        "pint" | "php-cs-fixer" | "phpcbf" => Some((CheckKind::Format, Scope::Whole)),
+        "mix" => classify_mix(rest),
+        "dotnet" => rest.first().and_then(|t| match *t {
+            "test" => Some((CheckKind::Test, path_scope(&rest[1..]))),
+            "build" => Some((CheckKind::Build, path_scope(&rest[1..]))),
+            "format" => Some((CheckKind::Format, path_scope(&rest[1..]))),
+            _ => None,
+        }),
+        // Maven and Gradle both have one blessed "run the checks" goal, and both
+        // spell everything narrower as a different word.
+        "mvn" | "mvnw" => classify_first_of(
+            rest,
+            &[
+                ("verify", CheckKind::Test),
+                ("test", CheckKind::Test),
+                ("compile", CheckKind::Build),
+                ("package", CheckKind::Build),
+            ],
+        ),
+        "gradle" | "gradlew" => classify_first_of(
+            rest,
+            &[
+                ("check", CheckKind::Test),
+                ("test", CheckKind::Test),
+                ("build", CheckKind::Build),
+            ],
+        ),
+        "swift" => classify_first_of(
+            rest,
+            &[("test", CheckKind::Test), ("build", CheckKind::Build)],
+        ),
+        "flutter" | "dart" => classify_first_of(
+            rest,
+            &[
+                ("test", CheckKind::Test),
+                ("analyze", CheckKind::Lint),
+                ("format", CheckKind::Format),
+            ],
+        ),
+        "ctest" => Some((CheckKind::Test, Scope::Whole)),
+        // `just test` is `make test` in a different hat — a named recipe, with
+        // the same handful of conventional names.
+        "make" | "gmake" | "just" => classify_make(rest),
         _ => None,
     }
+}
+
+/// The first bare argument that names a known goal — the shape shared by every
+/// task runner whose subcommand can sit behind flags (`mvn -B verify`,
+/// `./gradlew --no-daemon check`). Scope is whole: these goals mean the project.
+fn classify_first_of(args: &[&str], goals: &[(&str, CheckKind)]) -> Option<(CheckKind, Scope)> {
+    let mut kind = None;
+    walk_args(
+        args,
+        |_| false,
+        |arg| {
+            kind = goals.iter().find(|(g, _)| *g == arg).map(|(_, k)| *k);
+            kind.is_some()
+        },
+    );
+    kind.map(|k| (k, Scope::Whole))
+}
+
+/// `make test`, `make lint`. A bare `make` builds, but which target it builds is
+/// the project's business, so only named targets are read.
+fn classify_make(args: &[&str]) -> Option<(CheckKind, Scope)> {
+    classify_first_of(
+        args,
+        &[
+            ("test", CheckKind::Test),
+            ("check", CheckKind::Test),
+            ("lint", CheckKind::Lint),
+            ("fmt", CheckKind::Format),
+            ("format", CheckKind::Format),
+            ("typecheck", CheckKind::TypeCheck),
+            ("build", CheckKind::Build),
+        ],
+    )
+}
+
+fn classify_deno(args: &[&str]) -> Option<(CheckKind, Scope)> {
+    let (sub, rest) = args.split_first()?;
+    let kind = match *sub {
+        "test" => CheckKind::Test,
+        "lint" => CheckKind::Lint,
+        "fmt" => CheckKind::Format,
+        "check" => CheckKind::TypeCheck,
+        _ => return None,
+    };
+    Some((kind, path_scope(rest)))
+}
+
+fn classify_biome(args: &[&str]) -> Option<(CheckKind, Scope)> {
+    let (sub, rest) = args.split_first()?;
+    let kind = match *sub {
+        "check" | "lint" => CheckKind::Lint,
+        "format" => CheckKind::Format,
+        _ => return None,
+    };
+    Some((kind, path_scope(rest)))
+}
+
+fn classify_mix(args: &[&str]) -> Option<(CheckKind, Scope)> {
+    let (sub, rest) = args.split_first()?;
+    let kind = match *sub {
+        "test" => CheckKind::Test,
+        "credo" | "dialyzer" => CheckKind::Lint,
+        "format" => CheckKind::Format,
+        "compile" => CheckKind::Build,
+        _ => return None,
+    };
+    // `mix test test/foo_test.exs` is a subset; `mix format --check-formatted`
+    // is not, because its argument is a flag.
+    Some((kind, path_scope(rest)))
 }
 
 /// Flags whose *next* token is a value, not an argument of its own. Shared
@@ -711,6 +912,101 @@ fn tsc_scope(args: &[&str]) -> Scope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gate::{GateCheck, GateSource};
+
+    /// A ledger measuring against an explicit gate, without touching a disk.
+    fn ledger_gated(checks: &[(CheckKind, &str)]) -> VerificationLedger {
+        let mut ledger = VerificationLedger::default();
+        ledger.set_gate(Gate {
+            checks: checks
+                .iter()
+                .map(|(kind, command)| GateCheck {
+                    kind: *kind,
+                    command: (*command).to_string(),
+                })
+                .collect(),
+            source: Some(GateSource::Ci),
+            origins: vec![".github/workflows/ci.yml".to_string()],
+        });
+        ledger
+    }
+
+    /// Without a gate the ledger chases `test` alone; with one it chases every
+    /// kind the project gates on, which is the whole point of discovering it.
+    #[test]
+    fn the_gate_sets_which_kinds_are_owed() {
+        let mut bare = VerificationLedger::default();
+        bare.bump_source();
+        assert_eq!(bare.stale_kinds(), vec![CheckKind::Test]);
+
+        let mut gated = ledger_gated(&[
+            (CheckKind::Format, "cargo fmt --all -- --check"),
+            (CheckKind::Lint, "cargo clippy --all-targets -- -D warnings"),
+            (CheckKind::Test, "cargo test --workspace"),
+        ]);
+        gated.bump_source();
+        assert_eq!(
+            gated.stale_kinds(),
+            vec![CheckKind::Test, CheckKind::Lint, CheckKind::Format],
+        );
+    }
+
+    /// The wart the gate exists to remove: this repo's own lint command names no
+    /// workspace, so the classifier alone calls it partial and the note would
+    /// nag about it forever, however many times CI's exact command was run.
+    #[test]
+    fn running_the_projects_own_lint_command_clears_the_lint_bar() {
+        let mut ledger = ledger_gated(&[
+            (CheckKind::Lint, "cargo clippy --all-targets -- -D warnings"),
+            (CheckKind::Test, "cargo test --workspace"),
+        ]);
+        ledger.bump_source();
+        ledger.record("cargo clippy --all-targets -- -D warnings", true);
+        assert_eq!(
+            ledger.stale_kinds(),
+            vec![CheckKind::Test],
+            "lint is satisfied; only the untried test kind is still owed",
+        );
+    }
+
+    /// A gate turns the note from advice into an instruction: the commands it
+    /// names are the project's own, so following it needs no judgement.
+    #[test]
+    fn the_commit_note_names_the_gate_commands() {
+        let mut ledger = ledger_gated(&[
+            (CheckKind::Lint, "cargo clippy --all-targets -- -D warnings"),
+            (CheckKind::Test, "cargo test --workspace"),
+        ]);
+        ledger.bump_source();
+        let note = ledger.commit_note().expect("a note is owed");
+        assert!(
+            note.contains(
+                "run `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`"
+            ),
+            "{note}"
+        );
+
+        // Once both have passed there is nothing to say at all.
+        ledger.record("cargo clippy --all-targets -- -D warnings", true);
+        ledger.record("cargo test --workspace", true);
+        assert_eq!(ledger.commit_note(), None);
+
+        // …until the next edit moves the code out from under them.
+        ledger.bump_source();
+        assert!(ledger.commit_note().is_some());
+    }
+
+    /// A failing run of a gate command is still a run, and must not be mistaken
+    /// for having cleared the bar.
+    #[test]
+    fn a_failing_gate_command_satisfies_nothing() {
+        let mut ledger = ledger_gated(&[(CheckKind::Test, "cargo test --workspace")]);
+        ledger.bump_source();
+        ledger.record("cargo test --workspace", false);
+        assert_eq!(ledger.stale_kinds(), vec![CheckKind::Test]);
+        let note = ledger.commit_note().expect("a note is owed");
+        assert!(note.contains("nothing that ran has passed"), "{note}");
+    }
 
     #[test]
     fn a_workspace_wide_cargo_run_is_whole() {

@@ -5,8 +5,11 @@ Verifying:
 - Learn the project's own commands before you run anything — its `package.json`
   scripts, a `Makefile`/`justfile`/`Taskfile`, `CONTRIBUTING.md`, the CI workflow
   (`.github/workflows`) — and use those, not a guess.
-- Run the project's WHOLE gate set, not the four commands you habitually run. Open
-  its CI config and enumerate every job, then run each one's command locally. Past
+- Run the project's WHOLE gate set, not the four commands you habitually run. The
+  Verification gate section, when it is present, is the list already read out of
+  this project's config — start from it, and treat it as a FLOOR: it names one
+  command per tool per kind, and drops anything it could not recognise as a check.
+  Open its CI config and enumerate every job, then run each one's command locally. Past
   build/test/format/lint, projects gate things that are easy to forget and fail
   loudly in CI: an API-docs build treating warnings as errors, a
   **frozen-lockfile** build, dependency audits (licences, advisories, unused

@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use hrdr_llm::ToolDef;
 
 mod ansi;
+mod gate;
 mod guardrails;
 mod hooks;
 mod lsp;
@@ -34,6 +35,7 @@ mod tools;
 mod verification;
 mod web;
 
+pub use gate::{Gate, GateCheck, GateSource};
 pub use guardrails::{
     Guardrail, check_guardrails, default_guardrails, rebase_against_task_worktree,
     task_worktree_rebase_message,
