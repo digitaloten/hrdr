@@ -6,6 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Read-only sub-agents get a shell, and the bespoke `git` tool is gone.**
+  `explore`, `review` and `plan` had no shell at all, so a read-only `git` tool
+  existed to give them `log`/`diff`/`blame` — the one thing reviewing a change
+  is mostly made of. That left two ways to reach git, and a model that tried
+  `git add` through the read-only one paid a round-trip discovering it was
+  refused. Read-only is now enforced where it belongs — `effective_sandbox` puts
+  those agents in `SandboxMode::Read` — so they get a shell like every other
+  agent and run git, tests and linters through it, while keeping no write tools
+  and no `task`.
+
+  Stated plainly, because it is a real trade: the read-only guarantee now rests
+  on the OS sandbox rather than on the tool set. Where no OS sandbox is
+  available (Windows, a macOS without `sandbox-exec`, a Linux with neither bwrap
+  nor Landlock) hrdr already warns that shell commands are unconfined, and on
+  the Landlock fallback a read-mode agent degrades to write-confinement. Those
+  notices fire as before; nothing here silences them. `redact_secret_diffs`
+  survives the `git` tool's removal in its own module — `task_diff` composes its
+  own diff and still redacts credential files out of it.
+
+### Fixed
+
+- **A sandbox-blocked write no longer reads as a broken tool.** The confinement
+  is a read-only bind mount, so a refused write surfaces as `EROFS` from deep
+  inside whatever was running, about a path the model never named. A real run
+  hit exactly that: `npx prettier --write` ignored the installed `prettier` on
+  `PATH`, tried to fetch the package into `~/.npm/_cacache`, got `EROFS`, and
+  the model concluded "prettier is not available in this environment" — false
+  about the machine — then silently skipped formatting. Sandboxed `shell` output
+  that carries `EROFS`/"read-only file system" now gets a note naming the
+  sandbox, listing the writable roots, and saying to run the copy already on
+  `PATH` rather than downloading one. Deliberately narrow: a bare "Permission
+  denied" is an ordinary error and is never annotated.
+
 ## [0.8.5] - 2026-07-28
 
 ### Added

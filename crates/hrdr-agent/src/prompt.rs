@@ -375,18 +375,12 @@ pub fn environment_section(cwd: &Path, tools: &ToolRegistry, limits: SubagentLim
     if let Some(shell) = tools.shell() {
         lines.push(format!("- Shell: {}", shell.env_label()));
     }
-    // The limits a tool's own schema cannot carry, or carries where a model
-    // reliably misses it. Both are here because a real run paid a round-trip to
-    // discover them: `git add` refused, then four `task` calls for two slots.
-    // Stated as capabilities rather than warnings — what IS allowed, and how many
-    // — so the model plans within them instead of probing for the edge.
-    if has("git") {
-        lines.push(format!(
-            "- `git` tool is READ-ONLY — {}. Staging, committing, checkout, \
-             branch changes and push go through `shell`.",
-            hrdr_tools::GIT_READ_ONLY_SUBCOMMANDS.join(", "),
-        ));
-    }
+    // A limit a tool's own schema cannot carry: the `task` caps come from config
+    // (max_readonly_subagents / max_write_subagents), so they differ per session
+    // while the description has to stay generic. It is here because a real run
+    // paid for its absence — four write `task` calls for two slots, two refusals,
+    // and a re-planned batch. Stated as a capability rather than a warning: how
+    // many are allowed, so a batch is sized up front instead of probed for.
     if has("task") {
         lines.push(format!(
             "- `task` concurrency: at most {} read-only and {} write-capable \
@@ -868,12 +862,6 @@ mod tests {
             .contains("at most 9 read-only and 4 write-capable"),
             "the numbers track the config, not a default"
         );
-
-        // …and the git line quotes the tool's own allow-list, so the two cannot
-        // drift apart.
-        for sub in hrdr_tools::GIT_READ_ONLY_SUBCOMMANDS {
-            assert!(body.contains(sub), "git subcommand {sub} missing: {body}");
-        }
 
         // A read-only agent has no `task` and no shell, so those bullets vanish
         // rather than rendering empty.

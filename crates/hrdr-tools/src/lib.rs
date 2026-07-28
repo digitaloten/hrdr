@@ -46,10 +46,9 @@ pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
 pub use tools::{
-    CopyTool, DEFAULT_TOOL_TIMEOUT_SECS, DefinitionTool, DeleteTool, EditTool, FindTool,
-    GIT_READ_ONLY_SUBCOMMANDS, GitTool, GrepTool, LsTool, MoveTool, ReadTool, ReferencesTool,
-    RenameTool, ReplaceTool, Shell, ShellTool, TodoTool, TreeTool, WatchTool, WriteTool,
-    available_shell_tools, redact_secret_diffs,
+    CopyTool, DEFAULT_TOOL_TIMEOUT_SECS, DefinitionTool, DeleteTool, EditTool, FindTool, GrepTool,
+    LsTool, MoveTool, ReadTool, ReferencesTool, RenameTool, ReplaceTool, Shell, ShellTool,
+    TodoTool, TreeTool, WatchTool, WriteTool, available_shell_tools, redact_secret_diffs,
 };
 pub use web::{WebFetchTool, WebSearchTool};
 
@@ -1377,7 +1376,6 @@ impl ToolRegistry {
         r.register(Arc::new(DeleteTool));
         r.register(Arc::new(CopyTool));
         r.register(Arc::new(ReplaceTool));
-        r.register(Arc::new(GitTool));
         // The shell tool is presence-gated so the model is only offered a shell
         // it can actually use (`bash`, then POSIX `sh`; on Windows that means
         // WSL or Git Bash — there is no PowerShell path).
@@ -1415,6 +1413,14 @@ impl ToolRegistry {
     /// [`Tool::read_only`]); unknown names count as mutating.
     pub fn is_read_only(&self, name: &str) -> bool {
         self.tools.get(name).is_some_and(|t| t.read_only())
+    }
+
+    /// Whether `name` is a shell tool — one that hands the model a command line
+    /// ([`Tool::shell`]). Mirrors [`is_read_only`](Self::is_read_only): asked by
+    /// name, so a caller scoping a tool set never hardcodes the spelling
+    /// (`bash` vs `sh`) that registration happened to pick.
+    pub fn is_shell(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(|t| t.shell().is_some())
     }
 
     /// Whether the registry holds any mutating (non-read-only) tool. Drives

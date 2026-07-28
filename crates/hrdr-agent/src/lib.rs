@@ -1211,6 +1211,21 @@ const MEMORY_PREAMBLE: &str = "Durable notes you saved in earlier sessions (via 
      tool). Trust them but verify against the code before acting; update or prune entries as \
      things change. Detail lives in topic files you can `read`/`grep`.";
 
+/// The registered shell tool's name, if this build has one at all.
+///
+/// Presence-gated at registration (`bash`, then POSIX `sh`; on Windows only WSL
+/// or Git Bash), so a machine with no usable shell registers none and a
+/// read-only agent simply keeps the read tools. Asked of the registry rather
+/// than hardcoded, so the two cannot disagree about what the tool is called.
+fn shell_tool_names(tools: &ToolRegistry) -> Vec<String> {
+    tools
+        .defs()
+        .into_iter()
+        .map(|d| d.function.name)
+        .filter(|n| tools.is_shell(n))
+        .collect()
+}
+
 /// Build the system prompt as ordered, named sections.
 ///
 /// Least-volatile first, so the longest possible prefix is byte-identical across
@@ -1575,8 +1590,25 @@ impl Agent {
         if let Some(allow) = &config.allowed_tools {
             tools.retain_only(allow);
         } else if config.read_only {
-            let ro = tools.read_only_names();
-            tools.retain_only(&ro);
+            let mut keep = tools.read_only_names();
+            // …plus a SHELL. A read-only agent is confined by
+            // `effective_sandbox` (`SandboxMode::Read`), not by the absence of a
+            // shell, and without one an `explore` or `review` agent cannot run
+            // the one thing reviewing a change is mostly made of — `git log`,
+            // `git blame`, `git diff` — nor a test, a linter, or any other
+            // read-only command. It read whole files where a diff would have
+            // done.
+            //
+            // The trade this makes, stated plainly because it is real: the
+            // read-only guarantee now rests on the OS sandbox rather than on the
+            // tool set. Where no OS sandbox is available — Windows, a macOS
+            // without `sandbox-exec`, a Linux with neither bwrap nor Landlock —
+            // `NO_OS_SANDBOX_NOTICE` already says shell commands are not
+            // confined, and on Landlock a read-mode agent degrades to
+            // write-confinement. On those systems a read-only agent's shell can
+            // write. The notices fire; nothing here silences them.
+            keep.extend(shell_tool_names(&tools));
+            tools.retain_only(&keep);
         }
         let delegation_enabled = tools.defs().iter().any(|d| d.function.name == "task");
         if let Ok(mut runtime) = delegation_runtime.lock() {
@@ -5219,7 +5251,11 @@ mod tests {
         assert!(tools.iter().any(|n| n == "grep"));
         assert!(!tools.iter().any(|n| n == "write"));
         assert!(!tools.iter().any(|n| n == "edit"));
-        assert!(!tools.iter().any(|n| n == "shell"));
+        // …and a SHELL: read-only is enforced by the sandbox
+        // (`effective_sandbox` → `SandboxMode::Read`), not by withholding a
+        // command line. Without one an explorer could not run `git log`, a test,
+        // or a linter — it read whole files where a diff would have done.
+        assert!(tools.iter().any(|n| n == "shell"));
         // A read-only sub-agent can't itself delegate.
         assert!(!tools.iter().any(|n| n == "task"));
         // The persona made it into the system prompt.
@@ -5239,11 +5275,11 @@ mod tests {
         assert!(cfg.read_only);
         let agent = Agent::new(cfg).unwrap();
         let tools: Vec<String> = agent.tools().into_iter().map(|(n, _)| n).collect();
-        // Read/search tools only — no writers, no shell.
+        // No writers — but a shell, confined to reads by the sandbox.
         assert!(tools.iter().any(|n| n == "read"));
         assert!(!tools.iter().any(|n| n == "write"));
         assert!(!tools.iter().any(|n| n == "edit"));
-        assert!(!tools.iter().any(|n| n == "shell"));
+        assert!(tools.iter().any(|n| n == "shell"));
         assert!(system_prompt(&agent).contains("PLAN sub-agent"));
     }
 
@@ -5512,20 +5548,23 @@ mod tests {
             "definition",
             "fetch",
             "find",
-            "git",
             "grep",
             "ls",
             "models",
             "read",
             "references",
             "search",
+            // A shell, sandbox-confined to reads — the bespoke read-only `git`
+            // tool this list used to carry is gone, and `git log`/`diff`/`blame`
+            // run here like every other read-only command.
+            "shell",
             "skill",
             "todo",
             "tree",
         ];
         assert_eq!(tools("explore"), readers);
         assert_eq!(tools("review"), readers);
-        // `plan` is read-only too now: same reader set, no writers, no shell.
+        // `plan` is read-only too: same reader set, no writers.
         assert_eq!(tools("plan"), readers);
 
         // A general sub-agent has the full set, shell included…
@@ -5550,14 +5589,18 @@ mod tests {
         }
         assert!(!coder.contains(&"task".to_string()), "no nested delegation");
 
-        // No sub-agent gets the `shell` tool unless it is write-capable in the
-        // first place.
+        // Every sub-agent gets a shell — a read-only one is confined by the
+        // sandbox, not by having no command line — but NONE of them may write or
+        // delegate further.
         for ro in ["explore", "review", "plan"] {
             let t = tools(ro);
             assert!(
-                !t.contains(&"shell".to_string()),
-                "{ro} must not have the shell tool"
+                t.contains(&"shell".to_string()),
+                "{ro} needs a shell to run git, a test or a linter"
             );
+            for w in ["write", "edit", "move", "delete", "copy", "replace"] {
+                assert!(!t.contains(&w.to_string()), "{ro} must not have `{w}`");
+            }
             assert!(!t.contains(&"task".to_string()), "{ro} must not delegate");
         }
     }

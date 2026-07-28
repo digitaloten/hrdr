@@ -172,7 +172,7 @@ impl SandboxPolicy {
                  never write repository or agent metadata: a hook placed there runs with the \
                  user's full authority the next time they commit, outside this agent's boundary. \
                  If the change is really wanted, ask the user to make it. To record work, commit \
-                 it — the `git` tool or `shell` reach git through git itself, which writes its own \
+                 it — `shell` reaches git through git itself, which writes its own \
                  metadata; you do not.",
                 shown.display(),
             )
@@ -678,6 +678,46 @@ fn detect_backend_uncached() -> Detection {
     }
 }
 
+/// A note to append when a sandboxed command's output looks like the SANDBOX
+/// refused a write, rather than the program failing on its own terms.
+///
+/// The confinement is a read-only bind mount, so a blocked write surfaces as
+/// `EROFS` / "Read-only file system" — from deep inside whatever tool was
+/// running, describing a path the model never mentioned. That reads as a broken
+/// or missing tool, and a model acts on it as one.
+///
+/// The case this was written for: `npx prettier --write …` on a machine where
+/// `prettier` is installed and on `PATH`. `npx` ignored it, tried to fetch the
+/// package into `~/.npm/_cacache`, and got `EROFS`. The model concluded
+/// "prettier is not available in this environment" — a false statement about the
+/// machine — and silently skipped formatting the file it had just written.
+///
+/// Deliberately narrow. Only `EROFS`/"read-only file system" triggers it: those
+/// are all but unheard of on a developer's box outside a sandbox, whereas a
+/// bare "Permission denied" is a normal error this must not editorialize over.
+/// `None` when unconfined, or when nothing in the output matches.
+pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<String> {
+    if policy.mode == SandboxMode::None {
+        return None;
+    }
+    let lower = output.to_ascii_lowercase();
+    if !lower.contains("read-only file system") && !lower.contains("erofs") {
+        return None;
+    }
+    let where_writable = if policy.writable_roots.is_empty() {
+        "nothing is writable for this agent (read-only mode)".to_string()
+    } else {
+        format!("writable here: {}", join_roots(&policy.writable_roots))
+    };
+    Some(format!(
+        "\n\n[sandbox] the \"read-only file system\" above is hrdr's sandbox refusing a write \
+         outside this agent's roots — {where_writable}. The program is installed and working; \
+         it tried to write somewhere it may not. If it was a package runner fetching a tool \
+         (`npx`, `uvx`, `pipx`), run the copy already on PATH instead of downloading one. If \
+         the write is genuinely needed, say so — do not report the tool as missing or broken."
+    ))
+}
+
 /// The command `shell`/`watch` actually spawn: `cmd_str` run through `shell`,
 /// wrapped in whatever OS confinement the policy's mode demands. Mode `None`
 /// — or a platform/kernel with no backend — returns exactly what
@@ -1108,6 +1148,59 @@ pub(crate) fn confined_ctx(dir: &Path, mode: SandboxMode) -> crate::ToolContext 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A blocked write is reported as the SANDBOX, not as a broken tool.
+    ///
+    /// Verbatim from a real run: the model wrote a report, then ran
+    /// `npx prettier --write docs/code-review.md`. `prettier` was installed and
+    /// on `PATH`, but `npx` ignored it and tried to fetch the package into
+    /// `~/.npm/_cacache`, which the sandbox binds read-only. The model read the
+    /// `EROFS` as "prettier is not available in this environment" — a false claim
+    /// about the machine — and skipped formatting.
+    #[test]
+    fn a_sandboxed_write_denial_is_named_as_the_sandbox() {
+        const NPX_EROFS: &str = "npm error code EROFS\n\
+             npm error syscall open\n\
+             npm error path /home/u/.npm/_cacache/tmp/aa7100ad\n\
+             npm error errno EROFS\n\
+             npm error rofs Invalid response body while trying to fetch \
+             https://registry.npmjs.org/prettier: EROFS: read-only file system";
+
+        let dir = tempfile::tempdir().unwrap();
+        let write = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+        let note = sandbox_denial_note(&write, NPX_EROFS).expect("the denial is recognized");
+        assert!(note.contains("[sandbox]"), "{note}");
+        assert!(note.contains("writable here:"), "{note}");
+        // It must say the thing the model got wrong, in as many words.
+        assert!(
+            note.contains("do not report the tool as missing or broken"),
+            "{note}"
+        );
+        assert!(note.contains("run the copy already on PATH"), "{note}");
+
+        // A read-mode agent has no writable root at all — say that, rather than
+        // printing an empty list.
+        let read = SandboxPolicy::for_agent(SandboxMode::Read, dir.path(), &[]);
+        let ro_note = sandbox_denial_note(&read, NPX_EROFS).expect("recognized in read mode too");
+        assert!(ro_note.contains("read-only mode"), "{ro_note}");
+
+        // Unconfined: the sandbox did not do this, so it says nothing.
+        assert_eq!(
+            sandbox_denial_note(&SandboxPolicy::unconfined(), NPX_EROFS),
+            None
+        );
+        // …and NARROW: an ordinary failure is never editorialized over. A bare
+        // "Permission denied" is a normal error a program raises for its own
+        // reasons, and annotating it would be noise on every one of them.
+        for ordinary in [
+            "error: could not compile `foo`",
+            "cat: /etc/shadow: Permission denied",
+            "fatal: not a git repository",
+            "",
+        ] {
+            assert_eq!(sandbox_denial_note(&write, ordinary), None, "{ordinary}");
+        }
+    }
 
     /// `check_write` with the canonicalization its callers owe it.
     fn check_write(policy: &SandboxPolicy, path: &Path) -> anyhow::Result<()> {

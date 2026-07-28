@@ -4993,12 +4993,19 @@ mod revive_tests {
             ro_tools.contains(&"read".to_string()) && ro_tools.contains(&"grep".to_string()),
             "it is still an agent — the readers stay: {ro_tools:?}"
         );
-        for w in ["write", "edit", "shell", "move", "delete", "copy"] {
+        for w in ["write", "edit", "move", "delete", "copy"] {
             assert!(
                 !ro_tools.contains(&w.to_string()),
                 "a revived read-only run must not get `{w}`: {ro_tools:?}"
             );
         }
+        // A shell it DOES get: read-only is the sandbox's job
+        // (`effective_sandbox` → `SandboxMode::Read`), and a revived run is
+        // scoped by the same constructor as a fresh one, so it lands here too.
+        assert!(
+            ro_tools.contains(&"shell".to_string()),
+            "a revived read-only run keeps its shell: {ro_tools:?}"
+        );
 
         let rw = revive_target_from_disk(dir.path(), "005-coder")
             .await

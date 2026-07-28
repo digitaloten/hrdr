@@ -329,10 +329,18 @@ impl Tool for ShellTool {
         // hasn't seen what the command wrote, which is exactly what the
         // read-before-mutate guard is for.
         let before = ctx.tracked_sigs();
-        let out = run_streamed_command(cmd, &a.command, timeout, a.keep_ansi, ctx).await;
+        let mut out = run_streamed_command(cmd, &a.command, timeout, a.keep_ansi, ctx).await;
         // Also on failure: a command that exited non-zero (or timed out) may
         // still have rewritten files before it died.
         ctx.note_modifying_command(&before, &a.command);
+        // Name the sandbox when it is what actually failed. An `EROFS` raised
+        // deep inside a tool, about a path the model never named, otherwise
+        // reads as that tool being broken or absent — see `sandbox_denial_note`.
+        if let Ok(text) = &mut out
+            && let Some(note) = crate::sandbox::sandbox_denial_note(&ctx.sandbox, text)
+        {
+            text.push_str(&note);
+        }
         out
     }
 }

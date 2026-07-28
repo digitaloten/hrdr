@@ -3,13 +3,13 @@
 pub(crate) mod edit;
 pub(crate) mod fileops;
 pub(crate) mod find;
-pub(crate) mod git;
 pub(crate) mod grep;
 pub(crate) mod ls;
 pub(crate) mod lsp_nav;
 pub(crate) mod mutation;
 pub(crate) mod read;
 pub(crate) mod replace;
+pub(crate) mod secret_diff;
 pub(crate) mod shell;
 pub(crate) mod todo;
 pub(crate) mod tree;
@@ -233,12 +233,12 @@ pub(crate) fn rel_display<'a>(
 pub use edit::EditTool;
 pub use fileops::{CopyTool, DeleteTool, MoveTool};
 pub use find::FindTool;
-pub use git::{GIT_READ_ONLY_SUBCOMMANDS, GitTool, redact_secret_diffs};
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use lsp_nav::{DefinitionTool, ReferencesTool, RenameTool};
 pub use read::ReadTool;
 pub use replace::ReplaceTool;
+pub use secret_diff::redact_secret_diffs;
 pub use shell::{Shell, ShellTool, available_shell_tools};
 pub use todo::TodoTool;
 pub use tree::TreeTool;
