@@ -549,11 +549,11 @@ fn error_message(err: &Value) -> Option<String> {
 }
 
 /// Classify a Codex error code as transient or terminal. Only clearly transient
-/// codes (rate limit, server error, timeout) are marked retryable; all others
-/// (auth, bad request, etc.) are terminal (`Other`).
+/// codes (rate limit, server overload/error, timeout) are marked retryable; all
+/// others (auth, bad request, etc.) are terminal (`Other`).
 fn classify_codex_error(code: Option<&str>) -> crate::client::ChatErrorKind {
     match code {
-        Some("rate_limit_exceeded" | "server_error" | "timeout") => {
+        Some("rate_limit_exceeded" | "server_error" | "server_is_overloaded" | "timeout") => {
             crate::client::ChatErrorKind::Transient
         }
         _ => crate::client::ChatErrorKind::Other,
@@ -927,6 +927,15 @@ mod tests {
             chat_err.message
         );
         assert!(chat_err.message.contains("boom"), "{}", chat_err.message);
+
+        let overloaded = json!({
+            "type": "error",
+            "code": "server_is_overloaded",
+            "message": "Our servers are currently overloaded. Please try again later."
+        });
+        let err = map_event(&mut state, &overloaded).unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
     }
 
     /// An `error` event may nest its payload (`{"type":"error","error":{…}}`),
