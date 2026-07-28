@@ -10278,10 +10278,12 @@ mod tests {
                 TodoItem {
                     content: "write the fix".to_string(),
                     status: "in_progress".to_string(),
+                    evidence: None,
                 },
                 TodoItem {
                     content: "add a test".to_string(),
                     status: "pending".to_string(),
+                    evidence: None,
                 },
             ];
 
@@ -10369,6 +10371,7 @@ mod tests {
             *agent.todos().lock().unwrap() = vec![TodoItem {
                 content: "write the fix".to_string(),
                 status: "completed".to_string(),
+                evidence: None,
             }];
 
             let mut events: Vec<AgentEvent> = Vec::new();
@@ -10409,10 +10412,12 @@ mod tests {
                 TodoItem {
                     content: "write the fix".to_string(),
                     status: "completed".to_string(),
+                    evidence: None,
                 },
                 TodoItem {
                     content: "skip the other".to_string(),
                     status: "cancelled".to_string(),
+                    evidence: None,
                 },
             ];
 
@@ -10455,6 +10460,7 @@ mod tests {
             *agent.todos().lock().unwrap() = vec![TodoItem {
                 content: "review the change".to_string(),
                 status: "in_progress".to_string(),
+                evidence: None,
             }];
             let handle = tokio::spawn(async {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -10519,6 +10525,7 @@ mod tests {
             *agent.todos().lock().unwrap() = vec![TodoItem {
                 content: "unfinished work".to_string(),
                 status: "pending".to_string(),
+                evidence: None,
             }];
 
             let mut events: Vec<AgentEvent> = Vec::new();
@@ -10785,9 +10792,13 @@ mod tests {
         /// shorter *and* a named item vanished outright) and fires at most once.
         #[tokio::test]
         async fn agent_run_re_nudges_when_nudged_todos_are_deleted_not_resolved() {
-            let collapse = serde_json::to_string(
-                &json!({"todos": [{"content": "all done", "status": "completed"}]}),
-            )
+            // Carries `evidence` because the `todo` tool now refuses a bare
+            // completion outright — which is a different guard from the one
+            // under test here. Supplying it keeps this test about what its name
+            // says: deleting unfinished items rather than resolving them.
+            let collapse = serde_json::to_string(&json!({"todos": [
+                {"content": "all done", "status": "completed", "evidence": "cargo test: 3 passed"}
+            ]}))
             .unwrap();
             let server = MockServer::start(vec![
                 // Round 1: promise-then-stop with two unfinished items → nudge.
@@ -10819,10 +10830,12 @@ mod tests {
                 TodoItem {
                     content: "write the fix".to_string(),
                     status: "in_progress".to_string(),
+                    evidence: None,
                 },
                 TodoItem {
                     content: "add a test".to_string(),
                     status: "pending".to_string(),
+                    evidence: None,
                 },
             ];
 
@@ -10903,10 +10916,12 @@ mod tests {
                 TodoItem {
                     content: "write the fix".to_string(),
                     status: "in_progress".to_string(),
+                    evidence: None,
                 },
                 TodoItem {
                     content: "add a test".to_string(),
                     status: "pending".to_string(),
+                    evidence: None,
                 },
             ];
 

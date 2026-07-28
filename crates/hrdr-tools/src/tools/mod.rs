@@ -1239,7 +1239,9 @@ mod tests {
                     "todos": [
                         {"content": "pending task",  "status": "pending"},
                         {"content": "active task",   "status": "in_progress"},
-                        {"content": "done task",     "status": "completed"},
+                        // `evidence` because a completion without it is refused
+                        // — a separate guard from the mark rendering under test.
+                        {"content": "done task",     "status": "completed", "evidence": "ran it"},
                         {"content": "stopped task",  "status": "cancelled"}
                     ]
                 }),
@@ -1251,6 +1253,80 @@ mod tests {
         assert!(out.contains("⠋ active task"), "in_progress: {out}");
         assert!(out.contains("✓ done task"), "completed: {out}");
         assert!(out.contains("✗ stopped task"), "cancelled: {out}");
+    }
+
+    /// The gate has to hold through the tool, not just in the helper: a refused
+    /// call must also leave the previous list untouched, or a rejected tick
+    /// still loses the state the model was tracking.
+    #[tokio::test]
+    async fn the_todo_tool_refuses_a_bare_completion_and_keeps_the_old_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let list = |status: &str, evidence: Option<&str>| {
+            let mut item = serde_json::Map::new();
+            item.insert("content".into(), json!("fix it"));
+            item.insert("status".into(), json!(status));
+            if let Some(e) = evidence {
+                item.insert("evidence".into(), json!(e));
+            }
+            json!({ "todos": [serde_json::Value::Object(item)] })
+        };
+
+        TodoTool
+            .execute(list("in_progress", None), &c)
+            .await
+            .unwrap();
+        let err = TodoTool
+            .execute(list("completed", None), &c)
+            .await
+            .expect_err("a completion with no evidence must be refused");
+        assert!(err.to_string().contains("`fix it`"), "{err}");
+        // The refusal did not eat the list it was sent to replace.
+        assert_eq!(c.todos.lock().unwrap()[0].status, "in_progress");
+
+        let out = TodoTool
+            .execute(
+                list("completed", Some("cargo test -p hrdr-tools: 155 passed")),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.contains("↳ cargo test -p hrdr-tools: 155 passed"),
+            "{out}"
+        );
+        assert_eq!(c.todos.lock().unwrap()[0].status, "completed");
+    }
+
+    /// The nudge has to reach the model through the same result the edit does.
+    #[tokio::test]
+    async fn a_source_edit_with_no_test_carries_the_nudge_and_a_test_edit_stops_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let src = dir.path().join("a.rs");
+        tokio::fs::write(&src, "fn f() {}\n").await.unwrap();
+
+        let fc = super::mutation::apply_file_change(&c, &src, "edit", "fn f() { g(); }\n")
+            .await
+            .unwrap();
+        assert!(
+            fc.notes.iter().any(|n| n == crate::TEST_NUDGE_NOTE),
+            "{:?}",
+            fc.notes,
+        );
+
+        // Adding a test anywhere latches it off for the rest of the session.
+        let other = dir.path().join("b.rs");
+        tokio::fs::write(&other, "fn h() {}\n").await.unwrap();
+        super::mutation::apply_file_change(&c, &other, "edit", "fn h() {}\n#[test]\nfn t() {}\n")
+            .await
+            .unwrap();
+        let third = dir.path().join("c.rs");
+        tokio::fs::write(&third, "fn i() {}\n").await.unwrap();
+        let fc = super::mutation::apply_file_change(&c, &third, "edit", "fn i() { j(); }\n")
+            .await
+            .unwrap();
+        assert!(fc.notes.is_empty(), "{:?}", fc.notes);
     }
 
     #[test]

@@ -61,6 +61,27 @@ findings clearly marked as such).
    one-sentence statement of the defect, and the traced failure scenario. If
    nothing survives verification, say so plainly — a short honest report is the
    good outcome, and padding it with what you already disproved is not.
+   - WRITE THE FAILURE SCENARIO AS A TEST CASE, not as a paragraph. You already
+     traced it in step 3, so you have the three things a test needs; give them
+     under a `Repro:` heading, on their own lines, in the caller's own terms:
+     the exact input or state, the expected result, and the actual one.
+
+     ```
+     Repro: days_from_civil(1970, 1, 1)
+     Expect: 0
+     Actual: 122
+     ```
+
+     Not "an incorrect epoch is computed for dates near the year boundary".
+     Whoever fixes this next — you, another session, or the user — turns that
+     block into a failing test in one step and knows immediately when the fix
+     lands. A paragraph has to be re-derived first, and in practice is not:
+     it gets read, believed, patched around, and never observed to go green.
+   - Where a finding genuinely has no expressible input — a race, an unbounded
+     resource, a TOCTOU window — say so in the `Repro:` line and give the
+     observable instead ("map length after 10k distinct IPs: expect 0 retained,
+     actual 10k"). A thing you cannot state an observable for is a Hardening
+     note, not a finding.
 6. Add three short sections after the findings:
    - **Cleared** — the things you suspected and disproved, one line each with
      the reason they are safe. This is worth as much as the findings: it is the

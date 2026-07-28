@@ -8,6 +8,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A `todo` item cannot be ticked without saying how it was checked.** Moving
+  an item to `completed` now requires an `evidence` string naming the command
+  that was run and what it reported; the call is refused without one, and the
+  refusal leaves the previous list intact so the retry is a straight re-send.
+  Items already completed ride along untouched, and `cancelled` is exempt —
+  abandoning work is not a claim that it was done. The evidence is echoed back
+  under its item, which is what puts it in front of the user rather than only
+  the model that wrote it. Prompted by a session that marked ten findings ✓
+  before it had run a single build.
+
+- **A post-edit reminder when a session changes code and never changes a test.**
+  A source mutation that adds no test now carries one line on the tool result
+  saying so. It latches off permanently the moment a test is added anywhere, and
+  fires at most once per file, because a note on every edit is one the model
+  learns to skip. Detection is by counting a language's test markers across the
+  change rather than by path, since Rust unit tests live inside the file they
+  cover — a file that merely _contains_ tests says nothing about whether this
+  change added one. Languages whose test idiom hrdr cannot recognise are out of
+  scope in both directions.
+
 - **A `strict` sandbox mode, and `yolo` as a name for no sandbox at all.**
   `strict` is the confinement `read` used to apply — reads limited to the cwd,
   scratch and tool-output dirs, everything else absent — now opt-in
@@ -17,6 +37,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and it still renders back as `none`.
 
 ### Changed
+
+- **The prompt now names the difference between changing a shape and changing a
+  mechanism.** A change of shape — a type, a field, an argument, a deleted
+  branch — is verified by the compiler. A change of mechanism — whether an
+  eviction happens, whether a conversion produces the right number, whether a
+  guard ever rejects — compiles identically whether it works or does nothing, so
+  the write prompt now requires naming the observable _before_ writing one. A
+  review round supplied the evidence: seven fixes that changed shapes were all
+  correct, and all three that changed mechanisms were wrong, on a green test
+  suite.
+
+- **`:fix` writes the test before the fix, and must watch it fail.** The old
+  step said "reproduce the original failure (if possible)" — an opt-out, and it
+  was taken. It now requires the failing output pasted into the summary, says to
+  stop and re-diagnose if the test cannot be made to fail, and states that a
+  review finding which already gives input/expected/actual _is_ the test.
+
+- **`:review` writes each failure scenario as a repro block, not a paragraph.**
+  Input, expected, actual, on their own lines, in the caller's terms — the
+  reviewer already traced it, so the next session can transcribe a failing test
+  in one step instead of re-deriving one and skipping it.
+
+- **Naming a capability in the request means it gets used, or you hear why
+  not.** Asked to "delegate when needed", a session spawned nothing and never
+  mentioned it. Substituting your own method silently is a decision made on the
+  user's behalf and invisible to them, since they see the result and not the
+  route.
+
+- **The write prompt asks for idiomatic, portable code rather than bespoke
+  code.** Reach outward in order — the project's helper, the standard library, a
+  dependency already present, and only then your own implementation — because
+  hand-rolling what an ecosystem solved (dates, parsing, encoding, floats,
+  crypto) compiles, reads plausibly, and is wrong in the case you did not try.
+  It also asks for the construction the linter would leave alone rather than one
+  found by running it, and for the general form over the one that happens to
+  work on this OS: a `#[cfg]` arm that exists on only one side is not
+  portability, it is a check silently not running everywhere else.
 
 - **`read` mode restricts WRITING, not reading.** It used to mount only `/usr`
   and `/etc`, so `/home`, `/run` and `/opt` were absent — and a read-only

@@ -1,8 +1,18 @@
-# Code Review — 2026-07-28
+# Code Review — 2026-07-29
 
-Scope: full codebase (clean working tree, `v0.8.4..HEAD` baseline).
-Reviewed: `hrdr-web`, `hrdr-llm`, `hrdr-tools`, `hrdr-agent`. Skipped: `hrdr-app` CLI, `hrdr-tui`, `hrdr-editor`, `hrdr-ui` (no recent changes in the diff
-range to those crates, and scope limited by available review time).
+Scope: the fixes commit `8f220d7` made against the 2026-07-28 review,
+re-reviewed against the code as it stands. Findings that commit genuinely
+resolved have been pruned from this document; what remains is what it left
+behind or introduced.
+
+Reviewed: `hrdr-web`, `hrdr-llm`, `hrdr-tools`. Not reviewed this round:
+`hrdr-agent`, `hrdr-app`, `hrdr-tui`, `hrdr-editor`, `hrdr-ui` — nothing in
+`8f220d7` touched them beyond `compaction.rs`, which is clear.
+
+Resolved by `8f220d7` and removed from this document: `logout_handler` missing
+`Secure`; unbounded WebSocket frames; usernames containing `:`; the
+`tail_window` `clamp` panic; the SSE `cur_data_started` flag; the unreachable
+`capped_read` overflow branch.
 
 ---
 
@@ -10,147 +20,144 @@ range to those crates, and scope limited by available review time).
 
 ### HIGH
 
-**1. Rate limiter `HashMap<IpAddr, Vec<Instant>>` grows unbounded — memory DoS**
-`crates/hrdr-web/src/auth.rs:30`, `:123-129`, `:131-138`
+**1. The rate-limiter map still grows without bound — the fix is unreachable**
+`crates/hrdr-web/src/auth.rs:125`, `:133-141`
 
-The `HashMap` entries (IP address keys) are **never evicted**. Each check prunes the `Vec<Instant>` values (`retain` within the window), but the map key itself
-persists forever. An attacker sending one request each from many unique IPs (spoofed or real) permanently balloons the map.
+`8f220d7` added key eviction to `rate_limit_record`, but it cannot run. The
+function pushes `Instant::now()` and only then prunes, so the entry it tests is
+never empty:
+
+```rust
+let entry = guard.entry(ip).or_default();
+entry.push(Instant::now());          // entry.len() >= 1 from here on
+prune_rate_limit_entry(entry);       // prunes >60s old; the one just pushed stays
+if entry.is_empty() { guard.remove(&ip); }   // dead branch
+```
+
+`check_rate_limit` is the larger half: it is called on every login and every WS
+upgrade (`server.rs:221`, `:286`), and its `guard.entry(ip).or_default()`
+inserts a key for every IP it has ever seen. Nothing removes those. The original
+attack is unchanged.
 
 ```
-Failure: Attacker sends 1 request each from 10M unique IPs → 10M permanent
-Vec entries (most empty or one-element) → hundreds of MB → OOM.
+Repro: 10k distinct IPs each send one failed auth, then 61s pass
+Expect: rate_limiter.len() == 0 (all entries expired and evicted)
+Actual: rate_limiter.len() == 10000, every Vec empty
 ```
+
+The fix that works is a sweep, not a per-entry check: prune and drop empty keys
+across the map on a cadence (every Nth call, or by elapsed time), since an IP
+that never comes back is exactly the one no per-IP code path will ever revisit.
 
 ### MEDIUM
 
-**2. `logout_handler` omits `Secure` on TLS deployments — session cookie not cleared**
-`crates/hrdr-web/src/server.rs:261-271`
+**2. `Retry-After` HTTP-date parsing is arithmetically wrong**
+`crates/hrdr-llm/src/client.rs:352`
 
-`login_handler` at line 250 sets `; Secure` when `state.tls_enabled` is true. `logout_handler` takes **no `State`** (line 261) and always emits
-`hrdr_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0` — without `Secure`. Some browsers refuse to clear a `Secure` cookie via a response that omits
-`Secure`.
-
-```
-Failure: User logs out on TLS deployment → browser ignores the clear-Set-Cookie
-→ session cookie survives → attacker with physical access reuses the session.
-```
-
-**3. WebSocket accepts unbounded frames — memory exhaustion**
-`crates/hrdr-web/src/server.rs:348`
-
-`handle_socket` receives an axum `WebSocket` with default configuration — no `max_frame_size` or `max_message_size`. An attacker can send arbitrarily large
-WebSocket text frames, consuming server memory proportional to message size.
+`days_from_civil` misstates Howard Hinnant's algorithm. It computes
+`153 * (m + 1) / 5` where the algorithm requires `(153 * (m - 3) + 2) / 5`. The
+day-of-year offset is wrong for every date, and the month spacing is wrong too,
+so the error is not even a constant:
 
 ```
-Failure: Attacker connects to /ws → sends 1 GB Text frame → server allocates
-1 GB → repeated across connections → OOM.
+Repro: days_from_civil(1970, 1, 1) / (2000, 1, 1) / (1994, 11, 6)
+Expect: 0 / 10957 / 8710
+Actual: 122 / 11079 / 9197        (off by 122, 122, 487)
 ```
 
-**4. Usernames containing `:` deserialize incorrectly from session cookies**
-`crates/hrdr-web/src/auth.rs:284-285`, `:303-309`
+Every date-form `Retry-After` therefore resolves roughly four months into the
+future and clamps to the 60 s ceiling. A date in the _past_, which the function
+documents as returning `None`, yields a 60 s delay instead.
 
-`mint_session_cookie` formats `{username}:{expiry}` and `verify_session_cookie` splits with `split_once(':')`. A username like `admin:backup` becomes
-indistinguishable from `username=admin, expiry=backup`. The HMAC prevents forgery, but the cookie **authenticates as the wrong user** (`admin` instead of
-`admin:backup`).
-
-```
-Failure: Create user "admin:backup" → login → cookie authenticates as "admin"
-(truncated at the first colon) → privilege escalation within Users mode.
-```
-
-**5. `tail_window` panics on single-message input via `clamp`**
-`crates/hrdr-agent/src/compaction.rs:442`
-
-```rust
-let keep = (msgs.len() / div.max(1)).clamp(2, msgs.len());
-```
-
-`clamp(min, max)` panics if `min > max`. When `msgs.len() == 1` and `div ≥ 2`: `(1 / 2).clamp(2, 1)` → integer division gives `0`, `0.clamp(2, 1)` → panic because
-`2 > 1`.
-
-```
-Reachability: A conversation with [system, huge_user_message] where compaction
-fires. The summarizer overflows at stages 0 (full) and 1 (elide_tool_results).
-Stage 2 calls tail_window(&elide_tool_results(&full), 2) where `full =
-messages[1..tail_start]`. If tail_start=2, that's one message. When div=2,
-the calculation panics.
-```
+There are no tests for `parse_imf_fixdate` or `days_from_civil` — 40 lines of
+hand-transcribed calendar arithmetic, none of it observed against a known value.
+Either delete the HTTP-date branch (delta-seconds is what providers actually
+send) or take the algorithm from a dependency.
 
 ### LOW
 
-**6. SSE `cur_data_started` set true when data buffer is full**
-`crates/hrdr-llm/src/sse.rs:165-190`
+**3. The `atomic_write` TOCTOU guard cannot fire**
+`crates/hrdr-tools/src/tools/mutation.rs:141-155`
 
-When `remaining == 0` (the `cur_data` buffer is at `MAX_BUFFER_BYTES`), no data is appended — but `cur_data_started` is unconditionally set to `true` at line 190.
-A subsequent blank line emits an event with stale (or partial prior-event) `cur_data` content. The `overflowed` flag causes the caller to discard these events,
-so the impact is limited to the wasted event construction.
+The guard compares `metadata(path)` against
+`metadata(canonicalize_nearest(path))` and rejects on a `(dev, ino)` mismatch.
+`std::fs::metadata` follows symlinks, so a path and its canonical form resolve
+to the same inode by construction — that is what canonicalisation means. The
+condition is unreachable.
 
-**7. `read_capped_json` unreachable overflow branch and incorrect comment**
-`crates/hrdr-llm/src/capped_read.rs:119-127`
+```
+Repro: write through /tmp/link/f where link -> /tmp/real
+Expect (as documented): rejected as a swapped component
+Actual: dev/ino identical on both sides, write proceeds
+```
 
-The `buf.len() > cap` bail at line 119 is unreachable: the `remaining` check at line 109 guarantees `chunk.len() > remaining` bails before any write that would
-push past `cap`. The comment (lines 120-122) claims a zero-length chunk at exactly `cap` could land here — but `0 > 0` is false, so `extend_from_slice(&[])` is a
-no-op. Dead code with a misleading comment.
+A new file misses it regardless: `metadata(path)` is `Err` before the write, so
+the `if let` never binds. The check-to-write window the comment claims to close
+is exactly as open as it was. `guard_not_swapped` (`lib.rs`) is the mechanism
+that actually does this for reads and is still not used here.
 
-**8. Sandbox TOCTOU between path check and disk write**
-`crates/hrdr-tools/src/lib.rs:326-331`, `crates/hrdr-tools/src/tools/mutation.rs:96-114`
+**4. `set_timeout(None)` does not restore what its doc comment says**
+`crates/hrdr-llm/src/client.rs:646-651`
 
-`resolve_write` canonicalizes the path, calls `check_write`, then returns the **uncanonicalized** path. The mutating tools then pass this path to `atomic_write`
-without re-validating. A concurrent process (not the model) could replace a directory component with a symlink between check and write. `guard_not_swapped`
-(lib.rs:710-725) exists for the read path but is not used by write/edit. Limited impact: requires an external concurrent attacker.
+`Client::new` sets `.timeout(300s)` — an overall request deadline. `set_timeout`
+rebuilds the client with `.connect_timeout(dur).read_timeout(dur)` and no
+`.timeout(...)` at all. The doc comment now claims `None` "restores the default
+300-second timeout, matching the `Client::new` builder"; it does not. After any
+`set_timeout` call there is no overall request deadline, which was the substance
+of the original finding.
 
-**9. `Retry-After` header only handles delta-seconds, not HTTP-date**
-`crates/hrdr-llm/src/client.rs:300-301`
+Connect + read timeouts are arguably the better choice for a streaming client —
+but then the comment should say that, and `Client::new` should agree. As it
+stands the two constructors disagree about which deadline exists and the comment
+describes neither.
 
-`retry_after_from_headers` parses `Retry-After` as `u64` seconds only. RFC 7231 §7.1.3 also allows `Retry-After: <HTTP-date>`. A server sending a date format
-gets `None` (silently ignored), so the retry loop won't delay.
+**5. `prune_rate_limit_entry` documents a return value it does not have**
+`crates/hrdr-web/src/auth.rs:144-146`
 
-**10. `set_timeout(None)` removes the original 300s request timeout**
-`crates/hrdr-llm/src/client.rs:575-583`
+> `/// Prune expired timestamps from a rate-limit entry and return whether any remain.`
 
-`Client::new()` sets a 300-second request timeout (line 513). `set_timeout(None)` rebuilds `reqwest::Client` with NO timeout at all — `reqwest`'s own default,
-not the `Client`'s original 300s. A caller that does `set_timeout(Some(x))` then `set_timeout(None)` has no per-request deadline.
-
----
-
-## Cleared
-
-- **Argon2 usage**: `Argon2::default()` (argon2id, m=19 MiB, t=2, p=1) meets OWASP minimums. `verify_basic` runs argon2 even on username mismatch
-  (`DUMMY_HASH` anti-enumeration). ✓
-- **SQL injection**: All queries in `users.rs` use `rusqlite::params![]`. ✓
-- **Token/secret generation**: `rand::rng().random::<[u8; 32]>()` uses CSPRNG (ChaCha12). ✓
-- **Constant-time comparison**: `verify_token` and `verify_basic` use `subtle::ConstantTimeEq`. ✓
-- **Session cookie integrity**: HMAC-SHA256 over `username:expiry` with 32-byte CSPRNG key; expiry enforced server-side. ✓
-- **CSRF hardening**: Session cookie has `SameSite=Strict` + `HttpOnly`. WS upgrade validates `Origin` against `Host` header with port-aware loopback
-  enforcement (`auth.rs:174-199`). ✓
-- **X-Forwarded-For spoofing**: `extract_client_ip` only honors `X-Forwarded-For` when TCP peer is loopback (reverse-proxy scenario). ✓
-- **Path traversal in memory tool**: `safe_stem` rejects `/` and `\\`; `resolve` rejects `..` components. Both slugify + defense-in-depth. ✓
-- **Sandbox `.git` protection**: `protected_metadata_dir` checks all canonical path components for `.git`; symlink escape caught via canonicalization
-  (tested at sandbox.rs:1396-1403). ✓
-- **URI encoding**: `file_uri` correctly percent-encodes non-ASCII per RFC 3986; `uri_to_path` decodes via byte buffer to avoid Latin-1 mojibake. ✓
-- **ANSI stripping**: Correctly handles CSI sequences (all parameter/intermediate bytes), OSC (BEL and ST termination), CR progress-bar redraw, and
-  truncated sequences at end-of-input. ✓
-- **Process group killing**: `unix_group_kill` guards `pid > 1` to prevent `kill(-0)`/`kill(-1)`. `ProcessGroup::Drop` group-kills on cancel/abort. ✓
-- **`atomic_write` symlink/hardlink handling**: Detects symlinks (`is_symlink()`) and hardlinks (link count > 1), falling back to in-place `write` through
-  the link rather than replacing it with a regular file. ✓
-- **Guardrail `strip_unbalanced_quotes`**: Falls back toward false positive (blocks safe commands) rather than false negative (allowing dangerous ones).
-  The doc comment at `guardrails.rs:11-19` explicitly declares guardrails are a seatbelt, not a lock. ✓
-- **Guardrail nested `sh -c` extraction**: Bounded by `MAX_NESTED_PAYLOAD_BYTES` (64 KiB cumulative), not depth. ✓
-- **`canonicalize_nearest`**: Correctly resolves `..` in non-existent suffixes and canonicalizes the existing prefix. ✓
-- **`file_uri` ↔ `uri_to_path` round-trip**: Tested with non-ASCII filenames, spaces, and raw-UTF-8-from-server edge case. ✓
-- **`atomic_write` permissions preservation**: Unix: carries over existing mode bits (executable stays executable). Windows: leaves ACL inheritance to
-  containing directory (permissions are not a bitmask there). ✓
+It returns `()`. Had it returned that bool, finding 1's dead branch would have
+had something to test.
 
 ---
 
 ## Hardening
 
-- **Rate limiter global mutex** (`auth.rs:124`, `:133`): Every auth attempt acquires the same `Mutex<HashMap<…>>`. Under heavy legitimate load, all auth
-  checks serialize through this lock. A per-IP sharded approach would distribute contention.
-- **Rate limiter check→record TOCTOU** (`auth.rs:122-127`, `:131-138`): Concurrent requests at the same boundary (e.g., both read `len() == 9`) can both
-  pass, overshooting the 10-attempts-per-minute budget by 2-3× under concurrency.
-- **Delegation path rewriting** (`delegation.rs:1422-1440`): Only rewrites exact `"<cwd>/"` prefix occurrences. Absolute paths without trailing slash and
-  parent-directory paths escape the rewrite. Acknowledged in the comment at lines 1411-1419.
-- **SSE Content-Type not validated** (`client.rs:784-809`): The SSE decoder is fed response bytes without checking that `Content-Type` is
-  `text/event-stream`. A status-200 HTML/JSON error page produces garbage SSE events; the caller treats these as a transient error and retries until the
-  retry budget exhausts.
+- **Rate limiter global mutex** (`auth.rs:124`, `:132`): every auth attempt
+  serialises through one `Mutex<HashMap<…>>`. Sharding would distribute it.
+- **Rate limiter check→record TOCTOU** (`auth.rs:123-127`, `:131-141`):
+  concurrent requests can both observe `len() == 9` and both pass, overshooting
+  the 10-per-minute budget by 2–3× under concurrency.
+- **WebSocket 16 MiB frame cap** (`server.rs:201-202`): correct and needed, but
+  untested and unjustified in the code — nothing says what the largest
+  legitimate hrdr frame is, so the next person to raise it has no way to know if
+  they are restoring headroom or reopening the DoS.
+- **SSE `Content-Type` not validated** (`client.rs`): the decoder is fed
+  response bytes without checking for `text/event-stream`. A status-200 HTML
+  error page produces garbage events that read as a transient error and burn the
+  retry budget.
+- **Delegation path rewriting** (`delegation.rs`): rewrites only exact
+  `"<cwd>/"` prefixes; absolute paths without the trailing slash escape it.
+  Acknowledged in the code.
+
+---
+
+## Coverage
+
+Re-reviewed: every hunk of `8f220d7`, plus the surrounding functions each hunk
+lands in, plus the call sites of `check_rate_limit`/`rate_limit_record` in
+`server.rs`. Findings 1, 2 and 3 were each confirmed by execution rather than by
+reading — finding 2 by compiling `days_from_civil` standalone and running it
+against known epoch values, findings 1 and 3 by tracing every caller.
+
+Not reviewed: everything `8f220d7` did not touch. The 2026-07-28 review's
+"Cleared" list (argon2, SQL parameterisation, CSPRNG use, constant-time compare,
+XFF spoofing, `.git` protection, ANSI stripping, process-group kill,
+`atomic_write` symlink/hardlink handling) was not re-verified and is not
+restated here; treat it as still standing only for code that has not changed
+since.
+
+The three confirmed findings share one cause: each is a change of _mechanism_ —
+does an eviction happen, does a conversion produce the right number, does a
+guard ever reject — landed without an observable, in a commit whose test suite
+went green because nothing in it looks at any of the three.

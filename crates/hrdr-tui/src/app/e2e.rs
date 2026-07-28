@@ -3719,18 +3719,22 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
         hrdr_agent::Todo {
             content: "ship it".to_string(),
             status: "in_progress".to_string(),
+            evidence: None,
         },
         hrdr_agent::Todo {
             content: "wait here".to_string(),
             status: "pending".to_string(),
+            evidence: None,
         },
         hrdr_agent::Todo {
             content: "landed".to_string(),
             status: "completed".to_string(),
+            evidence: None,
         },
         hrdr_agent::Todo {
             content: "skip it".to_string(),
             status: "cancelled".to_string(),
+            evidence: None,
         },
     ];
 
@@ -3843,6 +3847,7 @@ async fn each_panel_above_the_input_owns_a_blank_row_above_it() {
     *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
         content: "ship it".to_string(),
         status: "in_progress".to_string(),
+        evidence: None,
     }];
     let rows = draw(&mut h, &mut term);
     let text_y = rows
@@ -4189,6 +4194,7 @@ async fn the_generating_line_heads_the_input_area_with_a_blank_row_each_side() {
     *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
         content: "ship it".to_string(),
         status: "in_progress".to_string(),
+        evidence: None,
     }];
     h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     // The loader tracks the *model* working, not merely a turn being in flight.
@@ -5800,6 +5806,7 @@ async fn the_todo_panel_shows_the_active_agents_list() {
     *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
         content: "main task".to_string(),
         status: "in_progress".to_string(),
+        evidence: None,
     }];
 
     // Register a sub-agent with its own TODO.
@@ -5807,6 +5814,7 @@ async fn the_todo_panel_shows_the_active_agents_list() {
     let sub_todos = std::sync::Arc::new(std::sync::Mutex::new(vec![hrdr_agent::Todo {
         content: "sub task".to_string(),
         status: "pending".to_string(),
+        evidence: None,
     }]));
     let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
     h.app.registry.register(hrdr_agent::AgentEntry {
@@ -5870,6 +5878,7 @@ async fn the_todo_panel_hides_while_a_sub_agent_is_running() {
     *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
         content: "main task".to_string(),
         status: "in_progress".to_string(),
+        evidence: None,
     }];
 
     // Register a running sub-agent with its own TODO.
@@ -5877,6 +5886,7 @@ async fn the_todo_panel_hides_while_a_sub_agent_is_running() {
     let sub_todos = std::sync::Arc::new(std::sync::Mutex::new(vec![hrdr_agent::Todo {
         content: "sub task".to_string(),
         status: "in_progress".to_string(),
+        evidence: None,
     }]));
     let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
     h.app.registry.register(hrdr_agent::AgentEntry {

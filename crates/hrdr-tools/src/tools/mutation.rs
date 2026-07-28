@@ -53,6 +53,11 @@ pub async fn apply_file_change(
     hook_event: &str,
     content: &str,
 ) -> Result<FileChange> {
+    // Snapshot the prior content for the test nudge, but only when a note could
+    // actually be owed — see `nudge_baseline`. A `rename`/rollback is excluded
+    // there: those rewrite files the model did not choose to change, so counting
+    // them as "changed code without a test" would be a lie about what it did.
+    let nudge_before = nudge_baseline(ctx, path, hook_event).await;
     // Re-check immediately before the pathname operation. This portable guard
     // cannot make arbitrary filesystems transactional, but closes the long
     // validation/planning window and refuses any symlink inserted meanwhile.
@@ -73,10 +78,44 @@ pub async fn apply_file_change(
     {
         notes.push(note);
     }
+    // Last, so a compile error the model must act on is never pushed down the
+    // result by a reminder it can act on afterwards.
+    if let Some(before) = nudge_before
+        && let Some(note) = ctx
+            .test_nudge
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(path, &before, &content_after)
+    {
+        notes.push(note.to_string());
+    }
     Ok(FileChange {
         content_after,
         notes,
     })
+}
+
+/// The file's content before this change, when the test nudge might have
+/// something to say about it — and `None` when it certainly won't, which is the
+/// point: that answer costs a lock and no I/O, so a session that writes tests
+/// (or edits config, or renames a symbol) never pays for the read.
+///
+/// A missing file reads as empty rather than failing: creating a new source file
+/// with no test is exactly the case worth a note, and it is not this function's
+/// job to decide whether the write itself will succeed.
+async fn nudge_baseline(ctx: &ToolContext, path: &Path, hook_event: &str) -> Option<String> {
+    if !matches!(hook_event, "edit" | "write" | "replace") {
+        return None;
+    }
+    let might = ctx
+        .test_nudge
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .might_nudge(path);
+    if !might {
+        return None;
+    }
+    Some(tokio::fs::read_to_string(path).await.unwrap_or_default())
 }
 
 /// Write `content` to `path` crash-safely: build the new bytes in a sibling temp

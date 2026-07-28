@@ -28,6 +28,35 @@ Style:
   same kind of thing — a similar handler, query, test, error type — and follow
   that pattern. Reuse the project's own helpers and abstractions instead of
   rolling your own; the best new code is indistinguishable from what's there.
+- REACH OUTWARD IN ORDER: the project's own helper, then the language's standard
+  library, then a dependency the project already has — and only then something
+  you write yourself. Hand-rolling what the ecosystem already solved is where a
+  change goes wrong quietly: it compiles, it reads plausibly, and it is wrong in
+  the case you did not think to try. Calendar and date arithmetic, time zones,
+  parsing a header or URL or version string, encoding and escaping, collation,
+  floating point, crypto, randomness — each has an ecosystem answer that has
+  been wrong in public and been fixed, and yours has not. When there genuinely
+  is no such answer and you must write it, keep it small, name the algorithm you
+  are transcribing, and test it against known values from the specification: a
+  transcription slip in ten lines of arithmetic passes review and every existing
+  test, because nothing else in the codebase knows what the right answer was.
+- WRITE WHAT THE LINTER WOULD LEAVE ALONE. The project's formatter and linter
+  define the idiom; arriving at them with a diff they rewrite means you wrote
+  the unidiomatic form first and let a tool find it for you. Reach for the
+  standard construction as you type — the range check, the iterator, the
+  combinator, the error constructor the language provides — and run the linter
+  to confirm, not to discover. When it does flag something, fix what it names.
+  Never quiet it with a construct whose only purpose is to quiet it, and never
+  reach for a blanket suppression to keep the code it objected to.
+- Write the general form, not the one that happens to work here. A guard, path,
+  command, separator or constant that assumes one operating system, one shell,
+  one filesystem layout, one vendor's API or one machine's configuration is
+  wrong on every other one. A conditional-compilation or `if platform ==` arm
+  that exists on only one side is not portability — it is a check that silently
+  does not run everywhere else, and "not supported here" arriving as "passed" is
+  the same defect as an unimplemented hook that reports success. Where behaviour
+  genuinely must differ per platform, implement every side or make the missing
+  side fail loudly, and say in the code which platforms you actually verified.
 - Factor out repetition when it's real, not before — DRY, and YAGNI holding it in
   check. Don't copy code that already exists: call it. The moment a *second* place
   needs the same logic, pull the shared part into one helper both call, so a later
@@ -119,6 +148,21 @@ Correctness:
     "passed". Require the implementation instead (no default), or have the check
     report WHAT it covered so an abstention is visible in the output. A check
     that can't say what it covered is barely a check.
+- KNOW WHICH KIND OF CHANGE YOU ARE MAKING, because it decides what counts as
+  having checked it. A change of SHAPE — a type, a field, an argument, a moved
+  line, a deleted branch — is verified by the compiler: it either fits or it
+  doesn't. A change of MECHANISM — whether something *happens* — is verified by
+  nothing at all until something observes it happening. Eviction from a
+  collection, winning a race, an arithmetic or unit conversion, a cache hit, a
+  retry, a guard actually rejecting: for each of these the code compiles
+  identically whether it works or does nothing. Before you write one, name the
+  observable — what value, read where, would differ if this works? Then go read
+  it. If you cannot name one, you cannot tell your change from a no-op, and
+  neither can the reviewer; a green build and an untouched test suite say
+  exactly as much about a broken mechanism as a working one. Note what this
+  rules out: a guard whose condition is unreachable, an eviction that runs where
+  nothing is ever empty, a transcribed algorithm off by a constant — all three
+  compile, pass every existing test, and read like the fix they are named for.
 - Don't claim a piece of work is complete unless its stated criterion is
   demonstrably met — run the thing that demonstrates it. If you leave a
   placeholder, make the CODE say so: name it for what it is, have its doc comment

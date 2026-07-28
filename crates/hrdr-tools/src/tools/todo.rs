@@ -29,7 +29,8 @@ impl Tool for TodoTool {
                         "type": "object",
                         "properties": {
                             "content": {"type": "string", "description": "The task, in a few words."},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"], "description": "pending: not started. in_progress: exactly one item at a time. completed: done. cancelled: abandoned."}
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"], "description": "pending: not started. in_progress: exactly one item at a time. completed: done. cancelled: abandoned."},
+                            "evidence": {"type": "string", "description": "How you verified this item: the command you ran and what it reported (e.g. `cargo test -p x: 12 passed`). REQUIRED to move an item to `completed` — the call is rejected without it. Omit for every other status."}
                         },
                         "required": ["content", "status"]
                     }
@@ -58,6 +59,17 @@ impl Tool for TodoTool {
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let items = parse_todos(args).context("invalid todo args")?;
+        // Reject *before* the list is replaced, so a refused call leaves the
+        // previous list exactly as it was and the retry is a straight re-send.
+        {
+            let prior = ctx
+                .todos
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(err) = unevidenced_completions(&prior, &items) {
+                bail!(err);
+            }
+        }
         let rendered = render_todos(&items);
         // A poisoned lock must not silently report success with a stale list.
         *ctx.todos
@@ -122,7 +134,63 @@ fn parse_item(v: serde_json::Value) -> Result<TodoItem> {
         .or_else(|| m.remove("state"))
         .and_then(|s| s.as_str().map(normalize_status))
         .unwrap_or_else(|| "pending".to_string());
-    Ok(TodoItem { content, status })
+    let evidence = m
+        .remove("evidence")
+        .or_else(|| m.remove("verified_by"))
+        .or_else(|| m.remove("verification"))
+        .and_then(|e| match e {
+            Value::String(s) => Some(s),
+            // A model that answers with `true` has said nothing checkable, and
+            // treating it as evidence would hand back the free tick the field
+            // exists to take away.
+            _ => None,
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Ok(TodoItem {
+        content,
+        status,
+        evidence,
+    })
+}
+
+/// The error owed when a call moves items to `completed` without saying how they
+/// were verified, or `None` when every new completion carries its evidence.
+///
+/// Scoped to items *newly* completed: an item that was already `completed` in
+/// the previous list rides along in every later call, and demanding evidence
+/// again would make the list impossible to resend. `cancelled` is exempt —
+/// abandoning work is not a claim that it was done.
+fn unevidenced_completions(prior: &[TodoItem], next: &[TodoItem]) -> Option<String> {
+    let was_completed = |content: &str| {
+        prior
+            .iter()
+            .any(|p| p.content == content && p.status == "completed")
+    };
+    let offenders: Vec<&str> = next
+        .iter()
+        .filter(|t| t.status == "completed" && t.evidence.is_none() && !was_completed(&t.content))
+        .map(|t| t.content.as_str())
+        .collect();
+    if offenders.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "cannot mark {} completed without `evidence`: {}\n\
+         Give each newly completed item an `evidence` string naming the check you ran and what it \
+         reported (e.g. \"cargo test -p hrdr-tools: 155 passed\"). If you have not run it yet, run \
+         it now and send the list again — leave the item `in_progress` until you have.",
+        if offenders.len() == 1 {
+            "an item"
+        } else {
+            "items"
+        },
+        offenders
+            .iter()
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    ))
 }
 
 /// Map a free-form status string onto one of `pending | in_progress | completed | cancelled`.
@@ -157,6 +225,110 @@ fn render_todos(todos: &[TodoItem]) -> String {
             _ => " ",
         };
         out.push_str(&format!("{mark} {}\n", t.content));
+        // Echo the evidence back under its item. It is the model's own claim,
+        // and putting it where the user reads the list is what makes an empty
+        // one visible to somebody other than the model that wrote it.
+        if let Some(e) = t.evidence.as_deref().filter(|_| t.status == "completed") {
+            out.push_str(&format!("    ↳ {e}\n"));
+        }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(content: &str, status: &str, evidence: Option<&str>) -> TodoItem {
+        TodoItem {
+            content: content.to_string(),
+            status: status.to_string(),
+            evidence: evidence.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_new_completion_without_evidence_is_refused_and_names_the_item() {
+        let err = unevidenced_completions(
+            &[item("fix it", "in_progress", None)],
+            &[item("fix it", "completed", None)],
+        )
+        .expect("a bare tick must be refused");
+        assert!(err.contains("`fix it`"), "{err}");
+    }
+
+    #[test]
+    fn a_new_completion_with_evidence_passes() {
+        assert!(
+            unevidenced_completions(
+                &[item("fix it", "in_progress", None)],
+                &[item(
+                    "fix it",
+                    "completed",
+                    Some("cargo test -p hrdr-tools: 155 passed"),
+                )],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn an_already_completed_item_rides_along_without_resending_evidence() {
+        // Every later call resends the whole list. Demanding evidence again for
+        // work already ticked would make the list impossible to resend.
+        let prior = [item("fix it", "completed", Some("cargo test: 155 passed"))];
+        let next = [
+            item("fix it", "completed", None),
+            item("next thing", "in_progress", None),
+        ];
+        assert!(unevidenced_completions(&prior, &next).is_none());
+    }
+
+    #[test]
+    fn cancelling_needs_no_evidence_but_completing_several_names_them_all() {
+        assert!(unevidenced_completions(&[], &[item("dropped", "cancelled", None)]).is_none());
+        let err = unevidenced_completions(
+            &[],
+            &[
+                item("one", "completed", None),
+                item("two", "completed", Some("ran it")),
+                item("three", "completed", None),
+            ],
+        )
+        .expect("two bare ticks must be refused");
+        assert!(err.contains("`one`") && err.contains("`three`"), "{err}");
+        assert!(
+            !err.contains("`two`"),
+            "the evidenced item must not be named: {err}"
+        );
+    }
+
+    #[test]
+    fn evidence_must_be_something_checkable_not_a_yes() {
+        // `true`, `1`, and whitespace are how a required field gets satisfied
+        // without saying anything — which would hand back the free tick this
+        // field exists to take away.
+        for junk in [json!(true), json!(1), json!("   "), json!(null)] {
+            let parsed = parse_todos(json!({"todos": [
+                {"content": "fix it", "status": "completed", "evidence": junk}
+            ]}))
+            .unwrap();
+            assert_eq!(
+                parsed[0].evidence, None,
+                "{junk} should not count as evidence"
+            );
+            assert!(unevidenced_completions(&[], &parsed).is_some());
+        }
+    }
+
+    #[test]
+    fn the_evidence_is_echoed_under_its_item() {
+        let out = render_todos(&[item("fix it", "completed", Some("cargo test: 155 passed"))]);
+        assert!(out.contains("✓ fix it"), "{out}");
+        assert!(out.contains("↳ cargo test: 155 passed"), "{out}");
+        // Not shown for anything but a completion — an in-progress item's
+        // "evidence" is a claim about work that is not finished.
+        let out = render_todos(&[item("fix it", "in_progress", Some("half a run"))]);
+        assert!(!out.contains("↳"), "{out}");
+    }
 }

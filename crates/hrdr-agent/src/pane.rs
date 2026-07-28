@@ -716,6 +716,7 @@ mod tests {
         let todos = std::sync::Arc::new(std::sync::Mutex::new(vec![hrdr_tools::TodoItem {
             content: "the sub-agent's own task".to_string(),
             status: "in_progress".to_string(),
+            evidence: None,
         }]));
         live.update(1, |e| {
             e.effort = Some("high".into());

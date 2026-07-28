@@ -29,6 +29,7 @@ mod mcp;
 pub mod memory;
 mod proc;
 pub mod sandbox;
+mod test_nudge;
 mod tools;
 mod web;
 
@@ -45,6 +46,7 @@ pub use lsp::{
 pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
+pub use test_nudge::{TEST_NUDGE_NOTE, TestNudgeState};
 pub use tools::{
     CopyTool, DEFAULT_TOOL_TIMEOUT_SECS, DefinitionTool, DeleteTool, EditTool, FindTool, GrepTool,
     LsTool, MoveTool, ReadTool, ReferencesTool, RenameTool, ReplaceTool, Shell, ShellTool,
@@ -83,6 +85,15 @@ pub struct TodoItem {
     /// `pending` | `in_progress` | `completed` | `cancelled`.
     #[serde(default = "default_status")]
     pub status: String,
+    /// How the item was verified — the command that was run and what it said.
+    ///
+    /// Required to move an item to `completed`, and the reason the field exists:
+    /// "done" was costing nothing to say. A model that has to name the check
+    /// alongside the tick either has one to name or discovers, while writing the
+    /// call, that it does not. `None` on anything not newly completed, and on
+    /// items restored from a session saved before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
 }
 
 fn default_status() -> String {
@@ -260,6 +271,11 @@ pub struct ToolContext {
     /// the clone every tool call gets writes into the same queue the agent
     /// drains.
     pub sandbox_notices: Arc<SandboxNotices>,
+    /// State for the post-edit test nudge: whether this session has added a test
+    /// yet, and which paths have already been reminded. Shared with the file
+    /// tools through [`apply_file_change`](crate::tools::apply_file_change), which
+    /// is the one place every content mutation passes through.
+    pub test_nudge: Arc<Mutex<TestNudgeState>>,
 }
 
 impl ToolContext {
@@ -282,6 +298,7 @@ impl ToolContext {
             lsp: None,
             sandbox: Arc::new(SandboxPolicy::unconfined()),
             sandbox_notices: Arc::new(SandboxNotices::default()),
+            test_nudge: Arc::new(Mutex::new(TestNudgeState::default())),
         }
     }
 

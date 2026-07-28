@@ -928,6 +928,7 @@ mod tests {
         let todo = |content: &str, status: &str| TodoItem {
             content: content.to_string(),
             status: status.to_string(),
+            evidence: None,
         };
         let mut todos = vec![
             todo("done thing", "completed"),

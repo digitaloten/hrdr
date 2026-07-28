@@ -2477,6 +2477,7 @@ mod roundtrip_audit {
             todos: vec![hrdr_tools::TodoItem {
                 content: "task".into(),
                 status: "completed".into(),
+                evidence: None,
             }],
             transcript: vec![
                 Entry::at(EntryKind::Header, t),
