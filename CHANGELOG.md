@@ -34,6 +34,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   should redraw. Files are untouched by any of this: `read` and `grep` still
   return exactly what is on disk.
 
+### Fixed
+
+- Codex Responses stream events with the `server_is_overloaded` code now use the
+  existing bounded exponential-backoff retry path instead of ending the turn.
+
 ## [0.8.4] - 2026-07-28
 
 ### Added
