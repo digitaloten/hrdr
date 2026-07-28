@@ -291,15 +291,86 @@ pub(crate) fn classify_status(status: u16) -> ChatErrorKind {
 }
 
 /// Parse a `Retry-After` header into a [`Duration`], clamped to 60 s.
+/// Accepts both delta-seconds (RFC 7231 §7.1.3) and IMF-fixdate formats.
 pub(crate) fn retry_after_from_headers(
     headers: &reqwest::header::HeaderMap,
 ) -> Option<std::time::Duration> {
-    headers
+    let raw = headers
         .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .map(|s| std::time::Duration::from_secs(s.min(60)))
+        .and_then(|v| v.to_str().ok())?;
+    let trimmed = raw.trim();
+    // Delta-seconds: a bare integer.
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return (secs > 0).then(|| std::time::Duration::from_secs(secs.min(60)));
+    }
+    // IMF-fixdate: `Sun, 06 Nov 1994 08:49:37 GMT`
+    parse_imf_fixdate(trimmed)
+}
+
+/// Parse an IMF-fixdate per RFC 7231 §7.1.1.1 into a duration-from-now,
+/// clamped to 60 s. Returns `None` on parse failure or past dates.
+fn parse_imf_fixdate(raw: &str) -> Option<std::time::Duration> {
+    // Format: `wkday "," SP date SP time SP "GMT"`
+    // date = day SP month SP year, e.g. `06 Nov 1994`
+    // time = hour ":" minute ":" second, e.g. `08:49:37`
+    let raw = raw.strip_suffix(" GMT")?;
+    // Strip the leading `wkday, ` prefix.
+    let date_time = raw.split_once(", ").map(|(_, rest)| rest).unwrap_or(raw);
+    let (date_str, time_str) = date_time.rsplit_once(' ')?;
+
+    let mut date_parts = date_str.split(' ');
+    let day: u64 = date_parts.next()?.parse().ok()?;
+    let month = parse_month(date_parts.next()?)?;
+    let year: i32 = date_parts.next()?.parse().ok()?;
+
+    let mut parts = time_str.split(':');
+    let hour: u64 = parts.next()?.parse().ok()?;
+    let min: u64 = parts.next()?.parse().ok()?;
+    let sec: u64 = parts.next()?.parse().ok()?;
+
+    let days = days_from_civil(year, month, day)?;
+    let total_secs = days as u64 * 86400 + hour * 3600 + min * 60 + sec;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let delay = total_secs.saturating_sub(now);
+    (delay > 0).then(|| std::time::Duration::from_secs(delay.min(60)))
+}
+
+/// Days since Unix epoch (1970-01-01) from a Gregorian year/month/day.
+fn days_from_civil(year: i32, month: u64, day: u64) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Howard Hinnant's algorithm: shift so March is month 1, compute eras.
+    let y = if month <= 2 { year - 1 } else { year };
+    let m = if month <= 2 { month + 12 } else { month };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = 153 * (m as u32 + 1) / 5 + day as u32 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let epoch_days = era as i64 * 146097 + doe as i64 - 719468;
+    Some(epoch_days)
+}
+
+fn parse_month(s: &str) -> Option<u64> {
+    match s.to_lowercase().as_str() {
+        "jan" => Some(1),
+        "feb" => Some(2),
+        "mar" => Some(3),
+        "apr" => Some(4),
+        "may" => Some(5),
+        "jun" => Some(6),
+        "jul" => Some(7),
+        "aug" => Some(8),
+        "sep" => Some(9),
+        "oct" => Some(10),
+        "nov" => Some(11),
+        "dec" => Some(12),
+        _ => None,
+    }
 }
 
 /// Format a retry-after duration as ` (retry-after: Ns)` for embedding in
@@ -569,14 +640,13 @@ impl Client {
 
     /// Rebuild the HTTP client with a connect + idle-read timeout (so a hung or
     /// stalled provider fails the request instead of blocking forever). `None`
-    /// restores the default (no timeout). The read timeout is per-chunk, so a
-    /// slow-but-progressing stream isn't killed. A build error keeps the current
-    /// client.
+    /// restores the default 300-second timeout, matching the [`Client::new`]
+    /// builder. The read timeout is per-chunk, so a slow-but-progressing stream
+    /// isn't killed. A build error keeps the current client.
     pub fn set_timeout(&mut self, timeout: Option<std::time::Duration>) {
         let mut builder = reqwest::Client::builder();
-        if let Some(t) = timeout {
-            builder = builder.connect_timeout(t).read_timeout(t);
-        }
+        let dur = timeout.unwrap_or(std::time::Duration::from_secs(300));
+        builder = builder.connect_timeout(dur).read_timeout(dur);
         if let Ok(http) = builder.build() {
             self.http = http;
         }

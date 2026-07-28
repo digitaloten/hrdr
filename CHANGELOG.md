@@ -66,6 +66,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `PATH` rather than downloading one. Deliberately narrow: a bare "Permission
   denied" is an ordinary error and is never annotated.
 
+- **Rate limiter HashMap keys no longer leak forever.** `check_rate_limit` and
+  `rate_limit_record` now remove an IP key from the map when its `Vec<Instant>`
+  is fully pruned, preventing an attacker from permanently ballooning the map
+  with one request each from many unique IPs.
+
+- **Session cookies no longer truncate at a colon in the username.** The
+  username is now base64-encoded inside the cookie payload before signing, so
+  `admin:backup` and `admin` produce distinct serializations and a name
+  containing `:` cannot be mistaken for a field separator.
+
+- **`logout_handler` now sets the `Secure` cookie attribute when TLS is
+  enabled**, matching `login_handler`'s behavior. Without it, browsers that
+  refuse to clear a `Secure` cookie via a non-`Secure` `Set-Cookie` would leave
+  the session cookie intact after logout.
+
+- **WebSocket connections now bound frame and message sizes** at 16 MiB each,
+  preventing an attacker from sending arbitrarily large frames and exhausting
+  server memory.
+
+- **`tail_window` no longer panics on single-message input.** The
+  `clamp(2, msgs.len())` call that used to panic when `msgs.len() == 1` now
+  degrades gracefully to `msgs.len()`.
+
+- **SSE decoder no longer sets `cur_data_started` when the data buffer is
+  full.** The flag now only sets inside the branch where data was actually
+  appended, so a full-buffer no-op can't produce a spurious (stale-content)
+  event on the next blank line.
+
+- **Dead overflow-guard branch removed from `read_capped_json`.** The
+  unreachable `buf.len() > cap` check and its misleading zero-length-chunk
+  comment are gone.
+
+- **`Retry-After` header now also parses IMF-fixdate HTTP-date values**, not
+  just bare delta-seconds, matching RFC 7231 §7.1.3. Uses a zero-dependency
+  Gregorian→epoch algorithm.
+
+- **`set_timeout(None)` now restores the original 300 s default** instead of
+  leaving reqwest with no timeout at all.
+
+- **`atomic_write` re-canonicalizes the path before writing**, rejecting the
+  write on Unix when the canonical form differs from the resolved path and the
+  (dev, ino) identities diverge — closing the TOCTOU window between the sandbox
+  check in `resolve_write` and the actual write.
+
 ## [0.8.5] - 2026-07-28
 
 ### Added

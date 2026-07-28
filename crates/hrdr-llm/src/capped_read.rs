@@ -116,15 +116,6 @@ pub async fn read_capped_json<T: serde::de::DeserializeOwned>(
             );
         }
         buf.extend_from_slice(&chunk);
-        if buf.len() > cap {
-            // The `remaining` check above prevents writing past cap, but a
-            // zero-length chunk at exactly `cap` could land here.
-            bail!(
-                "response body exceeds {} byte limit (buffered {})",
-                cap,
-                buf.len(),
-            );
-        }
     }
     serde_json::from_slice(&buf)
         .with_context(|| format!("decoding JSON body ({} bytes)", buf.len()))

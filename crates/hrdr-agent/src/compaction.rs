@@ -435,11 +435,14 @@ pub(crate) fn apply_prune_in(
     }
 }
 
-/// The most recent `1/div` of `msgs` (at least two messages), aligned forward
-/// past any leading `role:"tool"` results so no result is orphaned from its
-/// assistant `tool_calls` message (strict servers reject that).
+/// The most recent `1/div` of `msgs` (at least two messages, or all of them
+/// when there are fewer than two), aligned forward past any leading
+/// `role:"tool"` results so no result is orphaned from its assistant
+/// `tool_calls` message (strict servers reject that).
 pub(crate) fn tail_window(msgs: &[ChatMessage], div: usize) -> Vec<ChatMessage> {
-    let keep = (msgs.len() / div.max(1)).clamp(2, msgs.len());
+    let keep = (msgs.len() / div.max(1))
+        .min(msgs.len())
+        .max(2.min(msgs.len()));
     let start = align_past_tool_results(msgs, msgs.len() - keep);
     msgs[start..].to_vec()
 }

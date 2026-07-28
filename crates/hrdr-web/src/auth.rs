@@ -123,8 +123,7 @@ pub fn verify_basic(headers: &HeaderMap, user: Option<&str>, hash: Option<&str>)
 pub fn check_rate_limit(auth: &AuthState, ip: IpAddr) -> bool {
     let mut guard = auth.rate_limiter.lock().unwrap();
     let entry = guard.entry(ip).or_default();
-    let now = Instant::now();
-    entry.retain(|t| now.duration_since(*t).as_secs() < 60);
+    prune_rate_limit_entry(entry);
     entry.len() < 10
 }
 
@@ -133,6 +132,18 @@ pub fn rate_limit_record(auth: &AuthState, ip: IpAddr) {
     let mut guard = auth.rate_limiter.lock().unwrap();
     let entry = guard.entry(ip).or_default();
     entry.push(Instant::now());
+    prune_rate_limit_entry(entry);
+    // Remove the IP key when its entry is empty so the map doesn't grow
+    // without bound — an attacker sending one request each from many
+    // unique IPs must not permanently balloon the HashMap.
+    if entry.is_empty() {
+        guard.remove(&ip);
+    }
+}
+
+/// Prune expired timestamps from a rate-limit entry and return whether any
+/// remain. Shared by [`check_rate_limit`] and [`rate_limit_record`].
+fn prune_rate_limit_entry(entry: &mut Vec<Instant>) {
     let now = Instant::now();
     entry.retain(|t| now.duration_since(*t).as_secs() < 60);
 }
@@ -280,14 +291,18 @@ pub fn verify_basic_password(password: &str, hash: &str) -> bool {
 
 use sha2::Sha256;
 
-/// Cookie value: `base64(username || ":" || expiry || ":" || hmac(username:expiry, secret))`.
+/// Cookie value: `base64(username_b64 || ":" || expiry || ":" || hmac(username_b64:expiry, secret))`.
+///
+/// The username is base64-encoded so a `:` in the name cannot be mistaken for a
+/// field separator — `admin:backup` and `admin` produce distinct serializations.
 pub fn mint_session_cookie(username: &str, secret: &[u8]) -> String {
     let expiry = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
         + 7 * 24 * 3600; // 7 days
-    let payload = format!("{username}:{expiry}");
+    let user_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(username);
+    let payload = format!("{user_b64}:{expiry}");
     let mac = hmac_sha256_sign(&payload, secret);
     let cookie_val = format!("{payload}:{mac}");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cookie_val)
@@ -306,7 +321,7 @@ pub fn verify_session_cookie(cookie_b64: &str, secret: &[u8]) -> Option<String> 
         return None;
     }
 
-    let (username, expiry_str) = payload.split_once(':')?;
+    let (user_b64, expiry_str) = payload.split_once(':')?;
     let expiry: u64 = expiry_str.parse().ok()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -316,7 +331,12 @@ pub fn verify_session_cookie(cookie_b64: &str, secret: &[u8]) -> Option<String> 
         return None;
     }
 
-    Some(username.to_string())
+    let username = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(user_b64)
+        .ok()
+        .and_then(|v| String::from_utf8(v).ok())?;
+
+    Some(username)
 }
 
 fn hmac_sha256_sign(msg: &str, key: &[u8]) -> String {
@@ -537,5 +557,46 @@ mod tests {
             format!("Basic {creds}").parse().unwrap(),
         );
         assert!(verify_basic(&headers, Some("alice"), Some(&hash)));
+    }
+
+    #[test]
+    fn session_cookie_round_trips_plain_username() {
+        let secret: &[u8] = b"0123456789abcdef0123456789abcdef";
+        let cookie = mint_session_cookie("alice", secret);
+        let username = verify_session_cookie(&cookie, secret);
+        assert_eq!(username.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn session_cookie_round_trips_username_with_colon() {
+        let secret: &[u8] = b"0123456789abcdef0123456789abcdef";
+        let cookie = mint_session_cookie("admin:backup", secret);
+        let username = verify_session_cookie(&cookie, secret);
+        assert_eq!(username.as_deref(), Some("admin:backup"));
+    }
+
+    #[test]
+    fn session_cookie_rejects_wrong_secret() {
+        let secret: &[u8] = b"0123456789abcdef0123456789abcdef";
+        let wrong: &[u8] = b"ffffffffffffffffffffffffffffffff";
+        let cookie = mint_session_cookie("alice", secret);
+        assert!(verify_session_cookie(&cookie, wrong).is_none());
+    }
+
+    #[test]
+    fn session_cookie_rejects_tampered_username() {
+        let secret: &[u8] = b"0123456789abcdef0123456789abcdef";
+        let cookie = mint_session_cookie("alice", secret);
+        // Decode, change the base64 username, re-encode
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&cookie)
+            .unwrap();
+        let val = std::str::from_utf8(&bytes).unwrap();
+        let (payload, mac) = val.rsplit_once(':').unwrap();
+        let (_user_b64, rest) = payload.split_once(':').unwrap();
+        let evil_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("admin");
+        let tampered = format!("{evil_b64}:{rest}:{mac}");
+        let tampered_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tampered);
+        assert!(verify_session_cookie(&tampered_b64, secret).is_none());
     }
 }

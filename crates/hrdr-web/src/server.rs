@@ -198,7 +198,9 @@ async fn ws_handler(
         return status.into_response();
     }
     let session = state.session.clone();
-    ws.on_upgrade(move |socket| handle_socket(socket, session))
+    ws.max_frame_size(16 * 1024 * 1024) // 16 MiB per frame
+        .max_message_size(16 * 1024 * 1024) // 16 MiB per message
+        .on_upgrade(move |socket| handle_socket(socket, session))
 }
 
 // ── login / logout ─────────────────────────────────────────────────────────
@@ -258,13 +260,14 @@ async fn login_handler(
         .into_response()
 }
 
-async fn logout_handler() -> Response {
+async fn logout_handler(State(state): State<AppState>) -> Response {
+    let mut cookie = "hrdr_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".to_string();
+    if state.tls_enabled {
+        cookie.push_str("; Secure");
+    }
     (
         StatusCode::OK,
-        [(
-            header::SET_COOKIE,
-            "hrdr_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-        )],
+        [(header::SET_COOKIE, cookie.as_str())],
         "ok",
     )
         .into_response()

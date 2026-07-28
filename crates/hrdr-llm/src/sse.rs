@@ -186,8 +186,8 @@ impl SseDecoder {
                     self.cur_data.push_str(&value[..cut]);
                     self.overflowed = true;
                 }
+                self.cur_data_started = true;
             }
-            self.cur_data_started = true;
         } else if let Some(rest) = line.strip_prefix("event:") {
             let value = rest.strip_prefix(' ').unwrap_or(rest);
             self.cur_event = Some(value.to_string());
