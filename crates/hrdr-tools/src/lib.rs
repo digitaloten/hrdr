@@ -21,6 +21,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use hrdr_llm::ToolDef;
 
+mod ansi;
 mod guardrails;
 mod hooks;
 mod lsp;

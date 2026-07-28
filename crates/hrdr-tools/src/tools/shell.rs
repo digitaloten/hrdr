@@ -220,6 +220,11 @@ struct ShellArgs {
     command: String,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// Hand back the raw bytes, escape sequences and all — see
+    /// [`crate::ansi`]. Off by default: colour written for a terminal is noise
+    /// to every reader downstream of a tool call.
+    #[serde(default)]
+    keep_ansi: bool,
 }
 
 /// The JSON-Schema for the `shell` tool; only the command description differs by
@@ -236,6 +241,16 @@ fn shell_parameters(command_desc: &str) -> serde_json::Value {
                                 expect to be slow — a cold build, a full test suite, a \
                                 dependency install — rather than letting it be killed \
                                 and starting over."
+            },
+            "keep_ansi": {
+                "type": "boolean",
+                "description": "Keep ANSI escape sequences (colour, cursor moves) in \
+                                the output instead of stripping them. Default false: \
+                                output normally reaches you as a terminal would show \
+                                it, because escapes are written for a terminal and you \
+                                are not one. Set true only when the escapes ARE the \
+                                thing under test — checking that your own CLI colours \
+                                its errors, or that a progress line redraws."
             }
         },
         "required": ["command"]
@@ -306,7 +321,7 @@ impl Tool for ShellTool {
         // hasn't seen what the command wrote, which is exactly what the
         // read-before-mutate guard is for.
         let before = ctx.tracked_sigs();
-        let out = run_streamed_command(cmd, &a.command, timeout, ctx).await;
+        let out = run_streamed_command(cmd, &a.command, timeout, a.keep_ansi, ctx).await;
         // Also on failure: a command that exited non-zero (or timed out) may
         // still have rewritten files before it died.
         ctx.note_modifying_command(&before, &a.command);
@@ -374,11 +389,23 @@ async fn run_streamed_command(
     mut cmd: tokio::process::Command,
     command: &str,
     timeout: Duration,
+    keep_ansi: bool,
     ctx: &ToolContext,
 ) -> Result<String> {
     // Looked up *before* the run, so this run's own spool (recorded at the end)
     // can't answer for itself: the note is about output the model already had.
     let prior_spool = ctx.spooled_output_for(command);
+    if !keep_ansi {
+        // Ask first, strip second. Most tools honour these, and output that was
+        // never coloured costs nothing to clean — but `rustfmt --check` colours its
+        // diff regardless, and `color.ui = always` in a user's config overrides the
+        // not-a-terminal check, so the strip at ingest below is what actually
+        // guarantees it. Not set under `keep_ansi`: a caller asking for escapes
+        // wants the child to emit them.
+        cmd.env("NO_COLOR", "1")
+            .env("CLICOLOR", "0")
+            .env("CARGO_TERM_COLOR", "never");
+    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     // A model-supplied command must never read the TUI's terminal: something
     // like `sudo` prompting for a password would block on the user's keystrokes
@@ -510,7 +537,12 @@ async fn run_streamed_command(
                             if out_buf.last() == Some(&b'\n') { out_buf.pop(); }
                             if out_buf.last() == Some(&b'\r') { out_buf.pop(); }
                             let capped_len = out_buf.len().min(BASH_LINE_CAP);
-                            let line = String::from_utf8_lossy(&out_buf[..capped_len]).into_owned();
+                            let mut line = String::from_utf8_lossy(&out_buf[..capped_len]).into_owned();
+                            if !keep_ansi && crate::ansi::needs_clean(&line) {
+                                line = crate::ansi::clean(&line).into_owned();
+                            }
+                            // Counted after cleaning: the caps, the spool note and
+                            // the grep-tail check are all about what the model sees.
                             stdout_bytes += line.len() + 1;
                             ingest_line!(&line);
                             out_buf.clear();
@@ -525,7 +557,10 @@ async fn run_streamed_command(
                             if err_buf.last() == Some(&b'\n') { err_buf.pop(); }
                             if err_buf.last() == Some(&b'\r') { err_buf.pop(); }
                             let capped_len = err_buf.len().min(BASH_LINE_CAP);
-                            let line = String::from_utf8_lossy(&err_buf[..capped_len]).into_owned();
+                            let mut line = String::from_utf8_lossy(&err_buf[..capped_len]).into_owned();
+                            if !keep_ansi && crate::ansi::needs_clean(&line) {
+                                line = crate::ansi::clean(&line).into_owned();
+                            }
                             ingest_line!(&line);
                             err_buf.clear();
                             err_over = false;
@@ -870,6 +905,65 @@ mod tests {
             .to_string();
         assert!(err.contains("`timeout_ms` is gone"), "{err}");
         assert!(!err.contains("looks like"), "no bogus conversion: {err}");
+    }
+
+    /// **End to end.** A command that colours its output reaches the model as
+    /// text, and reaches it with the escapes only when they were asked for.
+    ///
+    /// `printf` is used rather than a real formatter so this asserts the tool's
+    /// behaviour and not some other program's colour policy.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn colour_is_stripped_from_output_unless_it_was_asked_for() {
+        let ctx = ToolContext::new(std::path::PathBuf::from("."));
+        let cmd = r#"printf '\033[31m-        removed\033[m\n\033[32m+        added\033[m\n'"#;
+
+        let clean = ShellTool::new(Shell::Bash)
+            .execute(json!({"command": cmd}), &ctx)
+            .await
+            .expect("the command runs");
+        assert!(
+            clean.contains("-        removed") && clean.contains("+        added"),
+            "the text survives: {clean:?}"
+        );
+        assert!(
+            !clean.contains('\x1b'),
+            "no escape reaches the model by default: {clean:?}"
+        );
+
+        let raw = ShellTool::new(Shell::Bash)
+            .execute(json!({"command": cmd, "keep_ansi": true}), &ctx)
+            .await
+            .expect("the command runs");
+        assert!(
+            raw.contains("\x1b[31m"),
+            "the escape hatch hands back what the program actually wrote: {raw:?}"
+        );
+    }
+
+    /// The default also asks the child not to colour in the first place, which is
+    /// what keeps the tokens from being spent at all — the strip is the backstop
+    /// for tools that colour regardless. Under `keep_ansi` the child is left alone,
+    /// or a caller testing its own colour output would find it disabled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_child_is_told_not_to_colour_unless_escapes_were_asked_for() {
+        let ctx = ToolContext::new(std::path::PathBuf::from("."));
+        let cmd = "echo \"NO_COLOR=[$NO_COLOR] CARGO_TERM_COLOR=[$CARGO_TERM_COLOR]\"";
+
+        let out = ShellTool::new(Shell::Bash)
+            .execute(json!({"command": cmd}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("NO_COLOR=[1]"), "{out}");
+        assert!(out.contains("CARGO_TERM_COLOR=[never]"), "{out}");
+
+        let out = ShellTool::new(Shell::Bash)
+            .execute(json!({"command": cmd, "keep_ansi": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("NO_COLOR=[]"), "{out}");
+        assert!(out.contains("CARGO_TERM_COLOR=[]"), "{out}");
     }
 
     /// The point of the whole `proc` module: a timeout must kill the entire

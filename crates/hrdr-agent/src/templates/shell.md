@@ -83,6 +83,11 @@ Shell:
   away: run once, then search the saved output. (You only need to redirect to a
   file yourself if you want the output to outlive the tool call — hrdr's saved
   file is scratch and gets pruned.)
+- Output reaches you as a terminal would SHOW it, not as the program wrote it:
+  colour and cursor escapes are stripped, and a progress line that redrew itself
+  in place arrives as its final state. So a coloured diff reads as a diff. When the
+  escapes are themselves what you are testing — your own CLI colouring its errors,
+  a spinner redrawing — pass `keep_ansi: true` and you get the exact bytes.
 - A figure for your own summary is never worth another run of the suite. Wanting a
   total, a count, or a single line out of a run you already did is the commonest
   way this rule gets broken: the run happened, its whole output is on disk, so

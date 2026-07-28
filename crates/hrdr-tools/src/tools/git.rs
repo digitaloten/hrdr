@@ -550,7 +550,13 @@ impl Tool for GitTool {
             .current_dir(&ctx.cwd)
             // A pager would hang waiting for a terminal that isn't there.
             .env("GIT_PAGER", "cat")
-            .env("GIT_OPTIONAL_LOCKS", "0");
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            // git suppresses colour off a terminal on its own, but
+            // `color.ui = always` in the user's config overrides that and would
+            // wrap every diff line in escapes. This tool has no `keep_ansi`: its
+            // output is data — a diff, a log, a status — never a colour test.
+            .env("GIT_CONFIG_PARAMETERS", "'color.ui=false'")
+            .env("NO_COLOR", "1");
         // `run_capped_output` nulls stdin, sets `kill_on_drop` (so Esc actually
         // stops a `git log -p` on a huge repo), and caps how much stdout is
         // buffered — `output()` would hold the entire diff/log in memory before
@@ -562,8 +568,11 @@ impl Tool for GitTool {
                 .await
                 .context("running git (is it installed?)")?;
 
-        let stdout = String::from_utf8_lossy(&stdout_bytes);
-        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        // Belt and braces with the config override above: a git that coloured
+        // anyway (an alias with `--color`, an older git ignoring the parameter)
+        // must not reach the model as escapes. See `crate::ansi`.
+        let stdout = crate::ansi::clean(&String::from_utf8_lossy(&stdout_bytes)).into_owned();
+        let stderr = crate::ansi::clean(&String::from_utf8_lossy(&stderr_bytes)).into_owned();
         // When output overflowed the cap the child was killed, so its exit
         // status is a signal death, not a git error. Treat it as a valid (large)
         // result — it flows through the redaction + overflow-file path below,

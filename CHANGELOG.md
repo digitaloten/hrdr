@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Tool output reaches the model as a terminal would show it, not as the
+  program wrote it.** `rustfmt --check` colours its diff whether or not it is
+  talking to a terminal, and nothing downstream of a tool call is one — so a
+  diff arrived as `\x1b[31m-        let b1 = make_snapshot(` and the model paid
+  tokens for every escape, twice over, since they survived into the transcript
+  and out to whatever rendered them (badly). The `shell` tool now strips escape
+  sequences from each line as it captures it — colour, cursor moves, line
+  erases, OSC titles and hyperlinks — and collapses a line a carriage return
+  overwrote to what would have been left on screen, so a progress bar that
+  redrew forty times reads as its final state. The `git` tool's output is
+  cleaned the same way (and asked not to colour via `GIT_CONFIG_PARAMETERS`,
+  since `color.ui = always` in a user's config overrides git's own
+  not-a-terminal check).
+
+  Prevention comes first and stripping is the backstop: a command runs with
+  `NO_COLOR=1`, `CLICOLOR=0` and `CARGO_TERM_COLOR=never` so most tools never
+  emit the bytes at all. Cleaning happens at ingest, so the spool file the model
+  greps later is clean too, and the byte caps now count what the model will
+  actually see.
+
+  **Escape hatch:** `keep_ansi: true` on a `shell` call skips all of it — no
+  stripping and no colour-suppressing environment — for when the escapes are the
+  thing under test: a CLI that should colour its own errors, a spinner that
+  should redraw. Files are untouched by any of this: `read` and `grep` still
+  return exactly what is on disk.
+
 ## [0.8.4] - 2026-07-28
 
 ### Added
