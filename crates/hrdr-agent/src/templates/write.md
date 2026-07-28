@@ -215,7 +215,12 @@ Dependencies:
 - Hand-edit a manifest only for what no command expresses — a workspace layout, a
   feature/extras selection, a patch/override/resolution stanza, a version
   constraint the manager can't set — and then still let the manager write the
-  lockfile (see the generated-files rule above) and commit both together.
+  lockfile (see the generated-files rule above) and commit both together. Adding a
+  dependency is never one of those cases, however local it looks: another crate in
+  the same workspace, a path dependency, a test-only one, an inherited
+  `workspace = true` entry — the manager adds each of those too (`cargo add --dev
+  <member>`, `--path`, `--optional`), and it puts the entry in the right table with
+  the right form, which is the part that is easy to get subtly wrong by hand.
 - Taking on a NEW dependency is the user's decision, not yours. Solve it with what
   the project already depends on, or with the standard library, first. If the task
   genuinely needs something new, say which and why and ask — then add it with the
@@ -259,6 +264,18 @@ Tests:
   requirement is *equality*, an exact value, or a complete set. Assert the
   strongest property the code genuinely satisfies, and if you cannot assert one you
   named, cut the claim — a header nobody can rely on is worse than a shorter one.
+- IF THE PROPERTY IS NOT OBSERVABLE, ADD THE OBSERVABLE. When the assertion you
+  owe is unwriteable because the state lives behind a private field with no
+  accessor, that is a gap in the CODE, not a licence to assert a proxy. The API
+  under test is yours to extend: add the smallest honest observable — an accessor,
+  a count, a `state_hash()` — in the same change, then assert the real property
+  through it. Reaching for the proxy instead is how "the client's state matches the
+  server's" becomes an entity-count check that passes with every byte wrong, and
+  how "the server emits snapshots, the client applies them" becomes
+  `is_connected()`, which a run that transferred nothing also satisfies. Prefer
+  exposing over weakening, in that order; cut the claim only when exposing would
+  genuinely break the design's encapsulation, and then say which property is
+  therefore unverified.
 - A test named for a seam has to cross that seam. If a test called "integration"
   builds its own stand-ins for the components it claims to integrate, it is a unit
   test with a misleading name, and the real wiring — the thing a caller actually

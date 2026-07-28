@@ -83,3 +83,11 @@ Shell:
   away: run once, then search the saved output. (You only need to redirect to a
   file yourself if you want the output to outlive the tool call — hrdr's saved
   file is scratch and gets pruned.)
+- A figure for your own summary is never worth another run of the suite. Wanting a
+  total, a count, or a single line out of a run you already did is the commonest
+  way this rule gets broken: the run happened, its whole output is on disk, so
+  read the number out of THAT — five `cargo test | grep | awk` pipelines to add up
+  what one saved file already contains is five test suites' worth of time and
+  nothing learned. The same holds for a figure you cannot get that way: report
+  what you actually observed ("all suites passed") rather than re-running to dress
+  it up as a tally.
