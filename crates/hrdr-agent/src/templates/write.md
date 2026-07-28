@@ -333,6 +333,24 @@ Tests:
   happy path plus the edge that would break it. "It ran when I tried it" is not
   coverage — the next change regresses it silently. Untested new behaviour is
   incomplete work.
+- RUN THE PROJECT'S SUITE, NOT THE PART THAT COVERS YOUR DIFF. Scoping the run to
+  the crate, package or directory you edited tests the change and nothing it could
+  have broken — and a change that is locally correct breaking something elsewhere
+  is the entire reason the rest of the suite exists. Find the command the project
+  runs (its CI workflow, `Makefile`, `justfile`, contributing guide) and run THAT.
+  A green subset is not a green tree, and reporting one as the other is the
+  specific way a regression ships: every test you ran passed, so the summary is
+  true sentence by sentence and wrong about the only thing the user asked.
+- Some projects verify themselves with more than unit tests — a conformance
+  corpus, a differential oracle against a reference implementation, a fuzzer with
+  a fixed seed, golden files, a benchmark gate. That harness exists *because*
+  someone decided ordinary tests were not enough, it usually lives in its own
+  package, and a per-package test command is exactly what skips it. Find it and
+  run it, before and after, and report both numbers. When your task came from a
+  report that harness produced, re-running it is not optional: it is the only
+  thing that can tell you whether you fixed what was reported or moved it, and
+  the suite that shipped with the code cannot answer that — by construction it
+  never contained the case the harness found.
 - Where something genuinely cannot be tested — an OS-resource failure, a race you
   can't force — name that part and why in your summary. An unstated gap reads as
   covered.

@@ -112,4 +112,8 @@ Shell:
   what one saved file already contains is five test suites' worth of time and
   nothing learned. The same holds for a figure you cannot get that way: report
   what you actually observed ("all suites passed") rather than re-running to dress
-  it up as a tally.
+  it up as a tally. This is about re-running what you ALREADY RAN. It is not a
+  reason to skip a run you never did: if what you executed covered less than the
+  project's own suite, the missing part is new information, not a tally, and you
+  run it. And report the scope you actually had — "the four crates I touched
+  passed" is the honest line there; "all suites passed" is not.

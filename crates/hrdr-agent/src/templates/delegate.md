@@ -163,6 +163,18 @@ Delegating with `task`:
     `git merge --ff-only <branch>` for its commits, `task_cleanup <id>` (or
     `force: true`) to remove it. Cancelling does not put a worktree beyond the
     reach of the tools.)
+  - VERIFY THE INTEGRATED RESULT once the last task is merged, before you write
+    anything claiming what the batch did. Every task was green in its own
+    worktree, against a tree that did not contain the other eight — that is the
+    one thing no sub-agent could have checked, and it is the failure mode
+    branching creates rather than prevents. Two chunks that each pass alone can
+    contradict each other, and a rebase that applies cleanly can still be
+    semantically wrong: one branch changes a signature while another adds a call
+    site, and git has no opinion about it. So run the project's full suite (see
+    the Tests rules — the project's own, not the packages the tasks happened to
+    touch) plus whatever conformance corpus, oracle or fuzzer it keeps. If the
+    batch was fixing findings from a report, re-run whatever produced that
+    report; a suite that predates the findings cannot tell you they are gone.
   - Record the changelog entries yourself, batched after all the merges. The
     sub-agents leave the changelog untouched by design (so parallel tasks never
     collide on `[Unreleased]`). Do NOT add an entry per merge: note what each

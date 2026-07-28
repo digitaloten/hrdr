@@ -38,6 +38,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The prompt says to run the project's suite, not the part that covers your
+  diff.** The `Tests:` section had nine bullets on how to _write_ a test and
+  none on running one; the only instruction to run the project's own tests fired
+  at tag time, during a release. It now also says to find the project's real
+  verification harness — a conformance corpus, a differential oracle, a
+  fixed-seed fuzzer, golden files — run it before and after, and report both
+  numbers, because that harness usually lives in its own package and a
+  per-package test command is exactly what skips it. Evidence: a delegated fix
+  pass on another repo closed nine audit findings, ran the four crates it had
+  edited, and shipped with two previously-green oracle suites broken; the oracle
+  was in a package nobody ran, and the fuzzer that had produced every finding
+  was never re-run.
+
+- **Delegated batches verify the integrated result before claiming what they
+  did.** `delegate.md` had a thorough merge protocol — review, rebase,
+  fast-forward, clean up, batch the changelog — and no step anywhere that ran
+  the tests. Every task is green in its own worktree against a tree that does
+  not contain the others, so the integrated result is the one thing no sub-agent
+  can check. It is now a step of its own, before the changelog commit, and it
+  explicitly covers the semantic conflict git cannot see: one branch changing a
+  signature while another adds a call site.
+
+- **The "don't re-run the suite for a figure" rule now says what it is not.** It
+  is about re-running what you already ran, and it offered `"all suites passed"`
+  as the sanctioned phrasing — which is exactly the false claim to reach for
+  after running a subset. It now carves out the run you never did and asks for
+  the scope you actually had.
+
 - **The prompt now names the difference between changing a shape and changing a
   mechanism.** A change of shape — a type, a field, an argument, a deleted
   branch — is verified by the compiler. A change of mechanism — whether an
