@@ -20,6 +20,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`task_consume` replaces `task_apply` and brings a finished task's WHOLE
+  result over in one call.** Its commits are rebased onto your HEAD and
+  fast-forwarded in; anything it left uncommitted is applied and staged. Two
+  reasons it is one tool rather than two. First, the rebase target: done by hand
+  it is `git -C <worktree> rebase <target>`, and `HEAD` there means the
+  _worktree's_ HEAD, so `rebase HEAD` is a no-op that reports success — the
+  fast-forward then fails because the parent moved, the fallback `cherry-pick`
+  leaves the branch unreachable, and `task_cleanup` has to be forced, discarding
+  the guard that would have caught a real mistake. `task_consume` resolves the
+  parent's HEAD to a SHA in the parent checkout, so there is no name left to get
+  wrong. Second, the order: a worktree can hold both commits and leftovers, and
+  landing the uncommitted half first forces a commit, which moves HEAD, which is
+  what stops the branch fast-forwarding — so commits go first, and the tool
+  knows that rather than the model having to. All-or-nothing throughout: a
+  conflicting rebase is aborted and the stash taken to clear the way is popped
+  back, so a refusal leaves both trees exactly as they were.
+
 - **A finished background task now says it is an interruption.** Every delivered
   result ends with the same "additional work, not a replacement" contract the
   prompt states for a mid-turn user message: acknowledge it in a line, finish

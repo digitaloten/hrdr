@@ -2596,7 +2596,7 @@ impl hrdr_tools::Tool for TaskCancelTool {
                     Some(format!(
                         " Its worktree has changes (uncommitted files or commits on its branch), \
                          so it was kept rather than thrown away, and task #{id} stays addressable \
-                         for it: `task_diff {id}` to review what it did, `task_apply {id}` to \
+                         for it: `task_diff {id}` to review what it did, `task_consume {id}` to \
                          bring uncommitted work into your working dir, `git merge --ff-only \
                          {branch}` to take its commits, then `task_cleanup {id}` (add \
                          `force: true` to discard the worktree and whatever is left in it). Never \
@@ -2638,7 +2638,7 @@ impl hrdr_tools::Tool for TaskCancelTool {
 }
 
 /// Resolve a task id to its `(worktree path, branch)` from the shared
-/// background-task registry — the one lookup `task_diff` / `task_apply` /
+/// background-task registry — the one lookup `task_diff` / `task_consume` /
 /// `task_cleanup` all do. The entry persists after delivery exactly so this is
 /// addressable by id. `Ok(None)` means the task has no worktree (read-only, or a
 /// shared-dir writer in a non-git project); each caller words that case for
@@ -2757,13 +2757,13 @@ impl hrdr_tools::Tool for TaskCleanupTool {
     fn description(&self) -> &'static str {
         "Remove a finished write sub-agent's worktree once you have merged its work into your \
          own working dir. Use it as the 'I'm done with this one' signal AFTER you have brought \
-         the changes over (via git merge / cherry-pick / `task_apply` — this tool does NOT merge \
+         the changes over (`task_consume` — this tool does NOT merge \
          for you). Pass the task `id` (from `task_list`). It refuses if the worktree still has \
-         uncommitted changes (bring them over with `task_apply` first), or if its branch has \
+         uncommitted changes (bring them over with `task_consume` first), or if its branch has \
          commits not yet reachable from your HEAD (it looks unmerged) — so you can't delete work \
          by accident. `force: true` overrides BOTH refusals and really does remove it: use it \
          when you already brought the work over another way (cherry-pick / squash / \
-         `task_apply`), or when you have decided the leftovers are debris — the result then names \
+         `task_consume`), or when you have decided the leftovers are debris — the result then names \
          what was discarded."
     }
     fn parameters(&self) -> serde_json::Value {
@@ -2773,7 +2773,7 @@ impl hrdr_tools::Tool for TaskCleanupTool {
                 "id": { "type": "integer", "description": "The task id (see `task_list`)." },
                 "force": {
                     "type": "boolean",
-                    "description": "Remove even if the worktree has uncommitted changes or the branch has commits not reachable from HEAD — confirm you already brought the work over (merge / cherry-pick / `task_apply`) or accept losing it. Default false."
+                    "description": "Remove even if the worktree has uncommitted changes or the branch has commits not reachable from HEAD — confirm you already brought the work over (`task_consume`) or accept losing it. Default false."
                 }
             },
             "required": ["id"]
@@ -2816,7 +2816,7 @@ impl hrdr_tools::Tool for TaskCleanupTool {
         if !force && dirty.as_ref().is_none_or(|f| !f.is_empty()) {
             anyhow::bail!(
                 "worktree for task #{id} has uncommitted changes ({}) — bring them over with \
-                 `task_apply {id}` (or commit them in the worktree) first, then clean up. Nothing \
+                 `task_consume {id}` (or commit them in the worktree) first, then clean up. Nothing \
                  was removed. If that work is debris you want thrown away, call task_cleanup \
                  again with force:true and it will be discarded.",
                 path.display()
@@ -2880,28 +2880,224 @@ impl hrdr_tools::Tool for TaskCleanupTool {
     }
 }
 
-/// `task_apply`: land a write sub-agent worktree's UNCOMMITTED work on the
-/// parent checkout. A sub-agent that was told not to commit — or that simply
-/// forgot — leaves its entire result uncommitted in its worktree, where the
-/// branch carries nothing and `task_diff` can only warn about it. Without this,
-/// the parent hand-copies files out of the worktree file by file (and `rm -rf`s
-/// the worktree when `task_cleanup` refuses it), which is how real sessions have
-/// lost work. Committed work is untouched: that still merges via the branch.
-pub(crate) struct TaskApplyTool;
+/// Run `git` in `dir` and return `(success, stdout, stderr)`, both trimmed.
+async fn git_in(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<(bool, String, String)> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("running `git {}` in {}", args.join(" "), dir.display()))?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    ))
+}
+
+/// Everything a finished write task left OUTSIDE its commits, captured from the
+/// worktree before anything is moved.
+///
+/// Captured eagerly, bytes and all, because landing the commits first means
+/// stashing this out of the way — and `git stash push -u` takes the untracked
+/// files with it, so a later read of the worktree would find them gone.
+struct Leftovers {
+    /// `git diff HEAD --binary`: staged and unstaged changes to tracked files.
+    patch: Vec<u8>,
+    /// `status\tpath` pairs for the report.
+    tracked: Vec<(String, String)>,
+    /// Untracked (non-ignored) files with their contents.
+    untracked: Vec<(String, Vec<u8>)>,
+}
+
+impl Leftovers {
+    fn is_empty(&self) -> bool {
+        self.patch.is_empty() && self.untracked.is_empty()
+    }
+    fn count(&self) -> usize {
+        self.tracked.len() + self.untracked.len()
+    }
+}
+
+/// Read a worktree's uncommitted work into memory. Ignored files stay where they
+/// are (`--exclude-standard`): they are build output, not results.
+async fn capture_leftovers(path: &std::path::Path) -> anyhow::Result<Leftovers> {
+    // `diff HEAD` is the worktree-vs-HEAD delta — exactly the uncommitted work,
+    // staged and unstaged together. `--binary` so a non-text change survives, and
+    // bytes rather than a `String` so the patch reaches `git apply` unmodified.
+    let diff_out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["diff", "HEAD", "--binary"])
+        .output()
+        .await
+        .context("reading the task worktree's uncommitted diff")?;
+    if !diff_out.status.success() {
+        anyhow::bail!(
+            "could not read the worktree's uncommitted changes (`git diff HEAD` in {}): {}",
+            path.display(),
+            String::from_utf8_lossy(&diff_out.stderr).trim()
+        );
+    }
+    let (_, names, _) = git_in(path, &["diff", "HEAD", "--name-status"]).await?;
+    let tracked: Vec<(String, String)> = names
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(st, p)| (st.trim().to_string(), p.trim().to_string()))
+        .collect();
+
+    let others_out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .output()
+        .await
+        .context("listing the task worktree's untracked files")?;
+    let mut untracked = Vec::new();
+    for rel in String::from_utf8_lossy(&others_out.stdout)
+        .split('\0')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let bytes = tokio::fs::read(path.join(rel))
+            .await
+            .with_context(|| format!("reading untracked file `{rel}` out of the worktree"))?;
+        untracked.push((rel.to_string(), bytes));
+    }
+    Ok(Leftovers {
+        patch: diff_out.stdout,
+        tracked,
+        untracked,
+    })
+}
+
+/// Land captured leftovers on the parent checkout, staged and uncommitted.
+///
+/// All-or-nothing: both halves are pre-flighted before anything is written, so a
+/// refusal never leaves a half-applied tree and then reports success.
+async fn land_leftovers(
+    ctx: &hrdr_tools::ToolContext,
+    id: u64,
+    path: &std::path::Path,
+    lo: &Leftovers,
+) -> anyhow::Result<String> {
+    let mut blockers: Vec<String> = Vec::new();
+    if !lo.patch.is_empty() {
+        let (ok, msg) = git_apply_3way(&ctx.cwd, &["--check"], &lo.patch).await?;
+        if !ok {
+            anyhow::bail!(
+                "task #{id}'s uncommitted changes do not apply to your working dir:\n{msg}"
+            );
+        }
+        blockers.extend(conflicted_paths(&msg));
+    }
+    // A copy would clobber an existing file, and an existing file is either the
+    // user's or the parent's own work — never overwrite one blind.
+    blockers.extend(
+        lo.untracked
+            .iter()
+            .filter(|(rel, _)| ctx.cwd.join(rel).exists())
+            .map(|(rel, _)| format!("{rel} (already exists)")),
+    );
+    if !blockers.is_empty() {
+        anyhow::bail!(
+            "{} file(s) in task #{id}'s uncommitted work conflict with your working dir:\n  {}\n\
+             Review them in the worktree ({}) and bring them over by hand.",
+            blockers.len(),
+            blockers.join("\n  "),
+            path.display(),
+        );
+    }
+
+    // The dry run passed, but it is not the same check: `--check` turns `--index`
+    // off, while the real `--3way` stages, so it additionally requires the index
+    // to match the working tree for the files it touches. `git apply` is atomic
+    // (no `--reject`), so a failure here applies nothing.
+    if !lo.patch.is_empty() {
+        let (ok, msg) = git_apply_3way(&ctx.cwd, &[], &lo.patch).await?;
+        if !ok {
+            anyhow::bail!(
+                "`git apply --3way` refused task #{id}'s uncommitted changes — it applies \
+                 atomically, so nothing was applied:\n{msg}\nA `does not match index` here means \
+                 YOUR working dir has unstaged edits to one of the same files (this applies \
+                 through the index): commit or stash yours, then consume again."
+            );
+        }
+    }
+    let mut copied: Vec<String> = Vec::new();
+    for (rel, bytes) in &lo.untracked {
+        let dest = ctx.cwd.join(rel);
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating {} for a copied file", parent.display()))?;
+        }
+        tokio::fs::write(&dest, bytes)
+            .await
+            .with_context(|| format!("writing untracked file `{rel}` into your working dir"))?;
+        copied.push(rel.clone());
+    }
+    if !copied.is_empty() {
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&ctx.cwd)
+            .args(["add", "--"])
+            .args(&copied)
+            .output()
+            .await;
+    }
+
+    let mut report = String::new();
+    for (status, file) in &lo.tracked {
+        report.push_str(&format!("  {status} {file}\n"));
+    }
+    for file in &copied {
+        report.push_str(&format!(
+            "  A {file} (untracked in the worktree — copied)\n"
+        ));
+    }
+    Ok(report)
+}
+
+/// `task_consume`: bring everything a finished write task produced into the
+/// parent checkout, in one call and in the order that works.
+///
+/// Replaces a hand-rolled sequence with a trap in it. By hand the commits are
+/// `git -C <worktree> rebase <target>` then `git merge --ff-only <branch>`, and
+/// the target is what goes wrong: `HEAD` inside the worktree is *the worktree's
+/// own* HEAD, so `rebase HEAD` is a no-op that reports "Current branch is up to
+/// date". The fast-forward then fails because the parent moved, and the fallback
+/// — `cherry-pick` — leaves the branch unreachable from HEAD, so `task_cleanup`
+/// refuses until it is forced. One correct sequence becomes three wrong ones, and
+/// the recovery discards the guard that would have caught a real mistake. Here
+/// the parent's HEAD is resolved to a SHA in the parent checkout and the rebase
+/// is onto that: there is no name left to get wrong.
+///
+/// **Commits first, then leftovers**, which is the other half of why this is one
+/// tool. A worktree can hold both, and the order is not symmetric: land the
+/// uncommitted work first and you must commit it, which moves your HEAD, which
+/// stops the branch fast-forwarding — manufacturing the rebase problem above.
+/// Landing the commits first leaves the parent at the branch tip, which is
+/// exactly what the leftover patch was computed against.
+///
+/// All-or-nothing at each step, and the worktree is restored on any failure: a
+/// conflicting rebase is aborted, a stash taken to clear the way is popped back.
+pub(crate) struct TaskConsumeTool;
 
 #[async_trait::async_trait]
-impl hrdr_tools::Tool for TaskApplyTool {
+impl hrdr_tools::Tool for TaskConsumeTool {
     fn name(&self) -> &'static str {
-        "task_apply"
+        "task_consume"
     }
     fn description(&self) -> &'static str {
-        "Bring a write sub-agent's UNCOMMITTED work (staged, unstaged, and untracked files) out \
-         of its worktree and into your own working dir, in one call — for a task that edited \
-         files but did not commit them, which `task_diff` reports as leftovers. Pass the task \
-         `id` (from `task_list`). It applies with `git apply --3way` and stages the result, so \
-         you review it with `git diff --cached` and commit it yourself. All-or-nothing: on \
-         conflict it names the conflicting files and applies NOTHING. It does NOT touch the \
-         task's COMMITTED work — that still merges via its branch (see `task_diff`)."
+        "Bring everything a finished write sub-agent produced into your working dir, in one call. \
+         Pass the task `id` (from `task_list`). Its COMMITS are rebased onto your current HEAD and \
+         fast-forwarded in (history stays linear); anything it left UNCOMMITTED is then applied \
+         and staged for you to review with `git diff --cached` and commit yourself. Review first \
+         with `task_diff` — this merges, it does not check. All-or-nothing: on conflict nothing \
+         lands, your tree and the worktree are left as they were, and the conflicting files are \
+         named. Afterwards call `task_cleanup` to remove the worktree."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
@@ -2920,177 +3116,147 @@ impl hrdr_tools::Tool for TaskApplyTool {
         args: serde_json::Value,
         ctx: &hrdr_tools::ToolContext,
     ) -> anyhow::Result<String> {
-        let id = args
-            .get("id")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("task_apply needs an integer `id` (see `task_list`)"))?;
-        // Same lookup as `task_diff` / `task_cleanup`.
+        let id = args.get("id").and_then(|v| v.as_u64()).ok_or_else(|| {
+            anyhow::anyhow!("task_consume needs an integer `id` (see `task_list`)")
+        })?;
         let Some((path, branch)) = task_worktree(ctx, id)? else {
             anyhow::bail!(
-                "task #{id} has no worktree to apply from — it was read-only or shared your \
-                 working dir, so anything it changed is already in your tree."
+                "task #{id} has no worktree to consume — it was read-only or shared your working \
+                 dir, so anything it changed is already in your tree."
             );
         };
 
-        // 1. Tracked changes, staged AND unstaged in one patch: `diff HEAD` is
-        // the worktree-vs-HEAD delta, which is exactly the uncommitted work.
-        // `--binary` so a non-text change survives; bytes, never a String, so the
-        // patch reaches `git apply` unmodified.
-        let diff_out = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&path)
-            .args(["diff", "HEAD", "--binary"])
-            .output()
-            .await
-            .context("reading the task worktree's uncommitted diff")?;
-        if !diff_out.status.success() {
-            anyhow::bail!(
-                "could not read task #{id}'s uncommitted changes (`git diff HEAD` in {}): {}",
-                path.display(),
-                String::from_utf8_lossy(&diff_out.stderr).trim()
-            );
-        }
-        let patch = diff_out.stdout;
-        let names_out = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&path)
-            .args(["diff", "HEAD", "--name-status"])
-            .output()
-            .await
-            .context("listing the task worktree's uncommitted files")?;
-        let tracked: Vec<(String, String)> = String::from_utf8_lossy(&names_out.stdout)
-            .lines()
-            .filter_map(|l| l.split_once('\t'))
-            .map(|(st, p)| (st.trim().to_string(), p.trim().to_string()))
-            .collect();
-
-        // 2. Untracked files (gitignored ones stay out — `--exclude-standard`).
-        // These have no pre-image to patch against, so they are copied.
-        let others_out = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&path)
-            .args(["ls-files", "--others", "--exclude-standard", "-z"])
-            .output()
-            .await
-            .context("listing the task worktree's untracked files")?;
-        let untracked: Vec<String> = String::from_utf8_lossy(&others_out.stdout)
-            .split('\0')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(str::to_string)
-            .collect();
-
-        if patch.is_empty() && untracked.is_empty() {
-            anyhow::bail!(
-                "worktree for task #{id} is clean — nothing uncommitted to apply. Its committed \
-                 work merges via the branch: review it with `task_diff {id}`, then merge \
-                 `{branch}`."
-            );
-        }
-
-        // 3. Pre-flight, both halves, BEFORE anything is written: a dry-run
-        // 3-way apply for the tracked patch, and a collision check for the
-        // copies. Either one failing aborts the whole call, so the tool never
-        // leaves a half-applied tree and then reports success.
-        let mut blockers: Vec<String> = Vec::new();
-        if !patch.is_empty() {
-            let (ok, msg) = git_apply_3way(&ctx.cwd, &["--check"], &patch).await?;
-            if !ok {
-                anyhow::bail!(
-                    "task #{id}'s uncommitted changes do not apply to your working dir — NOTHING \
-                     was applied (your tree is untouched):\n{msg}\nIf your tree has moved on, \
-                     have the work committed on `{branch}` and merge the branch instead (see \
-                     `task_diff {id}`)."
-                );
-            }
-            blockers.extend(conflicted_paths(&msg));
-        }
-        // A copy would clobber an existing file, and an existing file is either
-        // the user's or the parent's own work — never overwrite it blind.
-        let collisions: Vec<String> = untracked
-            .iter()
-            .filter(|rel| ctx.cwd.join(rel).exists())
-            .cloned()
-            .collect();
-        blockers.extend(collisions.iter().map(|p| format!("{p} (already exists)")));
-        if !blockers.is_empty() {
-            anyhow::bail!(
-                "{} file(s) in task #{id}'s uncommitted work conflict with your working dir — \
-                 NOTHING was applied (your tree is untouched):\n  {}\nReview them in the \
-                 worktree ({}) and bring them over by hand, or have the work committed on \
-                 `{branch}` and rebase that branch onto your HEAD so it merges normally.",
-                blockers.len(),
-                blockers.join("\n  "),
-                path.display(),
-            );
-        }
-
-        // 4. Apply for real. The dry run passed, but it is not the same check:
-        // `--check` turns `--index` off, while the real `--3way` stages, so it
-        // additionally requires your index to match your working tree for the
-        // files it touches. `git apply` is atomic (no `--reject` here), so a
-        // failure applies nothing — say so, and name the usual cause.
-        if !patch.is_empty() {
-            let (ok, msg) = git_apply_3way(&ctx.cwd, &[], &patch).await?;
-            if !ok {
-                anyhow::bail!(
-                    "`git apply --3way` refused task #{id}'s uncommitted changes — it applies \
-                     atomically, so nothing was applied:\n{msg}\nA `does not match index` here \
-                     means YOUR working dir has unstaged edits to one of the same files (this \
-                     applies through the index): commit or stash yours, then call task_apply \
-                     again. Verify with `git status` either way."
-                );
-            }
-        }
-        // 5. Copy the untracked files, then stage them, so everything this call
-        // brought over shows up in one `git diff --cached` review.
-        let mut copied: Vec<String> = Vec::new();
-        for rel in &untracked {
-            let dest = ctx.cwd.join(rel);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {} for a copied file", parent.display()))?;
-            }
-            std::fs::copy(path.join(rel), &dest)
-                .with_context(|| format!("copying untracked file `{rel}` out of the worktree"))?;
-            copied.push(rel.clone());
-        }
-        if !copied.is_empty() {
-            let _ = tokio::process::Command::new("git")
-                .arg("-C")
-                .arg(&ctx.cwd)
-                .args(["add", "--"])
-                .args(&copied)
-                .output()
-                .await;
-        }
-
-        let mut report = format!(
-            "Applied task #{id}'s uncommitted work to your working dir (`git apply --3way`; \
-             staged in your index, NOT committed):\n"
-        );
-        for (status, file) in &tracked {
-            report.push_str(&format!("  {status} {file}\n"));
-        }
-        for file in &copied {
-            report.push_str(&format!(
-                "  A {file} (untracked in the worktree — copied)\n"
+        let leftovers = capture_leftovers(&path).await?;
+        let (_, ahead, _) = git_in(
+            &ctx.cwd,
+            &["rev-list", "--count", &format!("HEAD..{branch}")],
+        )
+        .await?;
+        let commits: u64 = ahead.parse().unwrap_or(0);
+        if commits == 0 && leftovers.is_empty() {
+            return Ok(format!(
+                "Nothing to consume from task #{id}: `{branch}` has no commits your HEAD is \
+                 missing, and its worktree is clean. `task_cleanup` with id {id} removes it."
             ));
         }
+
+        // A rebase refuses to run over a dirty tree, so stash the leftovers out of
+        // the way. Their contents are already in memory, so this is only about
+        // giving git a clean tree — and it is reversible, which `reset --hard`
+        // would not be.
+        let stashed = if commits > 0 && !leftovers.is_empty() {
+            let (ok, _, err) = git_in(&path, &["stash", "push", "--include-untracked"]).await?;
+            if !ok {
+                anyhow::bail!(
+                    "could not set task #{id}'s uncommitted work aside to rebase its commits — \
+                     nothing was merged. git said: {err}"
+                );
+            }
+            true
+        } else {
+            false
+        };
+        // Put the worktree back exactly as it was found, on any failure after this
+        // point. A stash left behind is work the parent cannot see and the model
+        // has no reason to look for.
+        let restore = |stashed: bool, path: std::path::PathBuf| async move {
+            if stashed {
+                let _ = git_in(&path, &["stash", "pop"]).await;
+            }
+        };
+
+        let mut report = String::new();
+        if commits > 0 {
+            // The fix for the whole trap: resolve the parent's HEAD to a SHA
+            // *here*, in the parent checkout. `HEAD` would name the worktree's own
+            // head once it crossed the `-C` boundary, and a branch name would have
+            // to be the right one. A SHA is neither.
+            let (ok, head_sha, err) = git_in(&ctx.cwd, &["rev-parse", "HEAD"]).await?;
+            if !ok || head_sha.is_empty() {
+                restore(stashed, path.clone()).await;
+                anyhow::bail!("could not resolve your HEAD to rebase task #{id} onto: {err}");
+            }
+
+            let (rebased, _, rebase_err) = git_in(&path, &["rebase", &head_sha]).await?;
+            if !rebased {
+                // Name what collided before unwinding, then unwind.
+                let (_, conflicts, _) =
+                    git_in(&path, &["diff", "--name-only", "--diff-filter=U"]).await?;
+                let _ = git_in(&path, &["rebase", "--abort"]).await;
+                restore(stashed, path.clone()).await;
+                let files = if conflicts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Conflicting files: {}.", conflicts.replace('\n', ", "))
+                };
+                anyhow::bail!(
+                    "rebasing `{branch}` (task #{id}) onto your HEAD hit a conflict — the rebase \
+                     was aborted and NOTHING was merged; your tree and the worktree are as they \
+                     were.{files} Resolve it in the worktree ({}) and consume again, or review \
+                     and cherry-pick by hand. git said: {rebase_err}",
+                    path.display()
+                );
+            }
+
+            let (merged, _, merge_err) = git_in(&ctx.cwd, &["merge", "--ff-only", &branch]).await?;
+            if !merged {
+                restore(stashed, path.clone()).await;
+                anyhow::bail!(
+                    "`{branch}` (task #{id}) rebased cleanly but would not fast-forward into your \
+                     working dir — usually an uncommitted change of your own in a file it \
+                     touches. Nothing was merged. git said: {merge_err}"
+                );
+            }
+            let size = task_size_summary(&ctx.cwd, &branch)
+                .await
+                .map(|s| format!("\n{s}"))
+                .unwrap_or_default();
+            report.push_str(&format!(
+                "Merged {commits} commit(s) from `{branch}` (rebased onto your HEAD, \
+                 fast-forwarded in).{size}\n"
+            ));
+        }
+
+        if !leftovers.is_empty() {
+            match land_leftovers(ctx, id, &path, &leftovers).await {
+                Ok(files) => {
+                    report.push_str(&format!(
+                        "Applied {} uncommitted file(s), STAGED and not committed:\n{files}\
+                         Review with `git diff --cached` — every hunk, like a PR — and commit \
+                         them yourself with a proper message.\n",
+                        leftovers.count()
+                    ));
+                    // Only now: the work is in the parent, so the stashed copy is
+                    // a duplicate, and leaving it would have `task_cleanup` refuse
+                    // a worktree whose contents are already safe.
+                    if stashed {
+                        let _ = git_in(&path, &["stash", "drop"]).await;
+                    }
+                }
+                Err(e) => {
+                    restore(stashed, path.clone()).await;
+                    let merged_note = if commits > 0 {
+                        format!(
+                            " NOTE: the {commits} commit(s) DID merge — only the uncommitted half \
+                             failed, and it is back in the worktree."
+                        )
+                    } else {
+                        String::new()
+                    };
+                    anyhow::bail!("{e}{merged_note}");
+                }
+            }
+        }
+
         report.push_str(&format!(
-            "{} file(s). Review it with `git diff --cached` — every hunk, like a PR — and commit \
-             it yourself with a proper message.\nThis brought over ONLY the uncommitted changes. \
-             Any COMMITTED work of task #{id} is untouched and still merges the normal way \
-             (`task_diff {id}`, then merge `{branch}`). Once everything is in, `task_cleanup` \
-             with id {id}.\n",
-            tracked.len() + copied.len()
+            "The worktree is still on disk — call `task_cleanup` with id {id} to remove it.\n"
         ));
         Ok(hrdr_tools::truncate_saved(
             &report,
             ctx.max_output,
             ctx.max_output_lines,
             hrdr_tools::TruncateSide::Head,
-            "task_apply",
+            "task_consume",
         ))
     }
 }
@@ -3392,7 +3558,7 @@ impl hrdr_tools::Tool for TaskDiffTool {
                 "WARNING: the sub-agent left uncommitted/untracked changes in its worktree — \
                  these are NOT included in the diff below and must be handled (reviewed and \
                  committed, or discarded) before you merge or run `task_cleanup`. To bring them \
-                 into your working dir in one call, use `task_apply {id}`:\n{dirty}\n\n"
+                 into your working dir in one call, use `task_consume {id}`:\n{dirty}\n\n"
             ));
         }
         if commits.is_empty() {

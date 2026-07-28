@@ -91,8 +91,8 @@ Delegating with `task`:
 - Manage running tasks with `task_list` (what's running), `task_output` (peek a
   RUNNING task's newest output), `task_steer` (give it additional instructions), `task_diff` (review a finished write task's uncommitted
   leftovers, commits, and diff — pass `commit` to review one commit at a time),
-  `task_apply` (land a finished write task's UNCOMMITTED work in your working
-  dir), and `task_cancel` (stop one). You do not need these to collect results —
+  `task_consume` (bring a finished write task's whole result — commits and
+  uncommitted leftovers — into your working dir), and `task_cancel` (stop one). You do not need these to collect results —
   those arrive on their own.
 - Three stages, and each has ONE tool. While it runs: `task_output` for a summary
   of where it has got to — that is all you need, and you don't even need that
@@ -127,12 +127,20 @@ Delegating with `task`:
     clean once committed.) For a large result, review it commit-by-commit
     instead: pass `commit` (an index from the printed list, newest first, or a
     hash) to see just that commit's diff.
-  - If it left changes uncommitted or untracked, do NOT re-delegate and do NOT
-    hand-copy files out of the worktree — call `task_apply <id>`: one call that
-    lands that uncommitted work (tracked edits + untracked files) in your working
-    dir, staged for review, or names the conflicting files and applies nothing.
-    Then review it and commit it yourself (a proper message), or that work is
-    lost when the worktree goes away. Read the **entire** diff — every hunk, not
+  - BRING IT OVER WITH `task_consume <id>`, not with git by hand and never by
+    re-delegating. One call takes the whole result: the commits are rebased onto
+    your HEAD and fast-forwarded in, and anything left uncommitted (tracked edits
+    and untracked files both) is applied and staged. On conflict it lands nothing
+    and names the files. Commit whatever it staged yourself, with a proper
+    message, or that work is lost when the worktree goes away.
+    Hand-rolling it is where this goes wrong: `HEAD` inside the worktree is the
+    *worktree's* HEAD, so `git -C <worktree> rebase HEAD` is a no-op that reports
+    success, the fast-forward then fails because you have moved, and the
+    cherry-pick people reach for next leaves the branch unmergeable so
+    `task_cleanup` has to be forced. The order matters too, and `task_consume`
+    knows it: commits first, leftovers second — land the uncommitted half first
+    and committing it moves your HEAD, which is what stops the branch
+    fast-forwarding in the first place. Read the **entire** diff — every hunk, not
     just that commits exist: a sub-agent can misunderstand the task, over-reach,
     leave debris, or quietly do something wrong; you own whatever lands in your
     working dir, so review it like a PR and fix anything off before bringing it
@@ -160,7 +168,7 @@ Delegating with `task`:
     ask — do not move, overwrite, stage, or delete it. Then call `task_cleanup
     <id>` to remove the now-merged worktree. It
     refuses while the worktree has uncommitted changes, so deal with those first
-    (`task_apply <id>`, then commit) — or, if you have judged them debris,
+    (`task_consume <id>`, then commit) — or, if you have judged them debris,
     `force: true`, which really does remove it and reports what it discarded.
     Never `rm -rf` a worktree — that leaves git's own worktree registration
     behind, and `task_cleanup` is what clears both.
@@ -168,8 +176,8 @@ Delegating with `task`:
     is clean, and KEEPS one holding uncommitted work or unmerged commits rather
     than destroying it. A kept worktree is still the cancelled task's: its id
     stays addressable, so finish it the same way as a delivered one —
-    `task_diff <id>` to see it, `task_apply <id>` for uncommitted work,
-    `git merge --ff-only <branch>` for its commits, `task_cleanup <id>` (or
+    `task_diff <id>` to see it, `task_consume <id>` to bring its work over,
+    `task_cleanup <id>` (or
     `force: true`) to remove it. Cancelling does not put a worktree beyond the
     reach of the tools.)
   - VERIFY THE INTEGRATED RESULT once the last task is merged, before you write

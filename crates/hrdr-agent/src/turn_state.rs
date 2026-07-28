@@ -112,7 +112,7 @@ impl Agent {
             // is in the conversation) or cancelled.
             //
             // An entry that still HAS a worktree is retained either way, so it
-            // stays addressable by id in `task_list` / `task_diff` / `task_apply` /
+            // stays addressable by id in `task_list` / `task_diff` / `task_consume` /
             // `task_cleanup` until the parent resolves it. That includes a
             // **cancelled** task: `task_cancel` keeps a worktree holding
             // uncommitted work or unmerged commits, and pruning the entry anyway
@@ -163,22 +163,18 @@ impl Agent {
                         "[Background task #{id} ({label}) finished. Its changes are on branch \
                          `{branch}` in an isolated git worktree — NOTHING has landed in your \
                          working dir yet.\n  worktree: {p}\n  branch:   {branch}\n{size_block}\n\
-                         Read the whole diff yourself before merging. The sub-agent was told to commit all \
-                         its work and leave a clean tree, but confirm it actually did:\n  1. Call \
-                         `task_diff {id}` — shows any uncommitted/untracked leftovers (must be \
-                         none), its commits, and the full diff (`git diff \
-                         HEAD...{branch}`). For a large result, pass `commit` (an index from the \
-                         listed commits) to review it commit-by-commit instead.\n  2. If it flags \
-                         uncommitted/untracked changes, do not re-delegate to another sub-agent — \
-                         bring them into your working dir with `task_apply {id}` (one call: it \
-                         applies them staged, or names the conflicts and applies nothing), then \
-                         review and commit them YOURSELF (a proper Conventional Commits message), \
-                         or that work is lost. Then review the \
-                         diff like a PR — every hunk, not just that commits exist — and fix \
-                         anything off before bringing it over.\nThen merge the branch into your \
-                         working dir (rebase it onto HEAD in the worktree first if that'd conflict \
-                         — `git -C {p} rebase <your-branch>`), and once its work is in, call \
-                         `task_cleanup` with id {id} to remove the worktree. Its report:]\n{result}"
+                         Three calls, in order:\n  1. `task_diff {id}` — its commits, the full \
+                         diff (`git diff HEAD...{branch}`), and any uncommitted leftovers. Read it \
+                         like a PR: every hunk, not just that commits exist. For a large result \
+                         pass `commit` (an index from the listed commits) to go one at a time.\n  \
+                         2. `task_consume {id}` — brings the whole result over: its commits are \
+                         rebased onto your HEAD and fast-forwarded in, and anything it left \
+                         uncommitted is applied and STAGED. Do not hand-roll this with git and do \
+                         not re-delegate it; on conflict the call lands nothing and names the \
+                         files. Commit whatever it staged, yourself, with a proper Conventional \
+                         Commits message — that work is lost otherwise.\n  3. `task_cleanup` with \
+                         id {id} — removes the worktree once its work is in.\nIts report:]\n\
+                         {result}"
                     )
                 }
                 None => {

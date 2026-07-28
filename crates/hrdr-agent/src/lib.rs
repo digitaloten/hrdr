@@ -106,7 +106,7 @@ pub(crate) use delegation::{
     resolve_child_dir, task_size_summary,
 };
 pub(crate) use delegation::{
-    BgHandles, SteerTool, SubagentTool, TaskApplyTool, TaskCancelTool, TaskCleanupTool,
+    BgHandles, SteerTool, SubagentTool, TaskCancelTool, TaskCleanupTool, TaskConsumeTool,
     TaskDiffTool, TaskListTool, TaskOutputTool, TaskReviveTool, TaskTranscriptTool, bg_handles,
     gc_worktrees, subagent_base_config,
 };
@@ -1545,10 +1545,12 @@ impl Agent {
                 live: registry.clone(),
             }));
             tools.register(Arc::new(TaskDiffTool));
-            // Landing a sub-agent's UNCOMMITTED work: the missing step between
-            // `task_diff` (which only warns about leftovers) and `task_cleanup`
-            // (which removes the worktree they live in).
-            tools.register(Arc::new(TaskApplyTool));
+            // Integration: the step between `task_diff` (review) and
+            // `task_cleanup` (remove the worktree). One tool for both halves of a
+            // task's output — its commits and anything it left uncommitted —
+            // because the order between them is not symmetric and was being got
+            // wrong. See `TaskConsumeTool`.
+            tools.register(Arc::new(TaskConsumeTool));
             tools.register(Arc::new(TaskCleanupTool {
                 live: registry.clone(),
             }));
@@ -6024,13 +6026,26 @@ mod tests {
                 && last.contains("def5678 test(x): cover the thing"),
             "delivery includes the commit subjects: {last}"
         );
-        // Read-the-diff handoff: points at `task_diff` and still tells the
-        // parent to commit any leftovers itself.
+        // The handoff names all three integration tools, in order, and still
+        // makes committing the leftovers the parent's own job. The ordering is
+        // the point: reviewing after consuming is reviewing what you already
+        // merged, and `task_cleanup` before consuming throws the work away.
+        let (diff_at, consume_at, cleanup_at) = (
+            last.find("task_diff 1"),
+            last.find("task_consume 1"),
+            last.find("task_cleanup"),
+        );
         assert!(
-            last.contains("Read the whole diff yourself before merging")
-                && last.contains("task_diff 1")
-                && last.contains("commit them YOURSELF"),
-            "handoff tells the parent to verify + commit leftovers itself: {last}"
+            diff_at < consume_at && consume_at < cleanup_at && diff_at.is_some(),
+            "handoff names diff → consume → cleanup in order: {last}"
+        );
+        assert!(
+            last.contains("Read it \n") || last.contains("like a PR"),
+            "handoff still says to read the diff: {last}"
+        );
+        assert!(
+            last.contains("Commit whatever it staged, yourself"),
+            "committing the leftovers stays the parent's job: {last}"
         );
         assert!(
             !last.contains("should be discarded"),
@@ -6050,7 +6065,7 @@ mod tests {
     ///
     /// Regression: every cancelled entry used to be pruned on the next drain,
     /// while `task_cancel` deliberately leaves such a worktree on disk. The
-    /// worktree then existed with no way to reach it — `task_diff`/`task_apply`/
+    /// worktree then existed with no way to reach it — `task_diff`/`task_consume`/
     /// `task_cleanup` all answered "no background task #N" — so the only
     /// remaining move was the `rm -rf` the prompt forbids, and a real session did
     /// exactly that.
@@ -6720,7 +6735,7 @@ mod tests {
         assert!(!um_path.exists(), "force removes the unmerged worktree");
 
         // Case 3 — uncommitted changes → refused WITHOUT force (and the refusal
-        // points at `task_apply`), but `force: true` honestly forces: the
+        // points at `task_consume`), but `force: true` honestly forces: the
         // worktree goes and the result names what was discarded. A `force` that
         // still refused is what taught a real session to `rm -rf` the worktree
         // behind the harness's back.
@@ -6744,7 +6759,7 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string().contains("uncommitted changes")
-                && err.to_string().contains("task_apply 2"),
+                && err.to_string().contains("task_consume 2"),
             "refuses uncommitted work and names the tool that lands it: {err}"
         );
         assert!(dirty_path.exists(), "the worktree is not removed");
@@ -6775,13 +6790,14 @@ mod tests {
         );
     }
 
-    /// `task_apply` lands a sub-agent's UNCOMMITTED work — a tracked edit and an
-    /// untracked new file — on the parent checkout in one call, refuses a clean
-    /// worktree by pointing at the branch instead, and on conflict reports the
-    /// conflicting files while leaving the parent tree exactly as it was.
+    /// `task_consume` brings a finished task's whole output over in one call, in
+    /// the order that works: commits first (rebased onto the parent's HEAD so
+    /// they fast-forward), leftovers second (staged). The both-at-once case is
+    /// the reason it is one tool — landing the uncommitted half first would force
+    /// a commit, which moves HEAD, which stops the branch fast-forwarding.
     #[tokio::test]
-    async fn task_apply_lands_uncommitted_work_and_refuses_on_conflict() {
-        use super::{TaskApplyTool, Worktree};
+    async fn task_consume_lands_commits_then_leftovers_and_restores_on_conflict() {
+        use super::{TaskConsumeTool, Worktree};
         use hrdr_tools::Tool;
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
@@ -6803,120 +6819,137 @@ mod tests {
         if !repo.join(".git").exists() {
             return; // git unavailable — skip
         }
-
         let ctx = hrdr_tools::ToolContext::new(repo);
-        let apply = TaskApplyTool;
-
-        // (a) a worktree with an uncommitted tracked edit + an untracked file:
-        // both land in the parent tree, staged, and the report says the branch
-        // still carries any committed work.
-        let wt = Worktree::create(repo).await.unwrap();
-        std::fs::write(wt.path.join("f.txt"), "one\nTWO\nthree\n").unwrap();
-        std::fs::create_dir_all(wt.path.join("sub")).unwrap();
-        std::fs::write(wt.path.join("sub/new.txt"), "fresh\n").unwrap();
-        let kept = wt.keep();
-        ctx.background_tasks
-            .lock()
-            .unwrap()
-            .push(hrdr_tools::BackgroundTask {
-                id: 1,
-                delivered: true,
-                worktree: Some(kept.path.clone()),
-                branch: Some(kept.branch.clone()),
-                ..Default::default()
-            });
-        let out = apply
-            .execute(serde_json::json!({"id": 1}), &ctx)
-            .await
-            .unwrap();
-        assert!(out.contains("f.txt"), "names the patched file: {out}");
-        assert!(
-            out.contains("sub/new.txt") && out.contains("copied"),
-            "names the copied untracked file: {out}"
-        );
-        assert!(
-            out.contains("still merges the normal way"),
-            "reminds that committed work merges via the branch: {out}"
-        );
+        let consume = TaskConsumeTool;
         // CRLF-normalized: on Windows runners git's default `core.autocrlf=true`
-        // checks text out with CRLF, so the applied file reads back `\r\n` — the
+        // checks text out with CRLF, so an applied file reads back `\r\n` — the
         // content is what matters here, not the platform's line endings.
         let normalized = |p: &str| {
             std::fs::read_to_string(repo.join(p))
                 .unwrap()
                 .replace("\r\n", "\n")
         };
+        let register = |id: u64, path: &std::path::Path, branch: &str| {
+            ctx.background_tasks
+                .lock()
+                .unwrap()
+                .push(hrdr_tools::BackgroundTask {
+                    id,
+                    delivered: true,
+                    worktree: Some(path.to_path_buf()),
+                    branch: Some(branch.to_string()),
+                    ..Default::default()
+                });
+        };
+
+        // (a) COMMITS AND LEFTOVERS TOGETHER — the ordering case. The parent also
+        // moves on independently, so the branch cannot fast-forward without the
+        // rebase this tool does for itself.
+        let wt = Worktree::create(repo).await.unwrap();
+        let wt_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&wt.path)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        wt_git(&["config", "user.email", "t@t"]);
+        wt_git(&["config", "user.name", "t"]);
+        std::fs::write(wt.path.join("g.txt"), "keep\ncommitted by sub\n").unwrap();
+        wt_git(&["commit", "-qam", "sub commit"]);
+        // …and leftovers on top: one tracked edit, one untracked file.
+        std::fs::write(wt.path.join("f.txt"), "one\nTWO\nthree\n").unwrap();
+        std::fs::create_dir_all(wt.path.join("sub")).unwrap();
+        std::fs::write(wt.path.join("sub/new.txt"), "fresh\n").unwrap();
+        // The parent moves too, so a plain `merge --ff-only` would refuse.
+        std::fs::write(repo.join("h.txt"), "parent moved on\n").unwrap();
+        git(&["add", "h.txt"]);
+        git(&["commit", "-qm", "parent commit"]);
+        let kept = wt.keep();
+        register(1, &kept.path, &kept.branch);
+
+        let out = consume
+            .execute(serde_json::json!({"id": 1}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("Merged 1 commit"), "{out}");
+        assert!(out.contains("STAGED and not committed"), "{out}");
+        assert_eq!(
+            normalized("g.txt"),
+            "keep\ncommitted by sub\n",
+            "the sub-agent's committed work landed"
+        );
         assert_eq!(
             normalized("f.txt"),
             "one\nTWO\nthree\n",
-            "the uncommitted edit landed in the parent tree"
+            "its uncommitted edit landed too"
         );
+        assert_eq!(normalized("sub/new.txt"), "fresh\n", "and its new file");
         assert_eq!(
-            normalized("sub/new.txt"),
-            "fresh\n",
-            "the untracked file landed in the parent tree"
+            normalized("h.txt"),
+            "parent moved on\n",
+            "the parent's own commit survived the rebase"
         );
+        // Linear: the ff-merge means no merge commit was created.
+        let parents = String::from_utf8_lossy(&git(&["rev-list", "--merges", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        assert!(parents.is_empty(), "history stayed linear: {parents}");
         let staged = String::from_utf8_lossy(&git(&["diff", "--cached", "--name-only"]).stdout)
             .trim()
             .to_string();
         assert!(
             staged.contains("f.txt") && staged.contains("sub/new.txt"),
-            "everything applied is staged for review: {staged}"
+            "the leftovers are staged for review, not committed: {staged}"
         );
-        // Reset the parent tree for the cases below.
+        // The stash taken to clear the way for the rebase was dropped, not left
+        // behind holding a second copy of work the parent now has.
+        let stashes = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&kept.path)
+                .args(["stash", "list"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert!(stashes.is_empty(), "no stash left behind: {stashes}");
         git(&["reset", "-q", "--hard", "HEAD"]);
-        // `reset --hard` drops the staged copy; belt and braces if it lingers.
         let _ = std::fs::remove_file(repo.join("sub/new.txt"));
 
-        // (b) a clean worktree: refused, pointing at the branch.
+        // (b) Nothing to take: no commits ahead, clean worktree.
         let wt_clean = Worktree::create(repo).await.unwrap();
         let clean = wt_clean.keep();
-        ctx.background_tasks
-            .lock()
-            .unwrap()
-            .push(hrdr_tools::BackgroundTask {
-                id: 2,
-                delivered: true,
-                worktree: Some(clean.path.clone()),
-                branch: Some(clean.branch.clone()),
-                ..Default::default()
-            });
-        let err = apply
+        register(2, &clean.path, &clean.branch);
+        let out = consume
             .execute(serde_json::json!({"id": 2}), &ctx)
             .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("nothing uncommitted to apply")
-                && err.to_string().contains("merges via the branch"),
-            "a clean worktree is refused with the branch route: {err}"
-        );
+            .unwrap();
+        assert!(out.contains("Nothing to consume"), "{out}");
 
-        // (c) conflict: the sub-agent and the parent both changed the same line.
-        // The conflicting file is named and NOTHING is applied — the parent's own
-        // version survives untouched.
+        // (c) Conflict: the sub-agent and the parent changed the same line. The
+        // file is named, nothing lands, and the parent's version survives.
         let wt_conf = Worktree::create(repo).await.unwrap();
         std::fs::write(wt_conf.path.join("f.txt"), "one\nSUB\nthree\n").unwrap();
-        std::fs::write(wt_conf.path.join("g.txt"), "keep\nalso mine\n").unwrap();
+        std::fs::write(
+            wt_conf.path.join("g.txt"),
+            "keep\ncommitted by sub\nalso mine\n",
+        )
+        .unwrap();
         let conf = wt_conf.keep();
-        ctx.background_tasks
-            .lock()
-            .unwrap()
-            .push(hrdr_tools::BackgroundTask {
-                id: 3,
-                delivered: true,
-                worktree: Some(conf.path.clone()),
-                branch: Some(conf.branch.clone()),
-                ..Default::default()
-            });
+        register(3, &conf.path, &conf.branch);
         std::fs::write(repo.join("f.txt"), "one\nPARENT\nthree\n").unwrap();
         git(&["commit", "-qam", "parent edit"]);
-        let err = apply
+        let err = consume
             .execute(serde_json::json!({"id": 3}), &ctx)
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("f.txt") && err.to_string().contains("NOTHING was applied"),
-            "names the conflicting file and applies nothing: {err}"
+            err.to_string().contains("f.txt"),
+            "names the conflict: {err}"
         );
         assert_eq!(
             normalized("f.txt"),
@@ -6925,34 +6958,16 @@ mod tests {
         );
         assert_eq!(
             normalized("g.txt"),
-            "keep\n",
-            "the non-conflicting hunk of a refused apply is not applied either"
+            "keep\ncommitted by sub\n",
+            "the non-conflicting half of a refused consume is not applied either"
         );
 
-        // (d) an unknown id, and a read-only (worktree-less) task, both error clearly.
-        let err = apply
+        // (d) An unknown id errors clearly.
+        let err = consume
             .execute(serde_json::json!({"id": 999}), &ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no background task"), "{err}");
-        ctx.background_tasks
-            .lock()
-            .unwrap()
-            .push(hrdr_tools::BackgroundTask {
-                id: 4,
-                delivered: true,
-                worktree: None,
-                branch: None,
-                ..Default::default()
-            });
-        let err = apply
-            .execute(serde_json::json!({"id": 4}), &ctx)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("no worktree to apply from"),
-            "a read-only task explains there is nothing to apply: {err}"
-        );
     }
 
     /// The workspace map handed to a spawned sub-agent names the real
