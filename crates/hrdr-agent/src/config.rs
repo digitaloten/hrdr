@@ -65,7 +65,7 @@ pub const DEFAULT_MAX_READONLY_SUBAGENTS: usize = 5;
 pub const DEFAULT_MAX_WRITE_SUBAGENTS: usize = 2;
 
 /// Turns a completed TODO stays in the agent's list before it ages out.
-pub const DEFAULT_TODO_TTL: u64 = 5;
+pub const DEFAULT_TODO_TTL_TURNS: u64 = 5;
 
 /// Session-retention defaults (seconds): compress after a week idle, purge an
 /// auto-named session after a month idle. See `docs/session-retention.md`.
@@ -927,7 +927,7 @@ impl Default for AgentConfig {
             api_version: None,
             subagents: true,
             memory: true,
-            todo_ttl: DEFAULT_TODO_TTL,
+            todo_ttl: DEFAULT_TODO_TTL_TURNS,
             delegated: false,
             memory_dir: None,
             memory_roots: None,

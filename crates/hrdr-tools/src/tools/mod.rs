@@ -33,6 +33,28 @@ pub(crate) const READ_BUDGET_FACTOR: usize = 20;
 /// multi-gigabyte (or special/device) file would stall or OOM the process
 /// before a single line comes back. Generous enough for any real source file.
 pub(crate) const MAX_READ_BYTES: u64 = 50 * 1024 * 1024;
+/// **Naming for every duration constant in this workspace**, enforced by
+/// `hrdr-test-support`'s `duration_constants_name_their_unit` test rather than
+/// left to memory:
+///
+/// * A `Duration` constant carries **no unit suffix** — the type already says it
+///   — and ends in what it bounds: `_TIMEOUT`, `_INTERVAL`, `_TTL`, `_DEBOUNCE`,
+///   `_POLL`. (`HTTP_TIMEOUT`, `CALL_TIMEOUT`, `CACHE_TTL`.)
+/// * A **scalar** constant (`u64`/`usize`) must end in its unit: `_SECS`, `_MS`,
+///   or the non-time unit it counts (`_TURNS`, `_BYTES`, `_LINES`). A bare number
+///   whose unit lives only in a doc comment is how `100` meaning a tenth of a
+///   second becomes a minute and a half.
+/// * An optional leading `DEFAULT_` / `MAX_` / `MIN_` says which bound it is, and
+///   the scope comes next when the constant is exported (`DEFAULT_TOOL_…`,
+///   `DEFAULT_HOOK_…`); a module-private one takes the module as its scope
+///   (`NAV_TIMEOUT_SECS` in `lsp`).
+///
+/// Model- and config-facing durations are seconds, always, so a name ending
+/// `_MS` marks something deliberately sub-second: a debounce or a probe poll,
+/// never a timeout.
+///
+/// ---
+///
 /// How long **any** tool call gets before it is cut off, unless the model asks
 /// for more with `timeout_secs`. Enforced once, for every tool, in
 /// [`crate::ToolRegistry::execute`].

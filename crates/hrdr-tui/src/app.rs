@@ -2392,7 +2392,7 @@ mod tests {
     /// default (the aging logic itself is tested in `hrdr-app`).
     #[test]
     fn ttl_matches_config_default() {
-        assert_eq!(5, hrdr_app::DEFAULT_TODO_TTL);
+        assert_eq!(5, hrdr_app::DEFAULT_TODO_TTL_TURNS);
     }
 
     // ---- HitRect hit-test (transcript tool-block click targeting) ----

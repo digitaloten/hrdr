@@ -20,7 +20,7 @@ use hrdr_agent::parse_env_bool;
 
 /// Default lifetime (in turns) a completed TODO item stays visible before it's
 /// pruned: the turn it finishes plus four more.
-pub const DEFAULT_TODO_TTL: u64 = 5;
+pub const DEFAULT_TODO_TTL_TURNS: u64 = 5;
 
 /// Max text rows the input box auto-grows to (both frontends).
 pub const INPUT_MAX_ROWS: u16 = 5;
@@ -52,7 +52,7 @@ pub struct UiConfig {
     /// `true`.
     pub auto_resume: bool,
     /// How many turns a completed TODO item stays visible before it's pruned.
-    /// Default [`DEFAULT_TODO_TTL`].
+    /// Default [`DEFAULT_TODO_TTL_TURNS`].
     pub todo_ttl: u64,
     /// Show the model's `<think>` reasoning blocks. Default `true`. Toggled at
     /// runtime by `/thinking` (aka `/reasoning`).
@@ -72,7 +72,7 @@ impl Default for UiConfig {
             statusbar: None,
             bell: true,
             auto_resume: true,
-            todo_ttl: DEFAULT_TODO_TTL,
+            todo_ttl: DEFAULT_TODO_TTL_TURNS,
             show_thinking: true,
             scrollback: 500,
         }
@@ -349,7 +349,7 @@ mod tests {
         d.apply_file(UiFileConfig::default());
         assert!(!d.vim_mode);
         assert!(d.bell && d.auto_resume && d.show_thinking);
-        assert_eq!(d.todo_ttl, DEFAULT_TODO_TTL);
+        assert_eq!(d.todo_ttl, DEFAULT_TODO_TTL_TURNS);
     }
 
     #[test]

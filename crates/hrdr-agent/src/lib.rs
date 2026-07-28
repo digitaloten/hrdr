@@ -131,7 +131,7 @@ pub use config::{
     DEFAULT_MODEL_REF,
     DEFAULT_PRESERVE_RECENT_TOKENS,
     DEFAULT_TAIL_TURNS,
-    DEFAULT_TODO_TTL,
+    DEFAULT_TODO_TTL_TURNS,
     GuardrailConfig,
     HookConfig,
     LspFileConfig,

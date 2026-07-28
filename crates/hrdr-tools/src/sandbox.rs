@@ -582,8 +582,8 @@ fn userns_probe_succeeds(bwrap: &Path) -> bool {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    const TIMEOUT: Duration = Duration::from_millis(500);
-    const POLL: Duration = Duration::from_millis(50);
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+    const PROBE_POLL: Duration = Duration::from_millis(50);
 
     let Ok(mut child) = std::process::Command::new(bwrap)
         .args([
@@ -606,7 +606,7 @@ fn userns_probe_succeeds(bwrap: &Path) -> bool {
     else {
         return false;
     };
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status.success(),
@@ -618,7 +618,7 @@ fn userns_probe_succeeds(bwrap: &Path) -> bool {
             let _ = child.wait();
             return false;
         }
-        std::thread::sleep(POLL);
+        std::thread::sleep(PROBE_POLL);
     }
 }
 

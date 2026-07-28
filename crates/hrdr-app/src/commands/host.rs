@@ -215,7 +215,7 @@ pub trait CommandHost {
     }
     /// Turns a completed TODO stays visible before pruning.
     fn todo_ttl(&self) -> u64 {
-        crate::DEFAULT_TODO_TTL
+        crate::DEFAULT_TODO_TTL_TURNS
     }
     /// Apply a TODO lifetime (persistence is dispatch's job).
     fn set_todo_ttl(&mut self, turns: u64) {

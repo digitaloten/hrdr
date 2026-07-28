@@ -33,7 +33,7 @@ pub const DEFAULT_LSP_WAIT_SECS: u64 = 2;
 /// Deliberately still milliseconds while every *timeout* is seconds: this is a
 /// settle debounce, not a timeout. A whole second would triple the cost of every
 /// edit and zero would defeat the purpose, so seconds cannot express it.
-const SETTLE_MS: u64 = 300;
+const SETTLE_DEBOUNCE_MS: u64 = 300;
 
 /// Floor for a server's request timeout, so `wait_secs = 0` — a perfectly
 /// sensible "don't wait for diagnostics" — cannot also mean "give the server no
@@ -654,7 +654,8 @@ impl LspClient {
             let now = tokio::time::Instant::now();
             if let Some(list) = current {
                 if settle_until.is_none() {
-                    settle_until = Some((now + Duration::from_millis(SETTLE_MS)).min(deadline));
+                    settle_until =
+                        Some((now + Duration::from_millis(SETTLE_DEBOUNCE_MS)).min(deadline));
                 }
                 if now >= settle_until.unwrap() || !list.is_empty() {
                     return list;
