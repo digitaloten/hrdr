@@ -8,6 +8,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`task_cleanup` asks what is at risk, not what happened.** It refused any
+  branch with commits unreachable from HEAD — and a cherry-picked commit has a
+  new SHA, so it reads as unmerged forever. The refusal therefore fired on work
+  that was already in, and `force: true` became the routine answer, which also
+  silently waived the guard that matters: the one protecting uncommitted work.
+  Cleanup now tries three questions, cheapest first. Is the worktree's content
+  identical to the parent's HEAD (`git diff --quiet <head>` plus a check for
+  untracked files, both of which skip gitignored paths by construction)? Then
+  nothing there is unique, however it got there — including a **squash**, which
+  no patch comparison can match. Otherwise, does `git cherry` — patch ids, not
+  reachability — find commits genuinely missing? If so the refusal now names
+  them, subject and all, instead of printing a count, and says that a squash
+  legitimately reads this way so `force` is the right answer there.
+
 - **The sandbox no longer hides the GPU.** `bwrap --dev /dev` mounts a fresh,
   minimal devtmpfs — `null`, `zero`, `random`, `tty` and little else — so every
   accelerator on the host vanished inside the sandbox regardless of mode. A ROCm

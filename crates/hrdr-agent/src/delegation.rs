@@ -2657,6 +2657,95 @@ fn task_worktree(
     }
 }
 
+/// Whether `worktree` holds nothing the parent checkout does not already have.
+///
+/// Asks git the question directly instead of reasoning about the commit graph.
+/// `git diff <parent HEAD>` run inside the worktree compares its WORKING TREE —
+/// committed and uncommitted state together — against where the parent actually
+/// is; `ls-files --others --exclude-standard` catches new files, which `diff`
+/// never sees. Both skip gitignored paths by construction, so a worktree's own
+/// `target/` is never mistaken for unique work and there is no exclusion list to
+/// keep in step with the project.
+///
+/// True regardless of HOW the work arrived — merged, cherry-picked (a new SHA
+/// the graph calls unmerged forever), squashed (which no patch comparison can
+/// match), or written independently by the parent. That is the point: it is the
+/// only one of the cleanup guards that asks what is at risk rather than what
+/// happened.
+///
+/// Biased to `false`: an unreadable HEAD or any failed git call answers "not
+/// redundant", so a bad read can never be what removes a worktree.
+async fn worktree_matches_parent(repo: &std::path::Path, worktree: &std::path::Path) -> bool {
+    let Some(head) = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    // `--quiet` makes the exit status the answer: 0 = no differences.
+    let same_tracked = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["diff", "--quiet", &head])
+        .output()
+        .await
+        .is_ok_and(|o| o.status.success());
+    if !same_tracked {
+        return false;
+    }
+    tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .is_some_and(|s| s.trim().is_empty())
+}
+
+/// The commits on `branch` whose CHANGES are not in the parent's HEAD, as
+/// `"<sha> <subject>"` lines ready to print.
+///
+/// `git cherry` compares by patch id, not by reachability: a commit the parent
+/// cherry-picked gets a new SHA and is unreachable forever, but its patch is
+/// present, so it is reported with `-` and correctly counted as landed. Only the
+/// `+` lines are genuinely missing.
+///
+/// Empty on a failed call — the caller has already tried the content check by
+/// then, and refusing to clean up over a git error nobody can act on just sends
+/// the model to `force: true`, which is the habit this whole guard exists to
+/// break.
+async fn commits_missing_from_head(repo: &std::path::Path, branch: &str) -> Vec<String> {
+    tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        // `-v` appends each commit's subject, so the refusal can name what is
+        // missing instead of printing a count nobody can act on.
+        .args(["cherry", "-v", "HEAD", branch])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| l.strip_prefix("+ "))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The worktree's uncommitted paths (modified, staged, and untracked), from
 /// `git status --porcelain`. `None` when the status could not be read at all —
 /// callers treat that as "assume dirty", never as clean.
@@ -2807,13 +2896,20 @@ impl hrdr_tools::Tool for TaskCleanupTool {
         // silently. Read once: it decides the refusal below AND, under `force`,
         // the honest account of what got discarded.
         let dirty = worktree_dirty_files(&path).await;
+        // Ask the cheap, exact question first: does this worktree hold anything
+        // the parent does not already have? A yes settles BOTH guards below —
+        // uncommitted changes the parent also has are not work at risk, and
+        // neither are commits it already carries. It is also the only one of the
+        // three that does not care HOW the work arrived, which is what stopped
+        // `force: true` being the routine answer to a cherry-pick.
+        let redundant = !force && worktree_matches_parent(&ctx.cwd, &path).await;
         // Refuse while the working tree is dirty — uncommitted changes are
         // definitely NOT merged, so removing the worktree would lose them...
         // unless `force`, which is the caller saying exactly that. A `force` that
         // still refused just taught the model to `rm -rf` the worktree behind the
         // harness's back (which is what happened), losing the same work with no
         // record of it — so `force` now really forces, and reports the cost.
-        if !force && dirty.as_ref().is_none_or(|f| !f.is_empty()) {
+        if !force && !redundant && dirty.as_ref().is_none_or(|f| !f.is_empty()) {
             anyhow::bail!(
                 "worktree for task #{id} has uncommitted changes ({}) — bring them over with \
                  `task_consume {id}` (or commit them in the worktree) first, then clean up. Nothing \
@@ -2822,29 +2918,23 @@ impl hrdr_tools::Tool for TaskCleanupTool {
                 path.display()
             );
         }
-        // Guard against removing work that was never merged. Count the branch's
-        // commits not reachable from HEAD; if any, the branch looks unmerged, so
-        // refuse unless `force` (the parent brought them over via cherry-pick /
-        // squash, which leaves the originals unreachable). Biased to refuse: a
-        // failed count is treated as "unmerged" so nothing is deleted on a bad read.
-        if !force {
-            let unmerged = tokio::process::Command::new("git")
-                .arg("-C")
-                .arg(&ctx.cwd)
-                .args(["rev-list", "--count", &format!("HEAD..{branch}")])
-                .output()
-                .await
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "?".to_string());
-            if unmerged != "0" {
+        // Then the graph question, for the ordinary case the content check cannot
+        // answer: the parent merged this work and has since moved on, so the trees
+        // differ while nothing is at risk. Asked by PATCH (`git cherry`) rather
+        // than by reachability — a cherry-picked commit has a new SHA and is
+        // "unreachable" forever, which is what used to make this fire on work that
+        // was already in.
+        if !force && !redundant {
+            let missing = commits_missing_from_head(&ctx.cwd, &branch).await;
+            if !missing.is_empty() {
                 anyhow::bail!(
-                    "branch `{branch}` (task #{id}) has {unmerged} commit(s) not reachable from \
-                     your HEAD — it looks unmerged. Merge it first, or if you already brought the \
-                     work over (cherry-pick / squash) call task_cleanup again with force:true. \
-                     Nothing was removed."
+                    "branch `{branch}` (task #{id}) has {} commit(s) whose changes are not in your \
+                     HEAD:\n  {}\nBring them over with `task_consume {id}`. If you already did — a \
+                     SQUASH merge lands the changes under one new commit, which no patch \
+                     comparison can match — call task_cleanup again with force:true. Nothing was \
+                     removed.",
+                    missing.len(),
+                    missing.join("\n  "),
                 );
             }
         }

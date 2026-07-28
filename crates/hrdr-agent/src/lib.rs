@@ -6703,6 +6703,109 @@ mod tests {
             "the entry is pruned"
         );
 
+        // Case 1b — the work IS in the parent, but under a different SHA. This is
+        // the case that trained the model to reach for `force`: `rev-list
+        // HEAD..branch` counts a cherry-picked commit as unmerged forever, so the
+        // old guard refused a worktree holding nothing at risk, and forcing past
+        // it also silently waived the uncommitted-work guard.
+        let wt_cp = Worktree::create(repo).await.unwrap();
+        commit_in(&wt_cp.path, "work the parent will cherry-pick");
+        let cp = wt_cp.keep();
+        let cp_path = cp.path.clone();
+        // The parent must move independently first, or `cherry-pick` sees the
+        // commit's parent IS your HEAD and simply fast-forwards — same SHA, no
+        // divergence, and nothing for the old guard to be wrong about.
+        std::fs::write(repo.join("parent-only.txt"), "parent moved").unwrap();
+        git(&["add", "parent-only.txt"]);
+        git(&["commit", "-qm", "parent advances"]);
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["cherry-pick", &cp.branch])
+            .output()
+            .unwrap();
+        // Reachability still says unmerged — the SHA is new…
+        let unreachable = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["rev-list", "--count", &format!("HEAD..{}", cp.branch)])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(
+            unreachable, "1",
+            "the old reachability guard still calls this unmerged — which is the point"
+        );
+        // …and cleanup no longer asks for `force` anyway.
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 2,
+                delivered: true,
+                worktree: Some(cp.path.clone()),
+                branch: Some(cp.branch.clone()),
+                ..Default::default()
+            });
+        let msg = cleanup
+            .execute(serde_json::json!({"id": 2}), &ctx)
+            .await
+            .expect("cherry-picked work is in the parent — nothing is at risk");
+        assert!(msg.contains("Cleaned up"), "{msg}");
+        assert!(!cp_path.exists(), "the worktree is removed without force");
+
+        // Case 1c — SQUASHED into the parent. Two commits land as one new commit,
+        // so no patch id matches and `git cherry` reports both as missing — this
+        // is the case only the content check can answer, and the reason it runs
+        // first rather than being folded into the graph question.
+        let wt_sq = Worktree::create(repo).await.unwrap();
+        std::fs::write(wt_sq.path.join("sq.txt"), "first").unwrap();
+        commit_in(&wt_sq.path, "squash part one");
+        std::fs::write(wt_sq.path.join("sq.txt"), "second").unwrap();
+        commit_in(&wt_sq.path, "squash part two");
+        let sq = wt_sq.keep();
+        let sq_path = sq.path.clone();
+        git(&["merge", "--squash", &sq.branch]);
+        git(&["commit", "-qm", "squashed the task"]);
+        // Patch comparison genuinely cannot see this: both commits still read as
+        // missing.
+        let still_missing = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["cherry", "HEAD", &sq.branch])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .lines()
+        .filter(|l| l.starts_with('+'))
+        .count();
+        assert_eq!(
+            still_missing, 2,
+            "a squash defeats patch-id, by construction"
+        );
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 4,
+                delivered: true,
+                worktree: Some(sq.path.clone()),
+                branch: Some(sq.branch.clone()),
+                ..Default::default()
+            });
+        let msg = cleanup
+            .execute(serde_json::json!({"id": 4}), &ctx)
+            .await
+            .expect("the squashed content is in the parent — nothing is at risk");
+        assert!(msg.contains("Cleaned up"), "{msg}");
+        assert!(!sq_path.exists(), "the worktree is removed without force");
+
         // Case 2 — committed but NOT merged → refuse; `force:true` overrides.
         let wt_um = Worktree::create(repo).await.unwrap();
         commit_in(&wt_um.path, "unmerged work");
@@ -6723,8 +6826,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("not reachable"),
-            "refuses an unmerged branch: {err}"
+            err.to_string().contains("not in your HEAD")
+                && err.to_string().contains("unmerged work"),
+            "refuses an unmerged branch and NAMES the commit: {err}"
         );
         assert!(um_path.exists(), "the unmerged worktree is kept");
         let msg = cleanup
