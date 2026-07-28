@@ -32,14 +32,40 @@ Depth: $ARGUMENTS (default `low` — report only high-confidence findings; `high
      unwrap/expect in library code.
    - Concurrency: data races, deadlocks, incorrect `Send`/`Sync` impls, async
      cancellation unsafety, lock order inversions.
-3. Verify every candidate finding before reporting it: re-read the surrounding
-   code and the callers, and construct the concrete input or state that triggers
-   the failure. Drop anything you can't back with a specific failure scenario.
+3. Verify every candidate finding by EXECUTING it in your head against the real
+   code, not by describing it. A security finding is a claim that some input
+   REACHES some line — trace it, or you have not made the claim:
+   - Follow your concrete attacker-controlled input line by line from the entry
+     point to the line you claim is dangerous. Name what every validation,
+     parse, split and branch in between does to it. Most false findings die
+     here, at a step the narrative skipped.
+   - Where the input is a string, actually apply the string operations. If the
+     code does `strip_prefix` then `split('-').next()` then `parse()`, work out
+     what your crafted value yields at each step — the answer is often "the
+     parse fails and the dangerous line is never reached".
+   - Re-read every line you are about to cite, and quote from that read. Do not
+     cite a symbol you found in one file as if it were in another; when you
+     contrast a weak check against a stronger sibling, open both and give each
+     its own `file:line`.
+   - If a guard, type, or caller makes the path unreachable today, it is not a
+     vulnerability. Say so in the hardening notes instead of promoting it.
+   - Severity follows the traced impact, not the scariness of the function name.
+     A call that cannot be reached is not critical; a `kill`, `exec` or `unsafe`
+     that a guard already covers is not a finding at all.
 4. Write the report ranked most-severe first. Each finding: severity
    (critical/high/medium/low), `file:line`, a one-sentence statement of the
-   vulnerability or defect, and the concrete failure/exploit scenario. End with
-   a one-paragraph summary: total findings by severity, overall risk, and the
-   top 1-3 things to fix first.
+   vulnerability or defect, and the traced failure/exploit scenario. Then add:
+   - **Cleared** — what you suspected and disproved, one line each with why it
+     is safe. The expensive half of an audit, and it stops the next auditor
+     re-treading it.
+   - **Hardening** (if any) — correct today but fragile; explicitly not
+     vulnerabilities.
+   - **Coverage** — which entry points and classes you actually walked, and
+     which you did not, with the reason. "Audited everything" is almost never
+     true; saying where you stopped is what lets the user judge the report.
+
+   End with a one-paragraph summary: total findings by severity, overall risk,
+   and the top 1-3 things to fix first.
 5. Route the report by where you're working:
    - **Inside a git repo with a `docs/` directory** → write the full report to
      `docs/security-review.md`.

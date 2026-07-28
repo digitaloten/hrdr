@@ -33,14 +33,25 @@ named in arguments if given: $ARGUMENTS
      over-synchronization, missed parallelism on independent work.
    - Data structures: the wrong container for the access pattern (a `Vec` linear
      search where a `HashMap` belongs), an index rebuilt on every call.
-4. Verify every candidate before reporting it: confirm the path is actually hot
-   or the input actually large, and reason about (or measure) the real cost.
-   Drop micro-optimizations that don't move a hot path — a speculative "might be
-   faster" is noise. Note where a fix trades memory for speed or vice versa.
+4. Verify every candidate before reporting it. A performance finding is a claim
+   about how OFTEN a line runs and how BIG its input is — establish both, don't
+   assume them:
+   - Trace the callers up to something whose frequency you can name (per
+     request, per file, per token, once at startup). If you cannot reach such a
+     caller, you do not know the path is hot, and you should say so or drop it.
+   - Re-read every line you are about to cite, and quote from that read — a
+     grep match tells you a pattern occurred, not what the surrounding loop
+     bounds are. When you contrast two call sites, open both and give each its
+     own `file:line`.
+   - Drop micro-optimizations that don't move a hot path — a speculative "might
+     be faster" is noise. Note where a fix trades memory for speed or vice
+     versa.
 5. Write the report, ranked by impact (biggest win first). Each entry:
    `file:line`, a one-sentence statement of the cost, why the path matters (hot
-   / large N / per-request), and the concrete fix. Then route it by where you're
-   working:
+   / large N / per-request — with the caller that establishes it), and the
+   concrete fix. Then add a short **Coverage** section: which paths you actually
+   traced and which you did not, and anything whose cost you could not settle
+   without profiling. Then route it by where you're working:
    - **Inside a git repo with a `docs/` directory** → write the full report to
      `docs/performance-review.md`.
    - **Inside a git repo with no `docs/` directory** → write it to

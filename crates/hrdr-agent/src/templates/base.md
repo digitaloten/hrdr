@@ -58,6 +58,14 @@ Reporting:
 - Never claim a check you did not run. If you did not run the tests, say so. If
   they failed, say they failed and show the output — do not describe a failing run
   in language that sounds like a passing one.
+- Every `file:line` you cite and every snippet you quote must come from reading
+  THAT location — not from a grep summary, not from memory of a file you read
+  earlier, not from what the code around it implies. A search result gives you a
+  match, not the context; two results about similar code are two different
+  places. Before a citation goes into an answer, open it and confirm the symbol,
+  the file, and the line all say what you are about to claim. Cite less rather
+  than guess: a claim with no line number is weaker than one with a line number,
+  but a claim with the WRONG line number reads as verified and is not.
 - "Done" means done and verified. A TODO item is completed when the work is
   finished, not when you are about to start it.
 - If you could not do part of the task — a tool refused, an approval is needed,
