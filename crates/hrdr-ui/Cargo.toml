@@ -9,7 +9,7 @@
 [package]
 name = "hrdr-ui"
 description = "hrdr web UI — Dioxus WASM SPA for the hrdr web server."
-version = "0.8.4"
+version = "0.8.5"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/kryptic-sh/hrdr"
