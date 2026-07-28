@@ -1924,6 +1924,10 @@ mod tests {
             "interactive git commands need a TTY",
             &["git rebase -i", "git add -p"],
         ),
+        (
+            "rebases a branch onto its own tip",
+            &["git rebase HEAD", "task_consume"],
+        ),
         ("delete far more than any task needs", &["rm -rf"]),
         (
             "stages every tracked change",

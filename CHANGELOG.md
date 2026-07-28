@@ -20,6 +20,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Hand-rolling a sub-agent merge is now refused, not just discouraged.** Two
+  guardrails, because two different things are wrong. `git rebase HEAD` rebases
+  a branch onto its own tip — a no-op wherever it runs, and with `-C <dir>` the
+  HEAD it reads is that directory's rather than yours, which is how the recipe
+  silently does nothing. And a `git rebase` aimed at a path that is one of this
+  session's task worktrees is refused by task id, pointing at
+  `task_consume <id>`. The second cannot be a pattern: the worktrees are session
+  state, and `git -C <your checkout> rebase origin/main` is ordinary work that
+  looks identical — only the path tells them apart, which is why the check reads
+  it. Real targets (`HEAD~2`, `HEAD^`, `--onto HEAD`, a branch, or
+  `$(git rev-parse HEAD)` evaluated in the checkout you mean) are untouched.
+
 - **`task_consume` replaces `task_apply` and brings a finished task's WHOLE
   result over in one call.** Its commits are rebased onto your HEAD and
   fast-forwarded in; anything it left uncommitted is applied and staged. Two

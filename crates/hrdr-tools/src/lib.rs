@@ -33,7 +33,10 @@ mod test_nudge;
 mod tools;
 mod web;
 
-pub use guardrails::{Guardrail, check_guardrails, default_guardrails};
+pub use guardrails::{
+    Guardrail, check_guardrails, default_guardrails, rebase_against_task_worktree,
+    task_worktree_rebase_message,
+};
 pub use hooks::{
     DEFAULT_HOOK_TIMEOUT_SECS, EventHook, Hook, HookEvent, HookOutcome, run_event_hooks,
     run_file_hooks,

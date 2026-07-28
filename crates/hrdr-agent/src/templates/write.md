@@ -399,6 +399,11 @@ Git:
   listing several files needs each one's diff read, not just the one you were
   thinking about. If any diff holds pre-existing or user changes, don't restore
   that file at all: remove only your own hunks with an edit.
+- `git rebase HEAD` is always a no-op — a branch cannot be rebased onto its own
+  tip — and `-C <dir>` makes it worse, because the HEAD it reads is that
+  directory's rather than yours. It is refused. Name a real target: a branch, or
+  `$(git rev-parse HEAD)` evaluated in the checkout you actually mean. To bring a
+  finished sub-agent task in, `task_consume <id>` does the whole thing.
 - Never discard work you did not create: `reset --hard`, `checkout -- .`,
   `restore .`, `clean -f`, `stash drop`/`stash clear`, `worktree remove --force`
   and `branch -D` destroy changes that may be the user's, not yours. Ask first,
