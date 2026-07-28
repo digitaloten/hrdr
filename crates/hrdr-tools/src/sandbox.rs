@@ -739,11 +739,75 @@ fn detect_backend_uncached() -> Detection {
 /// are all but unheard of on a developer's box outside a sandbox, whereas a
 /// bare "Permission denied" is a normal error this must not editorialize over.
 /// `None` when unconfined, or when nothing in the output matches.
+/// The GPU/compute device nodes present on this host, for the sandbox to bind
+/// through.
+///
+/// `bwrap --dev /dev` mounts a *fresh, minimal* devtmpfs — `null`, `zero`,
+/// `random`, `tty` and little else — so every accelerator on the machine
+/// disappears inside the sandbox no matter how permissive the mode is. That is
+/// not a policy anyone chose: `Write` and `Read` both mount all of `/` and are
+/// meant to leave the host as visible as it really is. Without this a ROCm build
+/// fails on `/dev/kfd`, a CUDA one on `/dev/nvidiactl`, and the error names a
+/// missing device rather than a sandbox — which reads as "this machine has no
+/// GPU" and sends the agent off to work around a problem it does not have.
+///
+/// Matched by name rather than a fixed list because the numbered nodes
+/// (`nvidia0`, `nvidia1`, …) depend on how many cards are installed. Read live:
+/// a readdir of `/dev` costs microseconds, and a cached answer that missed a
+/// device after a driver reload would be a worse bug than the cost it saved.
+#[cfg(target_os = "linux")]
+pub(crate) fn gpu_device_nodes() -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir("/dev") else {
+        return Vec::new();
+    };
+    let mut out: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            // `kfd` is AMD's compute node; `dri` the render/card directory every
+            // vendor uses; `nvidia*` covers `nvidiactl`, `nvidia-uvm`,
+            // `nvidia-caps` and the per-card numbers.
+            name == "kfd" || name == "dri" || name.starts_with("nvidia")
+        })
+        .map(|e| e.path())
+        .collect();
+    // Stable order so the argv a test asserts on does not depend on readdir.
+    out.sort();
+    out
+}
+
 pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<String> {
     if policy.mode == SandboxMode::None {
         return None;
     }
     let lower = output.to_ascii_lowercase();
+    // A GPU node missing under `strict` — the one mode that deliberately does not
+    // bind them. Checked before the write case because the failure reads nothing
+    // like a write refusal: HIP/CUDA report a missing device or "no agents
+    // found", which is indistinguishable from a machine that genuinely has no
+    // card, and an agent that believes that goes off to work around it.
+    if policy.mode == SandboxMode::Strict
+        && [
+            "/dev/kfd",
+            "/dev/nvidia",
+            "/dev/dri",
+            "hsa_status",
+            "no rocm",
+            "no cuda",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return Some(
+            "\n\n[sandbox] `strict` mode does not bind GPU devices (`/dev/kfd`, `/dev/dri`, \
+             `/dev/nvidia*`), so a card that exists on this host is invisible in here. This is \
+             not a machine without a GPU and not a broken driver — it is the confinement this \
+             mode asks for. `write` and `read` mode both pass the devices through; if this work \
+             needs the GPU, say so rather than reporting the hardware as absent."
+                .to_string(),
+        );
+    }
     if !lower.contains("read-only file system") && !lower.contains("erofs") {
         return None;
     }
@@ -928,6 +992,12 @@ fn install_landlock_rules(writable_roots: &[PathBuf]) -> std::io::Result<()> {
         .map_err(std::io::Error::other)?
         .add_rules(path_beneath_rules(["/dev/null"], access_rw))
         .map_err(std::io::Error::other)?
+        // Same reasoning as the bwrap `--dev-bind` above, for the fallback
+        // backend: a GPU node is opened read-write to submit work at all, so
+        // read access alone leaves it unusable. Landlock has no `/dev` remount
+        // to undo — the nodes are visible — but the ruleset would deny the open.
+        .add_rules(path_beneath_rules(gpu_device_nodes(), access_rw))
+        .map_err(std::io::Error::other)?
         // Codex calls this `set_no_new_privs`, deprecated since its pin.
         .no_new_privs(true);
 
@@ -982,6 +1052,15 @@ fn bwrap_args(
                 &mut args,
                 &["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"],
             );
+            // The accelerators `--dev` just hid, put back. `--dev-bind` rather
+            // than `--ro-bind`: these are opened read-write even to submit work,
+            // so a read-only bind is the same as not having them. This is not a
+            // writable *root* — no file of the user's is reachable through a
+            // GPU character device — so it stands in `Read` mode too, which
+            // otherwise has no `--bind` at all.
+            for dev in gpu_device_nodes() {
+                bind(&mut args, "--dev-bind", &dev);
+            }
             // …then punch the writable roots through, in policy order. `Read`
             // has none — that is exactly what makes it read-only — so the loop
             // is a no-op there and the whole filesystem stays read-only. Same
@@ -1645,23 +1724,44 @@ mod tests {
             "/dev",
             "--proc",
             "/proc",
-            "--bind",
-            &one.display().to_string(),
-            &one.display().to_string(),
-            "--bind",
-            &two.display().to_string(),
-            &two.display().to_string(),
-            "--unshare-user",
-            "--unshare-pid",
-            "--chdir",
-            &chdir,
-            "--",
-            "bash",
-            "-c",
-            "echo hi",
         ]
         .iter()
         .map(|a| a.to_string())
+        // The GPU binds are derived, not hardcoded: which nodes exist is a
+        // property of the host, so a literal list would pass on this machine and
+        // fail on a runner with no card (or a second one). Their POSITION is
+        // still pinned — after the `/dev` remount they undo, before the writable
+        // roots — which is the part that has to be right.
+        .chain(
+            gpu_device_nodes()
+                .iter()
+                .flat_map(|d| {
+                    let p = d.display().to_string();
+                    ["--dev-bind".to_string(), p.clone(), p]
+                })
+                .collect::<Vec<_>>(),
+        )
+        .chain(
+            [
+                "--bind",
+                &one.display().to_string(),
+                &one.display().to_string(),
+                "--bind",
+                &two.display().to_string(),
+                &two.display().to_string(),
+                "--unshare-user",
+                "--unshare-pid",
+                "--chdir",
+                &chdir,
+                "--",
+                "bash",
+                "-c",
+                "echo hi",
+            ]
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>(),
+        )
         .collect();
         assert_eq!(args, expected);
 
@@ -1712,6 +1812,83 @@ mod tests {
         // No private /tmp either: that is strict mode's isolation, and mounting
         // a tmpfs here would hide a real /tmp the tools legitimately read.
         assert!(!args.iter().any(|a| a == "--tmpfs"), "{args:?}");
+    }
+
+    /// `--dev` mounts a fresh minimal devtmpfs, which silently deletes every
+    /// accelerator on the host from the sandbox's view. `Write` and `Read` both
+    /// mount all of `/` and are meant to show the machine as it is, so the GPU
+    /// nodes are bound back through — and with `--dev-bind`, because a compute
+    /// device is opened read-write to submit work at all, making a read-only
+    /// bind identical to not having it.
+    ///
+    /// Skipped when the host has no GPU: there is nothing to assert about a
+    /// machine with no such device, and asserting the *absence* would pass for
+    /// the wrong reason on every CI runner.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bwrap_binds_gpu_devices_back_through_the_fresh_dev_mount() {
+        let devices = gpu_device_nodes();
+        if devices.is_empty() {
+            return; // no GPU on this host — nothing this test can observe
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [SandboxMode::Write, SandboxMode::Read] {
+            let policy = SandboxPolicy::for_agent(mode, dir.path(), &[]);
+            let args = argv(&bwrap_args(
+                mode,
+                &policy,
+                dir.path(),
+                crate::Shell::Bash,
+                "rocminfo",
+            ));
+            // `--dev /dev` is still there — this adds to it rather than
+            // replacing it, so `/dev/null` and friends keep working.
+            assert!(args.windows(2).any(|w| w == ["--dev", "/dev"]), "{args:?}");
+            for dev in &devices {
+                let d = dev.to_string_lossy().to_string();
+                let bound = args
+                    .windows(3)
+                    .any(|w| w[0] == "--dev-bind" && w[1] == d && w[2] == d);
+                assert!(bound, "{mode:?} must bind {d} back through: {args:?}");
+            }
+        }
+        // Strict is the deliberate exception: it confines by leaving things out,
+        // and `sandbox_denial_note` explains the absence rather than the mount
+        // set quietly papering over it.
+        let policy = SandboxPolicy::for_agent(SandboxMode::Strict, dir.path(), &[]);
+        let args = argv(&bwrap_args(
+            SandboxMode::Strict,
+            &policy,
+            dir.path(),
+            crate::Shell::Bash,
+            "rocminfo",
+        ));
+        assert!(
+            !args.iter().any(|a| a == "--dev-bind"),
+            "strict binds no devices: {args:?}"
+        );
+    }
+
+    /// A GPU failure under `strict` reads exactly like a machine with no GPU —
+    /// HIP says the device is missing, not that a sandbox hid it — so the note
+    /// has to name the cause. Under the modes that DO bind the devices there is
+    /// nothing to explain, and saying it anyway would be wrong.
+    #[test]
+    fn a_missing_gpu_under_strict_is_explained_as_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let strict = SandboxPolicy::for_agent(SandboxMode::Strict, dir.path(), &[]);
+        let note = sandbox_denial_note(&strict, "hipErrorNoDevice: failed to open /dev/kfd")
+            .expect("strict must explain a hidden GPU");
+        assert!(note.contains("does not bind GPU devices"), "{note}");
+        assert!(note.contains("not a machine without a GPU"), "{note}");
+
+        for mode in [SandboxMode::Write, SandboxMode::Read] {
+            let policy = SandboxPolicy::for_agent(mode, dir.path(), &[]);
+            assert!(
+                sandbox_denial_note(&policy, "failed to open /dev/kfd").is_none(),
+                "{mode:?} binds the devices — a failure there is not the sandbox"
+            );
+        }
     }
 
     /// Linux-only: the Strict profile's mount set is built from what the *host*

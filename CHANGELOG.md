@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The sandbox no longer hides the GPU.** `bwrap --dev /dev` mounts a fresh,
+  minimal devtmpfs — `null`, `zero`, `random`, `tty` and little else — so every
+  accelerator on the host vanished inside the sandbox regardless of mode. A ROCm
+  build failed on `/dev/kfd`, a CUDA one on `/dev/nvidiactl`, and the error
+  named a missing device rather than a sandbox, which reads as "this machine has
+  no GPU" and sends the agent off to work around a problem it does not have.
+  `write` and `read` mode now bind `/dev/kfd`, `/dev/dri` and `/dev/nvidia*`
+  back through with `--dev-bind` when the host has them — read-write, because a
+  compute device is opened read-write to submit work at all, so a read-only bind
+  is the same as not having it. Nothing about this makes a file of the user's
+  reachable, which is why it stands in `read` mode too. The Landlock fallback
+  gained the matching rule; the nodes are visible there but the ruleset would
+  have denied the open. `strict` still leaves them out — confining by omission
+  is what that mode is — and a GPU failure under it is now annotated saying so,
+  rather than looking like absent hardware.
+
 - **A timed-out command no longer reports success.** `shell` returned `ok` for a
   run it had just killed, with the words "timed out" buried in the body — and
   the flag is what gets skimmed. A session set `timeout_secs: 30` on a
