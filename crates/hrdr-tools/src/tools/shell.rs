@@ -945,12 +945,19 @@ mod tests {
     /// what keeps the tokens from being spent at all — the strip is the backstop
     /// for tools that colour regardless. Under `keep_ansi` the child is left alone,
     /// or a caller testing its own colour output would find it disabled.
+    ///
+    /// Asserted against the *ambient* values, never against empty ones: what hrdr
+    /// owns is whether it overrides these, not what the surrounding environment
+    /// holds. CI sets `CARGO_TERM_COLOR=always` for its own logs, so a test
+    /// demanding an unset variable passes on a clean laptop and fails there.
     #[cfg(unix)]
     #[tokio::test]
     async fn the_child_is_told_not_to_colour_unless_escapes_were_asked_for() {
         let ctx = ToolContext::new(std::path::PathBuf::from("."));
         let cmd = "echo \"NO_COLOR=[$NO_COLOR] CARGO_TERM_COLOR=[$CARGO_TERM_COLOR]\"";
+        let ambient = |k: &str| std::env::var(k).unwrap_or_default();
 
+        // Default: hrdr's values win, whatever the environment said.
         let out = ShellTool::new(Shell::Bash)
             .execute(json!({"command": cmd}), &ctx)
             .await
@@ -958,12 +965,23 @@ mod tests {
         assert!(out.contains("NO_COLOR=[1]"), "{out}");
         assert!(out.contains("CARGO_TERM_COLOR=[never]"), "{out}");
 
+        // `keep_ansi`: hrdr sets nothing, so the child sees exactly what this
+        // process sees — which is the property, and it holds on any machine.
         let out = ShellTool::new(Shell::Bash)
             .execute(json!({"command": cmd, "keep_ansi": true}), &ctx)
             .await
             .unwrap();
-        assert!(out.contains("NO_COLOR=[]"), "{out}");
-        assert!(out.contains("CARGO_TERM_COLOR=[]"), "{out}");
+        assert!(
+            out.contains(&format!("NO_COLOR=[{}]", ambient("NO_COLOR"))),
+            "NO_COLOR passed through unchanged: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "CARGO_TERM_COLOR=[{}]",
+                ambient("CARGO_TERM_COLOR")
+            )),
+            "CARGO_TERM_COLOR passed through unchanged: {out}"
+        );
     }
 
     /// The point of the whole `proc` module: a timeout must kill the entire
