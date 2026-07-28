@@ -54,6 +54,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The `/model` picker offers every provider you are signed in to, not just
+  every provider with an API key.** Built-ins were gated on an API key
+  resolving, and a ChatGPT subscription login stores OAuth credentials and no
+  key — so a machine signed in to ChatGPT was offered no `openai` rows unless
+  ChatGPT was already the provider in use, which is added regardless. That is
+  what made the selector look like it only knew about the current provider. The
+  gate is now `provider_auth_state`, the function that already answers "is this
+  provider set up": a key, a subscription login, or keyless (`local`) all count.
+
 - **A fresh install now lists a provider's models in `/model`.** The models.dev
   catalog was only ever written to disk as a _side effect_ of needing one
   model's context window, and that path short-circuits: `probe_context_window`

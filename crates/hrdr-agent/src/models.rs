@@ -10,8 +10,7 @@ use anyhow::{Result, anyhow};
 use serde_json::Value;
 
 use crate::{
-    AgentConfig, BUILTIN_PROVIDERS, ModelRef, ProviderName, builtin_provider, resolve_api_key,
-    write_atomic,
+    AgentConfig, BUILTIN_PROVIDERS, ModelRef, ProviderName, builtin_provider, write_atomic,
 };
 
 /// One pickable model in the selector: the ids to switch to plus the friendly
@@ -78,11 +77,16 @@ fn configured_providers(config: &AgentConfig, active: Option<&str>) -> Vec<Confi
     for (name, c) in &config.providers {
         push(name.clone(), c.model.clone());
     }
-    // Built-in presets the user has a resolvable key for, plus `local` —
-    // keyless by design (a self-hosted endpoint), so it's always offered.
+    // Every built-in the machine is actually set up for. "Set up" is
+    // [`provider_auth_state`], not "has an API key": a subscription login stores
+    // OAuth credentials and no key at all, so gating on a key hid ChatGPT from
+    // the picker for exactly the users who had signed in to it — unless it
+    // happened to be the active provider, which is pushed unconditionally below.
+    // That is what made the selector look like it only knew the current provider.
+    // `Keyless` keeps `local` (a self-hosted endpoint needs no credential).
     for name in BUILTIN_PROVIDERS {
         if let Some(p) = builtin_provider(name)
-            && (*name == "local" || resolve_api_key(name, &p, None, None).is_some())
+            && crate::provider_auth_state(name, &p, None, None) != crate::ProviderAuthState::Missing
         {
             push((*name).to_string(), p.model);
         }
