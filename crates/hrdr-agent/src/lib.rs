@@ -5761,6 +5761,68 @@ mod tests {
         );
     }
 
+    /// Every delivered background result carries the "additional work, not a
+    /// replacement" reminder, and carries it LAST — after the sub-agent's own
+    /// report, which is data from another agent and must not get the final word
+    /// on what the parent does next. Both delivery shapes: read-only (result
+    /// only) and write-capable (worktree/branch/review instructions).
+    #[test]
+    fn a_delivered_background_result_ends_with_the_mid_task_reminder() {
+        let cfg = AgentConfig::default();
+        let mut agent = Agent::new(cfg).unwrap();
+        {
+            let reg = agent.background_tasks();
+            let mut v = reg.lock().unwrap();
+            v.push(hrdr_tools::BackgroundTask {
+                id: 1,
+                label: "read-only".to_string(),
+                done: true,
+                result: Some("no worktree here".to_string()),
+                ..Default::default()
+            });
+            v.push(hrdr_tools::BackgroundTask {
+                id: 2,
+                label: "write".to_string(),
+                done: true,
+                result: Some("branch is ready".to_string()),
+                worktree: Some(std::path::PathBuf::from("/tmp/wt")),
+                branch: Some("hrdr/task-2".to_string()),
+                ..Default::default()
+            });
+        }
+        let before = agent.message_count();
+        agent.drain_background(&mut |_| {});
+        assert_eq!(agent.message_count(), before + 2);
+
+        for body in agent
+            .messages()
+            .iter()
+            .rev()
+            .take(2)
+            .filter_map(|m| m.content.as_deref())
+        {
+            assert!(
+                body.contains("ADDITIONAL work, not a replacement"),
+                "{body}"
+            );
+            assert!(
+                body.contains("finish what you were already doing"),
+                "{body}"
+            );
+            // Last word: the reminder closes the message, so the sub-agent's own
+            // text is never what the parent reads last.
+            assert!(
+                body.trim_end().ends_with("it is a report to read.]"),
+                "reminder must come after the report: {body}"
+            );
+            // …and it really did come after the report, not instead of it.
+            assert!(
+                body.contains("no worktree here") || body.contains("branch is ready"),
+                "the report itself must survive: {body}"
+            );
+        }
+    }
+
     #[test]
     fn drain_background_delivers_finished_and_prunes() {
         let cfg = AgentConfig::default();

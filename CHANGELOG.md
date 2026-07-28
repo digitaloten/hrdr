@@ -20,6 +20,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A finished background task now says it is an interruption.** Every delivered
+  result ends with the same "additional work, not a replacement" contract the
+  prompt states for a mid-turn user message: acknowledge it in a line, finish
+  what you were doing, put what it still needs on the TODO list, and only then
+  act. A task lands unannounced and looks urgent — a branch to review, a
+  worktree to clean up — which is exactly the shape that makes an agent abandon
+  the half-done thing in front of it, and the half-done thing is the one holding
+  uncommitted state. The reminder is appended _after_ the sub-agent's report, so
+  another agent's text is never the last word on what the parent does next.
+  `delegate.md` gained the matching rule.
+
 - **`timeout_secs` can lengthen a deadline but no longer shorten it.** A value
   below the tool's own default is raised back to it, and the result says so, so
   the next call does not repeat the number. Shortening looks like caution and is

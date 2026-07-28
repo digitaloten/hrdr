@@ -6,6 +6,15 @@ Delegating with `task`:
   kept and why it is better handled directly (for example: independent integration,
   review, a tiny fix, or work that would conflict with their files). Do this when
   the split is made, not only in the final summary, so ownership is visible.
+- A FINISHED TASK IS AN INTERRUPTION, and the same rule covers it as a mid-task
+  message from the user: it is additional work, not a replacement. Its result
+  lands unannounced, in the middle of whatever you were doing, and it arrives
+  looking urgent — a branch to review, a worktree to clean up, a report full of
+  findings. Acknowledge it in a line, finish what you were already doing, put
+  what it still needs on your TODO list, and only then turn to it. The work you
+  abandon mid-way is the work holding uncommitted state, and it is the reason a
+  batch comes back with two chunks merged and the third left in a worktree
+  nobody returns to.
 - Never work a chunk you have delegated. The moment a task owns a piece of work it
   is the sub-agent's — implementing the same change yourself while it runs produces
   two independent versions of one fix that collide at integration: a duplicated
