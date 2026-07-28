@@ -12111,7 +12111,7 @@ mod tests {
         /// the durable transcript is complete regardless of which drove the turn.
         #[tokio::test]
         async fn a_steered_turn_persists_to_the_durable_transcript() {
-            use super::super::{AgentRegistry, PromptDelivery};
+            use super::super::AgentRegistry;
             use hrdr_tools::Tool;
             let server = MockServer::start(vec![
                 // Delegated run: one text turn, then stop.
@@ -12179,7 +12179,7 @@ mod tests {
                     let _ = tx.send(());
                 }
             });
-            assert_eq!(delivery, Some(PromptDelivery::StartedTurn));
+            assert!(delivery.is_some_and(|d| d.started_turn()));
             rx.await.expect("the steered turn runs to completion");
 
             // The jsonl now carries the steered turn AFTER the delegated run's End

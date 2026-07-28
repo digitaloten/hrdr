@@ -694,12 +694,23 @@ fn open_tool<'a>(transcript: &'a mut [Entry], id: &str) -> Option<&'a mut Entry>
 /// owns the wall-clock, so this only marks it closed (`took_ms: Some(0)` would
 /// lie); a frontend that tracks timing overwrites it.
 fn finish_reasoning(transcript: &mut [Entry]) {
-    if let Some(EntryKind::Reasoning {
+    let Some(entry) = transcript.last_mut() else {
+        return;
+    };
+    // How long the block was open, from its own timestamp. The reducer stamps this
+    // because the reducer is what closes the block: every agent's thinking time is
+    // then measured the same way, wherever its events were folded. It used to be a
+    // `0` placeholder that the TUI overwrote afterwards with a real elapsed — which
+    // only worked for the agent whose events that frontend happened to fold, so a
+    // delegated agent's reasoning block always read as instant.
+    let opened_at = entry.time;
+    if let EntryKind::Reasoning {
         took_ms: took @ None,
         ..
-    }) = transcript.last_mut().map(|e| &mut e.kind)
+    } = &mut entry.kind
     {
-        *took = Some(0);
+        let ms = (chrono::Local::now() - opened_at).num_milliseconds();
+        *took = Some(ms.max(0) as u64);
     }
 }
 

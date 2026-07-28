@@ -394,38 +394,69 @@ impl WebSession {
     pub(crate) fn submit_sync(&mut self, pane_id: PaneId, text: String) {
         let key = pane_id.key();
 
-        // Same expansion either way; only the main agent's own read-state is
-        // updated for `@file` inlines, since a sub-agent pane's message is
-        // delivered to that sub-agent, not to this handle.
-        let sent = if key == MAIN_KEY {
-            hrdr_app::prepare_outgoing_via(&self.agent, &text)
-        } else {
-            hrdr_app::prepare_outgoing_relayed(&self.agent, &text)
+        // Same expansion either way; only the session agent's own read-state is
+        // updated for `@file` inlines, since another pane's message is delivered to
+        // that agent, not to this handle.
+        let sent = match pane_id.is_main() {
+            true => hrdr_app::prepare_outgoing_via(&self.agent, &text),
+            false => hrdr_app::prepare_outgoing_relayed(&self.agent, &text),
         };
         let steer = Steer::new(sent, text);
 
-        if key == MAIN_KEY {
-            if self.main_turn_running() {
-                self.live.send_prompt(key, steer, |_ev| {});
-            } else {
-                self.reserve_session_id(&steer.sent);
-                self.live.enqueue(MAIN_KEY, steer);
-                self.spawn_pending_main_turn();
-            }
-        } else {
-            let notify = self.tick_notify.clone();
-            let delivered = self.live.send_prompt(key, steer, move |_ev| {
-                notify.notify_one();
-            });
-            if delivered.is_none() {
+        // Only the *session's* conversation has an id to reserve — it is what names
+        // the saved file. Idempotent, so it does not care whether this message opens
+        // a turn or steers one already running.
+        if pane_id.is_main() {
+            self.reserve_session_id(&steer.sent);
+            self.last_midturn_save = None;
+        }
+
+        // One send for every agent. Whether this message steers a turn in flight or
+        // starts a fresh one is `send_prompt`'s decision, not a shape this frontend
+        // reimplements per pane.
+        let delivered = self.live.send_prompt(key, steer, self.event_hook(key));
+        match delivered {
+            None => {
                 let seq = self.next_seq();
                 let frame = build_notice(seq, "that agent has finished and been released".into());
                 self.emit_raw(frame);
+            }
+            // A fresh turn: keep its handle so `cancel` can abort it. A steer landed
+            // on a turn already running, whose handle we already hold — replacing it
+            // with `None` there would report the running turn as finished.
+            Some(d) => {
+                if let Some(handle) = d.into_handle() {
+                    self.main_turn_handle = Some(handle);
+                }
             }
         }
 
         self.tick_notify.notify_one();
         self.tick();
+    }
+
+    /// How this frontend surfaces a turn on `key`, for [`AgentRegistry::start_turn`]
+    /// and [`AgentRegistry::send_prompt`] alike: stash the session conversation's
+    /// committed rounds for the mid-turn save, and wake the tick loop.
+    ///
+    /// Nothing here folds an event into a view — the event is already in the
+    /// agent's own record, and a pane is built by replaying that.
+    fn event_hook(&self, key: u64) -> impl FnMut(hrdr_agent::AgentEvent) + Send + 'static {
+        let history = self.mid_turn_history.clone();
+        let notify = self.tick_notify.clone();
+        move |ev| {
+            // The agent committed a round and sent its history: stash it for the
+            // mid-turn save (the agent lock is held for the whole turn, so this is
+            // the only way to see it). Only the session's own conversation is saved
+            // that way — a delegated agent snapshots itself beside its transcript.
+            if key == MAIN_KEY
+                && let hrdr_agent::AgentEvent::History(messages) = &ev
+                && let Ok(mut cell) = history.lock()
+            {
+                *cell = Some(messages.clone());
+            }
+            notify.notify_one();
+        }
     }
 
     // ── cancel ─────────────────────────────────────────────────────────────
@@ -727,54 +758,19 @@ impl WebSession {
     /// Launch a main-pane turn: `run` drains whatever is queued as its opener (an
     /// opener-less call hands the agent something already in its history).
     pub(crate) fn spawn_pending_main_turn(&mut self) {
-        self.live.begin_turn(MAIN_KEY);
-        let agent = self.agent.clone();
-        let steering = self.steering.clone();
-        let live = self.live.clone();
-        let tick_notify = self.tick_notify.clone();
-        let history = self.mid_turn_history.clone();
         self.last_midturn_save = None;
-
-        let handle = tokio::spawn(async move {
-            let _guard = hrdr_agent::RunGuard::new(live.clone(), MAIN_KEY);
-
-            let result = {
-                let mut a = agent.lock().await;
-                a.run(steering, {
-                    let live = live.clone();
-                    let notify = tick_notify.clone();
-                    move |ev| {
-                        // The agent committed a round and sent its history: stash it
-                        // for the mid-turn save (the agent lock is held for the whole
-                        // turn, so this is the only way to see it).
-                        if let hrdr_agent::AgentEvent::History(messages) = &ev
-                            && let Ok(mut cell) = history.lock()
-                        {
-                            *cell = Some(messages.clone());
-                        }
-                        live.record(MAIN_KEY, &ev);
-                        notify.notify_one();
-                    }
-                })
-                .await
-            };
-
-            match result {
-                Ok(()) => {
-                    live.record(MAIN_KEY, &hrdr_agent::AgentEvent::TurnDone);
-                }
-                Err(e) => {
-                    live.record(
-                        MAIN_KEY,
-                        &hrdr_agent::AgentEvent::Notice(format!("[error] {e:#}")),
-                    );
-                    live.record(MAIN_KEY, &hrdr_agent::AgentEvent::TurnDone);
-                }
-            }
-            tick_notify.notify_one();
-        });
-
-        self.main_turn_handle = Some(handle);
+        let done_notify = self.tick_notify.clone();
+        // The turn itself is the registry's — `begin_turn`, the run, the panic
+        // guard, recording every event on the agent's own entry, the terminal
+        // `TurnDone`. What is left here is what only this frontend knows, and it is
+        // the same hook a submitted message uses.
+        self.main_turn_handle = self.live.start_turn(
+            MAIN_KEY,
+            self.event_hook(MAIN_KEY),
+            move |_outcome| async move {
+                done_notify.notify_one();
+            },
+        );
     }
 
     // ── session switching (resume) ─────────────────────────────────────────

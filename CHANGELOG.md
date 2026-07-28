@@ -36,6 +36,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The main agent and a sub-agent differ only in configuration now — not in
+  code.** An audit of the agent seam found the logic already shared but the
+  naming and three real forks left over. The names first: `subagent_live.rs` is
+  `registry.rs` (`LiveSubagents` → `AgentRegistry`, `LiveSubagent` →
+  `AgentEntry`), `subagent_transcript.rs` is `transcript_log.rs`
+  (`SubagentTranscript` → `TranscriptLog`) — the session's own agent goes
+  through both — `AgentConfig::is_subagent` is `delegated`, and
+  `subagent_transcript_dir` is `child_transcript_dir`, because it says where an
+  agent's _children_ write, not where it writes. `Agent::is_subagent()` is gone:
+  it was dead outside two tests. Genuinely delegation-specific machinery
+  (`SubagentTool`, `SubagentSlots`, `SubagentProfile`, worktrees, the
+  `subagents` / `subagent_model` / `[[subagent]]` config keys) keeps its name.
+
+  Then the forks. **A pane is an agent key**: `PaneId` was `Main` plus
+  `Sub(key)`, so the session's agent had a second identity with no key in it and
+  every frontend carried the conversion; it is now a newtype over the registry
+  key with a `MAIN` constant, and `PaneSet` holds one `panes` vec instead of
+  `main` beside `subs`. **A turn is a turn**: `AgentRegistry::start_turn` is the
+  single driver — it starts the clock, runs the agent, guards against a
+  panicking tool, records every event on the agent's own entry, synthesizes the
+  terminal `TurnDone` on failure, and returns the handle that cancels it. Both
+  frontends had their own copy for the session's agent only; the TUI's copy was
+  where the panic guard lived, so a delegated agent's user-driven turn had none,
+  and the web's recorded a second `TurnDone` per turn. **An agent knows its own
+  window**: `Agent::new` resolves it instead of deriving it lazily on the first
+  turn, so the delegation path no longer pre-computes one to make a delegated
+  pane's gauge draw — and the web's main gauge no longer shows a bare number
+  until the first reply.
+
+  Smaller things that fell out: thinking time is stamped by the transcript
+  reducer from the block's own timestamp, so every agent's reasoning block
+  reports a real duration (a delegated agent's always read as instant, since
+  only the TUI held the clock, and only for the agent it was folding);
+  `AgentEntry` drops its unread `kind` field and `SpawnKind` goes with it (every
+  `task` call detaches now, so `Blocking` had no writer, and the session's agent
+  was recorded as `Blocking`, which was never true — the `Start` record drops
+  the field too, and older logs still read back); and a delegated run's two
+  `SessionState` saves go through one `RunSnapshot` rather than six captured
+  locals and two inline literals.
+
 - **Transcript persistence coalesces streamed deltas instead of writing one line
   per token.** Every reasoning or output delta was its own JSONL record — a few
   bytes of payload behind ~25 bytes of framing, each with its own `write(2)` and

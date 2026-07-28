@@ -26,6 +26,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use futures_util::FutureExt;
+use tokio::task::JoinHandle;
+
 use crate::{Agent, SteeringQueue};
 
 /// Monotonic key source for delegated agents. Distinct from `BG_SEQ` (which
@@ -95,12 +98,52 @@ pub fn event_log() -> EventLog {
 }
 
 /// What happened to a prompt handed to an agent — see [`AgentRegistry::send_prompt`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum PromptDelivery {
     /// A turn was already in flight, so the prompt was injected into it.
     Steered,
-    /// The agent was idle, so a fresh turn was started on it.
-    StartedTurn,
+    /// The agent was idle, so a fresh turn was started on it. The handle aborts
+    /// that turn, so a frontend can offer cancellation on any agent's turn.
+    StartedTurn(JoinHandle<()>),
+}
+
+impl PromptDelivery {
+    /// Whether a fresh turn was started (rather than the prompt being steered into
+    /// one already running).
+    pub fn started_turn(&self) -> bool {
+        matches!(self, Self::StartedTurn(_))
+    }
+
+    /// Take the turn's handle, if a turn was started.
+    pub fn into_handle(self) -> Option<JoinHandle<()>> {
+        match self {
+            Self::StartedTurn(h) => Some(h),
+            Self::Steered => None,
+        }
+    }
+}
+
+/// How a turn ended, for whoever asked for it.
+#[derive(Debug, Default)]
+pub struct TurnOutcome {
+    /// What went wrong, rendered for the user. `None` when the turn completed.
+    pub error: Option<String>,
+    /// The turn **panicked** rather than failing cleanly. A frontend that shares
+    /// the terminal with the panic hook needs to know: the hook has already left
+    /// the alt screen, so the display must be restored before drawing again.
+    pub panicked: bool,
+}
+
+/// Best-effort text of a caught panic payload, for turning a crashed turn into a
+/// reported error instead of a hung spinner.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 /// The decision `send_prompt` reaches while holding the entry lock: the entry is
@@ -620,11 +663,61 @@ impl AgentRegistry {
         // exactly like a mid-turn steer, through one path. A single turn, no
         // continuation loop.
         self.enqueue(key, input);
+        let handle = self.start_turn_on(key, agent, steering, on_event, |_| async {});
+        Some(PromptDelivery::StartedTurn(handle))
+    }
+
+    /// **Run a turn on agent `key`.** The one turn driver: whatever asked for the
+    /// turn — a delegated run, a user's message in any frontend, a steer that
+    /// arrived while the agent was idle — the turn itself happens here.
+    ///
+    /// What the caller supplies is how to *surface* the turn, never how to run it:
+    ///
+    /// * `on_event` sees each event after it has been recorded. A frontend uses it
+    ///   to wake itself; nothing needs to be folded there, because the event is
+    ///   already in the agent's own record ([`Self::record`]) and a pane is built
+    ///   by replaying that.
+    /// * `on_done` runs once, after the turn settles, with what went wrong (if
+    ///   anything). Async, so a frontend can flush its own queue before it reports
+    ///   the turn finished.
+    ///
+    /// Returns the task handle, so a caller that offers cancellation can abort the
+    /// turn — for **any** agent, not only the session's.
+    ///
+    /// `None` if `key` names no agent (released, or never registered).
+    pub fn start_turn<F, D, Fut>(&self, key: u64, on_event: F, on_done: D) -> Option<JoinHandle<()>>
+    where
+        F: FnMut(crate::AgentEvent) + Send + 'static,
+        D: FnOnce(TurnOutcome) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let (agent, steering) = self.handle(key)?;
+        Some(self.start_turn_on(key, agent, steering, on_event, on_done))
+    }
+
+    /// [`Self::start_turn`] with the agent handle already in hand — the path
+    /// `send_prompt` takes, where the handle was read under the same lock that
+    /// decided the agent was idle.
+    fn start_turn_on<F, D, Fut>(
+        &self,
+        key: u64,
+        agent: Arc<tokio::sync::Mutex<Agent>>,
+        steering: crate::SteeringQueue,
+        on_event: F,
+        on_done: D,
+    ) -> JoinHandle<()>
+    where
+        F: FnMut(crate::AgentEvent) + Send + 'static,
+        D: FnOnce(TurnOutcome) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        // The turn clock belongs to the agent whose turn it is, so a frontend
+        // showing that agent shows its loader.
         self.begin_turn(key);
         let live = self.clone();
         tokio::spawn(async move {
-            // The guard marks it idle again on every exit — including cancellation,
-            // where nothing after the await would run.
+            // The guard marks the agent idle again on every exit — including
+            // cancellation, where nothing after the await below would run.
             let _guard = RunGuard::new(live.clone(), key);
             let mut on_event = on_event;
             // Recorded on the agent's own entry rather than by whoever is watching:
@@ -634,15 +727,34 @@ impl AgentRegistry {
                 live.record(key, &ev);
                 on_event(ev);
             };
-            let mut a = agent.lock().await;
-            if let Err(e) = a.run(steering, &mut on_event).await {
-                on_event(crate::AgentEvent::Notice(format!("[error] {e:#}")));
-                // `run` only emits `TurnDone` on success; a frontend still needs to
-                // know the turn is over.
+            // A tool that panics unwinds this task. Guarded, so a crash becomes a
+            // finished turn carrying an error instead of an agent stuck `running`
+            // forever behind a spinner that never stops. (Cancellation aborts the
+            // task, dropping the future — `catch_unwind` does not intercept that,
+            // and the guard above is what ends the turn on that path.)
+            let run = async {
+                let mut a = agent.lock().await;
+                a.run(steering, &mut on_event).await
+            };
+            let outcome = match std::panic::AssertUnwindSafe(run).catch_unwind().await {
+                Ok(Ok(())) => TurnOutcome::default(),
+                Ok(Err(e)) => TurnOutcome {
+                    error: Some(format!("{e:#}")),
+                    panicked: false,
+                },
+                Err(payload) => TurnOutcome {
+                    error: Some(format!("turn crashed: {}", panic_message(&*payload))),
+                    panicked: true,
+                },
+            };
+            if let Some(error) = &outcome.error {
+                on_event(crate::AgentEvent::Notice(format!("[error] {error}")));
+                // `run` only emits `TurnDone` on success; whoever is watching still
+                // needs to know the turn is over.
                 on_event(crate::AgentEvent::TurnDone);
             }
-        });
-        Some(PromptDelivery::StartedTurn)
+            on_done(outcome).await;
+        })
     }
 
     /// Drop every entry that is finished, delivered, and unpinned. Called by the
@@ -854,7 +966,7 @@ mod tests {
         let steering = live.with(|v| Arc::clone(&v[0].steering));
 
         let delivery = live.send_prompt(1, crate::Steer::plain("look at auth too"), |_| {});
-        assert_eq!(delivery, Some(PromptDelivery::Steered));
+        assert!(matches!(delivery, Some(PromptDelivery::Steered)));
         assert_eq!(
             steering
                 .lock()
@@ -885,9 +997,8 @@ mod tests {
         });
 
         let delivery = live.send_prompt(1, crate::Steer::plain("now summarise"), |_| {});
-        assert_eq!(
-            delivery,
-            Some(PromptDelivery::StartedTurn),
+        assert!(
+            delivery.is_some_and(|d| d.started_turn()),
             "an idle agent is driven, not steered into a void"
         );
         assert!(
@@ -896,6 +1007,58 @@ mod tests {
         );
         // The turn itself runs against an unreachable endpoint and fails; the
         // RunGuard is what returns it to idle, which the cancellation test covers.
+    }
+
+    /// **A turn that fails reports it and ends.** The turn driver is shared, so
+    /// this holds for every agent — the session's own and every delegated one —
+    /// rather than only for whichever agent a frontend wrapped in its own guard.
+    ///
+    /// The agent here has no reachable endpoint, so its run returns an error: the
+    /// outcome carries it, a `Notice` and a terminal `TurnDone` reach the watcher
+    /// (a frontend cannot be left waiting on a turn that is over), and the agent is
+    /// idle again.
+    #[tokio::test]
+    async fn a_failed_turn_reports_the_error_and_leaves_the_agent_idle() {
+        let live = AgentRegistry::new();
+        live.register(entry(1));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let outcome = Arc::new(Mutex::new(None));
+
+        let handle = live
+            .start_turn(
+                1,
+                {
+                    let seen = Arc::clone(&seen);
+                    move |ev| seen.lock().unwrap().push(ev)
+                },
+                {
+                    let outcome = Arc::clone(&outcome);
+                    move |o| async move {
+                        *outcome.lock().unwrap() = Some(o);
+                    }
+                },
+            )
+            .expect("a registered agent can be driven");
+        handle.await.unwrap();
+
+        let outcome = outcome.lock().unwrap().take().expect("on_done ran");
+        assert!(outcome.error.is_some(), "the failure is reported");
+        assert!(!outcome.panicked, "it failed cleanly rather than crashing");
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, crate::AgentEvent::Notice(n) if n.starts_with("[error]"))),
+            "the watcher is told what went wrong: {seen:?}"
+        );
+        assert!(
+            matches!(seen.last(), Some(crate::AgentEvent::TurnDone)),
+            "and that the turn is over: {seen:?}"
+        );
+        assert!(
+            !live.with(|v| v[0].running),
+            "the guard returned it to idle"
+        );
     }
 
     /// A prompt to an agent that has already been released reports that, so a

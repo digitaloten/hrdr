@@ -291,12 +291,20 @@ impl EventSender {
     /// ends: if the stall that backed the queue up outlived the turn, this is
     /// where the tail events finally land. A closed receiver ends the drain at
     /// once instead of blocking.
+    #[cfg(test)]
     async fn drain(mut self) {
         while let Some(msg) = self.backlog.pop_front() {
             if self.tx.send(msg).await.is_err() {
                 break;
             }
         }
+    }
+
+    /// Take everything still queued, so a caller can await those sends without
+    /// holding the lock this sink is shared behind — the turn's event hook and its
+    /// completion hook are separate closures over the same sink.
+    fn take_backlog(&mut self) -> Vec<TurnMsg> {
+        self.backlog.drain(..).collect()
     }
 }
 
@@ -497,7 +505,6 @@ pub(crate) struct App {
     pub(crate) pending_fork: Option<(String, std::path::PathBuf)>,
     // ---- live inference stats (for the loader above the input) ----
     /// When the current thinking block started (for the "Thought:" footer).
-    pub(crate) reasoning_start: Option<Instant>,
     tx: mpsc::Sender<TurnMsg>,
     pub(crate) rx: Option<mpsc::Receiver<TurnMsg>>,
     pub(crate) should_quit: bool,
@@ -680,7 +687,6 @@ impl App {
             subagent_hits: Vec::new(),
             quit_armed: false,
             pending_fork: None,
-            reasoning_start: None,
             tx,
             rx: Some(rx),
             should_quit: false,
@@ -1177,7 +1183,7 @@ impl App {
         self.reserve_session_id(&format!("! {command}"));
         // Open the tool block immediately (synchronously, so it lands before
         // any streamed output). It renders as the `shell` tool.
-        self.apply_event(AgentEvent::ToolStart {
+        self.record_local(AgentEvent::ToolStart {
             id: id.clone(),
             name: "shell".to_string(),
             args: format!("! {command}"),
@@ -1342,7 +1348,7 @@ impl App {
             return; // it completed; the ToolEnd event already closed the block
         }
         shell.handle.abort();
-        self.apply_event(AgentEvent::ToolEnd {
+        self.record_local(AgentEvent::ToolEnd {
             id: shell.id,
             name: shell.name,
             result: "(cancelled)".to_string(),
@@ -1986,50 +1992,53 @@ impl App {
     /// `Steered` event `run` emits — not by pushing an entry here — so a normal
     /// message and a steering message reach the transcript the same way.
     fn launch_turn(&mut self) {
-        // The agent is what is running; the registry is where that is recorded. The
-        // turn clock belongs to the agent whose turn it is, so a frontend showing
-        // that agent shows its loader.
-        self.registry.begin_turn(hrdr_agent::MAIN_KEY);
-        self.reasoning_start = None;
         // Keep last_usage so the status-bar context size persists between turns;
         // it's refreshed when this turn's Usage event arrives.
-        let agent = self.agent.clone();
-        let steering = self.steering.clone();
         let tx = self.tx.clone();
-        let mut events = EventSender::new(tx.clone());
+        // The coalescing sink is shared by the two hooks below: one feeds it, the
+        // other flushes what it still holds once the turn is over.
+        let sink = Arc::new(std::sync::Mutex::new(EventSender::new(tx.clone())));
         let terminal_lost = self.terminal_lost.clone();
-        let handle = tokio::spawn(async move {
-            use futures_util::FutureExt;
-            // Release the agent lock before signalling Done, so the UI's
-            // auto-save (try_lock) can run immediately afterward.
-            //
-            // A tool that `unwrap`s (or otherwise panics) unwinds this task; guard
-            // the run future with `catch_unwind` so `Done` is ALWAYS sent, turning a
-            // crash into a finished turn with an error rather than a forever-spinner.
-            // The future isn't `UnwindSafe`, hence `AssertUnwindSafe`. The cancel
-            // path aborts the task (dropping the future) and drives the UI itself, so
-            // an abort still sends no `Done` — `catch_unwind` does not intercept it.
-            let run = async {
-                let mut a = agent.lock().await;
-                a.run(steering, |ev| events.send(ev)).await
-            };
-            let outcome = std::panic::AssertUnwindSafe(run).catch_unwind().await;
-            let err = match outcome {
-                Ok(result) => result.err().map(|e| e.to_string()),
-                Err(payload) => {
-                    // The panic hook already left the alt screen and dropped raw
-                    // mode; tell the driver to restore before it draws again.
-                    terminal_lost.store(true, Ordering::Release);
-                    Some(format!("turn crashed: {}", panic_message(&*payload)))
-                }
-            };
-            // Flush any events the coalescing sink still holds (a stall that
-            // outlived the turn) before signalling completion, so no tool/state
-            // event is lost and `Done` never overtakes them.
-            events.drain().await;
-            let _ = tx.send(TurnMsg::Done(err)).await;
-        });
-        self.turn_handle = Some(handle);
+        let on_event = {
+            let sink = Arc::clone(&sink);
+            move |ev| {
+                sink.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .send(ev)
+            }
+        };
+        // The turn belongs to the registry: it starts the clock, runs the agent,
+        // guards against a panicking tool, records every event on the agent's own
+        // entry, and marks it idle again on every exit — including cancellation.
+        // This frontend only says how to surface it.
+        self.turn_handle =
+            self.registry
+                .start_turn(hrdr_agent::MAIN_KEY, on_event, move |outcome| async move {
+                    if outcome.panicked {
+                        // The panic hook already left the alt screen and dropped raw
+                        // mode; tell the driver to restore before it draws again.
+                        terminal_lost.store(true, Ordering::Release);
+                    }
+                    // Flush anything the coalescing sink still holds (a stall that
+                    // outlived the turn) before signalling completion, so no tool/state
+                    // event is lost and `Done` never overtakes them.
+                    let queued = sink
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take_backlog();
+                    for msg in queued {
+                        if tx.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(TurnMsg::Done(outcome.error)).await;
+                });
+        if self.turn_handle.is_none() {
+            // The session's agent is registered before any input can reach here, so
+            // this is unreachable in practice — but a silently dropped turn would
+            // look like a hang, so say so.
+            self.system("no agent to run this turn on".to_string());
+        }
     }
 
     /// Launch a turn whose opener enters the model's history but is NOT shown in
@@ -2083,7 +2092,6 @@ impl App {
 
     /// Run a compaction pass on the background task, reporting via `TurnMsg`.
     fn spawn_compaction(&mut self, instructions: Option<String>) {
-        self.reasoning_start = None;
         // Summarizing is the model working: its own clock, no tools.
         self.registry.begin_turn(hrdr_agent::MAIN_KEY);
         // Compaction acts on the conversation you are looking at. `run_compaction`
@@ -2123,8 +2131,14 @@ impl App {
     pub(crate) fn on_turn_msg(&mut self, msg: TurnMsg) {
         match msg {
             TurnMsg::Event(ev) => {
-                // Ignore buffered events after cancellation.
-                if self.running() {
+                // Ignore buffered events after cancellation — and only then.
+                // Neither signal answers this alone: the turn clears the agent's
+                // `running` flag itself as it ends (`RunGuard`), so trailing messages
+                // from a turn that finished *normally* would be dropped if that were
+                // the test; and a turn driven without a handle (a queued message
+                // waiting on the agent's own queue) still has events worth applying.
+                // A cancelled turn is the one case where both are gone.
+                if self.turn_handle.is_some() || self.running() {
                     self.apply_event(ev);
                 }
             }
@@ -2133,7 +2147,7 @@ impl App {
                 if ended {
                     self.user_shell = None;
                 }
-                self.apply_event(ev);
+                self.record_local(ev);
                 if ended {
                     self.finish_user_shell(note, true);
                 }
@@ -2150,11 +2164,12 @@ impl App {
                 // Same rationale as TurnMsg::System above: passive async output.
             }
             TurnMsg::Done(err) => {
-                if !self.running() {
-                    // Stale Done from an aborted task; discard.
+                // A cancelled turn took the handle with it *and* marked the agent
+                // idle; a `Done` arriving after that is stale. Both signals are
+                // needed — see the `Event` arm above.
+                if self.turn_handle.take().is_none() && !self.running() {
                     return;
                 }
-                self.turn_handle = None;
                 self.registry.end_turn(hrdr_agent::MAIN_KEY);
                 // The turn is over — clear any sub-agents still in the live panel
                 // (an interrupted turn may not have delivered their ToolEnd).
@@ -2328,23 +2343,17 @@ impl App {
             .expect("the model switch is applied");
     }
 
-    /// Record how long the last reasoning block took, when thinking ends. The
-    /// renderer turns it into the block's `Thought: 1.2s` label — it is never
-    /// spliced into the entry's text.
-    fn finish_reasoning(&mut self) {
-        let Some(start) = self.reasoning_start.take() else {
-            return;
-        };
-        let elapsed = start.elapsed().as_millis() as u64;
-        if let Some(EntryKind::Reasoning { took_ms, .. }) = self
-            .panes
-            .main_mut()
-            .transcript_mut()
-            .last_mut()
-            .map(|e| &mut e.kind)
-        {
-            *took_ms = Some(elapsed);
-        }
+    /// Record an event this frontend produced itself on the session agent's own
+    /// entry, then bring the panes up to date.
+    ///
+    /// A turn does both halves for the events it drives
+    /// ([`hrdr_agent::AgentRegistry::start_turn`] records, then wakes the
+    /// frontend). A `!command` is a real tool block with no turn behind it, so the
+    /// frontend has to record it the same way — otherwise it renders once and is
+    /// missing from the agent's record, its durable transcript, and a resume.
+    fn record_local(&mut self, ev: AgentEvent) {
+        self.registry.record(hrdr_agent::MAIN_KEY, &ev);
+        self.apply_event(ev);
     }
 
     /// Handle one of the **main agent's** events.
@@ -2364,34 +2373,11 @@ impl App {
         if let AgentEvent::History(messages) = &ev {
             self.persist_mid_turn(messages.clone());
         }
-        // Thinking time is wall-clock, which only the frontend is holding. Stamp it
-        // on the open block *before* the event is folded: the reducer closes an
-        // unstamped block with a placeholder, and leaves a stamped one alone.
-        if matches!(ev, AgentEvent::Reasoning(_)) {
-            self.reasoning_start.get_or_insert_with(Instant::now);
-        } else {
-            self.finish_reasoning();
-        }
-
-        // ── the agent's own record: its transcript, its counters, its turn clock ──
-        // `record` folds the event into all three, for any agent. The loader, the
-        // throughput and the time-to-first-token shown for this agent come from
-        // there, so they are *this* agent's — not the main agent's borrowed by
-        // whatever pane happens to be on screen.
-        self.registry.record(hrdr_agent::MAIN_KEY, &ev);
+        // The event is already recorded on the agent's own entry — its transcript,
+        // its counters and its turn clock — by the turn that produced it
+        // (`AgentRegistry::start_turn`), for every agent alike. Nothing is folded
+        // here; this wake-up only brings the panes up to date with that record.
         self.sync_panes();
-    }
-}
-
-/// Best-effort text of a caught panic payload (`Box<dyn Any>`), for turning a
-/// crashed turn into a reported error instead of a hung spinner.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".to_string()
     }
 }
 
@@ -2401,72 +2387,6 @@ mod e2e;
 #[cfg(test)]
 mod tests {
     use super::HitRect;
-    use futures_util::FutureExt;
-
-    /// A turn task guards its run future with `catch_unwind` so a panicking tool
-    /// still delivers `Done`. Model the wrapper in isolation: a future that
-    /// panics must surface as an `Err(payload)` we can turn into a message,
-    /// never a lost signal.
-    #[tokio::test]
-    async fn panicking_turn_future_is_caught_and_reported() {
-        let run = async { panic!("tool exploded") };
-        let outcome = std::panic::AssertUnwindSafe(run).catch_unwind().await;
-        let err = match outcome {
-            Ok(()) => None,
-            Err(payload) => Some(format!("turn crashed: {}", super::panic_message(&*payload))),
-        };
-        assert_eq!(err.as_deref(), Some("turn crashed: tool exploded"));
-    }
-
-    /// A caught tool panic must flag the terminal as lost (the panic hook already
-    /// left the alt screen) so the driver re-enters before the next frame; a
-    /// clean turn must leave the flag untouched.
-    #[tokio::test]
-    async fn caught_panic_flags_terminal_lost_but_clean_run_does_not() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        async fn model(panics: bool, flag: &Arc<AtomicBool>) {
-            let run = async {
-                if panics {
-                    panic!("tool exploded")
-                }
-            };
-            if std::panic::AssertUnwindSafe(run)
-                .catch_unwind()
-                .await
-                .is_err()
-            {
-                flag.store(true, Ordering::Release);
-            }
-        }
-
-        let clean = Arc::new(AtomicBool::new(false));
-        model(false, &clean).await;
-        assert!(
-            !clean.swap(false, Ordering::AcqRel),
-            "clean run set the flag"
-        );
-
-        let crashed = Arc::new(AtomicBool::new(false));
-        model(true, &crashed).await;
-        assert!(
-            crashed.swap(false, Ordering::AcqRel),
-            "caught panic did not flag terminal lost"
-        );
-    }
-
-    /// `panic_message` extracts both `&str` and `String` payloads and falls back
-    /// for anything else.
-    #[test]
-    fn panic_message_extracts_common_payloads() {
-        let s: Box<dyn std::any::Any + Send> = Box::new("boom");
-        assert_eq!(super::panic_message(&*s), "boom");
-        let s: Box<dyn std::any::Any + Send> = Box::new(String::from("kaboom"));
-        assert_eq!(super::panic_message(&*s), "kaboom");
-        let s: Box<dyn std::any::Any + Send> = Box::new(42u8);
-        assert_eq!(super::panic_message(&*s), "unknown panic");
-    }
 
     /// The TUI's TODO-panel default lifetime must track the shared UI-config
     /// default (the aging logic itself is tested in `hrdr-app`).

@@ -357,12 +357,40 @@ impl Harness {
         }
     }
 
-    /// Drain the turn channel until the agent is no longer running.
+    /// Hand the app one agent event as a running turn would.
+    ///
+    /// A turn records the event on the agent's own entry and then wakes the
+    /// frontend ([`hrdr_agent::AgentRegistry::start_turn`]) — the transcript, the
+    /// counters and the turn clock all come from that record, for every agent. A
+    /// test that fabricates an event without a turn behind it has to do both, or it
+    /// is exercising a path that does not exist.
+    fn inject(&mut self, ev: hrdr_agent::AgentEvent) {
+        self.app.registry.record(hrdr_agent::MAIN_KEY, &ev);
+        self.app.on_turn_msg(TurnMsg::Event(ev));
+    }
+
+    /// Drain the turn channel until the agent is idle **and** nothing it sent is
+    /// still queued.
+    ///
+    /// The flag alone is not the end of the turn: a turn marks its own agent idle
+    /// as it finishes (`RunGuard`), and its closing `Done` — plus anything still
+    /// behind it — is already in the channel by then. Stopping at the flag would
+    /// leave the frontend's end-of-turn work (the stats line, the autosave, a
+    /// queued message's relaunch) undone. The relaunch is why this loops: draining
+    /// can start the next turn.
     async fn pump(&mut self) {
-        while self.app.running() {
-            match self.rx.recv().await {
-                Some(msg) => self.app.on_turn_msg(msg),
-                None => break,
+        loop {
+            while self.app.running() {
+                match self.rx.recv().await {
+                    Some(msg) => self.app.on_turn_msg(msg),
+                    None => break,
+                }
+            }
+            while let Ok(msg) = self.rx.try_recv() {
+                self.app.on_turn_msg(msg);
+            }
+            if !self.app.running() {
+                return;
             }
         }
     }
@@ -980,18 +1008,14 @@ async fn notice_event_preserves_scroll_when_scrolled_up() {
     let mut h = Harness::new(vec![]).await;
 
     h.app.scroll_offset = 7;
-    h.app.on_turn_msg(TurnMsg::Event(AgentEvent::Notice(
-        "tool-round limit reached".to_string(),
-    )));
+    h.inject(AgentEvent::Notice("tool-round limit reached".to_string()));
     assert_eq!(
         h.app.scroll_offset, 7,
         "AgentEvent::Notice reset scroll_offset while user was scrolled up"
     );
 
     h.app.scroll_offset = 0;
-    h.app.on_turn_msg(TurnMsg::Event(AgentEvent::Notice(
-        "health warning".to_string(),
-    )));
+    h.inject(AgentEvent::Notice("health warning".to_string()));
     assert_eq!(
         h.app.scroll_offset, 0,
         "AgentEvent::Notice changed scroll_offset while user was following"
@@ -1376,8 +1400,7 @@ async fn a_queued_message_rides_in_with_the_tool_results() {
         .registry
         .take_pending(hrdr_agent::MAIN_KEY)
         .expect("the agent takes it off its own queue");
-    h.app
-        .on_turn_msg(TurnMsg::Event(AgentEvent::Steered(taken.display)));
+    h.inject(AgentEvent::Steered(taken.display));
     assert_eq!(
         user_entries(&h),
         ["actually, use ripgrep"],
@@ -1615,10 +1638,7 @@ async fn history_snapshot_persists_the_session_mid_turn() {
         hrdr_agent::Message::user("do the thing"),
         hrdr_agent::Message::assistant("on it"),
     ];
-    h.app
-        .on_turn_msg(TurnMsg::Event(hrdr_agent::AgentEvent::History(
-            snapshot.clone(),
-        )));
+    h.inject(hrdr_agent::AgentEvent::History(snapshot.clone()));
 
     let id = h
         .app
@@ -2457,7 +2477,6 @@ async fn a_thinking_block_renders_no_label() {
         .transcript_mut()
         .push(Entry::reasoning("streaming thoughts"));
     h2.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
-    h2.app.reasoning_start = Some(std::time::Instant::now());
     let mut term = Terminal::new(TestBackend::new(50, 40)).unwrap();
     term.draw(|f| ui::draw(f, &mut h2.app)).unwrap();
     h2.app.scroll_offset = h2.app.max_scroll;
@@ -2492,8 +2511,7 @@ async fn an_empty_thinking_block_renders_nothing() {
 async fn an_empty_text_delta_opens_no_entry() {
     let mut h = Harness::new(vec![]).await;
     let before = h.app.transcript().len();
-    h.app
-        .on_turn_msg(TurnMsg::Event(hrdr_agent::AgentEvent::Text(String::new())));
+    h.inject(hrdr_agent::AgentEvent::Text(String::new()));
     assert_eq!(
         h.app.transcript().len(),
         before,
@@ -4034,16 +4052,16 @@ async fn the_loader_stops_while_the_models_tools_run() {
     assert!(turn(&h).inferring(), "the model works as the turn opens");
 
     // A tool round opens: the model handed off and is now idle.
-    h.app.on_turn_msg(TurnMsg::Event(AgentEvent::ToolStart {
+    h.inject(AgentEvent::ToolStart {
         id: "a".into(),
         name: "bash".into(),
         args: "{}".into(),
-    }));
-    h.app.on_turn_msg(TurnMsg::Event(AgentEvent::ToolStart {
+    });
+    h.inject(AgentEvent::ToolStart {
         id: "b".into(),
         name: "bash".into(),
         args: "{}".into(),
-    }));
+    });
     assert!(!turn(&h).inferring(), "idle while its tools run");
     let frozen = turn(&h).infer_elapsed();
 
@@ -4059,22 +4077,20 @@ async fn the_loader_stops_while_the_models_tools_run() {
     assert_eq!(turn(&h).infer_elapsed(), frozen, "the clock stopped");
 
     // One of two tools returning is not enough — the model is still waiting.
-    let end = |id: &str| {
-        TurnMsg::Event(AgentEvent::ToolEnd {
-            id: id.into(),
-            name: "bash".into(),
-            result: "ok".into(),
-            ok: true,
-        })
+    let end = |id: &str| AgentEvent::ToolEnd {
+        id: id.into(),
+        name: "bash".into(),
+        result: "ok".into(),
+        ok: true,
     };
-    h.app.on_turn_msg(end("a"));
+    h.inject(end("a"));
     assert!(
         !turn(&h).inferring(),
         "one tool of two is still outstanding"
     );
 
     // The last one hands control back: the model works again, and the clock runs.
-    h.app.on_turn_msg(end("b"));
+    h.inject(end("b"));
     assert!(turn(&h).inferring(), "the model resumed");
     std::thread::sleep(std::time::Duration::from_millis(20));
     assert!(turn(&h).infer_elapsed() > frozen, "the clock restarted");
