@@ -31,6 +31,7 @@ mod proc;
 pub mod sandbox;
 mod test_nudge;
 mod tools;
+mod verification;
 mod web;
 
 pub use guardrails::{
@@ -55,6 +56,7 @@ pub use tools::{
     LsTool, MoveTool, ReadTool, ReferencesTool, RenameTool, ReplaceTool, Shell, ShellTool,
     TodoTool, TreeTool, WatchTool, WriteTool, available_shell_tools, redact_secret_diffs,
 };
+pub use verification::{CheckKind, Scope, VerificationLedger};
 pub use web::{WebFetchTool, WebSearchTool};
 
 /// Default cap on a single tool's textual output, in bytes. Larger results are
@@ -279,6 +281,12 @@ pub struct ToolContext {
     /// tools through [`apply_file_change`](crate::tools::apply_file_change), which
     /// is the one place every content mutation passes through.
     pub test_nudge: Arc<Mutex<TestNudgeState>>,
+    /// What this session has actually verified, and whether it still holds: every
+    /// source mutation bumps its epoch (through
+    /// [`apply_file_change`](crate::tools::apply_file_change)) and every shell
+    /// command that looks like a check is classified into it (through `shell`),
+    /// so a commit can be told that its green was a green *subset*.
+    pub verification: Arc<Mutex<VerificationLedger>>,
     /// Whether a per-call `timeout_secs` shorter than the tool's own default is
     /// raised back to it (see [`floored_timeout_secs`]). Always true in a real
     /// session; tests set it false so a one-second deadline can still exercise
@@ -307,6 +315,7 @@ impl ToolContext {
             sandbox: Arc::new(SandboxPolicy::unconfined()),
             sandbox_notices: Arc::new(SandboxNotices::default()),
             test_nudge: Arc::new(Mutex::new(TestNudgeState::default())),
+            verification: Arc::new(Mutex::new(VerificationLedger::default())),
             enforce_timeout_floor: true,
         }
     }

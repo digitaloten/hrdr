@@ -86,7 +86,12 @@ fn is_test_path(path: &Path) -> bool {
 /// all": a language whose test idiom we cannot recognise is one where we would
 /// be guessing in both directions, so config, markup and data files — which have
 /// no markers — are silently out of scope.
-fn markers(path: &Path) -> &'static [&'static str] {
+///
+/// The verification ledger borrows the same answer as its definition of "a
+/// source file" (a mutation of one invalidates what the session had verified).
+/// Deliberately one table rather than two: two definitions of "code" would drift
+/// apart, and the pair of features would disagree about the same edit.
+pub(crate) fn markers(path: &Path) -> &'static [&'static str] {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())

@@ -1434,6 +1434,77 @@ mod tests {
         assert!(out.contains("timed out"), "timeout marker missing: {out}");
     }
 
+    // ---- verification ledger ----
+
+    /// The ledger reaches the model through the real tool path, end to end: a
+    /// source edit, a check that is not a whole-tree *pass*, then a commit — and
+    /// the commit's own result carries the note naming both. Then the ordering
+    /// that is the whole point: another edit, a whole-tree pass *after* it, and
+    /// the next commit is silent.
+    ///
+    /// `cargo` is shadowed by a shell function so this asserts on the ledger
+    /// rather than spawning a nine-crate suite; the ledger classifies the
+    /// command text, which is exactly what a real session hands it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_commit_after_an_unverified_edit_carries_the_verification_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path().to_path_buf());
+        let bash = ShellTool::new(Shell::Bash);
+        let run = async |command: &str| {
+            bash.execute(serde_json::json!({ "command": command }), &c)
+                .await
+        };
+
+        // A real repo, so the commit really commits.
+        run("git init -q . && git config user.email a@example.com \
+             && git config user.name a && git config commit.gpgsign false")
+        .await
+        .unwrap();
+        // A source edit through the real mutation path.
+        WriteTool
+            .execute(
+                serde_json::json!({"path": "lib.rs", "content": "fn a() {}\n"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        // A whole-tree run that failed. `false` short-circuits the `&&`, so no
+        // cargo is spawned — and a red tree settles nothing anyway.
+        let out = run("false && cargo test --workspace").await.unwrap();
+        assert!(
+            out.contains("exit status"),
+            "the run must have failed: {out}"
+        );
+
+        let out = run("git add lib.rs && git commit -q -m wip").await.unwrap();
+        assert!(out.contains("[verify]"), "no note on the commit: {out}");
+        assert!(out.contains("test"), "the owed kind is named: {out}");
+        assert!(
+            out.contains("cargo test --workspace") && out.contains("failed"),
+            "the note must name what was actually run: {out}"
+        );
+
+        // Now do it properly: edit, then a passing whole-tree run *after* it.
+        WriteTool
+            .execute(
+                serde_json::json!({"path": "lib.rs", "content": "fn a() { b(); }\n"}),
+                &c,
+            )
+            .await
+            .unwrap();
+        run("cargo() { return 0; }; cargo test --workspace")
+            .await
+            .unwrap();
+        let out = run("git add lib.rs && git commit -q -m done")
+            .await
+            .unwrap();
+        assert!(
+            !out.contains("[verify]"),
+            "a whole-tree pass at the current epoch owes nothing: {out}"
+        );
+    }
+
     /// Small output that never crosses either cap must not mention (or need)
     /// an overflow file at all — the overflow file is created only once
     /// output actually exceeds the caps, not eagerly on the first line.

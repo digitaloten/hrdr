@@ -64,6 +64,20 @@ pub async fn apply_file_change(
     atomic_write(path, content)
         .await
         .with_context(|| format!("writing {}", path.display()))?;
+    // The write landed, so whatever this session had verified is now verified
+    // about older code. Same gate as the nudge — a `rename`/rollback is not the
+    // model changing code, and a file with no test idiom is not code — and the
+    // same `markers` table, so the two features can never disagree about what
+    // counts as source. Only on the success path: a failed write invalidates
+    // nothing.
+    if matches!(hook_event, "edit" | "write" | "replace")
+        && !crate::test_nudge::markers(path).is_empty()
+    {
+        ctx.verification
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bump_source();
+    }
     let mut notes = crate::run_file_hooks(&ctx.hooks, hook_event, path, &ctx.cwd).await;
     let content_after = if !ctx.hooks.is_empty() {
         tokio::fs::read_to_string(path)
