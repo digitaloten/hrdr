@@ -1575,7 +1575,7 @@ async fn the_context_window_is_probed_from_the_endpoint_on_startup() {
         .expect("the probe posts a context window")
         .expect("the channel is open");
     assert!(
-        matches!(msg, TurnMsg::ContextWindow(hrdr_app::PaneId::Main, w) if w == MOCK_CONTEXT_WINDOW),
+        matches!(msg, TurnMsg::ContextWindow(hrdr_app::PaneId::MAIN, w) if w == MOCK_CONTEXT_WINDOW),
         "the probe posts the endpoint's advertised window"
     );
     h.app.on_turn_msg(msg);
@@ -3187,7 +3187,7 @@ async fn switching_agents_keeps_each_ones_place_and_draft() {
 
     // Go to the sub-agent: a different conversation, so a clean box and its own
     // place — not main's leftovers.
-    h.app.focus_pane(hrdr_app::PaneId::Sub(1));
+    h.app.focus_pane(hrdr_app::PaneId(1));
     assert_eq!(
         h.app.editor.content(),
         "",
@@ -3200,12 +3200,12 @@ async fn switching_agents_keeps_each_ones_place_and_draft() {
     h.app.scroll_offset = 5;
 
     // Back to main: its draft and its place are exactly where we left them.
-    h.app.focus_pane(hrdr_app::PaneId::Main);
+    h.app.focus_pane(hrdr_app::PaneId::MAIN);
     assert_eq!(h.app.editor.content(), "a thought for main");
     assert_eq!(h.app.scroll_offset, 12, "main's place is kept");
 
     // And back to the sub-agent: so are its.
-    h.app.focus_pane(hrdr_app::PaneId::Sub(1));
+    h.app.focus_pane(hrdr_app::PaneId(1));
     assert_eq!(
         h.app.editor.content(),
         "wait, check auth",
@@ -3250,7 +3250,7 @@ async fn the_input_box_routes_to_the_focused_agent() {
         transcript: None,
     });
     h.app.sync_panes();
-    h.app.focus_pane(hrdr_app::PaneId::Sub(1));
+    h.app.focus_pane(hrdr_app::PaneId(1));
 
     let main_before = h.app.transcript().len();
     h.submit("check the auth module too").await;
@@ -3282,7 +3282,7 @@ async fn the_input_box_routes_to_the_focused_agent() {
         .panes
         .subs()
         .iter()
-        .find(|p| p.id == hrdr_app::PaneId::Sub(1))
+        .find(|p| p.id == hrdr_app::PaneId(1))
         .unwrap();
     assert!(
         sub_pane
@@ -3397,7 +3397,7 @@ async fn the_agent_list_switches_the_focused_agent() {
         row: sub_y,
         modifiers: crossterm::event::KeyModifiers::empty(),
     });
-    assert_eq!(h.app.panes.active(), hrdr_app::PaneId::Sub(1));
+    assert_eq!(h.app.panes.active(), hrdr_app::PaneId(1));
 
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
@@ -3507,7 +3507,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
     );
 
     // Switch to the sub-agent: the bar switches with it.
-    h.app.focus_pane(hrdr_app::PaneId::Sub(1));
+    h.app.focus_pane(hrdr_app::PaneId(1));
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
     assert!(
@@ -3558,7 +3558,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
     );
 
     // Coming back to main restores main's chrome.
-    h.app.focus_pane(hrdr_app::PaneId::Main);
+    h.app.focus_pane(hrdr_app::PaneId::MAIN);
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
     assert!(
@@ -4133,7 +4133,7 @@ async fn the_loader_belongs_to_the_agent_on_screen() {
     );
 
     // Switch to the sub-agent: the loader is there, running *its* clock.
-    h.app.focus_pane(hrdr_app::PaneId::Sub(1));
+    h.app.focus_pane(hrdr_app::PaneId(1));
     h.app
         .registry
         .record(1, &hrdr_agent::AgentEvent::Text("looking".into()));
@@ -5832,7 +5832,7 @@ async fn the_todo_panel_shows_the_active_agents_list() {
     );
 
     // Switch to the sub-agent: now only its TODO shows.
-    h.app.focus_pane(hrdr_app::PaneId::Sub(sub_key));
+    h.app.focus_pane(hrdr_app::PaneId(sub_key));
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
     assert!(

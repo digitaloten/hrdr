@@ -392,7 +392,7 @@ impl WebSession {
     /// (`CommandHost::send_prompt`, which is a sync trait method) reach the very
     /// same routing rule instead of open-coding a second one.
     pub(crate) fn submit_sync(&mut self, pane_id: PaneId, text: String) {
-        let key = pane_id_to_key(pane_id);
+        let key = pane_id.key();
 
         // Same expansion either way; only the main agent's own read-state is
         // updated for `@file` inlines, since a sub-agent pane's message is
@@ -433,7 +433,7 @@ impl WebSession {
     /// Cancel a running turn.
     pub fn cancel(&mut self, wire_pane: WirePaneId) {
         let pane_id = crate::convert::core_pane_id(wire_pane);
-        let key = pane_id_to_key(pane_id);
+        let key = pane_id.key();
 
         if key == MAIN_KEY
             && let Some(handle) = self.main_turn_handle.take()
@@ -634,9 +634,9 @@ impl WebSession {
 
     fn pane_transcript(&self, id: PaneId) -> &Vec<Entry> {
         match id {
-            PaneId::Main => self.panes.main().transcript(),
-            PaneId::Sub(k) => {
-                if let Some(p) = self.panes.subs().iter().find(|p| p.id == PaneId::Sub(k)) {
+            PaneId::MAIN => self.panes.main().transcript(),
+            PaneId(k) => {
+                if let Some(p) = self.panes.subs().iter().find(|p| p.id == PaneId(k)) {
                     p.transcript()
                 } else {
                     self.panes.main().transcript()
@@ -651,8 +651,8 @@ impl WebSession {
 
         for sub in self.panes.subs() {
             let key = match sub.id {
-                PaneId::Main => unreachable!(),
-                PaneId::Sub(k) => k,
+                PaneId::MAIN => unreachable!(),
+                PaneId(k) => k,
             };
             let running = self.live.is_running(key);
             out.push(wire_pane(sub, running));
@@ -966,13 +966,6 @@ impl WebSession {
         if let Ok(mut cell) = self.subagent_dir.lock() {
             *cell = None;
         }
-    }
-}
-
-fn pane_id_to_key(id: PaneId) -> u64 {
-    match id {
-        PaneId::Main => MAIN_KEY,
-        PaneId::Sub(k) => k,
     }
 }
 

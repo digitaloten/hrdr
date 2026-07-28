@@ -49,7 +49,7 @@ mod tests {
         let mut panes = PaneSet::new();
         let rows = pane_rows(&panes);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, PaneId::Main);
+        assert_eq!(rows[0].id, PaneId::MAIN);
         assert!(rows[0].active, "main is active by default");
         assert_eq!(rows[0].title, "main");
 

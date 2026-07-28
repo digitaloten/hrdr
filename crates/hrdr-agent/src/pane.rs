@@ -1,40 +1,44 @@
-//! Agent panes: the frontend-agnostic layer that makes the main agent and a
-//! delegated sub-agent the *same kind of thing*.
+//! Agent panes: the frontend-agnostic layer where every agent is the *same kind
+//! of thing*.
 //!
-//! A pane is one addressable conversation — a transcript, a status, and (for a
-//! sub-agent) the handles needed to steer it or drive a further turn on it. The
-//! main agent is pane [`PaneId::Main`]; every retained sub-agent (see
-//! [`crate::AgentRegistry`]) is a pane of its own. A frontend switches which
-//! pane is *active*, renders that pane's transcript, and sends input to it —
-//! without caring which kind it is.
+//! A pane is one addressable conversation — a transcript, a status, and the
+//! handles needed to steer the agent or drive a further turn on it. There is one
+//! per agent in [`crate::AgentRegistry`], keyed the same way ([`PaneId`] *is* the
+//! registry key), and the session's own agent is simply the one at
+//! [`PaneId::MAIN`]. A frontend switches which pane is *active*, renders that
+//! pane's transcript, and sends input to it — with nothing to know about which
+//! agent it happens to be.
 //!
 //! The transcript itself is built by [`apply_event`], the shared event→entry
-//! reducer. Both the main agent's stream and a sub-agent's stream go through it,
-//! so a sub-agent's view is assembled by exactly the same rules as the main one:
-//! assistant text coalesces, reasoning coalesces, tool calls open and close.
+//! reducer, from the agent's own event record. Every agent's stream goes through
+//! it, so every view is assembled by exactly the same rules: assistant text
+//! coalesces, reasoning coalesces, tool calls open and close.
 
 use crate::{AgentEvent, AgentRegistry, Entry, SessionState, apply_event};
 
-/// Which conversation a pane is.
+/// Which conversation a pane is: the [`crate::AgentEntry::key`] of the agent it
+/// shows. The session's own agent is [`PaneId::MAIN`] and is a key like any
+/// other — a pane identifies an *agent*, and there is only one kind of those.
+///
+/// This used to be `Main` plus `Sub(key)`, which gave the session's agent a
+/// second identity with no key in it, so every frontend carried a conversion
+/// (`PaneId::MAIN => MAIN_KEY`) and every lookup carried a branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PaneId {
-    /// The session's own agent.
-    Main,
-    /// A delegated sub-agent, keyed by its [`crate::AgentEntry::key`].
-    Sub(u64),
-}
+pub struct PaneId(pub u64);
 
 impl PaneId {
+    /// The session's own agent's pane. Always present in a [`PaneSet`].
+    pub const MAIN: PaneId = PaneId(crate::MAIN_KEY);
+
+    /// Whether this is the session's own agent — the conversation itself, as
+    /// opposed to a task within it.
     pub fn is_main(self) -> bool {
-        matches!(self, PaneId::Main)
+        self == Self::MAIN
     }
 
-    /// The live-registry key, for a sub-agent pane.
-    pub fn key(self) -> Option<u64> {
-        match self {
-            PaneId::Main => None,
-            PaneId::Sub(k) => Some(k),
-        }
+    /// The registry key of the agent this pane shows.
+    pub fn key(self) -> u64 {
+        self.0
     }
 }
 
@@ -138,9 +142,9 @@ impl Pane {
     /// on the status bar, and repeating it here says nothing about *which agent*
     /// the row is — which is the only thing the list is for.
     pub fn title(&self) -> &str {
-        match self.id {
-            PaneId::Main => "main",
-            PaneId::Sub(_) => &self.state.name,
+        match self.id.is_main() {
+            true => "main",
+            false => &self.state.name,
         }
     }
 
@@ -160,25 +164,29 @@ impl Pane {
     }
 }
 
-/// The panes a frontend is showing: the main agent plus every retained
-/// sub-agent, and which one is active.
+/// The panes a frontend is showing — one per agent — and which one is active.
 ///
-/// [`Self::sync`] reconciles the sub-panes against the live registry — adopting
-/// sub-agents as they are delegated, dropping those the agent has released, and
-/// **pinning the active one** so the agent's prune leaves it alone while the user
-/// is reading it.
+/// [`Self::sync`] reconciles them against the agent registry: adopting agents as
+/// they are delegated, dropping those that have been released, and **pinning the
+/// active one** so the prune leaves it alone while the user is reading it.
 pub struct PaneSet {
-    /// The session's own agent. A pane like any other — it simply always exists.
-    main: Pane,
-    subs: Vec<Pane>,
+    /// Every agent's pane, in the order they appeared.
+    ///
+    /// **Invariant:** `panes[0]` is [`PaneId::MAIN`]. It is created with the set
+    /// and never removed — nothing releases the session's own agent — which is
+    /// what lets [`Self::main`] hand out a `&Pane` rather than an `Option`. The
+    /// session's agent is otherwise an ordinary member of this list: `sync`
+    /// updates it, replays into it, and reads it back through the same code as
+    /// every other pane.
+    panes: Vec<Pane>,
     active: PaneId,
 }
 
 impl Default for PaneSet {
     fn default() -> Self {
         Self {
-            main: Pane {
-                id: PaneId::Main,
+            panes: vec![Pane {
+                id: PaneId::MAIN,
                 status: PaneStatus::Idle,
                 state: SessionState::default(),
                 turn: crate::TurnStats::default(),
@@ -190,9 +198,8 @@ impl Default for PaneSet {
                 todos: Default::default(),
                 consumed: 0,
                 view: PaneView::default(),
-            },
-            subs: Vec::new(),
-            active: PaneId::Main,
+            }],
+            active: PaneId::MAIN,
         }
     }
 }
@@ -206,14 +213,14 @@ impl PaneSet {
         self.active
     }
 
-    /// The main agent's pane. Its transcript is the session's — the one that is
-    /// saved and restored.
+    /// The session agent's pane. Its transcript is the session's — the one that is
+    /// saved and restored. Always present (see [`PaneSet::panes`]).
     pub fn main(&self) -> &Pane {
-        &self.main
+        &self.panes[0]
     }
 
     pub fn main_mut(&mut self) -> &mut Pane {
-        &mut self.main
+        &mut self.panes[0]
     }
 
     /// The transcript currently on screen: whichever pane is active.
@@ -230,75 +237,55 @@ impl PaneSet {
     /// there is only the main agent, and a one-row list of the thing you are
     /// already looking at is just noise — so a fresh session shows no list.
     pub fn show_switcher(&self) -> bool {
-        !self.subs.is_empty()
+        self.panes.len() > 1
     }
 
-    /// Switch the active pane. Selecting a sub-agent that is no longer live falls
-    /// back to main rather than stranding the view on a dead pane.
+    /// Switch the active pane. Selecting an agent that is no longer live falls
+    /// back to the session's own pane rather than stranding the view on a dead one.
     pub fn focus(&mut self, id: PaneId) {
-        self.active = match id {
-            PaneId::Main => PaneId::Main,
-            PaneId::Sub(k) if self.subs.iter().any(|p| p.id == PaneId::Sub(k)) => PaneId::Sub(k),
-            PaneId::Sub(_) => PaneId::Main,
+        self.active = match self.panes.iter().any(|p| p.id == id) {
+            true => id,
+            false => PaneId::MAIN,
         };
     }
 
+    /// The delegated agents' panes — everything but the session's own.
     pub fn subs(&self) -> &[Pane] {
-        &self.subs
+        &self.panes[1..]
     }
 
-    pub fn sub_mut(&mut self, key: u64) -> Option<&mut Pane> {
-        self.subs.iter_mut().find(|p| p.id == PaneId::Sub(key))
+    /// The pane for a registry key, session's own or delegated. One lookup, which
+    /// is what lets `sync` treat every agent the same.
+    pub fn pane_for(&mut self, key: u64) -> Option<&mut Pane> {
+        self.panes.iter_mut().find(|p| p.id.key() == key)
     }
 
-    /// The pane for a registry key — the main agent's for [`crate::MAIN_KEY`],
-    /// otherwise the sub-agent's. Lets `sync` treat every agent the same.
-    fn pane_for(&mut self, key: u64) -> Option<&mut Pane> {
-        if key == crate::MAIN_KEY {
-            return Some(&mut self.main);
-        }
-        self.sub_mut(key)
-    }
-
-    /// A pane by id, main or sub.
+    /// A pane by id.
     pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
-        match id {
-            PaneId::Main => Some(&mut self.main),
-            PaneId::Sub(k) => self.sub_mut(k),
-        }
+        self.pane_for(id.key())
     }
 
-    /// The pane on screen.
+    /// The pane on screen. Falls back to the session's own if the active agent has
+    /// gone away between a `focus` and this read.
     pub fn active_pane(&self) -> &Pane {
-        match self.active {
-            PaneId::Main => &self.main,
-            PaneId::Sub(k) => self
-                .subs
-                .iter()
-                .find(|p| p.id == PaneId::Sub(k))
-                .unwrap_or(&self.main),
-        }
+        self.panes
+            .iter()
+            .find(|p| p.id == self.active)
+            .unwrap_or_else(|| self.main())
     }
 
     /// The pane on screen, mutably — where a frontend stows the reader's place and
     /// their unsent draft before switching away.
     pub fn active_pane_mut(&mut self) -> &mut Pane {
-        match self.active {
-            PaneId::Main => &mut self.main,
-            PaneId::Sub(k) => {
-                if let Some(i) = self.subs.iter().position(|p| p.id == PaneId::Sub(k)) {
-                    &mut self.subs[i]
-                } else {
-                    &mut self.main
-                }
-            }
+        match self.panes.iter().position(|p| p.id == self.active) {
+            Some(i) => &mut self.panes[i],
+            None => self.main_mut(),
         }
     }
 
-    /// The active sub-agent pane, if a sub-agent is what's active.
+    /// The active pane, if a *delegated* agent is what's on screen.
     pub fn active_sub(&self) -> Option<&Pane> {
-        let key = self.active.key()?;
-        self.subs.iter().find(|p| p.id == PaneId::Sub(key))
+        (!self.active.is_main()).then(|| self.active_pane())
     }
 
     /// Reconcile against the live registry and pin the active pane.
@@ -308,12 +295,12 @@ impl PaneSet {
     /// soon as it is finished, delivered, and unpinned, and this is the only
     /// thing that says "someone is still reading this one".
     pub fn sync(&mut self, live: &AgentRegistry) {
-        let active_key = self.active.key();
+        let active = self.active;
         let seen: Vec<LiveSnapshot> = live.with(|v| {
             for e in v.iter_mut() {
                 // The session's agent is always pinned — it is the conversation,
                 // and `owns_session` is the one place that says so.
-                e.pinned = e.owns_session() || Some(e.key) == active_key;
+                e.pinned = e.owns_session() || PaneId(e.key) == active;
             }
             v.iter()
                 .map(|e| LiveSnapshot {
@@ -339,7 +326,7 @@ impl PaneSet {
                     // A finished `task` block shows *what was delegated to*, not the
                     // work — the work is in that agent's own transcript.
                     tool_id: e.tool_id.clone(),
-                    delegation: (e.key != crate::MAIN_KEY).then(|| match &e.provider {
+                    delegation: (!e.owns_session()).then(|| match &e.provider {
                         Some(p) => format!("{} · {p}/{}", e.label, e.model),
                         None => format!("{} · {}", e.label, e.model),
                     }),
@@ -358,12 +345,12 @@ impl PaneSet {
                 (false, true) => PaneStatus::Done,
                 (false, false) => PaneStatus::Idle,
             };
-            let is_main = s.key == crate::MAIN_KEY;
+            let is_main = PaneId(s.key).is_main();
             let pane = match self.pane_for(s.key) {
                 Some(p) => p,
                 None => {
-                    self.subs.push(Pane {
-                        id: PaneId::Sub(s.key),
+                    self.panes.push(Pane {
+                        id: PaneId(s.key),
                         status,
                         state: SessionState::default(),
                         turn: crate::TurnStats::default(),
@@ -376,7 +363,7 @@ impl PaneSet {
                         consumed: 0,
                         view: PaneView::default(),
                     });
-                    self.subs.last_mut().expect("just pushed")
+                    self.panes.last_mut().expect("just pushed")
                 }
             };
             pane.status = status;
@@ -420,14 +407,15 @@ impl PaneSet {
 
         // Drop panes whose agent has been released. The active one is pinned above,
         // so it cannot vanish from under the user mid-read.
-        self.subs
-            .retain(|p| p.id.key().is_some_and(|k| seen.iter().any(|s| s.key == k)));
+        // The session's own pane is never released, so it is kept unconditionally
+        // (`panes[0]`, the invariant `main()` rests on) rather than depending on the
+        // registry having reported it this tick.
+        self.panes
+            .retain(|p| p.id.is_main() || seen.iter().any(|s| s.key == p.id.key()));
 
         // If the active pane was released anyway (it was never live), fall back.
-        if let Some(k) = self.active.key()
-            && !self.subs.iter().any(|p| p.id == PaneId::Sub(k))
-        {
-            self.active = PaneId::Main;
+        if !self.panes.iter().any(|p| p.id == self.active) {
+            self.active = PaneId::MAIN;
         }
     }
 }
@@ -533,7 +521,7 @@ mod tests {
         assert_eq!(panes.active_pane().state.usage.ctx_used(), 0);
 
         // Looking at the sub-agent: *its* model, endpoint, window and tokens.
-        panes.focus(PaneId::Sub(1));
+        panes.focus(PaneId(1));
         let p = panes.active_pane();
         assert_eq!(p.model(), "haiku");
         assert_eq!(p.provider(), "claude");
@@ -589,7 +577,7 @@ mod tests {
         // one is untouched behind it.
         let live = live_with(&[3]);
         panes.sync(&live);
-        panes.focus(PaneId::Sub(3));
+        panes.focus(PaneId(3));
         assert!(
             panes.active_transcript().is_empty(),
             "a fresh sub-agent pane starts empty"
@@ -600,7 +588,7 @@ mod tests {
         );
         assert_eq!(panes.active_transcript().len(), 1);
 
-        panes.focus(PaneId::Main);
+        panes.focus(PaneId::MAIN);
         assert!(
             matches!(&panes.active_transcript()[0].kind, EntryKind::Assistant(s) if s == "hi"),
             "the main transcript survived the excursion"
@@ -738,7 +726,7 @@ mod tests {
 
         let mut panes = PaneSet::new();
         panes.sync(&live);
-        panes.focus(PaneId::Sub(1));
+        panes.focus(PaneId(1));
 
         let p = panes.active_pane();
         assert_eq!(p.effort.as_deref(), Some("high"));
@@ -800,10 +788,10 @@ mod tests {
     #[test]
     fn focusing_a_sub_agent_that_is_gone_falls_back_to_main() {
         let mut panes = PaneSet::new();
-        panes.focus(PaneId::Sub(42));
+        panes.focus(PaneId(42));
         assert_eq!(
             panes.active(),
-            PaneId::Main,
+            PaneId::MAIN,
             "a dead sub-agent must not strand the view"
         );
     }
@@ -870,18 +858,18 @@ mod tests {
         let live = live_with(&[7, 8]);
         let mut panes = PaneSet::new();
         panes.sync(&live);
-        panes.focus(PaneId::Sub(7));
+        panes.focus(PaneId(7));
         panes.sync(&live);
         live.prune();
         panes.sync(&live);
 
         let keys: Vec<PaneId> = panes.subs().iter().map(|p| p.id).collect();
-        assert_eq!(keys, vec![PaneId::Sub(7)], "the pane being read is kept");
-        assert_eq!(panes.active(), PaneId::Sub(7));
+        assert_eq!(keys, vec![PaneId(7)], "the pane being read is kept");
+        assert_eq!(panes.active(), PaneId(7));
 
         // Switch back to main: nothing pins it now, so it is released and only the
         // main pane remains.
-        panes.focus(PaneId::Main);
+        panes.focus(PaneId::MAIN);
         panes.sync(&live);
         live.prune();
         panes.sync(&live);

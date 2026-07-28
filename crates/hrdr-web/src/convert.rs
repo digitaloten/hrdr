@@ -204,15 +204,15 @@ pub fn wire_turn(stats: &TurnStats, running: bool) -> WireTurn {
 
 pub fn wire_pane_id(id: PaneId) -> WirePaneId {
     match id {
-        PaneId::Main => WirePaneId::Main,
-        PaneId::Sub(k) => WirePaneId::Sub(k),
+        PaneId::MAIN => WirePaneId::Main,
+        PaneId(k) => WirePaneId::Sub(k),
     }
 }
 
 pub fn core_pane_id(id: WirePaneId) -> PaneId {
     match id {
-        WirePaneId::Main => PaneId::Main,
-        WirePaneId::Sub(k) => PaneId::Sub(k),
+        WirePaneId::Main => PaneId::MAIN,
+        WirePaneId::Sub(k) => PaneId(k),
     }
 }
 

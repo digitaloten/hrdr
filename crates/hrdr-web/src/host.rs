@@ -67,8 +67,8 @@ impl CommandHost for WebHost<'_> {
     fn agent(&self) -> Arc<tokio::sync::Mutex<Agent>> {
         let pane_id = self.session.panes().active();
         let key = match pane_id {
-            PaneId::Main => MAIN_KEY,
-            PaneId::Sub(k) => k,
+            PaneId::MAIN => MAIN_KEY,
+            PaneId(k) => k,
         };
         self.session
             .live()
@@ -91,7 +91,7 @@ impl CommandHost for WebHost<'_> {
 
     fn set_model_ref(&mut self, reference: ModelRef) {
         let pane_id = self.session.panes().active();
-        let key = pane_id_to_key(pane_id);
+        let key = pane_id.key();
         if let Some(pane) = self.session.panes_mut().pane_mut(pane_id) {
             pane.state.model = reference.clone();
         }
@@ -179,7 +179,7 @@ impl CommandHost for WebHost<'_> {
         // Resuming replaces the *session's* conversation, so the view follows it: this
         // also makes `agent()`/`model_ref()` below (which resolve the ACTIVE pane)
         // refer to the conversation being restored rather than to a sub-agent's.
-        self.session.panes_mut().focus(PaneId::Main);
+        self.session.panes_mut().focus(PaneId::MAIN);
 
         // The file lives under its own session's cwd (as in the TUI's `TuiHost::resume`);
         // fall back to ours for a file that never recorded one.
@@ -455,12 +455,5 @@ impl CommandHost for WebHost<'_> {
         // Needed by `restore_session_provider` (and `/model`): without it every
         // provider is "unknown" and a resumed session's endpoint can never be restored.
         self.session.cfg().resolve_provider(name)
-    }
-}
-
-fn pane_id_to_key(id: PaneId) -> u64 {
-    match id {
-        PaneId::Main => MAIN_KEY,
-        PaneId::Sub(k) => k,
     }
 }

@@ -771,7 +771,7 @@ impl App {
             if let Some(w) = window {
                 // The startup probe is the *session* agent's, whatever is on screen.
                 let _ = tx
-                    .send(TurnMsg::ContextWindow(hrdr_app::PaneId::Main, w))
+                    .send(TurnMsg::ContextWindow(hrdr_app::PaneId::MAIN, w))
                     .await;
             }
         });
@@ -1117,8 +1117,8 @@ impl App {
             // The input box talks to whichever agent you are looking at. On a
             // sub-agent pane that means *that* sub-agent — steered if a turn is in
             // flight, a fresh turn on the retained agent if it is idle.
-            if let Some(key) = self.panes.active().key() {
-                self.send_to_subagent(key, input);
+            if !self.panes.active().is_main() {
+                self.send_to_subagent(self.panes.active().key(), input);
                 return Action::None;
             }
             if self.running() || self.compacting() {
@@ -1634,7 +1634,7 @@ impl App {
         if delivered.is_none() {
             // Released while we were looking at it (finished, delivered, and the
             // prune won the race). Fall back rather than swallow what was typed.
-            self.focus_pane(hrdr_app::PaneId::Main);
+            self.focus_pane(hrdr_app::PaneId::MAIN);
             self.system("that sub-agent has finished and been released".to_string());
         }
     }
@@ -1671,15 +1671,13 @@ impl App {
 
     /// The agent behind a given pane.
     pub(crate) fn agent_for(&self, id: hrdr_app::PaneId) -> Arc<tokio::sync::Mutex<Agent>> {
-        match id.key() {
-            None => self.agent.clone(),
-            Some(key) => self
-                .registry
-                .handle(key)
-                .map(|(a, _)| a)
-                // Released while being viewed — fall back rather than do nothing.
-                .unwrap_or_else(|| self.agent.clone()),
-        }
+        // Every agent is in the registry, the session's own included, so this is
+        // one lookup with no pane-kind branch in it.
+        self.registry
+            .handle(id.key())
+            .map(|(a, _)| a)
+            // Released while being viewed — fall back rather than do nothing.
+            .unwrap_or_else(|| self.agent.clone())
     }
 
     /// Repoint the **active** agent's chrome — the model/provider/endpoint/window
@@ -1691,7 +1689,7 @@ impl App {
     /// pane would be silently overwritten on the next draw. The registry is the
     /// agent's own record of what it is running on, so that is where it belongs.
     fn update_chrome(&mut self, id: hrdr_app::PaneId, f: impl FnOnce(&mut hrdr_app::SessionState)) {
-        let key = id.key().unwrap_or(hrdr_agent::MAIN_KEY);
+        let key = id.key();
         let Some(pane) = self.panes.pane_mut(id) else {
             return; // released while we were switching it
         };

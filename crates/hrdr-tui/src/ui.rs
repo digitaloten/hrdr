@@ -2880,22 +2880,22 @@ mod subagent_tests {
             active: false,
         };
         let mut rows = [
-            row(PaneId::Sub(1), PaneStatus::Done),
-            row(PaneId::Sub(2), PaneStatus::Running),
-            row(PaneId::Main, PaneStatus::Idle),
-            row(PaneId::Sub(3), PaneStatus::Idle),
-            row(PaneId::Sub(4), PaneStatus::Done),
+            row(PaneId(1), PaneStatus::Done),
+            row(PaneId(2), PaneStatus::Running),
+            row(PaneId::MAIN, PaneStatus::Idle),
+            row(PaneId(3), PaneStatus::Idle),
+            row(PaneId(4), PaneStatus::Done),
         ];
         rows.sort_by_key(agent_sort_key);
         let order: Vec<PaneId> = rows.iter().map(|r| r.id).collect();
         assert_eq!(
             order,
             vec![
-                PaneId::Main,
-                PaneId::Sub(2), // running
-                PaneId::Sub(3), // idle (not finished) stays with the middle group
-                PaneId::Sub(1), // done
-                PaneId::Sub(4),
+                PaneId::MAIN,
+                PaneId(2), // running
+                PaneId(3), // idle (not finished) stays with the middle group
+                PaneId(1), // done
+                PaneId(4),
             ]
         );
     }
@@ -2904,9 +2904,9 @@ mod subagent_tests {
         (0..n)
             .map(|i| PaneRow {
                 id: if i == 0 {
-                    PaneId::Main
+                    PaneId::MAIN
                 } else {
-                    PaneId::Sub(i as u64)
+                    PaneId(i as u64)
                 },
                 title: format!("agent {i}"),
                 status: PaneStatus::Idle,
