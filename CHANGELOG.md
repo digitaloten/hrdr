@@ -36,6 +36,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Transcript persistence coalesces streamed deltas instead of writing one line
+  per token.** Every reasoning or output delta was its own JSONL record — a few
+  bytes of payload behind ~25 bytes of framing, each with its own `write(2)` and
+  its own `fstat` for the torn-write rollback — so a turn cost thousands of
+  syscalls and a file that was mostly syntax. Consecutive deltas of one stream
+  now accumulate into a single record, which is sound because it is invisible to
+  the reader: `apply_event` folds each delta by pushing onto the entry it
+  already has open, so N deltas and one record holding their concatenation
+  reconstruct the identical transcript (asserted against the raw event stream).
+  The buffer ends at whichever comes first — a **boundary** (a different delta
+  kind, so reasoning giving way to output; another tool's output; or any
+  non-streaming record at all, so `ToolStart`/`ToolEnd`/`Notice`/`End` are never
+  blurred), 512 bytes of payload, 500ms, an explicit flush at the end of a turn,
+  or dropping the writer mid-stream. `LiveSubagents::record` flushes on any
+  event with no record of its own (`Usage` ends a stream, `History` commits a
+  round, `TurnDone` ends the turn), so the crash trail is still current at every
+  round boundary; a crash inside the window can only lose buffered prose, never
+  a tool's arguments or result. A delta already larger than the threshold is
+  written straight through rather than held back waiting for a partner.
+
 - **`task_output` and `task_transcript` render identically; the only difference
   is which window you get.** Both now go through the same renderer, so one run
   reads the same whichever tool asked — `task_output` previously used the lossy

@@ -324,11 +324,19 @@ impl LiveSubagents {
             // through here, so it is written exactly once, in order, regardless
             // of which task drove it. Best-effort — a poisoned lock or a failed
             // write must never break recording.
-            if let Some(ts) = &e.transcript
-                && let Some(rec) = crate::subagent_transcript::Record::from_event(ev)
-            {
+            //
+            // An event with no record of its own still marks a moment worth
+            // landing the writer's buffered deltas at: `Usage` ends a stream,
+            // `History` commits a round, `TurnDone` ends the turn. So the
+            // no-record case flushes rather than doing nothing — durability at
+            // every round boundary, without a list of event kinds to keep in
+            // sync here.
+            if let Some(ts) = &e.transcript {
                 let mut w = ts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                w.write(&rec);
+                match crate::subagent_transcript::Record::from_event(ev) {
+                    Some(rec) => w.write(&rec),
+                    None => w.flush(),
+                }
             }
         });
     }
@@ -387,6 +395,15 @@ impl LiveSubagents {
         self.update(key, |e| {
             e.running = false;
             e.turn.end();
+            // The turn's last delta may still be buffered in the transcript
+            // writer, and the next event on this agent could be minutes away (or
+            // never). An idle agent's on-disk record must be its whole record:
+            // this is what a resume folds back, and what a crash leaves behind.
+            if let Some(ts) = &e.transcript {
+                ts.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .flush();
+            }
         });
     }
 
@@ -1042,8 +1059,18 @@ mod tests {
         // Give the entry a real writer, as a spawned sub-agent's does.
         live.update(1, |e| e.transcript = Some(writer.clone()));
 
-        live.record(1, &crate::AgentEvent::Text("steered reply".into()));
+        live.record(1, &crate::AgentEvent::Text("steered ".into()));
+        live.record(1, &crate::AgentEvent::Text("reply".into()));
+        // An event with no record of its own is a boundary: it lands the deltas
+        // the writer has been coalescing.
+        live.record(1, &crate::AgentEvent::TurnDone);
 
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body.lines().filter(|l| !l.trim().is_empty()).count(),
+            1,
+            "the two deltas cost one line, not two: {body:?}"
+        );
         let entries = subagent_transcript::read_transcript(&path);
         assert!(
             entries
@@ -1075,6 +1102,9 @@ mod tests {
         live.detach_transcript(1);
         live.attach_transcript(1, &second);
         live.record(1, &crate::AgentEvent::Text("two".into()));
+        // `first` was flushed by dropping its writer at `detach`; `second` still
+        // holds its delta until a boundary — the end of the turn is one.
+        live.end_turn(1);
 
         let body = std::fs::read_to_string(&first).unwrap();
         assert_eq!(

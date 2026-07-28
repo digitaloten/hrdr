@@ -20,10 +20,17 @@
 //! line-atomicity contract — [`SubagentTranscript::write`] either lands a whole
 //! record or rolls its bytes back, and the readers here skip a damaged line
 //! instead of stopping at it (a torn file from an older build must still resume).
+//!
+//! Streamed deltas are **coalesced** before they reach the disk: one `write(2)`
+//! per token is pure waste — a few bytes of payload behind ~25 bytes of JSON
+//! framing — when consecutive deltas of one stream fold to exactly the same
+//! transcript as a single record holding their concatenation. See
+//! [`SubagentTranscript::write`] for the buffer and the boundaries that end it.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -179,6 +186,20 @@ impl Record {
     }
 }
 
+/// How much coalesced delta payload buys a line of its own. A streamed delta is
+/// a few bytes behind ~25 bytes of JSON framing plus a `write(2)`, so writing one
+/// per token spends most of the file and nearly all of the syscalls on framing.
+/// At this size the framing is noise and a crash can lose at most this much
+/// streamed prose — which [`COALESCE_AGE`] bounds in wall-clock terms too.
+const COALESCE_BYTES: usize = 512;
+
+/// How long a partial line may sit unwritten. The size threshold alone is a
+/// *token* bound, and a slow model (or a long, quiet reasoning burst) can hold a
+/// buffer open for minutes under it — so the crash trail would lag arbitrarily
+/// far behind the run in wall-clock time. This caps that lag: a run being
+/// watched, or killed, is at most this stale on disk.
+const COALESCE_AGE: Duration = Duration::from_millis(500);
+
 /// An open append-only transcript file for one sub-agent run.
 pub struct SubagentTranscript {
     file: File,
@@ -189,6 +210,56 @@ pub struct SubagentTranscript {
     /// prefixed with `\n` so the fragment stays one broken line instead of
     /// swallowing the next record too. See [`Self::write`].
     torn: bool,
+    /// The streamed record still accumulating deltas, not yet on disk. Held as a
+    /// `Record` rather than a loose string so the flush cannot mislabel it.
+    pending: Option<Record>,
+    /// When [`Self::pending`] took its first delta, for the [`COALESCE_AGE`] cap.
+    opened_at: Option<Instant>,
+}
+
+/// Append `next` onto the open streamed record `open`, if they are the same
+/// stream. Only the three delta kinds coalesce, and only onto their own kind —
+/// [`crate::apply_event`] folds each by pushing onto the entry it already has
+/// open, so N consecutive deltas and one record holding their concatenation
+/// reconstruct the identical transcript. `ToolOutput` additionally has to match
+/// on `id`: two tools' output interleaved into one record would fold onto the
+/// wrong call.
+///
+/// Everything else returns `false` and is therefore a boundary — which covers
+/// the ones that matter on their own: reasoning giving way to output (different
+/// kinds), and a tool call opening or closing mid-stream.
+fn merge(open: &mut Record, next: &Record) -> bool {
+    match (open, next) {
+        (Record::Reasoning { text }, Record::Reasoning { text: more }) => {
+            text.push_str(more);
+            true
+        }
+        (Record::Text { chunk }, Record::Text { chunk: more }) => {
+            chunk.push_str(more);
+            true
+        }
+        (
+            Record::ToolOutput { id, chunk },
+            Record::ToolOutput {
+                id: next_id,
+                chunk: more,
+            },
+        ) if id == next_id => {
+            chunk.push_str(more);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The coalesced payload a streamed record carries, for the size threshold.
+/// `None` for a record that is not a delta and so is never buffered.
+fn delta_len(rec: &Record) -> Option<usize> {
+    match rec {
+        Record::Reasoning { text } => Some(text.len()),
+        Record::Text { chunk } | Record::ToolOutput { chunk, .. } => Some(chunk.len()),
+        _ => None,
+    }
 }
 
 impl SubagentTranscript {
@@ -230,6 +301,8 @@ impl SubagentTranscript {
             path,
             // Exclusively created: the file is empty, so it starts on a boundary.
             torn: false,
+            pending: None,
+            opened_at: None,
         })
     }
 
@@ -265,7 +338,70 @@ impl SubagentTranscript {
             // or a full disk during an earlier append). Resuming onto it must not
             // glue this session's first record onto that fragment.
             torn: ends_mid_line(path),
+            pending: None,
+            opened_at: None,
         })
+    }
+
+    /// Record one event. A streamed delta joins the open line instead of costing
+    /// a `write(2)` of its own; everything else lands immediately, after whatever
+    /// was buffered, so the file order is always the call order.
+    ///
+    /// The buffer ends — and the line lands — at whichever comes first:
+    ///
+    /// * **A boundary.** Any record [`merge`] rejects: a different delta kind
+    ///   (reasoning giving way to output), another tool's output, or a
+    ///   non-streaming record at all (`ToolStart`/`ToolEnd`/`Notice`/`End`, …).
+    ///   These are exactly the points a reader distinguishes, so no coalescing
+    ///   can ever blur one.
+    /// * **[`COALESCE_BYTES`] of payload**, so a long stream still lands in
+    ///   pieces rather than as one enormous line at the end.
+    /// * **[`COALESCE_AGE`]**, so a slow stream's trail cannot lag the run by an
+    ///   unbounded amount of wall-clock time.
+    /// * **[`Self::flush`]**, which the owner calls at a turn boundary, and
+    ///   `Drop` calls for a writer that is abandoned mid-stream.
+    ///
+    /// A crash inside the window loses the buffered deltas — bounded by the two
+    /// thresholds above, and only ever streamed prose: a tool's `args` and its
+    /// `result` ride on non-streaming records, and `ToolEnd` restates the whole
+    /// result that the `ToolOutput` deltas were progressively building.
+    pub fn write(&mut self, rec: &Record) {
+        // Same stream as the open line: append and stay buffered, unless this
+        // delta is what tips it over a threshold.
+        let full = match self.pending.as_mut() {
+            Some(open) => {
+                merge(open, rec).then(|| delta_len(open).is_some_and(|n| n >= COALESCE_BYTES))
+            }
+            None => None,
+        };
+        if let Some(full) = full {
+            if full || self.opened_at.is_some_and(|t| t.elapsed() >= COALESCE_AGE) {
+                self.flush();
+            }
+            return;
+        }
+        // A boundary: the buffered line goes out first, so `rec` cannot overtake
+        // the deltas that preceded it.
+        self.flush();
+        // A delta that is already worth a line of its own opens no buffer: it
+        // amortizes its own framing, and buffering it would only delay it (and
+        // copy it) waiting for a partner it does not need.
+        if delta_len(rec).is_some_and(|n| n < COALESCE_BYTES) {
+            self.pending = Some(rec.clone());
+            self.opened_at = Some(Instant::now());
+            return;
+        }
+        self.append_line(rec);
+    }
+
+    /// Land the buffered deltas, if any. Idempotent, and the boundary an owner
+    /// asserts by hand: the end of a turn, where the next event may be minutes
+    /// away and the on-disk transcript is what a resume folds back.
+    pub fn flush(&mut self) {
+        self.opened_at = None;
+        if let Some(rec) = self.pending.take() {
+            self.append_line(&rec);
+        }
     }
 
     /// Append one record as **one whole line** and flush. All errors are
@@ -287,7 +423,7 @@ impl SubagentTranscript {
     /// * If even the rollback fails, [`Self::torn`] is set and the next record
     ///   opens with a newline — the damage stays confined to one line, which
     ///   [`read_transcript`] skips.
-    pub fn write(&mut self, rec: &Record) {
+    fn append_line(&mut self, rec: &Record) {
         let Ok(json) = serde_json::to_string(rec) else {
             return;
         };
@@ -312,6 +448,16 @@ impl SubagentTranscript {
             }
         }
         let _ = self.file.flush();
+    }
+}
+
+/// A writer that goes away mid-stream still owes its buffered deltas to the
+/// file: a sub-agent whose run ends, a session switch that detaches the main
+/// agent's writer, a cancelled task whose registry entry is pruned. Without this
+/// the last partial line of every run would be dropped on the floor.
+impl Drop for SubagentTranscript {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -638,6 +784,11 @@ mod tests {
         t.write(&Record::Text {
             chunk: "done work".into(),
         });
+        // Streamed text is coalesced, so what is on disk mid-run is what has
+        // reached a boundary. The run's owner asserts one at every round
+        // (`LiveSubagents::record` on a no-record event, `end_turn`), which is
+        // what makes a crash trail worth reading; assert it by hand here.
+        t.flush();
 
         // Mid-run, before any End: an orphan whose completed work is on disk.
         assert!(!is_complete(&path), "no End line => orphan");
@@ -805,6 +956,7 @@ mod tests {
         t.write(&Record::Text {
             chunk: "after".into(),
         });
+        t.flush();
 
         let body = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -953,6 +1105,228 @@ mod tests {
                 assert!(seen.contains(&want), "missing {tag}-{i}");
             }
         }
+    }
+
+    /// Read a transcript's records back as written, skipping blank lines.
+    fn records(path: &Path) -> Vec<Record> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Record>(l).expect("standalone Record"))
+            .collect()
+    }
+
+    /// The IO the coalescing exists to remove: a token-sized delta must not cost
+    /// a line (and a `write(2)`) of its own.
+    #[test]
+    fn streaming_deltas_coalesce_into_one_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("009-coalesce.jsonl");
+        let mut t = SubagentTranscript::append(&path).unwrap();
+        for word in ["The ", "quick ", "brown ", "fox"] {
+            t.write(&Record::Text { chunk: word.into() });
+        }
+        t.flush();
+        assert_eq!(
+            records(&path),
+            vec![Record::Text {
+                chunk: "The quick brown fox".into()
+            }],
+            "four deltas, one line"
+        );
+    }
+
+    /// The boundaries the coalescing must not blur: reasoning giving way to
+    /// output, and a tool call opening and closing mid-stream. Each is a distinct
+    /// record on disk, in call order.
+    #[test]
+    fn a_kind_change_or_a_tool_call_breaks_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("010-boundary.jsonl");
+        let mut t = SubagentTranscript::append(&path).unwrap();
+        t.write(&Record::Reasoning {
+            text: "think".into(),
+        });
+        t.write(&Record::Reasoning { text: "ing".into() });
+        t.write(&Record::Text {
+            chunk: "say".into(),
+        });
+        t.write(&Record::Text {
+            chunk: "ing".into(),
+        });
+        t.write(&Record::ToolStart {
+            id: "c1".into(),
+            name: "read".into(),
+            args: "{}".into(),
+        });
+        t.write(&Record::ToolEnd {
+            id: "c1".into(),
+            name: "read".into(),
+            result: "ok".into(),
+            ok: true,
+        });
+        t.write(&Record::Text {
+            chunk: "after".into(),
+        });
+        t.flush();
+
+        assert_eq!(
+            records(&path),
+            vec![
+                Record::Reasoning {
+                    text: "thinking".into()
+                },
+                Record::Text {
+                    chunk: "saying".into()
+                },
+                Record::ToolStart {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    args: "{}".into(),
+                },
+                Record::ToolEnd {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    result: "ok".into(),
+                    ok: true,
+                },
+                Record::Text {
+                    chunk: "after".into()
+                },
+            ],
+        );
+    }
+
+    /// Two tools streaming at once must not have their output merged: the fold
+    /// pushes a `ToolOutput` onto the call named by its `id`, so one merged record
+    /// would append both tools' output to whichever id won.
+    #[test]
+    fn output_from_two_tools_never_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("011-two-tools.jsonl");
+        let mut t = SubagentTranscript::append(&path).unwrap();
+        for (id, chunk) in [("a", "a1"), ("a", "a2"), ("b", "b1"), ("a", "a3")] {
+            t.write(&Record::ToolOutput {
+                id: id.into(),
+                chunk: chunk.into(),
+            });
+        }
+        t.flush();
+        assert_eq!(
+            records(&path),
+            vec![
+                Record::ToolOutput {
+                    id: "a".into(),
+                    chunk: "a1a2".into()
+                },
+                Record::ToolOutput {
+                    id: "b".into(),
+                    chunk: "b1".into()
+                },
+                Record::ToolOutput {
+                    id: "a".into(),
+                    chunk: "a3".into()
+                },
+            ],
+        );
+    }
+
+    /// Coalescing is only sound because it is invisible to the reader: the same
+    /// event stream must fold to the same transcript whether it reached disk as
+    /// one record per delta or as one record per run of deltas. Compares the
+    /// folded file against `apply_event` over the raw events.
+    #[test]
+    fn a_coalesced_transcript_folds_exactly_like_the_event_stream() {
+        use crate::AgentEvent;
+        let events = vec![
+            AgentEvent::Steered("do the thing".into()),
+            AgentEvent::Reasoning("first ".into()),
+            AgentEvent::Reasoning("I plan".into()),
+            AgentEvent::Text("Now ".into()),
+            AgentEvent::Text("editing".into()),
+            AgentEvent::ToolStart {
+                id: "c1".into(),
+                name: "shell".into(),
+                args: r#"{"cmd":"ls"}"#.into(),
+            },
+            AgentEvent::ToolOutput {
+                id: "c1".into(),
+                chunk: "src\n".into(),
+            },
+            AgentEvent::ToolOutput {
+                id: "c1".into(),
+                chunk: "Cargo.toml\n".into(),
+            },
+            AgentEvent::ToolEnd {
+                id: "c1".into(),
+                name: "shell".into(),
+                result: "src\nCargo.toml\n".into(),
+                ok: true,
+            },
+            AgentEvent::Text("Done".into()),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("012-fold.jsonl");
+        {
+            let mut t = SubagentTranscript::append(&path).unwrap();
+            for ev in &events {
+                t.write(&Record::from_event(ev).unwrap());
+            }
+            // No explicit flush: the writer going out of scope owes the file its
+            // last buffered deltas, and that is exactly a run ending mid-stream.
+        }
+        // Coalescing happened at all — otherwise this asserts nothing.
+        assert!(
+            records(&path).len() < events.len(),
+            "deltas were merged: {:?}",
+            records(&path)
+        );
+
+        let mut want = Vec::new();
+        for ev in &events {
+            crate::apply_event(&mut want, ev);
+        }
+        let got = read_transcript(&path);
+        let kinds = |v: &[crate::Entry]| v.iter().map(|e| e.kind.clone()).collect::<Vec<_>>();
+        assert_eq!(kinds(&got), kinds(&want), "same fold, fewer lines");
+    }
+
+    /// A stream long enough to matter still lands in pieces: the size threshold
+    /// bounds how much streamed text a crash can take with it, and a delta that
+    /// is already big enough to amortize its own framing is never held back.
+    #[test]
+    fn a_long_stream_lands_in_pieces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("013-long.jsonl");
+        let mut t = SubagentTranscript::append(&path).unwrap();
+        for _ in 0..500 {
+            t.write(&Record::Text {
+                chunk: "tok ".into(),
+            });
+        }
+        let lines = records(&path);
+        assert!(lines.len() > 1, "not one giant line at the end");
+        for rec in &lines {
+            let len = delta_len(rec).unwrap();
+            assert!(
+                len < COALESCE_BYTES + 4,
+                "a line holds about one threshold of payload, got {len}"
+            );
+        }
+
+        // One oversized delta needs no partner: on an empty buffer it lands on
+        // its own, at once. (Onto an OPEN buffer it still merges first — same
+        // stream, one line, one syscall.)
+        t.flush();
+        let big = "x".repeat(COALESCE_BYTES * 2);
+        t.write(&Record::Text { chunk: big.clone() });
+        assert_eq!(
+            records(&path).last().unwrap(),
+            &Record::Text { chunk: big },
+            "an oversized delta is written straight through"
+        );
     }
 
     #[test]
