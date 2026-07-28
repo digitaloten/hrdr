@@ -6,17 +6,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed
-
-- **The look-before-you-restore rule now covers the staged copy and every named
-  path.** Reverting a file the agent owns was already gated on reading its diff
-  first, but only on `git diff`, which hides a staged edit — and the two restore
-  spellings then disagree about one: `git restore -- <file>` takes the index, so
-  a staged change survives and the file is _not_ back at HEAD, while
-  `git checkout HEAD -- <file>` destroys it outright. Both diffs are now
-  inspected, the difference is spelled out, and the ownership check applies to
-  every path in the command rather than the single file the agent had in mind.
-
 ### Added
 
 - **Staging a directory is now blocked at the shell**, alongside `git add -A` /
@@ -30,6 +19,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The look-before-you-restore rule now covers the staged copy and every named
+  path.** Reverting a file the agent owns was already gated on reading its diff
+  first, but only on `git diff`, which hides a staged edit — and the two restore
+  spellings then disagree about one: `git restore -- <file>` takes the index, so
+  a staged change survives and the file is _not_ back at HEAD, while
+  `git checkout HEAD -- <file>` destroys it outright. Both diffs are now
+  inspected, the difference is spelled out, and the ownership check applies to
+  every path in the command rather than the single file the agent had in mind.
 - **A test must assert what its name and header claim.** The third review round
   on the same delegated work found the correctness problems gone and this left:
   a replication test whose header promised "survives loss, reorder and
