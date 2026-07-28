@@ -54,6 +54,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A fresh install now lists a provider's models in `/model`.** The models.dev
+  catalog was only ever written to disk as a _side effect_ of needing one
+  model's context window, and that path short-circuits: `probe_context_window`
+  asks the endpoint's `/v1/models` first and returns as soon as it answers. So a
+  provider whose endpoint reports a context length — opencode zen does, once
+  `/login` has supplied a key — meant models.dev was never fetched at all, and
+  the `/model` selector (which reads the cache synchronously, because it builds
+  its list on a keypress, and never fetches) had nothing to offer but the single
+  configured model. Ironically it worked _without_ a key, since the failing
+  probe fell through to the catalog.
+
+  Starting a session now warms the catalog explicitly
+  (`hrdr_llm::catalog::warm()`, spawned from `Agent::new` for the session's own
+  agent), so the selector's list is a property of hrdr rather than of which code
+  path happened to run first. This also restores refresh-on-staleness: with the
+  window resolved eagerly at construction, the startup probe is skipped, and
+  nothing else re-fetched a catalog older than its 24-hour TTL.
+
+  Test binaries have fetching disabled outright (`HRDR_DISABLE_MODELS_FETCH` in
+  the sandbox ctor) so no test reaches models.dev.
+
 - Codex Responses stream events with the `server_is_overloaded` code now use the
   existing bounded exponential-backoff retry path instead of ending the turn.
 

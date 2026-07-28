@@ -90,6 +90,23 @@ pub async fn context_window(provider: Option<&str>, model: &str) -> Option<u32> 
     lookup(&load().await?, provider, model)
 }
 
+/// Make sure the catalog is on disk, fetching it if it is missing or stale.
+/// Best-effort and silent: the catalog is a nicety, never a reason to fail a
+/// session, and this is spawned rather than awaited by its caller.
+///
+/// **Why this exists.** Every other consumer either reads the cache without
+/// fetching ([`load_cached`], which the `/model` selector must use because it
+/// builds its list on a keypress) or fetches only as a *side effect* of needing
+/// one model's window. So the catalog was populated by luck: an endpoint that
+/// answered `/v1/models` with a window, or a window already known from config or
+/// cache, meant nothing ever fetched, and the selector had no models to offer —
+/// on a fresh install, forever. Warming it explicitly at startup is what makes
+/// the selector's list a property of hrdr rather than of which code path
+/// happened to run first.
+pub async fn warm() {
+    let _ = load().await;
+}
+
 /// [`context_window`] against the **already-cached** catalog only — no network, no
 /// await. For callers inside a live turn (the agent deciding whether its context is
 /// full), where firing an out-of-band HTTP request would interleave with the stream

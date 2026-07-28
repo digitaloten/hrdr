@@ -1438,6 +1438,17 @@ impl Agent {
         // delegation is on and this is a git repo — backgrounded off the startup
         // path, and skipped entirely without a runtime (sync tests), so it never
         // delays first paint or races the sync test suite.
+        // Warm the models.dev catalog so the `/model` selector has something to
+        // list. It reads the cache synchronously (it builds its list on a
+        // keypress) and never fetches, and every other consumer fetches only as a
+        // side effect of needing one model's window — so on a fresh install the
+        // cache could stay empty forever and the selector offer nothing but the
+        // configured model. Session agent only (a delegated one shares the same
+        // cache), backgrounded so it never delays first paint, and skipped without
+        // a runtime — the same shape as the worktree sweep below.
+        if !config.delegated && tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(hrdr_llm::catalog::warm());
+        }
         if config.subagents
             && !config.delegated
             && in_git_repo(&config.cwd)

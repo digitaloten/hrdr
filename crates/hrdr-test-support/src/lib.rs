@@ -75,6 +75,13 @@ fn sandbox_user_state() {
         std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
         std::env::set_var("XDG_STATE_HOME", root.join("state"));
         std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
+        // No test reaches models.dev. Building an `Agent` warms the catalog in the
+        // background, which is right in production and wrong in a test suite:
+        // hundreds of agents would each open a network request, making the suite
+        // slow, flaky offline, and dependent on a third party being up. Tests that
+        // need catalog data pin it with `HRDR_MODELS_PATH`, which takes precedence
+        // over both the cache and any fetch.
+        std::env::set_var("HRDR_DISABLE_MODELS_FETCH", "1");
     }
 }
 
