@@ -2131,7 +2131,8 @@ mod tests {
     async fn timeout_kill_reaches_through_bwrap() {
         let Some(shell) = bwrap_shell() else { return };
         let dir = tempfile::tempdir().unwrap();
-        let ctx = confined_ctx(dir.path(), SandboxMode::Write);
+        let mut ctx = confined_ctx(dir.path(), SandboxMode::Write);
+        ctx.enforce_timeout_floor = false;
         let marker = dir.path().join("grandchild-finished");
 
         let command = format!("(sleep 5 && touch {m}) & sleep 5", m = marker.display());
@@ -2142,7 +2143,8 @@ mod tests {
                 &ctx,
             )
             .await
-            .unwrap();
+            .expect_err("a killed command is not a successful one")
+            .to_string();
         assert!(out.contains("timed out"), "{out}");
 
         // Well past the grandchild's own sleep: if it were alive it would

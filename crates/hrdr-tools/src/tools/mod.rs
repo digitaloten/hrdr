@@ -1420,14 +1420,16 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bash_timeout_kills_process_and_keeps_partial_output() {
-        let c = ctx(std::path::PathBuf::from("."));
+        let mut c = ctx(std::path::PathBuf::from("."));
+        c.enforce_timeout_floor = false;
         let out = ShellTool::new(Shell::Bash)
             .execute(
                 serde_json::json!({"command": "echo early; sleep 30", "timeout_secs": 1}),
                 &c,
             )
             .await
-            .unwrap();
+            .expect_err("a killed command is not a successful one")
+            .to_string();
         assert!(out.contains("early"), "partial output missing: {out}");
         assert!(out.contains("timed out"), "timeout marker missing: {out}");
     }

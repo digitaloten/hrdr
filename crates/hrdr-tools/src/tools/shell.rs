@@ -321,7 +321,16 @@ impl Tool for ShellTool {
             &ctx.sandbox_notices,
         );
         cmd.current_dir(&ctx.cwd);
-        let timeout = Duration::from_secs(a.timeout_secs.unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS));
+        // `shell` opts out of the registry's deadline (see `timeout_secs`), so it
+        // applies the same floor itself rather than inheriting it.
+        let (timeout_secs, raised_from) = crate::floored_timeout_secs(
+            a.timeout_secs
+                .filter(|s| *s > 0)
+                .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS),
+            DEFAULT_TOOL_TIMEOUT_SECS,
+            ctx.enforce_timeout_floor,
+        );
+        let timeout = Duration::from_secs(timeout_secs);
         // A command is the usual reason a file the model read goes stale — a
         // formatter, a codegen step, `git checkout`. Note which tracked files
         // this one changed (before/after signatures) so a later `edit` refusal
@@ -340,6 +349,18 @@ impl Tool for ShellTool {
             && let Some(note) = crate::sandbox::sandbox_denial_note(&ctx.sandbox, text)
         {
             text.push_str(&note);
+        }
+        // The deadline the call asked for was not the one it got. Said even when
+        // the command finished comfortably — the point is that the next call
+        // should not repeat the number. On both arms: a raised deadline is worth
+        // knowing about whether or not the command then failed for its own
+        // reasons.
+        if let Some(asked) = raised_from {
+            let note = crate::timeout_floor_note(asked, timeout_secs);
+            out = match out {
+                Ok(text) => Ok(format!("{text}\n{note}")),
+                Err(e) => Err(anyhow::anyhow!("{e}\n{note}")),
+            };
         }
         out
     }
@@ -608,6 +629,10 @@ async fn run_streamed_command(
             None
         }
     };
+    // `None` only ever means the deadline fired — every other path waits for an
+    // exit status. Kept as its own flag because it decides `Ok` vs `Err` below,
+    // and `status` is consumed by the exit-code notes in between.
+    let timed_out = status.is_none();
     if let Some(s) = status
         && !s.success()
     {
@@ -643,14 +668,14 @@ async fn run_streamed_command(
 
     // Nothing produced.
     if total_lines == 0 {
-        return Ok(format!("(no output){notes}"));
+        return finish(format!("(no output){notes}"), timed_out);
     }
 
     // Within both display caps: return the full in-memory view (no pointer needed).
     if total_bytes <= ctx.max_output && total_lines <= ctx.max_output_lines {
         // head holds all lines in this branch.
         let out = head.trim_end();
-        return Ok(format!("{out}{notes}"));
+        return finish(format!("{out}{notes}"), timed_out);
     }
 
     // Over the display cap: emit head + overflow pointer + tail, via the shared
@@ -683,7 +708,27 @@ async fn run_streamed_command(
         total_lines,
         total_bytes,
     );
-    Ok(format!("{body}{notes}"))
+    finish(format!("{body}{notes}"), timed_out)
+}
+
+/// The tool result for a finished run: `Ok` normally, `Err` when the deadline
+/// fired and the process tree was killed.
+///
+/// A non-zero exit stays `Ok` — the command ran and answered, and the answer is
+/// the output. A timeout is not an answer: the work was destroyed part-way, so
+/// what came back describes an incomplete run and nothing about whether the
+/// command would have succeeded. Reporting that as success is how a killed test
+/// suite becomes a green one — an observed failure, where a session set
+/// `timeout_secs: 30` on a three-crate `cargo test`, read the `ok` and committed.
+///
+/// The partial output rides the error rather than being dropped: it is often the
+/// whole diagnosis (which test hung, how far the build got), and an error that
+/// discards it forces a re-run of the command that just cost the deadline.
+fn finish(body: String, timed_out: bool) -> Result<String> {
+    if timed_out {
+        bail!("{body}");
+    }
+    Ok(body)
 }
 
 /// Trim already-bounded display text down to `max_bytes` and `max_lines`,
@@ -1027,11 +1072,15 @@ mod tests {
             p = pid_file.display(),
         );
 
-        let ctx = ToolContext::new(dir.path().to_path_buf());
-        let out = ShellTool::new(Shell::Bash)
+        // A one-second deadline is the whole point of this test, so opt out of
+        // the floor that would otherwise raise it to the default.
+        let mut ctx = ToolContext::new(dir.path().to_path_buf());
+        ctx.enforce_timeout_floor = false;
+        let err = ShellTool::new(Shell::Bash)
             .execute(json!({"command": command, "timeout_secs": 1}), &ctx)
             .await
-            .unwrap();
+            .expect_err("a killed command is not a successful one");
+        let out = err.to_string();
         assert!(out.contains("timed out"), "{out}");
 
         // Give the group-kill a moment to land, then check the grandchild
@@ -1057,6 +1106,85 @@ mod tests {
             !marker.exists(),
             "the grandchild's sleep completed — it was never actually killed"
         );
+    }
+
+    /// A deadline shorter than the default is raised back to it, and the call is
+    /// told so. `timeout_secs` may lengthen a deadline and never shorten it: a
+    /// short one cannot make a command finish sooner, only kill one still
+    /// working. The note fires even though the command succeeded — the number
+    /// the model chose was not the number used, and without saying so the next
+    /// call repeats it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_short_timeout_is_raised_to_the_default_and_said_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        assert!(ctx.enforce_timeout_floor, "a real session always floors");
+
+        let out = ShellTool::new(Shell::Bash)
+            .execute(json!({"command": "echo hi", "timeout_secs": 30}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("hi"), "the output still comes back: {out}");
+        assert!(
+            out.contains("timeout_secs=30 was raised to the 300s"),
+            "{out}"
+        );
+
+        // Longer than the default is honoured untouched, and says nothing.
+        let out = ShellTool::new(Shell::Bash)
+            .execute(json!({"command": "echo hi", "timeout_secs": 900}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            !out.contains("was raised"),
+            "a longer deadline stands: {out}"
+        );
+
+        // And an unset one is the default already — not something "raised".
+        let out = ShellTool::new(Shell::Bash)
+            .execute(json!({"command": "echo hi"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.contains("was raised"), "{out}");
+    }
+
+    /// A timeout is a failure, a non-zero exit is an answer, and the tool result
+    /// has to tell them apart. A session that set `timeout_secs: 30` on a
+    /// three-crate `cargo test` got its suite killed, read the success flag, and
+    /// committed — the prose in the body said "timed out" and the flag said
+    /// otherwise, and the flag is what gets skimmed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_fails_the_call_but_a_non_zero_exit_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ToolContext::new(dir.path().to_path_buf());
+        ctx.enforce_timeout_floor = false;
+
+        // Killed by the deadline: Err, and the partial output survives on it —
+        // dropping that would force a re-run of the command that just cost the
+        // deadline.
+        let err = ShellTool::new(Shell::Bash)
+            .execute(
+                json!({"command": "echo starting; sleep 30", "timeout_secs": 1}),
+                &ctx,
+            )
+            .await
+            .expect_err("a killed command is not a successful one");
+        let msg = err.to_string();
+        assert!(msg.contains("timed out after 1s"), "{msg}");
+        assert!(
+            msg.contains("starting"),
+            "partial output must survive: {msg}"
+        );
+
+        // Ran to completion and said no: still Ok. The command answered, and the
+        // answer is the output — only the deadline case is unknowable.
+        let out = ShellTool::new(Shell::Bash)
+            .execute(json!({"command": "echo nope; exit 3"}), &ctx)
+            .await
+            .expect("a non-zero exit is a result, not a tool failure");
+        assert!(out.contains("nope") && out.contains("exit status"), "{out}");
     }
 
     /// Regression (MAJOR): head + hint + tail must be re-trimmed to the

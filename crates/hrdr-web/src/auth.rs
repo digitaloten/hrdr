@@ -147,7 +147,7 @@ pub fn rate_limit_record(auth: &AuthState, ip: IpAddr) {
     }
     // Periodic full-map sweep: prune every entry and drop empty ones.
     let count = RATE_LIMIT_SWEEP_COUNT.fetch_add(1, Ordering::Relaxed);
-    if count % 64 == 0 {
+    if count.is_multiple_of(64) {
         guard.retain(|_ip, timestamps| {
             prune_rate_limit_entry(timestamps);
             !timestamps.is_empty()

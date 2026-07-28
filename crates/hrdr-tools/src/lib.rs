@@ -276,6 +276,11 @@ pub struct ToolContext {
     /// tools through [`apply_file_change`](crate::tools::apply_file_change), which
     /// is the one place every content mutation passes through.
     pub test_nudge: Arc<Mutex<TestNudgeState>>,
+    /// Whether a per-call `timeout_secs` shorter than the tool's own default is
+    /// raised back to it (see [`floored_timeout_secs`]). Always true in a real
+    /// session; tests set it false so a one-second deadline can still exercise
+    /// the timeout path.
+    pub enforce_timeout_floor: bool,
 }
 
 impl ToolContext {
@@ -299,6 +304,7 @@ impl ToolContext {
             sandbox: Arc::new(SandboxPolicy::unconfined()),
             sandbox_notices: Arc::new(SandboxNotices::default()),
             test_nudge: Arc::new(Mutex::new(TestNudgeState::default())),
+            enforce_timeout_floor: true,
         }
     }
 
@@ -1363,6 +1369,42 @@ fn call_timeout_secs(args: &serde_json::Value, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// The deadline a call actually gets, and the value it asked for when that was
+/// raised — `None` in the second slot when nothing was raised.
+///
+/// `timeout_secs` may LENGTHEN a deadline and never shorten it. Shortening looks
+/// like caution and is the opposite: the tool's default is the number that was
+/// chosen knowing what these calls cost, and a shorter one buys nothing except a
+/// chance of killing work that was still running. What comes back from a killed
+/// run is not a faster answer, it is no answer — and an agent that reads it as
+/// one has traded a slow success for a fast unknown. Observed: a session set
+/// `timeout_secs: 30` on a three-crate `cargo test`, had the run killed at 30s,
+/// and committed.
+///
+/// `enforce` is false only in tests, which need a one-second deadline to
+/// exercise the timeout path at all.
+pub(crate) fn floored_timeout_secs(
+    requested: u64,
+    default: u64,
+    enforce: bool,
+) -> (u64, Option<u64>) {
+    if enforce && requested < default {
+        return (default, Some(requested));
+    }
+    (requested, None)
+}
+
+/// The note a call carries when its deadline was raised. Rides the result rather
+/// than replacing it: the command still ran, and the model needs to know its own
+/// number was not the one used — otherwise the next call repeats it.
+pub(crate) fn timeout_floor_note(asked: u64, used: u64) -> String {
+    format!(
+        "note: timeout_secs={asked} was raised to the {used}s default — a deadline \
+         shorter than the default cannot make a command finish sooner, it can only \
+         kill one that was still working, and a killed run answers nothing"
+    )
+}
+
 /// Ordered registry of tools, keyed by name.
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
@@ -1498,10 +1540,14 @@ impl ToolRegistry {
         // default; a tool that manages its own deadline (`shell`, `watch`) reports
         // `None` and is awaited untouched, because it turns expiry into a result
         // worth keeping rather than an error.
-        let budget = tool
-            .timeout_secs()
-            .map(|default| call_timeout_secs(&args, default));
-        let Some(secs) = budget else {
+        let budget = tool.timeout_secs().map(|default| {
+            floored_timeout_secs(
+                call_timeout_secs(&args, default),
+                default,
+                ctx.enforce_timeout_floor,
+            )
+        });
+        let Some((secs, raised_from)) = budget else {
             return tool.execute(args, ctx).await;
         };
         match tokio::time::timeout(
@@ -1510,6 +1556,12 @@ impl ToolRegistry {
         )
         .await
         {
+            // The note rides a successful result only: a failure already has
+            // something to say, and the deadline was not what shaped it.
+            Ok(Ok(out)) if raised_from.is_some() => {
+                let note = timeout_floor_note(raised_from.unwrap_or(secs), secs);
+                Ok(format!("{out}\n{note}"))
+            }
             Ok(result) => result,
             // The future is dropped, which is what stops the work: a subprocess
             // is `kill_on_drop` and a file mutation lands atomically or not at

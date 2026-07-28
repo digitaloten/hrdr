@@ -6,7 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A timed-out command no longer reports success.** `shell` returned `ok` for a
+  run it had just killed, with the words "timed out" buried in the body — and
+  the flag is what gets skimmed. A session set `timeout_secs: 30` on a
+  three-crate `cargo test`, had the suite killed at 30 s, read the `ok`, and
+  committed. A timeout is now an error. A non-zero exit still is not: the
+  command ran and answered, and the answer is the output; only a killed run is
+  unknowable. The partial output rides the error rather than being dropped — it
+  is usually the whole diagnosis, and discarding it would force a re-run of the
+  command that just cost the deadline.
+
 ### Added
+
+- **`timeout_secs` can lengthen a deadline but no longer shorten it.** A value
+  below the tool's own default is raised back to it, and the result says so, so
+  the next call does not repeat the number. Shortening looks like caution and is
+  the opposite: the default was chosen knowing what these calls cost, and a
+  shorter one cannot make a command finish sooner — it can only kill one that
+  was still working, trading a slow success for a fast unknown. Applied in both
+  places a deadline is set: the registry, for every tool, and `shell`, which
+  opts out of the registry's timeout so it can keep partial output.
 
 - **A `todo` item cannot be ticked without saying how it was checked.** Moving
   an item to `completed` now requires an `evidence` string naming the command
