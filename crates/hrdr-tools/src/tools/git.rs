@@ -20,6 +20,12 @@ use crate::{Tool, ToolContext};
 
 /// The subcommands this tool will run. All are read-only: none writes to the
 /// index, the working tree, the object store, or a remote.
+///
+/// Public because the system prompt's Environment block names them: the tool's
+/// own description says "read-only", and a model still spends a round-trip
+/// discovering that `git add` is refused. One list, quoted in both places.
+pub const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = ALLOWED;
+
 const ALLOWED: &[&str] = &[
     "status", "diff", "log", "show", "blame", "branch", "describe", "remote", "shortlog",
 ];

@@ -339,35 +339,66 @@ pub fn project_agent_docs_section(docs: Option<&str>) -> String {
 /// Only the tool *names* are inlined — the full name/description/schema defs go
 /// out natively with every request, so repeating descriptions here would pay
 /// their tokens twice.
-pub fn environment_section(cwd: &Path, tools: &ToolRegistry) -> String {
-    let mut system = String::new();
-    let tool_names = tools
-        .defs()
-        .into_iter()
-        .map(|d| d.function.name)
-        .collect::<Vec<_>>()
-        .join(", ");
-    // Local date: models otherwise guess from their training cutoff and get it
-    // wrong in changelog dates, copyright headers, and anything date-relative.
-    // Re-rendered each session (and on /clear).
-    let date = chrono::Local::now().format("%Y-%m-%d");
+/// The session's concurrency caps on `task`, for the Environment block.
+///
+/// A tool schema cannot state these — they come from config
+/// (`max_readonly_subagents` / `max_write_subagents`, their `HRDR_*` vars, the
+/// CLI flags), so they differ per session and the `task` description has to stay
+/// generic. Without them in the prompt the only way to learn a cap is to exceed
+/// it: a run that fans out four write tasks gets two, then two refusals, and has
+/// to re-plan a batch it could have sized correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubagentLimits {
+    pub read_only: usize,
+    pub write: usize,
+}
+
+pub fn environment_section(cwd: &Path, tools: &ToolRegistry, limits: SubagentLimits) -> String {
+    // One `- ` bullet per entry, joined at the end. Built as a list rather than
+    // one format string because several entries are CONDITIONAL, and the old
+    // shape carried each optional entry's leading newline *inside* the variable
+    // (`"\n- Shell: …"` vs `""`) so that an absent one left no blank line. That
+    // works, but it puts `{date}{shell_line}` on one source line and reads as
+    // though the shell is appended to the date. A list has nowhere to hide that.
+    let names: Vec<String> = tools.defs().into_iter().map(|d| d.function.name).collect();
+    let has = |name: &str| names.iter().any(|n| n == name);
+    let mut lines: Vec<String> = vec![
+        format!("- Tools available: {}", names.join(", ")),
+        format!("- OS: {}", os_context()),
+        // Local date: models otherwise guess from their training cutoff and get
+        // it wrong in changelog dates, copyright headers, and anything
+        // date-relative. Re-rendered each session (and on /clear).
+        format!("- Date: {}", chrono::Local::now().format("%Y-%m-%d")),
+    ];
     // Name the shell the `shell` tool runs, so the model writes for it — but only
-    // when the agent actually has a shell (a read-only agent gets no line). Goes
-    // before the working directory so `cwd` stays the volatile tail.
-    let shell_line = match tools.shell() {
-        Some(shell) => format!("\n- Shell: {}", shell.env_label()),
-        None => String::new(),
-    };
-    system.push_str(&format!(
-        "\n\nEnvironment:\n\
-         - Tools available: {tool_names}\n\
-         - OS: {os}\n\
-         - Date: {date}{shell_line}\n\
-         - Working directory: {cwd}",
-        os = os_context(),
-        cwd = cwd.display(),
-    ));
-    system
+    // when the agent actually has a shell (a read-only agent gets no line).
+    if let Some(shell) = tools.shell() {
+        lines.push(format!("- Shell: {}", shell.env_label()));
+    }
+    // The limits a tool's own schema cannot carry, or carries where a model
+    // reliably misses it. Both are here because a real run paid a round-trip to
+    // discover them: `git add` refused, then four `task` calls for two slots.
+    // Stated as capabilities rather than warnings — what IS allowed, and how many
+    // — so the model plans within them instead of probing for the edge.
+    if has("git") {
+        lines.push(format!(
+            "- `git` tool is READ-ONLY — {}. Staging, committing, checkout, \
+             branch changes and push go through `shell`.",
+            hrdr_tools::GIT_READ_ONLY_SUBCOMMANDS.join(", "),
+        ));
+    }
+    if has("task") {
+        lines.push(format!(
+            "- `task` concurrency: at most {} read-only and {} write-capable \
+             sub-agents run at once. A call past the cap is refused, so size each \
+             batch to fit — the rest wait for a free slot.",
+            limits.read_only, limits.write,
+        ));
+    }
+    // Last, always: the cwd is the volatile tail this whole section exists to
+    // keep at the bottom (see the doc comment).
+    lines.push(format!("- Working directory: {}", cwd.display()));
+    format!("\n\nEnvironment:\n{}", lines.join("\n"))
 }
 
 /// Max bytes the skill listing may spend. Names are never dropped (a name the
@@ -744,6 +775,125 @@ pub fn gather_agent_docs(cwd: &Path) -> AgentDocs {
 mod tests {
     use super::*;
 
+    /// Fixed `task` caps, so a rendered Environment block is deterministic.
+    fn test_limits() -> SubagentLimits {
+        SubagentLimits {
+            read_only: 5,
+            write: 2,
+        }
+    }
+
+    /// A stand-in for the delegation tool, which the default registry does not
+    /// carry (it needs a runtime). Only its NAME matters here — the Environment
+    /// block gates the concurrency bullet on `task` being registered.
+    struct StubTask;
+
+    #[async_trait::async_trait]
+    impl hrdr_tools::Tool for StubTask {
+        fn name(&self) -> &'static str {
+            "task"
+        }
+        fn description(&self) -> &'static str {
+            "stub"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        async fn execute(
+            &self,
+            _a: serde_json::Value,
+            _c: &hrdr_tools::ToolContext,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// The Environment block is ONE BULLET PER LINE, whichever optional entries
+    /// are present — and every line is a bullet, with no blank ones.
+    ///
+    /// The optional entries used to carry their own leading newline so that an
+    /// absent one collapsed cleanly (`"\n- Shell: …"` vs `""`). It rendered
+    /// correctly and read as though the shell were being appended to the date;
+    /// this pins the output so the clearer construction cannot regress it.
+    #[test]
+    fn the_environment_block_is_one_bullet_per_line() {
+        let write = ToolRegistry::with_defaults();
+        let block = environment_section(Path::new("/tmp/x"), &write, test_limits());
+        let body = block
+            .strip_prefix("\n\nEnvironment:\n")
+            .expect("the block opens with its own header");
+        for line in body.lines() {
+            assert!(line.starts_with("- "), "not a bullet: {line:?}");
+        }
+        // Each entry stands alone — nothing is glued onto the date's line.
+        let starts: Vec<&str> = body
+            .lines()
+            .map(|l| l.split(':').next().unwrap_or(l))
+            .collect();
+        assert!(starts.contains(&"- Date"), "{starts:?}");
+        assert!(starts.contains(&"- OS"), "{starts:?}");
+        assert!(starts.contains(&"- Working directory"), "{starts:?}");
+        let date_line = body
+            .lines()
+            .find(|l| l.starts_with("- Date:"))
+            .expect("a date line");
+        assert_eq!(
+            date_line.matches("- ").count(),
+            1,
+            "the date line carries nothing but the date: {date_line:?}"
+        );
+
+        // No `task` in the default registry, so no concurrency bullet — an
+        // absent optional entry leaves no trace at all.
+        assert!(!body.contains("`task` concurrency"), "{body}");
+
+        // With `task` registered, the caps come from the passed-in limits rather
+        // than a constant, so a configured cap reaches the model.
+        let mut delegating = ToolRegistry::with_defaults();
+        delegating.register(std::sync::Arc::new(StubTask));
+        let with_task = environment_section(Path::new("/tmp/x"), &delegating, test_limits());
+        assert!(
+            with_task.contains("at most 5 read-only and 2 write-capable"),
+            "{with_task}"
+        );
+        assert!(
+            environment_section(
+                Path::new("/tmp/x"),
+                &delegating,
+                SubagentLimits {
+                    read_only: 9,
+                    write: 4,
+                },
+            )
+            .contains("at most 9 read-only and 4 write-capable"),
+            "the numbers track the config, not a default"
+        );
+
+        // …and the git line quotes the tool's own allow-list, so the two cannot
+        // drift apart.
+        for sub in hrdr_tools::GIT_READ_ONLY_SUBCOMMANDS {
+            assert!(body.contains(sub), "git subcommand {sub} missing: {body}");
+        }
+
+        // A read-only agent has no `task` and no shell, so those bullets vanish
+        // rather than rendering empty.
+        let mut ro = ToolRegistry::with_defaults();
+        let ro_names = ro.read_only_names();
+        ro.retain_only(&ro_names);
+        let ro_block = environment_section(Path::new("/tmp/x"), &ro, test_limits());
+        let ro_body = ro_block
+            .strip_prefix("\n\nEnvironment:\n")
+            .expect("the block opens with its own header");
+        assert!(!ro_body.contains("`task` concurrency"), "{ro_body}");
+        assert!(!ro_body.contains("- Shell:"), "no shell tool: {ro_body}");
+        // The gap the optional entries used to leave: a dropped bullet must
+        // collapse entirely, not become an empty line.
+        assert!(!ro_body.contains("\n\n"), "no blank lines: {ro_body:?}");
+        for line in ro_body.lines() {
+            assert!(line.starts_with("- "), "not a bullet: {line:?}");
+        }
+    }
+
     /// Assemble the hrdr-authored prompt for an explicit gate combination — the
     /// test-side counterpart of [`capability_sections_for`]. Lets a test ask for
     /// any combination (a write agent with no shell, say) without constructing a
@@ -768,7 +918,7 @@ mod tests {
         // now (appended after the base body), so build the full prompt to assert
         // on both the body rules and the environment.
         let p = render_system(&tools, false).unwrap()
-            + &environment_section(Path::new("/tmp/x"), &tools);
+            + &environment_section(Path::new("/tmp/x"), &tools, test_limits());
         // Tool names present, one line, but not their long descriptions
         // (those ship natively as function defs — no double token spend).
         assert!(p.contains("read"));
@@ -2432,7 +2582,7 @@ mod tests {
         let tools = ToolRegistry::with_defaults();
         // The date rides the trailing environment block now.
         let p = render_system(&tools, false).unwrap()
-            + &environment_section(Path::new("/tmp/x"), &tools);
+            + &environment_section(Path::new("/tmp/x"), &tools, test_limits());
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         assert!(p.contains(&format!("- Date: {today}")), "{p}");
     }
@@ -2446,7 +2596,7 @@ mod tests {
         let tools = ToolRegistry::with_defaults();
         let shell = tools.shell().expect("a dev machine has a shell");
         let write = render_system(&tools, false).unwrap()
-            + &environment_section(Path::new("/tmp/x"), &tools);
+            + &environment_section(Path::new("/tmp/x"), &tools, test_limits());
         // Whatever this machine resolved, the line is the shell's own label.
         let expected = format!("- Shell: {}", shell.env_label());
         assert!(write.contains(&expected), "{write}");
@@ -2456,8 +2606,8 @@ mod tests {
         let names = ro.read_only_names();
         ro.retain_only(&names);
         assert!(ro.shell().is_none());
-        let read =
-            render_system(&ro, false).unwrap() + &environment_section(Path::new("/tmp/x"), &ro);
+        let read = render_system(&ro, false).unwrap()
+            + &environment_section(Path::new("/tmp/x"), &ro, test_limits());
         assert!(!read.contains("- Shell:"), "{read}");
     }
 

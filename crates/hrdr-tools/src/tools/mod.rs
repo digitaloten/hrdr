@@ -233,7 +233,7 @@ pub(crate) fn rel_display<'a>(
 pub use edit::EditTool;
 pub use fileops::{CopyTool, DeleteTool, MoveTool};
 pub use find::FindTool;
-pub use git::{GitTool, redact_secret_diffs};
+pub use git::{GIT_READ_ONLY_SUBCOMMANDS, GitTool, redact_secret_diffs};
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use lsp_nav::{DefinitionTool, ReferencesTool, RenameTool};

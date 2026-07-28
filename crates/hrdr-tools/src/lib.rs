@@ -46,10 +46,10 @@ pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
 pub use tools::{
-    CopyTool, DEFAULT_TOOL_TIMEOUT_SECS, DefinitionTool, DeleteTool, EditTool, FindTool, GitTool,
-    GrepTool, LsTool, MoveTool, ReadTool, ReferencesTool, RenameTool, ReplaceTool, Shell,
-    ShellTool, TodoTool, TreeTool, WatchTool, WriteTool, available_shell_tools,
-    redact_secret_diffs,
+    CopyTool, DEFAULT_TOOL_TIMEOUT_SECS, DefinitionTool, DeleteTool, EditTool, FindTool,
+    GIT_READ_ONLY_SUBCOMMANDS, GitTool, GrepTool, LsTool, MoveTool, ReadTool, ReferencesTool,
+    RenameTool, ReplaceTool, Shell, ShellTool, TodoTool, TreeTool, WatchTool, WriteTool,
+    available_shell_tools, redact_secret_diffs,
 };
 pub use web::{WebFetchTool, WebSearchTool};
 

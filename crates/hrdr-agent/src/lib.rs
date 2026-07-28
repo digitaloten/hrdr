@@ -974,6 +974,10 @@ pub struct Agent {
     /// agent — `task_revive`, through the sub-agent snapshot — can restore the
     /// same scope instead of assuming write capability.
     read_only: bool,
+    /// The `task` concurrency caps this session runs under, named in the prompt's
+    /// Environment block. Kept on the agent because the prompt is REBUILT when
+    /// memory or skills change, and a rebuild must not quietly drop them.
+    subagent_limits: prompt::SubagentLimits,
     /// Prompt tokens the last model call actually used — the agent's own view of
     /// how full its context is, so it can compact before the next request rather
     /// than after one has already failed. See [`Agent::maybe_self_compact`].
@@ -1244,6 +1248,7 @@ fn build_system_prompt_sections(
     persona: Option<&str>,
     delegated: bool,
     sandbox: &hrdr_tools::SandboxPolicy,
+    limits: prompt::SubagentLimits,
 ) -> Result<prompt::SystemPrompt> {
     use prompt::{
         SECTION_BASE, SECTION_ENVIRONMENT, SECTION_GLOBAL_AGENTS_MD, SECTION_GLOBAL_MEMORY,
@@ -1286,7 +1291,10 @@ fn build_system_prompt_sections(
     // cwd, so they sit below the environment block — the cache split is taken
     // before `SECTION_ENVIRONMENT`, so appending here costs the prefix nothing.
     p.push(SECTION_PERSONA, persona_section(persona));
-    p.push(SECTION_ENVIRONMENT, prompt::environment_section(cwd, tools));
+    p.push(
+        SECTION_ENVIRONMENT,
+        prompt::environment_section(cwd, tools, limits),
+    );
     p.push(SECTION_SANDBOX, prompt::sandbox_section(sandbox));
     Ok(p)
 }
@@ -1308,9 +1316,10 @@ fn build_system_prompt(
     persona: Option<&str>,
     delegated: bool,
     sandbox: &hrdr_tools::SandboxPolicy,
+    limits: prompt::SubagentLimits,
 ) -> Result<(String, Option<usize>)> {
     let p = build_system_prompt_sections(
-        tools, cwd, docs, memory, skills, persona, delegated, sandbox,
+        tools, cwd, docs, memory, skills, persona, delegated, sandbox, limits,
     )?;
     let split = p.prefix_len_before(prompt::SECTION_ENVIRONMENT);
     Ok((p.render(), split))
@@ -1649,6 +1658,10 @@ impl Agent {
             .as_ref()
             .map(|(p, g)| gather_memory(p, g))
             .unwrap_or_default();
+        let subagent_limits = prompt::SubagentLimits {
+            read_only: config.max_readonly_subagents,
+            write: config.max_write_subagents,
+        };
         let (system, system_cache_split) = build_system_prompt(
             &tools,
             &config.cwd,
@@ -1658,6 +1671,7 @@ impl Agent {
             config.agent_prompt.as_deref(),
             config.delegated,
             &ctx.sandbox,
+            subagent_limits,
         )?;
 
         // Configure the client from the (possibly auth-switched) resolved model,
@@ -1722,6 +1736,7 @@ impl Agent {
             live_home: None,
             delegated: config.delegated,
             read_only: config.read_only,
+            subagent_limits,
             last_prompt_tokens: None,
             prompt_cache: config.prompt_cache,
             tools,
@@ -1923,6 +1938,7 @@ impl Agent {
             self.agent_prompt.as_deref(),
             self.delegated,
             &self.ctx.sandbox,
+            self.subagent_limits,
         ) else {
             return;
         };
@@ -1993,6 +2009,7 @@ impl Agent {
             self.agent_prompt.as_deref(),
             self.delegated,
             &self.ctx.sandbox,
+            self.subagent_limits,
         ) else {
             return;
         };
@@ -4939,6 +4956,10 @@ mod tests {
                 Some("the persona"),
                 false,
                 sandbox,
+                super::prompt::SubagentLimits {
+                    read_only: DEFAULT_MAX_READONLY_SUBAGENTS,
+                    write: DEFAULT_MAX_WRITE_SUBAGENTS,
+                },
             )
             .unwrap()
         };
@@ -4995,6 +5016,10 @@ mod tests {
             None,
             false,
             &hrdr_tools::SandboxPolicy::unconfined(),
+            super::prompt::SubagentLimits {
+                read_only: DEFAULT_MAX_READONLY_SUBAGENTS,
+                write: DEFAULT_MAX_WRITE_SUBAGENTS,
+            },
         )
         .unwrap();
 
@@ -5024,6 +5049,10 @@ mod tests {
             None,
             false,
             &hrdr_tools::SandboxPolicy::unconfined(),
+            super::prompt::SubagentLimits {
+                read_only: DEFAULT_MAX_READONLY_SUBAGENTS,
+                write: DEFAULT_MAX_WRITE_SUBAGENTS,
+            },
         )
         .unwrap();
 
