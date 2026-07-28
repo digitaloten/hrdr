@@ -13,6 +13,7 @@ pub(crate) mod secret_diff;
 pub(crate) mod shell;
 pub(crate) mod todo;
 pub(crate) mod tree;
+pub(crate) mod verify;
 pub(crate) mod watch;
 pub(crate) mod write;
 
@@ -242,6 +243,7 @@ pub use secret_diff::redact_secret_diffs;
 pub use shell::{Shell, ShellTool, available_shell_tools};
 pub use todo::TodoTool;
 pub use tree::TreeTool;
+pub use verify::{DEFAULT_VERIFY_TIMEOUT_SECS, VerifyTool};
 pub use watch::WatchTool;
 pub use write::WriteTool;
 

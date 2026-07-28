@@ -54,9 +54,10 @@ pub use memory::MemoryTool;
 pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
 pub use test_nudge::{TEST_NUDGE_NOTE, TestNudgeState};
 pub use tools::{
-    CopyTool, DEFAULT_TOOL_TIMEOUT_SECS, DefinitionTool, DeleteTool, EditTool, FindTool, GrepTool,
-    LsTool, MoveTool, ReadTool, ReferencesTool, RenameTool, ReplaceTool, Shell, ShellTool,
-    TodoTool, TreeTool, WatchTool, WriteTool, available_shell_tools, redact_secret_diffs,
+    CopyTool, DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_VERIFY_TIMEOUT_SECS, DefinitionTool, DeleteTool,
+    EditTool, FindTool, GrepTool, LsTool, MoveTool, ReadTool, ReferencesTool, RenameTool,
+    ReplaceTool, Shell, ShellTool, TodoTool, TreeTool, VerifyTool, WatchTool, WriteTool,
+    available_shell_tools, redact_secret_diffs,
 };
 pub use verification::{CheckKind, Scope, VerificationLedger};
 pub use web::{WebFetchTool, WebSearchTool};
@@ -1455,6 +1456,13 @@ impl ToolRegistry {
         for shell in available_shell_tools() {
             r.register(shell);
         }
+        // `verify` runs the project's gate commands, so it needs the same shell
+        // — asked of the registry rather than detected a second time, so the two
+        // cannot end up on different dialects. No shell, no `verify`: the tool's
+        // entire body is running commands.
+        if let Some(shell) = r.shell() {
+            r.register(Arc::new(VerifyTool::new(shell)));
+        }
         r.register(Arc::new(GrepTool::detect()));
         r.register(Arc::new(FindTool));
         r.register(Arc::new(LsTool));
@@ -2186,7 +2194,7 @@ mod tests {
             let name = def.function.name.clone();
             let props = def.function.parameters.get("properties");
             let advertised = props.and_then(|p| p.get("timeout_secs")).is_some();
-            let tool_manages_own = matches!(name.as_str(), "shell" | "watch");
+            let tool_manages_own = matches!(name.as_str(), "shell" | "watch" | "verify");
             assert!(
                 advertised,
                 "{name} must advertise timeout_secs (self-managed: {tool_manages_own})"

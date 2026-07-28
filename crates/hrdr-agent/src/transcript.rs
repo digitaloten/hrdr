@@ -339,6 +339,10 @@ pub fn tool_display(name: &str, args: &str) -> ToolDisplay {
             plain(s)
         }
         "ls" | "tree" => plain(arg_str(&v, "path").unwrap_or_else(|| ".".into())),
+        // `verify` usually takes no arguments at all, so the generic
+        // arguments-as-rows fallback would render a header with nothing under
+        // it. What the call is *for* is fixed, so say that.
+        "verify" => plain("project gate".to_string()),
         // The tool result already contains the normalized replacement list.
         // Rendering the input too duplicates every item and can disagree with
         // normalization performed by the tool.

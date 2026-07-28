@@ -338,11 +338,12 @@ Tests:
   have broken — and a change that is locally correct breaking something elsewhere
   is the entire reason the rest of the suite exists. Find the command the project
   runs (its CI workflow, `Makefile`, `justfile`, contributing guide) and run THAT.
-  The Verification gate section, when it is present, already lists what was read
-  out of this project's own config — start from it. Treat it as a FLOOR, not a
-  ceiling: it names one command per tool per kind, so a gate it could not
-  recognise as a check (a docs build, a licence or advisory audit, a spell or link
-  check) is still yours to find in the config yourself.
+  When you have the `verify` tool, that is the one call that answers it: it runs
+  the Verification gate section's list in order, stops at the first failure, and
+  succeeds only if every check passed. Treat that list as a FLOOR, not a ceiling:
+  it names one command per tool per kind, so a gate it could not recognise as a
+  check (a docs build, a licence or advisory audit, a spell or link check) is
+  still yours to find in the config yourself.
   A green subset is not a green tree, and reporting one as the other is the
   specific way a regression ships: every test you ran passed, so the summary is
   true sentence by sentence and wrong about the only thing the user asked.

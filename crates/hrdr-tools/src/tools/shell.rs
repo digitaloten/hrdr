@@ -360,7 +360,12 @@ impl Tool for ShellTool {
         // hasn't seen what the command wrote, which is exactly what the
         // read-before-mutate guard is for.
         let before = ctx.tracked_sigs();
-        let mut out = run_streamed_command(cmd, &a.command, timeout, a.keep_ansi, ctx).await;
+        // `shell` reports the output and lets the model judge the exit code, so
+        // the run's `passed` flag is dropped here — `verify` is the caller that
+        // needs it (see [`CommandRun`]).
+        let mut out = run_streamed_command(cmd, &a.command, timeout, a.keep_ansi, ctx)
+            .await
+            .map(|run| run.output);
         // Also on failure: a command that exited non-zero (or timed out) may
         // still have rewritten files before it died.
         ctx.note_modifying_command(&before, &a.command);
@@ -444,13 +449,13 @@ async fn read_line_capped<R: AsyncBufRead + Unpin>(
 /// `command` is the raw command string — the same one `cmd` runs. It is needed
 /// for the result notes (grep-tail exit 1, spool reuse), which are about the
 /// *shape* of the command rather than its output.
-async fn run_streamed_command(
+pub(crate) async fn run_streamed_command(
     mut cmd: tokio::process::Command,
     command: &str,
     timeout: Duration,
     keep_ansi: bool,
     ctx: &ToolContext,
-) -> Result<String> {
+) -> Result<CommandRun> {
     // Looked up *before* the run, so this run's own spool (recorded at the end)
     // can't answer for itself: the note is about output the model already had.
     let prior_spool = ctx.spooled_output_for(command);
@@ -698,8 +703,8 @@ async fn run_streamed_command(
     // of text this function just wrote holds only until a command's own output
     // contains that string, and needs one spelling kept in sync across two
     // places to hold at all.
+    let passed = status.is_some_and(|s| s.success());
     {
-        let passed = status.is_some_and(|s| s.success());
         let mut ledger = ctx
             .verification
             .lock()
@@ -721,14 +726,14 @@ async fn run_streamed_command(
 
     // Nothing produced.
     if total_lines == 0 {
-        return finish(format!("(no output){notes}"), timed_out);
+        return finish(format!("(no output){notes}"), timed_out, passed);
     }
 
     // Within both display caps: return the full in-memory view (no pointer needed).
     if total_bytes <= ctx.max_output && total_lines <= ctx.max_output_lines {
         // head holds all lines in this branch.
         let out = head.trim_end();
-        return finish(format!("{out}{notes}"), timed_out);
+        return finish(format!("{out}{notes}"), timed_out, passed);
     }
 
     // Over the display cap: emit head + overflow pointer + tail, via the shared
@@ -761,7 +766,20 @@ async fn run_streamed_command(
         total_lines,
         total_bytes,
     );
-    finish(format!("{body}{notes}"), timed_out)
+    finish(format!("{body}{notes}"), timed_out, passed)
+}
+
+/// What a finished command produced.
+///
+/// `passed` is carried alongside the text rather than left to be read back out
+/// of it, because the two answer different questions. The text is what the model
+/// sees, and a non-zero exit is a legitimate `Ok` tool result — the command ran
+/// and answered. Whether it *succeeded* is a separate fact, and `verify` needs
+/// it: reconstructing it by grepping for `[exit status:` in output the tool just
+/// assembled holds only until a command's own output contains that string.
+pub(crate) struct CommandRun {
+    pub output: String,
+    pub passed: bool,
 }
 
 /// The tool result for a finished run: `Ok` normally, `Err` when the deadline
@@ -777,11 +795,14 @@ async fn run_streamed_command(
 /// The partial output rides the error rather than being dropped: it is often the
 /// whole diagnosis (which test hung, how far the build got), and an error that
 /// discards it forces a re-run of the command that just cost the deadline.
-fn finish(body: String, timed_out: bool) -> Result<String> {
+fn finish(body: String, timed_out: bool, passed: bool) -> Result<CommandRun> {
     if timed_out {
         bail!("{body}");
     }
-    Ok(body)
+    Ok(CommandRun {
+        output: body,
+        passed,
+    })
 }
 
 /// Trim already-bounded display text down to `max_bytes` and `max_lines`,

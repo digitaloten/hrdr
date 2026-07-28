@@ -1318,7 +1318,7 @@ fn build_system_prompt_sections(
         SECTION_ENVIRONMENT,
         prompt::environment_section(cwd, tools, limits),
     );
-    p.push(SECTION_GATE, prompt::gate_section(gate));
+    p.push(SECTION_GATE, prompt::gate_section(gate, tools));
     p.push(SECTION_SANDBOX, prompt::sandbox_section(sandbox));
     Ok(p)
 }

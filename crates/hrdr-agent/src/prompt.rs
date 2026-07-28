@@ -499,10 +499,22 @@ fn truncate_words(text: &str, max: usize) -> String {
 /// fact about the project and is stated as one; an ecosystem-derived gate is a
 /// convention hrdr is applying on the project's behalf, and saying so is what
 /// lets the model correct it out loud instead of silently obeying a guess.
-pub fn gate_section(gate: &hrdr_tools::Gate) -> String {
+pub fn gate_section(gate: &hrdr_tools::Gate, tools: &ToolRegistry) -> String {
     if gate.is_empty() {
         return String::new();
     }
+    // Naming the tool only when it is registered. A prompt that sends the model
+    // after a `verify` it does not have costs a refused call and a turn spent
+    // working out why — and this section is exactly where an agent with no shell
+    // (which is where `verify` is absent) would take the instruction literally.
+    let has_verify = tools.defs().iter().any(|d| d.function.name == "verify");
+    let runner = if has_verify {
+        "\nThe `verify` tool runs exactly this list, in this order, and stops at the first \
+         failure. Prefer it over running them by hand: it answers the whole question in one \
+         call, and it cannot report a subset as the whole."
+    } else {
+        ""
+    };
     let framing = match gate.source {
         Some(hrdr_tools::GateSource::Ci) => format!(
             "These are the checks this project's CI runs ({}). They are what turns a change \
@@ -518,7 +530,7 @@ pub fn gate_section(gate: &hrdr_tools::Gate) -> String {
         "\n\nVerification gate:\n\
          {framing}. Run them from your working directory, and make them pass, before you \
          report work finished or commit it:\n\
-         {}\n\
+         {}\n{runner}\n\
          A narrower command proves a narrower thing — a green `-p one-crate` or a green single \
          test file is not this gate, and reporting it as though it were is the failure this \
          section exists to prevent. If one of these is genuinely wrong for what you changed, \
@@ -2832,6 +2844,7 @@ mod tests {
     /// command the model runs and then has to debug.
     #[test]
     fn the_gate_section_names_every_command_and_where_it_came_from() {
+        let tools = ToolRegistry::with_defaults();
         let ci = hrdr_tools::Gate {
             checks: vec![
                 hrdr_tools::GateCheck {
@@ -2846,7 +2859,7 @@ mod tests {
             source: Some(hrdr_tools::GateSource::Ci),
             origins: vec![".github/workflows/ci.yml".to_string()],
         };
-        let s = gate_section(&ci);
+        let s = gate_section(&ci, &tools);
         assert!(s.starts_with("\n\nVerification gate:\n"), "{s}");
         assert!(
             s.contains("`cargo clippy --all-targets -- -D warnings` (lint)"),
@@ -2862,13 +2875,42 @@ mod tests {
             origins: vec!["Cargo.toml".to_string()],
             ..ci.clone()
         };
-        let s = gate_section(&guessed);
+        let s = gate_section(&guessed, &tools);
         assert!(s.contains("no CI configuration found"), "{s}");
         assert!(s.contains("unless the project says otherwise"), "{s}");
 
         // Nothing discovered: say nothing. Naming a gate we did not find sends
         // the model after a command that does not exist here.
-        assert!(gate_section(&hrdr_tools::Gate::default()).is_empty());
+        assert!(gate_section(&hrdr_tools::Gate::default(), &tools).is_empty());
+    }
+
+    /// `verify` is named only where it exists. An agent with no shell has no
+    /// `verify`, and telling it to call one costs a refused call and a turn
+    /// spent working out why.
+    #[test]
+    fn the_gate_section_names_verify_only_when_it_is_registered() {
+        let gate = hrdr_tools::Gate {
+            checks: vec![hrdr_tools::GateCheck {
+                kind: hrdr_tools::CheckKind::Test,
+                command: "cargo test --workspace".to_string(),
+            }],
+            source: Some(hrdr_tools::GateSource::Ci),
+            origins: vec![".github/workflows/ci.yml".to_string()],
+        };
+        let mut tools = ToolRegistry::with_defaults();
+        // Only meaningful on a machine that HAS a shell — `with_defaults`
+        // registers `verify` alongside one, so skip where there is none rather
+        // than assert something the build cannot satisfy.
+        if tools.shell().is_some() {
+            assert!(gate_section(&gate, &tools).contains("`verify` tool"));
+        }
+        tools.retain_only(&["read".to_string()]);
+        let s = gate_section(&gate, &tools);
+        assert!(!s.contains("`verify`"), "{s}");
+        assert!(
+            s.contains("cargo test --workspace"),
+            "the gate is still stated: {s}"
+        );
     }
 
     /// The model is told its boundary positively, and every writable root is

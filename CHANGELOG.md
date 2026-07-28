@@ -8,6 +8,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A `verify` tool that runs the gate and answers one question.** Everything
+  else in this story only describes: the prompt names the gate, the ledger
+  notices when it has not been cleared, the commit note says so — and each is a
+  sentence a model can read, agree with, and not act on. (The session that
+  prompted all of this had four separate rules in its system prompt telling it
+  to run the whole suite.) `verify` is the part that cannot be read past: one
+  call runs every gate command in order, stops at the **first** failure, and
+  returns `Ok` only if all of them passed. A failure comes back as an error
+  carrying that command's output plus what had already passed, so a run stopped
+  at check two cannot be summarised as though checks three and four also went
+  green. There is deliberately no argument for choosing which checks to run — a
+  filter is a way to answer "did everything pass" with a subset — so `shell`
+  stays the way to run one check, and `verify` the way to get the answer. A
+  project with no discoverable gate is an error, not a pass. Each command gets
+  its own 15-minute deadline (a shared one would spend the suite's budget on the
+  formatter), with the same floor `shell` applies. Registered wherever a shell
+  is, dropped for read-only agents, and named in the prompt only when it is
+  actually present.
 - **hrdr reads the project's CI to learn what "done" means here.** The
   verification ledger below knew a run was partial but had no idea what a
   complete one would have been. It does now: at startup hrdr discovers the

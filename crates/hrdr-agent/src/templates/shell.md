@@ -6,9 +6,10 @@ Verifying:
   scripts, a `Makefile`/`justfile`/`Taskfile`, `CONTRIBUTING.md`, the CI workflow
   (`.github/workflows`) — and use those, not a guess.
 - Run the project's WHOLE gate set, not the four commands you habitually run. The
-  Verification gate section, when it is present, is the list already read out of
-  this project's config — start from it, and treat it as a FLOOR: it names one
-  command per tool per kind, and drops anything it could not recognise as a check.
+  `verify` tool runs the list in the Verification gate section, in order, stopping
+  at the first failure — one call for "is this green", and it cannot answer with a
+  subset. Treat that list as a FLOOR, though: it names one command per tool per
+  kind, and drops anything it could not recognise as a check.
   Open its CI config and enumerate every job, then run each one's command locally. Past
   build/test/format/lint, projects gate things that are easy to forget and fail
   loudly in CI: an API-docs build treating warnings as errors, a
