@@ -130,7 +130,14 @@ pub fn check_rate_limit(auth: &AuthState, ip: IpAddr) -> bool {
     let mut guard = auth.rate_limiter.lock().unwrap();
     let entry = guard.entry(ip).or_default();
     prune_rate_limit_entry(entry);
-    entry.len() < 10
+    let count = entry.len();
+    // Remove the IP key when its entry is empty so the map doesn't grow
+    // without bound — successful auths call check_rate_limit but not
+    // rate_limit_record, so empty entries would otherwise accumulate unboundedly.
+    if count == 0 {
+        guard.remove(&ip);
+    }
+    count < 10
 }
 
 /// Record a failed auth attempt.
