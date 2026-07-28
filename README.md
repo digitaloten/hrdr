@@ -551,7 +551,13 @@ status bar's "X of Y" and the auto-compaction threshold.
 ### Context management
 
 hrdr keeps context under control in three layers (modeled on opencode), all
-tunable in `config.toml`:
+tunable in `config.toml`.
+
+> **Config keys are strict.** An unrecognised key in any table is a startup error
+> naming the field and the ones that were expected, rather than being silently
+> ignored — a typo'd `timout_secs` that quietly does nothing is worse than one
+> that fails. Every duration is **seconds**; the old `timeout_ms` / `wait_ms`
+> spellings are rejected with the converted value to use.
 
 ```toml
 # Per-tool output caps: over either limit, shell/grep/git output is truncated and
@@ -1032,7 +1038,7 @@ error.
 on = "edit"                 # edit | write | * (default: *)
 glob = "*.rs"               # optional; name or cwd-relative path
 run = "cargo fmt -- {path}" # {path} = quoted file path
-timeout_ms = 30000          # optional (default 30000)
+timeout_secs = 30           # optional (default 30)
 
 [[hooks]]
 glob = "*.{md,ts,json}"
@@ -1047,7 +1053,7 @@ event (plus `HRDR_HOOK_EVENT` / `HRDR_HOOK_TOOL` in its environment) and speaks
 through its exit code: **0** proceeds, **2 blocks** the tool call or prompt
 (stderr becomes the reason the model sees), and any other failure is a
 non-blocking warning. Hooks run sequentially, each bounded by its own
-`timeout_ms`.
+`timeout_secs`.
 
 | `event`         | Fires                                          | Payload extras                 | Special powers                               |
 | --------------- | ---------------------------------------------- | ------------------------------ | -------------------------------------------- |
@@ -1095,16 +1101,17 @@ overlap their warm-up with your first prompt instead of missing the first edit's
 diagnostics. `/doctor` shows each server's status. Built-ins: `rust-analyzer`
 (.rs), `typescript-language-server` (.ts/.tsx/.js/…), `pyright-langserver`
 (.py), `gopls` (.go), `clangd` (.c/.cpp/…). Diagnostics run on what's actually
-on disk — after any formatter hooks. Each edit waits at most `wait_ms` (default
-2000 ms) for the server; a slow or dead server degrades to "no diagnostics",
-never to a failed edit. Files outside the workspace the servers were initialized
-against — a worktree-isolated sub-agent's tree, temp-dir scratch files — are
-deliberately skipped rather than left to server-dependent behavior.
+on disk — after any formatter hooks. Each edit waits at most `wait_secs`
+(default 2 s) for the server; a slow or dead server degrades to "no
+diagnostics", never to a failed edit. Files outside the workspace the servers
+were initialized against — a worktree-isolated sub-agent's tree, temp-dir
+scratch files — are deliberately skipped rather than left to server-dependent
+behavior.
 
 ```toml
 [lsp]
 enabled = true   # default; `false` (or HRDR_LSP=0) turns it off
-wait_ms = 2000   # per-edit diagnostics wait
+wait_secs = 2    # per-edit diagnostics wait (0 skips it)
 
 # Custom servers are consulted before the built-ins:
 [[lsp.servers]]

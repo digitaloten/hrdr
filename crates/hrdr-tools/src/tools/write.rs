@@ -261,7 +261,7 @@ mod tests {
             on: "edit".to_string(),
             glob: None,
             run: "exit 7".to_string(),
-            timeout_ms: crate::DEFAULT_HOOK_TIMEOUT_MS,
+            timeout_secs: crate::DEFAULT_HOOK_TIMEOUT_SECS,
         }]);
         c.mark_read(&path);
 

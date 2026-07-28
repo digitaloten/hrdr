@@ -566,8 +566,8 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
 async fn lsp_status_text(agent: &std::sync::Arc<tokio::sync::Mutex<hrdr_agent::Agent>>) -> String {
     match agent.lock().await.lsp_statuses().await {
         None => "lsp: disabled".to_string(),
-        Some((wait_ms, reports)) => {
-            let mut out = format!("lsp: enabled (wait {wait_ms}ms)");
+        Some((wait_secs, reports)) => {
+            let mut out = format!("lsp: enabled (wait {wait_secs}ms)");
             for r in reports {
                 out.push_str(&format!(
                     "\n  {} (.{}): {}",

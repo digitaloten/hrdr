@@ -31,12 +31,12 @@ pub struct Hook {
     pub glob: Option<glob::Pattern>,
     /// Shell command template; every `{path}` becomes the (quoted) file path.
     pub run: String,
-    /// Kill the hook after this long (default [`DEFAULT_HOOK_TIMEOUT_MS`]).
-    pub timeout_ms: u64,
+    /// Kill the hook after this long (default [`DEFAULT_HOOK_TIMEOUT_SECS`]).
+    pub timeout_secs: u64,
 }
 
 /// Default per-hook timeout: formatters are fast; anything slower is stuck.
-pub const DEFAULT_HOOK_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 
 impl Hook {
     /// Whether this hook applies to `tool` mutating `path` (relative to `cwd`).
@@ -103,7 +103,7 @@ pub async fn run_file_hooks(hooks: &[Hook], tool: &str, path: &Path, cwd: &Path)
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
-        let timeout = Duration::from_millis(hook.timeout_ms);
+        let timeout = Duration::from_secs(hook.timeout_secs);
         // `Ok(Ok(out))` / `Ok(Err(spawn_err))` / `Err(Elapsed)` — same shape
         // `tokio::time::timeout(timeout, cmd.output()).await` produced, so the
         // match below is unchanged; spawning is just pulled out in front so we
@@ -143,7 +143,7 @@ pub async fn run_file_hooks(hooks: &[Hook], tool: &str, path: &Path, cwd: &Path)
             Ok(Err(e)) => notes.push(format!("[hook `{}` couldn't run: {e}]", hook.run)),
             Err(_) => notes.push(format!(
                 "[hook `{}` timed out after {}ms; killed]",
-                hook.run, hook.timeout_ms
+                hook.run, hook.timeout_secs
             )),
         }
     }
@@ -208,8 +208,8 @@ pub struct EventHook {
     /// Shell command; receives the event payload as JSON on stdin, plus
     /// `HRDR_HOOK_EVENT` / `HRDR_HOOK_TOOL` in the environment.
     pub run: String,
-    /// Kill the hook after this long (default [`DEFAULT_HOOK_TIMEOUT_MS`]).
-    pub timeout_ms: u64,
+    /// Kill the hook after this long (default [`DEFAULT_HOOK_TIMEOUT_SECS`]).
+    pub timeout_secs: u64,
 }
 
 /// What a round of lifecycle hooks decided.
@@ -266,7 +266,7 @@ pub async fn run_event_hooks(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let timeout = Duration::from_millis(hook.timeout_ms);
+        let timeout = Duration::from_secs(hook.timeout_secs);
         // `Ok(Ok(out))` / `Ok(Err(spawn_err))` / `Err(Elapsed)` — same shape
         // as before; spawning is pulled out in front of the timed race (which
         // also feeds the payload to stdin) so we can hold the group needed to
@@ -333,7 +333,7 @@ pub async fn run_event_hooks(
                 .push(format!("[hook `{}` couldn't run: {e}]", hook.run)),
             Err(_) => out.notes.push(format!(
                 "[hook `{}` timed out after {}ms; killed]",
-                hook.run, hook.timeout_ms
+                hook.run, hook.timeout_secs
             )),
         }
     }
@@ -349,7 +349,7 @@ mod tests {
             on: on.to_string(),
             glob: glob.map(|g| glob::Pattern::new(g).unwrap()),
             run: run.to_string(),
-            timeout_ms: DEFAULT_HOOK_TIMEOUT_MS,
+            timeout_secs: DEFAULT_HOOK_TIMEOUT_SECS,
         }
     }
 
@@ -423,9 +423,12 @@ mod tests {
             "{}",
             notes[0]
         );
-        // …and a hung hook is killed at its timeout.
+        // …and a hung hook is killed at its timeout. One second, not the old
+        // `100` — that was 100 *milliseconds* when this field was `timeout_ms`,
+        // and reading it as seconds would make this test wait a minute and a half
+        // for a `sleep 5` that the timeout is supposed to cut short.
         let mut slow = hook("edit", None, "sleep 5");
-        slow.timeout_ms = 100;
+        slow.timeout_secs = 1;
         let notes = run_file_hooks(&[slow], "edit", &file, dir.path()).await;
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("timed out"), "{}", notes[0]);
@@ -437,7 +440,7 @@ mod tests {
             event,
             on: on.to_string(),
             run: run.to_string(),
-            timeout_ms: DEFAULT_HOOK_TIMEOUT_MS,
+            timeout_secs: DEFAULT_HOOK_TIMEOUT_SECS,
         }
     }
 

@@ -1409,7 +1409,7 @@ impl Agent {
             Arc::new(hrdr_tools::LspRegistry::new(
                 config.cwd.clone(),
                 servers,
-                config.lsp_wait_ms,
+                config.lsp_wait_secs,
             ))
         });
         // The LSP navigation tools ride the same registry (a sub-agent's is
@@ -1580,7 +1580,9 @@ impl Agent {
                             event,
                             on: h.on.clone(),
                             run: h.run.clone(),
-                            timeout_ms: h.timeout_ms.unwrap_or(hrdr_tools::DEFAULT_HOOK_TIMEOUT_MS),
+                            timeout_secs: h
+                                .timeout_secs
+                                .unwrap_or(hrdr_tools::DEFAULT_HOOK_TIMEOUT_SECS),
                         });
                     }
                     continue;
@@ -1596,7 +1598,9 @@ impl Agent {
                     on: h.on.clone(),
                     glob,
                     run: h.run.clone(),
-                    timeout_ms: h.timeout_ms.unwrap_or(hrdr_tools::DEFAULT_HOOK_TIMEOUT_MS),
+                    timeout_secs: h
+                        .timeout_secs
+                        .unwrap_or(hrdr_tools::DEFAULT_HOOK_TIMEOUT_SECS),
                 });
             }
             if !file_hooks.is_empty() {
@@ -2225,10 +2229,10 @@ impl Agent {
     }
 
     /// Status of the post-edit LSP layer for `/doctor`:
-    /// `(wait_ms, one row per configured server)`, or `None` when disabled.
+    /// `(wait_secs, one row per configured server)`, or `None` when disabled.
     pub async fn lsp_statuses(&self) -> Option<(u64, Vec<hrdr_tools::LspServerReport>)> {
         let reg = self.ctx.lsp.as_ref()?;
-        Some((reg.wait_ms(), reg.statuses().await))
+        Some((reg.wait_secs(), reg.statuses().await))
     }
 
     pub async fn probe_context_window(&self) -> Option<u32> {
@@ -8169,8 +8173,9 @@ mod tests {
             mcp: vec![],
             prompt_cache: Some("on".to_string()),
             lsp: Some(LspFileConfig {
+                wait_ms: None,
                 enabled: Some(false),
-                wait_ms: Some(500),
+                wait_secs: Some(500),
                 servers: vec![LspServerEntry {
                     command: "zls".to_string(),
                     args: vec![],
@@ -8181,7 +8186,7 @@ mod tests {
         });
         assert_eq!(cfg.prompt_cache.as_deref(), Some("on"));
         assert!(!cfg.lsp);
-        assert_eq!(cfg.lsp_wait_ms, Some(500));
+        assert_eq!(cfg.lsp_wait_secs, Some(500));
         assert_eq!(cfg.lsp_servers.len(), 1);
         assert_eq!(cfg.lsp_servers[0].command, "zls");
         assert_eq!(cfg.tool_max_lines, 500);
@@ -8353,7 +8358,7 @@ mod tests {
 
             [[hooks]]
             run = "prettier --write {path}"
-            timeout_ms = 5000
+            timeout_secs = 5000
 
             [[hooks]]
             event = "pre_tool"
@@ -8369,7 +8374,7 @@ mod tests {
         assert_eq!(cfg.hooks[0].glob.as_deref(), Some("*.rs"));
         assert_eq!(cfg.hooks[0].event, None); // no event = post-edit file hook
         assert_eq!(cfg.hooks[1].on, "*"); // default: any file-mutating tool
-        assert_eq!(cfg.hooks[1].timeout_ms, Some(5000));
+        assert_eq!(cfg.hooks[1].timeout_secs, Some(5000));
         assert_eq!(cfg.hooks[2].event.as_deref(), Some("pre_tool"));
         assert_eq!(cfg.hooks[2].on, "bash");
     }
@@ -10835,11 +10840,12 @@ mod tests {
         #[cfg(unix)] // the lifecycle tests are unix-gated (they shell out)
         fn event_hook_cfg(event: &str, on: &str, run: &str) -> crate::HookConfig {
             crate::HookConfig {
+                timeout_ms: None,
                 event: Some(event.to_string()),
                 on: on.to_string(),
                 glob: None,
                 run: run.to_string(),
-                timeout_ms: None,
+                timeout_secs: None,
             }
         }
 

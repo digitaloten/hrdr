@@ -34,13 +34,13 @@ mod web;
 
 pub use guardrails::{Guardrail, check_guardrails, default_guardrails};
 pub use hooks::{
-    DEFAULT_HOOK_TIMEOUT_MS, EventHook, Hook, HookEvent, HookOutcome, run_event_hooks,
+    DEFAULT_HOOK_TIMEOUT_SECS, EventHook, Hook, HookEvent, HookOutcome, run_event_hooks,
     run_file_hooks,
 };
 pub use lsp::{
-    DEFAULT_LSP_WAIT_MS, LspFileEdits, LspLocation, LspRegistry, LspServerConfig, LspServerReport,
-    LspServerStatus, LspTextEdit, apply_lsp_edits, default_lsp_servers, parse_locations,
-    parse_workspace_edit, uri_to_path,
+    DEFAULT_LSP_WAIT_SECS, LspFileEdits, LspLocation, LspRegistry, LspServerConfig,
+    LspServerReport, LspServerStatus, LspTextEdit, apply_lsp_edits, default_lsp_servers,
+    parse_locations, parse_workspace_edit, uri_to_path,
 };
 pub use mcp::McpClient;
 pub use memory::MemoryTool;

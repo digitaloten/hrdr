@@ -23,19 +23,28 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 /// How long `initialize` may take before the server is written off.
-const INIT_TIMEOUT_MS: u64 = 15_000;
-/// Default per-edit wait for `publishDiagnostics` (config `[lsp] wait_ms`).
-pub const DEFAULT_LSP_WAIT_MS: u64 = 2_000;
+const INIT_TIMEOUT_SECS: u64 = 15;
+/// Default per-edit wait for `publishDiagnostics` (config `[lsp] wait_secs`).
+pub const DEFAULT_LSP_WAIT_SECS: u64 = 2;
 /// After the first publish for the file, wait this much longer for a
 /// follow-up — servers often publish a quick stale/empty set first and the
 /// real analysis a beat later.
+///
+/// Deliberately still milliseconds while every *timeout* is seconds: this is a
+/// settle debounce, not a timeout. A whole second would triple the cost of every
+/// edit and zero would defeat the purpose, so seconds cannot express it.
 const SETTLE_MS: u64 = 300;
+
+/// Floor for a server's request timeout, so `wait_secs = 0` — a perfectly
+/// sensible "don't wait for diagnostics" — cannot also mean "give the server no
+/// time to answer anything", which expired every request instantly.
+const MIN_SEND_TIMEOUT_SECS: u64 = 2;
 /// Diagnostics lines shown per edit before "…and N more".
 const MAX_DIAG_LINES: usize = 8;
 /// How long a navigation request (`definition`/`references`/`rename`) may
 /// take — longer than the diagnostics wait: the model asked explicitly, and
 /// an indexing server answers when ready.
-const NAV_TIMEOUT_MS: u64 = 30_000;
+const NAV_TIMEOUT_SECS: u64 = 30;
 
 /// One language server: which command to run and which files it checks.
 #[derive(Debug, Clone, Default)]
@@ -174,7 +183,7 @@ pub struct LspRegistry {
     root: PathBuf,
     configs: Vec<LspServerConfig>,
     /// Per-edit wait for diagnostics.
-    wait_ms: u64,
+    wait_secs: u64,
     /// Command → probed slot; absent = not yet used.
     clients: tokio::sync::Mutex<HashMap<String, ClientSlot>>,
 }
@@ -182,11 +191,11 @@ pub struct LspRegistry {
 impl LspRegistry {
     /// `configs` are consulted in order (put custom servers first); `root` is
     /// the workspace the servers are initialized against.
-    pub fn new(root: PathBuf, configs: Vec<LspServerConfig>, wait_ms: Option<u64>) -> Self {
+    pub fn new(root: PathBuf, configs: Vec<LspServerConfig>, wait_secs: Option<u64>) -> Self {
         Self {
             root,
             configs,
-            wait_ms: wait_ms.unwrap_or(DEFAULT_LSP_WAIT_MS),
+            wait_secs: wait_secs.unwrap_or(DEFAULT_LSP_WAIT_SECS),
             clients: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -211,7 +220,7 @@ impl LspRegistry {
             .iter()
             .find(|c| c.extensions.iter().any(|e| e == &ext))?;
         let client = self.client_for(config).await?;
-        let wait = Duration::from_millis(self.wait_ms);
+        let wait = Duration::from_secs(self.wait_secs);
         // Bound the whole sync + wait interaction. A wedged server — one that
         // stopped draining its stdin (a crashed-but-not-exited process, a
         // rust-analyzer stuck on a huge crate) — must not hang the edit. `send`
@@ -259,7 +268,7 @@ impl LspRegistry {
         let slot = if which::which(&config.command).is_err() {
             ClientSlot::Unavailable(LspServerStatus::NotInstalled)
         } else {
-            match LspClient::start(config, &self.root, self.wait_ms).await {
+            match LspClient::start(config, &self.root, self.wait_secs).await {
                 Ok(c) => ClientSlot::Running(c),
                 Err(_) => ClientSlot::Unavailable(LspServerStatus::Failed),
             }
@@ -297,8 +306,8 @@ impl LspRegistry {
     }
 
     /// The configured per-edit diagnostics wait (for `/doctor`).
-    pub fn wait_ms(&self) -> u64 {
-        self.wait_ms
+    pub fn wait_secs(&self) -> u64 {
+        self.wait_secs
     }
 
     /// The client + extension for a navigation request on `path` — unlike the
@@ -358,7 +367,7 @@ impl LspRegistry {
             }
         }
         client
-            .request(method, params, Duration::from_millis(NAV_TIMEOUT_MS))
+            .request(method, params, Duration::from_secs(NAV_TIMEOUT_SECS))
             .await
     }
 
@@ -443,7 +452,7 @@ fn initialize_params(root_uri: &str, initialization_options: Option<&Value>) -> 
 
 impl LspClient {
     /// Spawn + `initialize` + `initialized`.
-    async fn start(config: &LspServerConfig, root: &Path, wait_ms: u64) -> Result<Arc<Self>> {
+    async fn start(config: &LspServerConfig, root: &Path, wait_secs: u64) -> Result<Arc<Self>> {
         let mut cmd = tokio::process::Command::new(&config.command);
         cmd.args(&config.args)
             .current_dir(root)
@@ -474,7 +483,7 @@ impl LspClient {
             open_docs: tokio::sync::Mutex::new(HashMap::new()),
             capabilities: std::sync::OnceLock::new(),
             degraded: AtomicBool::new(false),
-            send_timeout: Duration::from_millis(wait_ms),
+            send_timeout: Duration::from_secs(wait_secs.max(MIN_SEND_TIMEOUT_SECS)),
             _child: child,
             _group: group,
         });
@@ -484,7 +493,7 @@ impl LspClient {
             .request(
                 "initialize",
                 initialize_params(&file_uri(root), config.initialization_options.as_ref()),
-                Duration::from_millis(INIT_TIMEOUT_MS),
+                Duration::from_secs(INIT_TIMEOUT_SECS),
             )
             .await?;
         let _ = client
@@ -1794,7 +1803,7 @@ mod tests {
                 extensions: vec!["xyz".to_string()],
                 initialization_options: None,
             }],
-            Some(500), // short write budget so the test is quick
+            Some(1), // 1s write budget (was 500ms) so the test stays quick
         );
 
         // A body larger than the OS pipe buffer (~64KB) forces `write_all` to

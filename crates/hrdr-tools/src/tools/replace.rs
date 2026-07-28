@@ -798,7 +798,7 @@ mod tests {
             on: "replace".to_string(),
             glob: None,
             run: "printf 'hooked\\n' >> {path}".to_string(),
-            timeout_ms: crate::DEFAULT_HOOK_TIMEOUT_MS,
+            timeout_secs: crate::DEFAULT_HOOK_TIMEOUT_SECS,
         }]);
         write(&dir.path().join("a.txt"), "old\n").await;
 
@@ -826,7 +826,7 @@ mod tests {
             on: "replace".to_string(),
             glob: None,
             run: "exit 7".to_string(),
-            timeout_ms: crate::DEFAULT_HOOK_TIMEOUT_MS,
+            timeout_secs: crate::DEFAULT_HOOK_TIMEOUT_SECS,
         }]);
         write(&dir.path().join("a.txt"), "old\n").await;
 
@@ -859,7 +859,7 @@ mod tests {
             on: "replace".to_string(),
             glob: None,
             run: "printf 'hooked\\n' >> {path}".to_string(),
-            timeout_ms: crate::DEFAULT_HOOK_TIMEOUT_MS,
+            timeout_secs: crate::DEFAULT_HOOK_TIMEOUT_SECS,
         }]);
         write(&dir.path().join("a.txt"), "old\n").await;
 

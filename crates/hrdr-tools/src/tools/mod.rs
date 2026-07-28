@@ -969,7 +969,7 @@ mod tests {
             on: "edit".to_string(),
             glob: None,
             run: "printf 'hooked\\n' >> {path}".to_string(),
-            timeout_ms: crate::DEFAULT_HOOK_TIMEOUT_MS,
+            timeout_secs: crate::DEFAULT_HOOK_TIMEOUT_SECS,
         }]);
         c.mark_read(&path);
         let out = EditTool
@@ -987,7 +987,7 @@ mod tests {
             on: "edit".to_string(),
             glob: None,
             run: "exit 7".to_string(),
-            timeout_ms: crate::DEFAULT_HOOK_TIMEOUT_MS,
+            timeout_secs: crate::DEFAULT_HOOK_TIMEOUT_SECS,
         }]);
         let out = EditTool
             .execute(

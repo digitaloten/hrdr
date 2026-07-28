@@ -326,8 +326,8 @@ pub struct AgentConfig {
     /// installed) checks it and any errors ride back with the tool result.
     /// `[lsp] enabled = false` / `$HRDR_LSP=0` turns it off.
     pub lsp: bool,
-    /// Per-edit diagnostics wait in ms (`[lsp] wait_ms`; default 2000).
-    pub lsp_wait_ms: Option<u64>,
+    /// Per-edit diagnostics wait in seconds (`[lsp] wait_secs`; default 2).
+    pub lsp_wait_secs: Option<u64>,
     /// Custom `[[lsp.servers]]`, consulted before the built-in registry.
     pub lsp_servers: Vec<LspServerEntry>,
     /// Internal (sub-agents): the tool context receives the parent's shared
@@ -440,6 +440,7 @@ pub struct AgentConfig {
 /// **provider** — than the main agent (e.g. Opus on Anthropic manages, a model on
 /// another provider implements).
 #[derive(Debug, Clone, Default, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SubagentProfile {
     /// Name the model refers to (the `task` tool's `agent` argument).
     pub name: String,
@@ -505,6 +506,7 @@ impl SubagentProfile {
 
 /// A user-defined provider from `[providers.<name>]` in config.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     /// OpenAI-compatible base URL (including the `/v1` suffix).
     pub base_url: String,
@@ -540,6 +542,7 @@ pub struct ProviderConfig {
 /// commands matching `pattern` (a regex) are rejected with `message`. Applied
 /// on top of the built-in rules (`hrdr_tools::default_guardrails`).
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct GuardrailConfig {
     pub pattern: String,
     pub message: String,
@@ -558,6 +561,7 @@ pub struct GuardrailConfig {
 /// tool name. Exit 2 blocks the tool call / prompt; other failures warn. See
 /// [`hrdr_tools::run_event_hooks`].
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct HookConfig {
     /// Lifecycle event name; absent = a post-edit file hook.
     #[serde(default)]
@@ -573,7 +577,14 @@ pub struct HookConfig {
     /// Shell command template; `{path}` becomes the quoted file path (file
     /// hooks), and lifecycle hooks read the JSON payload from stdin.
     pub run: String,
-    /// Per-run timeout in milliseconds (default 30000).
+    /// Per-run timeout in seconds (default 30). `0` means the default rather
+    /// than "kill it instantly", which is never what anyone means.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// **Removed**, kept only to reject it. Timeouts are seconds now, and serde
+    /// ignores unknown fields — so a config still saying `timeout_ms = 120000`
+    /// would silently run on the 30-second default instead of the two minutes it
+    /// asked for. Fail loudly with the converted value instead.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
@@ -584,10 +595,14 @@ pub(crate) fn default_hook_on() -> String {
 
 /// The `[lsp]` config table: post-edit diagnostics from language servers.
 #[derive(Debug, Clone, Default, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LspFileConfig {
     /// Master switch (default on; servers only spawn when installed anyway).
     pub enabled: Option<bool>,
-    /// Per-edit wait for diagnostics, ms (default 2000).
+    /// Per-edit wait for diagnostics, in seconds (default 2). `0` skips the
+    /// wait entirely.
+    pub wait_secs: Option<u64>,
+    /// **Removed**, kept only to reject it — see [`HookEntry::timeout_ms`].
     pub wait_ms: Option<u64>,
     /// Custom servers (`[[lsp.servers]]`), consulted before the built-ins so
     /// they win for their extensions.
@@ -597,6 +612,7 @@ pub struct LspFileConfig {
 
 /// One custom language server from `[[lsp.servers]]`.
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LspServerEntry {
     /// Executable on PATH.
     pub command: String,
@@ -663,6 +679,7 @@ pub struct ResolvedProvider {
 /// opencode's `tool_output`. Output over either limit is truncated and (for
 /// `bash`/`grep`) the full text is saved to disk.
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ToolOutputConfig {
     /// Max output lines before truncation (default 2000).
     #[serde(default)]
@@ -685,6 +702,7 @@ pub(crate) struct ToolOutputConfig {
 /// provider was in force — and take that provider's API key with it. It is refused
 /// by [`legacy_config_error`] too.
 #[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FileConfig {
     pub(crate) api_key: Option<String>,
     pub(crate) model: Option<ModelSpec>,
@@ -796,6 +814,25 @@ impl FileConfig {
                 ));
             }
         }
+        // The millisecond spellings are gone. Serde ignores unknown fields, so
+        // leaving them unmentioned would silently run a config that asked for two
+        // minutes on the 30-second default — the exact hazard the model-facing
+        // `timeout_ms` guard exists for. Name the field and do the division, so the
+        // fix is the message.
+        let ms_gone = |value: Option<u64>, old: &str, new: &str| -> Option<String> {
+            value.map(|ms| {
+                format!(
+                    "`{old}` is gone — timeouts are seconds now; use `{new} = {}`",
+                    (ms / 1000).max(1)
+                )
+            })
+        };
+        for hook in &self.hooks {
+            errors.extend(ms_gone(hook.timeout_ms, "hooks.timeout_ms", "timeout_secs"));
+        }
+        if let Some(lsp) = &self.lsp {
+            errors.extend(ms_gone(lsp.wait_ms, "lsp.wait_ms", "wait_secs"));
+        }
         errors
     }
 }
@@ -808,6 +845,7 @@ impl FileConfig {
 /// to the server-advertised endpoint. Exactly one of `command`/`url` is
 /// required. `disabled = true` keeps the entry but skips it.
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     /// Short name; namespaces the server's tools and labels its errors.
     pub name: String,
@@ -902,7 +940,7 @@ impl Default for AgentConfig {
             sandbox_writable_roots: Vec::new(),
             child_transcript_dir: None,
             lsp: true,
-            lsp_wait_ms: None,
+            lsp_wait_secs: None,
             lsp_servers: Vec::new(),
             lsp_shared: false,
         }
@@ -1585,8 +1623,8 @@ impl AgentConfig {
             if let Some(e) = l.enabled {
                 self.lsp = e;
             }
-            if l.wait_ms.is_some() {
-                self.lsp_wait_ms = l.wait_ms;
+            if l.wait_secs.is_some() {
+                self.lsp_wait_secs = l.wait_secs;
             }
             if !l.servers.is_empty() {
                 self.lsp_servers = l.servers;
@@ -2410,6 +2448,73 @@ mod sandbox_tests {
             ..Default::default()
         };
         assert!(fc.validate().is_empty());
+    }
+
+    /// **A key nobody recognises is an error, not a shrug.** Serde ignores
+    /// unknown fields by default, so a typo'd or stale key silently did nothing —
+    /// the user's setting was simply absent, and the only clue was behaviour that
+    /// did not match the file. Every table deserialized from the config now denies
+    /// unknown fields, and the parse error names both the bad key and the
+    /// alternatives.
+    #[test]
+    fn an_unknown_config_key_is_a_parse_error() {
+        for (toml_text, bad_key) in [
+            ("modle = \"claude://x\"\n", "modle"),
+            ("[lsp]\nwiat_secs = 2\n", "wiat_secs"),
+            (
+                "[[hooks]]\nrun = \"x\"\nglob_pattern = \"*.rs\"\n",
+                "glob_pattern",
+            ),
+            ("[tool_output]\nmax_line = 10\n", "max_line"),
+        ] {
+            let err = match toml::from_str::<FileConfig>(toml_text) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{bad_key} must be rejected"),
+            };
+            assert!(
+                err.contains(bad_key),
+                "the error names the offending key: {err}"
+            );
+        }
+
+        // A valid file still parses — strictness must not reject what it documents.
+        assert!(
+            toml::from_str::<FileConfig>(
+                "model = \"claude://x\"\n[lsp]\nwait_secs = 2\n[[hooks]]\nrun = \"fmt {path}\"\ntimeout_secs = 5\n",
+            )
+            .is_ok(),
+            "documented keys must still parse"
+        );
+    }
+
+    /// The millisecond spellings are *known* fields kept solely to reject them, so
+    /// the message can do the division rather than leaving the user to notice their
+    /// two-minute hook timeout had quietly become thirty seconds.
+    #[test]
+    fn the_millisecond_spellings_are_rejected_with_the_converted_value() {
+        let fc: FileConfig =
+            toml::from_str("[[hooks]]\nrun = \"x\"\ntimeout_ms = 120000\n").unwrap();
+        let errors = fc.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("hooks.timeout_ms"), "{}", errors[0]);
+        assert!(
+            errors[0].contains("timeout_secs = 120"),
+            "the fix is the message: {}",
+            errors[0]
+        );
+
+        let fc: FileConfig = toml::from_str("[lsp]\nwait_ms = 2000\n").unwrap();
+        let errors = fc.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("wait_secs = 2"), "{}", errors[0]);
+
+        // Sub-second values still name a usable floor rather than `= 0`.
+        let fc: FileConfig = toml::from_str("[lsp]\nwait_ms = 500\n").unwrap();
+        assert!(
+            fc.validate()[0].contains("wait_secs = 1"),
+            "{:?}",
+            fc.validate()
+        );
     }
 
     /// Every cell of the decision table: the session default × what the agent
