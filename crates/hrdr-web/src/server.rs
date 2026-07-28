@@ -260,7 +260,19 @@ async fn login_handler(
         .into_response()
 }
 
-async fn logout_handler(State(state): State<AppState>) -> Response {
+async fn logout_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    // Require authentication when session cookies are in use (AuthMode::Users).
+    // Without this an unauthenticated cross-origin POST could clear the
+    // victim's hrdr_session cookie — a CSRF logout attack.
+    if state.auth.mode == AuthMode::Users {
+        let valid = session_cookie(&headers)
+            .map(|val| auth::verify_session_cookie(val, &state.auth.cookie_secret[..]).is_some())
+            .unwrap_or(false);
+        if !valid {
+            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        }
+    }
+
     let mut cookie = "hrdr_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".to_string();
     if state.tls_enabled {
         cookie.push_str("; Secure");
