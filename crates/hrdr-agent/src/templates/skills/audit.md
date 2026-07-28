@@ -49,10 +49,23 @@ Depth: $ARGUMENTS (default `low` — report only high-confidence findings; `high
      its own `file:line`.
    - If a guard, type, or caller makes the path unreachable today, it is not a
      vulnerability. Say so in the hardening notes instead of promoting it.
+   - Trace to where the function RETURNS, not to the first step that agrees with
+     you. Stopping at the interesting line is how a rejected input gets reported
+     as an accepted one — the parse two lines further down often throws the
+     whole thing out.
    - Severity follows the traced impact, not the scariness of the function name.
      A call that cannot be reached is not critical; a `kill`, `exec` or `unsafe`
      that a guard already covers is not a finding at all.
-4. Write the report ranked most-severe first. Each finding: severity
+4. If you split the audit across `task` sub-agents, what comes back is a list of
+   CANDIDATES, not findings. You are publishing them under your own name, so the
+   verification in step 3 is yours to do — a sub-agent's confidence is not
+   evidence, and reading its report is not checking its work. Re-open every
+   `file:line` it cites and re-trace before the finding enters the report; give
+   each brief the verification contract from step 3, not just "report
+   vulnerabilities with file:line"; and cover the whole scope you declared —
+   whatever no brief names goes unaudited, so either brief it or list it as a
+   gap in Coverage.
+5. Write the report ranked most-severe first. Each finding: severity
    (critical/high/medium/low), `file:line`, a one-sentence statement of the
    vulnerability or defect, and the traced failure/exploit scenario. Then add:
    - **Cleared** — what you suspected and disproved, one line each with why it
@@ -61,12 +74,16 @@ Depth: $ARGUMENTS (default `low` — report only high-confidence findings; `high
    - **Hardening** (if any) — correct today but fragile; explicitly not
      vulnerabilities.
    - **Coverage** — which entry points and classes you actually walked, and
-     which you did not, with the reason. "Audited everything" is almost never
-     true; saying where you stopped is what lets the user judge the report.
+     which you did not. Report a gap as a GAP: "not audited" is the honest line.
+     Do not invent a constraint to excuse it — you have no clock, no budget and
+     no deadline, so "limited by available time" is never true, and neither is
+     narrowing a full-codebase audit to a diff range nobody asked for.
+     "Audited everything" is almost never true either; saying where you stopped
+     is what lets the user judge the report.
 
    End with a one-paragraph summary: total findings by severity, overall risk,
    and the top 1-3 things to fix first.
-5. Route the report by where you're working:
+6. Route the report by where you're working:
    - **Inside a git repo with a `docs/` directory** → write the full report to
      `docs/security-review.md`.
    - **Inside a git repo with no `docs/` directory** → write it to
@@ -79,4 +96,4 @@ Depth: $ARGUMENTS (default `low` — report only high-confidence findings; `high
    the full list. When you do NOT write to disk, give the user the full findings
    in your reply.
 
-6. Report only — don't change any code unless asked to fix the findings.
+7. Report only — don't change any code unless asked to fix the findings.
