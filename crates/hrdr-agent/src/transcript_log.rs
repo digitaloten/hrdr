@@ -1,23 +1,29 @@
-//! Per-sub-agent transcript: an append-only JSONL log of one delegated `task`
-//! run, written independently of the parent session so a sub-agent that dies
-//! mid-run leaves all completed work recoverable on disk.
+//! An agent's durable transcript: an append-only JSONL log of one agent's run,
+//! written as the run happens so an agent that dies mid-turn leaves all
+//! completed work recoverable on disk.
 //!
-//! Each line is a [`Record`] — a complete, serializable projection of the
-//! sub-agent's `AgentEvent` stream: tool calls keep their full args and results,
-//! so the on-disk record shows exactly which files and paths a tool touched. On
-//! read, each `Record` maps back to an `AgentEvent` and folds through the SAME
-//! [`crate::apply_event`] reducer as the main transcript, so a sub-agent's
-//! durable record renders identically to the main agent's.
+//! **One log per agent, one format for all of them.** The session's own agent
+//! attaches to its `<session-id>.jsonl` ([`AgentRegistry::attach_transcript`]);
+//! a delegated agent owns a `<NNN-label>.jsonl` of its own. Neither is a
+//! different kind of artifact, and neither has a reader of its own: each line is
+//! a [`Record`], a complete serializable projection of that agent's `AgentEvent`
+//! stream — tool calls keep their full args and results, so the record shows
+//! exactly which files and paths a tool touched — and on read each `Record` maps
+//! back to an `AgentEvent` and folds through the SAME [`crate::apply_event`]
+//! reducer the live panes use. So a durable transcript renders identically to
+//! the run it recorded, whichever agent produced it.
 //!
-//! Persistence is best-effort: every write error is swallowed, because writing
-//! a transcript must never break the actual sub-agent run. A brand-new,
-//! never-saved session has no id yet, so the very first sub-agent spawned
-//! before the first autosave is not persisted (the dir cell is still empty).
+//! Persistence is best-effort: every write error is swallowed, because writing a
+//! transcript must never break the run it is recording. A brand-new, never-saved
+//! session has no id yet, so an agent spawned before the first autosave is not
+//! persisted (the dir cell is still empty).
+//!
+//! [`AgentRegistry::attach_transcript`]: crate::AgentRegistry::attach_transcript
 //!
 //! Best-effort is *not* licence to leave a half-written line behind, though: a
 //! torn line costs two records (the fragment, and whatever is appended onto it)
 //! and breaks every line-by-line reader of the file. So the two sides hold a
-//! line-atomicity contract — [`SubagentTranscript::write`] either lands a whole
+//! line-atomicity contract — [`TranscriptLog::write`] either lands a whole
 //! record or rolls its bytes back, and the readers here skip a damaged line
 //! instead of stopping at it (a torn file from an older build must still resume).
 //!
@@ -25,7 +31,7 @@
 //! per token is pure waste — a few bytes of payload behind ~25 bytes of JSON
 //! framing — when consecutive deltas of one stream fold to exactly the same
 //! transcript as a single record holding their concatenation. See
-//! [`SubagentTranscript::write`] for the buffer and the boundaries that end it.
+//! [`TranscriptLog::write`] for the buffer and the boundaries that end it.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -34,15 +40,12 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-/// How a sub-agent was spawned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SpawnKind {
-    Blocking,
-    Background,
-}
+/// How the agent this log belongs to came to exist. The registry's enum, not a
+/// second copy of it: the `Start` record and the agent's registry entry state the
+/// same fact.
+pub use crate::registry::SpawnKind;
 
-/// Terminal status of a sub-agent run.
+/// Terminal status of an agent's run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndStatus {
@@ -201,7 +204,7 @@ const COALESCE_BYTES: usize = 512;
 const COALESCE_AGE: Duration = Duration::from_millis(500);
 
 /// An open append-only transcript file for one sub-agent run.
-pub struct SubagentTranscript {
+pub struct TranscriptLog {
     file: File,
     path: std::path::PathBuf,
     /// The file ends **mid-record**: a previous append got a partial write that
@@ -262,14 +265,14 @@ fn delta_len(rec: &Record) -> Option<usize> {
     }
 }
 
-impl SubagentTranscript {
+impl TranscriptLog {
     /// The transcript file's path, so a caller can point a reader at it later.
     pub fn path(&self) -> &Path {
         &self.path
     }
 }
 
-impl SubagentTranscript {
+impl TranscriptLog {
     /// Create `dir/<id>.jsonl` for one run, creating `dir` if needed.
     ///
     /// **Exclusive.** A run owns its file outright: if `id` is already taken this
@@ -455,7 +458,7 @@ impl SubagentTranscript {
 /// file: a sub-agent whose run ends, a session switch that detaches the main
 /// agent's writer, a cancelled task whose registry entry is pruned. Without this
 /// the last partial line of every run would be dropped on the floor.
-impl Drop for SubagentTranscript {
+impl Drop for TranscriptLog {
     fn drop(&mut self) {
         self.flush();
     }
@@ -638,7 +641,7 @@ mod tests {
     #[test]
     fn write_appends_one_line_per_record() {
         let dir = tempfile::tempdir().unwrap();
-        let mut t = SubagentTranscript::create(dir.path(), "001-x").unwrap();
+        let mut t = TranscriptLog::create(dir.path(), "001-x").unwrap();
         t.write(&Record::Start {
             model: "m".into(),
             label: "l".into(),
@@ -668,7 +671,7 @@ mod tests {
     fn read_transcript_preserves_tool_args_and_result() {
         use crate::EntryKind;
         let dir = tempfile::tempdir().unwrap();
-        let mut t = SubagentTranscript::create(dir.path(), "003-edit").unwrap();
+        let mut t = TranscriptLog::create(dir.path(), "003-edit").unwrap();
         let args = r#"{"path":"src/lib.rs"}"#;
         let result = "@@ -1 +1 @@\n-old line\n+new line";
         t.write(&Record::Start {
@@ -729,7 +732,7 @@ mod tests {
     #[test]
     fn create_refuses_to_reuse_an_existing_run_file() {
         let dir = tempfile::tempdir().unwrap();
-        let mut first = SubagentTranscript::create(dir.path(), "000-sub-task").unwrap();
+        let mut first = TranscriptLog::create(dir.path(), "000-sub-task").unwrap();
         first.write(&Record::Start {
             model: "m".into(),
             label: "sub-task".into(),
@@ -739,7 +742,7 @@ mod tests {
         // No End: the first run crashed. It must stay an identifiable orphan.
         drop(first);
 
-        let err = match SubagentTranscript::create(dir.path(), "000-sub-task") {
+        let err = match TranscriptLog::create(dir.path(), "000-sub-task") {
             Ok(_) => panic!("an id already on disk must not be reopened"),
             Err(e) => e,
         };
@@ -757,7 +760,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("subagents");
-        let _t = SubagentTranscript::create(&root, "000-x").unwrap();
+        let _t = TranscriptLog::create(&root, "000-x").unwrap();
         let file_mode = std::fs::metadata(root.join("000-x.jsonl"))
             .unwrap()
             .permissions()
@@ -774,7 +777,7 @@ mod tests {
         let path = dir.path().join("002-x.jsonl");
         // One run holds one handle for its whole life — the file is never
         // reopened, so this mirrors the real spawn paths.
-        let mut t = SubagentTranscript::create(dir.path(), "002-x").unwrap();
+        let mut t = TranscriptLog::create(dir.path(), "002-x").unwrap();
         t.write(&Record::Start {
             model: "m".into(),
             label: "l".into(),
@@ -786,7 +789,7 @@ mod tests {
         });
         // Streamed text is coalesced, so what is on disk mid-run is what has
         // reached a boundary. The run's owner asserts one at every round
-        // (`LiveSubagents::record` on a no-record event, `end_turn`), which is
+        // (`AgentRegistry::record` on a no-record event, `end_turn`), which is
         // what makes a crash trail worth reading; assert it by hand here.
         t.flush();
 
@@ -814,7 +817,7 @@ mod tests {
     fn read_transcript_folds_an_event_stream_in_order() {
         use crate::{AgentEvent, EntryKind};
         let dir = tempfile::tempdir().unwrap();
-        let mut t = SubagentTranscript::create(dir.path(), "004-main").unwrap();
+        let mut t = TranscriptLog::create(dir.path(), "004-main").unwrap();
 
         // Written order: user turn, assistant reply, a tool call (args + result).
         t.write(&Record::from_event(&AgentEvent::Steered("audit the config".into())).unwrap());
@@ -932,7 +935,7 @@ mod tests {
     fn a_torn_tail_does_not_swallow_the_next_record() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("005-torn.jsonl");
-        let mut t = SubagentTranscript::append(&path).unwrap();
+        let mut t = TranscriptLog::append(&path).unwrap();
         t.write(&Record::Text {
             chunk: "before".into(),
         });
@@ -947,7 +950,7 @@ mod tests {
             f.write_all(b"{\"t\":\"reasoning\",\"tex").unwrap();
         }
 
-        let mut t = SubagentTranscript::append(&path).unwrap();
+        let mut t = TranscriptLog::append(&path).unwrap();
         t.write(&Record::ToolStart {
             id: "call-1".into(),
             name: "shell".into(),
@@ -1036,7 +1039,7 @@ mod tests {
     fn is_complete_ignores_a_torn_tail() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("007-tail.jsonl");
-        let mut t = SubagentTranscript::append(&path).unwrap();
+        let mut t = TranscriptLog::append(&path).unwrap();
         t.write(&Record::End {
             status: EndStatus::Ok,
             bytes: 1,
@@ -1060,7 +1063,7 @@ mod tests {
         const PER_THREAD: usize = 200;
         let dir = tempfile::tempdir().unwrap();
         let writer = Arc::new(std::sync::Mutex::new(
-            SubagentTranscript::create(dir.path(), "008-race").unwrap(),
+            TranscriptLog::create(dir.path(), "008-race").unwrap(),
         ));
         let path = dir.path().join("008-race.jsonl");
 
@@ -1123,7 +1126,7 @@ mod tests {
     fn streaming_deltas_coalesce_into_one_line() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("009-coalesce.jsonl");
-        let mut t = SubagentTranscript::append(&path).unwrap();
+        let mut t = TranscriptLog::append(&path).unwrap();
         for word in ["The ", "quick ", "brown ", "fox"] {
             t.write(&Record::Text { chunk: word.into() });
         }
@@ -1144,7 +1147,7 @@ mod tests {
     fn a_kind_change_or_a_tool_call_breaks_the_line() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("010-boundary.jsonl");
-        let mut t = SubagentTranscript::append(&path).unwrap();
+        let mut t = TranscriptLog::append(&path).unwrap();
         t.write(&Record::Reasoning {
             text: "think".into(),
         });
@@ -1205,7 +1208,7 @@ mod tests {
     fn output_from_two_tools_never_merges() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("011-two-tools.jsonl");
-        let mut t = SubagentTranscript::append(&path).unwrap();
+        let mut t = TranscriptLog::append(&path).unwrap();
         for (id, chunk) in [("a", "a1"), ("a", "a2"), ("b", "b1"), ("a", "a3")] {
             t.write(&Record::ToolOutput {
                 id: id.into(),
@@ -1270,7 +1273,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("012-fold.jsonl");
         {
-            let mut t = SubagentTranscript::append(&path).unwrap();
+            let mut t = TranscriptLog::append(&path).unwrap();
             for ev in &events {
                 t.write(&Record::from_event(ev).unwrap());
             }
@@ -1300,7 +1303,7 @@ mod tests {
     fn a_long_stream_lands_in_pieces() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("013-long.jsonl");
-        let mut t = SubagentTranscript::append(&path).unwrap();
+        let mut t = TranscriptLog::append(&path).unwrap();
         for _ in 0..500 {
             t.write(&Record::Text {
                 chunk: "tok ".into(),
@@ -1341,6 +1344,6 @@ mod tests {
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, b"x").unwrap();
         let bad_dir = blocker.join("subdir"); // parent is a file
-        assert!(SubagentTranscript::create(&bad_dir, "id").is_err());
+        assert!(TranscriptLog::create(&bad_dir, "id").is_err());
     }
 }

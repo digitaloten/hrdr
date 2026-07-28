@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hrdr_agent::{Agent, AgentConfig, Entry, LiveSubagents, MAIN_KEY, PaneId, PaneSet, Steer};
+use hrdr_agent::{Agent, AgentConfig, AgentRegistry, Entry, MAIN_KEY, PaneId, PaneSet, Steer};
 use hrdr_app::{self, StatusInputs};
 use hrdr_protocol::{PaneTranscript, ServerFrame, WirePane, WirePaneId};
 use tokio::sync::{Mutex, Notify, broadcast};
@@ -96,7 +96,7 @@ pub struct WebSession {
     // ── agent ──
     agent: Arc<tokio::sync::Mutex<Agent>>,
     steering: hrdr_agent::SteeringQueue,
-    live: LiveSubagents,
+    live: AgentRegistry,
     panes: PaneSet,
 
     // ── sub-agent transcript dir cell (set after first save assigns an id) ──
@@ -146,7 +146,7 @@ impl WebSession {
 
         // Sub-agent transcript dir cell — created before the agent.
         let subagent_dir: Arc<std::sync::Mutex<Option<PathBuf>>> = Default::default();
-        config.subagent_transcript_dir = Some(subagent_dir.clone());
+        config.child_transcript_dir = Some(subagent_dir.clone());
 
         let cwd = config.cwd.clone();
         // Kept for provider resolution on `/resume` (the identity a saved
@@ -166,8 +166,8 @@ impl WebSession {
             )
         };
 
-        let live = LiveSubagents::new();
-        live.register_main(
+        let live = AgentRegistry::new();
+        live.register_session(
             agent.clone(),
             steering.clone(),
             model_name,
@@ -589,7 +589,7 @@ impl WebSession {
     fn refresh_subagent_dir(&self) {
         if let Some(id) = &self.panes.main().state.id {
             let cwd_str = self.cwd.display().to_string();
-            let dir = hrdr_app::subagent_transcript_dir(&cwd_str, id);
+            let dir = hrdr_app::child_transcript_dir(&cwd_str, id);
             if let Ok(mut cell) = self.subagent_dir.lock() {
                 *cell = Some(dir);
             }
@@ -866,7 +866,7 @@ impl WebSession {
     /// Keep the main agent's registry entry in step with its pane's state — the
     /// counters half of the TUI's `publish_main_agent`.
     ///
-    /// `register_main` is idempotent (a no-op once the entry exists), so what this
+    /// `register_session` is idempotent (a no-op once the entry exists), so what this
     /// actually does after startup is seed the resumed session's usage. What the
     /// agent is *running on* is deliberately not written here: the agent publishes
     /// that itself (`Agent::attach_live`), and a copy kept here is a copy that can be
@@ -877,7 +877,7 @@ impl WebSession {
             let s = &self.panes.main().state;
             (s.model.clone(), s.base_url.clone(), s.usage)
         };
-        self.live.register_main(
+        self.live.register_session(
             self.agent.clone(),
             self.steering.clone(),
             reference.model().to_string(),
@@ -909,7 +909,7 @@ impl WebSession {
         self.tick_notify.notify_one();
     }
 
-    pub fn live(&self) -> &LiveSubagents {
+    pub fn live(&self) -> &AgentRegistry {
         &self.live
     }
 
@@ -979,7 +979,7 @@ fn pane_id_to_key(id: PaneId) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hrdr_agent::{AgentEvent, LiveSubagents, MAIN_KEY};
+    use hrdr_agent::{AgentEvent, AgentRegistry, MAIN_KEY};
     use hrdr_protocol::{WireEntryKind, WireToolBody};
 
     /// Build a bare WebSession for tests. We create a real (minimal) Agent
@@ -1008,9 +1008,9 @@ mod tests {
         );
         let agent = Arc::new(tokio::sync::Mutex::new(agent));
 
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         // Register main so sync() can find it.
-        live.register_main(
+        live.register_session(
             agent.clone(),
             hrdr_agent::steering_queue(),
             model,

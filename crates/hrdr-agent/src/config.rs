@@ -384,7 +384,7 @@ pub struct AgentConfig {
     /// applies: those constrain *tool calls*, and a sub-agent makes those too.
     ///
     /// Set only by [`subagent_base_config`]; never configurable.
-    pub is_subagent: bool,
+    pub delegated: bool,
     /// Override the base memory directory (default `<XDG data>/memory`) — point
     /// hrdr at another tool's memory store. The `projects/<cwd-slug>/` and
     /// `global/` scope subdirectories still apply beneath it. Config
@@ -432,8 +432,7 @@ pub struct AgentConfig {
     /// reads it at spawn: `None` (outer) = feature off; `Some` with an inner
     /// `None` = id not yet assigned (pre-first-save) so that spawn is not
     /// persisted. Cleared for sub-agent base configs (subs don't spawn subs).
-    pub subagent_transcript_dir:
-        Option<std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>>,
+    pub child_transcript_dir: Option<std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>>,
 }
 
 /// A named sub-agent profile (`[[subagent]]`): a model the `task` tool can
@@ -891,7 +890,7 @@ impl Default for AgentConfig {
             subagents: true,
             memory: true,
             todo_ttl: DEFAULT_TODO_TTL,
-            is_subagent: false,
+            delegated: false,
             memory_dir: None,
             memory_roots: None,
             subagent_model: None,
@@ -901,7 +900,7 @@ impl Default for AgentConfig {
             read_only: false,
             sandbox: SandboxMode::Write,
             sandbox_writable_roots: Vec::new(),
-            subagent_transcript_dir: None,
+            child_transcript_dir: None,
             lsp: true,
             lsp_wait_ms: None,
             lsp_servers: Vec::new(),

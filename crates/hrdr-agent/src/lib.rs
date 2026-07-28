@@ -52,13 +52,13 @@ pub use validate::{
     confirm_identity_with, validate_identity, validate_placeholder_model,
 };
 mod models;
-mod subagent_live;
-pub use subagent_live::{
-    EventLog, LiveSubagent, LiveSubagents, MAIN_KEY, PromptDelivery, RunGuard, SubagentKind,
+mod registry;
+pub use registry::{
+    AgentEntry, AgentRegistry, EventLog, MAIN_KEY, PromptDelivery, RunGuard, SpawnKind,
     age_completed_todos, event_log,
 };
-mod subagent_transcript;
 mod transcript;
+mod transcript_log;
 pub use transcript::*;
 mod session;
 pub use session::*;
@@ -96,10 +96,10 @@ pub use compaction::{
 mod delegation;
 #[cfg(test)]
 pub(crate) use delegation::{
-    BACKGROUND_REPORT_MAX_BYTES, REVIEW_PROMPT, SubagentDirCell, SubagentSlots, Worktree,
-    apply_model_ref, apply_task_overrides, format_shortstat, named_spec_ref,
-    open_next_subagent_transcript_from, remove_worktree, resolve_subagent_dir,
-    subagent_context_window, subagent_transcript_id, subagent_usage, task_size_summary,
+    BACKGROUND_REPORT_MAX_BYTES, ChildDirCell, REVIEW_PROMPT, SubagentSlots, Worktree,
+    apply_model_ref, apply_task_overrides, child_transcript_id, format_shortstat, named_spec_ref,
+    open_next_subagent_transcript_from, remove_worktree, resolve_child_dir,
+    subagent_context_window, subagent_usage, task_size_summary,
 };
 pub(crate) use delegation::{
     BgHandles, SteerTool, SubagentTool, TaskApplyTool, TaskCancelTool, TaskCleanupTool,
@@ -955,14 +955,14 @@ pub struct Agent {
     delegation_runtime: SharedDelegationRuntime,
     /// Sub-agents this agent has delegated to and is still holding — the
     /// frontend steers, views, and drives further turns on them through this.
-    /// Pruned at turn end (see [`LiveSubagents::prune`]).
-    live_subagents: LiveSubagents,
+    /// Pruned at turn end (see [`AgentRegistry::prune`]).
+    registry: AgentRegistry,
     /// This agent's own entry in the registry a frontend reads — set by
     /// [`Agent::attach_live`]. `None` when nothing is displaying it (headless).
-    live_home: Option<(LiveSubagents, u64)>,
+    live_home: Option<(AgentRegistry, u64)>,
     /// This is a delegated sub-agent, not the session's agent. Gates every
-    /// session-scoped feature — see [`AgentConfig::is_subagent`].
-    is_subagent: bool,
+    /// session-scoped feature — see [`AgentConfig::delegated`].
+    delegated: bool,
     /// This agent's tool set was pruned to the read-only one
     /// ([`AgentConfig::read_only`]). Kept so whoever persists or rebuilds this
     /// agent — `task_revive`, through the sub-agent snapshot — can restore the
@@ -1236,7 +1236,7 @@ fn build_system_prompt_sections(
     memory: &MemoryIndex,
     skills: &[Skill],
     persona: Option<&str>,
-    is_subagent: bool,
+    delegated: bool,
     sandbox: &hrdr_tools::SandboxPolicy,
 ) -> Result<prompt::SystemPrompt> {
     use prompt::{
@@ -1269,7 +1269,7 @@ fn build_system_prompt_sections(
     // ones an agent got is inspectable. After the project content on purpose: a
     // read-only `explore` and a write `coder` in the same project then share every
     // byte above this line and diverge only here.
-    for (name, body) in prompt::capability_sections(tools, is_subagent) {
+    for (name, body) in prompt::capability_sections(tools, delegated) {
         p.push(name, prompt::section_text(body));
     }
     // 7. what the `skill` tool can load — names and one-liners, no bodies. Gated
@@ -1300,18 +1300,11 @@ fn build_system_prompt(
     memory: &MemoryIndex,
     skills: &[Skill],
     persona: Option<&str>,
-    is_subagent: bool,
+    delegated: bool,
     sandbox: &hrdr_tools::SandboxPolicy,
 ) -> Result<(String, Option<usize>)> {
     let p = build_system_prompt_sections(
-        tools,
-        cwd,
-        docs,
-        memory,
-        skills,
-        persona,
-        is_subagent,
-        sandbox,
+        tools, cwd, docs, memory, skills, persona, delegated, sandbox,
     )?;
     let split = p.prefix_len_before(prompt::SECTION_ENVIRONMENT);
     Ok((p.render(), split))
@@ -1383,7 +1376,7 @@ impl Agent {
         // fields, so it and `self.resolved` can never disagree.
         let resolved = oauth_derived(ResolvedModel::from_config(&config));
         let delegation_runtime = new_delegation_runtime(&config, &resolved);
-        let live_subagents = LiveSubagents::new();
+        let registry = AgentRegistry::new();
         tools.register(Arc::new(ModelsTool {
             runtime: Arc::clone(&delegation_runtime),
             available: available_models(&config, Some(config.model.provider().as_str())),
@@ -1446,7 +1439,7 @@ impl Agent {
         // path, and skipped entirely without a runtime (sync tests), so it never
         // delays first paint or races the sync test suite.
         if config.subagents
-            && !config.is_subagent
+            && !config.delegated
             && in_git_repo(&config.cwd)
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
@@ -1464,8 +1457,8 @@ impl Agent {
                 Arc::clone(&cost_total),
                 Arc::clone(&cost_partial),
                 lsp.clone(),
-                config.subagent_transcript_dir.clone(),
-                live_subagents.clone(),
+                config.child_transcript_dir.clone(),
+                registry.clone(),
             );
             // `task_revive` shares the `task` tool's concurrency slots so a revive
             // counts against the same write cap, not an uncounted extra sub-agent.
@@ -1477,8 +1470,8 @@ impl Agent {
                 Arc::clone(&cost_total),
                 Arc::clone(&cost_partial),
                 lsp.clone(),
-                config.subagent_transcript_dir.clone(),
-                live_subagents.clone(),
+                config.child_transcript_dir.clone(),
+                registry.clone(),
             );
             tools.register(Arc::new(subagent_tool));
             // Management tools for the background sub-agents `task` spawns: check
@@ -1488,21 +1481,21 @@ impl Agent {
             // `task_output` also read the on-disk sub-agent snapshots, so a
             // finished/orphaned run survives a `/resume` (they take the dir cell).
             tools.register(Arc::new(TaskListTool {
-                transcript_dir: config.subagent_transcript_dir.clone(),
+                transcript_dir: config.child_transcript_dir.clone(),
             }));
             tools.register(Arc::new(TaskOutputTool {
-                live: live_subagents.clone(),
+                live: registry.clone(),
             }));
             tools.register(Arc::new(TaskTranscriptTool {
-                transcript_dir: config.subagent_transcript_dir.clone(),
+                transcript_dir: config.child_transcript_dir.clone(),
             }));
             tools.register(Arc::new(SteerTool {
-                live: live_subagents.clone(),
+                live: registry.clone(),
             }));
             tools.register(Arc::new(revive_tool));
             tools.register(Arc::new(TaskCancelTool {
                 bg_handles: Arc::clone(&bg_handles),
-                live: live_subagents.clone(),
+                live: registry.clone(),
             }));
             tools.register(Arc::new(TaskDiffTool));
             // Landing a sub-agent's UNCOMMITTED work: the missing step between
@@ -1510,7 +1503,7 @@ impl Agent {
             // (which removes the worktree they live in).
             tools.register(Arc::new(TaskApplyTool));
             tools.register(Arc::new(TaskCleanupTool {
-                live: live_subagents.clone(),
+                live: registry.clone(),
             }));
         }
         // Memory: expose the `memory` tool (registered before scoping so a
@@ -1636,7 +1629,7 @@ impl Agent {
             &memory,
             &skills.lock().unwrap_or_else(|p| p.into_inner()).clone(),
             config.agent_prompt.as_deref(),
-            config.is_subagent,
+            config.delegated,
             &ctx.sandbox,
         )?;
 
@@ -1687,9 +1680,9 @@ impl Agent {
             providers: config.providers,
             pending_notices,
             delegation_runtime,
-            live_subagents,
+            registry,
             live_home: None,
-            is_subagent: config.is_subagent,
+            delegated: config.delegated,
             read_only: config.read_only,
             last_prompt_tokens: None,
             prompt_cache: config.prompt_cache,
@@ -1889,7 +1882,7 @@ impl Agent {
             &memory,
             &self.skills_snapshot(),
             self.agent_prompt.as_deref(),
-            self.is_subagent,
+            self.delegated,
             &self.ctx.sandbox,
         ) else {
             return;
@@ -1959,7 +1952,7 @@ impl Agent {
             &memory,
             &skills,
             self.agent_prompt.as_deref(),
-            self.is_subagent,
+            self.delegated,
             &self.ctx.sandbox,
         ) else {
             return;
@@ -2017,7 +2010,7 @@ impl Agent {
     /// copy could adopt a session's model and provider label into the status bar
     /// while the agent went on talking to the endpoint it launched with, and the bar
     /// would confidently name a provider the request never went to.
-    pub fn attach_live(&mut self, live: LiveSubagents, key: u64) {
+    pub fn attach_live(&mut self, live: AgentRegistry, key: u64) {
         // The agent's own TODO list, so a frontend showing this agent shows *its*
         // list rather than the main agent's.
         let todos = Arc::clone(&self.ctx.todos);
@@ -2339,18 +2332,9 @@ impl Agent {
     }
 
     /// The sub-agents this agent is holding — the frontend steers, displays, and
-    /// drives further turns on them through this handle. See [`LiveSubagents`].
-    pub fn live_subagents(&self) -> LiveSubagents {
-        self.live_subagents.clone()
-    }
-
-    /// Whether this is a delegated sub-agent rather than the session's own agent.
-    ///
-    /// A frontend showing sub-agent panes asks this before offering anything
-    /// session-scoped — compaction, saving, session lifecycle hooks. Those act
-    /// on the conversation the *user* owns, and a sub-agent is not it.
-    pub fn is_subagent(&self) -> bool {
-        self.is_subagent
+    /// drives further turns on them through this handle. See [`AgentRegistry`].
+    pub fn registry(&self) -> AgentRegistry {
+        self.registry.clone()
     }
 
     /// Number of messages currently in history (including the system prompt).
@@ -2704,27 +2688,27 @@ mod tests {
         assert!(!steer_content.contains("DEPLOY_MARKER"), "{steer_content}");
     }
 
-    use super::SubagentDirCell;
+    use super::ChildDirCell;
     use super::{
         Agent, AgentConfig, AgentEvent, ConfigDiagnostics, DEFAULT_BASE_URL,
         DEFAULT_MAX_READONLY_SUBAGENTS, DEFAULT_MAX_WRITE_SUBAGENTS,
         DEFAULT_PRESERVE_RECENT_TOKENS, DEFAULT_TAIL_TURNS, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS,
         FileConfig, LspFileConfig, LspServerEntry, PRUNE_PLACEHOLDER,
         PRUNE_TASK_PLACEHOLDER_PREFIX, PRUNE_TOOL_PLACEHOLDER_PREFIX, ProviderConfig,
-        SubagentSlots, ToolOutputConfig, builtin_provider, compaction_tail_start,
-        elide_tool_results, ensure_assistant_has_content, estimate_tokens,
+        SubagentSlots, ToolOutputConfig, builtin_provider, child_transcript_id,
+        compaction_tail_start, elide_tool_results, ensure_assistant_has_content, estimate_tokens,
         estimate_tokens_in_messages, flatten_tool_protocol, format_duration, in_git_repo,
         is_context_overflow, is_transient, legacy_config_error, mega_turn_tail_start,
         parse_env_bool, provider_alias_collision_error, repair_dangling_tool_calls, resolve,
-        resolve_subagent_dir, retry_after_hint, steering_queue, strip_user_timestamp,
-        subagent_base_config, subagent_transcript_id, tail_window, timestamped_user_message,
+        resolve_child_dir, retry_after_hint, steering_queue, strip_user_timestamp,
+        subagent_base_config, tail_window, timestamped_user_message,
     };
     use crate::cwd_slug;
-    use crate::subagent_live;
-    use crate::subagent_transcript;
+    use crate::registry;
+    use crate::transcript_log;
     use crate::{
-        LiveSubagent, LiveSubagents, MAIN_KEY, ModelRef, ModelSpec, ResolvedProviderKind,
-        SubagentKind, TurnStats,
+        AgentEntry, AgentRegistry, MAIN_KEY, ModelRef, ModelSpec, ResolvedProviderKind, SpawnKind,
+        TurnStats,
     };
     use futures_util::FutureExt;
     use hrdr_llm::{ChatMessage, FunctionCall, MessageOrigin, Role, ToolCall};
@@ -3572,10 +3556,10 @@ mod tests {
         let sub = subagent_base_config(&parent);
 
         // Session-scoped: stays behind.
-        assert!(sub.is_subagent, "the sub-agent knows what it is");
+        assert!(sub.delegated, "the sub-agent knows what it is");
         assert!(!sub.subagents, "no nesting");
         assert!(
-            sub.subagent_transcript_dir.is_none(),
+            sub.child_transcript_dir.is_none(),
             "a sub-agent writes no sub-agent transcripts"
         );
 
@@ -3851,10 +3835,7 @@ mod tests {
                 .any(|d| d.function.name == "memory"),
             "the session's agent can write memories"
         );
-        assert!(
-            !main.is_subagent(),
-            "the session's agent is not a sub-agent"
-        );
+        assert!(!main.delegated, "the session's agent is not a sub-agent");
 
         // A delegated sub-agent keeps it — being delegated is not a permission.
         let sub = Agent::new(subagent_base_config(&AgentConfig {
@@ -3862,7 +3843,7 @@ mod tests {
             ..Default::default()
         }))
         .unwrap();
-        assert!(sub.is_subagent());
+        assert!(sub.delegated);
         assert!(
             sub.tools.defs().iter().any(|d| d.function.name == "memory"),
             "a sub-agent is still an agent"
@@ -4743,7 +4724,7 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
             None,
-            super::LiveSubagents::new(),
+            super::AgentRegistry::new(),
         );
         let ctx = hrdr_tools::ToolContext::new(cwd.path());
         // The profile repoints to `c-other`; the ad-hoc override then asks for
@@ -5914,11 +5895,11 @@ mod tests {
     #[tokio::test]
     async fn task_list_and_cancel_manage_background_tasks() {
         use super::{
-            LiveSubagent, LiveSubagents, SteerTool, SubagentKind, TaskCancelTool, TaskListTool,
-            TurnStats, bg_handles, steering_queue, subagent_live,
+            AgentEntry, AgentRegistry, SpawnKind, SteerTool, TaskCancelTool, TaskListTool,
+            TurnStats, bg_handles, registry, steering_queue,
         };
         use hrdr_tools::Tool;
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         let bg_handles = bg_handles();
         let ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
 
@@ -5945,9 +5926,9 @@ mod tests {
                 ..Default::default()
             });
         }
-        let key = LiveSubagents::next_key();
+        let key = AgentRegistry::next_key();
         live.with(|v| {
-            v.push(LiveSubagent {
+            v.push(AgentEntry {
                 key,
                 bg_id: Some(1),
                 tool_id: None,
@@ -5960,9 +5941,9 @@ mod tests {
                 compaction_reserved: 0,
                 todos: Default::default(),
                 usage: crate::AgentUsage::default(),
-                events: subagent_live::event_log(),
+                events: registry::event_log(),
                 turn: TurnStats::default(),
-                kind: SubagentKind::Background,
+                kind: SpawnKind::Background,
                 agent: Arc::new(tokio::sync::Mutex::new(
                     Agent::new(AgentConfig::default()).unwrap(),
                 )),
@@ -6047,7 +6028,7 @@ mod tests {
     /// points at the durable transcript so the parent can read the full run.
     #[tokio::test]
     async fn task_output_falls_back_to_result_and_transcript() {
-        use super::{LiveSubagents, TaskOutputTool};
+        use super::{AgentRegistry, TaskOutputTool};
         use hrdr_tools::Tool;
         let ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
         ctx.background_tasks
@@ -6064,7 +6045,7 @@ mod tests {
             });
         // Empty live store → falls through to the registry entry.
         let out = TaskOutputTool {
-            live: LiveSubagents::new(),
+            live: AgentRegistry::new(),
         }
         .execute(serde_json::json!({"id": 7}), &ctx)
         .await
@@ -6090,7 +6071,7 @@ mod tests {
     /// narration from the start of the run.
     #[tokio::test]
     async fn task_output_peek_keeps_the_tail() {
-        use super::{LiveSubagents, TaskOutputTool};
+        use super::{AgentRegistry, TaskOutputTool};
         use hrdr_tools::Tool;
         let mut ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
         ctx.max_output = 200;
@@ -6108,7 +6089,7 @@ mod tests {
                 ..Default::default()
             });
         let out = TaskOutputTool {
-            live: LiveSubagents::new(),
+            live: AgentRegistry::new(),
         }
         .execute(serde_json::json!({"id": 9}), &ctx)
         .await
@@ -6290,7 +6271,7 @@ mod tests {
     /// telling the caller where the (unreviewed) changes are so they aren't lost.
     #[tokio::test]
     async fn task_cancel_keeps_dirty_worktree_removes_clean() {
-        use super::{LiveSubagents, TaskCancelTool, Worktree, bg_handles};
+        use super::{AgentRegistry, TaskCancelTool, Worktree, bg_handles};
         use hrdr_tools::Tool;
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
@@ -6315,7 +6296,7 @@ mod tests {
         let ctx = hrdr_tools::ToolContext::new(repo);
         let cancel = TaskCancelTool {
             bg_handles: bg_handles(),
-            live: LiveSubagents::new(),
+            live: AgentRegistry::new(),
         };
 
         // Dirty worktree (untracked file) → kept, and the message points at it.
@@ -6427,7 +6408,7 @@ mod tests {
     /// what was discarded.
     #[tokio::test]
     async fn task_cleanup_removes_merged_refuses_uncommitted() {
-        use super::{LiveSubagents, TaskCleanupTool, Worktree};
+        use super::{AgentRegistry, TaskCleanupTool, Worktree};
         use hrdr_tools::Tool;
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
@@ -6451,7 +6432,7 @@ mod tests {
 
         let ctx = hrdr_tools::ToolContext::new(repo);
         let cleanup = TaskCleanupTool {
-            live: LiveSubagents::new(),
+            live: AgentRegistry::new(),
         };
 
         let commit_in = |wt: &std::path::Path, msg: &str| {
@@ -7634,9 +7615,9 @@ mod tests {
                 });
             }
             // Inject a matching live-subagent entry (background kind).
-            agent.live_subagents.with(|v| {
-                let entry_key = LiveSubagents::next_key();
-                v.push(LiveSubagent {
+            agent.registry.with(|v| {
+                let entry_key = AgentRegistry::next_key();
+                v.push(AgentEntry {
                     key: entry_key,
                     bg_id: Some(id),
                     tool_id: None,
@@ -7649,9 +7630,9 @@ mod tests {
                     compaction_reserved: 0,
                     todos: Default::default(),
                     usage: crate::AgentUsage::default(),
-                    events: subagent_live::event_log(),
+                    events: registry::event_log(),
                     turn: TurnStats::default(),
-                    kind: SubagentKind::Background,
+                    kind: SpawnKind::Background,
                     agent: Arc::new(tokio::sync::Mutex::new(
                         Agent::new(AgentConfig::default()).unwrap(),
                     )),
@@ -7665,7 +7646,7 @@ mod tests {
                 });
             });
             // Also register the main entry so we can verify it survives.
-            agent.live_subagents.register_main(
+            agent.registry.register_session(
                 Arc::new(tokio::sync::Mutex::new(
                     Agent::new(AgentConfig::default()).unwrap(),
                 )),
@@ -7682,11 +7663,7 @@ mod tests {
                 1,
                 "background registry has the entry"
             );
-            assert_eq!(
-                agent.live_subagents.len(),
-                2,
-                "live has main + background entry"
-            );
+            assert_eq!(agent.registry.len(), 2, "live has main + background entry");
 
             agent.abort_background_tasks();
 
@@ -7695,13 +7672,9 @@ mod tests {
                 agent.ctx.background_tasks.lock().unwrap().is_empty(),
                 "background registry is cleaned up"
             );
-            assert_eq!(
-                agent.live_subagents.len(),
-                1,
-                "only the main entry survives"
-            );
+            assert_eq!(agent.registry.len(), 1, "only the main entry survives");
             // The surviving entry is the main one.
-            agent.live_subagents.with(|v| {
+            agent.registry.with(|v| {
                 assert_eq!(v[0].key, MAIN_KEY, "main entry is retained");
             });
         });
@@ -7758,9 +7731,9 @@ mod tests {
             }
 
             // Inject background live entries for both.
-            let add_bg_live = |v: &mut Vec<LiveSubagent>, bg_id: u64| {
-                let key = LiveSubagents::next_key();
-                v.push(LiveSubagent {
+            let add_bg_live = |v: &mut Vec<AgentEntry>, bg_id: u64| {
+                let key = AgentRegistry::next_key();
+                v.push(AgentEntry {
                     key,
                     bg_id: Some(bg_id),
                     tool_id: None,
@@ -7773,9 +7746,9 @@ mod tests {
                     compaction_reserved: 0,
                     todos: Default::default(),
                     usage: crate::AgentUsage::default(),
-                    events: subagent_live::event_log(),
+                    events: registry::event_log(),
                     turn: TurnStats::default(),
-                    kind: SubagentKind::Background,
+                    kind: SpawnKind::Background,
                     agent: Arc::new(tokio::sync::Mutex::new(
                         Agent::new(AgentConfig::default()).unwrap(),
                     )),
@@ -7788,13 +7761,13 @@ mod tests {
                     transcript: None,
                 });
             };
-            agent.live_subagents.with(|v| {
+            agent.registry.with(|v| {
                 add_bg_live(v, id1);
                 add_bg_live(v, id2);
             });
 
             // Register the main entry.
-            agent.live_subagents.register_main(
+            agent.registry.register_session(
                 Arc::new(tokio::sync::Mutex::new(
                     Agent::new(AgentConfig::default()).unwrap(),
                 )),
@@ -7805,7 +7778,7 @@ mod tests {
                 crate::AgentUsage::default(),
             );
 
-            assert_eq!(agent.live_subagents.len(), 3, "main + 2 bg entries");
+            assert_eq!(agent.registry.len(), 3, "main + 2 bg entries");
 
             agent.clear();
 
@@ -7815,11 +7788,11 @@ mod tests {
                 "all background registry entries removed"
             );
             assert_eq!(
-                agent.live_subagents.len(),
+                agent.registry.len(),
                 1,
                 "only the main entry survives clear"
             );
-            agent.live_subagents.with(|v| {
+            agent.registry.with(|v| {
                 assert_eq!(v[0].key, MAIN_KEY, "main entry is retained");
             });
         });
@@ -9100,7 +9073,7 @@ mod tests {
         );
         assert!(
             crate::delegation::TaskOutputTool {
-                live: LiveSubagents::new(),
+                live: AgentRegistry::new(),
             }
             .repeatable()
         );
@@ -11604,7 +11577,7 @@ mod tests {
 
         // ── (e) sub-agent transcript persistence ──────────────────────────────
 
-        use super::super::{SubagentDirCell, SubagentTool, subagent_transcript};
+        use super::super::{ChildDirCell, SubagentTool, transcript_log};
 
         /// Build a `task` tool whose spawned sub-agents talk to `base_url` and
         /// whose transcripts land in `ts_dir`.
@@ -11613,7 +11586,7 @@ mod tests {
             cwd: &std::path::Path,
             ts_dir: &std::path::Path,
         ) -> SubagentTool {
-            let cell: SubagentDirCell = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+            let cell: ChildDirCell = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
                 ts_dir.to_path_buf(),
             ))));
             let mut cfg = test_cfg(base_url, cwd);
@@ -11634,7 +11607,7 @@ mod tests {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 None,
                 cell,
-                super::super::LiveSubagents::new(),
+                super::super::AgentRegistry::new(),
             )
         }
 
@@ -11659,7 +11632,7 @@ mod tests {
 
         fn read_events(
             ts_dir: &std::path::Path,
-        ) -> (std::path::PathBuf, Vec<subagent_transcript::Record>) {
+        ) -> (std::path::PathBuf, Vec<transcript_log::Record>) {
             let files: Vec<std::path::PathBuf> = std::fs::read_dir(ts_dir)
                 .unwrap()
                 .filter_map(|e| e.ok())
@@ -11683,7 +11656,7 @@ mod tests {
         /// while a frontend is looking at it.
         #[tokio::test]
         async fn a_delegated_subagent_is_retained_then_pruned_unless_pinned() {
-            use super::super::{LiveSubagents, SubagentKind};
+            use super::super::{AgentRegistry, SpawnKind};
             use hrdr_tools::Tool;
             let server = MockServer::start(vec![MockResp::Sse(vec![
                 text_chunk("c1", "sub work done"),
@@ -11692,7 +11665,7 @@ mod tests {
             ])])
             .await;
             let cwd = tempfile::tempdir().unwrap();
-            let live = LiveSubagents::new();
+            let live = AgentRegistry::new();
             let mut cfg = test_cfg(server.base_url(), cwd.path());
             // Read-only: shares the cwd, so no git worktree is needed.
             cfg.read_only = true;
@@ -11730,7 +11703,7 @@ mod tests {
                 let e = &v[0];
                 (e.key, e.kind, e.running, e.done, e.delivered)
             });
-            assert_eq!(kind, SubagentKind::Background);
+            assert_eq!(kind, SpawnKind::Background);
             assert!(!running && done && !delivered, "done but still owed");
 
             // Undelivered → survives the prune even unpinned (its answer is owed).
@@ -11794,7 +11767,7 @@ mod tests {
             await_background(&tool, &ctx).await;
 
             let (_, events) = read_events(ts_dir.path());
-            let subagent_transcript::Record::Start { prompt, .. } = &events[0] else {
+            let transcript_log::Record::Start { prompt, .. } = &events[0] else {
                 panic!("first event is a Start: {:?}", events[0]);
             };
             assert!(
@@ -11843,25 +11816,25 @@ mod tests {
 
             let (path, events) = read_events(ts_dir.path());
             assert!(
-                matches!(&events[0], subagent_transcript::Record::Start { kind: subagent_transcript::SpawnKind::Background, prompt, .. } if prompt == "do the sub task"),
+                matches!(&events[0], transcript_log::Record::Start { kind: transcript_log::SpawnKind::Background, prompt, .. } if prompt == "do the sub task"),
                 "first event is a background Start with the full prompt: {:?}",
                 events[0]
             );
             assert!(
-                events.iter().any(|e| matches!(e, subagent_transcript::Record::Text { chunk } if chunk.contains("sub work done"))),
+                events.iter().any(|e| matches!(e, transcript_log::Record::Text { chunk } if chunk.contains("sub work done"))),
                 "text chunk recorded: {events:?}"
             );
             assert!(
                 matches!(
                     events.last().unwrap(),
-                    subagent_transcript::Record::End {
-                        status: subagent_transcript::EndStatus::Ok,
+                    transcript_log::Record::End {
+                        status: transcript_log::EndStatus::Ok,
                         ..
                     }
                 ),
                 "ends ok: {events:?}"
             );
-            assert!(subagent_transcript::is_complete(&path));
+            assert!(transcript_log::is_complete(&path));
         }
 
         /// A sub-agent whose model call fails records Error then End(failed) — the
@@ -11890,21 +11863,21 @@ mod tests {
             assert!(
                 events
                     .iter()
-                    .any(|e| matches!(e, subagent_transcript::Record::Error { .. })),
+                    .any(|e| matches!(e, transcript_log::Record::Error { .. })),
                 "error recorded: {events:?}"
             );
             assert!(
                 matches!(
                     events.last().unwrap(),
-                    subagent_transcript::Record::End {
-                        status: subagent_transcript::EndStatus::Failed,
+                    transcript_log::Record::End {
+                        status: transcript_log::EndStatus::Failed,
                         ..
                     }
                 ),
                 "ends failed: {events:?}"
             );
             // A written End line means the reader sees it as complete (failed, not orphaned).
-            assert!(subagent_transcript::is_complete(&path));
+            assert!(transcript_log::is_complete(&path));
         }
 
         /// A background (`background: true`) sub-agent records its own transcript
@@ -11965,19 +11938,19 @@ mod tests {
 
             let (_path, events) = read_events(ts_dir.path());
             assert!(
-                matches!(&events[0], subagent_transcript::Record::Start { kind: subagent_transcript::SpawnKind::Background, prompt, .. } if prompt == "bg task"),
+                matches!(&events[0], transcript_log::Record::Start { kind: transcript_log::SpawnKind::Background, prompt, .. } if prompt == "bg task"),
                 "first event is a background Start with the full prompt: {:?}",
                 events[0]
             );
             assert!(
-                events.iter().any(|e| matches!(e, subagent_transcript::Record::Text { chunk } if chunk.contains("bg work done"))),
+                events.iter().any(|e| matches!(e, transcript_log::Record::Text { chunk } if chunk.contains("bg work done"))),
                 "text chunk recorded: {events:?}"
             );
             assert!(
                 matches!(
                     events.last().unwrap(),
-                    subagent_transcript::Record::End {
-                        status: subagent_transcript::EndStatus::Ok,
+                    transcript_log::Record::End {
+                        status: transcript_log::EndStatus::Ok,
                         ..
                     }
                 ),
@@ -12125,7 +12098,7 @@ mod tests {
         /// the durable transcript is complete regardless of which drove the turn.
         #[tokio::test]
         async fn a_steered_turn_persists_to_the_durable_transcript() {
-            use super::super::{LiveSubagents, PromptDelivery};
+            use super::super::{AgentRegistry, PromptDelivery};
             use hrdr_tools::Tool;
             let server = MockServer::start(vec![
                 // Delegated run: one text turn, then stop.
@@ -12146,8 +12119,8 @@ mod tests {
             let ts_dir = tempfile::tempdir().unwrap();
             // Build the tool by hand (not via `transcript_tool`) so the test keeps
             // a handle on the live registry — it needs it to drive the steered turn.
-            let live = LiveSubagents::new();
-            let cell: SubagentDirCell = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+            let live = AgentRegistry::new();
+            let cell: ChildDirCell = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
                 ts_dir.path().to_path_buf(),
             ))));
             let mut cfg = test_cfg(server.base_url(), cwd.path());
@@ -12201,20 +12174,20 @@ mod tests {
             let (_, events) = read_events(ts_dir.path());
             let end_at = events
                 .iter()
-                .position(|e| matches!(e, subagent_transcript::Record::End { .. }))
+                .position(|e| matches!(e, transcript_log::Record::End { .. }))
                 .expect("the delegated run wrote an End frame");
             let tail = &events[end_at + 1..];
             assert!(
                 tail.iter().any(|e| matches!(
                     e,
-                    subagent_transcript::Record::Steered { text } if text == "now summarise"
+                    transcript_log::Record::Steered { text } if text == "now summarise"
                 )),
                 "the steered prompt persists after the run's End: {events:?}"
             );
             assert!(
                 tail.iter().any(|e| matches!(
                     e,
-                    subagent_transcript::Record::Text { chunk } if chunk.contains("steered reply")
+                    transcript_log::Record::Text { chunk } if chunk.contains("steered reply")
                 )),
                 "the steered reply persists after the run's End: {events:?}"
             );
@@ -12235,10 +12208,10 @@ mod tests {
         /// above; the branch decision itself by `continue_or_finish`'s unit tests.)
         #[tokio::test]
         async fn a_message_queued_after_a_turn_drives_a_second_delegated_turn() {
-            use super::super::LiveSubagents;
+            use super::super::AgentRegistry;
             use hrdr_tools::Tool;
 
-            let live = LiveSubagents::new();
+            let live = AgentRegistry::new();
             let live_hook = live.clone();
             let server = MockServer::start_with_hook(
                 vec![
@@ -12269,7 +12242,7 @@ mod tests {
 
             let cwd = tempfile::tempdir().unwrap();
             let ts_dir = tempfile::tempdir().unwrap();
-            let cell: SubagentDirCell = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+            let cell: ChildDirCell = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
                 ts_dir.path().to_path_buf(),
             ))));
             let mut cfg = test_cfg(server.base_url(), cwd.path());
@@ -12313,7 +12286,7 @@ mod tests {
             assert!(
                 events.iter().any(|e| matches!(
                     e,
-                    subagent_transcript::Record::Steered { text } if text == "and now summarise"
+                    transcript_log::Record::Steered { text } if text == "and now summarise"
                 )),
                 "the queued follow-up opened a second turn: {events:?}"
             );
@@ -12321,14 +12294,14 @@ mod tests {
             assert!(
                 events.iter().any(|e| matches!(
                     e,
-                    subagent_transcript::Record::Text { chunk } if chunk.contains("delegated answer")
+                    transcript_log::Record::Text { chunk } if chunk.contains("delegated answer")
                 )),
                 "turn 1's answer persists: {events:?}"
             );
             assert!(
                 events.iter().any(|e| matches!(
                     e,
-                    subagent_transcript::Record::Text { chunk }
+                    transcript_log::Record::Text { chunk }
                         if chunk.contains("continuation answer")
                 )),
                 "turn 2's answer persists: {events:?}"
@@ -12446,7 +12419,7 @@ mod tests {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 None,
                 None,
-                super::super::LiveSubagents::new(),
+                super::super::AgentRegistry::new(),
             );
             let ctx = hrdr_tools::ToolContext::new(cwd.path());
 
@@ -12489,7 +12462,7 @@ mod tests {
         /// operate inside the worktree with no `git -C`/path juggling.
         #[tokio::test]
         async fn write_subagent_cwd_is_its_worktree() {
-            use super::super::{LiveSubagents, SubagentTool};
+            use super::super::{AgentRegistry, SubagentTool};
             use hrdr_tools::Tool;
             let server = MockServer::start(vec![MockResp::Sse(vec![
                 text_chunk("c1", "done"),
@@ -12523,7 +12496,7 @@ mod tests {
                 &cfg,
                 &super::super::ResolvedModel::from_config(&cfg),
             );
-            let live = LiveSubagents::new();
+            let live = AgentRegistry::new();
             let bg_handles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let tool = SubagentTool::new(
                 cfg,
@@ -12594,7 +12567,7 @@ mod tests {
 
         #[tokio::test]
         async fn write_subagent_brief_naming_parent_path_is_rewritten() {
-            use super::super::{LiveSubagents, SubagentTool};
+            use super::super::{AgentRegistry, SubagentTool};
             use hrdr_tools::Tool;
             let server = MockServer::start(vec![MockResp::Sse(vec![
                 text_chunk("c1", "done"),
@@ -12627,7 +12600,7 @@ mod tests {
                 &cfg,
                 &super::super::ResolvedModel::from_config(&cfg),
             );
-            let live = LiveSubagents::new();
+            let live = AgentRegistry::new();
             let bg_handles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let tool = SubagentTool::new(
                 cfg,
@@ -12679,11 +12652,11 @@ mod tests {
     #[test]
     fn a_resumed_session_never_writes_into_a_previous_runs_transcript() {
         use super::open_next_subagent_transcript_from;
-        use subagent_transcript::{EndStatus, Record, SpawnKind};
+        use transcript_log::{EndStatus, Record, SpawnKind};
 
         let dir = tempfile::tempdir().unwrap();
         // A previous process left an orphaned run behind (crashed: no End).
-        let mut old = subagent_transcript::SubagentTranscript::create(dir.path(), "000-sub-task")
+        let mut old = transcript_log::TranscriptLog::create(dir.path(), "000-sub-task")
             .expect("seed the previous run");
         old.write(&Record::Start {
             model: "m".into(),
@@ -12716,27 +12689,27 @@ mod tests {
         assert_eq!(old_body.lines().count(), 1, "previous run not appended to");
         assert!(old_body.contains("previous session"));
         assert!(
-            !subagent_transcript::is_complete(&dir.path().join("000-sub-task.jsonl")),
+            !transcript_log::is_complete(&dir.path().join("000-sub-task.jsonl")),
             "the crashed run must still read as an orphan"
         );
 
         let new_body = std::fs::read_to_string(dir.path().join("001-sub-task.jsonl"))
             .expect("the resumed run claims the next free id");
         assert!(new_body.contains("resumed session"));
-        assert!(subagent_transcript::is_complete(
+        assert!(transcript_log::is_complete(
             &dir.path().join("001-sub-task.jsonl")
         ));
     }
 
     #[test]
-    fn subagent_transcript_id_slugifies_and_pads() {
+    fn child_transcript_id_slugifies_and_pads() {
         assert_eq!(
-            subagent_transcript_id(0, "Explore the repo"),
+            child_transcript_id(0, "Explore the repo"),
             "000-explore-the-repo"
         );
-        assert_eq!(subagent_transcript_id(12, "  "), "012-task");
-        assert_eq!(subagent_transcript_id(7, "!!!"), "007-task");
-        let long = subagent_transcript_id(3, &"a".repeat(80));
+        assert_eq!(child_transcript_id(12, "  "), "012-task");
+        assert_eq!(child_transcript_id(7, "!!!"), "007-task");
+        let long = child_transcript_id(3, &"a".repeat(80));
         assert_eq!(long, format!("003-{}", "a".repeat(32)));
     }
 
@@ -12744,27 +12717,27 @@ mod tests {
     fn resolve_subagent_dir_reads_the_cell() {
         use std::path::PathBuf;
         use std::sync::{Arc, Mutex};
-        assert_eq!(resolve_subagent_dir(&None), None);
-        let empty: SubagentDirCell = Some(Arc::new(Mutex::new(None)));
-        assert_eq!(resolve_subagent_dir(&empty), None);
-        let full: SubagentDirCell = Some(Arc::new(Mutex::new(Some(PathBuf::from("/x/y")))));
-        assert_eq!(resolve_subagent_dir(&full), Some(PathBuf::from("/x/y")));
+        assert_eq!(resolve_child_dir(&None), None);
+        let empty: ChildDirCell = Some(Arc::new(Mutex::new(None)));
+        assert_eq!(resolve_child_dir(&empty), None);
+        let full: ChildDirCell = Some(Arc::new(Mutex::new(Some(PathBuf::from("/x/y")))));
+        assert_eq!(resolve_child_dir(&full), Some(PathBuf::from("/x/y")));
     }
 
     #[test]
     fn subagent_base_config_clears_the_transcript_cell() {
         use std::sync::{Arc, Mutex};
         let cfg = AgentConfig {
-            subagent_transcript_dir: Some(Arc::new(Mutex::new(Some("/x".into())))),
+            child_transcript_dir: Some(Arc::new(Mutex::new(Some("/x".into())))),
             ..AgentConfig::default()
         };
         let base = subagent_base_config(&cfg);
-        assert!(base.subagent_transcript_dir.is_none());
+        assert!(base.child_transcript_dir.is_none());
     }
 
     #[test]
     fn record_from_event_keeps_tool_args_and_drops_bookkeeping() {
-        use subagent_transcript::Record;
+        use transcript_log::Record;
         assert_eq!(
             Record::from_event(&AgentEvent::Text("hi".into())),
             Some(Record::Text { chunk: "hi".into() })

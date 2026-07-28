@@ -42,12 +42,12 @@ impl super::App {
     pub(super) fn refresh_subagent_dir(&self) {
         if let Some(id) = &self.state().id {
             let cwd = self.current_cwd();
-            let dir = hrdr_app::subagent_transcript_dir(&cwd, id);
+            let dir = hrdr_app::child_transcript_dir(&cwd, id);
             if let Ok(mut cell) = self.subagent_dir.lock() {
                 *cell = Some(dir);
             }
             let jsonl = hrdr_app::session_transcript_path(&cwd, id);
-            self.live_subagents
+            self.registry
                 .attach_transcript(hrdr_agent::MAIN_KEY, &jsonl);
         }
     }
@@ -347,7 +347,7 @@ impl super::App {
         // adopted id (append mode — a resume continues that session's jsonl).
         // Without this a resumed/switched session would append onto the file we
         // just left.
-        self.live_subagents.detach_transcript(hrdr_agent::MAIN_KEY);
+        self.registry.detach_transcript(hrdr_agent::MAIN_KEY);
         self.refresh_subagent_dir();
         // The pane is rebuilt from the registry every frame, main agent included —
         // so a resumed session's model/endpoint/counters have to land there too, or
@@ -378,7 +378,7 @@ impl super::App {
             let s = self.state();
             (s.model.clone(), s.usage.context_window)
         };
-        let current = self.live_subagents.with(|v| {
+        let current = self.registry.with(|v| {
             v.iter()
                 .find(|e| e.key == hrdr_agent::MAIN_KEY)
                 .map(|e| (e.provider.clone().unwrap_or_default(), e.model.clone()))

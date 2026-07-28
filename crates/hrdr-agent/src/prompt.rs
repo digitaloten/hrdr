@@ -106,7 +106,7 @@ mod frag {
 pub fn capability_sections_for(
     can_write: bool,
     can_delegate: bool,
-    is_subagent: bool,
+    delegated: bool,
     shell: Option<hrdr_tools::Shell>,
 ) -> Vec<(&'static str, &'static str)> {
     let mut out: Vec<(&'static str, &'static str)> = Vec::new();
@@ -119,7 +119,7 @@ pub fn capability_sections_for(
             }
         }
         out.push((SECTION_COMMITTING, frag::COMMITTING));
-        out.push(if is_subagent {
+        out.push(if delegated {
             (SECTION_COMMITTING_SUBAGENT, frag::COMMITTING_SUBAGENT)
         } else {
             (SECTION_COMMITTING_MAIN, frag::COMMITTING_MAIN)
@@ -128,7 +128,7 @@ pub fn capability_sections_for(
     if can_delegate {
         out.push((SECTION_DELEGATE, frag::DELEGATE));
     }
-    if is_subagent {
+    if delegated {
         out.push((SECTION_SUBAGENT, frag::SUBAGENT));
         if can_write {
             out.push((SECTION_SUBAGENT_WRITE, frag::SUBAGENT_WRITE));
@@ -141,7 +141,7 @@ pub fn capability_sections_for(
 /// tool set opens. Assembly itself is [`capability_sections_for`].
 pub fn capability_sections(
     tools: &ToolRegistry,
-    is_subagent: bool,
+    delegated: bool,
 ) -> Vec<(&'static str, &'static str)> {
     // Gate the edit/git guidance: a purely read-only sub-agent has no mutating
     // tools, so those sections would be dead weight (and mildly contradict its
@@ -155,7 +155,7 @@ pub fn capability_sections(
     // The shell the `shell` tool runs, or `None` when the agent has no shell
     // (read-only, or no shell on PATH). Read from the tool set itself so the prompt
     // agrees with what was actually registered.
-    capability_sections_for(can_write, can_delegate, is_subagent, tools.shell())
+    capability_sections_for(can_write, can_delegate, delegated, tools.shell())
 }
 
 /// The base body plus the capability sections, concatenated — the whole
@@ -165,9 +165,9 @@ pub fn capability_sections(
 /// prompt *content*) want the whole thing; [`crate::build_system_prompt_sections`]
 /// instead pushes the pieces separately so the volatile content can be
 /// interleaved between them.
-pub fn render_system(tools: &ToolRegistry, is_subagent: bool) -> Result<String> {
+pub fn render_system(tools: &ToolRegistry, delegated: bool) -> Result<String> {
     let mut out = String::from(base_section().as_str());
-    for (_, body) in capability_sections(tools, is_subagent) {
+    for (_, body) in capability_sections(tools, delegated) {
         out.push_str(&section_text(body));
     }
     Ok(out)
@@ -751,11 +751,11 @@ mod tests {
     fn render_flags(
         can_write: bool,
         can_delegate: bool,
-        is_subagent: bool,
+        delegated: bool,
         shell: Option<hrdr_tools::Shell>,
     ) -> String {
         let mut out = base_section();
-        for (_, body) in capability_sections_for(can_write, can_delegate, is_subagent, shell) {
+        for (_, body) in capability_sections_for(can_write, can_delegate, delegated, shell) {
             out.push_str(&section_text(body));
         }
         out
@@ -1026,12 +1026,12 @@ mod tests {
         );
     }
 
-    /// The same prefix-cache invariant, one gate deeper: the `is_subagent`-gated
+    /// The same prefix-cache invariant, one gate deeper: the `delegated`-gated
     /// commit guidance sits in a `Committing:` section at the very END of the
     /// `can_write` block, past every section identical for a main agent and a
     /// write sub-agent (Scope → … → Git → Releasing → Deleting → Shell). So the
     /// two share all of that before diverging only at `Committing:`. Moving the
-    /// `is_subagent` gate back up among the shared sections would shorten the
+    /// `delegated` gate back up among the shared sections would shorten the
     /// prefix a spawned sub-agent reuses from the main agent's cached prompt.
     #[test]
     fn main_and_subagent_prompts_share_all_of_the_write_block_but_committing() {
@@ -1135,7 +1135,7 @@ mod tests {
     #[test]
     fn write_subagent_prompt_forbids_commands_in_the_parent_repo() {
         let tools = ToolRegistry::with_defaults();
-        let sub = render_system(&tools, true).unwrap(); // is_subagent = true
+        let sub = render_system(&tools, true).unwrap(); // delegated = true
         let main = render_system(&tools, false).unwrap();
         assert!(
             sub.contains("the parent project directory your worktree was"),
@@ -2367,7 +2367,7 @@ mod tests {
         assert!(!main.contains("fresh checkout of"), "main is not");
 
         // The commit-at-each-checkpoint discipline is shared by both, above the
-        // is_subagent gate.
+        // delegated gate.
         assert!(
             main.contains("Commit at each checkpoint"),
             "main commits proactively"
@@ -2404,7 +2404,7 @@ mod tests {
         );
     }
 
-    /// A read-only sub-agent (explore/review: is_subagent but no write tools)
+    /// A read-only sub-agent (explore/review: delegated but no write tools)
     /// must NOT be told to commit or pointed at a Git section that never renders.
     #[test]
     fn read_only_subagent_is_not_told_to_commit() {

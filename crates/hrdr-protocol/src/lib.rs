@@ -290,7 +290,7 @@ pub struct PaneTranscript {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
-    /// User pressed send. Routed via `LiveSubagents::send_prompt` (steer if a
+    /// User pressed send. Routed via `AgentRegistry::send_prompt` (steer if a
     /// turn is in flight, new turn if idle).
     Submit {
         pane: WirePaneId,

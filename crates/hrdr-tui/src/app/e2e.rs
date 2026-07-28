@@ -1298,7 +1298,7 @@ async fn a_mid_turn_submit_waits_when_the_model_just_answers() {
     let mut h = Harness::new(vec![MockReply::Text("first reply".into())]).await;
 
     // A turn is in flight.
-    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     h.type_str("second question");
     h.press(KeyCode::Enter);
 
@@ -1345,7 +1345,7 @@ async fn a_queued_message_rides_in_with_the_tool_results() {
     use hrdr_agent::AgentEvent;
 
     let mut h = Harness::new(vec![]).await;
-    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
 
     // Submitted while the model works.
     h.type_str("actually, use ripgrep");
@@ -1373,7 +1373,7 @@ async fn a_queued_message_rides_in_with_the_tool_results() {
     // the frontend does in parallel.
     let taken = h
         .app
-        .live_subagents
+        .registry
         .take_pending(hrdr_agent::MAIN_KEY)
         .expect("the agent takes it off its own queue");
     h.app
@@ -1396,7 +1396,7 @@ async fn a_queued_message_rides_in_with_the_tool_results() {
 #[tokio::test]
 async fn cancelling_drops_an_undelivered_steer() {
     let mut h = Harness::new(vec![]).await;
-    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     h.type_str("never mind");
     h.press(KeyCode::Enter);
     assert_eq!(h.app.steering_len_for_test(), 1);
@@ -1411,7 +1411,7 @@ async fn cancelling_drops_an_undelivered_steer() {
 #[tokio::test]
 async fn queued_messages_are_sent_fifo_one_turn_at_a_time() {
     let mut h = Harness::new(vec![]).await;
-    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     for msg in ["one", "two"] {
         h.type_str(msg);
         h.press(KeyCode::Enter);
@@ -1453,7 +1453,7 @@ async fn every_transcript_row_is_rendered_through_the_block_path() {
     h.submit("run it").await;
     h.app.transcript_mut().push(Entry::diff("+added"));
     h.app
-        .live_subagents
+        .registry
         .enqueue(hrdr_agent::MAIN_KEY, hrdr_agent::Steer::plain("queued msg"));
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
@@ -1609,7 +1609,7 @@ async fn history_snapshot_persists_the_session_mid_turn() {
 
     // Simulate a running turn: the turn task would hold the agent lock; here
     // the flag alone shows the regular autosave path is not what saves us.
-    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     h.app.push_entry(Entry::user("do the thing"));
     let snapshot = vec![
         hrdr_agent::Message::user("do the thing"),
@@ -1799,7 +1799,7 @@ async fn autosave_writes_the_state_and_it_loads_back_identically() {
 /// The shared sub-agent transcript cell starts empty (no id yet) and is
 /// repointed at the session's dir once the first autosave assigns an id.
 #[tokio::test]
-async fn autosave_populates_the_subagent_transcript_dir() {
+async fn autosave_populates_the_child_transcript_dir() {
     let _data_home = isolated_data_home();
 
     let mut h = Harness::new(vec![MockReply::Text("done".into())]).await;
@@ -1817,7 +1817,7 @@ async fn autosave_populates_the_subagent_transcript_dir() {
         .id
         .clone()
         .expect("autosave assigned a session id");
-    let want = hrdr_app::subagent_transcript_dir(&h.app.current_cwd(), &id);
+    let want = hrdr_app::child_transcript_dir(&h.app.current_cwd(), &id);
     assert_eq!(
         *h.app.subagent_dir.lock().unwrap(),
         Some(want),
@@ -1863,7 +1863,7 @@ async fn the_first_turn_reserves_the_session_id_before_any_tool_can_run() {
         .expect("the id is reserved at turn start, before the agent runs");
     assert_eq!(
         *h.app.subagent_dir.lock().unwrap(),
-        Some(hrdr_app::subagent_transcript_dir(&h.app.current_cwd(), &id)),
+        Some(hrdr_app::child_transcript_dir(&h.app.current_cwd(), &id)),
         "a sub-agent spawned in the first round already has somewhere to write"
     );
 
@@ -2456,7 +2456,7 @@ async fn a_thinking_block_renders_no_label() {
     h2.app
         .transcript_mut()
         .push(Entry::reasoning("streaming thoughts"));
-    h2.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
+    h2.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     h2.app.reasoning_start = Some(std::time::Instant::now());
     let mut term = Terminal::new(TestBackend::new(50, 40)).unwrap();
     term.draw(|f| ui::draw(f, &mut h2.app)).unwrap();
@@ -3155,7 +3155,7 @@ async fn the_input_pane_matches_the_user_prompt_block() {
 async fn switching_agents_keeps_each_ones_place_and_draft() {
     let mut h = Harness::new(vec![]).await;
     let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
-    h.app.live_subagents.register(hrdr_agent::LiveSubagent {
+    h.app.registry.register(hrdr_agent::AgentEntry {
         key: 1,
         bg_id: None,
         tool_id: Some("call-1".to_string()),
@@ -3170,7 +3170,7 @@ async fn switching_agents_keeps_each_ones_place_and_draft() {
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         turn: hrdr_agent::TurnStats::default(),
-        kind: hrdr_agent::SubagentKind::Blocking,
+        kind: hrdr_agent::SpawnKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
         running: true,
@@ -3225,7 +3225,7 @@ async fn the_input_box_routes_to_the_focused_agent() {
 
     let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
     let steering = hrdr_agent::steering_queue();
-    h.app.live_subagents.register(hrdr_agent::LiveSubagent {
+    h.app.registry.register(hrdr_agent::AgentEntry {
         key: 1,
         bg_id: None,
         tool_id: Some("call-1".to_string()),
@@ -3240,7 +3240,7 @@ async fn the_input_box_routes_to_the_focused_agent() {
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         turn: hrdr_agent::TurnStats::default(),
-        kind: hrdr_agent::SubagentKind::Blocking,
+        kind: hrdr_agent::SpawnKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: steering.clone(),
         // Mid-turn: a message must be delivered as steering, not a new turn.
@@ -3274,7 +3274,7 @@ async fn the_input_box_routes_to_the_focused_agent() {
     // the main agent follows (`AgentEvent::Steered` is emitted as the message enters
     // the conversation, so the transcript's order matches the model's view). Here
     // that is the agent's own record; replay it as `run` would on its next round.
-    h.app.live_subagents.record(
+    h.app.registry.record(
         1,
         &hrdr_agent::AgentEvent::Steered("check the auth module too".to_string()),
     );
@@ -3325,7 +3325,7 @@ async fn the_agent_list_switches_the_focused_agent() {
     h.app
         .push_entry(Entry::tool_running("call-1", "task", "{}"));
     let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
-    h.app.live_subagents.register(hrdr_agent::LiveSubagent {
+    h.app.registry.register(hrdr_agent::AgentEntry {
         key: 1,
         bg_id: None,
         tool_id: Some("call-1".to_string()),
@@ -3340,7 +3340,7 @@ async fn the_agent_list_switches_the_focused_agent() {
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         turn: hrdr_agent::TurnStats::default(),
-        kind: hrdr_agent::SubagentKind::Blocking,
+        kind: hrdr_agent::SpawnKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
         running: true,
@@ -3355,7 +3355,7 @@ async fn the_agent_list_switches_the_focused_agent() {
     // The sub-agent works. It records what it emits on its own entry — that record
     // is what its pane is built from, so it does not matter whether anyone was
     // watching (or even whether the pane existed) while it ran.
-    h.app.live_subagents.record(
+    h.app.registry.record(
         1,
         &hrdr_agent::AgentEvent::Text("reading the codebase".to_string()),
     );
@@ -3466,7 +3466,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
     }
 
     let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
-    h.app.live_subagents.register(hrdr_agent::LiveSubagent {
+    h.app.registry.register(hrdr_agent::AgentEntry {
         key: 1,
         bg_id: None,
         tool_id: Some("call-1".to_string()),
@@ -3491,7 +3491,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
         },
         events: hrdr_agent::event_log(),
         turn: hrdr_agent::TurnStats::default(),
-        kind: hrdr_agent::SubagentKind::Blocking,
+        kind: hrdr_agent::SpawnKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
         running: false,
@@ -3538,7 +3538,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
         "/model switched the agent on screen — provider and model together"
     );
     assert_eq!(
-        h.app.live_subagents.with(|v| v
+        h.app.registry.with(|v| v
             .iter()
             .find(|e| e.key == 1)
             .map(|e| e.model.clone())
@@ -3627,9 +3627,9 @@ async fn a_finished_background_task_wakes_an_idle_model() {
     // Finished, but a turn is already in flight — it will drain at its next
     // request, so don't spawn a second turn on top of it.
     *h.app.background_tasks.lock().unwrap() = vec![task(true, false)];
-    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     h.app.maybe_deliver_background();
-    h.app.live_subagents.end_turn(hrdr_agent::MAIN_KEY);
+    h.app.registry.end_turn(hrdr_agent::MAIN_KEY);
 
     // Already delivered: nothing to do (and no wake-up loop).
     *h.app.background_tasks.lock().unwrap() = vec![task(true, true)];
@@ -3654,7 +3654,7 @@ async fn a_finished_background_task_wakes_an_idle_model() {
 #[tokio::test]
 async fn the_queued_badge_sits_below_a_blank_row() {
     let mut h = Harness::new(vec![]).await;
-    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     h.type_str("hold this thought");
     h.press(KeyCode::Enter);
     assert_eq!(h.app.pending().len(), 1, "the message is pending");
@@ -4025,13 +4025,13 @@ async fn the_loader_stops_while_the_models_tools_run() {
     use hrdr_agent::AgentEvent;
 
     let mut h = Harness::new(vec![]).await;
-    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     h.app.resume_inference_for_test();
     // The clock is the *agent's*, kept on its registry entry — the main agent's is
     // read exactly the way a sub-agent's is.
     let turn = |h: &Harness| {
         h.app
-            .live_subagents
+            .registry
             .turn(hrdr_agent::MAIN_KEY)
             .expect("the session's agent is in the registry")
     };
@@ -4099,7 +4099,7 @@ async fn the_loader_stops_while_the_models_tools_run() {
 async fn the_loader_belongs_to_the_agent_on_screen() {
     let mut h = Harness::new(vec![]).await;
     let sub = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
-    h.app.live_subagents.register(hrdr_agent::LiveSubagent {
+    h.app.registry.register(hrdr_agent::AgentEntry {
         key: 1,
         bg_id: None,
         tool_id: Some("call-1".to_string()),
@@ -4114,7 +4114,7 @@ async fn the_loader_belongs_to_the_agent_on_screen() {
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         turn: hrdr_agent::TurnStats::default(),
-        kind: hrdr_agent::SubagentKind::Background,
+        kind: hrdr_agent::SpawnKind::Background,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
         steering: hrdr_agent::steering_queue(),
         running: true,
@@ -4129,7 +4129,7 @@ async fn the_loader_belongs_to_the_agent_on_screen() {
 
     // The sub-agent is working; the main agent is idle. On main: no loader — it is
     // not the main agent that is busy.
-    h.app.live_subagents.begin_turn(1);
+    h.app.registry.begin_turn(1);
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
     assert!(
@@ -4140,7 +4140,7 @@ async fn the_loader_belongs_to_the_agent_on_screen() {
     // Switch to the sub-agent: the loader is there, running *its* clock.
     h.app.focus_pane(hrdr_app::PaneId::Sub(1));
     h.app
-        .live_subagents
+        .registry
         .record(1, &hrdr_agent::AgentEvent::Text("looking".into()));
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
@@ -4151,7 +4151,7 @@ async fn the_loader_belongs_to_the_agent_on_screen() {
 
     // Its tool runs: the model is idle, so the loader hides — its own pane, its own
     // clock.
-    h.app.live_subagents.record(
+    h.app.registry.record(
         1,
         &hrdr_agent::AgentEvent::ToolStart {
             id: "t1".into(),
@@ -4179,7 +4179,7 @@ async fn the_generating_line_heads_the_input_area_with_a_blank_row_each_side() {
         content: "ship it".to_string(),
         status: "in_progress".to_string(),
     }];
-    h.app.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     // The loader tracks the *model* working, not merely a turn being in flight.
     h.app.resume_inference_for_test();
 
@@ -5797,7 +5797,7 @@ async fn the_todo_panel_shows_the_active_agents_list() {
         status: "pending".to_string(),
     }]));
     let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
-    h.app.live_subagents.register(hrdr_agent::LiveSubagent {
+    h.app.registry.register(hrdr_agent::AgentEntry {
         key: sub_key,
         bg_id: None,
         tool_id: Some("call-1".to_string()),
@@ -5812,7 +5812,7 @@ async fn the_todo_panel_shows_the_active_agents_list() {
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         turn: hrdr_agent::TurnStats::default(),
-        kind: hrdr_agent::SubagentKind::Blocking,
+        kind: hrdr_agent::SpawnKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub_agent)),
         steering: hrdr_agent::steering_queue(),
         running: false,
@@ -5868,7 +5868,7 @@ async fn the_todo_panel_hides_while_a_sub_agent_is_running() {
         status: "in_progress".to_string(),
     }]));
     let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
-    h.app.live_subagents.register(hrdr_agent::LiveSubagent {
+    h.app.registry.register(hrdr_agent::AgentEntry {
         key: sub_key,
         bg_id: None,
         tool_id: Some("call-1".to_string()),
@@ -5883,7 +5883,7 @@ async fn the_todo_panel_hides_while_a_sub_agent_is_running() {
         usage: hrdr_agent::AgentUsage::default(),
         events: hrdr_agent::event_log(),
         turn: hrdr_agent::TurnStats::default(),
-        kind: hrdr_agent::SubagentKind::Blocking,
+        kind: hrdr_agent::SpawnKind::Blocking,
         agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub_agent)),
         steering: hrdr_agent::steering_queue(),
         running: true,
@@ -5907,7 +5907,7 @@ async fn the_todo_panel_hides_while_a_sub_agent_is_running() {
 
     // Mark the sub-agent as no longer running (done). After re-sync, the TODO
     // panel should reappear.
-    h.app.live_subagents.update(sub_key, |s| {
+    h.app.registry.update(sub_key, |s| {
         s.running = false;
         s.done = true;
     });

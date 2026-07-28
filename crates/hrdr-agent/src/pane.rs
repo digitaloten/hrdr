@@ -4,7 +4,7 @@
 //! A pane is one addressable conversation — a transcript, a status, and (for a
 //! sub-agent) the handles needed to steer it or drive a further turn on it. The
 //! main agent is pane [`PaneId::Main`]; every retained sub-agent (see
-//! [`crate::LiveSubagents`]) is a pane of its own. A frontend switches which
+//! [`crate::AgentRegistry`]) is a pane of its own. A frontend switches which
 //! pane is *active*, renders that pane's transcript, and sends input to it —
 //! without caring which kind it is.
 //!
@@ -13,14 +13,14 @@
 //! so a sub-agent's view is assembled by exactly the same rules as the main one:
 //! assistant text coalesces, reasoning coalesces, tool calls open and close.
 
-use crate::{AgentEvent, Entry, LiveSubagents, SessionState, apply_event};
+use crate::{AgentEvent, AgentRegistry, Entry, SessionState, apply_event};
 
 /// Which conversation a pane is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PaneId {
     /// The session's own agent.
     Main,
-    /// A delegated sub-agent, keyed by its [`crate::LiveSubagent::key`].
+    /// A delegated sub-agent, keyed by its [`crate::AgentEntry::key`].
     Sub(u64),
 }
 
@@ -66,7 +66,7 @@ pub struct Pane {
     /// How many of this agent's recorded events have been folded into the
     /// transcript above. [`PaneSet::sync`] replays the rest.
     ///
-    /// A sub-agent records everything it emits ([`crate::LiveSubagent::events`]),
+    /// A sub-agent records everything it emits ([`crate::AgentEntry::events`]),
     /// so a pane opened ten minutes into a run still shows the whole run — the
     /// transcript is rebuilt from the agent's own record rather than assembled from
     /// whatever the frontend happened to be listening for at the time.
@@ -307,12 +307,13 @@ impl PaneSet {
     /// it — is what keeps the user's pane alive: the agent prunes a sub-agent as
     /// soon as it is finished, delivered, and unpinned, and this is the only
     /// thing that says "someone is still reading this one".
-    pub fn sync(&mut self, live: &LiveSubagents) {
+    pub fn sync(&mut self, live: &AgentRegistry) {
         let active_key = self.active.key();
         let seen: Vec<LiveSnapshot> = live.with(|v| {
             for e in v.iter_mut() {
-                // The main agent is always pinned — it is the conversation.
-                e.pinned = e.key == crate::MAIN_KEY || Some(e.key) == active_key;
+                // The session's agent is always pinned — it is the conversation,
+                // and `owns_session` is the one place that says so.
+                e.pinned = e.owns_session() || Some(e.key) == active_key;
             }
             v.iter()
                 .map(|e| LiveSnapshot {
@@ -493,7 +494,7 @@ fn apply_replayed(transcript: &mut Vec<Entry>, ev: &AgentEvent, agents: &[LiveSn
 mod tests {
     use super::*;
     use crate::EntryKind;
-    use crate::SubagentKind;
+    use crate::SpawnKind;
 
     fn tool_start(id: &str, name: &str) -> AgentEvent {
         AgentEvent::ToolStart {
@@ -676,7 +677,7 @@ mod tests {
     /// the TUI for the main agent. They had already drifted.
     #[test]
     fn the_main_agent_is_built_from_its_own_record_like_any_other() {
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         let agent = || {
             std::sync::Arc::new(tokio::sync::Mutex::new(
                 crate::Agent::new(crate::AgentConfig {
@@ -685,7 +686,7 @@ mod tests {
                 .unwrap(),
             ))
         };
-        live.register_main(
+        live.register_session(
             agent(),
             crate::steering_queue(),
             "opus".to_string(),
@@ -810,14 +811,14 @@ mod tests {
 
     /// Build a live registry entry for `key`, finished and delivered — i.e. one
     /// the agent will prune the moment nobody is looking at it.
-    fn live_with(keys: &[u64]) -> LiveSubagents {
-        let live = LiveSubagents::new();
+    fn live_with(keys: &[u64]) -> AgentRegistry {
+        let live = AgentRegistry::new();
         for &key in keys {
             let agent = crate::Agent::new(crate::AgentConfig {
                 ..Default::default()
             })
             .unwrap();
-            live.register(crate::LiveSubagent {
+            live.register(crate::AgentEntry {
                 key,
                 bg_id: None,
                 tool_id: None,
@@ -832,7 +833,7 @@ mod tests {
                 usage: crate::AgentUsage::default(),
                 events: crate::event_log(),
                 turn: crate::TurnStats::default(),
-                kind: SubagentKind::Blocking,
+                kind: SpawnKind::Blocking,
                 agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
                 steering: crate::steering_queue(),
                 running: false,

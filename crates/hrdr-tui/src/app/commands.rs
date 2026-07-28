@@ -78,7 +78,7 @@ impl super::App {
         if reloaded {
             self.push_entry(Entry::notice(hrdr_app::PROJECT_DOCS_RELOADED_MSG));
         }
-        self.live_subagents.clear_pending(hrdr_agent::MAIN_KEY);
+        self.registry.clear_pending(hrdr_agent::MAIN_KEY);
         if let Ok(mut q) = self.steering.lock() {
             q.clear();
         }
@@ -116,7 +116,7 @@ impl super::App {
         // Detach the main agent's transcript writer for the same reason: the next
         // session mints a fresh id and `refresh_subagent_dir` opens its own jsonl.
         // Without this the new conversation would append onto the one we just left.
-        self.live_subagents.detach_transcript(hrdr_agent::MAIN_KEY);
+        self.registry.detach_transcript(hrdr_agent::MAIN_KEY);
         self.state_mut().name.clear();
         self.find = hrdr_app::FindState::default();
         self.pending_goto = None;

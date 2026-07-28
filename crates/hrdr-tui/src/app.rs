@@ -308,7 +308,7 @@ pub(crate) struct App {
     pub(crate) panes: hrdr_app::PaneSet,
     /// The agent's live sub-agent registry — the source the pane list is
     /// reconciled against, and where a pane's steering queue and `Agent` come from.
-    pub(crate) live_subagents: hrdr_agent::LiveSubagents,
+    pub(crate) registry: hrdr_agent::AgentRegistry,
     /// Shared cell for the sub-agent transcript dir, handed to the agent config
     /// and refreshed whenever the session id is assigned (see
     /// [`Self::refresh_subagent_dir`]).
@@ -554,14 +554,14 @@ impl App {
         // can persist sub-agent runs) and kept here to repoint at the session's
         // dir once an id is assigned (`refresh_subagent_dir`).
         let subagent_dir = Arc::new(std::sync::Mutex::new(None));
-        config.subagent_transcript_dir = Some(subagent_dir.clone());
+        config.child_transcript_dir = Some(subagent_dir.clone());
         // The user's TODO-lifetime preference lives in the UI config, but the
         // ageing itself is the agent's — hand the preference over.
         config.todo_ttl = todo_ttl;
         let cfg = config.clone();
         let agent = Agent::new(config)?;
         let todos = agent.todos();
-        let live_subagents = agent.live_subagents();
+        let registry = agent.registry();
         let background_tasks = agent.background_tasks();
         let project_docs_loaded = agent.project_docs().is_some();
         let (tx, rx) = mpsc::channel(TUI_EVENT_CAP);
@@ -614,7 +614,7 @@ impl App {
         let mut app = Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             subagent_dir,
-            live_subagents,
+            registry,
             panes: {
                 let mut panes = hrdr_app::PaneSet::new();
                 panes.main_mut().state = state;
@@ -709,7 +709,7 @@ impl App {
         // The live registry still carries the identity as two values (it is shared
         // with the agent side, which has its own reasons); it is taken apart here, at
         // the edge, and nowhere else.
-        self.live_subagents.register_main(
+        self.registry.register_session(
             self.agent.clone(),
             self.steering.clone(),
             reference.model().to_string(),
@@ -724,11 +724,11 @@ impl App {
         // that can be wrong, and one that was: a resumed session's provider label
         // reached the status bar while the agent kept talking to the endpoint it
         // launched with.
-        self.live_subagents
+        self.registry
             .update(hrdr_agent::MAIN_KEY, |e| e.usage = usage);
         // Adopt the entry (idempotent) so every later change republishes into it.
         let agent = self.agent.clone();
-        let live = self.live_subagents.clone();
+        let live = self.registry.clone();
         if let Ok(mut a) = agent.try_lock() {
             a.attach_live(live, hrdr_agent::MAIN_KEY);
         } else {
@@ -1129,7 +1129,7 @@ impl App {
                 // nothing drains it and `Done` re-sends it as a turn of its own.
                 // (While compacting, nothing is in `run()` to drain it at all.)
                 let sent = hrdr_app::prepare_outgoing_via(&self.agent, &input);
-                self.live_subagents
+                self.registry
                     .enqueue(hrdr_agent::MAIN_KEY, hrdr_agent::Steer::new(sent, input));
             } else {
                 self.spawn_turn(input);
@@ -1566,19 +1566,19 @@ impl App {
     /// and every other agent's `running` already came from the registry. A copy in
     /// the frontend is a copy that can be wrong.
     pub(crate) fn running(&self) -> bool {
-        self.live_subagents.is_running(hrdr_agent::MAIN_KEY)
+        self.registry.is_running(hrdr_agent::MAIN_KEY)
     }
 
     /// Whether the session's agent is summarizing its own context.
     pub(crate) fn compacting(&self) -> bool {
-        self.live_subagents.is_compacting(hrdr_agent::MAIN_KEY)
+        self.registry.is_compacting(hrdr_agent::MAIN_KEY)
     }
 
     /// What the user has said to the session's agent that has not reached it yet.
     /// (The renderer reads the *active* pane's queue; this is main's, for tests.)
     #[cfg(test)]
     pub(crate) fn pending(&self) -> Vec<String> {
-        self.live_subagents.pending(hrdr_agent::MAIN_KEY)
+        self.registry.pending(hrdr_agent::MAIN_KEY)
     }
 
     /// The main agent's state: its name, model, endpoint, history, transcript and
@@ -1602,16 +1602,16 @@ impl App {
         // The registry drives every pane's status, main included — so tell it
         // whether the session's agent is working.
         let running = self.running();
-        self.live_subagents
+        self.registry
             .update(hrdr_agent::MAIN_KEY, |e| e.running = running);
-        self.panes.sync(&self.live_subagents);
+        self.panes.sync(&self.registry);
     }
 
     /// Send `input` to the sub-agent whose pane is on screen.
     ///
     /// The routing rule — steer a turn in flight, start a new one on an idle agent
     /// — is not the TUI's to own: it is the same for any agent driven by anything,
-    /// so it lives in `LiveSubagents::send_prompt`. All the frontend does here is
+    /// so it lives in `AgentRegistry::send_prompt`. All the frontend does here is
     /// show what was said, and say where the events should be surfaced.
     fn send_to_subagent(&mut self, key: u64, input: String) {
         // Expanded with the main agent's cwd/names, but delivered to the
@@ -1623,7 +1623,7 @@ impl App {
         // is folded into the transcript here — doing it in both places would show
         // every message twice.
         let tx = self.tx.clone();
-        let delivered = self.live_subagents.send_prompt(key, input, move |ev| {
+        let delivered = self.registry.send_prompt(key, input, move |ev| {
             // The events go to the agent's log; this only wakes the UI so the next
             // frame picks them up. Sync callback — can't await; and since the
             // event is already durably in the agent's log, a dropped wake (full
@@ -1674,7 +1674,7 @@ impl App {
         match id.key() {
             None => self.agent.clone(),
             Some(key) => self
-                .live_subagents
+                .registry
                 .handle(key)
                 .map(|(a, _)| a)
                 // Released while being viewed — fall back rather than do nothing.
@@ -1701,7 +1701,7 @@ impl App {
         // next draw.
         let mut s = std::mem::take(&mut pane.state);
         f(&mut s);
-        self.live_subagents.update(key, |e| {
+        self.registry.update(key, |e| {
             e.model = s.model.model().to_string();
             e.provider = Some(s.model.provider().to_string());
             e.base_url = s.base_url.clone();
@@ -1927,9 +1927,9 @@ impl App {
             // next turn — harmless either way.
             self.quit_reap = Some(handle);
         }
-        self.live_subagents.end_turn(hrdr_agent::MAIN_KEY);
+        self.registry.end_turn(hrdr_agent::MAIN_KEY);
         // Undelivered messages would otherwise leak into the next turn.
-        let dropped = self.live_subagents.clear_pending(hrdr_agent::MAIN_KEY);
+        let dropped = self.registry.clear_pending(hrdr_agent::MAIN_KEY);
         self.push_entry(Entry::system(hrdr_app::cancel_message(dropped)));
         // The turn never reached `Done`, so nothing has autosaved the visible
         // user message + whatever partial reply streamed in before the
@@ -1976,7 +1976,7 @@ impl App {
         // on. `run` drains it, emits `Steered`, and the frontend folds that into the
         // user entry; nothing is pushed into the transcript here.
         self.reserve_session_id(&sent);
-        self.live_subagents
+        self.registry
             .enqueue(hrdr_agent::MAIN_KEY, hrdr_agent::Steer::new(sent, input));
         self.launch_turn();
     }
@@ -1991,7 +1991,7 @@ impl App {
         // The agent is what is running; the registry is where that is recorded. The
         // turn clock belongs to the agent whose turn it is, so a frontend showing
         // that agent shows its loader.
-        self.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
+        self.registry.begin_turn(hrdr_agent::MAIN_KEY);
         self.reasoning_start = None;
         // Keep last_usage so the status-bar context size persists between turns;
         // it's refreshed when this turn's Usage event arrives.
@@ -2071,7 +2071,7 @@ impl App {
     /// ran at least [`hrdr_app::BELL_MIN_SECS`], so quick replies stay silent).
     fn maybe_bell(&self) {
         let elapsed = self
-            .live_subagents
+            .registry
             .turn(hrdr_agent::MAIN_KEY)
             .and_then(|t| t.started)
             .map(|t| t.elapsed().as_secs_f64());
@@ -2087,7 +2087,7 @@ impl App {
     fn spawn_compaction(&mut self, instructions: Option<String>) {
         self.reasoning_start = None;
         // Summarizing is the model working: its own clock, no tools.
-        self.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
+        self.registry.begin_turn(hrdr_agent::MAIN_KEY);
         // Compaction acts on the conversation you are looking at. `run_compaction`
         // takes any agent — a sub-agent's history fills a context window like any
         // other, and it is the agent's own to manage.
@@ -2157,7 +2157,7 @@ impl App {
                     return;
                 }
                 self.turn_handle = None;
-                self.live_subagents.end_turn(hrdr_agent::MAIN_KEY);
+                self.registry.end_turn(hrdr_agent::MAIN_KEY);
                 // The turn is over — clear any sub-agents still in the live panel
                 // (an interrupted turn may not have delivered their ToolEnd).
                 if let Some(e) = err {
@@ -2244,7 +2244,7 @@ impl App {
             TurnMsg::ConfigChanged => self.maybe_reload_config(),
             TurnMsg::Compacted(res) => {
                 self.turn_handle = None;
-                self.live_subagents.end_turn(hrdr_agent::MAIN_KEY);
+                self.registry.end_turn(hrdr_agent::MAIN_KEY);
                 // Context shrank; drop stale usage so the status bar refreshes
                 // on the next turn (and we don't immediately re-trigger).
                 self.state_mut().usage.set_last(None);
@@ -2266,7 +2266,7 @@ impl App {
     /// Format the final stats line for the just-finished turn, if it produced
     /// any output.
     fn turn_stats(&self) -> Option<String> {
-        let turn = self.live_subagents.turn(hrdr_agent::MAIN_KEY)?;
+        let turn = self.registry.turn(hrdr_agent::MAIN_KEY)?;
         turn.started?;
         hrdr_app::turn_stats_line(hrdr_app::TurnStatsLine {
             // The model's working time, excluding the tool calls it waited on.
@@ -2313,7 +2313,7 @@ impl App {
     /// Start the inference clock from a test, without spawning a real turn.
     #[cfg(test)]
     pub(crate) fn resume_inference_for_test(&mut self) {
-        self.live_subagents.begin_turn(hrdr_agent::MAIN_KEY);
+        self.registry.begin_turn(hrdr_agent::MAIN_KEY);
     }
 
     /// Apply a `/model` pick without driving the picker's UI — the same
@@ -2380,7 +2380,7 @@ impl App {
         // throughput and the time-to-first-token shown for this agent come from
         // there, so they are *this* agent's — not the main agent's borrowed by
         // whatever pane happens to be on screen.
-        self.live_subagents.record(hrdr_agent::MAIN_KEY, &ev);
+        self.registry.record(hrdr_agent::MAIN_KEY, &ev);
         self.sync_panes();
     }
 }

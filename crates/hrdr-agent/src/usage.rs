@@ -9,7 +9,7 @@
 //! otherwise is lying about whichever agent you are looking at.
 //!
 //! Kept here (rather than in a frontend's session state) so the figures exist
-//! with no UI attached: [`crate::LiveSubagents::send_prompt`] folds each call's
+//! with no UI attached: [`crate::AgentRegistry::send_prompt`] folds each call's
 //! usage into the sub-agent's entry, and a frontend reads it off the registry.
 
 use serde::{Deserialize, Serialize};

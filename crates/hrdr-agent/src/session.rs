@@ -688,7 +688,7 @@ fn session_dir(cwd: &str) -> PathBuf {
 
 /// `sessions/<cwd-slug>/subagents/<session-id>/` — where a session's sub-agent
 /// transcripts live (one `.jsonl` per delegated `task`).
-pub fn subagent_transcript_dir(cwd: &str, id: &str) -> PathBuf {
+pub fn child_transcript_dir(cwd: &str, id: &str) -> PathBuf {
     session_dir(cwd).join("subagents").join(sanitize_name(id))
 }
 
@@ -911,7 +911,7 @@ impl Session {
         if let Some(stem) = session.state.id.as_deref() {
             let jsonl = path.with_file_name(format!("{stem}.jsonl"));
             if jsonl.exists() {
-                session.state.transcript = crate::subagent_transcript::read_transcript(&jsonl);
+                session.state.transcript = crate::transcript_log::read_transcript(&jsonl);
             }
         }
         // A load always knows the true `created` for this path — remember it,
@@ -1414,14 +1414,14 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn subagent_transcript_dir_nests_under_session() {
+    fn child_transcript_dir_nests_under_session() {
         // Both paths below are derived from $XDG_DATA_HOME, and `with_test_env`
         // swaps that process-global for other tests. Take the same lock: without
         // it a concurrent swap lands between the two calls and they disagree —
         // a latent race that only showed up once the suite grew enough to
         // reschedule around it.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = subagent_transcript_dir("/home/me/proj", "My Session");
+        let dir = child_transcript_dir("/home/me/proj", "My Session");
         // sessions/<cwd-slug>/subagents/<sanitized-id>
         assert!(dir.ends_with("subagents/my-session"), "got {dir:?}");
         assert!(
@@ -1535,7 +1535,7 @@ mod tests {
         assert_eq!(loaded.state.messages.len(), 1);
         assert_eq!(loaded.state.messages[0].role, MessageRole::User);
         // The transcript is NOT in the snapshot; no sibling jsonl exists here, so
-        // it loads empty. (Its own round-trip is pinned by the subagent_transcript
+        // it loads empty. (Its own round-trip is pinned by the transcript_log
         // tests and `roundtrip_audit::transcript_rebuilds_from_the_sibling_jsonl`.)
         assert!(
             loaded.state.transcript.is_empty(),
@@ -2586,7 +2586,7 @@ mod roundtrip_audit {
     /// tool args and results intact. This is what a resume actually rebuilds from.
     #[test]
     fn transcript_rebuilds_from_the_sibling_jsonl() {
-        use crate::subagent_transcript::{Record, SubagentTranscript};
+        use crate::transcript_log::{Record, TranscriptLog};
         with_test_env(|_tmp| {
             let cwd = std::env::current_dir()
                 .unwrap()
@@ -2599,7 +2599,7 @@ mod roundtrip_audit {
             // Write the sibling transcript as the live path would: a user turn, a
             // reply, and a tool call with args + result.
             let path = session_transcript_path(&cwd, "jsonl-rebuild");
-            let mut w = SubagentTranscript::append(&path).unwrap();
+            let mut w = TranscriptLog::append(&path).unwrap();
             w.write(&Record::Steered {
                 text: "audit the config".into(),
             });

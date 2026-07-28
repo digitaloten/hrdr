@@ -1,46 +1,52 @@
-//! Live sub-agents: the delegated agents a frontend can *address* — steer them
-//! mid-turn, watch their output, or drive another turn on one after its task has
-//! landed.
+//! The agent registry: every agent in the session — the one the user talks to
+//! and every agent it delegated to — as entries of one kind, in one list.
 //!
-//! A delegated sub-agent used to be unreachable: `SubagentTool` built it inside
-//! its spawned task, handed `run` a throwaway steering queue, and dropped the
-//! whole `Agent` when the task ended. Its output survived only as a flat log
-//! string. This registry retains the `Agent` itself, along with the very steering
-//! queue its `run` is draining, so the frontend can treat a sub-agent the way it
-//! treats the main one.
+//! A frontend *addresses* an agent through here: steer it mid-turn, watch its
+//! output, drive another turn on it. Which agent it is changes nothing about how
+//! that works, which is the point of the registry existing. The session's own
+//! agent is the entry at [`MAIN_KEY`]; a delegated one takes the next key. The
+//! only asymmetries are its retention (below) and what a delegated agent's
+//! *configuration* gives it — never a second code path.
 //!
-//! **Retention.** A sub-agent is kept while it is running, while its result is
-//! still owed to the main agent, or while a frontend has [`pinned`] it (because
-//! the user is looking at it). Once it is finished, delivered, and unpinned, it
-//! is pruned — see [`LiveSubagents::prune`]. The prune runs inside the agent, so
-//! a frontend that never pins (the headless CLI, a test) cannot leak agents by
-//! simply not participating.
+//! A delegated agent used to be unreachable: `SubagentTool` built it inside its
+//! spawned task, handed `run` a throwaway steering queue, and dropped the whole
+//! `Agent` when the task ended. Its output survived only as a flat log string.
+//! The registry retains the `Agent` itself, along with the very steering queue
+//! its `run` is draining, so every agent is as addressable as the first one.
 //!
-//! [`pinned`]: LiveSubagent::pinned
+//! **Retention.** A delegated agent is kept while it is running, while its
+//! result is still owed to its caller, or while a frontend has [`pinned`] it
+//! (because the user is looking at it). Once it is finished, delivered, and
+//! unpinned, it is pruned — see [`AgentRegistry::prune`]. The prune runs inside
+//! the agent, so a frontend that never pins (the headless CLI, a test) cannot
+//! leak agents by simply not participating. The session's own agent is never
+//! pruned: [`AgentEntry::owns_session`] is what says so, in one place.
+//!
+//! [`pinned`]: AgentEntry::pinned
 
 use std::sync::{Arc, Mutex};
 
 use crate::{Agent, SteeringQueue};
 
-/// Monotonic key source for live sub-agents. Distinct from `BG_SEQ` (which
+/// Monotonic key source for delegated agents. Distinct from `BG_SEQ` (which
 /// numbers *background* runs, and which the model sees as `task#N`): this keys
-/// every sub-agent, blocking or background, so a frontend has one identity space
+/// every agent, blocking or background, so a frontend has one identity space
 /// for its panes.
 static LIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The session's own agent, in the same registry as every delegated one.
 ///
-/// The main agent is not a different *kind* of thing — it is the agent that
-/// happens to have been there first. Registering it here is what lets a frontend
-/// build its view the same way for all of them: replay the agent's record. Keys
-/// from [`LiveAgents::next_key`] start at 1, so this never collides.
+/// It is not a different *kind* of thing — it is the agent that happens to have
+/// been there first. Registering it here is what lets a frontend build its view
+/// the same way for all of them: replay the agent's record. Keys from
+/// [`AgentRegistry::next_key`] start at 1, so this never collides.
 pub const MAIN_KEY: u64 = 0;
 
 /// An agent's own record of what it has emitted, in order. Shared between the
 /// running agent (which appends) and a frontend (which replays).
 ///
 /// Consumed events are dropped once every reader has seen them
-/// ([`LiveAgents::compact`]), so a long session does not retain every token delta
+/// ([`Events::compact`]), so a long session does not retain every token delta
 /// it ever streamed — `base` keeps cursors stable across that.
 #[derive(Default)]
 pub struct Events {
@@ -88,7 +94,7 @@ pub fn event_log() -> EventLog {
     Arc::new(Mutex::new(Events::default()))
 }
 
-/// What happened to a prompt handed to an agent — see [`LiveSubagents::send_prompt`].
+/// What happened to a prompt handed to an agent — see [`AgentRegistry::send_prompt`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptDelivery {
     /// A turn was already in flight, so the prompt was injected into it.
@@ -112,24 +118,32 @@ enum SendOutcome {
     },
 }
 
-/// How a sub-agent was delegated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubagentKind {
+/// How an agent came to exist.
+///
+/// One enum, shared with the durable transcript ([`crate::transcript_log`]
+/// re-exports it) — a run's `Start` record and its registry entry describe the
+/// same fact, and two enums with the same variants could only drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnKind {
+    /// The session's own agent: nobody delegated to it, and nothing is waiting
+    /// on an answer from it. Exactly one entry per session has this.
+    Session,
     /// The `task` call blocks on it; its answer becomes the tool result.
     Blocking,
     /// Detached (`background: true`); its answer is delivered later.
     Background,
 }
 
-/// A delegated sub-agent the frontend can address.
+/// One agent the frontend can address — the session's own, or a delegated one.
 ///
 /// Deliberately not `Debug`: it holds an `Agent`, whose config carries an API
 /// key.
-pub struct LiveSubagent {
-    /// Frontend-facing identity, unique across blocking and background runs.
+pub struct AgentEntry {
+    /// Frontend-facing identity, unique across every agent in the session.
     pub key: u64,
     /// The background run id (`task#N`) the model sees, when this is a background
-    /// run. `None` for a blocking sub-agent, which the model never names.
+    /// run. `None` otherwise — a blocking or session agent the model never names.
     pub bg_id: Option<u64>,
     /// The `task` tool call that spawned it, when there was one.
     pub tool_id: Option<String>,
@@ -153,12 +167,12 @@ pub struct LiveSubagent {
     /// its own; a frontend showing this agent shows *its* list.
     pub todos: Arc<Mutex<Vec<hrdr_tools::TodoItem>>>,
     /// Its own token/cost counters, folded from every call it makes — by
-    /// [`LiveSubagents::send_prompt`] for a turn the user drove, and by the `task`
+    /// [`AgentRegistry::send_prompt`] for a turn the user drove, and by the `task`
     /// tool for the delegated run. A frontend showing this agent reads its usage
     /// from here; nothing has to be watching for the figures to be right.
     pub usage: crate::AgentUsage,
     /// **Everything this agent has emitted**, in order — the record a frontend
-    /// replays to build its transcript ([`LiveSubagents::events_since`]).
+    /// replays to build its transcript ([`AgentRegistry::events_since`]).
     ///
     /// The agent keeps it itself because it is the agent's own history, and
     /// because the alternative does not work: a *background* sub-agent's `task`
@@ -174,7 +188,7 @@ pub struct LiveSubagent {
     /// turns, so every agent has one — a frontend showing this agent shows *its*
     /// loader, not the main agent's.
     pub turn: crate::TurnStats,
-    pub kind: SubagentKind,
+    pub kind: SpawnKind,
     /// The sub-agent itself, retained so a frontend can drive a further turn on
     /// it once its delegated task has landed.
     pub agent: Arc<tokio::sync::Mutex<Agent>>,
@@ -201,25 +215,30 @@ pub struct LiveSubagent {
     /// one. Every event recorded against this agent — its delegated run OR a
     /// steered turn — is appended here, so the on-disk transcript is complete
     /// regardless of which path drove the turn.
-    pub transcript:
-        Option<std::sync::Arc<std::sync::Mutex<crate::subagent_transcript::SubagentTranscript>>>,
+    pub transcript: Option<std::sync::Arc<std::sync::Mutex<crate::transcript_log::TranscriptLog>>>,
 }
 
-impl LiveSubagent {
-    /// Whether this entry may be dropped: its work is done, the main agent has
-    /// its result, and nobody is looking at it.
-    ///
-    /// The session's own agent is never disposable — it is the conversation.
+impl AgentEntry {
+    /// This is the agent the session belongs to. **The one asymmetry**, stated
+    /// here so nobody restates it: it is never pruned and never unpinned, because
+    /// it is the conversation rather than a task within it. Everything else about
+    /// an agent is its configuration.
+    pub fn owns_session(&self) -> bool {
+        self.key == MAIN_KEY
+    }
+
+    /// Whether this entry may be dropped: its work is done, its caller has its
+    /// result, and nobody is looking at it.
     fn disposable(&self) -> bool {
-        self.key != MAIN_KEY && !self.running && self.done && self.delivered && !self.pinned
+        !self.owns_session() && !self.running && self.done && self.delivered && !self.pinned
     }
 }
 
-/// The set of live sub-agents, shared between the agent and its frontend.
+/// Every agent in the session, shared between the agents and their frontend.
 #[derive(Clone, Default)]
-pub struct LiveSubagents(Arc<Mutex<Vec<LiveSubagent>>>);
+pub struct AgentRegistry(Arc<Mutex<Vec<AgentEntry>>>);
 
-impl LiveSubagents {
+impl AgentRegistry {
     pub fn new() -> Self {
         Self::default()
     }
@@ -231,23 +250,23 @@ impl LiveSubagents {
 
     /// Run `f` over the entries under the lock. A poisoned lock is recovered
     /// rather than propagated: losing the pane list must never fail a turn.
-    pub fn with<R>(&self, f: impl FnOnce(&mut Vec<LiveSubagent>) -> R) -> R {
+    pub fn with<R>(&self, f: impl FnOnce(&mut Vec<AgentEntry>) -> R) -> R {
         let mut v = self.0.lock().unwrap_or_else(|p| p.into_inner());
         f(&mut v)
     }
 
     /// Register an agent.
-    pub fn register(&self, entry: LiveSubagent) {
+    pub fn register(&self, entry: AgentEntry) {
         self.with(|v| v.push(entry));
     }
 
     /// Register the session's own agent, so it is an entry in the registry like
     /// every delegated one — same record, same counters, same chrome.
     ///
-    /// This is what makes a frontend able to stop special-casing it: it builds the
-    /// main agent's view by replaying the main agent's record, exactly as it builds
-    /// a sub-agent's. Idempotent.
-    pub fn register_main(
+    /// This is what makes a frontend able to stop special-casing it: it builds
+    /// this agent's view by replaying its record, exactly as it builds any
+    /// other's. Idempotent.
+    pub fn register_session(
         &self,
         agent: Arc<tokio::sync::Mutex<Agent>>,
         steering: SteeringQueue,
@@ -260,7 +279,7 @@ impl LiveSubagents {
             if v.iter().any(|e| e.key == MAIN_KEY) {
                 return;
             }
-            v.push(LiveSubagent {
+            v.push(AgentEntry {
                 key: MAIN_KEY,
                 bg_id: None,
                 tool_id: None,
@@ -277,18 +296,21 @@ impl LiveSubagents {
                 usage,
                 events: event_log(),
                 turn: crate::TurnStats::default(),
-                kind: SubagentKind::Blocking,
+                // Nobody delegated to it and nothing waits on its answer — the
+                // reason `done`/`delivered` below are meaningless for it.
+                kind: SpawnKind::Session,
                 agent,
                 steering,
                 running: false,
                 compacting: false,
-                // The session's agent is never finished, never owed, never pruned.
+                // The session's agent is never finished, never owed, never pruned
+                // (`AgentEntry::owns_session`).
                 done: false,
                 delivered: false,
                 pinned: true,
                 // Attached later via `attach_transcript`, once the session id is
                 // assigned and its jsonl path is known — the same durable
-                // event-fold transcript a delegated sub-agent gets. `None` until
+                // event-fold transcript every delegated agent gets. `None` until
                 // then (a brand-new session before its first save has no id yet).
                 transcript: None,
             });
@@ -296,7 +318,7 @@ impl LiveSubagents {
     }
 
     /// Apply `f` to the entry with `key`, if it is still present.
-    pub fn update(&self, key: u64, f: impl FnOnce(&mut LiveSubagent)) {
+    pub fn update(&self, key: u64, f: impl FnOnce(&mut AgentEntry)) {
         self.with(|v| {
             if let Some(e) = v.iter_mut().find(|e| e.key == key) {
                 f(e);
@@ -333,7 +355,7 @@ impl LiveSubagents {
             // sync here.
             if let Some(ts) = &e.transcript {
                 let mut w = ts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                match crate::subagent_transcript::Record::from_event(ev) {
+                match crate::transcript_log::Record::from_event(ev) {
                     Some(rec) => w.write(&rec),
                     None => w.flush(),
                 }
@@ -343,7 +365,7 @@ impl LiveSubagents {
 
     /// Attach a durable transcript writer to agent `key` at `path`, if it does not
     /// already have one. Opens the file in **append** mode
-    /// ([`crate::subagent_transcript::SubagentTranscript::append`]): the main
+    /// ([`crate::transcript_log::TranscriptLog::append`]): the main
     /// agent's id is stable across resumes, so a resumed session continues its
     /// existing jsonl rather than starting a second one.
     ///
@@ -363,7 +385,7 @@ impl LiveSubagents {
         if self.with(|v| v.iter().any(|e| e.key == key && e.transcript.is_some())) {
             return;
         }
-        let Ok(writer) = crate::subagent_transcript::SubagentTranscript::append(path) else {
+        let Ok(writer) = crate::transcript_log::TranscriptLog::append(path) else {
             return;
         };
         let writer = Arc::new(Mutex::new(writer));
@@ -700,12 +722,12 @@ pub fn age_completed_todos(
 /// each still holding an `Agent` — and shown to the user as a live pane they can
 /// "steer", with nothing on the other end.
 pub struct RunGuard {
-    live: LiveSubagents,
+    live: AgentRegistry,
     key: u64,
 }
 
 impl RunGuard {
-    pub fn new(live: LiveSubagents, key: u64) -> Self {
+    pub fn new(live: AgentRegistry, key: u64) -> Self {
         Self { live, key }
     }
 }
@@ -726,12 +748,12 @@ mod tests {
     use super::*;
     use crate::{AgentConfig, steering_queue};
 
-    fn entry(key: u64) -> LiveSubagent {
+    fn entry(key: u64) -> AgentEntry {
         let agent = Agent::new(AgentConfig {
             ..Default::default()
         })
         .unwrap();
-        LiveSubagent {
+        AgentEntry {
             key,
             bg_id: None,
             tool_id: None,
@@ -746,7 +768,7 @@ mod tests {
             usage: crate::AgentUsage::default(),
             events: event_log(),
             turn: crate::TurnStats::default(),
-            kind: SubagentKind::Blocking,
+            kind: SpawnKind::Blocking,
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             steering: steering_queue(),
             running: true,
@@ -760,7 +782,7 @@ mod tests {
 
     #[test]
     fn prune_keeps_running_owed_and_pinned_entries() {
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
 
         // Still running → kept.
         live.register(entry(1));
@@ -799,8 +821,8 @@ mod tests {
 
     #[test]
     fn keys_are_unique_across_runs() {
-        let a = LiveSubagents::next_key();
-        let b = LiveSubagents::next_key();
+        let a = AgentRegistry::next_key();
+        let b = AgentRegistry::next_key();
         assert_ne!(a, b);
     }
 
@@ -847,7 +869,7 @@ mod tests {
     /// into the very queue that agent's `run` is draining.
     #[tokio::test]
     async fn a_prompt_to_a_busy_agent_steers_the_turn_in_flight() {
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         live.register(entry(1)); // `entry` is running
         let steering = live.with(|v| Arc::clone(&v[0].steering));
 
@@ -874,7 +896,7 @@ mod tests {
     /// conversation continues rather than being re-delegated from scratch.
     #[tokio::test]
     async fn a_prompt_to_an_idle_agent_starts_a_further_turn_on_it() {
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         live.register(entry(1));
         // Its delegated task has landed.
         live.update(1, |e| {
@@ -900,7 +922,7 @@ mod tests {
     /// caller can say so rather than silently swallowing what the user typed.
     #[test]
     fn a_prompt_to_a_released_agent_is_reported_not_swallowed() {
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         assert!(
             live.send_prompt(99, crate::Steer::plain("hello?"), |_| {})
                 .is_none()
@@ -911,7 +933,7 @@ mod tests {
     /// never runs when the task is aborted, so the guard has to do it on drop.
     #[test]
     fn a_cancelled_run_still_releases_its_sub_agent() {
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         live.register(entry(1));
         {
             let _guard = RunGuard::new(live.clone(), 1);
@@ -944,7 +966,7 @@ mod tests {
     /// *because* you noticed it working.
     #[test]
     fn an_agents_events_are_recorded_on_it_and_replayed_from_a_cursor() {
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         live.register(entry(1));
 
         live.record(1, &crate::AgentEvent::Text("looking".into()));
@@ -980,7 +1002,7 @@ mod tests {
     /// the reader.
     #[test]
     fn a_folded_in_record_is_released_without_disturbing_the_cursor() {
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         live.register(entry(1));
         live.record(1, &crate::AgentEvent::Text("a".into()));
         live.record(1, &crate::AgentEvent::Text("b".into()));
@@ -1010,7 +1032,7 @@ mod tests {
     /// A status bar reading the agent you are looking at reads these.
     #[test]
     fn a_sub_agents_calls_are_counted_on_its_own_entry() {
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         live.register(entry(1));
         live.register(entry(2));
         live.record(
@@ -1047,14 +1069,14 @@ mod tests {
     /// same on-disk jsonl.
     #[test]
     fn record_writes_to_the_durable_transcript() {
-        use crate::subagent_transcript;
+        use crate::transcript_log;
         let dir = tempfile::tempdir().unwrap();
         let writer = Arc::new(Mutex::new(
-            subagent_transcript::SubagentTranscript::create(dir.path(), "000-x").unwrap(),
+            transcript_log::TranscriptLog::create(dir.path(), "000-x").unwrap(),
         ));
         let path = writer.lock().unwrap().path().to_path_buf();
 
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         live.register(entry(1));
         // Give the entry a real writer, as a spawned sub-agent's does.
         live.update(1, |e| e.transcript = Some(writer.clone()));
@@ -1071,7 +1093,7 @@ mod tests {
             1,
             "the two deltas cost one line, not two: {body:?}"
         );
-        let entries = subagent_transcript::read_transcript(&path);
+        let entries = transcript_log::read_transcript(&path);
         assert!(
             entries
                 .iter()
@@ -1086,12 +1108,12 @@ mod tests {
     /// *replaces* the writer, so no record ever lands in the file we just left.
     #[test]
     fn attach_transcript_never_leaves_two_writers_on_one_file() {
-        use crate::subagent_transcript;
+        use crate::transcript_log;
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.jsonl");
         let second = dir.path().join("second.jsonl");
 
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         live.register(entry(1));
         live.attach_transcript(1, &first);
         // Idempotent: this must not open a second handle on `first`.
@@ -1122,7 +1144,7 @@ mod tests {
         for p in [&first, &second] {
             let text = std::fs::read_to_string(p).unwrap();
             for l in text.lines().filter(|l| !l.trim().is_empty()) {
-                serde_json::from_str::<subagent_transcript::Record>(l).expect("a standalone line");
+                serde_json::from_str::<transcript_log::Record>(l).expect("a standalone line");
             }
         }
     }
@@ -1132,7 +1154,7 @@ mod tests {
     /// and stops its clock.
     #[test]
     fn continue_or_finish_finishes_an_empty_queue() {
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         live.register(entry(1)); // `entry` starts running
         // The loop leaves the clock ticking before each `run`; start it so the
         // finish path has something to stop.
@@ -1154,7 +1176,7 @@ mod tests {
     /// opener, so it must still be waiting.
     #[test]
     fn continue_or_finish_continues_when_a_message_is_queued() {
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         live.register(entry(1));
         live.begin_turn(1);
         live.enqueue(1, crate::Steer::plain("next"));
@@ -1178,7 +1200,7 @@ mod tests {
     /// An absent key is a no-op: no continuation, and no panic.
     #[test]
     fn continue_or_finish_on_an_unknown_key_is_false() {
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         assert!(
             !live.continue_or_finish(999),
             "no entry means no continuation"
@@ -1187,7 +1209,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_exposes_the_retained_agent_and_its_steering_queue() {
-        let live = LiveSubagents::new();
+        let live = AgentRegistry::new();
         live.register(entry(7));
         let (agent, steering) = live.handle(7).expect("a live sub-agent is addressable");
         // The queue is the one `run` drains, so a push is a mid-turn injection.

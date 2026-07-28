@@ -108,7 +108,7 @@ impl Agent {
         // The main agent now has these answers, so the live entries are no longer
         // owed. They stay only while pinned (the user is viewing one); the prune
         // at turn end drops the rest.
-        self.live_subagents.with(|v| {
+        self.registry.with(|v| {
             for e in v.iter_mut() {
                 if e.bg_id.is_some_and(|b| finished.iter().any(|f| f.id == b)) {
                     e.delivered = true;

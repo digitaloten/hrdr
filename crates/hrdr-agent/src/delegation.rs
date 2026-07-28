@@ -140,8 +140,8 @@ fn spawn_background(
     cost_total: Arc<std::sync::Mutex<f64>>,
     cost_partial: Arc<std::sync::atomic::AtomicBool>,
     lsp: Option<Arc<hrdr_tools::LspRegistry>>,
-    transcript_dir: SubagentDirCell,
-    live: LiveSubagents,
+    transcript_dir: ChildDirCell,
+    live: AgentRegistry,
     // A write-capable sub-agent's isolated worktree (`Fresh` for a new `task`,
     // `Existing` for a `task_revive` continuation), or `None`.
     worktree: SpawnWorktree,
@@ -154,7 +154,7 @@ fn spawn_background(
     let header = format!("↳ task#{id} ({}): {label}", cfg.model.model());
     // Identity for the live registry, taken before `tool_id` is moved into the
     // background-task row below.
-    let live_key = LiveSubagents::next_key();
+    let live_key = AgentRegistry::next_key();
     let tool_id_for_live = tool_id.clone();
     let label_for_live = label.clone();
     let model_for_live = cfg.model.model().to_string();
@@ -226,14 +226,14 @@ fn spawn_background(
     // later steered turn) and its path can go onto the background-task row as a
     // `task_output` fallback. `None` when it could not be opened (no session dir
     // yet, or an unwritable one) — best-effort, like every transcript write.
-    let transcript: Option<Arc<Mutex<subagent_transcript::SubagentTranscript>>> =
-        resolve_subagent_dir(&transcript_dir)
+    let transcript: Option<Arc<Mutex<transcript_log::TranscriptLog>>> =
+        resolve_child_dir(&transcript_dir)
             .and_then(|dir| open_next_subagent_transcript(&dir, &label))
             .map(|t| Arc::new(Mutex::new(t)));
     let transcript_path = transcript
         .as_ref()
         .and_then(|ts| ts.lock().ok().map(|g| g.path().to_path_buf()));
-    live.register(LiveSubagent {
+    live.register(AgentEntry {
         key: live_key,
         bg_id: Some(id),
         tool_id: tool_id_for_live,
@@ -246,9 +246,9 @@ fn spawn_background(
         compaction_reserved: 0,
         todos: Default::default(),
         usage: usage_for_live,
-        events: subagent_live::event_log(),
+        events: registry::event_log(),
         turn: TurnStats::default(),
-        kind: SubagentKind::Background,
+        kind: SpawnKind::Background,
         agent: Arc::clone(&sub),
         steering: Arc::clone(&steering),
         running: true,
@@ -274,10 +274,10 @@ fn spawn_background(
     if let Some(ts) = &transcript
         && let Ok(mut t) = ts.lock()
     {
-        t.write(&subagent_transcript::Record::Start {
+        t.write(&transcript_log::Record::Start {
             model: model_for_live.clone(),
             label: label.clone(),
-            kind: subagent_transcript::SpawnKind::Background,
+            kind: transcript_log::SpawnKind::Background,
             prompt: prompt.clone(),
         });
     }
@@ -445,8 +445,8 @@ fn spawn_background(
                         // The transcript is the durable full record — its byte
                         // count is the whole run, not the (possibly narrower)
                         // report delivered to the parent below.
-                        t.write(&subagent_transcript::Record::End {
-                            status: subagent_transcript::EndStatus::Ok,
+                        t.write(&transcript_log::Record::End {
+                            status: transcript_log::EndStatus::Ok,
                             bytes: o.len(),
                         });
                     }
@@ -480,11 +480,11 @@ fn spawn_background(
                     if let Some(ts) = &ts_inner
                         && let Ok(mut t) = ts.lock()
                     {
-                        t.write(&subagent_transcript::Record::Error {
+                        t.write(&transcript_log::Record::Error {
                             msg: format!("{e:#}"),
                         });
-                        t.write(&subagent_transcript::Record::End {
-                            status: subagent_transcript::EndStatus::Failed,
+                        t.write(&transcript_log::Record::End {
+                            status: transcript_log::EndStatus::Failed,
                             bytes: out.len(),
                         });
                     }
@@ -505,8 +505,8 @@ fn spawn_background(
                 if let Some(ts) = &ts_outer
                     && let Ok(mut t) = ts.lock()
                 {
-                    t.write(&subagent_transcript::Record::End {
-                        status: subagent_transcript::EndStatus::Panicked,
+                    t.write(&transcript_log::Record::End {
+                        status: transcript_log::EndStatus::Panicked,
                         bytes: 0,
                     });
                 }
@@ -640,9 +640,8 @@ pub(crate) fn format_shortstat(raw: &str) -> Option<String> {
 }
 
 /// The shared, lazily-resolved sub-agent transcript directory cell (see
-/// [`AgentConfig::subagent_transcript_dir`]).
-pub(crate) type SubagentDirCell =
-    Option<std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>>;
+/// [`AgentConfig::child_transcript_dir`]).
+pub(crate) type ChildDirCell = Option<std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>>;
 
 /// Monotonic counter for sub-agent transcript file ids, shared by the blocking
 /// and background spawn paths so ids are ordered and unique within a session
@@ -651,7 +650,7 @@ static SUBAGENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 /// A transcript file id: `NNN-<slug>`, where `slug` is the sanitized label.
 /// `seq` is the pre-fetched counter value.
-pub(crate) fn subagent_transcript_id(seq: u64, label: &str) -> String {
+pub(crate) fn child_transcript_id(seq: u64, label: &str) -> String {
     let lowered: String = label
         .trim()
         .chars()
@@ -678,7 +677,7 @@ pub(crate) fn subagent_transcript_id(seq: u64, label: &str) -> String {
 
 /// Read the resolved transcript dir from the shared cell, if the feature is on
 /// and a session id has been assigned.
-pub(crate) fn resolve_subagent_dir(cell: &SubagentDirCell) -> Option<std::path::PathBuf> {
+pub(crate) fn resolve_child_dir(cell: &ChildDirCell) -> Option<std::path::PathBuf> {
     cell.as_ref()?.lock().ok()?.clone()
 }
 
@@ -691,7 +690,7 @@ const SUBAGENT_ID_ATTEMPTS: u64 = 10_000;
 /// The id counter restarts at 0 in every process while `dir` is keyed by session
 /// id and survives a resume, so `NNN-<slug>` collides with a previous run's file
 /// on the very first task after `/resume` (the default label is `sub-task`, so
-/// this is the common case, not a corner). [`SubagentTranscript::create`] is
+/// this is the common case, not a corner). [`TranscriptLog::create`] is
 /// exclusive, so a taken id fails and we advance instead of appending a new run
 /// onto an old run's log.
 ///
@@ -699,7 +698,7 @@ const SUBAGENT_ID_ATTEMPTS: u64 = 10_000;
 fn open_next_subagent_transcript(
     dir: &std::path::Path,
     label: &str,
-) -> Option<subagent_transcript::SubagentTranscript> {
+) -> Option<transcript_log::TranscriptLog> {
     open_next_subagent_transcript_from(&SUBAGENT_SEQ, dir, label)
 }
 
@@ -710,11 +709,11 @@ pub(crate) fn open_next_subagent_transcript_from(
     seq_source: &std::sync::atomic::AtomicU64,
     dir: &std::path::Path,
     label: &str,
-) -> Option<subagent_transcript::SubagentTranscript> {
+) -> Option<transcript_log::TranscriptLog> {
     for _ in 0..SUBAGENT_ID_ATTEMPTS {
         let seq = seq_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let id = subagent_transcript_id(seq, label);
-        match subagent_transcript::SubagentTranscript::create(dir, &id) {
+        let id = child_transcript_id(seq, label);
+        match transcript_log::TranscriptLog::create(dir, &id) {
             Ok(t) => return Some(t),
             // Taken by a previous run (or a concurrent spawn): try the next id.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -790,7 +789,7 @@ pub(crate) fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     base.allowed_tools = None;
     base.read_only = false;
     // Sub-agents never spawn sub-agents, so they never write transcripts.
-    base.subagent_transcript_dir = None;
+    base.child_transcript_dir = None;
     // ── The session/sub-agent seam ──────────────────────────────────────────
     // A sub-agent is an agent. It keeps every capability the main agent has;
     // what it may *do* is bounded by its type and permissions (`read_only`,
@@ -800,7 +799,7 @@ pub(crate) fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
     //   - it writes no sub-agent transcripts of its own.
     // Everything else — memory, compaction, guardrails, hooks, the cost ceiling
     // — is inherited, and the agent works with no UI attached.
-    base.is_subagent = true;
+    base.delegated = true;
     // The sub-agent model. A bare id is a model on the SAME provider — "Opus
     // drives, Sonnet implements", same endpoint, same key, same bill. A whole
     // `provider://model` moves the sub-agents to another provider, and the endpoint
@@ -1093,11 +1092,11 @@ pub(crate) struct SubagentTool {
     /// base config has `lsp = false`, so none builds a registry of its own).
     lsp: Option<Arc<hrdr_tools::LspRegistry>>,
     /// The parent session's transcript dir cell (see
-    /// [`AgentConfig::subagent_transcript_dir`]); read at spawn.
-    transcript_dir: SubagentDirCell,
+    /// [`AgentConfig::child_transcript_dir`]); read at spawn.
+    transcript_dir: ChildDirCell,
     /// Every sub-agent spawned here is registered so the frontend can steer it,
-    /// display it, and drive further turns on it. See [`LiveSubagents`].
-    live: LiveSubagents,
+    /// display it, and drive further turns on it. See [`AgentRegistry`].
+    live: AgentRegistry,
     /// The parent tree's uncommitted paths as of the last time a spawn warned
     /// about them (see the dirty-tree note in [`Self::spawn_task`]). Kept so a
     /// fan-out of four parallel tasks doesn't repeat one warning four times,
@@ -1116,8 +1115,8 @@ impl SubagentTool {
         cost_total: Arc<std::sync::Mutex<f64>>,
         cost_partial: Arc<std::sync::atomic::AtomicBool>,
         lsp: Option<Arc<hrdr_tools::LspRegistry>>,
-        transcript_dir: SubagentDirCell,
-        live: LiveSubagents,
+        transcript_dir: ChildDirCell,
+        live: AgentRegistry,
     ) -> Self {
         let caps = (base.max_readonly_subagents, base.max_write_subagents);
         let mut desc = String::from(
@@ -1758,7 +1757,7 @@ struct DiskRun {
 /// one per `<stem>.jsonl`, with its label/cwd taken from the sibling `<stem>.json`
 /// snapshot when present (a run that reached its first `History` save) or the
 /// Whether `stem` is a well-formed run id — the `NNN-slug` shape
-/// [`subagent_transcript_id`] mints and [`scan_subagent_runs`] surfaces. A
+/// [`child_transcript_id`] mints and [`scan_subagent_runs`] surfaces. A
 /// `task_output` / `task_revive` id comes from the model, which joins it onto the
 /// snapshot dir; rejecting a path separator, `..`, or empty string keeps that
 /// lookup inside `subagents/<main-id>/` instead of escaping it.
@@ -1790,14 +1789,14 @@ fn scan_subagent_runs(dir: &std::path::Path) -> Vec<DiskRun> {
         else {
             continue;
         };
-        let done = subagent_transcript::is_complete(&path);
+        let done = transcript_log::is_complete(&path);
         // Label + cwd: prefer the snapshot (its name IS the label; its cwd is the
         // worktree), else fall back to the jsonl's opening `Start` record.
         let json = path.with_extension("json");
         let (label, cwd) = match crate::Session::load_path(&json) {
             Ok(s) => (s.state.name, Some(s.state.cwd)),
-            Err(_) => match subagent_transcript::read_start(&path) {
-                Some(subagent_transcript::Record::Start { label, .. }) => (label, None),
+            Err(_) => match transcript_log::read_start(&path) {
+                Some(transcript_log::Record::Start { label, .. }) => (label, None),
                 _ => (String::new(), None),
             },
         };
@@ -1814,7 +1813,7 @@ fn scan_subagent_runs(dir: &std::path::Path) -> Vec<DiskRun> {
 
 /// A sub-agent conversation resolved for `task_revive`: the messages/identity to
 /// hydrate a fresh agent from, plus the existing worktree/branch to continue on.
-/// Produced live-first (from a retained [`LiveSubagent`]) or from disk
+/// Produced live-first (from a retained [`AgentEntry`]) or from disk
 /// ([`revive_target_from_disk`]).
 struct RevivedState {
     messages: Vec<ChatMessage>,
@@ -1899,9 +1898,9 @@ async fn revive_target_from_disk(dir: &std::path::Path, stem: &str) -> Result<Re
 /// selects a resumable run from.
 pub(crate) struct TaskListTool {
     /// The parent session's sub-agent snapshot dir cell (see
-    /// [`AgentConfig::subagent_transcript_dir`]); resolved at call time so the
+    /// [`AgentConfig::child_transcript_dir`]); resolved at call time so the
     /// disk scan survives a resume. `None` (or unresolved) → in-memory list only.
-    pub(crate) transcript_dir: SubagentDirCell,
+    pub(crate) transcript_dir: ChildDirCell,
 }
 
 #[async_trait::async_trait]
@@ -1973,7 +1972,7 @@ impl hrdr_tools::Tool for TaskListTool {
         // On-disk runs from earlier sessions (post-`/resume` the registry above is
         // empty), deduped against the live rows. A finished/orphaned run is invisible
         // in memory but recoverable here, and this is what `task_revive` selects from.
-        if let Some(dir) = resolve_subagent_dir(&self.transcript_dir) {
+        if let Some(dir) = resolve_child_dir(&self.transcript_dir) {
             let disk: Vec<String> = scan_subagent_runs(&dir)
                 .into_iter()
                 .filter(|r| !live_stems.contains(&r.stem))
@@ -2012,7 +2011,7 @@ impl hrdr_tools::Tool for TaskListTool {
 /// question at different fidelities is how a model ends up with the worse answer,
 /// so the overlap was cut rather than kept: peek here, read back there.
 pub(crate) struct TaskOutputTool {
-    pub(crate) live: LiveSubagents,
+    pub(crate) live: AgentRegistry,
 }
 
 #[async_trait::async_trait]
@@ -2133,7 +2132,7 @@ impl hrdr_tools::Tool for TaskOutputTool {
 /// follow-up — the counterpart to `task_steer`, which only reaches a *running*
 /// turn. Resolution is live-first, disk-fallback:
 ///
-/// * **Live** — the sub-agent is still retained in [`LiveSubagents`] (finished but
+/// * **Live** — the sub-agent is still retained in [`AgentRegistry`] (finished but
 ///   not yet pruned): reuse its in-memory conversation directly (the freshest
 ///   copy) and its recorded worktree.
 /// * **Disk** — otherwise hydrate from the persisted `<stem>.json` snapshot under
@@ -2161,8 +2160,8 @@ pub(crate) struct TaskReviveTool {
     cost_total: Arc<std::sync::Mutex<f64>>,
     cost_partial: Arc<std::sync::atomic::AtomicBool>,
     lsp: Option<Arc<hrdr_tools::LspRegistry>>,
-    transcript_dir: SubagentDirCell,
-    live: LiveSubagents,
+    transcript_dir: ChildDirCell,
+    live: AgentRegistry,
 }
 
 impl TaskReviveTool {
@@ -2175,8 +2174,8 @@ impl TaskReviveTool {
         cost_total: Arc<std::sync::Mutex<f64>>,
         cost_partial: Arc<std::sync::atomic::AtomicBool>,
         lsp: Option<Arc<hrdr_tools::LspRegistry>>,
-        transcript_dir: SubagentDirCell,
-        live: LiveSubagents,
+        transcript_dir: ChildDirCell,
+        live: AgentRegistry,
     ) -> Self {
         let max_readonly = base.max_readonly_subagents;
         let max_write = base.max_write_subagents;
@@ -2421,7 +2420,7 @@ impl hrdr_tools::Tool for TaskReviveTool {
             .ok_or_else(|| {
                 anyhow::anyhow!("task_revive needs an integer id or a stem id (see `task_list`)")
             })?;
-        let dir = resolve_subagent_dir(&self.transcript_dir).ok_or_else(|| {
+        let dir = resolve_child_dir(&self.transcript_dir).ok_or_else(|| {
             anyhow::anyhow!("no session directory yet — cannot revive `{stem}` from disk")
         })?;
         let st = revive_target_from_disk(&dir, stem).await?;
@@ -2431,7 +2430,7 @@ impl hrdr_tools::Tool for TaskReviveTool {
 
 /// `task_steer`: add instructions to a background sub-agent's in-flight turn.
 pub(crate) struct SteerTool {
-    pub(crate) live: LiveSubagents,
+    pub(crate) live: AgentRegistry,
 }
 
 #[async_trait::async_trait]
@@ -2496,7 +2495,7 @@ impl hrdr_tools::Tool for SteerTool {
 /// worktree.
 pub(crate) struct TaskCancelTool {
     pub(crate) bg_handles: BgHandles,
-    pub(crate) live: LiveSubagents,
+    pub(crate) live: AgentRegistry,
 }
 
 #[async_trait::async_trait]
@@ -2733,7 +2732,7 @@ fn conflicted_paths(msg: &str) -> Vec<String> {
 /// into its own working dir, remove that worktree and drop the task. This is the
 /// explicit "merged, done with it" signal — it does NOT perform the merge.
 pub(crate) struct TaskCleanupTool {
-    pub(crate) live: LiveSubagents,
+    pub(crate) live: AgentRegistry,
 }
 
 #[async_trait::async_trait]
@@ -3095,7 +3094,7 @@ impl hrdr_tools::Tool for TaskApplyTool {
 pub(crate) struct TaskTranscriptTool {
     /// Where a finished/orphaned run's `<stem>.jsonl` lives, so a run from an
     /// earlier session (post-`/resume`) is still readable. `None` → live only.
-    pub(crate) transcript_dir: SubagentDirCell,
+    pub(crate) transcript_dir: ChildDirCell,
 }
 
 #[async_trait::async_trait]
@@ -3192,7 +3191,7 @@ impl hrdr_tools::Tool for TaskTranscriptTool {
                 if !valid_run_stem(stem) {
                     anyhow::bail!("`{stem}` is not a valid run id (see `task_list`)");
                 }
-                let dir = resolve_subagent_dir(&self.transcript_dir).ok_or_else(|| {
+                let dir = resolve_child_dir(&self.transcript_dir).ok_or_else(|| {
                     anyhow::anyhow!("no session directory yet — cannot read `{stem}` from disk")
                 })?;
                 dir.join(format!("{stem}.jsonl"))
@@ -3204,7 +3203,7 @@ impl hrdr_tools::Tool for TaskTranscriptTool {
                 path.display()
             );
         }
-        let entries = subagent_transcript::read_transcript(&path);
+        let entries = transcript_log::read_transcript(&path);
         let text = crate::transcript_to_plain_text(&entries, crate::TRANSCRIPT_TOOL_BODY_MAX);
         if text.trim().is_empty() {
             return Ok(format!("The run recorded no output ({}).", path.display()));
@@ -4361,8 +4360,8 @@ impl Agent {
                 remove_worktree(&repo, &path, &branch);
             }
         }
-        self.live_subagents.with(|v| {
-            v.retain(|e| e.key == 0 || e.kind != SubagentKind::Background);
+        self.registry.with(|v| {
+            v.retain(|e| e.key == 0 || e.kind != SpawnKind::Background);
         });
     }
 
@@ -4384,11 +4383,11 @@ impl Agent {
 #[cfg(test)]
 mod revive_tests {
     use super::*;
-    use crate::subagent_transcript::{EndStatus, Record, SpawnKind, SubagentTranscript};
+    use crate::transcript_log::{EndStatus, Record, SpawnKind, TranscriptLog};
     use hrdr_tools::Tool;
 
     /// A resolved dir cell pointing at `dir`, as the real one resolves post-save.
-    fn cell(dir: &std::path::Path) -> SubagentDirCell {
+    fn cell(dir: &std::path::Path) -> ChildDirCell {
         Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
             dir.to_path_buf(),
         ))))
@@ -4403,7 +4402,7 @@ mod revive_tests {
         text: Option<&str>,
         complete: bool,
     ) {
-        let mut t = SubagentTranscript::create(dir, stem).unwrap();
+        let mut t = TranscriptLog::create(dir, stem).unwrap();
         t.write(&Record::Start {
             model: "m".into(),
             label: label.into(),
@@ -4432,7 +4431,7 @@ mod revive_tests {
     #[tokio::test]
     async fn task_transcript_renders_a_run_without_the_json() {
         let dir = tempfile::tempdir().unwrap();
-        let mut t = SubagentTranscript::create(dir.path(), "003-planner").unwrap();
+        let mut t = TranscriptLog::create(dir.path(), "003-planner").unwrap();
         t.write(&Record::Start {
             model: "m".into(),
             label: "Plan the protocol".into(),
@@ -4550,7 +4549,7 @@ mod revive_tests {
     #[tokio::test]
     async fn task_transcript_pages_a_long_run() {
         let dir = tempfile::tempdir().unwrap();
-        let mut t = SubagentTranscript::create(dir.path(), "004-long").unwrap();
+        let mut t = TranscriptLog::create(dir.path(), "004-long").unwrap();
         t.write(&Record::Start {
             model: "m".into(),
             label: "long".into(),
@@ -4727,7 +4726,7 @@ mod revive_tests {
         // Any non-integer id is refused, naming what it got and where it IS served.
         for given in ["003-fix", "not a stem"] {
             let err = TaskOutputTool {
-                live: LiveSubagents::new(),
+                live: AgentRegistry::new(),
             }
             .execute(serde_json::json!({"id": given}), &ctx)
             .await
@@ -4742,7 +4741,7 @@ mod revive_tests {
         // An all-digit string is still that live id, differently typed.
         assert!(
             TaskOutputTool {
-                live: LiveSubagents::new(),
+                live: AgentRegistry::new(),
             }
             .execute(serde_json::json!({"id": "7"}), &ctx)
             .await

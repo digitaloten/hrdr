@@ -9,7 +9,7 @@
 use anyhow::{Result, bail};
 
 use crate::{
-    Agent, AgentEvent, ChatMessage, LiveSubagents, MessageOrigin, Role, drain_stream,
+    Agent, AgentEvent, AgentRegistry, ChatMessage, MessageOrigin, Role, drain_stream,
     flatten_tool_protocol, is_context_overflow, is_transient, retry_after_hint, retry_backoff,
 };
 
@@ -73,10 +73,10 @@ pub fn prune_meets_roi(usage: u32, context_window: u32, reserved: u32, reclaimab
 /// Marks an agent as compacting for as long as it is, and clears the flag on every
 /// exit — a summarization that fails or is cancelled must not leave its pane
 /// spinning "compacting…" forever.
-struct CompactingGuard(Option<(LiveSubagents, u64)>);
+struct CompactingGuard(Option<(AgentRegistry, u64)>);
 
 impl CompactingGuard {
-    fn new(home: Option<(LiveSubagents, u64)>) -> Self {
+    fn new(home: Option<(AgentRegistry, u64)>) -> Self {
         if let Some((live, key)) = &home {
             live.update(*key, |e| e.compacting = true);
         }

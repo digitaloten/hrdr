@@ -1,6 +1,6 @@
 //! Representation-independent sub-agent panel model shared by hrdr's frontends.
 //!
-//! [`SubAgentPanel`] maintains the live list of running blocking `task`
+//! [`SubagentPanel`] maintains the live list of running blocking `task`
 //! sub-agents, updated via its event-fold methods as `ToolStart`/`ToolOutput`/
 //! `ToolEnd` events arrive. [`panel_items`] merges the blocking list with
 //! detached background tasks from the shared registry to produce a unified
@@ -19,7 +19,7 @@ use hrdr_tools::BackgroundTask;
 /// it finishes. `log` is the full streamed progress/output; the panel shows only
 /// its first line, as the row's title.
 #[derive(Default, Clone)]
-pub struct SubAgentLog {
+pub struct SubagentLog {
     /// The task tool-call id (matches the `ToolOutput`/`ToolEnd` id, and the
     /// transcript entry a click on this row jumps to).
     pub id: String,
@@ -30,15 +30,15 @@ pub struct SubAgentLog {
 /// Stateful holder for the live list of blocking sub-agents, updated by the
 /// event-fold methods as `ToolStart`/`ToolOutput`/`ToolEnd` events arrive.
 #[derive(Default)]
-pub struct SubAgentPanel {
+pub struct SubagentPanel {
     /// Live blocking sub-agents in arrival order.
-    pub agents: Vec<SubAgentLog>,
+    pub agents: Vec<SubagentLog>,
 }
 
-impl SubAgentPanel {
+impl SubagentPanel {
     /// A `task` tool call started: push a new live entry.
     pub fn on_tool_start(&mut self, id: String) {
-        self.agents.push(SubAgentLog {
+        self.agents.push(SubagentLog {
             id,
             log: String::new(),
         });
@@ -90,7 +90,7 @@ pub fn panel_item_header(item: &PanelItem, running_marker: &str) -> String {
 /// Collect the panel's rows: blocking sub-agents from `agents` followed by
 /// detached background tasks from the shared registry.
 pub fn panel_items(
-    agents: &[SubAgentLog],
+    agents: &[SubagentLog],
     background: &Mutex<Vec<BackgroundTask>>,
 ) -> Vec<PanelItem> {
     let mut items = Vec::new();
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn event_fold_lifecycle() {
-        let mut panel = SubAgentPanel::default();
+        let mut panel = SubagentPanel::default();
         // Start two agents.
         panel.on_tool_start("id1".to_string());
         panel.on_tool_start("id2".to_string());
@@ -160,7 +160,7 @@ mod tests {
     /// jumps to — and only the log's first line, never its body.
     #[test]
     fn panel_items_merges_blocking_and_background() {
-        let mut panel = SubAgentPanel::default();
+        let mut panel = SubagentPanel::default();
         panel.on_tool_start("block1".to_string());
         panel.on_tool_output("block1", "task: do thing\nrunning…");
 

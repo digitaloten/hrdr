@@ -1405,7 +1405,7 @@ impl Agent {
     /// Running inside the agent, rather than leaving it to the frontend, is what
     /// keeps a headless run (which pins nothing) from leaking agents.
     fn release_finished_subagents(&mut self) {
-        self.live_subagents.prune();
+        self.registry.prune();
     }
 
     /// Age out TODOs that have been finished for `todo_ttl` turns.
