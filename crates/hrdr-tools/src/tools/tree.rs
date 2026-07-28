@@ -866,10 +866,10 @@ mod tests {
     /// `tree` walks the filesystem, so a read-confined agent may only point it
     /// inside the readable roots.
     #[tokio::test]
-    async fn tree_outside_roots_is_refused_in_read_mode() {
+    async fn tree_outside_roots_is_refused_in_strict_mode() {
         let cwd = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Read);
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Strict);
 
         let err = TreeTool
             .execute(

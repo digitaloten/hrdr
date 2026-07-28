@@ -1099,11 +1099,11 @@ mod tests {
     /// search outside its readable roots — asserted at the tool seam (which
     /// covers every backend) and again on the built-in walker's own resolve.
     #[tokio::test]
-    async fn grep_outside_roots_is_refused_in_read_mode() {
+    async fn grep_outside_roots_is_refused_in_strict_mode() {
         let cwd = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("a.txt"), "needle here").unwrap();
-        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Read);
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Strict);
 
         let err = GrepTool::detect()
             .execute(

@@ -29,14 +29,37 @@ use crate::{canonicalize_nearest, tool_output_dir};
 #[serde(rename_all = "lowercase")]
 pub enum SandboxMode {
     /// No confinement — full read/write everywhere. The pre-sandbox behavior.
+    ///
+    /// Spelled `none`, `yolo` or `off` in config/env/flags; `none` is canonical
+    /// and the one this renders back as.
     None,
     /// Read broadly (builds need /usr, toolchains, ~/.cargo, …); write ONLY
     /// within the writable roots (cwd + temp/scratch + tool-output dir + git
     /// metadata roots for a linked worktree + configured extras).
     Write,
-    /// Read ONLY within the readable roots (cwd + scratch + tool-output);
-    /// no writes anywhere. For read-only / research agents.
+    /// Read broadly, write NOWHERE. What a read-only agent gets.
+    ///
+    /// "Read-only" is a restriction on WRITING, not on reading — the same
+    /// meaning Codex gives its `read-only` mode, and for the same reason: a
+    /// review agent has to run the tools the user installed, and those live all
+    /// over the filesystem (`~/.cargo/bin`, a nvm/fnm node, a Homebrew or Nix
+    /// prefix, a mason symlink farm). This mode used to confine reads too, which
+    /// left an agent's shell able to see only `/usr` and `/etc` — "command not
+    /// found" for tools that are plainly installed. [`Strict`](Self::Strict) is
+    /// that behavior, kept and made opt-in.
     Read,
+    /// Read only within the readable roots (cwd + scratch + tool-output), write
+    /// nowhere. The strongest confinement hrdr has, and **opt-in**
+    /// (`sandbox = "strict"`).
+    ///
+    /// Everything else is not merely unwritable but ABSENT — an outside path is
+    /// ENOENT rather than EROFS, so nothing outside the workspace can be read at
+    /// all. The price is that the agent's shell has only the system toolchain
+    /// (`/usr`, `/etc`): anything installed under `$HOME` is invisible, and a
+    /// build that needs a rustup toolchain or a node from a version manager
+    /// cannot run. Choose it when confining reads matters more than running the
+    /// user's tools.
+    Strict,
 }
 
 impl SandboxMode {
@@ -46,6 +69,7 @@ impl SandboxMode {
             SandboxMode::None => "none",
             SandboxMode::Write => "write",
             SandboxMode::Read => "read",
+            SandboxMode::Strict => "strict",
         }
     }
 }
@@ -57,9 +81,17 @@ impl std::str::FromStr for SandboxMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "write" => Ok(SandboxMode::Write),
             "read" => Ok(SandboxMode::Read),
-            "none" => Ok(SandboxMode::None),
+            "strict" => Ok(SandboxMode::Strict),
+            // `yolo` is a SPELLING of `none`, not a fourth behavior: turning the
+            // sandbox off is already exactly one thing, and two modes that did
+            // the same thing under different names would be a bug waiting to be
+            // written. It exists because that is the word people reach for, and
+            // a mode you cannot name is one you disable some other, worse way.
+            // `none` stays canonical — it is what `as_str`/`Display` render.
+            "none" | "yolo" | "off" => Ok(SandboxMode::None),
             other => Err(format!(
-                "unknown sandbox mode {other:?} — expected write, read, or none"
+                "unknown sandbox mode {other:?} — expected write, read, strict, or none \
+                 (aka yolo/off)"
             )),
         }
     }
@@ -101,9 +133,13 @@ impl SandboxPolicy {
     /// Writable (mode `Write` only): `cwd`, [`std::env::temp_dir`],
     /// [`session_scratch_dir`], [`tool_output_dir`], the git metadata roots a
     /// linked worktree needs to commit (see [`git_metadata_roots`]), then the
-    /// caller's configured `extras`. Readable: `cwd`, the scratch dir, the
-    /// tool-output dir. Every root is run through [`canonicalize_nearest`] and
-    /// deduped (a root already under an earlier root is dropped).
+    /// caller's configured `extras`. Every root is run through
+    /// [`canonicalize_nearest`] and deduped (a root already under an earlier
+    /// root is dropped).
+    ///
+    /// Readable roots (`cwd`, scratch, tool-output) are only ever CONSULTED in
+    /// [`SandboxMode::Strict`] — the one mode that confines reads. `Read` and
+    /// `Write` both read broadly, so they carry the list but never check it.
     ///
     /// Non-existent `extras` are skipped silently — a user config typo is not
     /// worth failing a session over, and everything in the default set is
@@ -116,7 +152,7 @@ impl SandboxPolicy {
         let output = tool_output_dir();
         let readable_roots =
             canonical_roots(vec![cwd.to_path_buf(), scratch.clone(), output.clone()]);
-        let writable_roots = if mode == SandboxMode::Read {
+        let writable_roots = if matches!(mode, SandboxMode::Read | SandboxMode::Strict) {
             Vec::new()
         } else {
             let mut roots = vec![cwd.to_path_buf(), std::env::temp_dir(), scratch, output];
@@ -180,16 +216,17 @@ impl SandboxPolicy {
         Ok(())
     }
 
-    /// Err iff the mode is `Read` and `canon` (already canonicalized) is
-    /// outside every readable root. A no-op in `Write` and `None` modes: broad
-    /// reads under `Write` are a deliberate tradeoff (builds read all over the
-    /// filesystem).
+    /// Err iff the mode is `Strict` and `canon` (already canonicalized) is
+    /// outside every readable root. A no-op in every other mode — `Read` means
+    /// "writes nowhere", not "reads nowhere", so like `Write` it reads broadly
+    /// (builds and review tools read all over the filesystem).
     pub fn check_read(&self, canon: &Path, shown: &Path) -> anyhow::Result<()> {
-        if self.mode != SandboxMode::Read || is_under_any(canon, &self.readable_roots) {
+        if self.mode != SandboxMode::Strict || is_under_any(canon, &self.readable_roots) {
             return Ok(());
         }
         anyhow::bail!(
-            "sandbox: refusing to read {} — this agent is read-only and may read only under: {}.",
+            "sandbox: refusing to read {} — this agent is strictly confined and may read only \
+             under: {}.",
             shown.display(),
             join_roots(&self.readable_roots)
         )
@@ -491,7 +528,7 @@ const NO_OS_SANDBOX_NOTICE: &str = "sandbox: no OS-level sandbox is available on
 /// runners.
 #[cfg(target_os = "linux")]
 const BWRAP_MISSING_NOTICE: &str = "sandbox: bwrap not found — falling back to Landlock: writes \
-     are still confined, but reads are not, and read-mode agents degrade to write-mode \
+     are still confined, but reads are not, and strict-mode agents degrade to write-only \
      confinement for shell commands. Install bubblewrap for full confinement.";
 
 /// Emitted when bwrap is installed but the kernel/distro forbids unprivileged
@@ -499,14 +536,20 @@ const BWRAP_MISSING_NOTICE: &str = "sandbox: bwrap not found — falling back to
 #[cfg(target_os = "linux")]
 const USERNS_DISABLED_NOTICE: &str = "sandbox: unprivileged user namespaces are disabled on this \
      system — falling back to Landlock: writes are still confined, but reads are not, and \
-     read-mode agents degrade to write-mode confinement for shell commands.";
+     strict-mode agents degrade to write-only confinement for shell commands.";
 
-/// Emitted in addition to the fallback notice when a *read-mode* agent runs a
-/// shell command on Landlock: the ruleset confines writes only, so this agent
+/// Emitted in addition to the fallback notice when a **strict-mode** agent runs
+/// a shell command on Landlock: the ruleset confines writes only, so this agent
 /// is quietly weaker than its mode claims — say so, loudly.
+///
+/// `Read` is deliberately NOT here. It means "read broadly, write nowhere",
+/// which is precisely what a Landlock ruleset with no writable roots expresses,
+/// so a read-only agent loses nothing on this backend. Only `Strict`, which asks
+/// for reads to be confined, is weakened by it.
 #[cfg(target_os = "linux")]
-const READ_DEGRADES_UNDER_LANDLOCK_NOTICE: &str = "sandbox: Landlock cannot confine reads — this \
-     read-only agent's shell commands are write-confined only.";
+const STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE: &str = "sandbox: Landlock cannot confine reads — this \
+     strict-mode agent's shell commands are write-confined only, so paths outside its readable \
+     roots remain readable.";
 
 /// The OS mechanism available to confine *shell children* on this machine.
 ///
@@ -785,10 +828,11 @@ fn shell_command_with_backend(
             if let Some(why) = detection().degraded {
                 notices.set(why.to_string());
             }
-            // Landlock has no read axis, so a read-mode agent gets write
-            // confinement and an explicit admission of the gap.
-            if policy.mode == SandboxMode::Read {
-                notices.set(READ_DEGRADES_UNDER_LANDLOCK_NOTICE.to_string());
+            // Landlock has no read axis. `Read` does not need one (no writable
+            // roots IS the whole mode), but `Strict` does — so only it gets the
+            // explicit admission of the gap.
+            if policy.mode == SandboxMode::Strict {
+                notices.set(STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE.to_string());
             }
             landlock_command(shell, cmd_str, policy)
         }
@@ -932,18 +976,21 @@ fn bwrap_args(
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     push(&mut args, &["--new-session", "--die-with-parent"]);
     match mode {
-        SandboxMode::Write => {
+        SandboxMode::Write | SandboxMode::Read => {
             // Everything readable, nothing writable…
             push(
                 &mut args,
                 &["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"],
             );
-            // …then punch the writable roots through, in policy order.
+            // …then punch the writable roots through, in policy order. `Read`
+            // has none — that is exactly what makes it read-only — so the loop
+            // is a no-op there and the whole filesystem stays read-only. Same
+            // shape Codex gives its `read-only` mode.
             for root in policy.writable_roots.iter().filter(|root| root.exists()) {
                 bind(&mut args, "--bind", root);
             }
         }
-        SandboxMode::Read => {
+        SandboxMode::Strict => {
             // Only the system dirs an interpreter/compiler needs exist at
             // all; `/home`, `/opt`, `/var`, … are simply absent, so reads
             // there fail with ENOENT — stronger than EROFS.
@@ -1097,17 +1144,19 @@ fn seatbelt_profile(mode: SandboxMode, policy: &SandboxPolicy) -> String {
          (allow ipc-posix*)\n",
     );
     match mode {
-        SandboxMode::Write => {
+        SandboxMode::Write | SandboxMode::Read => {
             profile.push_str("(allow file-read*)\n");
             // An empty root list must stay closed: `(allow file-write*)` with
             // no filter allows every write there is, so the line is omitted
-            // and `(deny default)` answers instead.
+            // and `(deny default)` answers instead. `Read` has no writable
+            // roots at all, so it always takes that branch — broad reads, no
+            // writes anywhere.
             if !policy.writable_roots.is_empty() {
                 let writes = subpaths(&policy.writable_roots);
                 profile.push_str(&format!("(allow file-write* {writes})\n"));
             }
         }
-        SandboxMode::Read => {
+        SandboxMode::Strict => {
             let reads = subpaths(&policy.readable_roots);
             let reads = if reads.is_empty() {
                 String::new()
@@ -1277,9 +1326,9 @@ mod tests {
     }
 
     #[test]
-    fn read_mode_refuses_reads_outside_roots_and_allows_cwd() {
+    fn strict_mode_refuses_reads_outside_roots_and_allows_cwd() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = SandboxPolicy::for_agent(SandboxMode::Read, dir.path(), &[]);
+        let policy = SandboxPolicy::for_agent(SandboxMode::Strict, dir.path(), &[]);
 
         check_read(&policy, &dir.path().join("notes.md")).unwrap();
         check_read(&policy, &session_scratch_dir().join("probe")).unwrap();
@@ -1289,7 +1338,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("refusing to read /etc/passwd"), "{err}");
-        assert!(err.contains("read-only and may read only under"), "{err}");
+        assert!(err.contains("strictly confined and may read only"), "{err}");
         assert!(
             err.contains(&canonicalize_nearest(dir.path()).display().to_string()),
             "{err}"
@@ -1626,7 +1675,46 @@ mod tests {
         assert!(ro_root < mount_at(&args, "--bind", &two).unwrap());
     }
 
-    /// Linux-only: the Read profile's mount set is built from what the *host*
+    /// `read` is a WRITE restriction, not a read one: the whole filesystem is
+    /// bound read-only and nothing is writable anywhere.
+    ///
+    /// This is the shape Codex gives its own `read-only` mode, and hrdr adopted
+    /// it after the previous behavior (mount only `/usr` + `/etc`, the current
+    /// [`SandboxMode::Strict`]) left a read-only agent's shell unable to see the
+    /// tools the user had installed — `~/.cargo/bin`, a version-managed node, a
+    /// Homebrew or Nix prefix — and reporting "command not found" for them.
+    #[test]
+    fn bwrap_read_args_bind_the_whole_filesystem_read_only_and_nothing_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy::for_agent(SandboxMode::Read, dir.path(), &[]);
+        assert!(
+            policy.writable_roots.is_empty(),
+            "no writable root is what makes it read-only"
+        );
+        let args = argv(&bwrap_args(
+            SandboxMode::Read,
+            &policy,
+            dir.path(),
+            crate::Shell::Bash,
+            "echo hi",
+        ));
+
+        // The whole filesystem, read-only — so every PATH entry resolves.
+        assert!(
+            args.windows(3).any(|w| w == ["--ro-bind", "/", "/"]),
+            "{args:?}"
+        );
+        // …and not one writable bind, anywhere.
+        assert!(
+            !args.iter().any(|a| a == "--bind"),
+            "read mode writes nothing: {args:?}"
+        );
+        // No private /tmp either: that is strict mode's isolation, and mounting
+        // a tmpfs here would hide a real /tmp the tools legitimately read.
+        assert!(!args.iter().any(|a| a == "--tmpfs"), "{args:?}");
+    }
+
+    /// Linux-only: the Strict profile's mount set is built from what the *host*
     /// filesystem really has — `/usr`, `/etc`, and whatever `/bin` turns out to
     /// be — through `.exists()`/`symlink_metadata` filters. Off Linux those
     /// paths are absent (Windows) or shaped differently, so the builder
@@ -1636,11 +1724,11 @@ mod tests {
     /// `/` bind the builder emits unconditionally.
     #[cfg(target_os = "linux")]
     #[test]
-    fn bwrap_read_args_omit_rw_binds_and_private_tmp() {
+    fn bwrap_strict_args_omit_rw_binds_and_private_tmp() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = SandboxPolicy::for_agent(SandboxMode::Read, dir.path(), &[]);
+        let policy = SandboxPolicy::for_agent(SandboxMode::Strict, dir.path(), &[]);
         let args = argv(&bwrap_args(
-            SandboxMode::Read,
+            SandboxMode::Strict,
             &policy,
             dir.path(),
             crate::Shell::Bash,
@@ -1752,14 +1840,14 @@ mod tests {
     /// Read mode grants no writes at all and narrows reads to the system
     /// directories plus the readable roots.
     #[test]
-    fn seatbelt_read_profile_allows_no_writes_and_only_the_read_roots() {
+    fn seatbelt_strict_profile_allows_no_writes_and_only_the_read_roots() {
         let policy = SandboxPolicy {
-            mode: SandboxMode::Read,
+            mode: SandboxMode::Strict,
             writable_roots: Vec::new(),
             readable_roots: vec![PathBuf::from("/work/wt")],
         };
         assert_eq!(
-            seatbelt_profile(SandboxMode::Read, &policy),
+            seatbelt_profile(SandboxMode::Strict, &policy),
             concat!(
                 "(version 1)\n",
                 "(deny default)\n",
@@ -2016,11 +2104,11 @@ mod tests {
     /// (`/usr` and `/etc` stay readable by design; probe `/home`.)
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn read_mode_cannot_even_see_outside_paths() {
+    async fn strict_mode_cannot_even_see_outside_paths() {
         let Some(shell) = bwrap_shell() else { return };
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("visible.txt"), "x").unwrap();
-        let ctx = confined_ctx(dir.path(), SandboxMode::Read);
+        let ctx = confined_ctx(dir.path(), SandboxMode::Strict);
 
         let out = run_shell(shell, &ctx, "ls /home").await;
         assert!(out.contains("No such file or directory"), "{out}");
@@ -2149,10 +2237,10 @@ mod tests {
     /// only write-confined — which must never be silent.
     #[cfg(target_os = "linux")]
     #[test]
-    fn read_mode_under_landlock_degrades_with_a_notice() {
+    fn strict_mode_under_landlock_degrades_with_a_notice() {
         let dir = tempfile::tempdir().unwrap();
         let policy = SandboxPolicy {
-            mode: SandboxMode::Read,
+            mode: SandboxMode::Strict,
             writable_roots: Vec::new(),
             readable_roots: vec![canonicalize_nearest(dir.path())],
         };
@@ -2172,7 +2260,7 @@ mod tests {
         assert!(
             queued
                 .iter()
-                .any(|n| n == READ_DEGRADES_UNDER_LANDLOCK_NOTICE),
+                .any(|n| n == STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE),
             "{queued:?}"
         );
 
@@ -2191,7 +2279,7 @@ mod tests {
         assert!(
             theirs
                 .iter()
-                .any(|n| n == READ_DEGRADES_UNDER_LANDLOCK_NOTICE),
+                .any(|n| n == STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE),
             "a sibling agent must hear its own degradation: {theirs:?}"
         );
     }
@@ -2276,19 +2364,20 @@ mod tests {
             assert_eq!(
                 BWRAP_MISSING_NOTICE,
                 "sandbox: bwrap not found — falling back to Landlock: writes are still confined, \
-                 but reads are not, and read-mode agents degrade to write-mode confinement for \
+                 but reads are not, and strict-mode agents degrade to write-only confinement for \
                  shell commands. Install bubblewrap for full confinement."
             );
             assert_eq!(
                 USERNS_DISABLED_NOTICE,
                 "sandbox: unprivileged user namespaces are disabled on this system — falling back \
-                 to Landlock: writes are still confined, but reads are not, and read-mode agents \
-                 degrade to write-mode confinement for shell commands."
+                 to Landlock: writes are still confined, but reads are not, and strict-mode \
+                 agents degrade to write-only confinement for shell commands."
             );
             assert_eq!(
-                READ_DEGRADES_UNDER_LANDLOCK_NOTICE,
-                "sandbox: Landlock cannot confine reads — this read-only agent's shell commands \
-                 are write-confined only."
+                STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE,
+                "sandbox: Landlock cannot confine reads — this strict-mode agent's shell \
+                 commands are write-confined only, so paths outside its readable roots remain \
+                 readable."
             );
         }
     }

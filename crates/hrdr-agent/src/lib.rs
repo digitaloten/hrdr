@@ -3957,8 +3957,9 @@ mod tests {
 
     /// Confinement is derived in `Agent::new`, from the session default and the
     /// agent's own permissions: a write-capable agent gets `Write` (its cwd and
-    /// the scratch dirs), a read-only one `Read` (no writes at all, reads only
-    /// under its roots). Sub-agents clone the base config, so this single
+    /// the scratch dirs), a read-only one `Read` (broad reads, no writable root
+    /// anywhere), and a read-only one in a `strict` session gets `Strict` (reads
+    /// confined too). Sub-agents clone the base config, so this single
     /// derivation is the only one there is.
     #[test]
     fn a_read_only_agent_gets_read_confinement() {
@@ -3967,6 +3968,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             ..Default::default()
         };
+        let cfg2 = cfg.clone();
 
         let writer = Agent::new(cfg.clone()).unwrap();
         assert_eq!(writer.ctx.sandbox.mode, hrdr_tools::SandboxMode::Write);
@@ -3986,13 +3988,45 @@ mod tests {
         .unwrap();
         assert_eq!(reader.ctx.sandbox.mode, hrdr_tools::SandboxMode::Read);
         reader.ctx.resolve_read("notes.md").unwrap();
+        // `read` restricts WRITING, not reading — the same meaning Codex gives
+        // its `read-only` mode. Confining reads too is `strict`, below. This
+        // matters because a read-only agent now has a shell: the tools it must
+        // run live outside the workspace, and hiding them made it report
+        // "command not found" for things that are installed.
+        reader
+            .ctx
+            .resolve_read("/etc/hostname")
+            .expect("read mode reads broadly");
+        // …but every write is still refused, everywhere.
+        reader.ctx.resolve_write("out.txt").unwrap_err();
         let err = reader
+            .ctx
+            .resolve_write("/etc/hrdr-should-never-write")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("You may write only under"), "{err}");
+        assert!(
+            reader.ctx.sandbox.writable_roots.is_empty(),
+            "no writable root at all is what makes it read-only"
+        );
+
+        // `strict` is the old behavior, kept and made opt-in: reads confined to
+        // the roots, writes refused everywhere.
+        let strict = Agent::new(AgentConfig {
+            read_only: true,
+            sandbox: hrdr_tools::SandboxMode::Strict,
+            ..cfg2
+        })
+        .unwrap();
+        assert_eq!(strict.ctx.sandbox.mode, hrdr_tools::SandboxMode::Strict);
+        strict.ctx.resolve_read("notes.md").unwrap();
+        let err = strict
             .ctx
             .resolve_read("/etc/hostname")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("this agent is read-only"), "{err}");
-        reader.ctx.resolve_write("out.txt").unwrap_err();
+        assert!(err.contains("strictly confined"), "{err}");
+        strict.ctx.resolve_write("out.txt").unwrap_err();
     }
 
     /// An `AGENTS.md` too large to load reaches the *user*, not just the record.

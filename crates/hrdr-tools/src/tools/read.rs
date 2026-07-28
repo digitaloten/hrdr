@@ -438,9 +438,9 @@ mod tests {
     /// platform and outside every readable root (they are all deeper than the
     /// temp dir), so this exercises the same refusal hermetically.
     #[tokio::test]
-    async fn read_and_search_refuse_outside_roots_in_read_mode() {
+    async fn read_and_search_refuse_outside_roots_in_strict_mode() {
         let cwd = tempfile::tempdir().unwrap();
-        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Read);
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Strict);
 
         let outside = tempfile::tempdir().unwrap();
         let outside_file = outside.path().join("hostname");
@@ -448,7 +448,7 @@ mod tests {
         let err = ReadTool
             .execute(serde_json::json!({"path": outside_file}), &ctx)
             .await
-            .expect_err("a read-only agent may not read outside its roots")
+            .expect_err("a strict-mode agent may not read outside its roots")
             .to_string();
         assert!(
             err.contains(&format!(
@@ -457,7 +457,7 @@ mod tests {
             )),
             "{err}"
         );
-        assert!(err.contains("read-only and may read only under"), "{err}");
+        assert!(err.contains("strictly confined and may read only"), "{err}");
         assert!(
             err.contains(
                 &crate::canonicalize_nearest(cwd.path())

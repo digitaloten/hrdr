@@ -499,11 +499,23 @@ pub fn sandbox_section(policy: &hrdr_tools::SandboxPolicy) -> String {
              these roots, stop and say so instead of attempting it.",
             roots(&policy.writable_roots)
         ),
-        hrdr_tools::SandboxMode::Read => format!(
+        hrdr_tools::SandboxMode::Read => String::from(
             "\n\nSandbox:\n\
-             - Mode: read — this agent is read-only.\n\
+             - Mode: read — this agent may read anything but write NOTHING.\n\
+             - Reads are unrestricted, so run the tools you need: `git log`/`diff`/`blame`, \
+             a linter, a checker, anything that only inspects.\n\
+             - Every write is refused, everywhere — there is no writable root at all. Do not \
+             attempt to create, edit or delete a file, and do not try to work around it; \
+             report what you found instead.",
+        ),
+        hrdr_tools::SandboxMode::Strict => format!(
+            "\n\nSandbox:\n\
+             - Mode: strict — this agent may write nothing, and may read only inside its \
+             roots.\n\
              - You may read ONLY under:\n{}\n\
-             - Reads elsewhere and all writes are refused.",
+             - Reads elsewhere and all writes are refused. Paths outside are not merely \
+             protected but ABSENT, so a tool installed elsewhere on this machine will report \
+             `command not found` — that is the mode, not a broken install.",
             roots(&policy.readable_roots)
         ),
     }
@@ -2775,7 +2787,9 @@ mod tests {
         assert!(s.contains("- /work/wt-1"));
         assert!(s.contains("- /scratch/hrdr"));
 
-        // Read mode names the readable roots and the read-only sentence instead.
+        // Read mode restricts WRITING only, so it names no readable roots — it
+        // says reads are unrestricted and every write is refused. Listing roots
+        // here would describe a boundary that is not enforced.
         let ro = hrdr_tools::SandboxPolicy {
             mode: hrdr_tools::SandboxMode::Read,
             writable_roots: Vec::new(),
@@ -2783,9 +2797,27 @@ mod tests {
         };
         let s = sandbox_section(&ro);
         assert!(s.contains("Mode: read"));
+        assert!(s.contains("write NOTHING"));
+        assert!(s.contains("Reads are unrestricted"));
+        assert!(
+            !s.contains("read ONLY under"),
+            "read mode confines no reads: {s}"
+        );
+        assert!(!s.contains("/work/ro"), "…so it must not list roots: {s}");
+
+        // Strict is the mode that does confine reads, and it names them.
+        let strict = hrdr_tools::SandboxPolicy {
+            mode: hrdr_tools::SandboxMode::Strict,
+            writable_roots: Vec::new(),
+            readable_roots: vec![std::path::PathBuf::from("/work/ro")],
+        };
+        let s = sandbox_section(&strict);
+        assert!(s.contains("Mode: strict"));
         assert!(s.contains("read ONLY under"));
         assert!(s.contains("- /work/ro"));
         assert!(s.contains("all writes are refused"));
+        // It warns about the consequence that surprises people most.
+        assert!(s.contains("command not found"), "{s}");
     }
 
     /// An unconfined agent gets no section at all (empty body → dropped by

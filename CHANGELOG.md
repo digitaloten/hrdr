@@ -6,7 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **A `strict` sandbox mode, and `yolo` as a name for no sandbox at all.**
+  `strict` is the confinement `read` used to apply — reads limited to the cwd,
+  scratch and tool-output dirs, everything else absent — now opt-in
+  (`sandbox = "strict"`, `--sandbox strict`) for when confining reads matters
+  more than running the user's tools. `yolo` and `off` are spellings of `none`,
+  with a `--yolo` flag beside `--no-sandbox`: one behavior, not a fourth mode,
+  and it still renders back as `none`.
+
 ### Changed
+
+- **`read` mode restricts WRITING, not reading.** It used to mount only `/usr`
+  and `/etc`, so `/home`, `/run` and `/opt` were absent — and a read-only
+  agent's shell reported `command not found` for `cargo`, `node`, a formatter or
+  a linter on any machine where those come from rustup, nvm, mise, Homebrew or
+  Nix rather than the system package manager. It now binds the whole filesystem
+  read-only with **no writable root anywhere**, which is what makes it
+  read-only; this is the shape Codex gives its own `read-only` mode. A
+  consequence worth having: the Landlock fallback can express this exactly (a
+  ruleset with no writable roots), so a read-only agent no longer degrades on
+  machines without bwrap — only `strict` does, and only it now carries that
+  notice.
 
 - **Read-only sub-agents get a shell, and the bespoke `git` tool is gone.**
   `explore`, `review` and `plan` had no shell at all, so a read-only `git` tool

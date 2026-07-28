@@ -109,15 +109,26 @@ struct Cli {
     #[arg(long = "auto-prune", global = true, value_name = "on|off")]
     auto_prune: Option<String>,
 
-    /// Filesystem confinement for this session: `write` (writes confined to the
-    /// working directory, temp/scratch and tool output), `read` (read-only
-    /// agents read only there), or `none` (no confinement).
-    #[arg(long, global = true, value_name = "write|read|none")]
+    /// Filesystem confinement for this session: `write` (the default — reads
+    /// unrestricted, writes confined to the working directory, temp/scratch and
+    /// tool output), `read` (what read-only agents get: reads unrestricted,
+    /// writes refused everywhere), `strict` (as `read`, and reads confined to
+    /// the working directory too — tools installed elsewhere become invisible),
+    /// or `none`, also spelled `yolo` (no confinement at all).
+    #[arg(long, global = true, value_name = "write|read|strict|none")]
     sandbox: Option<String>,
 
     /// Run without filesystem confinement (alias for `--sandbox none`).
     #[arg(long = "no-sandbox", global = true, conflicts_with = "sandbox")]
     no_sandbox: bool,
+
+    /// Run without filesystem confinement (alias for `--sandbox none`).
+    #[arg(
+        long = "yolo",
+        global = true,
+        conflicts_with_all = ["sandbox", "no_sandbox"]
+    )]
+    yolo: bool,
 
     /// Prompt caching: off, on, or auto (default; on for remote endpoints).
     #[arg(long = "prompt-cache", global = true, value_name = "off|on|auto")]
@@ -570,7 +581,9 @@ async fn main() -> Result<()> {
             Err(e) => eprintln!("warning: --sandbox: {e} — keeping {}", config.sandbox),
         }
     }
-    if cli.no_sandbox {
+    // `--no-sandbox` and `--yolo` are the same switch under two names, both
+    // exclusive with `--sandbox`, so order between them cannot matter.
+    if cli.no_sandbox || cli.yolo {
         config.sandbox = hrdr_tools::SandboxMode::None;
     }
     if cli.no_auto_resume {

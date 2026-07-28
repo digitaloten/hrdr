@@ -553,11 +553,11 @@ status bar's "X of Y" and the auto-compaction threshold.
 hrdr keeps context under control in three layers (modeled on opencode), all
 tunable in `config.toml`.
 
-> **Config keys are strict.** An unrecognised key in any table is a startup error
-> naming the field and the ones that were expected, rather than being silently
-> ignored — a typo'd `timout_secs` that quietly does nothing is worse than one
-> that fails. Every duration is **seconds**; the old `timeout_ms` / `wait_ms`
-> spellings are rejected with the converted value to use.
+> **Config keys are strict.** An unrecognised key in any table is a startup
+> error naming the field and the ones that were expected, rather than being
+> silently ignored — a typo'd `timout_secs` that quietly does nothing is worse
+> than one that fails. Every duration is **seconds**; the old `timeout_ms` /
+> `wait_ms` spellings are rejected with the converted value to use.
 
 ```toml
 # Per-tool output caps: over either limit, shell/grep/git output is truncated and
@@ -942,8 +942,20 @@ own permissions:
   the tool-output spill dir, the git metadata a linked worktree needs in order
   to commit, and any `sandbox_writable_roots` you configure.
 - **`read`** — what a read-only agent or `--agent` profile gets automatically:
-  no writes at all, and reads only under its cwd, scratch and tool-output dirs.
-- **`none`** — no confinement; exactly the pre-sandbox behavior.
+  reads are unrestricted, and **no writes are permitted anywhere** (there is no
+  writable root at all). "Read-only" restricts writing, not reading — the same
+  meaning Codex gives its `read-only` mode. Reads stay broad on purpose: a
+  read-only agent has a shell, and the tools it must run (`git`, a linter, a
+  formatter) live outside the workspace — under `~/.cargo/bin`, a
+  version-managed node, a Homebrew or Nix prefix.
+- **`strict`** — opt-in, the strongest confinement hrdr has: as `read`, plus
+  reads confined to the cwd, scratch and tool-output dirs. Everything else is
+  not merely unwritable but **absent** (ENOENT, not EROFS). The price is that
+  the agent's shell sees only the system toolchain, so anything installed under
+  `$HOME` reports `command not found`. Choose it when confining reads matters
+  more than running the user's tools.
+- **`none`** (also spelled **`yolo`** or `off`; `--yolo` / `--no-sandbox`) — no
+  confinement; exactly the pre-sandbox behavior.
 
 Two layers enforce it. The file tools (`write`, `edit`, `replace`, `move`,
 `copy`, `delete`, `read`, `grep`, `ls`, `tree`, `lsp_nav`) check every path the

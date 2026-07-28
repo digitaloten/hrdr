@@ -1713,14 +1713,22 @@ impl AgentConfig {
 /// branch: a revived sub-agent, a `--agent explore` main agent, and a write
 /// sub-agent all derive here, from the same two inputs.
 ///
-/// - Session `none` is an explicit global opt-out and wins everywhere.
-/// - A read-only agent has no write tools, so it takes read confinement.
+/// - Session `none` (aka `yolo`) is an explicit global opt-out and wins
+///   everywhere.
+/// - A read-only agent takes `read`: broad reads, no writable root anywhere.
+///   That is what makes it read-only now that it has a shell — the tool set no
+///   longer does it.
+/// - …unless the session asked for `strict`, which is the same no-write
+///   guarantee with reads confined as well. Only a read-only agent can honour
+///   it; see the next rule.
 /// - A write-capable agent must be able to write, so it floors at `write` even
-///   when the session default is `read` — its writable roots are what confine
-///   it.
+///   when the session default is `read` or `strict` — its writable roots are
+///   what confine it. A `strict` session therefore means "strict for the agents
+///   that can be, `write` for the ones that must write", not "nothing can run".
 pub fn effective_sandbox(session: SandboxMode, read_only: bool) -> SandboxMode {
     match (session, read_only) {
         (SandboxMode::None, _) => SandboxMode::None,
+        (SandboxMode::Strict, true) => SandboxMode::Strict,
         (_, true) => SandboxMode::Read,
         (_, false) => SandboxMode::Write,
     }
@@ -2375,6 +2383,26 @@ mod sandbox_tests {
         // `read` — the two rows an unconfigured session can produce.
         assert_eq!(effective_sandbox(cfg.sandbox, false), SandboxMode::Write);
         assert_eq!(effective_sandbox(cfg.sandbox, true), SandboxMode::Read);
+        // A `strict` session hands its read-only agents the strict mode, and
+        // still floors write-capable ones at `write` — otherwise a strict
+        // session could not run a coder at all.
+        assert_eq!(
+            effective_sandbox(SandboxMode::Strict, true),
+            SandboxMode::Strict
+        );
+        assert_eq!(
+            effective_sandbox(SandboxMode::Strict, false),
+            SandboxMode::Write
+        );
+        // `none`/`yolo` is the global opt-out and wins for every agent.
+        assert_eq!(
+            effective_sandbox(SandboxMode::None, true),
+            SandboxMode::None
+        );
+        assert_eq!(
+            effective_sandbox(SandboxMode::None, false),
+            SandboxMode::None
+        );
     }
 
     /// The config-file key parses the three spellings, and a misspelling is a
@@ -2436,10 +2464,23 @@ mod sandbox_tests {
         assert_eq!(cfg.sandbox, SandboxMode::Read, "trimmed, case-insensitive");
         setter(&mut cfg, "none").unwrap();
         assert_eq!(cfg.sandbox, SandboxMode::None);
+        setter(&mut cfg, "strict").unwrap();
+        assert_eq!(cfg.sandbox, SandboxMode::Strict);
+        // `yolo` and `off` are spellings of `none`, not modes of their own —
+        // turning the sandbox off is one behavior, and it renders back as `none`.
+        for spelling in ["yolo", "off", "YOLO"] {
+            setter(&mut cfg, spelling).unwrap();
+            assert_eq!(cfg.sandbox, SandboxMode::None, "{spelling}");
+            assert_eq!(
+                cfg.sandbox.as_str(),
+                "none",
+                "{spelling} renders canonically"
+            );
+        }
 
         setter(&mut cfg, "write").unwrap();
         let reason = setter(&mut cfg, "wrote").expect_err("garbage is reported");
-        assert!(reason.contains("write, read, or none"), "{reason}");
+        assert!(reason.contains("write, read, strict, or none"), "{reason}");
         assert_eq!(
             cfg.sandbox,
             SandboxMode::Write,
