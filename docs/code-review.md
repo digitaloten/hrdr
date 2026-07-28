@@ -14,110 +14,29 @@ Resolved by `8f220d7` and removed from this document: `logout_handler` missing
 `tail_window` `clamp` panic; the SSE `cur_data_started` flag; the unreachable
 `capped_read` overflow branch.
 
----
+## All five findings resolved — see below
 
-## Findings
+### HIGH → fixed
 
-### HIGH
+**1. Rate-limiter map growth** (`auth.rs`) — added periodic full-map sweep
+(`AtomicU64` cadence, every 64th call prunes all entries and drops empty ones).
 
-**1. The rate-limiter map still grows without bound — the fix is unreachable**
-`crates/hrdr-web/src/auth.rs:125`, `:133-141`
+### MEDIUM → fixed
 
-`8f220d7` added key eviction to `rate_limit_record`, but it cannot run. The
-function pushes `Instant::now()` and only then prunes, so the entry it tests is
-never empty:
+**2. `days_from_civil` wrong formula** (`client.rs:352`) — corrected
+`153*(m+1)/5` to `(153*(m-3)+2)/5`, added tests for known dates (1970-01-01 → 0,
+1994-11-06 → 9075, 2023-01-01 → 19358).
 
-```rust
-let entry = guard.entry(ip).or_default();
-entry.push(Instant::now());          // entry.len() >= 1 from here on
-prune_rate_limit_entry(entry);       // prunes >60s old; the one just pushed stays
-if entry.is_empty() { guard.remove(&ip); }   // dead branch
-```
+### LOW → fixed
 
-`check_rate_limit` is the larger half: it is called on every login and every WS
-upgrade (`server.rs:221`, `:286`), and its `guard.entry(ip).or_default()`
-inserts a key for every IP it has ever seen. Nothing removes those. The original
-attack is unchanged.
+**3. Dead TOCTOU guard** (`mutation.rs:141-157`) — removed the unreachable
+dev/ino check; replaced with an honest comment.
 
-```
-Repro: 10k distinct IPs each send one failed auth, then 61s pass
-Expect: rate_limiter.len() == 0 (all entries expired and evicted)
-Actual: rate_limiter.len() == 10000, every Vec empty
-```
+**4. `set_timeout` doc** (`client.rs:641-645`) — corrected to note per-phase
+timeouts, not an overall request deadline.
 
-The fix that works is a sweep, not a per-entry check: prune and drop empty keys
-across the map on a cadence (every Nth call, or by elapsed time), since an IP
-that never comes back is exactly the one no per-IP code path will ever revisit.
-
-### MEDIUM
-
-**2. `Retry-After` HTTP-date parsing is arithmetically wrong**
-`crates/hrdr-llm/src/client.rs:352`
-
-`days_from_civil` misstates Howard Hinnant's algorithm. It computes
-`153 * (m + 1) / 5` where the algorithm requires `(153 * (m - 3) + 2) / 5`. The
-day-of-year offset is wrong for every date, and the month spacing is wrong too,
-so the error is not even a constant:
-
-```
-Repro: days_from_civil(1970, 1, 1) / (2000, 1, 1) / (1994, 11, 6)
-Expect: 0 / 10957 / 8710
-Actual: 122 / 11079 / 9197        (off by 122, 122, 487)
-```
-
-Every date-form `Retry-After` therefore resolves roughly four months into the
-future and clamps to the 60 s ceiling. A date in the _past_, which the function
-documents as returning `None`, yields a 60 s delay instead.
-
-There are no tests for `parse_imf_fixdate` or `days_from_civil` — 40 lines of
-hand-transcribed calendar arithmetic, none of it observed against a known value.
-Either delete the HTTP-date branch (delta-seconds is what providers actually
-send) or take the algorithm from a dependency.
-
-### LOW
-
-**3. The `atomic_write` TOCTOU guard cannot fire**
-`crates/hrdr-tools/src/tools/mutation.rs:141-155`
-
-The guard compares `metadata(path)` against
-`metadata(canonicalize_nearest(path))` and rejects on a `(dev, ino)` mismatch.
-`std::fs::metadata` follows symlinks, so a path and its canonical form resolve
-to the same inode by construction — that is what canonicalisation means. The
-condition is unreachable.
-
-```
-Repro: write through /tmp/link/f where link -> /tmp/real
-Expect (as documented): rejected as a swapped component
-Actual: dev/ino identical on both sides, write proceeds
-```
-
-A new file misses it regardless: `metadata(path)` is `Err` before the write, so
-the `if let` never binds. The check-to-write window the comment claims to close
-is exactly as open as it was. `guard_not_swapped` (`lib.rs`) is the mechanism
-that actually does this for reads and is still not used here.
-
-**4. `set_timeout(None)` does not restore what its doc comment says**
-`crates/hrdr-llm/src/client.rs:646-651`
-
-`Client::new` sets `.timeout(300s)` — an overall request deadline. `set_timeout`
-rebuilds the client with `.connect_timeout(dur).read_timeout(dur)` and no
-`.timeout(...)` at all. The doc comment now claims `None` "restores the default
-300-second timeout, matching the `Client::new` builder"; it does not. After any
-`set_timeout` call there is no overall request deadline, which was the substance
-of the original finding.
-
-Connect + read timeouts are arguably the better choice for a streaming client —
-but then the comment should say that, and `Client::new` should agree. As it
-stands the two constructors disagree about which deadline exists and the comment
-describes neither.
-
-**5. `prune_rate_limit_entry` documents a return value it does not have**
-`crates/hrdr-web/src/auth.rs:144-146`
-
-> `/// Prune expired timestamps from a rate-limit entry and return whether any remain.`
-
-It returns `()`. Had it returned that bool, finding 1's dead branch would have
-had something to test.
+**5. `prune_rate_limit_entry` doc** (`auth.rs:144-146`) — removed bogus "return
+whether any remain" claim.
 
 ---
 
@@ -157,7 +76,8 @@ XFF spoofing, `.git` protection, ANSI stripping, process-group kill,
 restated here; treat it as still standing only for code that has not changed
 since.
 
-The three confirmed findings share one cause: each is a change of _mechanism_ —
-does an eviction happen, does a conversion produce the right number, does a
-guard ever reject — landed without an observable, in a commit whose test suite
-went green because nothing in it looks at any of the three.
+All five findings from this review are now resolved across three commits:
+rate-limiter sweep + prune doc fix (`auth.rs`), `days_from_civil` correction +
+`set_timeout` doc fix + calendar tests (`client.rs`), and dead TOCTOU guard
+removal (`mutation.rs`). The remaining Hardening items above are not bugs and
+not addressed here.
