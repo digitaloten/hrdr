@@ -15,8 +15,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `git add` through the read-only one paid a round-trip discovering it was
   refused. Read-only is now enforced where it belongs — `effective_sandbox` puts
   those agents in `SandboxMode::Read` — so they get a shell like every other
-  agent and run git, tests and linters through it, while keeping no write tools
-  and no `task`.
+  agent and run read-only commands through it — `git log`/`diff`/`blame`,
+  `grep`, a checker that only reads — while keeping no write tools and no
+  `task`. Note what that does NOT include: read mode grants no writable root, so
+  anything needing to write still fails. `cargo test` cannot create `target/`.
+  That is the mode working as designed, not a gap.
 
   Stated plainly, because it is a real trade: the read-only guarantee now rests
   on the OS sandbox rather than on the tool set. Where no OS sandbox is
