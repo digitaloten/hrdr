@@ -33,16 +33,21 @@ pub(crate) const READ_BUDGET_FACTOR: usize = 20;
 /// multi-gigabyte (or special/device) file would stall or OOM the process
 /// before a single line comes back. Generous enough for any real source file.
 pub(crate) const MAX_READ_BYTES: u64 = 50 * 1024 * 1024;
-/// How long a shell command gets before it is killed, unless the model asks for
-/// more with `timeout_secs`. Used by the `shell` tool.
+/// How long **any** tool call gets before it is cut off, unless the model asks
+/// for more with `timeout_secs`. Enforced once, for every tool, in
+/// [`crate::ToolRegistry::execute`].
 ///
-/// Five minutes, because the commands worth running are the slow ones: a cold
-/// `cargo build`, a full test suite, an `npm install` on a fresh tree. The old
-/// two-minute default killed those *just* often enough to be maddening — and a
-/// killed build teaches the model nothing except to try a narrower command, so the
-/// work is redone rather than finished. A command that hangs is still caught; it
-/// just gets a realistic amount of rope first.
-pub(crate) const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 300;
+/// Five minutes, because the calls worth waiting on are the slow ones: a cold
+/// `cargo build`, a full test suite, an `npm install` on a fresh tree, a search
+/// across a huge tree. The old two-minute shell default killed those *just* often
+/// enough to be maddening — and a killed build teaches the model nothing except to
+/// try a narrower command, so the work is redone rather than finished. Something
+/// genuinely wedged is still caught; it just gets a realistic amount of rope first.
+///
+/// It was `DEFAULT_SHELL_TIMEOUT_SECS` while only `shell` had a deadline at all.
+/// `grep` and `git` had none, so a pathological pattern or a git command on a cold
+/// mount could hang a turn indefinitely — the name changed with the scope.
+pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 300;
 /// Hard cap on a single output line accumulated from the shell; prevents
 /// a minified-file line from blowing the per-turn context.
 pub(crate) const BASH_LINE_CAP: usize = 8_192;

@@ -8,6 +8,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Every tool call runs under a deadline, and the model can raise it per
+  call.** `grep` and `git` had no time bound at all — they capped how much
+  output they would hold, then waited forever, so a pathological pattern, a cold
+  network mount, or git blocking on a lock hung the turn with no way out but
+  Esc. The same was true of `task_diff`/`task_apply` and any future tool, since
+  nothing above the tools enforced anything. `ToolRegistry::execute` now bounds
+  every call in one place: `DEFAULT_TOOL_TIMEOUT_SECS` (300, renamed from
+  `DEFAULT_SHELL_TIMEOUT_SECS` — the name followed the scope), overridable by a
+  `timeout_secs` argument that is advertised on every bounded tool's schema, so
+  it is discoverable rather than a secret the dispatcher honours. A `0` or
+  non-integer is read as "no override" rather than "cancel immediately".
+
+  `shell` and `watch` opt out (`Tool::timeout_secs() -> None`) because they own
+  their deadlines and turn expiry into a _result_ worth keeping — partial output
+  with a "timed out" note; "no change within Ns" plus the last check's output —
+  which an outer cancellation would throw away. `watch` would also have been cut
+  from its 30-minute default to five minutes.
+
 - **Tool output reaches the model as a terminal would show it, not as the
   program wrote it.** `rustfmt --check` colours its diff whether or not it is
   talking to a terminal, and nothing downstream of a tool call is one — so a

@@ -46,9 +46,10 @@ pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
 pub use tools::{
-    CopyTool, DefinitionTool, DeleteTool, EditTool, FindTool, GitTool, GrepTool, LsTool, MoveTool,
-    ReadTool, ReferencesTool, RenameTool, ReplaceTool, Shell, ShellTool, TodoTool, TreeTool,
-    WatchTool, WriteTool, available_shell_tools, redact_secret_diffs,
+    CopyTool, DEFAULT_TOOL_TIMEOUT_SECS, DefinitionTool, DeleteTool, EditTool, FindTool, GitTool,
+    GrepTool, LsTool, MoveTool, ReadTool, ReferencesTool, RenameTool, ReplaceTool, Shell,
+    ShellTool, TodoTool, TreeTool, WatchTool, WriteTool, available_shell_tools,
+    redact_secret_diffs,
 };
 pub use web::{WebFetchTool, WebSearchTool};
 
@@ -1273,13 +1274,77 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// How long a call to this tool may run before the dispatcher cuts it off,
+    /// in seconds. The model can override it per call with `timeout_secs`.
+    ///
+    /// `None` means **this tool owns its own deadline** and must not be
+    /// preempted. Only `shell` and `watch` do that, and for the same reason: both
+    /// turn expiry into a *result* — partial output with a "timed out" note, "no
+    /// change within Ns" — which an outer cancellation would throw away, leaving
+    /// the model an error where it could have had what was found so far.
+    ///
+    /// Everything else gets [`DEFAULT_TOOL_TIMEOUT_SECS`]. Before this existed,
+    /// `grep` and `git` had no time bound at all: they capped how much output they
+    /// would hold but would wait forever for a subprocess, so a pathological
+    /// regex, a cold network mount, or git blocking on a lock hung the turn with
+    /// no way out but the user hitting Esc.
+    fn timeout_secs(&self) -> Option<u64> {
+        Some(DEFAULT_TOOL_TIMEOUT_SECS)
+    }
+
     /// Run the tool. A returned `Err` is surfaced to the model as a tool
     /// result, not propagated as a hard failure — the agent keeps going.
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String>;
 
     fn to_def(&self) -> ToolDef {
-        ToolDef::function(self.name(), self.description(), self.parameters())
+        ToolDef::function(self.name(), self.description(), self.timed_parameters())
     }
+
+    /// This tool's schema with `timeout_secs` advertised, so the override is
+    /// discoverable rather than a secret the dispatcher honours.
+    ///
+    /// Added centrally: a tool that already declares the parameter (`shell`,
+    /// `watch` — the self-managed ones, whose own descriptions explain what
+    /// expiry means for them) keeps its own wording, and a schema with no
+    /// `properties` map at all is left alone.
+    fn timed_parameters(&self) -> serde_json::Value {
+        let mut schema = self.parameters();
+        let Some(secs) = self.timeout_secs() else {
+            return schema;
+        };
+        let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) else {
+            return schema;
+        };
+        if props.contains_key("timeout_secs") {
+            return schema;
+        }
+        props.insert(
+            "timeout_secs".to_string(),
+            serde_json::json!({
+                "type": "integer",
+                "description": format!(
+                    "Seconds to let this call run before it is cut off (default {secs}). \
+                     Raise it for something you expect to be slow — a search across a huge \
+                     tree, a git command on a large history — rather than having it killed \
+                     and starting over."
+                ),
+            }),
+        );
+        schema
+    }
+}
+
+/// The deadline for one tool call: the model's `timeout_secs` if it passed a
+/// usable one, else the tool's own default.
+///
+/// `0` and a non-integer are read as "no override" rather than "cut it off
+/// immediately" — the latter is never what anyone means and would fail every
+/// call. The tool's default stands instead.
+fn call_timeout_secs(args: &serde_json::Value, default: u64) -> u64 {
+    args.get("timeout_secs")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|secs| *secs > 0)
+        .unwrap_or(default)
 }
 
 /// Ordered registry of tools, keyed by name.
@@ -1405,7 +1470,33 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| anyhow!("{}", self.unknown_tool_message(name)))?;
-        tool.execute(args, ctx).await
+        // Every tool call runs under a deadline, in one place, so no tool can
+        // forget to have one. The model's `timeout_secs` wins over the tool's
+        // default; a tool that manages its own deadline (`shell`, `watch`) reports
+        // `None` and is awaited untouched, because it turns expiry into a result
+        // worth keeping rather than an error.
+        let budget = tool
+            .timeout_secs()
+            .map(|default| call_timeout_secs(&args, default));
+        let Some(secs) = budget else {
+            return tool.execute(args, ctx).await;
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(secs),
+            tool.execute(args, ctx),
+        )
+        .await
+        {
+            Ok(result) => result,
+            // The future is dropped, which is what stops the work: a subprocess
+            // is `kill_on_drop` and a file mutation lands atomically or not at
+            // all, so there is nothing half-applied to report.
+            Err(_) => Err(anyhow!(
+                "`{name}` timed out after {secs}s and was cancelled — raise \
+                 `timeout_secs` if it genuinely needs longer, or narrow the call \
+                 (a tighter path or pattern) so it finishes"
+            )),
+        }
     }
 
     /// Why `name` isn't callable, and what to call instead. A model that
@@ -1926,6 +2017,93 @@ pub fn floor_char_boundary(s: &str, max: usize) -> usize {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    // ---- every tool call has a deadline ----
+
+    /// A tool that never returns is cut off by the dispatcher, not left to hang
+    /// the turn. This is the property `grep` and `git` lacked entirely: they
+    /// bounded how much output they would hold and then waited forever.
+    #[tokio::test]
+    async fn a_wedged_tool_call_is_cut_off_rather_than_hanging_the_turn() {
+        struct Wedged;
+        #[async_trait]
+        impl Tool for Wedged {
+            fn name(&self) -> &'static str {
+                "wedged"
+            }
+            fn description(&self) -> &'static str {
+                "never returns"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+            fn timeout_secs(&self) -> Option<u64> {
+                Some(1)
+            }
+            async fn execute(&self, _a: serde_json::Value, _c: &ToolContext) -> Result<String> {
+                std::future::pending::<()>().await;
+                unreachable!("pending never completes")
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(std::sync::Arc::new(Wedged));
+        let ctx = ToolContext::new(PathBuf::from("."));
+
+        let started = std::time::Instant::now();
+        let err = reg
+            .execute("wedged", serde_json::json!({}), &ctx)
+            .await
+            .expect_err("a wedged call must not resolve")
+            .to_string();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "cut off promptly"
+        );
+        assert!(err.contains("timed out after 1s"), "{err}");
+        assert!(err.contains("timeout_secs"), "the remedy is named: {err}");
+    }
+
+    /// The model can buy more time per call, and a nonsense `0` falls back to the
+    /// tool's default instead of cancelling everything instantly.
+    #[test]
+    fn a_call_can_raise_its_own_deadline_but_zero_is_not_an_override() {
+        let default = 300;
+        assert_eq!(call_timeout_secs(&serde_json::json!({}), default), 300);
+        assert_eq!(
+            call_timeout_secs(&serde_json::json!({"timeout_secs": 900}), default),
+            900
+        );
+        assert_eq!(
+            call_timeout_secs(&serde_json::json!({"timeout_secs": 0}), default),
+            300,
+            "0 means no override, never 'cancel immediately'"
+        );
+        assert_eq!(
+            call_timeout_secs(&serde_json::json!({"timeout_secs": "soon"}), default),
+            300,
+            "a non-integer is ignored rather than silently zeroing the budget"
+        );
+    }
+
+    /// The override is advertised on every tool that the dispatcher bounds — a
+    /// parameter the model cannot see is a parameter it will not use — and the two
+    /// self-managed tools keep their own wording instead of being given a second
+    /// `timeout_secs` description.
+    #[test]
+    fn the_deadline_override_is_advertised_on_the_tools_it_applies_to() {
+        let reg = ToolRegistry::with_defaults();
+        for def in reg.defs() {
+            let name = def.function.name.clone();
+            let props = def.function.parameters.get("properties");
+            let advertised = props.and_then(|p| p.get("timeout_secs")).is_some();
+            let tool_manages_own = matches!(name.as_str(), "shell" | "watch");
+            assert!(
+                advertised,
+                "{name} must advertise timeout_secs (self-managed: {tool_manages_own})"
+            );
+        }
+    }
 
     // ---- open-handle identity guard ----
 

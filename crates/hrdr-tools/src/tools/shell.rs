@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 use crate::{Tool, ToolContext};
 
-use super::{BASH_LINE_CAP, DEFAULT_SHELL_TIMEOUT_SECS};
+use super::{BASH_LINE_CAP, DEFAULT_TOOL_TIMEOUT_SECS};
 
 // ---- shell ----
 
@@ -294,6 +294,14 @@ impl Tool for ShellTool {
     fn shell(&self) -> Option<Shell> {
         Some(self.shell)
     }
+    /// Self-managed: this tool kills the process group at its own deadline and
+    /// returns what the command printed *before* it hung, with a note saying it
+    /// timed out. Letting the dispatcher cancel it instead would replace that with
+    /// a bare error and throw the output away — which is the half that tells the
+    /// model whether to narrow the command or raise the limit.
+    fn timeout_secs(&self) -> Option<u64> {
+        None
+    }
     fn parameters(&self) -> serde_json::Value {
         shell_parameters("Shell command to run.")
     }
@@ -313,7 +321,7 @@ impl Tool for ShellTool {
             &ctx.sandbox_notices,
         );
         cmd.current_dir(&ctx.cwd);
-        let timeout = Duration::from_secs(a.timeout_secs.unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS));
+        let timeout = Duration::from_secs(a.timeout_secs.unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS));
         // A command is the usual reason a file the model read goes stale — a
         // formatter, a codegen step, `git checkout`. Note which tracked files
         // this one changed (before/after signatures) so a later `edit` refusal
@@ -805,7 +813,7 @@ mod tests {
     #[test]
     fn a_shell_command_gets_five_minutes_by_default_and_says_so() {
         assert_eq!(
-            DEFAULT_SHELL_TIMEOUT_SECS, 300,
+            DEFAULT_TOOL_TIMEOUT_SECS, 300,
             "five minutes: long enough for a cold build, short enough to catch a hang"
         );
 
@@ -850,7 +858,7 @@ mod tests {
             .expect("command alone is valid");
         assert_eq!(default.timeout_secs, None, "absent means absent");
         assert_eq!(
-            Duration::from_secs(default.timeout_secs.unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)),
+            Duration::from_secs(default.timeout_secs.unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS)),
             Duration::from_secs(300),
             "…and absent resolves to five minutes"
         );
@@ -859,7 +867,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"command": "true", "timeout_secs": 900}))
                 .expect("an override is valid");
         assert_eq!(
-            Duration::from_secs(given.timeout_secs.unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)),
+            Duration::from_secs(given.timeout_secs.unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS)),
             Duration::from_secs(900),
             "a model that asks for fifteen minutes gets fifteen minutes"
         );

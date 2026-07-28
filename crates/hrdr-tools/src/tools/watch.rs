@@ -64,6 +64,14 @@ impl Tool for WatchTool {
          max 21600) and reports the last check's output."
     }
 
+    /// Self-managed: waiting IS the tool. Its own `timeout_secs` already bounds
+    /// the wait (default 30 min, capped at 6 h) and expiry is a *result* — "no
+    /// change within Ns", the last check's output — not a failure. The default tool
+    /// deadline would cut every long watch short at five minutes.
+    fn timeout_secs(&self) -> Option<u64> {
+        None
+    }
+
     fn parameters(&self) -> serde_json::Value {
         json!({
             "type": "object",
