@@ -133,29 +133,10 @@ async fn nudge_baseline(ctx: &ToolContext, path: &Path, hook_event: &str) -> Opt
 /// exist on Windows too, and silently converting one into a regular file is the
 /// same data loss there as anywhere else.
 pub(crate) async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    // Re-canonicalize the path before writing so a directory-component
-    // swap between the sandbox check (`resolve_write`) and this call is
-    // detected: the new canonical form would point through the symlink
-    // and differ from `path`.  This is what `guard_not_swapped` does for
-    // the read path — close the same TOCTOU window on writes.
-    let canon_check = crate::canonicalize_nearest(path);
-    if canon_check != path {
-        // If the canonical form differs, a component was swapped. Reject
-        // rather than writing through the unintended path.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if let (Ok(opened), Ok(named)) =
-                (std::fs::metadata(path), std::fs::metadata(&canon_check))
-                && (opened.dev() != named.dev() || opened.ino() != named.ino())
-            {
-                return Err(std::io::Error::other(format!(
-                    "{} changed while it was being validated — re-read the file",
-                    path.display()
-                )));
-            }
-        }
-    }
+    // Unlike the read path (`guard_not_swapped` in lib.rs), the write path
+    // cannot close the TOCTOU window between the sandbox check and the write:
+    // there is no pre-existing open handle to compare against.  The sandbox
+    // check (`resolve_write`) is the primary defense.
     // `symlink_metadata` is an lstat and portable: it describes the symlink
     // itself, not its destination, and `is_symlink` reports Windows symlinks as
     // well. Ask it first — it is one cheap call that needs no open, and it must
