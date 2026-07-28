@@ -4964,8 +4964,9 @@ async fn model_catalog_matching_generation_merges_rows() {
     let sel = h.app.model_selector.as_ref().unwrap();
     assert!(
         sel.rows()
-            .any(|c| c.provider == "chatgpt" && c.model == "gpt-5.5"),
-        "the entitled ChatGPT row is merged into the picker"
+            .any(|c| c.provider == "openai" && c.model == "gpt-5.5"),
+        "the entitled ChatGPT row is merged into the picker, under the CANONICAL \
+         provider name every other row carries"
     );
 }
 

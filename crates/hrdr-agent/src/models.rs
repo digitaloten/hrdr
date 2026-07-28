@@ -235,13 +235,20 @@ fn sort_choices(out: &mut [ModelChoice], usage: &HashMap<String, u64>) {
     });
 }
 
-/// Convert entitled ChatGPT catalog rows into selector choices for the built-in
-/// `chatgpt` provider, carrying each model's context window.
+/// Convert entitled ChatGPT catalog rows into selector choices, carrying each
+/// model's context window.
+///
+/// The rows name `openai` — the CANONICAL provider, the one every other row in
+/// the picker carries and the one `ModelRef` folds `chatgpt`/`codex` onto. A row
+/// spelled `chatgpt` would be validated against one entry (the auth gate resolves
+/// the raw name) and talked to as another, which is the split
+/// `configured_providers` documents at length; it also made these rows fail to
+/// supersede the base rows they are meant to replace.
 pub fn chatgpt_model_choices(models: &[crate::ChatGptModel]) -> Vec<ModelChoice> {
     models
         .iter()
         .map(|m| ModelChoice {
-            provider: "chatgpt".to_string(),
+            provider: ProviderName::new("chatgpt").as_str().to_string(),
             model: m.slug.clone(),
             provider_label: "ChatGPT".to_string(),
             model_label: m.label.clone(),
@@ -256,11 +263,16 @@ pub fn chatgpt_model_choices(models: &[crate::ChatGptModel]) -> Vec<ModelChoice>
 /// left untouched. ChatGPT rows retain their upstream order within equal
 /// usage/label ties via the stable sort.
 ///
-/// The superseded rows are matched with [`crate::is_chatgpt_provider_name`], not
-/// an exact `"chatgpt"` compare: a base row carries the provider name as the
-/// user spelled it, so a config that says `provider = "codex"` would otherwise
-/// survive the filter and leave the picker showing the model twice — once from
-/// the stale preset (with no context window) and once from the live catalog.
+/// A superseded row is matched by **folding** its provider name, not by an alias
+/// list: any spelling that `ProviderName` folds onto `openai` is the same
+/// provider, so `chatgpt`, `codex`, `openai-oauth` and `openai` all match.
+///
+/// It used to ask [`crate::is_chatgpt_provider_name`], whose list is
+/// `chatgpt`/`codex`/`openai-oauth` — every spelling except the canonical one.
+/// Since the picker canonicalizes every row it builds, `openai` is the only name
+/// a base row can actually carry, so nothing was ever replaced: the live rows
+/// were appended beside the stale ones and the picker showed each entitled model
+/// twice, once without a context window.
 ///
 /// `usage` is passed in rather than loaded here: this runs on the UI thread when
 /// the async catalog lands, and a pure merge keeps its test hermetic.
@@ -269,9 +281,10 @@ pub fn merge_chatgpt_choices(
     chatgpt: &[crate::ChatGptModel],
     usage: &HashMap<String, u64>,
 ) -> Vec<ModelChoice> {
+    let chatgpt_provider = ProviderName::new("chatgpt");
     let mut out: Vec<ModelChoice> = base
         .into_iter()
-        .filter(|c| !crate::is_chatgpt_provider_name(&c.provider))
+        .filter(|c| ProviderName::new(&c.provider) != chatgpt_provider)
         .collect();
     out.extend(chatgpt_model_choices(chatgpt));
     sort_choices(&mut out, usage);
@@ -1011,7 +1024,9 @@ mod tests {
 
         let a = choices.iter().find(|c| c.model == "a-model").unwrap();
         assert_eq!(a.context_window, Some(272_000));
-        assert_eq!(a.provider, "chatgpt");
+        // The CANONICAL provider — the name every other row carries, and the one
+        // `ModelRef` folds `chatgpt`/`codex` onto. Only the LABEL says "ChatGPT".
+        assert_eq!(a.provider, "openai");
         assert_eq!(a.provider_label, "ChatGPT");
     }
 
@@ -1065,7 +1080,7 @@ mod tests {
         let out = merge_chatgpt_choices(base, &cg, &HashMap::new());
         let chatgpt: Vec<&str> = out
             .iter()
-            .filter(|c| c.provider == "chatgpt")
+            .filter(|c| ProviderName::new(&c.provider) == ProviderName::new("chatgpt"))
             .map(|c| c.model.as_str())
             .collect();
         assert_eq!(chatgpt, vec!["fresh"], "stale chatgpt rows replaced");
@@ -1075,13 +1090,32 @@ mod tests {
         );
     }
 
+    /// The merge supersedes a base row under EVERY spelling of the provider —
+    /// above all the canonical one.
+    ///
+    /// The regression: `configured_providers` canonicalizes, so the only name a
+    /// base row can actually carry is `openai`. The filter asked
+    /// `is_chatgpt_provider_name`, whose list is `chatgpt`/`codex`/`openai-oauth`
+    /// — every spelling *except* the one that occurs. So the authenticated rows
+    /// were added beside the base rows instead of replacing them, and the picker
+    /// showed each entitled model twice: once as `openai://<slug>` with no
+    /// context window, once as the live row. The old test looped over five
+    /// aliases and omitted `openai`, so it asserted the property only for names
+    /// that can never appear.
     #[test]
     fn merge_replaces_chatgpt_rows_spelled_with_any_alias() {
         use crate::ChatGptModel;
-        // A base row carries the provider name as the user spelled it in config.
-        // Every ChatGPT alias must be superseded by the authenticated catalog —
-        // an exact `== "chatgpt"` compare would leave a duplicate row behind.
-        for alias in ["chatgpt", "codex", "openai-oauth", "ChatGPT", "CODEX"] {
+        // A base row carries the provider name as the user spelled it in config —
+        // or, from the picker, the canonical name it folds onto.
+        for alias in [
+            "openai",
+            "chatgpt",
+            "codex",
+            "openai-oauth",
+            "ChatGPT",
+            "CODEX",
+            "OpenAI",
+        ] {
             let base = vec![ModelChoice {
                 provider: alias.into(),
                 model: "stale".into(),
