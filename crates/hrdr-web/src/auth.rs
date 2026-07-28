@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -119,6 +120,11 @@ pub fn verify_basic(headers: &HeaderMap, user: Option<&str>, hash: Option<&str>)
 
 // ── rate limiter ───────────────────────────────────────────────────────────
 
+/// Sweep cadence counter — every 64th call to `rate_limit_record` triggers a
+/// full-map prune so the HashMap doesn't grow without bound from IPs that send
+/// one request and never return.
+static RATE_LIMIT_SWEEP_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Check the rate limiter: max 10 failures per minute per IP.
 pub fn check_rate_limit(auth: &AuthState, ip: IpAddr) -> bool {
     let mut guard = auth.rate_limiter.lock().unwrap();
@@ -139,10 +145,18 @@ pub fn rate_limit_record(auth: &AuthState, ip: IpAddr) {
     if entry.is_empty() {
         guard.remove(&ip);
     }
+    // Periodic full-map sweep: prune every entry and drop empty ones.
+    let count = RATE_LIMIT_SWEEP_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count % 64 == 0 {
+        guard.retain(|_ip, timestamps| {
+            prune_rate_limit_entry(timestamps);
+            !timestamps.is_empty()
+        });
+    }
 }
 
-/// Prune expired timestamps from a rate-limit entry and return whether any
-/// remain. Shared by [`check_rate_limit`] and [`rate_limit_record`].
+/// Prune expired timestamps from a rate-limit entry. Shared by
+/// [`check_rate_limit`] and [`rate_limit_record`].
 fn prune_rate_limit_entry(entry: &mut Vec<Instant>) {
     let now = Instant::now();
     entry.retain(|t| now.duration_since(*t).as_secs() < 60);
