@@ -467,7 +467,9 @@ fn spawn_background(
                             hrdr_tools::truncate_middle(report, BACKGROUND_REPORT_MAX_BYTES);
                         if over_budget && let Some(p) = &transcript_path {
                             text.push_str(&format!(
-                                "\n\n(full transcript: {} — `read` it for the complete run)",
+                                "\n\n(truncated — `task_transcript` with this task's id reads the \
+                                 whole run, rendered; the raw file at {} is one JSON record per \
+                                 streamed token, don't `read` it)",
                                 p.display()
                             ));
                         }
@@ -2125,7 +2127,9 @@ impl hrdr_tools::Tool for TaskOutputTool {
                 // the stored summary, and it outlives the live event log.
                 if let Some(p) = transcript {
                     out.push_str(&format!(
-                        "\n\n(full transcript: {} — `read` it for the complete run)",
+                        "\n\n(for the whole run — its reasoning and every tool call — use \
+                         `task_transcript`; don't `read` the raw file at {}, which is one JSON record \
+                         per streamed token)",
                         p.display()
                     ));
                 }
@@ -3092,6 +3096,165 @@ impl hrdr_tools::Tool for TaskApplyTool {
 /// `task_diff`: review a finished write sub-agent's work in one call, instead of
 /// the parent hand-rolling the 3-command git recipe (`status --porcelain`,
 /// `log --oneline HEAD..<branch>`, `diff HEAD...<branch>`) every time.
+/// `task_transcript`: read a sub-agent's run back as plain text.
+///
+/// Exists because the harness used to point at the `.jsonl` and say "`read` it",
+/// and a session did exactly that: the reply came back as one JSON record per
+/// streamed token, which is the same run at a multiple of the tokens with the
+/// content buried in syntax. The records are already folded into entries by the
+/// same reducer the panes use; this renders them.
+pub(crate) struct TaskTranscriptTool {
+    /// Where a finished/orphaned run's `<stem>.jsonl` lives, so a run from an
+    /// earlier session (post-`/resume`) is still readable. `None` → live only.
+    pub(crate) transcript_dir: SubagentDirCell,
+}
+
+#[async_trait::async_trait]
+impl hrdr_tools::Tool for TaskTranscriptTool {
+    fn name(&self) -> &'static str {
+        "task_transcript"
+    }
+    fn description(&self) -> &'static str {
+        "Read a sub-agent's whole run back as plain text: what it was asked, what it thought, \
+         every tool call with its arguments and result, and what it answered. Use it to see HOW a \
+         sub-agent reached its result — why it chose an approach, what it looked at, where it went \
+         wrong — which its final message alone doesn't tell you. Pass a live/finished task's \
+         integer `id`, or the `NNN-slug` stem of a run from an earlier session (see `task_list`). \
+         Long runs page with `offset`/`limit`, like `read`. Never `read` the raw `.jsonl` \
+         yourself: it is one JSON record per streamed token and says the same thing at many times \
+         the size. For a write task's CODE, use `task_diff` instead — this is the conversation, \
+         not the change."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": ["integer", "string"],
+                    "description": "The task id: a live task's integer id, or an on-disk run's `NNN-slug` stem (see `task_list`)."
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "1-based line to start at in the rendered transcript. Default 1."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "How many lines to return. Default: as many as fit the output cap."
+                }
+            },
+            "required": ["id"]
+        })
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &hrdr_tools::ToolContext,
+    ) -> anyhow::Result<String> {
+        let id_val = args
+            .get("id")
+            .ok_or_else(|| anyhow::anyhow!("task_transcript needs an `id` (see `task_list`)"))?;
+        let offset = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .max(1) as usize;
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+
+        // Same dual addressing as `task_output`: an integer (or all-digit string)
+        // names a live/recently-finished task, a `NNN-slug` stem names a run on
+        // disk. Resolve either to the `.jsonl` the fold reads.
+        let path = match id_val
+            .as_u64()
+            .or_else(|| id_val.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        {
+            Some(id) => {
+                let from_registry = ctx
+                    .background_tasks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .find(|t| t.id == id)
+                    .and_then(|t| t.transcript.clone());
+                from_registry.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no transcript for task #{id} — it may predate this session (try its \
+                         `NNN-slug` stem from `task_list`), or the task may not exist"
+                    )
+                })?
+            }
+            None => {
+                let stem = id_val
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "task_transcript needs an integer id or a stem id (see `task_list`)"
+                        )
+                    })?;
+                if !valid_run_stem(stem) {
+                    anyhow::bail!("`{stem}` is not a valid run id (see `task_list`)");
+                }
+                let dir = resolve_subagent_dir(&self.transcript_dir).ok_or_else(|| {
+                    anyhow::anyhow!("no session directory yet — cannot read `{stem}` from disk")
+                })?;
+                dir.join(format!("{stem}.jsonl"))
+            }
+        };
+        if !path.exists() {
+            anyhow::bail!(
+                "no transcript at {} — the run may have been pruned (see `task_list`)",
+                path.display()
+            );
+        }
+        let entries = subagent_transcript::read_transcript(&path);
+        let text = crate::transcript_to_plain_text(&entries, crate::TRANSCRIPT_TOOL_BODY_MAX);
+        if text.trim().is_empty() {
+            return Ok(format!("The run recorded no output ({}).", path.display()));
+        }
+        Ok(window_lines(&text, offset, limit, ctx.max_output))
+    }
+}
+
+/// `limit` lines of `text` from 1-based `offset`, capped at `max_output` bytes,
+/// with a trailer naming the total and how to reach the rest.
+///
+/// Paged rather than middle-truncated: unlike a peek at a running task — where
+/// the newest output is the point — reading a run back is read from the start,
+/// and the reader needs to know there IS more and how to ask for it.
+fn window_lines(text: &str, offset: usize, limit: Option<usize>, max_output: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let start = offset.saturating_sub(1).min(total);
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for line in lines[start..].iter().take(limit.unwrap_or(usize::MAX)) {
+        // Leave room for the trailer.
+        if out.len() + line.len() + 1 > max_output.saturating_sub(200) {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+        shown += 1;
+    }
+    let last = start + shown;
+    let mut header = format!("Transcript lines {}-{last} of {total}", start + 1);
+    if last < total {
+        header.push_str(&format!(
+            " — {} more; continue with offset: {}",
+            total - last,
+            last + 1
+        ));
+    }
+    format!("{header}\n\n{}", out.trim_end())
+}
+
 pub(crate) struct TaskDiffTool;
 
 #[async_trait::async_trait]
@@ -4216,6 +4379,157 @@ mod revive_tests {
                 bytes: 0,
             });
         }
+    }
+
+    /// `task_transcript` renders a run as plain text — reasoning and every tool
+    /// call with its arguments and result — instead of the raw records.
+    ///
+    /// The tool exists because a real session followed a "`read` it for the
+    /// complete run" pointer to a `.jsonl` and got one JSON record per streamed
+    /// token back. `transcript_to_text` was no substitute: it prints `[tool: edit]`
+    /// and drops the arguments and the result, which is the part you read a run
+    /// back FOR.
+    #[tokio::test]
+    async fn task_transcript_renders_a_run_without_the_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = SubagentTranscript::create(dir.path(), "003-planner").unwrap();
+        t.write(&Record::Start {
+            model: "m".into(),
+            label: "Plan the protocol".into(),
+            kind: SpawnKind::Background,
+            prompt: "plan it".into(),
+        });
+        // Streamed one token per record, exactly as a live run writes it.
+        for chunk in ["I ", "should ", "read ", "the ", "codec."] {
+            t.write(&Record::Reasoning { text: chunk.into() });
+        }
+        t.write(&Record::ToolStart {
+            id: "c1".into(),
+            name: "read".into(),
+            args: r#"{"path":"src/codec.rs"}"#.into(),
+        });
+        t.write(&Record::ToolEnd {
+            id: "c1".into(),
+            name: "read".into(),
+            result: "pub fn decode() {}".into(),
+            ok: true,
+        });
+        t.write(&Record::Text {
+            chunk: "Plan: three phases.".into(),
+        });
+        t.write(&Record::End {
+            status: EndStatus::Ok,
+            bytes: 0,
+        });
+        drop(t);
+
+        let ctx = hrdr_tools::ToolContext::new(dir.path().to_path_buf());
+        let out = TaskTranscriptTool {
+            transcript_dir: cell(dir.path()),
+        }
+        .execute(serde_json::json!({"id": "003-planner"}), &ctx)
+        .await
+        .unwrap();
+
+        // No JSON: not a record key in sight.
+        assert!(
+            !out.contains("{\"t\":") && !out.contains("\"chunk\""),
+            "rendered text must carry no record syntax: {out}"
+        );
+        // The streamed deltas are joined back into readable prose.
+        assert!(
+            out.contains("I should read the codec."),
+            "reasoning is reassembled: {out}"
+        );
+        // The part `transcript_to_text` throws away: the call's args AND result.
+        assert!(out.contains("## Tool: read"), "{out}");
+        assert!(
+            out.contains(r#"{"path":"src/codec.rs"}"#),
+            "args kept: {out}"
+        );
+        assert!(out.contains("pub fn decode() {}"), "result kept: {out}");
+        assert!(out.contains("Plan: three phases."), "{out}");
+    }
+
+    /// A long run pages like `read`, and says how much is left and how to ask for
+    /// it — a transcript is read from the start, so silently keeping the tail
+    /// (what a *peek* does) would hide the beginning with no sign it was cut.
+    #[tokio::test]
+    async fn task_transcript_pages_a_long_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = SubagentTranscript::create(dir.path(), "004-long").unwrap();
+        t.write(&Record::Start {
+            model: "m".into(),
+            label: "long".into(),
+            kind: SpawnKind::Background,
+            prompt: "go".into(),
+        });
+        for i in 0..40 {
+            t.write(&Record::Notice {
+                msg: format!("step {i}"),
+            });
+        }
+        drop(t);
+
+        let ctx = hrdr_tools::ToolContext::new(dir.path().to_path_buf());
+        let tool = TaskTranscriptTool {
+            transcript_dir: cell(dir.path()),
+        };
+        let page = tool
+            .execute(
+                serde_json::json!({"id": "004-long", "offset": 1, "limit": 5}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(page.starts_with("Transcript lines 1-5 of "), "{page}");
+        assert!(page.contains("continue with offset: 6"), "{page}");
+        assert!(
+            page.contains("step 0") && !page.contains("step 30"),
+            "{page}"
+        );
+
+        // The next window starts where the last one ended.
+        let next = tool
+            .execute(
+                serde_json::json!({"id": "004-long", "offset": 6, "limit": 5}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(next.starts_with("Transcript lines 6-10 of "), "{next}");
+        assert!(!next.contains("step 0\n"), "no overlap with page 1: {next}");
+    }
+
+    /// An unknown run says so instead of returning an empty transcript, and a
+    /// live-task id with no transcript points at the stem form.
+    #[tokio::test]
+    async fn task_transcript_refuses_what_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = hrdr_tools::ToolContext::new(dir.path().to_path_buf());
+        let tool = TaskTranscriptTool {
+            transcript_dir: cell(dir.path()),
+        };
+        let err = tool
+            .execute(serde_json::json!({"id": "009-nope"}), &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no transcript at"), "{err}");
+        // Not a valid stem at all.
+        let err = tool
+            .execute(serde_json::json!({"id": "../escape"}), &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a valid run id"), "{err}");
+        // An integer id with nothing in the registry.
+        let err = tool
+            .execute(serde_json::json!({"id": 42}), &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no transcript for task #42"), "{err}");
     }
 
     /// Persist the sibling `<stem>.json` snapshot the revive path hydrates from.

@@ -80,11 +80,18 @@ Delegating with `task`:
   parallel tasks editing the same module just buys you a merge conflict and a
   wasted round.
 - Manage running tasks with `task_list` (what's running), `task_output` (peek one
-  task's progress), `task_steer` (give it additional instructions), `task_diff` (review
-  a finished write task's uncommitted leftovers, commits, and diff — pass
-  `commit` to review one commit at a time), `task_apply` (land a finished write
-  task's UNCOMMITTED work in your working dir), and `task_cancel` (stop one). You
-  do not need these to collect results — those arrive on their own.
+  task's progress), `task_transcript` (read a whole run back — its reasoning and
+  every tool call with arguments and result — when you need to know HOW it got
+  there, not just what it answered), `task_steer` (give it additional
+  instructions), `task_diff` (review a finished write task's uncommitted
+  leftovers, commits, and diff — pass `commit` to review one commit at a time),
+  `task_apply` (land a finished write task's UNCOMMITTED work in your working
+  dir), and `task_cancel` (stop one). You do not need these to collect results —
+  those arrive on their own.
+- Never `read` a sub-agent's `.jsonl` transcript file directly, even when a path
+  is in front of you. It stores one JSON record per streamed token: the same run
+  at many times the size, with the content buried in syntax you then parse by eye.
+  `task_transcript` renders it.
 - Never poll a task to wait for it — not with `watch`, a `sleep` loop, or any
   shell command. The `task_*` names are hrdr tools, not shell programs, so a shell
   (or `watch`) can't run them; it just errors in a loop. When you have nothing to

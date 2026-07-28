@@ -103,8 +103,8 @@ pub(crate) use delegation::{
 };
 pub(crate) use delegation::{
     BgHandles, SteerTool, SubagentTool, TaskApplyTool, TaskCancelTool, TaskCleanupTool,
-    TaskDiffTool, TaskListTool, TaskOutputTool, TaskReviveTool, bg_handles, gc_worktrees,
-    subagent_base_config,
+    TaskDiffTool, TaskListTool, TaskOutputTool, TaskReviveTool, TaskTranscriptTool, bg_handles,
+    gc_worktrees, subagent_base_config,
 };
 pub use delegation::{
     builtin_subagent_profiles, config_for_agent_profile, in_git_repo, list_provider_models,
@@ -1492,6 +1492,9 @@ impl Agent {
             }));
             tools.register(Arc::new(TaskOutputTool {
                 live: live_subagents.clone(),
+                transcript_dir: config.subagent_transcript_dir.clone(),
+            }));
+            tools.register(Arc::new(TaskTranscriptTool {
                 transcript_dir: config.subagent_transcript_dir.clone(),
             }));
             tools.register(Arc::new(SteerTool {
@@ -6069,9 +6072,16 @@ mod tests {
         .await
         .unwrap();
         assert!(out.contains("the answer"), "shows the stored result: {out}");
+        // Points at the TOOL that renders the run, and warns off the raw file —
+        // it used to say "`read` it for the complete run", and a session did,
+        // getting one JSON record per streamed token back.
         assert!(
-            out.contains("full transcript") && out.contains("007-done.jsonl"),
-            "points at the durable transcript: {out}"
+            out.contains("`task_transcript`") && out.contains("don't `read` the raw file"),
+            "points at the rendering tool, not the jsonl: {out}"
+        );
+        assert!(
+            out.contains("007-done.jsonl"),
+            "still names the file, for a human who wants it: {out}"
         );
     }
 
@@ -12395,9 +12405,9 @@ mod tests {
                 &result[..result.len().min(200)]
             );
             assert!(
-                result.contains("full transcript:") && result.contains("for the complete run"),
-                "points at the transcript for the full run: {}",
-                &result[result.len().saturating_sub(200)..]
+                result.contains("`task_transcript`") && result.contains("don't `read` it"),
+                "a truncated report points at the rendering tool, not the raw jsonl: {}",
+                &result[result.len().saturating_sub(300)..]
             );
         }
 

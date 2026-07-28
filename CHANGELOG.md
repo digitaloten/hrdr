@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`task_transcript` — read a sub-agent's whole run back as plain text.** What
+  it was asked, what it thought, every tool call with its arguments and result,
+  and what it answered, rendered from the records the panes already fold. This
+  existed before only as an invitation to disaster: `task_output` ended a
+  truncated report with "(full transcript: `<path>.jsonl` — `read` it for the
+  complete run)", and a session took that literally — the reply came back as one
+  JSON record per streamed token, the same run at many times the size with the
+  content buried in syntax. Both pointers now name the tool and say plainly not
+  to read the raw file, and the prompt says the same. `transcript_to_text` (used
+  by `/copy all` and `/export`) was no substitute: it prints `[tool: edit]` and
+  drops the arguments and the result, which is the part you read a run back for.
+  Addresses a live task by integer id or an earlier session's run by its
+  `NNN-slug` stem, pages with `offset`/`limit` like `read`, and reports how many
+  lines remain and the offset to continue from — a transcript is read from the
+  start, so quietly keeping the tail would hide the beginning. Shelling it out
+  is blocked with the rest of the `task_*` family.
 - **Staging a directory is now blocked at the shell**, alongside `git add -A` /
   `--all` / `.` and `git commit -a`/`-am`. `git add tests/` sweeps in every file
   under it — the same hazard one level down, and the easiest one to talk

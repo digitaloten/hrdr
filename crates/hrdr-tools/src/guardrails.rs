@@ -260,6 +260,7 @@ const MAX_NESTED_PAYLOAD_BYTES: usize = 64 * 1024;
 /// background task, which just errors in a loop.
 const TASK_TOOLS: &[&str] = &[
     "task_output",
+    "task_transcript",
     "task_list",
     "task_diff",
     "task_steer",
@@ -614,6 +615,7 @@ mod tests {
         ));
         assert!(blocked("task_list"));
         assert!(blocked("task_diff 2"));
+        assert!(blocked("task_transcript 3"));
         assert!(blocked("task_cancel 1 && echo stopped"));
         assert!(blocked("echo start; task_output 3"));
         // The hrdr `watch` tool passes this exact command string through.
