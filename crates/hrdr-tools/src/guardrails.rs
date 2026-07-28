@@ -52,8 +52,22 @@ pub fn default_guardrails() -> Vec<Guardrail> {
         ),
         // A trailing slash is an unambiguous directory, and staging one sweeps in
         // whatever else lives under it — same hazard as `git add -A`, one level
-        // down. Only this spelling is caught: `git add dir` (no slash) is
-        // indistinguishable from a file by string matching alone.
+        // down.
+        //
+        // KNOWN LIMITATION: only this spelling is caught. `git add dir` without
+        // the slash reads exactly like a file path here, and these rules are pure
+        // string matching over the command line — no filesystem access — so
+        // nothing in this layer can tell the two apart. The prompt covers the gap
+        // by naming directories alongside `-A`/`--all`/`.`.
+        //
+        // Closing it properly means resolving each `git add` pathspec against the
+        // tool's cwd and stat-ing it, which drags in what a shell would do to
+        // those words first: `cd`/`git -C` earlier in the same compound command
+        // move the base, globs and `$VAR`s must be skipped rather than guessed at,
+        // and it has to fail OPEN on anything unresolvable or it starts refusing
+        // legitimate work. That was prototyped and judged too much machinery for
+        // the payoff (2026-07-28) — revisit if a directory add actually slips
+        // through in practice.
         (
             r"\bgit\s+add\b[^&|;]*\s[^\s'\x22;&|]+/(\s|$|['\x22;&|])",
             "staging a directory is blanket staging — it sweeps every file under it, \
