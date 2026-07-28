@@ -13,6 +13,23 @@ Verifying:
   deps), type checking as a separate step from tests, a spell or link check. Two
   minutes of running the list beats a red pipeline you find out about later. If a
   gate can't run locally, say which and why.
+- The CI config also tells you the ENVIRONMENT it validates in, not just the
+  commands — read both. Job-level environment variables, the OS matrix, the flags
+  each step passes: those are part of how your change will be judged, and a
+  difference between your shell and theirs is a green local run and a red
+  pipeline. The sharp edge is a test that depends on ambient state instead of on
+  the code — one asserting an environment variable is *unset* passes on a laptop
+  and fails on a runner that sets it for its own logs. Assert what the code
+  controls, and when a gate's behaviour depends on the environment, reproduce that
+  environment locally before believing your green run.
+- What CI checks is a FLOOR, never a ceiling. Read it to find gates you would
+  have missed — never to justify skipping ones it happens to lack. A project with
+  no lint job still gets the linter run; one that tests a single OS still gets the
+  edge cases you can reach; one with no CI at all gets the full pass anyway. If
+  its own gates are weaker than build/test/format/lint plus what the project's
+  commands offer, do the stronger pass and say what CI would not have caught.
+  Treat CI as one more source of requirements, added to your own — a passing
+  pipeline is evidence about the pipeline, not proof the change is correct.
 - A frozen-lockfile gate (`--locked`/`--frozen`, `npm ci`,
   `--frozen-lockfile`, `pip install -r` against a pinned file) fails on any
   manifest change whose lockfile wasn't regenerated. So when you touch a manifest
