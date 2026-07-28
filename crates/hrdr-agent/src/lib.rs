@@ -6962,7 +6962,65 @@ mod tests {
             "the non-conflicting half of a refused consume is not applied either"
         );
 
-        // (d) An unknown id errors clearly.
+        // (d) The rebase SUCCEEDS and the fast-forward is then refused — the case
+        // `rebase --abort` cannot undo, because there is no rebase in progress by
+        // then. The branch must be rewound to where the sub-agent left it, or the
+        // tool has rewritten its history while reporting that nothing happened.
+        let wt_ff = Worktree::create(repo).await.unwrap();
+        let ff_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&wt_ff.path)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        ff_git(&["config", "user.email", "t@t"]);
+        ff_git(&["config", "user.name", "t"]);
+        std::fs::write(wt_ff.path.join("m.txt"), "sub\n").unwrap();
+        ff_git(&["add", "m.txt"]);
+        ff_git(&["commit", "-qm", "sub adds m"]);
+        let tip_before = String::from_utf8_lossy(&ff_git(&["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        let ff = wt_ff.keep();
+        register(4, &ff.path, &ff.branch);
+        // The parent must advance AFTER the worktree forked, or the rebase is a
+        // no-op and the tip never moves — which would make the assertion below
+        // pass whether or not the rewind exists.
+        std::fs::write(repo.join("p.txt"), "parent advanced\n").unwrap();
+        git(&["add", "p.txt"]);
+        git(&["commit", "-qm", "parent advances"]);
+        // And an UNCOMMITTED parent change to the file the branch adds, so the
+        // rebase succeeds and only the fast-forward is refused.
+        std::fs::write(repo.join("m.txt"), "parent got here first\n").unwrap();
+        let err = consume
+            .execute(serde_json::json!({"id": 4}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("would not fast-forward"),
+            "the refusal names what happened: {err}"
+        );
+        let tip_after = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&ff.path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(
+            tip_after, tip_before,
+            "a refused fast-forward rewinds the branch — the sub-agent's commits stay where it \
+             left them instead of being silently rebased"
+        );
+        let _ = std::fs::remove_file(repo.join("m.txt"));
+
+        // (e) An unknown id errors clearly.
         let err = consume
             .execute(serde_json::json!({"id": 999}), &ctx)
             .await

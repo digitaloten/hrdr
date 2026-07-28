@@ -3156,10 +3156,21 @@ impl hrdr_tools::Tool for TaskConsumeTool {
         } else {
             false
         };
+        // Where the branch pointed before any of this. A rebase that SUCCEEDS and
+        // is then followed by a failure is the case that needs it: `rebase
+        // --abort` only unwinds a rebase still in progress, so without this the
+        // branch stays moved after a refused fast-forward — and the tool would be
+        // claiming it left everything as it was while having quietly rewritten
+        // the sub-agent's history.
+        let (_, orig_tip, _) = git_in(&path, &["rev-parse", "HEAD"]).await?;
         // Put the worktree back exactly as it was found, on any failure after this
-        // point. A stash left behind is work the parent cannot see and the model
-        // has no reason to look for.
-        let restore = |stashed: bool, path: std::path::PathBuf| async move {
+        // point: branch tip first, then the stash. That order matters — the stash
+        // was taken against the pre-rebase tree, so popping it onto a rebased one
+        // can conflict and leave the worktree in a state nobody asked for.
+        let restore = |stashed: bool, rewound: bool, path: std::path::PathBuf, tip: String| async move {
+            if rewound && !tip.is_empty() {
+                let _ = git_in(&path, &["reset", "--hard", &tip]).await;
+            }
             if stashed {
                 let _ = git_in(&path, &["stash", "pop"]).await;
             }
@@ -3173,7 +3184,7 @@ impl hrdr_tools::Tool for TaskConsumeTool {
             // to be the right one. A SHA is neither.
             let (ok, head_sha, err) = git_in(&ctx.cwd, &["rev-parse", "HEAD"]).await?;
             if !ok || head_sha.is_empty() {
-                restore(stashed, path.clone()).await;
+                restore(stashed, false, path.clone(), orig_tip.clone()).await;
                 anyhow::bail!("could not resolve your HEAD to rebase task #{id} onto: {err}");
             }
 
@@ -3183,7 +3194,7 @@ impl hrdr_tools::Tool for TaskConsumeTool {
                 let (_, conflicts, _) =
                     git_in(&path, &["diff", "--name-only", "--diff-filter=U"]).await?;
                 let _ = git_in(&path, &["rebase", "--abort"]).await;
-                restore(stashed, path.clone()).await;
+                restore(stashed, false, path.clone(), orig_tip.clone()).await;
                 let files = if conflicts.is_empty() {
                     String::new()
                 } else {
@@ -3200,11 +3211,14 @@ impl hrdr_tools::Tool for TaskConsumeTool {
 
             let (merged, _, merge_err) = git_in(&ctx.cwd, &["merge", "--ff-only", &branch]).await?;
             if !merged {
-                restore(stashed, path.clone()).await;
+                // The rebase landed; only the merge did not. Rewind the branch so
+                // the sub-agent's commits are where it left them.
+                restore(stashed, true, path.clone(), orig_tip.clone()).await;
                 anyhow::bail!(
                     "`{branch}` (task #{id}) rebased cleanly but would not fast-forward into your \
                      working dir — usually an uncommitted change of your own in a file it \
-                     touches. Nothing was merged. git said: {merge_err}"
+                     touches. Nothing was merged, and the branch was rewound to where the \
+                     sub-agent left it. git said: {merge_err}"
                 );
             }
             let size = task_size_summary(&ctx.cwd, &branch)
@@ -3234,7 +3248,9 @@ impl hrdr_tools::Tool for TaskConsumeTool {
                     }
                 }
                 Err(e) => {
-                    restore(stashed, path.clone()).await;
+                    // The commits, if any, are already merged — rewinding the
+                    // branch now would say the opposite of what happened.
+                    restore(stashed, false, path.clone(), orig_tip.clone()).await;
                     let merged_note = if commits > 0 {
                         format!(
                             " NOTE: the {commits} commit(s) DID merge — only the uncommitted half \
