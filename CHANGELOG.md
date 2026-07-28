@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **A verification ledger, and a word about it at commit time.** hrdr now keeps
+  score of what a session has actually verified: every shell command is
+  classified (test / lint / format / build / type-check) and scored for whether
+  it covered the whole project or a slice of it, biased to "a slice" on any
+  doubt. The load-bearing part is an epoch — a counter bumped by every source
+  edit — so the question is not "were tests run" but "were they run _after your
+  last change_", which is what catches the common shape: run the suite, edit
+  three more files, commit. A `git commit` that leaves a check owed carries a
+  note naming what was run, at what scope, and how many edits landed after it. A
+  note, never a block: a WIP commit mid-refactor is legitimate, and a harness
+  that refuses one teaches the model to route around it. Prompted by a session
+  that ran four crates out of nine, edited more afterwards, and reported the
+  work verified.
+
 ### Fixed
 
 - **`task_cleanup` asks what is at risk, not what happened.** It refused any

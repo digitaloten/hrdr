@@ -364,29 +364,6 @@ impl Tool for ShellTool {
         // Also on failure: a command that exited non-zero (or timed out) may
         // still have rewritten files before it died.
         ctx.note_modifying_command(&before, &a.command);
-        // Keep score of what this session has actually verified, and say so on
-        // the way out of a commit.
-        {
-            let passed = command_passed(&out);
-            let mut ledger = ctx
-                .verification
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            ledger.record(&a.command, passed);
-            // A note, never a block: a WIP commit mid-refactor is legitimate,
-            // and a harness that refuses one teaches the model to route around
-            // it. Gated on the commit having actually happened — a `git commit`
-            // that exited non-zero (nothing staged, a rejecting hook) must not
-            // be told "committed, but…" about a commit that isn't there.
-            if crate::verification::is_git_commit(&a.command)
-                && passed
-                && let Ok(text) = &mut out
-                && let Some(note) = ledger.commit_note()
-            {
-                text.push('\n');
-                text.push_str(&note);
-            }
-        }
         // Name the sandbox when it is what actually failed. An `EROFS` raised
         // deep inside a tool, about a path the model never named, otherwise
         // reads as that tool being broken or absent — see `sandbox_denial_note`.
@@ -681,7 +658,7 @@ async fn run_streamed_command(
     if let Some(s) = status
         && !s.success()
     {
-        let msg = format!("{EXIT_STATUS_MARKER} {s}]");
+        let msg = format!("[exit status: {s}]");
         ingest_line!(&msg);
     }
 
@@ -709,6 +686,37 @@ async fn run_streamed_command(
     // Record this run's own spool for the next re-run (newest wins per base).
     if let Some(path) = &overflow_path {
         ctx.note_spooled_command(command, path);
+    }
+
+    // Keep score of what this session has actually verified, and say so on the
+    // way out of a commit.
+    //
+    // Here rather than in `execute` because `status` is here: `None` is the
+    // timeout (a killed suite proved nothing) and a non-zero exit is a real
+    // answer that is still not a pass. Asking the `ExitStatus` IS the question.
+    // Recovering it instead by matching the `[exit status: …]` marker back out
+    // of text this function just wrote holds only until a command's own output
+    // contains that string, and needs one spelling kept in sync across two
+    // places to hold at all.
+    {
+        let passed = status.is_some_and(|s| s.success());
+        let mut ledger = ctx
+            .verification
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ledger.record(command, passed);
+        // A note, never a block: a WIP commit mid-refactor is legitimate, and a
+        // harness that refuses one teaches the model to route around it. Gated
+        // on the commit having actually happened — a `git commit` that exited
+        // non-zero (nothing staged, a rejecting hook) must not be told
+        // "committed, but…" about a commit that is not there.
+        if passed
+            && crate::verification::is_git_commit(command)
+            && let Some(note) = ledger.commit_note()
+        {
+            notes.push('\n');
+            notes.push_str(&note);
+        }
     }
 
     // Nothing produced.
@@ -754,27 +762,6 @@ async fn run_streamed_command(
         total_bytes,
     );
     finish(format!("{body}{notes}"), timed_out)
-}
-
-/// How a non-zero exit is announced in the body. A constant because the
-/// verification ledger reads it back out of the finished result
-/// ([`command_passed`]) — two spellings of the same marker would silently turn
-/// every failed suite into a passing one.
-const EXIT_STATUS_MARKER: &str = "[exit status:";
-
-/// Whether the command actually succeeded, for the verification ledger.
-///
-/// Two things have to be true, and neither alone is enough. `Ok` rules out a
-/// timeout — a killed suite proved nothing (see [`finish`]) — but a non-zero
-/// exit *stays* `Ok` here on purpose, because the command answered and the
-/// answer is its output. So the body is also checked for the exit-status marker:
-/// a red test run must never be credited as a green one, which is the entire
-/// point of the ledger.
-///
-/// A command that merely *prints* the marker is read as a failure. That is the
-/// harmless direction: the worst it costs is being asked to run the suite again.
-fn command_passed(out: &Result<String>) -> bool {
-    matches!(out, Ok(body) if !body.contains(EXIT_STATUS_MARKER))
 }
 
 /// The tool result for a finished run: `Ok` normally, `Err` when the deadline
@@ -823,23 +810,6 @@ pub fn available_shell_tools() -> Vec<std::sync::Arc<dyn Tool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A non-zero exit is `Ok` — the command answered, and the answer is the
-    /// output — but it is not a *pass*. The verification ledger reads this, so
-    /// getting it wrong credits every red suite as a green tree.
-    #[test]
-    fn a_nonzero_exit_is_a_result_but_not_a_pass() {
-        assert!(command_passed(&Ok(
-            "test result: ok. 391 passed".to_string()
-        )));
-        assert!(!command_passed(&Ok(format!(
-            "FAILED\n{EXIT_STATUS_MARKER} exit status: 101]"
-        ))));
-        // A timeout is not an answer at all.
-        assert!(!command_passed(&Err(anyhow::anyhow!(
-            "[command timed out after 30s]"
-        ))));
-    }
 
     /// Every dialect answers the whole seam, and the answers agree with each
     /// other: `command` invokes `program` with `invoke_args`, and `quote`
