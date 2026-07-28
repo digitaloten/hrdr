@@ -118,23 +118,6 @@ enum SendOutcome {
     },
 }
 
-/// How an agent came to exist.
-///
-/// One enum, shared with the durable transcript ([`crate::transcript_log`]
-/// re-exports it) — a run's `Start` record and its registry entry describe the
-/// same fact, and two enums with the same variants could only drift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SpawnKind {
-    /// The session's own agent: nobody delegated to it, and nothing is waiting
-    /// on an answer from it. Exactly one entry per session has this.
-    Session,
-    /// The `task` call blocks on it; its answer becomes the tool result.
-    Blocking,
-    /// Detached (`background: true`); its answer is delivered later.
-    Background,
-}
-
 /// One agent the frontend can address — the session's own, or a delegated one.
 ///
 /// Deliberately not `Debug`: it holds an `Agent`, whose config carries an API
@@ -188,9 +171,8 @@ pub struct AgentEntry {
     /// turns, so every agent has one — a frontend showing this agent shows *its*
     /// loader, not the main agent's.
     pub turn: crate::TurnStats,
-    pub kind: SpawnKind,
-    /// The sub-agent itself, retained so a frontend can drive a further turn on
-    /// it once its delegated task has landed.
+    /// The agent itself, retained so a frontend can drive a further turn on it
+    /// once its delegated task has landed.
     pub agent: Arc<tokio::sync::Mutex<Agent>>,
     /// The steering queue its `run` is draining. Push here to inject a message
     /// into the turn already in flight.
@@ -298,7 +280,6 @@ impl AgentRegistry {
                 turn: crate::TurnStats::default(),
                 // Nobody delegated to it and nothing waits on its answer — the
                 // reason `done`/`delivered` below are meaningless for it.
-                kind: SpawnKind::Session,
                 agent,
                 steering,
                 running: false,
@@ -768,7 +749,6 @@ mod tests {
             usage: crate::AgentUsage::default(),
             events: event_log(),
             turn: crate::TurnStats::default(),
-            kind: SpawnKind::Blocking,
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             steering: steering_queue(),
             running: true,

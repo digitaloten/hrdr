@@ -54,8 +54,8 @@ pub use validate::{
 mod models;
 mod registry;
 pub use registry::{
-    AgentEntry, AgentRegistry, EventLog, MAIN_KEY, PromptDelivery, RunGuard, SpawnKind,
-    age_completed_todos, event_log,
+    AgentEntry, AgentRegistry, EventLog, MAIN_KEY, PromptDelivery, RunGuard, age_completed_todos,
+    event_log,
 };
 mod transcript;
 mod transcript_log;
@@ -97,9 +97,9 @@ mod delegation;
 #[cfg(test)]
 pub(crate) use delegation::{
     BACKGROUND_REPORT_MAX_BYTES, ChildDirCell, REVIEW_PROMPT, SubagentSlots, Worktree,
-    apply_model_ref, apply_task_overrides, child_transcript_id, format_shortstat, named_spec_ref,
-    open_next_subagent_transcript_from, remove_worktree, resolve_child_dir,
-    subagent_context_window, subagent_usage, task_size_summary,
+    apply_model_ref, apply_task_overrides, child_context_window, child_transcript_id,
+    format_shortstat, named_spec_ref, open_next_subagent_transcript_from, remove_worktree,
+    resolve_child_dir, task_size_summary,
 };
 pub(crate) use delegation::{
     BgHandles, SteerTool, SubagentTool, TaskApplyTool, TaskCancelTool, TaskCleanupTool,
@@ -1674,6 +1674,17 @@ impl Agent {
         // missing from the prompt — the same channel carries it, for the same reason.
         pending_notices.extend(project_docs.skipped.iter().map(|s| s.notice()));
 
+        // The window this agent works against, decided once, here: a configured
+        // window wins, otherwise the one its identity derives — network-free, since
+        // resolving the identity above already looked it up.
+        //
+        // Eager on purpose. It is published to this agent's registry entry the
+        // moment a frontend attaches (`publish_chrome`), so every agent's context
+        // gauge can draw before its first turn. Deriving it lazily meant the
+        // delegation path had to compute a window of its own to fill a delegated
+        // agent's gauge, while the session's own agent — whose frontend seeded the
+        // entry with zeroed counters — showed a bare number until its first reply.
+        let context_window = config.context_window.or_else(|| resolved.context_window());
         Ok(Self {
             client,
             resolved,
@@ -1693,9 +1704,10 @@ impl Agent {
             auto_prune: config.auto_prune,
             auto_compact: config.auto_compact,
             compaction_reserved: config.compaction_reserved,
-            context_window: config.context_window,
-            // A config-supplied window is authoritative; otherwise we go looking.
-            context_window_probed: config.context_window.is_some(),
+            context_window,
+            // Answered already, unless the identity had nothing to say — in which
+            // case a later `ensure_context_window` may still find something.
+            context_window_probed: context_window.is_some(),
             self_compact_failed: false,
             todo_turn: 0,
             todo_completed_at: HashMap::new(),
@@ -2707,8 +2719,7 @@ mod tests {
     use crate::registry;
     use crate::transcript_log;
     use crate::{
-        AgentEntry, AgentRegistry, MAIN_KEY, ModelRef, ModelSpec, ResolvedProviderKind, SpawnKind,
-        TurnStats,
+        AgentEntry, AgentRegistry, MAIN_KEY, ModelRef, ModelSpec, ResolvedProviderKind, TurnStats,
     };
     use futures_util::FutureExt;
     use hrdr_llm::{ChatMessage, FunctionCall, MessageOrigin, Role, ToolCall};
@@ -3670,30 +3681,35 @@ mod tests {
         );
     }
 
+    /// An agent knows the window it works against from the moment it is built —
+    /// not after its first reply, and not because a caller computed one for it.
+    /// That is what lets one code path fill every agent's gauge: `Agent::new`
+    /// decides it, `publish_chrome` publishes it into whatever registry entry the
+    /// agent is attached to, session's own or delegated alike.
     #[test]
-    fn subagent_usage_resolves_chatgpt_window_from_the_account_catalog() {
-        use super::subagent_usage;
+    fn an_agent_knows_its_window_before_its_first_turn() {
         let cfg = AgentConfig {
             base_url: super::CHATGPT_CODEX_BASE_URL.into(),
             model: r("chatgpt://totally-fake-model-xyz"),
-            // No inherited window → force resolution. A delegated ChatGPT
-            // sub-agent's gauge must read the account-catalog window (preset floor
-            // for an uncached slug), not the models.dev `None` this used to give.
+            // Nothing configured → the identity must answer. A ChatGPT agent's
+            // gauge reads the account-catalog window (the preset floor for an
+            // uncached slug), not the models.dev `None` this used to give.
             context_window: None,
             ..Default::default()
         };
-        assert_eq!(subagent_usage(&cfg).context_window, Some(272_000));
+        let agent = Agent::new(cfg).expect("an agent builds");
+        assert_eq!(agent.context_window, Some(272_000));
     }
 
     #[test]
     fn subagent_window_on_codex_endpoint_always_rederives_never_inheriting() {
-        use super::{CHATGPT_CODEX_BASE_URL, subagent_context_window};
+        use super::{CHATGPT_CODEX_BASE_URL, child_context_window};
         // On the Codex endpoint the per-model catalog is authoritative and total, so
         // an inherited window is ALWAYS dropped — the "per-model wins over inherited"
         // branch, deterministic via the preset floor. This is the whole fix: a stale
         // 400k inherited from the parent never reaches the sub-agent.
         assert_eq!(
-            subagent_context_window(
+            child_context_window(
                 Some(400_000),
                 Some("chatgpt"),
                 CHATGPT_CODEX_BASE_URL,
@@ -3706,7 +3722,7 @@ mod tests {
 
     #[test]
     fn subagent_window_off_codex_prefers_inherited() {
-        use super::subagent_context_window;
+        use super::child_context_window;
         // Off the Codex endpoint, an inherited window is ALWAYS preferred — this is
         // the pre-existing behaviour, kept intact so the fix regresses nothing.
         //
@@ -3715,7 +3731,7 @@ mod tests {
         // server window (8k) wins over the catalog figure — inheriting short-circuits
         // before any catalog lookup, so this holds with or without a models.dev cache.
         assert_eq!(
-            subagent_context_window(
+            child_context_window(
                 Some(8_000),
                 Some("openai"),
                 "http://localhost:1234/v1",
@@ -3726,7 +3742,7 @@ mod tests {
         );
         // Off-catalog with an inherited value → inherited survives (never blinded).
         assert_eq!(
-            subagent_context_window(
+            child_context_window(
                 Some(50_000),
                 Some("zen"),
                 "https://opencode.ai/zen/v1",
@@ -3738,7 +3754,7 @@ mod tests {
         // local URL is NOT the Codex endpoint — its explicitly-configured window is
         // preserved, not overwritten by the 272k preset floor.
         assert_eq!(
-            subagent_context_window(
+            child_context_window(
                 Some(32_768),
                 Some("chatgpt"),
                 "http://localhost:9099/v1",
@@ -3750,7 +3766,7 @@ mod tests {
         // Off-catalog with NO inherited value → falls to the catalog (here None),
         // never inventing a number.
         assert_eq!(
-            subagent_context_window(
+            child_context_window(
                 None,
                 Some("zen"),
                 "https://opencode.ai/zen/v1",
@@ -5895,8 +5911,8 @@ mod tests {
     #[tokio::test]
     async fn task_list_and_cancel_manage_background_tasks() {
         use super::{
-            AgentEntry, AgentRegistry, SpawnKind, SteerTool, TaskCancelTool, TaskListTool,
-            TurnStats, bg_handles, registry, steering_queue,
+            AgentEntry, AgentRegistry, SteerTool, TaskCancelTool, TaskListTool, TurnStats,
+            bg_handles, registry, steering_queue,
         };
         use hrdr_tools::Tool;
         let live = AgentRegistry::new();
@@ -5943,7 +5959,6 @@ mod tests {
                 usage: crate::AgentUsage::default(),
                 events: registry::event_log(),
                 turn: TurnStats::default(),
-                kind: SpawnKind::Background,
                 agent: Arc::new(tokio::sync::Mutex::new(
                     Agent::new(AgentConfig::default()).unwrap(),
                 )),
@@ -7632,7 +7647,6 @@ mod tests {
                     usage: crate::AgentUsage::default(),
                     events: registry::event_log(),
                     turn: TurnStats::default(),
-                    kind: SpawnKind::Background,
                     agent: Arc::new(tokio::sync::Mutex::new(
                         Agent::new(AgentConfig::default()).unwrap(),
                     )),
@@ -7748,7 +7762,6 @@ mod tests {
                     usage: crate::AgentUsage::default(),
                     events: registry::event_log(),
                     turn: TurnStats::default(),
-                    kind: SpawnKind::Background,
                     agent: Arc::new(tokio::sync::Mutex::new(
                         Agent::new(AgentConfig::default()).unwrap(),
                     )),
@@ -11656,7 +11669,7 @@ mod tests {
         /// while a frontend is looking at it.
         #[tokio::test]
         async fn a_delegated_subagent_is_retained_then_pruned_unless_pinned() {
-            use super::super::{AgentRegistry, SpawnKind};
+            use super::super::AgentRegistry;
             use hrdr_tools::Tool;
             let server = MockServer::start(vec![MockResp::Sse(vec![
                 text_chunk("c1", "sub work done"),
@@ -11698,12 +11711,12 @@ mod tests {
 
             // Retained and idle. A background sub-agent's answer is owed until the
             // run loop delivers it, so it is NOT delivered yet.
-            let (key, kind, running, done, delivered) = live.with(|v| {
+            let (key, bg_id, running, done, delivered) = live.with(|v| {
                 assert_eq!(v.len(), 1, "the delegated sub-agent is registered");
                 let e = &v[0];
-                (e.key, e.kind, e.running, e.done, e.delivered)
+                (e.key, e.bg_id, e.running, e.done, e.delivered)
             });
-            assert_eq!(kind, SpawnKind::Background);
+            assert!(bg_id.is_some(), "a delegated run is detached and named");
             assert!(!running && done && !delivered, "done but still owed");
 
             // Undelivered → survives the prune even unpinned (its answer is owed).
@@ -11816,7 +11829,7 @@ mod tests {
 
             let (path, events) = read_events(ts_dir.path());
             assert!(
-                matches!(&events[0], transcript_log::Record::Start { kind: transcript_log::SpawnKind::Background, prompt, .. } if prompt == "do the sub task"),
+                matches!(&events[0], transcript_log::Record::Start { prompt, .. } if prompt == "do the sub task"),
                 "first event is a background Start with the full prompt: {:?}",
                 events[0]
             );
@@ -11938,7 +11951,7 @@ mod tests {
 
             let (_path, events) = read_events(ts_dir.path());
             assert!(
-                matches!(&events[0], transcript_log::Record::Start { kind: transcript_log::SpawnKind::Background, prompt, .. } if prompt == "bg task"),
+                matches!(&events[0], transcript_log::Record::Start { prompt, .. } if prompt == "bg task"),
                 "first event is a background Start with the full prompt: {:?}",
                 events[0]
             );
@@ -12652,7 +12665,7 @@ mod tests {
     #[test]
     fn a_resumed_session_never_writes_into_a_previous_runs_transcript() {
         use super::open_next_subagent_transcript_from;
-        use transcript_log::{EndStatus, Record, SpawnKind};
+        use transcript_log::{EndStatus, Record};
 
         let dir = tempfile::tempdir().unwrap();
         // A previous process left an orphaned run behind (crashed: no End).
@@ -12661,7 +12674,6 @@ mod tests {
         old.write(&Record::Start {
             model: "m".into(),
             label: "sub-task".into(),
-            kind: SpawnKind::Blocking,
             prompt: "work from the previous session".into(),
         });
         drop(old);
@@ -12674,7 +12686,6 @@ mod tests {
         fresh.write(&Record::Start {
             model: "m".into(),
             label: "sub-task".into(),
-            kind: SpawnKind::Blocking,
             prompt: "work from the resumed session".into(),
         });
         fresh.write(&Record::End {

@@ -40,11 +40,6 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-/// How the agent this log belongs to came to exist. The registry's enum, not a
-/// second copy of it: the `Start` record and the agent's registry entry state the
-/// same fact.
-pub use crate::registry::SpawnKind;
-
 /// Terminal status of an agent's run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,8 +50,8 @@ pub enum EndStatus {
     Cancelled,
 }
 
-/// One line in a sub-agent transcript. A complete, serializable projection of
-/// the sub-agent's `AgentEvent` stream — tool calls keep their full args and
+/// One line in an agent's transcript. A complete, serializable projection of
+/// that agent's `AgentEvent` stream — tool calls keep their full args and
 /// results — plus the `Start`/`End`/`Error` framing needed for orphan
 /// detection. Serialized with a `t` discriminator so a reader can dispatch on
 /// the record kind.
@@ -66,7 +61,6 @@ pub enum Record {
     Start {
         model: String,
         label: String,
-        kind: SpawnKind,
         prompt: String,
     },
     Reasoning {
@@ -606,14 +600,17 @@ mod tests {
         let start = Record::Start {
             model: "m".into(),
             label: "l".into(),
-            kind: SpawnKind::Background,
             prompt: "p".into(),
         };
         let s = serde_json::to_string(&start).unwrap();
         assert!(s.contains(r#""t":"start""#), "got {s}");
-        assert!(s.contains(r#""kind":"background""#), "got {s}");
         // Round-trips.
         assert_eq!(serde_json::from_str::<Record>(&s).unwrap(), start);
+        // A log written by an older build carried a `kind` here. Unknown fields
+        // are ignored, so those runs still read back rather than being skipped as
+        // unparsable lines.
+        let legacy = r#"{"t":"start","model":"m","label":"l","kind":"background","prompt":"p"}"#;
+        assert_eq!(serde_json::from_str::<Record>(legacy).unwrap(), start);
 
         // A tool call keeps its full args on the wire (the whole point of the
         // complete projection).
@@ -645,7 +642,6 @@ mod tests {
         t.write(&Record::Start {
             model: "m".into(),
             label: "l".into(),
-            kind: SpawnKind::Blocking,
             prompt: "p".into(),
         });
         t.write(&Record::Text {
@@ -677,7 +673,6 @@ mod tests {
         t.write(&Record::Start {
             model: "m".into(),
             label: "edit-task".into(),
-            kind: SpawnKind::Blocking,
             prompt: "edit the file".into(),
         });
         t.write(&Record::ToolStart {
@@ -736,7 +731,6 @@ mod tests {
         first.write(&Record::Start {
             model: "m".into(),
             label: "sub-task".into(),
-            kind: SpawnKind::Blocking,
             prompt: "first run".into(),
         });
         // No End: the first run crashed. It must stay an identifiable orphan.
@@ -781,7 +775,6 @@ mod tests {
         t.write(&Record::Start {
             model: "m".into(),
             label: "l".into(),
-            kind: SpawnKind::Blocking,
             prompt: "p".into(),
         });
         t.write(&Record::Text {

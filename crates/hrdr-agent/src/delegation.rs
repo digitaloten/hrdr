@@ -128,6 +128,55 @@ pub(crate) struct RestoredContext {
     pub(crate) usage: AgentUsage,
 }
 
+/// Where a delegated run's state is snapshotted, and everything about the run
+/// that never changes once it is spawned.
+///
+/// A run saves itself twice — on every committed round, and once more when it
+/// settles — and those two saves must not be able to describe the same run
+/// differently, which is what six separately-captured locals invited. Nothing
+/// here is delegation-specific except the destination: the state written is the
+/// same [`crate::SessionState`] the session's own agent persists.
+struct RunSnapshot {
+    /// `<stem>.json`, beside the run's transcript. `None` when there is no
+    /// transcript dir to write into (best-effort, the rule the jsonl follows) —
+    /// then nothing is snapshotted and the run is not revivable.
+    path: Option<PathBuf>,
+    name: String,
+    read_only: bool,
+    model: crate::ModelRef,
+    base_url: String,
+    cwd: String,
+}
+
+impl RunSnapshot {
+    /// Write the agent's state beside its transcript.
+    ///
+    /// The snapshot carries the model-facing `messages` (which the jsonl does not
+    /// hold) plus metadata; `transcript` is left EMPTY on purpose — it is the
+    /// sibling jsonl, folded back by `read_transcript` on load — so a round never
+    /// re-serializes the whole transcript it just appended one line to.
+    /// Best-effort: a failed save must never break the run.
+    fn save(&self, messages: Vec<ChatMessage>, usage: AgentUsage) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let state = crate::SessionState {
+            name: self.name.clone(),
+            named_by_user: false,
+            read_only: self.read_only,
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            cwd: self.cwd.clone(),
+            messages,
+            transcript: Vec::new(),
+            usage,
+            todos: Vec::new(),
+            ..Default::default()
+        };
+        let _ = crate::Session::new(state.persisted()).save_to_path(path);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_background(
     cfg: AgentConfig,
@@ -161,20 +210,26 @@ fn spawn_background(
     let provider_for_live = Some(cfg.model.provider().to_string());
     let base_url_for_live = cfg.base_url.clone();
     // A revived run seeds the pane with its restored counters (so its gauge and
-    // cost count on from where it left off); a fresh task starts from zero.
-    let usage_for_live = restore
-        .as_ref()
-        .map(|r| r.usage)
-        .unwrap_or_else(|| subagent_usage(&cfg));
-    // The sub-agent's own identity for its `SessionState` snapshot, captured
-    // before `cfg` is moved into `Agent::new` below. Persisting this state file
-    // is the same core save the main agent uses — only the destination differs.
-    let sub_model = cfg.model.clone();
-    let sub_cwd = cfg.cwd.display().to_string();
-    let sub_base_url = cfg.base_url.clone();
-    // Its capability belongs in that snapshot too: without it a `task_revive` of a
-    // read-only run cannot tell one from a writer, and rebuilds it write-capable.
-    let sub_read_only = cfg.read_only;
+    // cost count on from where it left off); a fresh task starts from zero. The
+    // context window is NOT seeded here — the agent publishes its own the moment it
+    // attaches below, exactly as the session's agent does.
+    let usage_for_live = restore.as_ref().map(|r| r.usage).unwrap_or_default();
+    // This run's snapshot identity, captured before `cfg` is moved into
+    // `Agent::new` below. One value, so the two save points (every committed
+    // round, and once more when the run settles) cannot describe the same run
+    // differently. Its `path` is filled in below, once the transcript is open.
+    let snapshot = RunSnapshot {
+        path: None,
+        // The label names the snapshot's session (auto-derived, never user-named).
+        name: label.clone(),
+        // Capability belongs in the snapshot: without it a `task_revive` of a
+        // read-only run cannot tell one from a writer, and rebuilds it
+        // write-capable.
+        read_only: cfg.read_only,
+        model: cfg.model.clone(),
+        base_url: cfg.base_url.clone(),
+        cwd: cfg.cwd.display().to_string(),
+    };
     // Build and register synchronously so `task_steer` can address the id as soon as
     // `task` returns; registration inside the spawned future races the caller.
     let mut sub = Agent::new(cfg)?;
@@ -217,7 +272,6 @@ fn spawn_background(
         .map(|(branch, repo)| (repo, branch));
     sub.cost_total = cost_total;
     sub.cost_partial = cost_partial;
-    sub.attach_live(live.clone(), live_key);
     sub.ctx.lsp = lsp;
     let steering = steering_queue();
     let sub = Arc::new(tokio::sync::Mutex::new(sub));
@@ -248,7 +302,6 @@ fn spawn_background(
         usage: usage_for_live,
         events: registry::event_log(),
         turn: TurnStats::default(),
-        kind: SpawnKind::Background,
         agent: Arc::clone(&sub),
         steering: Arc::clone(&steering),
         running: true,
@@ -262,13 +315,25 @@ fn spawn_background(
         // (`Start`/`End`/`Error`) is written directly, from this scope.
         transcript: transcript.clone(),
     });
-    // The sub-agent's own `SessionState` snapshot lives next to its `.jsonl`
-    // crash-trail: the sibling `<stem>.json`. No transcript dir (best-effort,
-    // same rule the jsonl uses) means no snapshot. This is the resumable/revivable
-    // artifact; the jsonl stays as the fine-grained record.
-    let sub_json_path = transcript_path.as_ref().map(|p| p.with_extension("json"));
-    // The label names the snapshot's session (auto-derived, never user-named).
-    let label_for_state = label.clone();
+    // Now that its entry exists, let the agent publish into it: the model,
+    // provider, endpoint, effort and context window it is *actually* on, from the
+    // agent itself. Attaching before registering published into nothing (a
+    // `update` on an absent key is a no-op), which is why this path used to
+    // pre-compute a window for the entry by hand.
+    //
+    // Nothing else holds the lock yet — the run task below is not spawned — so the
+    // `try_lock` cannot fail; it is used only because this function is sync.
+    if let Ok(mut g) = sub.try_lock() {
+        g.attach_live(live.clone(), live_key);
+    }
+    // The agent's `SessionState` snapshot lives next to its `.jsonl` crash-trail:
+    // the sibling `<stem>.json`. No transcript dir (best-effort, same rule the
+    // jsonl uses) means no snapshot. This is the resumable/revivable artifact; the
+    // jsonl stays as the fine-grained record.
+    let snapshot = RunSnapshot {
+        path: transcript_path.as_ref().map(|p| p.with_extension("json")),
+        ..snapshot
+    };
     // The `Start` frame is written synchronously here, BEFORE the run task is
     // spawned, so it precedes every event `record` appends for the run.
     if let Some(ts) = &transcript
@@ -277,7 +342,6 @@ fn spawn_background(
         t.write(&transcript_log::Record::Start {
             model: model_for_live.clone(),
             label: label.clone(),
-            kind: transcript_log::SpawnKind::Background,
             prompt: prompt.clone(),
         });
     }
@@ -353,31 +417,13 @@ fn spawn_background(
                         // spawn scope, around this run.
                         usage_live.record(live_key, &ev);
                         // On every committed round (a `History` event, emitted with
-                        // no dangling tool calls) snapshot the sub-agent's
-                        // `SessionState` next to the jsonl. The snapshot carries the
-                        // model-facing `messages` (which the jsonl does not hold) plus
-                        // metadata; the `transcript` is left EMPTY on purpose — it is
-                        // the sibling jsonl, folded back with `read_transcript` on
-                        // load — so a round does not re-serialize the whole transcript
-                        // it already appended one line of. Best-effort: a failed save
-                        // must never break the run, like the jsonl writes above.
-                        if let AgentEvent::History(messages) = &ev
-                            && let Some(path) = &sub_json_path
-                        {
-                            let state = crate::SessionState {
-                                name: label_for_state.clone(),
-                                named_by_user: false,
-                                read_only: sub_read_only,
-                                model: sub_model.clone(),
-                                base_url: sub_base_url.clone(),
-                                cwd: sub_cwd.clone(),
-                                messages: messages.clone(),
-                                transcript: Vec::new(),
-                                usage: usage_live.usage(live_key).unwrap_or_default(),
-                                todos: Vec::new(),
-                                ..Default::default()
-                            };
-                            let _ = crate::Session::new(state.persisted()).save_to_path(path);
+                        // no dangling tool calls) snapshot this agent's state next
+                        // to the jsonl.
+                        if let AgentEvent::History(messages) = &ev {
+                            snapshot.save(
+                                messages.clone(),
+                                usage_live.usage(live_key).unwrap_or_default(),
+                            );
                         }
                         let chunk = match ev {
                             AgentEvent::Text(t) => {
@@ -413,28 +459,13 @@ fn spawn_background(
                 Ok(())
             }
             .await;
-            // Final `SessionState` snapshot from the agent's settled history: the
-            // closing assistant text lands AFTER the last `History` event, so the
-            // in-loop saves above miss it. Read the retained agent's final messages
-            // (the method the main agent's autosave uses); the transcript stays in
-            // the jsonl (rebuilt on load), so the snapshot is messages + metadata.
-            // Best-effort, like the jsonl writes.
-            if let Some(path) = &sub_json_path {
+            // Final snapshot from the agent's settled history: the closing assistant
+            // text lands AFTER the last `History` event, so the in-loop saves above
+            // miss it. Read the retained agent's final messages — the method the
+            // session agent's autosave uses.
+            if snapshot.path.is_some() {
                 let messages = sub.lock().await.messages_owned();
-                let state = crate::SessionState {
-                    name: label_for_state.clone(),
-                    named_by_user: false,
-                    read_only: sub_read_only,
-                    model: sub_model.clone(),
-                    base_url: sub_base_url.clone(),
-                    cwd: sub_cwd.clone(),
-                    messages,
-                    transcript: Vec::new(),
-                    usage: live.usage(live_key).unwrap_or_default(),
-                    todos: Vec::new(),
-                    ..Default::default()
-                };
-                let _ = crate::Session::new(state.persisted()).save_to_path(path);
+                snapshot.save(messages, live.usage(live_key).unwrap_or_default());
             }
             match result {
                 Ok(()) => {
@@ -740,7 +771,12 @@ pub(crate) fn open_next_subagent_transcript_from(
 /// a gap, never blinding the agent. (A stale `inherited` after a cross-provider
 /// `/model` switch is a pre-existing, separately-tracked limitation; correcting it
 /// needs the parent's live window published on the delegation runtime.)
-pub(crate) fn subagent_context_window(
+/// This is **config**, not display: whatever it returns becomes the child's
+/// `AgentConfig::context_window`, which the child then treats as its configured
+/// window. What a *running* agent shows comes from the agent itself
+/// (`Agent::new` decides it, `publish_chrome` publishes it) — no caller
+/// pre-computes a window on an agent's behalf.
+pub(crate) fn child_context_window(
     inherited: Option<u32>,
     provider: Option<&str>,
     base_url: &str,
@@ -750,28 +786,6 @@ pub(crate) fn subagent_context_window(
         return context_window_for(provider, base_url, model);
     }
     inherited.or_else(|| context_window_for(provider, base_url, model))
-}
-
-/// The opening usage counters for a delegated sub-agent — zeroed, but knowing
-/// the context window it is working against.
-///
-/// The window is resolved the same way the agent resolves its own
-/// (`Agent::ensure_context_window`): the config's, else per-model via
-/// [`context_window_for`] (the ChatGPT account cache, or models.dev),
-/// network-free. Without it a sub-agent's pane had a used-tokens count and no
-/// maximum, so its gauge could not draw — it showed a bare number where the main
-/// agent shows a bar.
-pub(crate) fn subagent_usage(cfg: &AgentConfig) -> AgentUsage {
-    AgentUsage {
-        context_window: cfg.context_window.or_else(|| {
-            context_window_for(
-                Some(cfg.model.provider().as_str()),
-                &cfg.base_url,
-                cfg.model.model(),
-            )
-        }),
-        ..Default::default()
-    }
 }
 
 pub(crate) fn subagent_base_config(config: &AgentConfig) -> AgentConfig {
@@ -1366,7 +1380,7 @@ impl hrdr_tools::Tool for SubagentTool {
         // carrying it onto a different one is the overflow bug (e.g. a ChatGPT
         // parent's window following a plain delegation onto a smaller model). Runs
         // before both the background and blocking spawns below.
-        cfg.context_window = subagent_context_window(
+        cfg.context_window = child_context_window(
             cfg.context_window,
             Some(cfg.model.provider().as_str()),
             &cfg.base_url,
@@ -2290,7 +2304,7 @@ impl TaskReviveTool {
             None if st.cwd.exists() => st.cwd.clone(),
             None => ctx.cwd.clone(),
         };
-        cfg.context_window = subagent_context_window(
+        cfg.context_window = child_context_window(
             cfg.context_window,
             Some(cfg.model.provider().as_str()),
             &cfg.base_url,
@@ -4361,7 +4375,7 @@ impl Agent {
             }
         }
         self.registry.with(|v| {
-            v.retain(|e| e.key == 0 || e.kind != SpawnKind::Background);
+            v.retain(|e| e.key == 0 || e.bg_id.is_none());
         });
     }
 
@@ -4383,7 +4397,7 @@ impl Agent {
 #[cfg(test)]
 mod revive_tests {
     use super::*;
-    use crate::transcript_log::{EndStatus, Record, SpawnKind, TranscriptLog};
+    use crate::transcript_log::{EndStatus, Record, TranscriptLog};
     use hrdr_tools::Tool;
 
     /// A resolved dir cell pointing at `dir`, as the real one resolves post-save.
@@ -4406,7 +4420,6 @@ mod revive_tests {
         t.write(&Record::Start {
             model: "m".into(),
             label: label.into(),
-            kind: SpawnKind::Background,
             prompt: "do it".into(),
         });
         if let Some(x) = text {
@@ -4435,7 +4448,6 @@ mod revive_tests {
         t.write(&Record::Start {
             model: "m".into(),
             label: "Plan the protocol".into(),
-            kind: SpawnKind::Background,
             prompt: "plan it".into(),
         });
         // Streamed one token per record, exactly as a live run writes it.
@@ -4553,7 +4565,6 @@ mod revive_tests {
         t.write(&Record::Start {
             model: "m".into(),
             label: "long".into(),
-            kind: SpawnKind::Background,
             prompt: "go".into(),
         });
         for i in 0..40 {

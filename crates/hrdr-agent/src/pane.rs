@@ -494,7 +494,6 @@ fn apply_replayed(transcript: &mut Vec<Entry>, ev: &AgentEvent, agents: &[LiveSn
 mod tests {
     use super::*;
     use crate::EntryKind;
-    use crate::SpawnKind;
 
     fn tool_start(id: &str, name: &str) -> AgentEvent {
         AgentEvent::ToolStart {
@@ -833,7 +832,6 @@ mod tests {
                 usage: crate::AgentUsage::default(),
                 events: crate::event_log(),
                 turn: crate::TurnStats::default(),
-                kind: SpawnKind::Blocking,
                 agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
                 steering: crate::steering_queue(),
                 running: false,
