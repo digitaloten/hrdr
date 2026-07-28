@@ -19,9 +19,9 @@
 //! - **Config-file values are hard errors.** A value in `config.toml` is a
 //!   deliberate statement of intent; a nonsensical one (a malformed table, a
 //!   zero sub-agent cap, a compaction reserve larger than the context window) is
-//!   a mistake worth stopping for, exactly like the stale two-key forms
-//!   [`legacy_config_error`] already refuses. These are collected by
-//!   [`FileConfig::validate`] (per-field bounds) and
+//!   a mistake worth stopping for — as is a key hrdr does not have, which
+//!   [`FileConfig`]'s `deny_unknown_fields` refuses outright. These are collected
+//!   by [`FileConfig::validate`] (per-field bounds) and
 //!   [`AgentConfig::validate_semantics`] (cross-field checks on the merged
 //!   result). `main` prints them and exits non-zero.
 //! - **Environment-variable values are warnings.** A `HRDR_*` override is an
@@ -651,6 +651,12 @@ pub enum ProviderAuthState {
     Key,
     /// Trusted ChatGPT OAuth with usable or refreshable credentials.
     OAuth,
+    /// A remote provider that serves *some* of its models to callers with no
+    /// account at all — today only OpenCode Zen, which takes the literal key
+    /// `public` and answers for its zero-cost models (see [`public_api_key`]).
+    /// Usable, but only for the free subset: [`crate::model_choices`] narrows
+    /// the picker to those rows, since a priced one would 401.
+    Anonymous,
     /// A keyless local endpoint (`remote = false`); no credential needed.
     Keyless,
     /// A remote provider with no key and no usable OAuth credential.
@@ -693,14 +699,17 @@ pub(crate) struct ToolOutputConfig {
 ///
 /// The model identity is ONE key — `model = "openrouter://deepseek/deepseek-chat"`
 /// — deserialized as a [`ModelSpec`] (a bare id is that model on the provider in
-/// effect). The old top-level `provider = …` selector is gone; a config still
-/// carrying it is refused at startup by [`legacy_config_error`].
+/// effect). There is no top-level `provider = …` selector and no free-floating
+/// `base_url = …`: **the endpoint belongs to the provider**, and lives in the
+/// `[providers.<name>]` table that defines it (or in a built-in preset). Either
+/// would be a second, independent way to say where a request goes, free to
+/// disagree with the provider actually in force — and a free-floating endpoint
+/// relocated whichever provider was in effect, taking that provider's API key with
+/// it.
 ///
-/// So is the old top-level `base_url = …`: **the endpoint belongs to the provider**,
-/// and lives in the `[providers.<name>]` table that defines it (or in a built-in
-/// preset). A free-floating endpoint was an override that could relocate whichever
-/// provider was in force — and take that provider's API key with it. It is refused
-/// by [`legacy_config_error`] too.
+/// Neither has a bespoke "you wrote the old form" message: `deny_unknown_fields`
+/// refuses them as the unknown keys they are. hrdr is pre-1.0 and carries no
+/// back-compat.
 #[derive(serde::Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileConfig {
@@ -751,6 +760,43 @@ pub(crate) struct FileConfig {
     pub(crate) mcp: Vec<McpServerConfig>,
     pub(crate) prompt_cache: Option<String>,
     pub(crate) lsp: Option<LspFileConfig>,
+
+    // ── The FRONTEND's keys ─────────────────────────────────────────────────
+    //
+    // One `config.toml`, two readers: the agent parses this struct, and the
+    // frontend parses `hrdr_app::UiFileConfig` from the same file. Each has
+    // always ignored the other's keys — but `deny_unknown_fields` cannot tell
+    // "a key that belongs to the other layer" from "a typo", and turning it on
+    // made every display setting a fatal startup error: a config with
+    // `timestamps = "relative"` in it refused to start, naming a list of valid
+    // keys that did not include the one the user had written.
+    //
+    // So they are declared, and ignored. That keeps `deny_unknown_fields`
+    // meaning what it says — a key neither layer knows is still refused — and
+    // the split stays honest rather than lenient. `hrdr-app` cannot be a
+    // dependency here (the dependency runs the other way), so
+    // `hrdr_app::config`'s `the_agent_accepts_every_ui_key` test pins the two
+    // lists together: add a UI key without adding it here and it fails.
+    #[serde(default, rename = "vim")]
+    pub(crate) _ui_vim: Option<toml::Value>,
+    #[serde(default, rename = "theme")]
+    pub(crate) _ui_theme: Option<toml::Value>,
+    #[serde(default, rename = "icons")]
+    pub(crate) _ui_icons: Option<toml::Value>,
+    #[serde(default, rename = "timestamps")]
+    pub(crate) _ui_timestamps: Option<toml::Value>,
+    #[serde(default, rename = "statusbar")]
+    pub(crate) _ui_statusbar: Option<toml::Value>,
+    #[serde(default, rename = "bell")]
+    pub(crate) _ui_bell: Option<toml::Value>,
+    #[serde(default, rename = "auto_resume")]
+    pub(crate) _ui_auto_resume: Option<toml::Value>,
+    #[serde(default, rename = "todo_ttl")]
+    pub(crate) _ui_todo_ttl: Option<toml::Value>,
+    #[serde(default, rename = "show_thinking")]
+    pub(crate) _ui_show_thinking: Option<toml::Value>,
+    #[serde(default, rename = "scrollback")]
+    pub(crate) _ui_scrollback: Option<toml::Value>,
 }
 
 impl FileConfig {
@@ -1139,6 +1185,43 @@ pub fn resolve_api_key(
         })
 }
 
+/// The key OpenCode Zen reads as "no account": the literal string `public`.
+///
+/// Zen's gateway maps this to an anonymous, IP-rate-limited caller and serves it
+/// every model flagged for anonymous use — which is exactly its zero-cost ones
+/// ([`hrdr_llm::catalog::is_free_model`]); a priced model answers 401 "Missing
+/// API key". opencode's own client does the same thing (`if (!hasKey)
+/// provider.request.body.apiKey = "public"`, then it disables the priced rows),
+/// and this is hrdr's half of that arrangement.
+const ZEN_PUBLIC_API_KEY: &str = "public";
+
+/// The anonymous key `provider` accepts in place of a credential, if it accepts
+/// one. `Some` only for the BUILT-IN `zen` preset: a user-defined
+/// `[providers.zen]` shadow (kind `Custom`) points somewhere else entirely and
+/// must never be handed a key it did not ask for, and `go` — which shares Zen's
+/// account — has no anonymous tier.
+pub fn public_api_key(provider: &str, p: &ResolvedProvider) -> Option<&'static str> {
+    (p.kind == ResolvedProviderKind::BuiltIn && ProviderName::new(provider).as_str() == "zen")
+        .then_some(ZEN_PUBLIC_API_KEY)
+}
+
+/// [`resolve_api_key`], falling back to the provider's anonymous key
+/// ([`public_api_key`]) when no real credential resolves.
+///
+/// This is what goes ON THE WIRE; `resolve_api_key` stays "a credential this user
+/// holds", which is what [`provider_auth_state`] must ask about (otherwise every
+/// logged-out Zen session would report itself as authenticated and the picker
+/// would offer it models it cannot run).
+pub fn resolve_api_key_or_public(
+    provider: &str,
+    p: &ResolvedProvider,
+    parent_key: Option<&str>,
+    parent_base_url: Option<&str>,
+) -> Option<String> {
+    resolve_api_key(provider, p, parent_key, parent_base_url)
+        .or_else(|| public_api_key(provider, p).map(str::to_string))
+}
+
 /// The environment variable the effective API key is drawn FROM, if any — i.e.
 /// no inline preset key shadows it and `key_env`'s variable is set in the
 /// environment. `None` when the key is inline, from the `/login` store, a
@@ -1216,6 +1299,12 @@ pub(crate) fn provider_auth_state_with(
     }
     if is_openai_oauth_capable(resolved.kind, name) && oauth_ready {
         return ProviderAuthState::OAuth;
+    }
+    // Below a real credential, above "unconfigured": a provider that serves part
+    // of its catalog to anonymous callers is *usable*, and saying `Missing` here
+    // is what hid free Zen from a user who had not logged in to anything.
+    if public_api_key(name, resolved).is_some() {
+        return ProviderAuthState::Anonymous;
     }
     if !resolved.remote {
         return ProviderAuthState::Keyless;
@@ -1296,86 +1385,14 @@ pub fn named_model_specs() -> Vec<ModelSpec> {
         .collect()
 }
 
-/// The startup refusal for a config.toml still written in a dead form —
-/// `Some(message)` when `text` carries the old `provider` selector or a
-/// free-floating `base_url`, `None` when it is written the one way that is left.
+/// [`provider_alias_collision_error`] against the user's real config file.
+/// `Ok(())` when there is no config file, or it says one thing once: no provider
+/// named twice under two spellings.
 ///
-/// A HARD ERROR, not a migration. Both dead keys are the same bug in two costumes:
-/// a second, independent way to say where a request goes, which could always
-/// disagree with the provider actually in force — and guessing which half of a
-/// contradictory pair the user meant is exactly the behavior this design removes.
-/// A free-floating `base_url` *relocated* whichever provider was in effect, sending
-/// that provider's API key to an address that was not its own. The endpoint is a
-/// property of the provider: a built-in preset, or the `[providers.<name>]` table
-/// that defines it. The message names the file, echoes what the user wrote, and
-/// prints what replaces it.
-///
-/// (Sessions are the opposite case — they are data, not config, and migrate
-/// silently. Config is a statement of intent, and a stale one is worth stopping
-/// for.)
-pub fn legacy_config_error(text: &str, path: &std::path::Path) -> Option<String> {
-    let toml::Value::Table(root) = text.parse::<toml::Value>().ok()? else {
-        return None;
-    };
-    let as_str = |v: Option<&toml::Value>| v.and_then(|v| v.as_str()).map(str::to_string);
-
-    // The free-floating endpoint: `base_url = "http://localhost:1234/v1"` at the top
-    // level, belonging to no provider — so it moved whichever one was in force.
-    if let Some(base_url) = as_str(root.get("base_url")) {
-        let model = as_str(root.get("model"));
-        let model_line = match &model {
-            Some(m) if !m.contains("://") => format!("myserver://{m}"),
-            _ => "myserver://<model-id>".to_string(),
-        };
-        return Some(format!(
-            "hrdr: {} has a top-level `base_url` — the endpoint belongs to the provider.\n  \
-             replace:\n      base_url = \"{base_url}\"\n  with a provider that owns it:\n      \
-             [providers.myserver]\n      base_url = \"{base_url}\"\n  \
-             and name it in the model:\n      model = \"{model_line}\"",
-            path.display(),
-        ));
-    }
-
-    // The top-level selector: `provider = "openrouter"` beside `model = "…"`.
-    if let Some(provider) = as_str(root.get("provider")) {
-        let model = as_str(root.get("model"));
-        let old = match &model {
-            Some(m) => format!("      provider = \"{provider}\"\n      model = \"{m}\""),
-            None => format!("      provider = \"{provider}\""),
-        };
-        let new = model.unwrap_or_else(|| "<model-id>".to_string());
-        return Some(format!(
-            "hrdr: {} uses the old split provider/model keys.\n  \
-             replace:\n{old}\n  with:\n      model = \"{provider}://{new}\"",
-            path.display(),
-        ));
-    }
-
-    // The same split, inside a `[[subagent]]` profile.
-    let profiles = root.get("subagent").and_then(|v| v.as_array())?;
-    for p in profiles {
-        let Some(provider) = as_str(p.get("provider")) else {
-            continue;
-        };
-        let name = as_str(p.get("name")).unwrap_or_else(|| "<name>".to_string());
-        let model = as_str(p.get("model"));
-        let old = match &model {
-            Some(m) => format!("      provider = \"{provider}\"\n      model = \"{m}\""),
-            None => format!("      provider = \"{provider}\""),
-        };
-        let new = model.unwrap_or_else(|| "<model-id>".to_string());
-        return Some(format!(
-            "hrdr: {} uses the old split provider/model keys in [[subagent]] '{name}'.\n  \
-             replace:\n{old}\n  with:\n      model = \"{provider}://{new}\"",
-            path.display(),
-        ));
-    }
-    None
-}
-
-/// [`legacy_config_error`] and [`provider_alias_collision_error`] against the user's
-/// real config file. `Ok(())` when there is no config file, or it says one thing
-/// once: no dead two-key form, and no provider named twice under two spellings.
+/// There is deliberately no check for *dead* config shapes here. hrdr is pre-1.0
+/// and carries no back-compat: a key that no longer exists is refused by
+/// `FileConfig`'s `deny_unknown_fields` like any other unknown key, and needs no
+/// bespoke message explaining what it used to mean.
 pub fn check_config_compat() -> Result<()> {
     let Some(path) = config_file_path() else {
         return Ok(());
@@ -1383,8 +1400,7 @@ pub fn check_config_compat() -> Result<()> {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Ok(());
     };
-    match legacy_config_error(&text, &path).or_else(|| provider_alias_collision_error(&text, &path))
-    {
+    match provider_alias_collision_error(&text, &path) {
         Some(msg) => bail!(msg),
         None => Ok(()),
     }
@@ -1405,6 +1421,29 @@ pub fn config_file_path() -> Option<std::path::PathBuf> {
 
 /// Read the config TOML file and deserialize it into `T`. Returns `None` when
 /// the file is missing or unreadable.
+/// Every hard problem in the config file at `path` — a parse failure (which
+/// includes a key no layer of hrdr knows, since the schema denies unknown
+/// fields) and every out-of-range value. Empty when the file is absent, or
+/// wholly valid.
+///
+/// [`AgentConfig::load_diagnosed`] is the same check against the file at the
+/// default location; this one takes a path, for a caller validating a file it
+/// names rather than the user's own. Env layering, and the cross-field checks
+/// that need the merged result, are deliberately not run here — this answers
+/// "would hrdr refuse THIS file?", nothing more.
+pub fn config_file_errors(path: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    match toml::from_str::<FileConfig>(&text) {
+        Ok(fc) => fc.validate(),
+        Err(e) => vec![format!(
+            "{}: could not parse config file: {e}",
+            path.display()
+        )],
+    }
+}
+
 pub fn read_config_file<T: serde::de::DeserializeOwned>() -> Option<T> {
     let path = config_file_path()?;
     let text = std::fs::read_to_string(&path).ok()?;

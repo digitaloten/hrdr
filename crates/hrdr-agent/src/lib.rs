@@ -52,6 +52,10 @@ pub use validate::{
     confirm_identity_with, validate_identity, validate_placeholder_model,
 };
 mod models;
+mod provider_catalog;
+pub use provider_catalog::{
+    cached_models as cached_provider_models, refresh_all as refresh_models,
+};
 mod registry;
 pub use registry::{
     AgentEntry, AgentRegistry, EventLog, MAIN_KEY, PromptDelivery, RunGuard, age_completed_todos,
@@ -147,6 +151,7 @@ pub use config::{
     canonical_providers,
     check_config_compat,
     config_dir,
+    config_file_errors,
     config_file_path,
     effective_sandbox,
     env_model_spec,
@@ -154,16 +159,17 @@ pub use config::{
     is_codex_oauth,
     is_local_endpoint,
     is_openai_oauth_capable,
-    legacy_config_error,
     named_model_specs,
     parse_env_bool,
     parse_toggle_or_num,
     persist_setting,
     provider_alias_collision_error,
     provider_auth_state,
+    public_api_key,
     read_config_file,
     remove_setting,
     resolve_api_key,
+    resolve_api_key_or_public,
     resolve_cache_mode,
     // Functions
     resolve_provider_in,
@@ -1446,8 +1452,14 @@ impl Agent {
         // configured model. Session agent only (a delegated one shares the same
         // cache), backgrounded so it never delays first paint, and skipped without
         // a runtime — the same shape as the worktree sweep below.
+        //
+        // The same pass refreshes what each provider actually SERVES
+        // (`provider_catalog`) — for every provider this machine is set up for,
+        // not just the one in use, since `/model` offers them all. models.dev is
+        // warmed unconditionally: it needs no credential, so it is the one list
+        // that must land even for a user logged in to nothing.
         if !config.delegated && tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(hrdr_llm::catalog::warm());
+            tokio::spawn(provider_catalog::refresh_all(config.clone()));
         }
         if config.subagents
             && !config.delegated
@@ -2725,10 +2737,10 @@ mod tests {
         SubagentSlots, ToolOutputConfig, builtin_provider, child_transcript_id,
         compaction_tail_start, elide_tool_results, ensure_assistant_has_content, estimate_tokens,
         estimate_tokens_in_messages, flatten_tool_protocol, format_duration, in_git_repo,
-        is_context_overflow, is_transient, legacy_config_error, mega_turn_tail_start,
-        parse_env_bool, provider_alias_collision_error, repair_dangling_tool_calls, resolve,
-        resolve_child_dir, retry_after_hint, steering_queue, strip_user_timestamp,
-        subagent_base_config, tail_window, timestamped_user_message,
+        is_context_overflow, is_transient, mega_turn_tail_start, parse_env_bool,
+        provider_alias_collision_error, repair_dangling_tool_calls, resolve, resolve_child_dir,
+        retry_after_hint, steering_queue, strip_user_timestamp, subagent_base_config, tail_window,
+        timestamped_user_message,
     };
     use crate::cwd_slug;
     use crate::registry;
@@ -7939,40 +7951,6 @@ mod tests {
         assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
     }
 
-    /// A free-floating top-level `base_url =` in config.toml is the same override in
-    /// another costume — it relocated whichever provider was in force. It is a HARD
-    /// ERROR, like the `provider` key it stands beside in history, and the message
-    /// names the fix: define a provider that OWNS the endpoint.
-    #[test]
-    fn a_top_level_base_url_is_refused_with_a_migration_hint() {
-        let path = std::path::Path::new("/tmp/hrdr/config.toml");
-        let msg = legacy_config_error(
-            "base_url = \"http://localhost:1234/v1\"\nmodel = \"qwen3\"\n",
-            path,
-        )
-        .expect("a free-floating base_url is refused");
-        assert!(
-            msg.contains("the endpoint belongs to the provider"),
-            "{msg}"
-        );
-        assert!(msg.contains("[providers.myserver]"), "{msg}");
-        assert!(
-            msg.contains("base_url = \"http://localhost:1234/v1\""),
-            "{msg}"
-        );
-        assert!(msg.contains("model = \"myserver://qwen3\""), "{msg}");
-
-        // A `[providers.*]` base_url is a provider DEFINITION, not an override — the
-        // one place an endpoint may come from, and it is accepted.
-        assert!(
-            legacy_config_error(
-                "model = \"myserver://qwen3\"\n\n[providers.myserver]\nbase_url = \"http://localhost:1234/v1\"\n",
-                path,
-            )
-            .is_none(),
-        );
-    }
-
     /// …and the parser has no field for it either: `FileConfig` cannot carry an
     /// endpoint, so no code path can pick one up even if the refusal were bypassed.
     /// A `[providers.*]` one still resolves, and `myserver://qwen` talks to it.
@@ -8194,6 +8172,10 @@ mod tests {
                     initialization_options: None,
                 }],
             }),
+            // The frontend's keys, which this struct declares only so the
+            // agent's `deny_unknown_fields` does not reject a display setting.
+            // Nothing here reads them.
+            ..Default::default()
         });
         assert_eq!(cfg.prompt_cache.as_deref(), Some("on"));
         assert!(!cfg.lsp);
@@ -12928,60 +12910,44 @@ mod one_key_identity_tests {
     use super::*;
     use crate::model_ref::spec;
 
-    /// A config still carrying the split keys does not start — and the refusal names
-    /// the file, echoes the values the user actually wrote, and prints the ONE line
-    /// that replaces them. Nothing is guessed: a pair that can disagree is not
-    /// silently resolved in the user's favour, because there is no way to know which
-    /// half they meant.
+    /// A config still carrying the dead split keys does not start.
+    ///
+    /// No migration hint, and no bespoke message: hrdr is pre-1.0 and carries no
+    /// back-compat, so `provider = …` and a free-floating `base_url = …` are
+    /// refused as the unknown keys they are, by the same
+    /// `deny_unknown_fields` that catches a typo. What matters — and what this
+    /// pins — is that a pair which could DISAGREE about where a request goes is
+    /// never silently resolved in the user's favour.
     #[test]
-    fn a_legacy_two_key_config_is_refused_and_names_the_exact_replacement() {
-        let path = std::path::Path::new("/home/me/.config/hrdr/config.toml");
-        let err = legacy_config_error(
+    fn the_dead_two_key_config_forms_are_refused_not_migrated() {
+        for dead in [
+            // The old top-level selector, beside a model.
             "provider = \"openrouter\"\nmodel = \"deepseek/deepseek-chat\"\n",
-            path,
-        )
-        .expect("the old split keys are refused");
-        assert_eq!(
-            err,
-            "hrdr: /home/me/.config/hrdr/config.toml uses the old split provider/model keys.\n  \
-             replace:\n      provider = \"openrouter\"\n      model = \"deepseek/deepseek-chat\"\n  \
-             with:\n      model = \"openrouter://deepseek/deepseek-chat\"",
-        );
+            // …and alone.
+            "provider = \"zen\"\n",
+            // The free-floating endpoint, which relocated whichever provider was
+            // in force and took its API key along.
+            "base_url = \"http://localhost:1234/v1\"\nmodel = \"qwen3\"\n",
+        ] {
+            let Err(err) = toml::from_str::<FileConfig>(dead) else {
+                panic!("a dead key is refused, not ignored: {dead}");
+            };
+            assert!(err.to_string().contains("unknown field"), "{dead}: {err}");
+        }
 
-        // The legacy `provider` key ALONE is just as dead — and just as clearly
-        // reported, with the model half left as a blank to fill in.
-        let err = legacy_config_error("provider = \"zen\"\n", path)
-            .expect("a lone provider key is refused too");
-        assert!(err.contains("old split provider/model keys"), "{err}");
-        assert!(err.contains("provider = \"zen\""), "{err}");
-        assert!(err.contains("model = \"zen://<model-id>\""), "{err}");
-
-        // The same split inside a `[[subagent]]` profile — also config, also refused.
-        let err = legacy_config_error(
-            "model = \"zen://kimi-k2\"\n\n[[subagent]]\nname = \"implementer\"\n\
-             provider = \"openrouter\"\nmodel = \"deepseek/deepseek-chat\"\n",
-            path,
-        )
-        .expect("a legacy subagent profile is refused");
-        assert!(err.contains("[[subagent]] 'implementer'"), "{err}");
+        // …and a config in the one-key form parses, `[providers.*]` tables (whose
+        // `model` is a BARE id — the provider is the table name, and `base_url`
+        // there is a provider DEFINITION, not an override) included.
         assert!(
-            err.contains("model = \"openrouter://deepseek/deepseek-chat\""),
-            "{err}"
-        );
-
-        // …and a config already in the one-key form starts, `[providers.*]` tables
-        // (whose `model` is a BARE id — the provider is the table name) included.
-        assert_eq!(
-            legacy_config_error(
+            toml::from_str::<FileConfig>(
                 "model = \"openrouter://deepseek/deepseek-chat\"\n\n\
                  [providers.mylocal]\nbase_url = \"http://localhost:9099/v1\"\n\
                  model = \"qwen3\"\nremote = false\n\n\
                  [[subagent]]\nname = \"implementer\"\nmodel = \"zen://kimi-k2\"\n",
-                path
-            ),
-            None,
+            )
+            .is_ok()
         );
-        assert_eq!(legacy_config_error("", path), None);
+        assert!(toml::from_str::<FileConfig>("").is_ok());
     }
 
     /// The `[providers.<name>]` table is untouched by all of this: its `model` is a

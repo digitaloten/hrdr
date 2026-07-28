@@ -21,7 +21,7 @@ use crate::model_ref::{ModelRef, catalog_provider_key};
 use crate::{
     AgentConfig, BUILTIN_PROVIDERS, CHATGPT_CODEX_BASE_URL, ProviderConfig, ResolvedProviderKind,
     chatgpt_models, has_oauth_credentials, is_codex_oauth, is_openai_oauth_capable,
-    resolve_api_key, resolve_provider_in,
+    resolve_api_key_or_public, resolve_provider_in,
 };
 
 /// The key-inheritance context a *child* agent resolves against: the caller's
@@ -205,7 +205,11 @@ pub fn resolve_in(
             BUILTIN_PROVIDERS.join(", ")
         )
     })?;
-    let api_key = resolve_api_key(
+    // `_or_public`, not `resolve_api_key`: this value goes on the wire, and a
+    // provider with an anonymous tier (Zen's `public`) is usable without a
+    // credential. The credential *question* — "is this user logged in?" — is
+    // `provider_auth_state`'s, and it deliberately asks the stricter function.
+    let api_key = resolve_api_key_or_public(
         name,
         &p,
         parent.and_then(|c| c.api_key),
@@ -317,7 +321,7 @@ mod tests {
     use super::*;
     use crate::config::{cfg, cfg_with, provider_config};
     use crate::model_ref::r;
-    use crate::{builtin_provider, context_window_for};
+    use crate::{builtin_provider, context_window_for, resolve_api_key};
 
     /// PARITY: every built-in resolves to exactly what `builtin_provider` says —
     /// endpoint, trust kind, API version, headers. `resolve()` adds no opinion of

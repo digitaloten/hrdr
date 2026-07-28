@@ -19,7 +19,7 @@ use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
 /// A one-shot HTTP server for `/api.json`, returning `(url, join handle)`.
-fn serve_catalog(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+fn serve_catalog(body: String) -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
     let url = format!("http://{}", listener.local_addr().unwrap());
     let handle = std::thread::spawn(move || {
@@ -39,12 +39,36 @@ fn serve_catalog(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
     (url, handle)
 }
 
+/// A catalog body of at least `min_bytes`, padded with filler providers.
+///
+/// The real models.dev catalog passed 3 MiB some time ago, and the read cap it
+/// was being fetched under was 1 MiB — so `fetch` errored, `load` fell through to
+/// "no catalog", and nothing was ever written. Serving a body of realistic size
+/// is what makes this test able to catch that; the original 110-byte fixture
+/// passed happily throughout.
+fn padded_catalog(min_bytes: usize) -> String {
+    let mut s = String::from(
+        r#"{"opencode":{"name":"opencode zen","models":{"grok-code":{"name":"Grok Code","limit":{"context":256000}}}}"#,
+    );
+    let mut n = 0;
+    while s.len() < min_bytes {
+        s.push_str(&format!(
+            r#","filler-{n}":{{"name":"Filler {n}","models":{{"m-{n}":{{"name":"Model {n}","limit":{{"context":128000}}}}}}}}"#
+        ));
+        n += 1;
+    }
+    s.push('}');
+    s
+}
+
 /// `warm()` writes the catalog to the cache, so a later synchronous
 /// `load_cached()` — the selector's only source — can see it.
 #[test]
 fn warming_the_catalog_populates_the_cache_the_selector_reads() {
-    const BODY: &str = r#"{"opencode":{"name":"opencode zen","models":{"grok-code":{"name":"Grok Code","limit":{"context":256000}}}}}"#;
-    let (url, server) = serve_catalog(BODY);
+    // Comfortably over the 1 MiB structured-JSON cap the catalog used to be read
+    // under, and in the same order of magnitude as the real thing.
+    let body = padded_catalog(4 * 1024 * 1024);
+    let (url, server) = serve_catalog(body);
 
     // SAFETY: single-threaded test binary, before any other thread exists. The
     // sandbox ctor disables fetching for every test binary; this one is about the

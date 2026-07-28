@@ -20,6 +20,22 @@ pub const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 /// unbounded.
 pub const MAX_STRUCTURED_JSON_BYTES: usize = 1024 * 1024;
 
+/// Maximum bytes for the models.dev catalog (**32 MiB**).
+///
+/// The catalog is a *whole-ecosystem* index — every provider, every model, with
+/// prices, limits and capabilities — and is a different order of magnitude from a
+/// single endpoint's `/v1/models`. It passed 3 MiB some time ago, and the 1 MiB
+/// [`MAX_STRUCTURED_JSON_BYTES`] cap had been silently rejecting it ever since:
+/// [`crate::catalog::fetch`] treats any read error as "no catalog", so the fetch
+/// failed, nothing was cached, and every consumer fell back to whatever it could
+/// derive without one — no context windows, no prices, and a `/model` picker with
+/// nothing but the configured model in it. Nothing said a word.
+///
+/// Sized for headroom rather than for today: this is a public index hrdr chooses
+/// to fetch from one known host, not an untrusted tool result, so the cap is here
+/// to bound a pathological response, not to police a plausible one.
+pub const MAX_CATALOG_JSON_BYTES: usize = 32 * 1024 * 1024;
+
 /// Truncation marker appended to diagnostic text when the body exceeds
 /// the caller's limit.
 pub const TRUNCATION_MARKER: &str = "\n… [truncated]";

@@ -297,8 +297,11 @@ pub fn status_sections(i: &StatusInputs) -> Vec<StatusSeg> {
             text: provider.to_string(),
             role: StatusRole::Provider,
         });
+        // `://`, not `/`: the status bar spells the identity exactly as every
+        // input surface takes it (`--model`, `$HRDR_MODEL`, `model =` in
+        // config.toml), so what you read is what you can paste back.
         model_runs.push(StatusRun {
-            text: "/".to_string(),
+            text: "://".to_string(),
             role: StatusRole::Provider,
         });
     }
@@ -384,6 +387,11 @@ mod tests {
 
     /// The model section carries the provider before the model (one section, so
     /// they never split), and drops to just the model when no provider is set.
+    ///
+    /// Spelled `provider://model` — the identity's canonical form, and the exact
+    /// string `--model` / `$HRDR_MODEL` / `model =` take — so what the chrome shows
+    /// is what a user can paste back. It used to render `zen/qwen3`, a form nothing
+    /// accepts.
     #[test]
     fn the_model_section_shows_provider_and_model() {
         let segs = status_sections(&inputs());
@@ -392,7 +400,12 @@ mod tests {
             .find(|s| s.runs.iter().any(|r| r.role == StatusRole::Model))
             .expect("a model section exists");
         let text: String = model_seg.runs.iter().map(|r| r.text.as_str()).collect();
-        assert_eq!(text, "zen/qwen3");
+        assert_eq!(text, "zen://qwen3");
+        assert_eq!(
+            text.parse::<hrdr_agent::ModelRef>().map(|r| r.to_string()),
+            Ok(text.clone()),
+            "the chrome renders a parseable identity, not a lookalike"
+        );
         assert!(
             model_seg
                 .runs

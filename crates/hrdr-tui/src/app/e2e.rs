@@ -3520,7 +3520,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
     assert!(
-        screen.contains("claude/opus") && screen.contains("200.0k"),
+        screen.contains("claude://opus") && screen.contains("200.0k"),
         "on main, the bar shows the main agent's model and window:\n{screen}"
     );
 
@@ -3529,8 +3529,8 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
     assert!(
-        screen.contains("local/qwen3"),
-        "the bar shows the sub-agent's provider/model:\n{screen}"
+        screen.contains("local://qwen3"),
+        "the bar shows the sub-agent's provider://model:\n{screen}"
     );
     assert!(
         screen.contains("64.0k") && !screen.contains("200.0k"),
@@ -3571,7 +3571,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
     assert!(
-        screen.contains("openai/gpt-5") && screen.contains("400.0k"),
+        screen.contains("openai://gpt-5") && screen.contains("400.0k"),
         "the bar shows the newly-chosen model and its window:\n{screen}"
     );
 
@@ -3580,7 +3580,7 @@ async fn the_status_bar_and_model_command_follow_the_agent_on_screen() {
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
     assert!(
-        screen.contains("claude/opus"),
+        screen.contains("claude://opus"),
         "back on main, the bar is main's again:\n{screen}"
     );
 }

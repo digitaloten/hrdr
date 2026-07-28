@@ -6,7 +6,89 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **OpenCode Zen's free models work with no login at all.** Zen serves its
+  zero-cost models to anonymous callers — its gateway reads the literal API key
+  `public` as "no account" and IP-rate-limits it — but hrdr gated the provider
+  on holding a credential, so a fresh install with no `/login` was offered
+  nothing from it. It is now a first-class auth state
+  (`ProviderAuthState::Anonymous`) sitting between "has a key" and
+  "unconfigured": the wire key is `public` (`resolve_api_key_or_public`), while
+  `resolve_api_key` still answers `None`, because "can hrdr call this?" and "is
+  this user logged in?" are different questions. The `/model` picker and
+  `hrdr models` narrow such a provider to the models the catalog prices at zero
+  — a priced row would only 401, and an _unpriced_ one is unknown rather than
+  free, so it is not offered either. A real key outranks the anonymous tier, and
+  a custom `[providers.zen]` shadow never receives a key it did not ask for.
+
+- **Every provider you are set up for gets its model list refreshed in the
+  background**, not just the one in use (`provider_catalog`). One pass at
+  session start warms the models.dev catalog — unconditionally, since it needs
+  no credential and is the one list that must land for a user logged in to
+  nothing — then fans out `GET /v1/models` across every authenticated provider
+  concurrently, caching each under `<XDG cache>/hrdr/providers/<name>.json` with
+  its own mtime-based freshness (24h), so one slow or broken provider neither
+  blocks nor invalidates another. A ChatGPT subscription is included via its
+  account catalog, which `/v1/models` cannot serve. Reads never fetch: the
+  picker builds its list on a keypress.
+
+  This makes the provider itself the authority on what _exists_, with models.dev
+  the authority on naming and pricing. They disagree more than you would hope:
+  of the 24 free Zen models models.dev listed, 7 were still being served, and
+  several of the rest answer `Model … is not supported`. A model id a provider
+  ships today is now offered the same day, and the startup pre-flight
+  (`preflight_model`) judges against the union of both sources, so it stopped
+  warning that a model which demonstrably works "isn't in the provider's known
+  catalog".
+
+### Fixed
+
+- **The models.dev catalog had not been caching at all.** It is fetched through
+  a capped reader, under the 1 MiB `MAX_STRUCTURED_JSON_BYTES` limit meant for a
+  single endpoint's `/v1/models`. The catalog — every provider, every model,
+  with prices and limits — passed 3 MiB some time ago, so every fetch failed the
+  read, `load()` returned "no catalog", nothing was written, and every consumer
+  silently fell back: no context windows, no prices, and a `/model` picker
+  holding nothing but the configured model. It now has a cap of its own
+  (`MAX_CATALOG_JSON_BYTES`, 32 MiB), and the regression test serves a
+  realistically-sized body rather than the 110-byte fixture that passed
+  throughout.
+
+- **A config with display settings in it refused to start.** `config.toml` has
+  two readers — the agent's `FileConfig` and the frontend's `UiFileConfig` — and
+  each has always ignored the other's keys. Turning on `deny_unknown_fields` to
+  make a typo fail loudly could not tell "the other layer's key" from "a typo",
+  so `timestamps = "relative"` or `theme = "tokyonight"` became a fatal error
+  whose message listed the valid keys, none of which was the one the user had
+  written. The agent now declares the frontend's keys and ignores them, with a
+  test in `hrdr-app` pinning the two lists together; a key neither layer knows
+  is still refused.
+
+### Removed
+
+- **The bespoke "you wrote the old config form" errors**
+  (`legacy_config_error`). hrdr is pre-1.0 and carries no back-compat, so the
+  dead top-level `provider =` selector and free-floating `base_url =` are
+  refused as the unknown keys they are, by the same `deny_unknown_fields` that
+  catches a typo — no migration hint, no second code path. The pair that could
+  disagree about where a request goes is still never silently resolved.
+  `check_config_compat` remains, now covering only the provider-alias collision
+  check, which is a real ambiguity in a _current_ config.
+
 ### Changed
+
+- **The identity is spelled `provider://model` everywhere the user meets it.**
+  The status bar rendered `zen/qwen3`, a form nothing accepts; it now shows
+  `zen://qwen3`, exactly what `--model`, `$HRDR_MODEL` and `model =` take, so
+  what you read is what you can paste back. `hrdr models` prints one
+  `provider://model` per line and covers every provider the machine is set up
+  for, rather than bare ids from whichever one happened to be active. The
+  `/model` picker's fuzzy filter searches the canonical id too — typing
+  `zen://kimi` used to match nothing, since only the friendly labels were
+  searched and neither carries a `://` or the raw model id — and the model-usage
+  store is keyed by that same one string instead of a second `provider/model`
+  encoding of the pair.
 
 - **Every tool call runs under a deadline, and the model can raise it per
   call.** `grep` and `git` had no time bound at all — they capped how much

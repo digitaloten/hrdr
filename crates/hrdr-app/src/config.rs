@@ -352,6 +352,59 @@ mod tests {
         assert_eq!(d.todo_ttl, DEFAULT_TODO_TTL_TURNS);
     }
 
+    /// ONE `config.toml`, TWO readers — and the agent's reader now refuses
+    /// unknown keys, so it has to know the frontend's.
+    ///
+    /// The regression this exists for: `deny_unknown_fields` went onto the
+    /// agent's `FileConfig` to make a typo fail loudly, and made every *display*
+    /// setting fail loudly too. A config that had worked for months —
+    /// `timestamps = "relative"`, `theme = "tokyonight"` — refused to start, and
+    /// the error helpfully listed the valid keys, none of which was the one the
+    /// user had written. The two layers cannot see each other's structs (the
+    /// dependency runs one way), so this walks every key the UI parses through
+    /// the agent's loader and fails if any is rejected.
+    #[test]
+    fn the_agent_accepts_every_ui_key() {
+        // Every field of `UiFileConfig`, with a value of the right shape. Adding a
+        // UI key without declaring it on the agent's `FileConfig` fails here.
+        const UI_KEYS: &str = r#"
+            vim = true
+            theme = "tokyonight"
+            icons = "nerd"
+            timestamps = "relative"
+            statusbar = "truncate"
+            bell = true
+            auto_resume = true
+            todo_ttl = 10
+            show_thinking = true
+            scrollback = 500
+        "#;
+        // The UI reads them all…
+        let ui: UiFileConfig = toml::from_str(UI_KEYS).expect("the UI parses its own keys");
+        let mut cfg = UiConfig::default();
+        cfg.apply_file(ui);
+        assert_eq!(cfg.timestamps.as_deref(), Some("relative"));
+
+        // …and the AGENT accepts the same file rather than refusing to start.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, format!("{UI_KEYS}\nmodel = \"zen://kimi-k2\"\n"))
+            .expect("the config is written");
+        let errors = hrdr_agent::config_file_errors(&path);
+        assert!(
+            errors.is_empty(),
+            "the agent refused the frontend's own keys: {errors:?}"
+        );
+
+        // …while a key NEITHER layer knows is still refused — the whole point of
+        // `deny_unknown_fields` survives.
+        std::fs::write(&path, "tiemstamps = \"relative\"\n").expect("written");
+        assert!(
+            !hrdr_agent::config_file_errors(&path).is_empty(),
+            "a typo must still fail loudly"
+        );
+    }
+
     #[test]
     fn timestamp_style_from_config() {
         assert_eq!(

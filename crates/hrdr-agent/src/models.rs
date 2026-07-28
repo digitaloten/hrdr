@@ -47,6 +47,11 @@ struct ConfiguredProvider {
     /// The provider's own configured default model — a fallback list entry when
     /// the catalog carries nothing for it.
     configured_model: Option<String>,
+    /// This provider is reachable only ANONYMOUSLY
+    /// ([`ProviderAuthState::Anonymous`](crate::ProviderAuthState::Anonymous)), so
+    /// only its free models are actually runnable — every priced one answers 401.
+    /// The picker offers exactly the runnable subset.
+    free_only: bool,
 }
 
 /// The providers the user can switch a model to: every custom `[providers.*]`,
@@ -60,7 +65,7 @@ fn configured_providers(config: &AgentConfig, active: Option<&str>) -> Vec<Confi
     // spelled with an alias would be validated against one endpoint (the auth gate
     // resolves it) and talked to on another (`ModelRef::new` folds it): the picker
     // is the one place both halves are composed, so it must not hold the split.
-    let mut push = |name: String, model: Option<String>| {
+    let mut push = |name: String, model: Option<String>, free_only: bool| {
         let name = ProviderName::new(&name).as_str().to_string();
         if seen.insert(name.clone()) {
             let catalog_key = builtin_catalog_key(&name)
@@ -69,13 +74,14 @@ fn configured_providers(config: &AgentConfig, active: Option<&str>) -> Vec<Confi
                 name,
                 catalog_key,
                 configured_model: model,
+                free_only,
             });
         }
     };
 
     // Custom providers are always in — the user defined them explicitly.
     for (name, c) in &config.providers {
-        push(name.clone(), c.model.clone());
+        push(name.clone(), c.model.clone(), false);
     }
     // Every built-in the machine is actually set up for. "Set up" is
     // [`provider_auth_state`], not "has an API key": a subscription login stores
@@ -83,19 +89,28 @@ fn configured_providers(config: &AgentConfig, active: Option<&str>) -> Vec<Confi
     // the picker for exactly the users who had signed in to it — unless it
     // happened to be the active provider, which is pushed unconditionally below.
     // That is what made the selector look like it only knew the current provider.
-    // `Keyless` keeps `local` (a self-hosted endpoint needs no credential).
+    // `Keyless` keeps `local` (a self-hosted endpoint needs no credential), and
+    // `Anonymous` keeps OpenCode Zen for a user who has logged in to nothing —
+    // narrowed to the free models it will actually serve them.
     for name in BUILTIN_PROVIDERS {
-        if let Some(p) = builtin_provider(name)
-            && crate::provider_auth_state(name, &p, None, None) != crate::ProviderAuthState::Missing
-        {
-            push((*name).to_string(), p.model);
+        if let Some(p) = builtin_provider(name) {
+            match crate::provider_auth_state(name, &p, None, None) {
+                crate::ProviderAuthState::Missing => {}
+                state => push(
+                    (*name).to_string(),
+                    p.model,
+                    state == crate::ProviderAuthState::Anonymous,
+                ),
+            }
         }
     }
     // The active provider, even without a key (it's in use right now).
     if let Some(a) = active
         && let Some(p) = config.resolve_provider(a)
     {
-        push(a.to_string(), p.model);
+        let free_only =
+            crate::provider_auth_state(a, &p, None, None) == crate::ProviderAuthState::Anonymous;
+        push(a.to_string(), p.model, free_only);
     }
     out
 }
@@ -116,49 +131,82 @@ fn pretty_provider(name: &str) -> String {
         .join(" ")
 }
 
-/// Build the list of every model across the configured providers, using
-/// `catalog` for model lists and friendly names. Ordered by **usage** (the
-/// most-often-selected first, from `usage`), then by model name
-/// (case-insensitive) to break ties. A provider with no catalog entry
-/// contributes its single configured model (or "default" when it names none).
-/// Pure — the runtime entry point [`model_choices`] supplies the cached
-/// catalog and usage counts.
+/// Build the list of every model across the configured providers. Ordered by
+/// **usage** (the most-often-selected first, from `usage`), then by model name
+/// (case-insensitive) to break ties.
+///
+/// **Two sources, and which one wins what.** `live` is what each provider's own
+/// `/v1/models` last reported ([`crate::provider_catalog`]); `catalog` is
+/// models.dev. Existence comes from `live` when it is known, because it is the
+/// only source that is *current* — models.dev listed 17 OpenCode Zen models that
+/// the endpoint answers "not supported" for, and every one of them was an
+/// offerable row here. Friendly names, and the free/priced split, come from the
+/// catalog either way; a live id the catalog has never heard of is still offered,
+/// labelled with its own id.
+///
+/// A provider neither source covers contributes its single configured model (or
+/// `default`, the server's own pick, when it names none) — a keyless `local`
+/// endpoint lands there.
+///
+/// Pure: the runtime entry point [`model_choices`] supplies both caches.
 fn choices_from(
     providers: &[ConfiguredProvider],
     catalog: Option<&Value>,
+    live: &HashMap<String, Vec<String>>,
     usage: &HashMap<String, u64>,
 ) -> Vec<ModelChoice> {
     let mut out: Vec<ModelChoice> = Vec::new();
     for p in providers {
         let from_catalog =
             catalog.and_then(|c| hrdr_llm::catalog::provider_models(c, &p.catalog_key));
-        match from_catalog {
-            Some((provider_label, models)) => {
-                for (id, name) in models {
+        // A provider is only runnable-anonymously for its FREE models, and only
+        // the catalog prices them — so an unpriced (or uncatalogued) id is not
+        // offered to an anonymous caller at all. It would 401.
+        let runnable = |id: &str| {
+            !p.free_only
+                || catalog.is_some_and(|c| hrdr_llm::catalog::is_free_model(c, &p.catalog_key, id))
+        };
+        let labels: HashMap<&str, &str> = from_catalog
+            .iter()
+            .flat_map(|(_, models)| models.iter().map(|(id, name)| (id.as_str(), name.as_str())))
+            .collect();
+        let ids: Option<Vec<String>> = live.get(&p.name).cloned().or_else(|| {
+            from_catalog
+                .as_ref()
+                .map(|(_, models)| models.iter().map(|(id, _)| id.clone()).collect())
+        });
+        match ids {
+            Some(ids) => {
+                let provider_label = from_catalog
+                    .as_ref()
+                    .map_or_else(|| pretty_provider(&p.name), |(label, _)| label.clone());
+                for id in ids.into_iter().filter(|id| runnable(id)) {
+                    let model_label = labels
+                        .get(id.as_str())
+                        .map_or_else(|| id.clone(), |n| (*n).to_string());
                     out.push(ModelChoice {
                         provider: p.name.clone(),
                         model: id,
                         provider_label: provider_label.clone(),
-                        model_label: name,
+                        model_label,
                         context_window: None,
                     });
                 }
             }
             None => {
-                // No catalog entry: offer the configured model, or "default"
-                // (the server's own pick) when none is named — keyless `local`
-                // endpoints land here.
                 let m = p
                     .configured_model
                     .clone()
                     .unwrap_or_else(|| "default".to_string());
-                out.push(ModelChoice {
-                    provider: p.name.clone(),
-                    model: m.clone(),
-                    provider_label: pretty_provider(&p.name),
-                    model_label: m,
-                    context_window: None,
-                });
+                if runnable(&m) {
+                    out.push(ModelChoice {
+                        provider: p.name.clone(),
+                        model: m.clone(),
+                        provider_label: pretty_provider(&p.name),
+                        model_label: m,
+                        context_window: None,
+                    });
+                }
             }
         }
     }
@@ -235,9 +283,11 @@ fn usage_path() -> Option<PathBuf> {
     Some(hjkl_xdg::data_dir("hrdr").ok()?.join("model_usage.json"))
 }
 
-/// The store key for a `(provider, model)` pick.
+/// The store key for a `(provider, model)` pick: the identity's own canonical
+/// `provider://model` form, so the file reads as the identities it counts and
+/// there is no second stringly encoding of the pair to keep in step.
 fn usage_key(provider: &str, model: &str) -> String {
-    format!("{provider}/{model}")
+    format!("{provider}://{model}")
 }
 
 /// Load the per-model selection counts; empty when nothing has been picked yet
@@ -462,14 +512,31 @@ pub fn model_for_resolved_provider_in(
 pub fn model_choices(config: &AgentConfig, active: Option<&str>) -> Vec<ModelChoice> {
     let providers = configured_providers(config, active);
     let catalog = hrdr_llm::catalog::load_cached();
+    let live = live_models(&providers);
     let usage = load_model_usage();
-    choices_from(&providers, catalog.as_ref(), &usage)
+    choices_from(&providers, catalog.as_ref(), &live, &usage)
+}
+
+/// What each provider was last seen serving, read from
+/// [`crate::provider_catalog`]'s cache — synchronous, no network. A provider
+/// with no entry is simply absent from the map, which `choices_from` reads as
+/// "unknown, use the catalog", never as "serves nothing".
+fn live_models(providers: &[ConfiguredProvider]) -> HashMap<String, Vec<String>> {
+    providers
+        .iter()
+        .filter_map(|p| {
+            crate::provider_catalog::cached_models(&p.name).map(|ids| (p.name.clone(), ids))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelSource {
     AccountCatalog,
+    /// The provider's own `/v1/models`, as of the last background refresh — the
+    /// authority on what exists right now.
+    ProviderListing,
     ModelsDev,
     Configured,
 }
@@ -482,25 +549,59 @@ pub struct AvailableModel {
     pub source: ModelSource,
 }
 
-/// Discoverable configured/catalog models with provenance for agent introspection.
+/// Discoverable configured/catalog models with provenance for agent introspection
+/// and `hrdr models`.
+///
+/// Same two sources, same precedence and same anonymous narrowing as the `/model`
+/// picker ([`choices_from`]) — this and the picker must not be able to disagree
+/// about what is runnable, or `hrdr models` prints identities that `/model`
+/// refuses to offer and the agent's `models` tool proposes ones that 401.
 pub fn available_models(config: &AgentConfig, active: Option<&str>) -> Vec<AvailableModel> {
     let providers = configured_providers(config, active);
     let catalog = hrdr_llm::catalog::load_cached();
+    let live = live_models(&providers);
     let mut rows = Vec::new();
     for provider in providers {
-        if let Some((_, models)) = catalog
+        let from_catalog = catalog
             .as_ref()
-            .and_then(|c| hrdr_llm::catalog::provider_models(c, &provider.catalog_key))
-        {
-            rows.extend(models.into_iter().filter(|(id, _)| id != "default").map(
-                |(model, label)| AvailableModel {
+            .and_then(|c| hrdr_llm::catalog::provider_models(c, &provider.catalog_key));
+        let runnable = |id: &str| {
+            id != "default"
+                && (!provider.free_only
+                    || catalog.as_ref().is_some_and(|c| {
+                        hrdr_llm::catalog::is_free_model(c, &provider.catalog_key, id)
+                    }))
+        };
+        // The endpoint's own listing wins over models.dev for the same reason the
+        // picker prefers it: it is the only source that is current.
+        if let Some(ids) = live.get(&provider.name) {
+            let labels: HashMap<&str, &str> = from_catalog
+                .iter()
+                .flat_map(|(_, m)| m.iter().map(|(id, n)| (id.as_str(), n.as_str())))
+                .collect();
+            rows.extend(ids.iter().filter(|id| runnable(id)).map(|id| {
+                AvailableModel {
                     provider: provider.name.clone(),
-                    model,
-                    label,
-                    source: ModelSource::ModelsDev,
-                },
-            ));
-        } else if let Some(model) = provider.configured_model.filter(|m| m != "default") {
+                    model: id.clone(),
+                    label: labels
+                        .get(id.as_str())
+                        .map_or_else(|| id.clone(), |n| (*n).to_string()),
+                    source: ModelSource::ProviderListing,
+                }
+            }));
+        } else if let Some((_, models)) = from_catalog {
+            rows.extend(
+                models
+                    .into_iter()
+                    .filter(|(id, _)| runnable(id))
+                    .map(|(model, label)| AvailableModel {
+                        provider: provider.name.clone(),
+                        model,
+                        label,
+                        source: ModelSource::ModelsDev,
+                    }),
+            );
+        } else if let Some(model) = provider.configured_model.filter(|m| runnable(m)) {
             rows.push(AvailableModel {
                 provider: provider.name,
                 label: model.clone(),
@@ -535,22 +636,36 @@ pub fn available_models(config: &AgentConfig, active: Option<&str>) -> Vec<Avail
     rows
 }
 
-/// The model ids hrdr knows **locally** that `provider` serves — the models.dev
-/// index for its catalog key, minus the [`PLACEHOLDER_MODEL`](crate::PLACEHOLDER_MODEL).
+/// The model ids hrdr knows **locally** that `provider` serves: the union of the
+/// provider's own last-seen `/v1/models` listing ([`crate::provider_catalog`])
+/// and the models.dev index for its catalog key, minus the
+/// [`PLACEHOLDER_MODEL`](crate::PLACEHOLDER_MODEL).
+///
+/// A **union**, because this feeds a warning ([`preflight_model`]) and each source
+/// is incomplete in the other's direction: models.dev carries ids a provider has
+/// since retired, and a provider serves ids models.dev has never indexed (or
+/// indexed this morning). Warning about a model that one of them knows about would
+/// be crying wolf at exactly the id the user got right.
 ///
 /// `None` means *unknowable from here*, which is a different thing from "serves
-/// nothing": no catalog has been cached, the provider has no models.dev key at all
-/// (`local`, a custom `[providers.*]`), this index does not carry it, or it carries
-/// it with an empty model set. A caller must read `None` as ignorance and say
-/// nothing — never as absence.
+/// nothing": nothing cached from either source, the provider has no models.dev key
+/// at all (`local`, a custom `[providers.*]`), or both come back empty. A caller
+/// must read `None` as ignorance and say nothing — never as absence.
 pub fn known_model_ids(catalog: Option<&Value>, provider: &ProviderName) -> Option<Vec<String>> {
-    let key = provider.catalog_key()?;
-    let (_, models) = hrdr_llm::catalog::provider_models(catalog?, key)?;
-    let ids: Vec<String> = models
-        .into_iter()
-        .map(|(id, _)| id)
-        .filter(|id| id != crate::PLACEHOLDER_MODEL)
-        .collect();
+    let from_catalog = provider
+        .catalog_key()
+        .zip(catalog)
+        .and_then(|(key, c)| hrdr_llm::catalog::provider_models(c, key))
+        .map(|(_, models)| models.into_iter().map(|(id, _)| id).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut ids: Vec<String> =
+        crate::provider_catalog::cached_models(provider.as_str()).unwrap_or_default();
+    for id in from_catalog {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids.retain(|id| id != crate::PLACEHOLDER_MODEL);
     (!ids.is_empty()).then_some(ids)
 }
 
@@ -638,9 +753,14 @@ fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 /// Case-insensitive fuzzy filter over the choices: the query's characters must
-/// appear in order somewhere within `"model_label provider_label"`. Returns the
-/// matching indices in their original (sorted) order; an empty query matches
-/// everything.
+/// appear in order somewhere within `"model_label provider_label provider://model"`.
+/// Returns the matching indices in their original (sorted) order; an empty query
+/// matches everything.
+///
+/// The canonical `provider://model` id is part of the haystack because it is the
+/// form the user is told the identity in everywhere else — the status bar, `hrdr
+/// models`, `--model`. Filtering on the friendly labels alone meant typing the
+/// thing you were looking at (`zen://kimi`) matched nothing.
 pub fn filter_model_choices(choices: &[ModelChoice], query: &str) -> Vec<usize> {
     let q: Vec<char> = query.trim().to_lowercase().chars().collect();
     if q.is_empty() {
@@ -650,7 +770,11 @@ pub fn filter_model_choices(choices: &[ModelChoice], query: &str) -> Vec<usize> 
         .iter()
         .enumerate()
         .filter_map(|(i, c)| {
-            let hay = format!("{} {}", c.model_label, c.provider_label).to_lowercase();
+            let hay = format!(
+                "{} {} {}://{}",
+                c.model_label, c.provider_label, c.provider, c.model
+            )
+            .to_lowercase();
             is_subsequence(&q, &hay).then_some(i)
         })
         .collect()
@@ -707,11 +831,13 @@ mod tests {
                 name: "zen".into(),
                 catalog_key: "opencode".into(),
                 configured_model: None,
+                free_only: false,
             },
             ConfiguredProvider {
                 name: "go".into(),
                 catalog_key: "opencode-go".into(),
                 configured_model: None,
+                free_only: false,
             },
         ]
     }
@@ -720,7 +846,12 @@ mod tests {
     fn choices_are_friendly_and_sorted_across_providers() {
         // With no usage recorded yet, the order is the model-name tie-break:
         // alphabetical by friendly model name across both providers.
-        let out = choices_from(&providers(), Some(&catalog()), &HashMap::new());
+        let out = choices_from(
+            &providers(),
+            Some(&catalog()),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let rows: Vec<(&str, &str, &str)> = out
             .iter()
             .map(|c| {
@@ -744,6 +875,88 @@ mod tests {
         assert_eq!(out[1].provider, "go");
     }
 
+    /// EXISTENCE comes from the provider, METADATA from the catalog.
+    ///
+    /// The bug this pins: models.dev is an index of the ecosystem and reliably
+    /// behind. It listed 17 OpenCode Zen models the endpoint answers "Model … is
+    /// not supported" for, and offered every one of them — while the ids Zen had
+    /// actually just shipped were nowhere. A provider's own `/v1/models` settles
+    /// what exists; the catalog keeps naming and pricing it.
+    #[test]
+    fn the_providers_own_listing_decides_what_exists_the_catalog_only_names_it() {
+        let live = HashMap::from([(
+            "zen".to_string(),
+            // One id the catalog knows, one it has never heard of. The catalog's
+            // `claude-fable-5` is absent: retired, so it must not be offered.
+            vec!["gpt-5-6".to_string(), "brand-new-model".to_string()],
+        )]);
+        let out = choices_from(&providers(), Some(&catalog()), &live, &HashMap::new());
+        let zen: Vec<(&str, &str)> = out
+            .iter()
+            .filter(|c| c.provider == "zen")
+            .map(|c| (c.model.as_str(), c.model_label.as_str()))
+            .collect();
+        assert_eq!(
+            zen,
+            vec![
+                ("brand-new-model", "brand-new-model"),
+                ("gpt-5-6", "GPT-5.6"),
+            ],
+            "a live id the catalog knows keeps its friendly name; one it doesn't \
+             is still offered, labelled with its id; a retired catalog id is gone"
+        );
+        // A provider with no live listing is untouched — "unknown" is not "empty".
+        assert!(out.iter().any(|c| c.provider == "go"));
+    }
+
+    /// An anonymous provider is narrowed to its free models whichever source
+    /// named them — a live id that the catalog prices above zero still 401s.
+    #[test]
+    fn an_anonymous_providers_live_listing_is_still_narrowed_to_the_free_models() {
+        let catalog = json!({
+            "opencode": { "name": "OpenCode Zen", "models": {
+                "free-one": { "name": "Free One", "cost": { "input": 0, "output": 0 } },
+                "priced": { "name": "Priced", "cost": { "input": 1, "output": 2 } },
+            }},
+        });
+        let ps = vec![ConfiguredProvider {
+            name: "zen".into(),
+            catalog_key: "opencode".into(),
+            configured_model: None,
+            free_only: true,
+        }];
+        let live = HashMap::from([(
+            "zen".to_string(),
+            vec![
+                "free-one".to_string(),
+                "priced".to_string(),
+                "uncatalogued".to_string(),
+            ],
+        )]);
+        let out = choices_from(&ps, Some(&catalog), &live, &HashMap::new());
+        let ids: Vec<&str> = out.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["free-one"],
+            "priced is unrunnable anonymously, and an uncatalogued id has no \
+             known price — unknown is not free"
+        );
+        // The same provider WITH a credential offers all three.
+        let keyed = vec![ConfiguredProvider {
+            free_only: false,
+            ..ConfiguredProvider {
+                name: "zen".into(),
+                catalog_key: "opencode".into(),
+                configured_model: None,
+                free_only: true,
+            }
+        }];
+        assert_eq!(
+            choices_from(&keyed, Some(&catalog), &live, &HashMap::new()).len(),
+            3
+        );
+    }
+
     #[test]
     fn usage_orders_the_list_most_used_first_then_by_name() {
         // GPT is used twice, DeepSeek once, Claude never.
@@ -751,7 +964,7 @@ mod tests {
             (usage_key("zen", "gpt-5-6"), 2),
             (usage_key("go", "deepseek-v4-pro"), 1),
         ]);
-        let out = choices_from(&providers(), Some(&catalog()), &usage);
+        let out = choices_from(&providers(), Some(&catalog()), &HashMap::new(), &usage);
         let order: Vec<&str> = out.iter().map(|c| c.model.as_str()).collect();
         assert_eq!(order, vec!["gpt-5-6", "deepseek-v4-pro", "claude-fable-5"]);
 
@@ -761,7 +974,7 @@ mod tests {
             (usage_key("go", "deepseek-v4-pro"), 1),
             (usage_key("zen", "claude-fable-5"), 1),
         ]);
-        let out = choices_from(&providers(), Some(&catalog()), &tied);
+        let out = choices_from(&providers(), Some(&catalog()), &HashMap::new(), &tied);
         let order: Vec<&str> = out.iter().map(|c| c.model.as_str()).collect();
         assert_eq!(order, vec!["claude-fable-5", "deepseek-v4-pro", "gpt-5-6"]);
     }
@@ -898,8 +1111,9 @@ mod tests {
             name: "mylocal".into(),
             catalog_key: "mylocal".into(),
             configured_model: Some("Qwen3-30B".into()),
+            free_only: false,
         }];
-        let out = choices_from(&ps, Some(&catalog()), &HashMap::new());
+        let out = choices_from(&ps, Some(&catalog()), &HashMap::new(), &HashMap::new());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].provider, "mylocal");
         assert_eq!(out[0].model, "Qwen3-30B");
@@ -962,8 +1176,9 @@ mod tests {
             name: "local".into(),
             catalog_key: "local".into(),
             configured_model: None,
+            free_only: false,
         }];
-        let out = choices_from(&ps, Some(&catalog()), &HashMap::new());
+        let out = choices_from(&ps, Some(&catalog()), &HashMap::new(), &HashMap::new());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].provider, "local");
         assert_eq!(out[0].model, "default");
@@ -973,7 +1188,12 @@ mod tests {
 
     #[test]
     fn filter_matches_model_and_provider_case_insensitively() {
-        let out = choices_from(&providers(), Some(&catalog()), &HashMap::new());
+        let out = choices_from(
+            &providers(),
+            Some(&catalog()),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         // Matches on the model name.
         let deepseek = filter_model_choices(&out, "deepseek");
         assert_eq!(deepseek.len(), 1);
@@ -989,6 +1209,20 @@ mod tests {
         assert_eq!(filter_model_choices(&out, "  ").len(), out.len());
         // No match.
         assert!(filter_model_choices(&out, "zzzzz").is_empty());
+
+        // The CANONICAL identity is filterable too — the form the status bar,
+        // `hrdr models` and `--model` all speak. Typing what you are looking at
+        // used to match nothing, because only the friendly labels were searched
+        // and neither carries a `://` or the raw model id.
+        let by_id = filter_model_choices(&out, "zen://gpt-5-6");
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(out[by_id[0]].model, "gpt-5-6");
+        // The filter is a fuzzy SUBSEQUENCE, so a bare `go://` legitimately also
+        // matches rows whose text merely contains those characters in order —
+        // the point here is only that the identity is searchable at all.
+        assert!(filter_model_choices(&out, "go://deepseek").len() == 1);
+        // And the raw id, which no friendly label contains.
+        assert_eq!(filter_model_choices(&out, "claude-fable-5").len(), 1);
     }
 
     /// The store keeps a model PER PROVIDER, because that is the only honest answer

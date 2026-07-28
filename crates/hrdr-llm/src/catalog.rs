@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::capped_read::MAX_STRUCTURED_JSON_BYTES;
+use crate::capped_read::MAX_CATALOG_JSON_BYTES;
 
 /// Where the catalog is fetched from, unless `HRDR_MODELS_URL` says otherwise.
 const DEFAULT_URL: &str = "https://models.dev";
@@ -74,6 +74,33 @@ pub fn provider_models(catalog: &Value, key: &str) -> Option<(String, Vec<(Strin
         .collect();
     models.sort_by_key(|(_, name)| name.to_lowercase());
     Some((provider_name, models))
+}
+
+/// Whether `provider_key` serves `model` **free of charge** — the catalog prices
+/// it, and prices it at zero on both sides.
+///
+/// This is what decides which models an unauthenticated provider may still be
+/// offered: OpenCode Zen serves its zero-cost models to anonymous callers (see
+/// `hrdr_agent::public_api_key`) and 401s on every priced one, so listing a
+/// priced model to a logged-out user is offering something that cannot work.
+///
+/// An **unpriced** model answers `false`, deliberately. The catalog omitting a
+/// `cost` object means *we do not know what this costs*, and "unknown" must not
+/// be read as "free" — that is the direction that puts an unusable row in the
+/// picker. (opencode's own check is `!model.cost.some(c => c.input > 0)`, which
+/// does read a missing price as free; hrdr is stricter on purpose.)
+pub fn is_free_model(catalog: &Value, provider_key: &str, model: &str) -> bool {
+    let Some(cost) = catalog
+        .get(provider_key)
+        .and_then(|p| p.get("models"))
+        .and_then(|m| m.get(model))
+        .and_then(|m| m.get("cost"))
+    else {
+        return false;
+    };
+    // Priced at zero, not merely *unpriced*: `Some(0.0)` on both sides.
+    let is_zero = |k: &str| cost.get(k).and_then(Value::as_f64) == Some(0.0);
+    is_zero("input") && is_zero("output")
 }
 
 /// The context window for `model`, from the models.dev catalog.
@@ -311,7 +338,10 @@ async fn fetch() -> Option<Value> {
     if !resp.status().is_success() {
         return None;
     }
-    crate::capped_read::read_capped_json(resp, MAX_STRUCTURED_JSON_BYTES)
+    // The catalog gets its own, far larger cap — see `MAX_CATALOG_JSON_BYTES`. The
+    // shared 1 MiB one had been rejecting the whole 3 MiB catalog, silently, for
+    // as long as it had been that big.
+    crate::capped_read::read_capped_json(resp, MAX_CATALOG_JSON_BYTES)
         .await
         .ok()
 }
@@ -488,6 +518,31 @@ mod tests {
         // A provider with no `name` falls back to its key.
         let c2 = json!({ "x": { "models": { "m": {} } } });
         assert_eq!(provider_models(&c2, "x").unwrap().0, "x");
+    }
+
+    /// Free means **priced, at zero, on both sides**. An unpriced model is
+    /// unknown, not free — the direction that keeps an unusable row out of an
+    /// anonymous picker.
+    #[test]
+    fn free_models_are_the_ones_priced_at_zero() {
+        let c = json!({
+            "opencode": { "models": {
+                "grok-code": { "cost": { "input": 0, "output": 0, "cache_read": 0 } },
+                "claude-opus-5": { "cost": { "input": 5, "output": 25 } },
+                // Zero in, priced out: not free.
+                "half": { "cost": { "input": 0, "output": 2 } },
+                // No `cost` object at all: unknown, so not offered.
+                "unpriced": { "limit": { "context": 1000 } },
+            }},
+        });
+        assert!(is_free_model(&c, "opencode", "grok-code"));
+        assert!(!is_free_model(&c, "opencode", "claude-opus-5"));
+        assert!(!is_free_model(&c, "opencode", "half"));
+        assert!(!is_free_model(&c, "opencode", "unpriced"));
+        // Unknown provider / model / empty catalog are all "not free".
+        assert!(!is_free_model(&c, "nope", "grok-code"));
+        assert!(!is_free_model(&c, "opencode", "nope"));
+        assert!(!is_free_model(&json!({}), "opencode", "grok-code"));
     }
 
     /// The configured provider's own number wins — the same model is served with

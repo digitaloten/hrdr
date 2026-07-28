@@ -240,7 +240,8 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         prompt: Vec<String>,
     },
-    /// List available models from the configured endpoint.
+    /// List available models, as `provider://model`, across every provider this
+    /// machine is set up for.
     Models,
     /// Start the web server (HTTP + WebSocket) for the browser UI.
     Serve {
@@ -473,9 +474,12 @@ async fn main() -> Result<()> {
     // Unified readiness folds in trusted ChatGPT OAuth: a built-in ChatGPT login
     // with usable/refreshable credentials is `OAuth` (no key), so it must not draw
     // the missing-key warning. Only a genuinely unconfigured remote provider
-    // (`Missing`) warns; the copy is unchanged.
+    // (`Missing`) warns; the copy is unchanged. `_or_public` supplies Zen's
+    // anonymous key when nothing else resolves, so a logged-out session can still
+    // run its free models — `auth_state` stays `Anonymous` rather than `Key`, so
+    // the picker knows to narrow to those.
     let auth_state = hrdr_agent::provider_auth_state(&name, &p, None, None);
-    if let Some(key) = hrdr_agent::resolve_api_key(&name, &p, None, None) {
+    if let Some(key) = hrdr_agent::resolve_api_key_or_public(&name, &p, None, None) {
         config.api_key = Some(key);
     } else if config.api_key.is_none() && auth_state == hrdr_agent::ProviderAuthState::Missing {
         let env = p.key_env.as_deref().unwrap_or("HRDR_API_KEY");
@@ -975,10 +979,20 @@ fn event_json(ev: &AgentEvent) -> String {
 }
 
 /// Print available model ids, one per line.
+/// `hrdr models` — every model this machine can actually reach, one
+/// `provider://model` identity per line, ready to paste into `--model`.
+///
+/// It lists ALL providers, not the one in effect: which provider you happen to be
+/// on has nothing to do with which ones you are set up for, and the whole point of
+/// the listing is to find the identity to switch to. The refresh is awaited here
+/// (unlike the session's background one) because it IS the command — with fresh
+/// per-provider caches it costs nothing, and on a cold one it is the difference
+/// between a real answer and an empty list.
 async fn list_models(config: AgentConfig) -> Result<()> {
-    let models = hrdr_agent::list_provider_models(&config).await?;
-    for m in models {
-        println!("{m}");
+    hrdr_agent::refresh_models(config.clone()).await;
+    let active = config.model.provider().as_str().to_string();
+    for m in hrdr_agent::available_models(&config, Some(&active)) {
+        println!("{}://{}", m.provider, m.model);
     }
     Ok(())
 }
