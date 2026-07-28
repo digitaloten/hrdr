@@ -349,7 +349,7 @@ fn days_from_civil(year: i32, month: u64, day: u64) -> Option<i64> {
     let m = if month <= 2 { month + 12 } else { month };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
     let yoe = (y - era * 400) as u32;
-    let doy = 153 * (m as u32 + 1) / 5 + day as u32 - 1;
+    let doy = (153 * (m as u32 - 3) + 2) / 5 + day as u32 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let epoch_days = era as i64 * 146097 + doe as i64 - 719468;
     Some(epoch_days)
@@ -638,11 +638,12 @@ impl Client {
         self.params = params;
     }
 
-    /// Rebuild the HTTP client with a connect + idle-read timeout (so a hung or
-    /// stalled provider fails the request instead of blocking forever). `None`
-    /// restores the default 300-second timeout, matching the [`Client::new`]
-    /// builder. The read timeout is per-chunk, so a slow-but-progressing stream
-    /// isn't killed. A build error keeps the current client.
+    /// Rebuild the HTTP client with a connect + per-chunk read timeout (so a
+    /// hung or stalled provider fails the request instead of blocking forever).
+    /// `None` sets a 300-second connect and per-chunk read timeout. (This differs
+    /// from [`Client::new`], which uses an overall request deadline; the
+    /// per-phase timeouts are better suited to streaming responses.) A build
+    /// error keeps the current client.
     pub fn set_timeout(&mut self, timeout: Option<std::time::Duration>) {
         let mut builder = reqwest::Client::builder();
         let dur = timeout.unwrap_or(std::time::Duration::from_secs(300));
@@ -1899,6 +1900,28 @@ mod tests {
         assert!(!wire_log_over_cap(6, 4, 10));
         // One byte too many → rotate.
         assert!(wire_log_over_cap(7, 4, 10));
+    }
+
+    // ── days_from_civil ──────────────────────────────────────────────────
+
+    #[test]
+    fn days_from_civil_known_dates() {
+        // 1970-01-01 = Unix epoch day 0.
+        assert_eq!(days_from_civil(1970, 1, 1), Some(0));
+        // 1994-11-06 = day 9075 (verified by manual epoch-days arithmetic).
+        assert_eq!(days_from_civil(1994, 11, 6), Some(9075));
+        // 2023-01-01.
+        assert_eq!(days_from_civil(2023, 1, 1), Some(19358));
+        // 1969-12-31 = day -1 (before epoch).
+        assert_eq!(days_from_civil(1969, 12, 31), Some(-1));
+    }
+
+    #[test]
+    fn days_from_civil_out_of_range() {
+        assert_eq!(days_from_civil(1970, 0, 1), None);
+        assert_eq!(days_from_civil(1970, 13, 1), None);
+        assert_eq!(days_from_civil(1970, 1, 0), None);
+        assert_eq!(days_from_civil(1970, 1, 32), None);
     }
 
     #[test]
