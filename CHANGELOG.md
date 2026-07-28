@@ -24,6 +24,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lines remain and the offset to continue from — a transcript is read from the
   start, so quietly keeping the tail would hide the beginning. Shelling it out
   is blocked with the rest of the `task_*` family.
+
+  It is framed as a **diagnostic**, in both its description and the delegation
+  prompt, because a whole run is a lot of context to spend by habit. The three
+  stages each have one tool: while a task runs, `task_output` for a summary of
+  where it has got to; when it finishes, review the **work** with `task_diff`
+  (or `git diff`/`git show` against its branch); and only if that review finds
+  something wrong, `task_transcript` to investigate — the diff holds something
+  nobody asked for, the task claims a success its work contradicts, it failed,
+  or it misread the brief.
+
+### Changed
+
+- **`task_output` and `task_transcript` render identically; the only difference
+  is which window you get.** Both now go through the same renderer, so one run
+  reads the same whichever tool asked — `task_output` previously used the lossy
+  `transcript_to_text` (tool name only, no arguments, no result) while
+  `task_transcript` showed everything, meaning the answer depended on which tool
+  the model reached for first. `task_output` returns the **tail** (newest
+  output, what a peek is for) and now says how many earlier lines it dropped
+  instead of starting mid-run as though that were the whole thing;
+  `task_transcript` **pages** from the start. One line-budget helper serves
+  both.
+- **`task_output` is live tasks only.** It used to read an on-disk run by its
+  `NNN-slug` stem too — the same question `task_transcript` answers, at lower
+  fidelity, with which tool you happened to pick deciding how much you learned.
+  A stem now gets a refusal that names `task_transcript`, and `task_list` points
+  there as well.
 - **Staging a directory is now blocked at the shell**, alongside `git add -A` /
   `--all` / `.` and `git commit -a`/`-am`. `git add tests/` sweeps in every file
   under it — the same hazard one level down, and the easiest one to talk
@@ -32,9 +59,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unambiguous spelling is caught (a trailing slash); `git add dir` without one
   is indistinguishable from a file by string matching, so the prompt carries the
   rest.
-
-### Changed
-
 - **The look-before-you-restore rule now covers the staged copy and every named
   path.** Reverting a file the agent owns was already gated on reading its diff
   first, but only on `git diff`, which hides a staged edit — and the two restore

@@ -79,15 +79,22 @@ Delegating with `task`:
   N+1, so its worktree forks from a HEAD that already has that work — two
   parallel tasks editing the same module just buys you a merge conflict and a
   wasted round.
-- Manage running tasks with `task_list` (what's running), `task_output` (peek one
-  task's progress), `task_transcript` (read a whole run back — its reasoning and
-  every tool call with arguments and result — when you need to know HOW it got
-  there, not just what it answered), `task_steer` (give it additional
-  instructions), `task_diff` (review a finished write task's uncommitted
+- Manage running tasks with `task_list` (what's running), `task_output` (peek a
+  RUNNING task's newest output), `task_steer` (give it additional instructions), `task_diff` (review a finished write task's uncommitted
   leftovers, commits, and diff — pass `commit` to review one commit at a time),
   `task_apply` (land a finished write task's UNCOMMITTED work in your working
   dir), and `task_cancel` (stop one). You do not need these to collect results —
   those arrive on their own.
+- Three stages, and each has ONE tool. While it runs: `task_output` for a summary
+  of where it has got to — that is all you need, and you don't even need that
+  unless the user asks. When it finishes: review the WORK, with `task_diff` (or
+  `git diff`/`git show` against its branch in the shell, if you want a shape
+  `task_diff` doesn't give you). Only if that review finds something wrong:
+  `task_transcript`, to investigate. It is the debugging step, not a stage in the
+  normal flow — the diff holds something you didn't ask for, the task claims a
+  success its work contradicts, it failed or was cancelled, or it plainly misread
+  the brief, and now you need what it was thinking and what it actually ran. A
+  whole run is a lot of context; spend it on a question you already have.
 - Never `read` a sub-agent's `.jsonl` transcript file directly, even when a path
   is in front of you. It stores one JSON record per streamed token: the same run
   at many times the size, with the content buried in syntax you then parse by eye.

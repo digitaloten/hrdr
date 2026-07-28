@@ -1696,7 +1696,11 @@ fn peek_events(events: &[AgentEvent]) -> String {
     for ev in events {
         crate::apply_event(&mut entries, ev);
     }
-    crate::transcript_to_text(&entries)
+    // The SAME rendering `task_transcript` returns. A peek used to go through
+    // `transcript_to_text`, which prints `[tool: read]` and drops the arguments
+    // and the result — so the two tools described one run in two vocabularies,
+    // and the peek was the poorer of them for no reason anybody chose.
+    crate::transcript_to_plain_text(&entries, crate::TRANSCRIPT_TOOL_BODY_MAX)
 }
 
 /// Compact human duration for `task_list`: `8s`, `3m12s`, `1h4m`.
@@ -1910,9 +1914,9 @@ impl hrdr_tools::Tool for TaskListTool {
          cancelled) and — for a write-capable sub-agent — the isolated git worktree its changes \
          are in. Covers both the ones live in this session and, after a `/resume`, the ones \
          persisted on disk from earlier sessions (shown by their `NNN-slug` stem id, marked `done` \
-         or `orphaned`) — pass a stem to `task_output` or `task_revive` to read or re-engage one. \
-         A live task's result is delivered to you automatically; use this to check progress, not \
-         to collect results."
+         or `orphaned`) — pass a stem to `task_transcript` to read one back, or to `task_revive` \
+         to re-engage it. A live task's result is delivered to you automatically; use this to \
+         check progress, not to collect results."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({ "type": "object", "properties": {} })
@@ -1999,13 +2003,16 @@ impl hrdr_tools::Tool for TaskListTool {
     }
 }
 
-/// `task_output`: peek a background sub-agent's live progress without waiting.
+/// `task_output`: peek a RUNNING sub-agent's live progress without waiting.
+///
+/// Deliberately live-only. Reading a finished run back is `task_transcript`'s job,
+/// and this tool used to do a lossy version of it too (a `NNN-slug` stem branch
+/// rendering the on-disk transcript through [`crate::transcript_to_text`], which
+/// drops each tool call's arguments and result). Two tools answering the same
+/// question at different fidelities is how a model ends up with the worse answer,
+/// so the overlap was cut rather than kept: peek here, read back there.
 pub(crate) struct TaskOutputTool {
     pub(crate) live: LiveSubagents,
-    /// The parent session's sub-agent snapshot dir cell, so a finished/orphaned
-    /// run that is no longer in the live registry (post-`/resume`) can be read
-    /// back from its persisted `<stem>.jsonl`. `None` → live/registry only.
-    pub(crate) transcript_dir: SubagentDirCell,
 }
 
 #[async_trait::async_trait]
@@ -2014,20 +2021,20 @@ impl hrdr_tools::Tool for TaskOutputTool {
         "task_output"
     }
     fn description(&self) -> &'static str {
-        "Peek the current progress of a background sub-agent by its `id` (from `task_list`), \
-         without blocking. Returns a snapshot of its output so far — useful if the user asks how \
-         a task is going. Pass a live task's integer id, or the `NNN-slug` stem of an on-disk run \
-         from an earlier session (its persisted transcript is read back). The final result of a \
-         live task is still delivered to you automatically when it finishes; you do not need to \
-         poll."
+        "Peek what a RUNNING background sub-agent has produced so far, by its integer `id` (from \
+         `task_list`), without blocking — for when the user asks how a task is going. Shows the \
+         newest output; the middle is dropped if it is long. The final result of a live task is \
+         delivered to you automatically when it finishes, so you never need to poll. To read a \
+         run BACK — a finished one, one from an earlier session, or any run's reasoning and tool \
+         calls in full — use `task_transcript` instead; this tool only sees live tasks."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "id": {
-                    "type": ["integer", "string"],
-                    "description": "The task id: a live task's integer id, or an on-disk run's `NNN-slug` stem (see `task_list`)."
+                    "type": "integer",
+                    "description": "The live task's integer id (see `task_list`). For an on-disk run from an earlier session, use `task_transcript` with its `NNN-slug` stem."
                 }
             },
             "required": ["id"]
@@ -2049,42 +2056,24 @@ impl hrdr_tools::Tool for TaskOutputTool {
         let id_val = args
             .get("id")
             .ok_or_else(|| anyhow::anyhow!("task_output needs an `id` (see `task_list`)"))?;
-        // An integer (or an all-digit string) addresses a LIVE / recently-finished
-        // task; a `NNN-slug` stem addresses an on-disk run from an earlier session.
+        // Live tasks only, addressed by integer id (an all-digit string counts —
+        // the same id, differently typed). A `NNN-slug` stem is an on-disk run,
+        // which belongs to `task_transcript`: it renders reasoning and each tool
+        // call's arguments and result, where this tool's renderer would drop them.
         let Some(id) = id_val
             .as_u64()
             .or_else(|| id_val.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
         else {
-            // Disk fallback: read the persisted transcript for the stem.
-            let stem = id_val
-                .as_str()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "task_output needs an integer id or a stem id (see `task_list`)"
-                    )
-                })?;
-            if !valid_run_stem(stem) {
-                anyhow::bail!("`{stem}` is not a valid run id (see `task_list`)");
-            }
-            let dir = resolve_subagent_dir(&self.transcript_dir).ok_or_else(|| {
-                anyhow::anyhow!("no session directory yet — cannot read `{stem}` from disk")
-            })?;
-            let jsonl = dir.join(format!("{stem}.jsonl"));
-            if !jsonl.exists() {
-                anyhow::bail!("no sub-agent run `{stem}` (see `task_list`)");
-            }
-            // Fold the persisted record through the SAME reducer the live peek uses,
-            // then keep the tail like the live/registry branches below.
-            let entries = subagent_transcript::read_transcript(&jsonl);
-            let text = crate::transcript_to_text(&entries);
-            let text = if text.trim().is_empty() {
-                format!("(run `{stem}` recorded no output)")
-            } else {
-                text
-            };
-            return Ok(hrdr_tools::truncate_middle(&text, ctx.max_output));
+            // One message for every non-integer id. Splitting on whether the string
+            // looks like a stem would be guesswork — `valid_run_stem` only rejects
+            // path traversal, not shape — and both cases have the same answer.
+            let given = id_val.as_str().map(str::trim).unwrap_or_default();
+            anyhow::bail!(
+                "task_output takes a LIVE task's integer id (see `task_list`), and got \
+                 `{given}`. To read a run back — a finished one, or one from an earlier session \
+                 addressed by its `NNN-slug` stem — use `task_transcript`, which also shows its \
+                 reasoning and every tool call's arguments and result."
+            );
         };
         // Prefer the live event log; fall back to the registry entry's stored
         // result if the task already finished and its live entry was pruned.
@@ -2100,11 +2089,11 @@ impl hrdr_tools::Tool for TaskOutputTool {
             })
         });
         if let Some(text) = peek.filter(|t| !t.is_empty()) {
-            // Middle-truncate, not head-truncate: this is a *peek at a
-            // still-running* task, so the newest output (the tail) is exactly
-            // its current progress — head-only truncation would cut that and
-            // keep only stale narration from the start of the run.
-            return Ok(hrdr_tools::truncate_middle(&text, ctx.max_output));
+            // The TAIL, in the same rendering `task_transcript` produces: on a
+            // still-running task the newest output is its current progress, and
+            // keeping the head would hand back stale narration from the start.
+            // That framing is the only difference between the two tools.
+            return Ok(tail_lines(&text, ctx.max_output));
         }
         let done = {
             let v = ctx
@@ -3115,15 +3104,17 @@ impl hrdr_tools::Tool for TaskTranscriptTool {
         "task_transcript"
     }
     fn description(&self) -> &'static str {
-        "Read a sub-agent's whole run back as plain text: what it was asked, what it thought, \
-         every tool call with its arguments and result, and what it answered. Use it to see HOW a \
-         sub-agent reached its result — why it chose an approach, what it looked at, where it went \
-         wrong — which its final message alone doesn't tell you. Pass a live/finished task's \
-         integer `id`, or the `NNN-slug` stem of a run from an earlier session (see `task_list`). \
-         Long runs page with `offset`/`limit`, like `read`. Never `read` the raw `.jsonl` \
-         yourself: it is one JSON record per streamed token and says the same thing at many times \
-         the size. For a write task's CODE, use `task_diff` instead — this is the conversation, \
-         not the change."
+        "DIAGNOSTIC: read a sub-agent's whole run back as plain text — what it was asked, what it \
+         thought, every tool call with its arguments and result, and what it answered. Reach for \
+         it when something is WRONG and the result alone doesn't explain it: `task_diff` shows a \
+         change you didn't expect, a task reports success but its work says otherwise, it failed \
+         or was cancelled, or it clearly misread the brief. Most tasks need none of this — the \
+         result is delivered to you automatically, and a write task's work is reviewed with \
+         `task_diff` (the change) not here (the conversation). A whole run is a lot of context, so \
+         spend it when you have a question it answers. Pass a live/finished task's integer `id`, \
+         or the `NNN-slug` stem of a run from an earlier session (see `task_list`); long runs page \
+         with `offset`/`limit`, like `read`. Never `read` the raw `.jsonl` yourself — it is one \
+         JSON record per streamed token and says the same thing at many times the size."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
@@ -3222,28 +3213,41 @@ impl hrdr_tools::Tool for TaskTranscriptTool {
     }
 }
 
-/// `limit` lines of `text` from 1-based `offset`, capped at `max_output` bytes,
-/// with a trailer naming the total and how to reach the rest.
+/// Room left for a window's one-line header once the body has its budget.
+const WINDOW_HEADER_BUDGET: usize = 200;
+
+/// Lines `start..` of `lines`, at most `limit` of them and within `budget` bytes.
+/// Returns the joined text and how many lines it took.
 ///
-/// Paged rather than middle-truncated: unlike a peek at a running task — where
-/// the newest output is the point — reading a run back is read from the start,
-/// and the reader needs to know there IS more and how to ask for it.
-fn window_lines(text: &str, offset: usize, limit: Option<usize>, max_output: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let total = lines.len();
-    let start = offset.saturating_sub(1).min(total);
+/// The one place the line budget is applied — `task_output`'s tail and
+/// `task_transcript`'s page differ only in which window they ask for, and that is
+/// the whole intended difference between the two tools.
+fn take_lines(lines: &[&str], start: usize, limit: usize, budget: usize) -> (String, usize) {
     let mut out = String::new();
-    let mut shown = 0usize;
-    for line in lines[start..].iter().take(limit.unwrap_or(usize::MAX)) {
-        // Leave room for the trailer.
-        if out.len() + line.len() + 1 > max_output.saturating_sub(200) {
+    let mut taken = 0usize;
+    for line in lines.iter().skip(start).take(limit) {
+        if out.len() + line.len() + 1 > budget {
             break;
         }
         out.push_str(line);
         out.push('\n');
-        shown += 1;
+        taken += 1;
     }
-    let last = start + shown;
+    (out.trim_end().to_string(), taken)
+}
+
+/// `limit` lines of `text` from 1-based `offset`, with a header naming the total
+/// and the offset to continue from.
+///
+/// Paged rather than truncated: reading a run back starts at the beginning, and
+/// the reader needs to know there IS more and how to ask for it.
+fn window_lines(text: &str, offset: usize, limit: Option<usize>, max_output: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let start = offset.saturating_sub(1).min(total);
+    let budget = max_output.saturating_sub(WINDOW_HEADER_BUDGET);
+    let (body, taken) = take_lines(&lines, start, limit.unwrap_or(usize::MAX), budget);
+    let last = start + taken;
     let mut header = format!("Transcript lines {}-{last} of {total}", start + 1);
     if last < total {
         header.push_str(&format!(
@@ -3252,7 +3256,43 @@ fn window_lines(text: &str, offset: usize, limit: Option<usize>, max_output: usi
             last + 1
         ));
     }
-    format!("{header}\n\n{}", out.trim_end())
+    format!("{header}\n\n{body}")
+}
+
+/// The LAST lines of `text` that fit in `max_output`, headed with what was kept
+/// and where the rest is.
+///
+/// The peek's half of the split: same rendering as a page, opposite end. It says
+/// how many earlier lines it dropped, because a peek that silently starts
+/// mid-run reads like the whole run.
+fn tail_lines(text: &str, max_output: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let budget = max_output.saturating_sub(WINDOW_HEADER_BUDGET);
+    // Walk back from the end while the lines still fit, then take that window
+    // forward through the shared helper.
+    let mut start = total;
+    let mut used = 0usize;
+    while start > 0 {
+        let len = lines[start - 1].len() + 1;
+        if used + len > budget {
+            break;
+        }
+        used += len;
+        start -= 1;
+    }
+    let (body, taken) = take_lines(&lines, start, usize::MAX, budget);
+    let mut header = if taken >= total {
+        format!("Progress so far — all {total} lines")
+    } else {
+        format!(
+            "Progress so far — last {taken} of {total} lines ({} earlier omitted; \
+             `task_transcript` reads the run from the start)",
+            total - taken
+        )
+    };
+    header.push_str(":\n\n");
+    format!("{header}{body}")
 }
 
 pub(crate) struct TaskDiffTool;
@@ -4451,6 +4491,59 @@ mod revive_tests {
         assert!(out.contains("Plan: three phases."), "{out}");
     }
 
+    /// One rendering, two windows: a peek and a page describe a run in the same
+    /// vocabulary, and differ only in which end they keep.
+    ///
+    /// `task_output` used to render through `transcript_to_text` (tool name only,
+    /// no args, no result) while `task_transcript` showed everything — so the same
+    /// run looked like two different runs depending on which tool asked, and the
+    /// one a model reaches for first was the poorer of the two.
+    #[test]
+    fn a_peek_and_a_page_render_the_same_way() {
+        use crate::{EntryKind, transcript_to_plain_text};
+        let entries = vec![
+            crate::Entry::now(EntryKind::Tool {
+                id: "c1".into(),
+                name: "read".into(),
+                args: r#"{"path":"src/codec.rs"}"#.into(),
+                result: "pub fn decode() {}".into(),
+                ok: true,
+                done: true,
+                expanded: false,
+            }),
+            crate::Entry::now(EntryKind::Assistant("done".into())),
+        ];
+        let rendered = transcript_to_plain_text(&entries, crate::TRANSCRIPT_TOOL_BODY_MAX);
+
+        // Both windows carry the args and the result — the detail the peek's old
+        // renderer dropped — and both are drawn from this one rendering.
+        let peek = tail_lines(&rendered, 10_000);
+        let page = window_lines(&rendered, 1, None, 10_000);
+        for view in [&peek, &page] {
+            assert!(view.contains("## Tool: read"), "{view}");
+            assert!(view.contains(r#"{"path":"src/codec.rs"}"#), "{view}");
+            assert!(view.contains("pub fn decode() {}"), "{view}");
+        }
+        // The difference is the framing, and each says which window it gave you.
+        assert!(peek.starts_with("Progress so far"), "{peek}");
+        assert!(page.starts_with("Transcript lines 1-"), "{page}");
+    }
+
+    /// A peek that must drop lines keeps the NEWEST ones and says how many it
+    /// dropped — a peek silently starting mid-run reads like the whole run.
+    #[test]
+    fn a_peek_keeps_the_newest_lines_and_admits_the_cut() {
+        let text: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+        // A budget that fits only a handful of lines once the header is reserved.
+        let out = tail_lines(&text, 300);
+        assert!(out.contains("line 200"), "keeps the newest: {out}");
+        assert!(!out.contains("line 1\n"), "drops the oldest: {out}");
+        assert!(
+            out.contains("earlier omitted") && out.contains("task_transcript"),
+            "and names what was dropped, plus where to read it: {out}"
+        );
+    }
+
     /// A long run pages like `read`, and says how much is left and how to ask for
     /// it — a transcript is read from the start, so silently keeping the tail
     /// (what a *peek* does) would hide the beginning with no sign it was cut.
@@ -4611,10 +4704,16 @@ mod revive_tests {
         assert!(!valid_run_stem("/etc/passwd"));
     }
 
-    /// `task_output` reads a finished/orphaned run's persisted transcript back
-    /// from disk when it is no longer in the live registry (post-`/resume`).
+    /// An on-disk run belongs to `task_transcript`; `task_output` is live-only and
+    /// hands a stem over instead of serving a lossier copy of the same answer.
+    ///
+    /// `task_output` used to read stems itself, rendering through
+    /// `transcript_to_text` — which prints `[tool: read]` and drops the arguments
+    /// and the result. Two tools answering one question at different fidelities
+    /// means whichever the model reaches for first decides how much it learns, so
+    /// the overlap was removed rather than left to chance.
     #[tokio::test]
-    async fn task_output_reads_a_persisted_run_from_disk() {
+    async fn task_output_is_live_only_and_hands_a_stem_to_task_transcript() {
         let dir = tempfile::tempdir().unwrap();
         write_run(
             dir.path(),
@@ -4623,25 +4722,47 @@ mod revive_tests {
             Some("HELLO-FROM-DISK"),
             true,
         );
-
         let ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
-        let tool = TaskOutputTool {
-            live: LiveSubagents::new(),
-            transcript_dir: cell(dir.path()),
-        };
-        let out = tool
-            .execute(serde_json::json!({"id": "003-fix"}), &ctx)
+
+        // Any non-integer id is refused, naming what it got and where it IS served.
+        for given in ["003-fix", "not a stem"] {
+            let err = TaskOutputTool {
+                live: LiveSubagents::new(),
+            }
+            .execute(serde_json::json!({"id": given}), &ctx)
             .await
-            .unwrap();
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("integer id") && err.contains("task_transcript"),
+                "the refusal names the tool that serves it, for `{given}`: {err}"
+            );
+            assert!(err.contains(given), "and echoes what it got: {err}");
+        }
+        // An all-digit string is still that live id, differently typed.
+        assert!(
+            TaskOutputTool {
+                live: LiveSubagents::new(),
+            }
+            .execute(serde_json::json!({"id": "7"}), &ctx)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no background task #7"),
+            "an all-digit string resolves as an integer id, not a stem"
+        );
+
+        // And the capability did not vanish with the branch: the same run reads
+        // back through `task_transcript`, with more than it had before.
+        let out = TaskTranscriptTool {
+            transcript_dir: cell(dir.path()),
+        }
+        .execute(serde_json::json!({"id": "003-fix"}), &ctx)
+        .await
+        .unwrap();
         assert!(
             out.contains("HELLO-FROM-DISK"),
-            "the persisted output is folded and read back: {out}"
-        );
-        // An unknown stem is a clean error, not a panic.
-        assert!(
-            tool.execute(serde_json::json!({"id": "999-nope"}), &ctx)
-                .await
-                .is_err()
+            "the persisted output still reads back: {out}"
         );
     }
 

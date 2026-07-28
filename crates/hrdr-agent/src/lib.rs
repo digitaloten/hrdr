@@ -1492,7 +1492,6 @@ impl Agent {
             }));
             tools.register(Arc::new(TaskOutputTool {
                 live: live_subagents.clone(),
-                transcript_dir: config.subagent_transcript_dir.clone(),
             }));
             tools.register(Arc::new(TaskTranscriptTool {
                 transcript_dir: config.subagent_transcript_dir.clone(),
@@ -6066,7 +6065,6 @@ mod tests {
         // Empty live store → falls through to the registry entry.
         let out = TaskOutputTool {
             live: LiveSubagents::new(),
-            transcript_dir: None,
         }
         .execute(serde_json::json!({"id": 7}), &ctx)
         .await
@@ -6111,7 +6109,6 @@ mod tests {
             });
         let out = TaskOutputTool {
             live: LiveSubagents::new(),
-            transcript_dir: None,
         }
         .execute(serde_json::json!({"id": 9}), &ctx)
         .await
@@ -9104,6 +9101,14 @@ mod tests {
         assert!(
             crate::delegation::TaskOutputTool {
                 live: LiveSubagents::new(),
+            }
+            .repeatable()
+        );
+        // `task_transcript` is the opposite case: a run's transcript is a fixed
+        // artifact, so a second identical read learns nothing and the repeat guard
+        // should say so.
+        assert!(
+            !crate::delegation::TaskTranscriptTool {
                 transcript_dir: None,
             }
             .repeatable()
