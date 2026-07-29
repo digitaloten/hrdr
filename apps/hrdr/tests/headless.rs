@@ -55,9 +55,23 @@ fn run_hrdr(server: &MockServer, args: &[&str]) -> Output {
     run_hrdr_in(server, args, None)
 }
 
+/// As [`run_hrdr`], but with extra environment for the child process.
+fn run_hrdr_env(server: &MockServer, args: &[&str], env: &[(&str, &str)]) -> Output {
+    run_hrdr_inner(server, args, None, env)
+}
+
 /// As [`run_hrdr`], but a caller-provided project dir (for tests that pre-seed a
 /// file the model will read). When `None`, a fresh tempdir is used.
 fn run_hrdr_in(server: &MockServer, args: &[&str], project: Option<&std::path::Path>) -> Output {
+    run_hrdr_inner(server, args, project, &[])
+}
+
+fn run_hrdr_inner(
+    server: &MockServer,
+    args: &[&str],
+    project: Option<&std::path::Path>,
+    env: &[(&str, &str)],
+) -> Output {
     let home = tempfile::tempdir().expect("temp home");
     write_config(home.path(), &server.base_url());
     let fresh = tempfile::tempdir().expect("temp project");
@@ -81,6 +95,9 @@ fn run_hrdr_in(server: &MockServer, args: &[&str], project: Option<&std::path::P
     // the only identity source.
     for key in ["HRDR_MODEL", "HRDR_API_KEY", "RUST_LOG"] {
         cmd.env_remove(key);
+    }
+    for (key, value) in env {
+        cmd.env(key, value);
     }
     cmd.output().expect("spawn hrdr")
 }
@@ -266,11 +283,15 @@ fn run_json_reports_errors_as_a_json_event_and_exits_nonzero() {
 /// (there is no `--json`, so nothing structured is expected on stdout).
 ///
 /// A dropped connection is classified transient, so the turn loop retries with
-/// bounded backoff (~8s worst case) before giving up — hence the diagnostic is
-/// asserted loosely and the test carries no tight timing.
+/// backoff before giving up — hence the diagnostic is asserted loosely and the
+/// test carries no tight timing.
+///
+/// The shipped budget is ten attempts over ~6¼ minutes, which no test may sit
+/// through, so the child is given two: one real retry (~5s of real backoff,
+/// covering the path this test is about) and then the give-up it asserts on.
 #[test]
 fn run_reports_a_network_failure_on_stderr_and_exits_nonzero() {
-    // Enough Drops to outlast the retry budget (MAX_RETRIES = 4).
+    // Enough Drops to outlast the retry budget set below.
     let server = MockServer::start(vec![
         Chat::Drop,
         Chat::Drop,
@@ -279,7 +300,7 @@ fn run_reports_a_network_failure_on_stderr_and_exits_nonzero() {
         Chat::Drop,
         Chat::Drop,
     ]);
-    let out = run_hrdr(&server, &["run", "hi"]);
+    let out = run_hrdr_env(&server, &["run", "hi"], &[("HRDR_RETRY_ATTEMPTS", "2")]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

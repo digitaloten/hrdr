@@ -77,11 +77,9 @@ mod turn_loop;
 #[cfg(test)]
 pub(crate) use turn_loop::{
     RepeatGuard, ensure_assistant_has_content, format_duration, repair_dangling_tool_calls,
-    retry_jitter, tool_error_text,
+    tool_error_text,
 };
-pub(crate) use turn_loop::{
-    drain_stream, is_context_overflow, is_transient, retry_after_hint, retry_backoff,
-};
+pub(crate) use turn_loop::{drain_stream, is_context_overflow};
 mod compaction;
 mod turn_state;
 #[cfg(test)]
@@ -193,7 +191,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use futures_util::FutureExt;
 use futures_util::StreamExt;
-use hrdr_llm::{Accumulator, ChatMessage, ChatStream, Client, Role, ToolDef};
+use hrdr_llm::{
+    Accumulator, ChatMessage, ChatStream, Client, RetryAttempt, RetryBudget, Role, ToolDef,
+};
 use hrdr_tools::{TodoItem, ToolContext, ToolRegistry};
 
 #[derive(Clone)]
@@ -1014,6 +1014,10 @@ pub struct Agent {
     ctx: ToolContext,
     messages: Vec<ChatMessage>,
     max_steps: usize,
+    /// How hard this agent retries a failing model call
+    /// ([`AgentConfig::retry`]). One [`RetryBudget`] is minted from it per
+    /// logical operation — see [`Agent::connect_and_drain`].
+    retry_policy: RetryPolicy,
     /// Prune stale tool output from the history when pressure and ROI justify
     /// it (see [`AgentConfig::auto_prune`]).
     auto_prune: bool,
@@ -1869,6 +1873,7 @@ impl Agent {
             ctx,
             messages: vec![ChatMessage::system(system)],
             max_steps: config.max_steps,
+            retry_policy: config.retry,
             auto_prune: config.auto_prune,
             auto_compact: config.auto_compact,
             compaction_reserved: config.compaction_reserved,
@@ -2606,6 +2611,10 @@ impl Agent {
 // Re-exports consumers need without reaching into sub-crates.
 pub use hrdr_llm::ChatMessage as Message;
 pub use hrdr_llm::MessageOrigin;
+/// The type of [`AgentConfig::retry`] — re-exported so a frontend can name it
+/// (a test pointing an agent at a dead endpoint wants `max_attempts: 1`)
+/// without a direct `hrdr-llm` dependency.
+pub use hrdr_llm::RetryPolicy;
 pub use hrdr_llm::Role as MessageRole;
 /// The models.dev catalog (context windows, price cards, effort levels) —
 /// re-exported so frontends don't need a direct `hrdr-llm` dependency.
@@ -2920,10 +2929,9 @@ mod tests {
         SubagentSlots, ToolOutputConfig, builtin_provider, child_transcript_id,
         compaction_tail_start, elide_tool_results, ensure_assistant_has_content, estimate_tokens,
         estimate_tokens_in_messages, flatten_tool_protocol, format_duration, in_git_repo,
-        is_context_overflow, is_transient, mega_turn_tail_start, parse_env_bool,
-        provider_alias_collision_error, repair_dangling_tool_calls, resolve, resolve_child_dir,
-        retry_after_hint, steering_queue, strip_user_timestamp, subagent_base_config, tail_window,
-        timestamped_user_message,
+        mega_turn_tail_start, parse_env_bool, provider_alias_collision_error,
+        repair_dangling_tool_calls, resolve, resolve_child_dir, steering_queue,
+        strip_user_timestamp, subagent_base_config, tail_window, timestamped_user_message,
     };
     use crate::cwd_slug;
     use crate::registry;
@@ -6410,113 +6418,6 @@ mod tests {
     }
 
     #[test]
-    fn classifies_transient_and_overflow_errors() {
-        let overflow = anyhow::anyhow!(
-            "chat endpoint returned 400 Bad Request: This model's maximum context length is 8192 tokens"
-        );
-        assert!(is_context_overflow(&overflow));
-        assert!(!is_transient(&overflow));
-
-        let rate = anyhow::anyhow!("chat endpoint returned 429 Too Many Requests: slow down");
-        assert!(is_transient(&rate));
-        assert!(!is_context_overflow(&rate));
-
-        let net = anyhow::anyhow!("chat stream request failed: connection refused");
-        assert!(is_transient(&net));
-
-        let plain = anyhow::anyhow!("chat endpoint returned 400 Bad Request: invalid tool schema");
-        assert!(!is_transient(&plain));
-        assert!(!is_context_overflow(&plain));
-
-        // Incomplete stream errors are transient (the server dropped the connection).
-        assert!(is_transient(&anyhow::anyhow!(
-            "incomplete stream: something"
-        )));
-    }
-
-    #[test]
-    fn typed_chat_error_classified_correctly() {
-        use hrdr_llm::{ChatError, ChatErrorKind};
-        use std::time::Duration;
-
-        // Overflow typed error.
-        let overflow = anyhow::Error::new(ChatError {
-            status: Some(413),
-            kind: ChatErrorKind::Overflow,
-            retry_after: None,
-            message: "request too large".to_string(),
-        });
-        assert!(is_context_overflow(&overflow));
-        assert!(!is_transient(&overflow));
-        assert_eq!(retry_after_hint(&overflow), None);
-
-        // Transient typed error with Retry-After.
-        let delay = Duration::from_secs(30);
-        let rate = anyhow::Error::new(ChatError {
-            status: Some(429),
-            kind: ChatErrorKind::Transient,
-            retry_after: Some(delay),
-            message: "rate limited".to_string(),
-        });
-        assert!(is_transient(&rate));
-        assert!(!is_context_overflow(&rate));
-        assert_eq!(retry_after_hint(&rate), Some(delay));
-
-        // Other typed error: neither transient nor overflow.
-        let other = anyhow::Error::new(ChatError {
-            status: Some(400),
-            kind: ChatErrorKind::Other,
-            retry_after: None,
-            message: "bad request".to_string(),
-        });
-        assert!(!is_transient(&other));
-        assert!(!is_context_overflow(&other));
-
-        // A 400 whose body describes a context overflow classifies as Other by
-        // status, but must still fall through to the body-text scan and be
-        // treated as overflow (many OpenAI-compatible providers do this instead
-        // of 413) — otherwise auto-compaction silently stops firing for them.
-        let overflow_400 = anyhow::Error::new(ChatError {
-            status: Some(400),
-            kind: ChatErrorKind::Other,
-            retry_after: None,
-            message: "chat endpoint returned 400: maximum context length exceeded".to_string(),
-        });
-        assert!(is_context_overflow(&overflow_400));
-        assert!(!is_transient(&overflow_400));
-    }
-
-    #[test]
-    fn typed_other_error_is_not_retried_on_incidental_substring_match() {
-        // Regression: a permanent, server-provided error body that merely
-        // *contains* a transport-sounding word ("connection", "reset") must not
-        // be retried as if it were a real network failure. Only the typed
-        // `kind` decides for a `ChatError`; the broad substring scan is reserved
-        // for errors that never went through the typed classifier (raw
-        // transport/network failures).
-        use hrdr_llm::{ChatError, ChatErrorKind};
-        let bad_request = anyhow::Error::new(ChatError {
-            status: Some(400),
-            kind: ChatErrorKind::Other,
-            retry_after: None,
-            message: "chat endpoint returned 400: invalid 'reset_token' — connection profile \
-                      is malformed"
-                .to_string(),
-        });
-        assert!(
-            !is_transient(&bad_request),
-            "a typed Other error must not be retried just because its body mentions \
-             'reset'/'connection'"
-        );
-
-        // A raw (non-typed) transport failure with the same words must still be
-        // treated as transient — the scan isn't disabled entirely, just scoped
-        // away from typed server-error bodies.
-        let raw_transport = anyhow::anyhow!("chat stream request failed: connection reset by peer");
-        assert!(is_transient(&raw_transport));
-    }
-
-    #[test]
     fn background_abort_clears_handles() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6955,6 +6856,27 @@ mod tests {
             "bad value should be reported"
         );
         assert_eq!(cfg.auto_compact, original, "bad value should be ignored");
+    }
+
+    /// `$HRDR_RETRY_ATTEMPTS` moves the attempt count and nothing else — the
+    /// backoff schedule is not a knob (see the setter's comment), so a fleet
+    /// under a shared rate limit cannot be reconfigured into a retry storm.
+    #[test]
+    fn env_setter_retry_attempts_moves_only_the_count() {
+        let setter = find_setter("HRDR_RETRY_ATTEMPTS");
+        let mut cfg = AgentConfig::default();
+        let default = cfg.retry;
+        setter(&mut cfg, "3").unwrap();
+        assert_eq!(cfg.retry.max_attempts, 3);
+        assert_eq!(cfg.retry.first_backoff, default.first_backoff);
+        assert_eq!(cfg.retry.max_backoff, default.max_backoff);
+        // `1` is the documented "don't retry" setting; `0` and junk are refused
+        // and leave the count where it was.
+        setter(&mut cfg, "1").unwrap();
+        assert_eq!(cfg.retry.max_attempts, 1);
+        assert!(setter(&mut cfg, "0").is_err());
+        assert!(setter(&mut cfg, "lots").is_err());
+        assert_eq!(cfg.retry.max_attempts, 1);
     }
 
     #[test]
@@ -7424,101 +7346,6 @@ mod tests {
     }
 
     // ---- is_transient / is_context_overflow (additional variants) ----
-
-    #[test]
-    fn retry_after_hint_parses_and_clamps() {
-        use super::retry_after_hint;
-        // Parsed from the client's error suffix.
-        let e = anyhow::anyhow!("chat endpoint returned 429 : rate limited (retry-after: 5s)");
-        assert_eq!(retry_after_hint(&e).map(|d| d.as_secs()), Some(5));
-        // Clamped to 60s.
-        let big = anyhow::anyhow!("returned 429 (retry-after: 9999s)");
-        assert_eq!(retry_after_hint(&big).map(|d| d.as_secs()), Some(60));
-        // Absent → None (falls back to exponential backoff).
-        assert_eq!(retry_after_hint(&anyhow::anyhow!("returned 500")), None);
-    }
-
-    #[test]
-    fn retry_backoff_grows_capped_with_bounded_jitter() {
-        use super::retry_backoff;
-        for attempt in 1..=8 {
-            let base = (0.5 * 2f64.powi(attempt as i32 - 1)).min(8.0);
-            let d = retry_backoff(attempt).as_secs_f64();
-            assert!(
-                d >= base * 0.75 - 1e-9 && d <= base * 1.25 + 1e-9,
-                "attempt {attempt}: {d}s outside ±25% of {base}s"
-            );
-        }
-    }
-
-    #[test]
-    fn retry_jitter_uses_every_slot() {
-        use super::retry_jitter;
-        let mut seen: Vec<f64> = (0..1000).map(retry_jitter).collect();
-        seen.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        seen.dedup();
-        assert_eq!(seen.len(), 1000);
-        assert!((seen[0] - 0.75).abs() < 1e-9);
-        assert!(seen[999] < 1.25);
-    }
-
-    #[test]
-    fn is_transient_more_variants() {
-        for msg in [
-            "chat stream request failed: connection timed out",
-            "broken pipe",
-            "chat endpoint returned 502 Bad Gateway: upstream down",
-            "chat endpoint returned 503 Service Unavailable",
-            "chat endpoint returned 504 Gateway Timeout",
-            "connection reset by peer",
-            "chat endpoint returned 529 : {\"type\":\"overloaded_error\"}", // Anthropic
-            "anthropic stream error: Overloaded",
-        ] {
-            assert!(
-                is_transient(&anyhow::anyhow!("{msg}")),
-                "expected transient for: {msg}"
-            );
-        }
-    }
-
-    #[test]
-    fn is_context_overflow_more_variants() {
-        for msg in [
-            "context window exceeded",
-            "too many tokens in the prompt",
-            "please reduce the length of the messages",
-            "context size limit reached",
-            "context_length exceeded",
-            // Provider-specific patterns ported from pi.
-            "prompt is too long: 213462 tokens > 200000 maximum", // Anthropic
-            "request_too_large",                                  // Anthropic 413
-            "your input exceeds the context window of this model", // OpenAI
-            "the input token count (1196265) exceeds the maximum", // Gemini
-            "this model's maximum prompt length is 131072",       // xAI
-            "exceeds the maximum allowed input length of 8000 tokens", // OpenRouter
-            "is longer than the model's context length (4096 tokens)", // Together
-            "prompt token count of 5 exceeds the limit of 4",     // Copilot
-            "your request exceeded model token limit",            // Kimi
-            "too large for model with 8192 maximum context length", // Mistral
-            "model_context_window_exceeded",                      // z.ai
-        ] {
-            assert!(
-                is_context_overflow(&anyhow::anyhow!("{msg}")),
-                "expected context overflow for: {msg}"
-            );
-        }
-        // Rate-limit / throttling is NOT overflow, even when it mentions tokens.
-        for msg in [
-            "chat endpoint returned 429 Too Many Requests: slow down",
-            "ThrottlingException: too many tokens, please wait",
-            "rate limit exceeded, retry after 20s",
-        ] {
-            assert!(
-                !is_context_overflow(&anyhow::anyhow!("{msg}")),
-                "throttling must not be treated as overflow: {msg}"
-            );
-        }
-    }
 
     // ---- compaction shrink helpers ----
 
@@ -8737,6 +8564,13 @@ mod tests {
 
         /// Minimal agent config pointing at `base_url`, with subagents disabled
         /// for test isolation.
+        ///
+        /// The retry schedule is kept but its waits are zeroed: every test here
+        /// drives the REAL retry loops (a queue that runs dry closes the
+        /// connection, which is a transient failure like any other), and the
+        /// shipped schedule would make each of those tests sit through minutes
+        /// of backoff. The counts — how many attempts, in what order — are
+        /// untouched, and they are what these tests assert on.
         fn test_cfg(base_url: String, cwd: &std::path::Path) -> AgentConfig {
             AgentConfig {
                 base_url,
@@ -8745,6 +8579,16 @@ mod tests {
                 subagents: false,
                 memory: false,
                 auto_prune: false,
+                retry: instant_retries(),
+                ..Default::default()
+            }
+        }
+
+        /// The shipped retry policy with the waiting taken out.
+        fn instant_retries() -> hrdr_llm::RetryPolicy {
+            hrdr_llm::RetryPolicy {
+                first_backoff: std::time::Duration::ZERO,
+                max_backoff: std::time::Duration::ZERO,
                 ..Default::default()
             }
         }
@@ -10275,6 +10119,146 @@ mod tests {
                 })
                 .collect();
             assert!(text.contains("Retry succeeded"));
+        }
+
+        // ── the retry budget is shared, not multiplied ────────────────────────
+
+        /// THE headline guarantee: connecting and draining share ONE budget, so
+        /// an assistant round makes at most ten requests — full stop.
+        ///
+        /// The response pattern is the one that used to be worst: four 503s
+        /// (spending the connect loop's whole allowance) followed by a stream
+        /// that dies mid-flight (spending one drain retry). The drain retry then
+        /// re-entered `connect_stream`, which minted a **fresh** `attempt = 0`
+        /// every time — so the 4-retry connect budget was handed out four times
+        /// over, and this exact pattern produced 20 requests against a provider
+        /// that was already failing, with no constant in the code saying 20.
+        /// Thirty responses are queued; exactly ten may be consumed.
+        #[tokio::test]
+        async fn connect_and_drain_share_one_retry_budget() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let mut responses = Vec::new();
+            for _ in 0..6 {
+                for _ in 0..4 {
+                    responses.push(MockResp::HttpError(503));
+                }
+                // A stream that ends without `[DONE]`: the connect succeeded,
+                // the drain fails — the other half of the budget.
+                responses.push(MockResp::Sse(vec![text_chunk("c1", "half an ans")]));
+            }
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counter = requests.clone();
+            let server = MockServer::start_with_hook(responses, move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            let mut notices: Vec<String> = Vec::new();
+            let err = agent
+                .run_input("hello", |ev| {
+                    if let AgentEvent::Notice(n) = ev {
+                        notices.push(n);
+                    }
+                })
+                .await
+                .expect_err("ten failed attempts must fail the turn");
+
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                10,
+                "one round = ten requests; got these notices: {notices:#?} (error: {err})"
+            );
+            // Both loops drew on the same budget — and said so with the same
+            // numbers, counting up through a single sequence rather than each
+            // restarting at 1.
+            let attempts: Vec<&String> = notices
+                .iter()
+                .filter(|n| n.contains("retrying in"))
+                .collect();
+            assert_eq!(attempts.len(), 9, "ten attempts means nine retries");
+            assert!(
+                attempts.iter().any(|n| n.starts_with("network error")),
+                "the connect failures are reported: {attempts:#?}"
+            );
+            assert!(
+                attempts.iter().any(|n| n.starts_with("stream interrupted")),
+                "the drain failures are reported too: {attempts:#?}"
+            );
+            for (i, n) in attempts.iter().enumerate() {
+                assert!(
+                    n.contains(&format!("(attempt {}/10)", i + 2)),
+                    "attempt {} of the shared budget reads: {n}",
+                    i + 2
+                );
+            }
+        }
+
+        /// A context overflow is not a transient failure and must not be
+        /// charged to the transient budget: compaction is a *different*,
+        /// smaller request, not a retry of the one that failed.
+        ///
+        /// 413 → compact once (one summarizer call) → retry. The retried
+        /// request then fails transiently forever, and must still get all ten
+        /// attempts: 1 + 1 + 10 = 12 requests. If the overflow round-trip were
+        /// counted, this would stop at 11.
+        #[tokio::test]
+        async fn a_context_overflow_compacts_once_without_spending_the_retry_budget() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let mut responses = vec![
+                // The request that overflows.
+                MockResp::HttpError(413),
+                // The summarizer call compaction makes in response.
+                MockResp::Sse(vec![
+                    text_chunk("s1", "Summary of the conversation so far."),
+                    stop_chunk("s1"),
+                    "[DONE]".to_string(),
+                ]),
+            ];
+            // Far more transient failures than the budget allows, so the count
+            // is decided by the budget and nothing else.
+            responses.extend((0..20).map(|_| MockResp::HttpError(503)));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counter = requests.clone();
+            let server = MockServer::start_with_hook(responses, move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            // Enough history that compaction actually shrinks something —
+            // otherwise `compact` no-ops and the overflow path bails early.
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+            let mut notices: Vec<String> = Vec::new();
+            agent
+                .run(steering_queue(), |ev| {
+                    if let AgentEvent::Notice(n) = ev {
+                        notices.push(n);
+                    }
+                })
+                .await
+                .expect_err("the transient failures after compaction fail the turn");
+
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                12,
+                "1 overflow + 1 summarizer + a full 10-attempt budget: {notices:#?}"
+            );
+            assert_eq!(
+                notices
+                    .iter()
+                    .filter(|n| n.contains("compacting and retrying"))
+                    .count(),
+                1,
+                "at most one automatic compaction per turn: {notices:#?}"
+            );
         }
 
         // ── compaction retries a transient error on the summarization call ────

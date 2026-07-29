@@ -843,6 +843,15 @@ mod tests {
 
     fn entry(key: u64) -> AgentEntry {
         let agent = Agent::new(AgentConfig {
+            // These tests drive turns against an endpoint nothing is listening
+            // on — that unreachable endpoint IS the fixture. A refused
+            // connection is a transient failure, so with the shipped policy the
+            // turn would spend ten attempts and ~6¼ minutes of backoff getting
+            // to the error the test asserts on. One attempt, no waiting.
+            retry: hrdr_llm::RetryPolicy {
+                max_attempts: 1,
+                ..Default::default()
+            },
             ..Default::default()
         })
         .unwrap();

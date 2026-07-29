@@ -377,6 +377,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **One retry seam for every provider, and a budget that means what it says.**
+  Error _classification_ was already shared — all three backends build the same
+  typed `ChatError` — but the retrying was not: three hand-rolled loops (connect
+  4, mid-stream drain 3, compaction 3) each re-implemented the same five lines,
+  and two of them **nested**. `connect_stream`'s attempt counter was
+  function-local, so every pass of the drain loop minted a fresh one: the real
+  ceiling was **20 requests per assistant round**, which is what neither
+  constant said. There is now one `RetryPolicy`/`RetryBudget` in `hrdr-llm`
+  owning classify → server hint or computed backoff → report → sleep → count,
+  and **connect and drain share one budget**, so "10 retries" is literally true
+  for a round. Compaction keeps its own, deliberately — it is a different model
+  call, not a retry of the same request. The policy is 10 attempts with waits of
+  5s, 10s, 20s, 40s then 60s (375s ≈ 6¼ minutes), keeping the existing ±25%
+  jitter and its process-wide counter so parallel sub-agents tripping one rate
+  limit do not retry in lockstep. A server `Retry-After` still wins, still
+  clamped to 60s — now the same constant as the backoff ceiling. The three
+  byte-identical 16-line HTTP-error blocks collapsed into one helper.
+  `HRDR_RETRY_ATTEMPTS` tunes the count; the schedule is fixed.
+
 - **The prompt says to run the project's suite, not the part that covers your
   diff.** The `Tests:` section had nine bullets on how to _write_ a test and
   none on running one; the only instruction to run the project's own tests fired

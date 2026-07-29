@@ -18,6 +18,7 @@ pub mod catalog;
 mod client;
 mod codex;
 pub mod fs;
+mod retry;
 pub mod sse;
 mod types;
 
@@ -26,6 +27,10 @@ pub use client::{
     url_host, wire_protocol,
 };
 pub use fs::{owner_only_options, owner_only_options_no_follow, unique_sibling_path};
+pub use retry::{
+    MAX_BACKOFF, RetryAttempt, RetryBudget, RetryPolicy, is_context_overflow, is_transient,
+    retry_after_hint,
+};
 pub use sse::{SseDecoder, SseEvent, SseOverflow};
 pub use types::{
     Accumulator, CacheMode, ChatChunk, ChatMessage, ChatRequest, ChunkChoice, Delta, FunctionCall,

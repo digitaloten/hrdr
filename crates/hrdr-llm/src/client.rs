@@ -290,7 +290,37 @@ pub(crate) fn classify_status(status: u16) -> ChatErrorKind {
     }
 }
 
-/// Parse a `Retry-After` header into a [`Duration`], clamped to 60 s.
+/// Turn a non-2xx HTTP response into the typed error every backend reports.
+///
+/// One definition, called from all three backends (this one, `anthropic.rs`,
+/// `codex.rs`), which each carried a byte-identical copy of it. They were
+/// identical because they must be — the agent's retry and compaction decisions
+/// read `kind`/`retry_after`, so a backend that classified differently would
+/// silently retry differently — and three copies is exactly the shape that
+/// drifts. Consumes `resp`: the body is read (capped) for the diagnostic.
+pub(crate) async fn error_from_response(resp: reqwest::Response) -> anyhow::Error {
+    let status = resp.status();
+    let retry_after = retry_after_from_headers(resp.headers());
+    let text = crate::capped_read::read_capped_text(resp, MAX_DIAGNOSTIC_BYTES).await;
+    let status_u16 = status.as_u16();
+    log_wire(
+        "error_response",
+        serde_json::json!({"status": status_u16, "body": text}),
+    );
+    anyhow::Error::new(ChatError {
+        status: Some(status_u16),
+        retry_after,
+        kind: classify_status(status_u16),
+        message: format!(
+            "chat endpoint returned {status}: {text}{}",
+            retry_after_suffix_from(retry_after)
+        ),
+    })
+}
+
+/// Parse a `Retry-After` header into a [`Duration`], clamped to
+/// [`MAX_BACKOFF`](crate::MAX_BACKOFF) — the same ceiling the computed backoff
+/// obeys, so no server can park a turn for longer than our own worst wait.
 /// Accepts both delta-seconds (RFC 7231 §7.1.3) and IMF-fixdate formats.
 pub(crate) fn retry_after_from_headers(
     headers: &reqwest::header::HeaderMap,
@@ -301,7 +331,8 @@ pub(crate) fn retry_after_from_headers(
     let trimmed = raw.trim();
     // Delta-seconds: a bare integer.
     if let Ok(secs) = trimmed.parse::<u64>() {
-        return (secs > 0).then(|| std::time::Duration::from_secs(secs.min(60)));
+        return (secs > 0)
+            .then(|| std::time::Duration::from_secs(secs.min(crate::MAX_BACKOFF.as_secs())));
     }
     // IMF-fixdate: `Sun, 06 Nov 1994 08:49:37 GMT`
     parse_imf_fixdate(trimmed)
@@ -336,7 +367,7 @@ fn parse_imf_fixdate(raw: &str) -> Option<std::time::Duration> {
         .unwrap_or_default()
         .as_secs();
     let delay = total_secs.saturating_sub(now);
-    (delay > 0).then(|| std::time::Duration::from_secs(delay.min(60)))
+    (delay > 0).then(|| std::time::Duration::from_secs(delay.min(crate::MAX_BACKOFF.as_secs())))
 }
 
 /// Days since Unix epoch (1970-01-01) from a Gregorian year/month/day.
@@ -857,24 +888,8 @@ impl Client {
             .send()
             .await
             .context("chat stream request failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let retry_after = retry_after_from_headers(resp.headers());
-            let text = crate::capped_read::read_capped_text(resp, MAX_DIAGNOSTIC_BYTES).await;
-            let status_u16 = status.as_u16();
-            log_wire(
-                "error_response",
-                serde_json::json!({"status": status_u16, "body": text}),
-            );
-            return Err(anyhow::Error::new(ChatError {
-                status: Some(status_u16),
-                retry_after,
-                kind: classify_status(status_u16),
-                message: format!(
-                    "chat endpoint returned {status}: {text}{}",
-                    retry_after_suffix_from(retry_after)
-                ),
-            }));
+        if !resp.status().is_success() {
+            return Err(error_from_response(resp).await);
         }
 
         let mut bytes = resp.bytes_stream();

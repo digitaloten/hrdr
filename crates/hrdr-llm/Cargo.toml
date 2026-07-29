@@ -15,6 +15,10 @@ serde_json.workspace = true
 anyhow.workspace = true
 futures-util.workspace = true
 async-stream.workspace = true
+# The retry driver (src/retry.rs) sleeps between attempts, which needs a timer.
+# Already in the tree (reqwest runs on it, every other crate depends on it) —
+# this promotes it from a dev-dependency, it does not add a crate.
+tokio.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # O_NOFOLLOW for `owner_only_options_no_follow` (src/fs.rs, used by the wire-log
@@ -27,4 +31,3 @@ libc = "0.2"
 # Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).
 hrdr-test-support.workspace = true
 tempfile.workspace = true
-tokio.workspace = true

@@ -173,152 +173,14 @@ pub(crate) fn tool_error_text(e: &anyhow::Error) -> String {
     format!("Error: {e:#}")
 }
 
-/// Case-insensitive substring scan of an error's display string against a set
-/// of marker phrases — the shared shape of the classifiers below.
-fn err_mentions(e: &anyhow::Error, needles: &[&str]) -> bool {
-    let msg = e.to_string().to_ascii_lowercase();
-    needles.iter().any(|n| msg.contains(n))
-}
-
-/// Whether an error looks like a transient network/server failure worth
-/// retrying (connection issues `request failed`/`timed out`/…, 429, or 5xx).
-///
-/// Checks the typed [`hrdr_llm::ChatError`] first. A typed error's `message`
-/// carries the server's own response body (or, for a mid-stream error object,
-/// the server's own error text) — arbitrary data that happens to contain a
-/// word like "connection" or "reset" as part of an unrelated, permanent 400
-/// isn't evidence of a transient failure, so the broad substring scan below is
-/// **not** applied to it; `kind` alone decides. Only errors that never went
-/// through the typed path at all — raw transport/network failures (a reqwest
-/// send failure, a dropped connection mid-read) or a legacy plain-text error —
-/// fall back to the substring scan, where those same marker words genuinely
-/// describe the transport-level failure itself.
-pub(crate) fn is_transient(e: &anyhow::Error) -> bool {
-    if let Some(ce) = e.downcast_ref::<hrdr_llm::ChatError>() {
-        return ce.kind == hrdr_llm::ChatErrorKind::Transient;
-    }
-    err_mentions(
-        e,
-        &[
-            "request failed", // reqwest send() failure (network)
-            "timed out",
-            "connection",
-            "reset",
-            "broken pipe",
-            "returned 429", // rate limited
-            "returned 500",
-            "returned 502",
-            "returned 503",
-            "returned 504",
-            "returned 529",      // Anthropic "Overloaded"
-            "overloaded",        // Anthropic mid-stream overloaded_error
-            "incomplete stream", // stream truncated without terminal marker
-        ],
-    )
-}
-
-/// Whether an error is the server rejecting the request for exceeding the
-/// model's context window. The marker phrases are ported from pi's
-/// provider-specific overflow patterns (`packages/ai/src/utils/overflow.ts`),
-/// covering ~20 OpenAI-compatible backends.
-///
-/// Checks the typed [`hrdr_llm::ChatError`] first; falls back to a
-/// case-insensitive substring scan of the display string for errors that
-/// predate the typed form.
-pub(crate) fn is_context_overflow(e: &anyhow::Error) -> bool {
-    if let Some(ce) = e.downcast_ref::<hrdr_llm::ChatError>() {
-        match ce.kind {
-            hrdr_llm::ChatErrorKind::Overflow => return true,
-            hrdr_llm::ChatErrorKind::Transient => return false,
-            // `Other` falls through to the body-text scan: many providers
-            // signal context overflow with a 400 + descriptive body, which
-            // `classify_status` can't distinguish from an ordinary bad request.
-            hrdr_llm::ChatErrorKind::Other => {}
-        }
-    }
-    // Rate-limit / throttling errors sometimes contain overflow-ish wording
-    // (e.g. Bedrock's "Throttling: too many tokens") — exclude them first so
-    // they retry (via [`is_transient`]) rather than triggering a compaction.
-    if err_mentions(
-        e,
-        &["rate limit", "too many requests", "throttl", "returned 429"],
-    ) {
-        return false;
-    }
-    err_mentions(
-        e,
-        &[
-            // Generic phrasings (cover most backends + our own error text).
-            "context length",
-            "context_length",
-            "maximum context",
-            "context window",
-            "context size",
-            "too many tokens",
-            "token limit exceeded",
-            "reduce the length",
-            // Provider-specific (from pi's overflow.ts).
-            "prompt is too long",                     // Anthropic
-            "request_too_large",                      // Anthropic 413
-            "request too large",                      // Anthropic 413 (spaced)
-            "returned 413",                           // our formatting of a 413
-            "input is too long",                      // Bedrock
-            "exceeds the context window",             // OpenAI
-            "input token count",                      // Google Gemini
-            "maximum prompt length is",               // xAI Grok
-            "maximum allowed input length",           // OpenRouter/Poolside
-            "longer than the model's context length", // Together AI
-            "exceeds the limit of",                   // GitHub Copilot
-            "exceeded model token limit",             // Kimi
-            "too large for model with",               // Mistral
-            "model_context_window_exceeded",          // z.ai
-            "configured context size",                // DS4
-        ],
-    )
-}
-
-/// Process-wide counter mixed into jitter so concurrent agents (sub-agents
-/// especially) don't get identical jitter from same subsec-nanos and retry
-/// in lockstep.
-static JITTER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Map a sequence number to one of 1,000 evenly spaced jitter slots.
-pub(crate) fn retry_jitter(seq: u64) -> f64 {
-    0.75 + f64::from((seq % 1_000) as u32) / 2_000.0
-}
-
-/// Exponential backoff for retry `attempt` (1-based), capped at 8s, with
-/// ±25% jitter so parallel agents (sub-agents especially) tripping the same
-/// rate limit don't retry in lockstep and re-trip it together.
-pub(crate) fn retry_backoff(attempt: usize) -> std::time::Duration {
-    let secs = (0.5 * 2f64.powi((attempt as i32 - 1).max(0))).min(8.0);
-    // Every call increments the atomic counter, so concurrent agents receive
-    // adjacent jitter slots. The counter cycles evenly through all 1,000.
-    let seq = JITTER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::time::Duration::from_secs_f64(secs * retry_jitter(seq))
-}
-
-/// The server-requested wait from a `Retry-After` header, if the client embedded
-/// one in the error as `retry-after: <seconds>s` (see the client's rate-limit
-/// error formatting). Clamped to 60s so a hostile/oversized value can't stall the
-/// turn. Only the integer-seconds form is parsed (the HTTP-date form is ignored).
-///
-/// Checks the typed [`hrdr_llm::ChatError`] first; falls back to a text scan
-/// of the display string for errors that predate the typed form.
-pub(crate) fn retry_after_hint(e: &anyhow::Error) -> Option<std::time::Duration> {
-    if let Some(ce) = e.downcast_ref::<hrdr_llm::ChatError>() {
-        return ce.retry_after;
-    }
-    let msg = e.to_string().to_ascii_lowercase();
-    let after = msg.split("retry-after:").nth(1)?;
-    let secs: u64 = after
-        .trim_start()
-        .split(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()?;
-    (secs > 0).then(|| std::time::Duration::from_secs(secs.min(60)))
-}
+/// Error classification lives in hrdr-llm, next to the [`hrdr_llm::ChatError`]
+/// it reads — the agent decides what to *do* about a failure ("compact and
+/// retry", "give up on this round"), not what the failure *is*. `is_transient`
+/// and `retry_after_hint` moved with it and are now read only by
+/// [`hrdr_llm::RetryBudget`]; overflow is the one classification the agent still
+/// acts on itself, so it is re-exported here where its call sites already
+/// spell it `crate::is_context_overflow`.
+pub(crate) use hrdr_llm::is_context_overflow;
 
 /// Drain a chat stream into an [`Accumulator`], emitting `Reasoning` and `Text`
 /// deltas as they arrive. Shared by the turn loop, the budget-exhausted wrap-up
@@ -1296,34 +1158,46 @@ impl Agent {
     /// Stream one assistant turn, retrying both the connect and any transient
     /// mid-stream failure with the same backoff the connect path uses. History
     /// is unchanged when `drain_stream` fails, so a clean re-request is safe.
+    ///
+    /// **The round is the unit the retry budget is measured in.** Connecting and
+    /// draining are two ways for one request to fail, so they share the single
+    /// [`RetryBudget`] created here, threaded into [`Self::connect_stream`].
+    /// They used to hold a budget each — 3 drain retries wrapped around 4
+    /// connect retries — and because the connect loop restarted on every pass of
+    /// the drain loop, its allowance was handed back out four times: one round
+    /// could issue 20 requests, a number neither constant named. Anything added
+    /// to this loop later must take `budget` too, not open its own.
     async fn connect_and_drain<F: FnMut(AgentEvent)>(
         &mut self,
         defs: &[ToolDef],
         overflow_compacted: &mut bool,
         on_event: &mut F,
     ) -> Result<Drained> {
-        const MAX_DRAIN_RETRIES: usize = 3;
-        let mut drain_attempt = 0usize;
+        let mut budget = RetryBudget::new(self.retry_policy);
         loop {
             let mut stream = self
-                .connect_stream(defs, overflow_compacted, on_event)
+                .connect_stream(defs, overflow_compacted, &mut budget, on_event)
                 .await?;
             match drain_stream(&mut stream, on_event).await {
                 // Only the round that actually streamed is timed: the retried
                 // attempts and the backoff between them are not generation.
                 Ok(drained) => return Ok(drained),
-                Err(e) if is_transient(&e) && drain_attempt < MAX_DRAIN_RETRIES => {
-                    drain_attempt += 1;
-                    let delay =
-                        retry_after_hint(&e).unwrap_or_else(|| retry_backoff(drain_attempt));
-                    on_event(AgentEvent::Notice(format!(
-                        "stream interrupted — retrying in {:.0}s \
-                         (attempt {drain_attempt}/{MAX_DRAIN_RETRIES})",
-                        delay.as_secs_f64()
-                    )));
-                    tokio::time::sleep(delay).await;
+                Err(e) => {
+                    let retried = budget
+                        .retry(&e, &mut |a: RetryAttempt| {
+                            on_event(AgentEvent::Notice(format!(
+                                "stream interrupted — retrying in {:.0}s \
+                                 (attempt {}/{})",
+                                a.delay.as_secs_f64(),
+                                a.attempt,
+                                a.max_attempts
+                            )));
+                        })
+                        .await;
+                    if !retried {
+                        return Err(e);
+                    }
                 }
-                Err(e) => return Err(e),
             }
         }
     }
@@ -1364,15 +1238,17 @@ impl Agent {
     /// Open a chat stream, retrying transient network/server errors with
     /// exponential backoff and auto-compacting once on a context-length
     /// overflow. Emits `Notice` events for each recovery attempt.
+    ///
+    /// `budget` belongs to the caller's round, not to this function — see
+    /// [`Self::connect_and_drain`] for why it must not create its own.
     async fn connect_stream<F: FnMut(AgentEvent)>(
         &mut self,
         defs: &[ToolDef],
         overflow_compacted: &mut bool,
+        budget: &mut RetryBudget,
         on_event: &mut F,
     ) -> Result<ChatStream> {
         self.refresh_oauth_if_needed().await;
-        const MAX_RETRIES: usize = 4;
-        let mut attempt = 0usize;
         loop {
             match self.client.chat_stream(&self.messages, defs).await {
                 Ok(stream) => return Ok(stream),
@@ -1400,16 +1276,24 @@ impl Agent {
                         }
                         continue;
                     }
-                    // Transient network/server error → backoff and retry. Honor a
-                    // server `Retry-After` when present, else exponential backoff.
-                    if is_transient(&e) && attempt < MAX_RETRIES {
-                        attempt += 1;
-                        let delay = retry_after_hint(&e).unwrap_or_else(|| retry_backoff(attempt));
-                        on_event(AgentEvent::Notice(format!(
-                            "network error — retrying in {:.0}s (attempt {attempt}/{MAX_RETRIES})",
-                            delay.as_secs_f64()
-                        )));
-                        tokio::time::sleep(delay).await;
+                    // Transient network/server error → backoff and retry (the
+                    // driver honours a server `Retry-After` over its own
+                    // schedule). Note the overflow branch above `continue`s
+                    // *without* touching `budget`: a compaction is not a retry
+                    // of the same request, it is a different, smaller one, and
+                    // charging it here would cost the round a network retry it
+                    // may still need.
+                    if budget
+                        .retry(&e, &mut |a: RetryAttempt| {
+                            on_event(AgentEvent::Notice(format!(
+                                "network error — retrying in {:.0}s (attempt {}/{})",
+                                a.delay.as_secs_f64(),
+                                a.attempt,
+                                a.max_attempts
+                            )));
+                        })
+                        .await
+                    {
                         continue;
                     }
                     return Err(e);

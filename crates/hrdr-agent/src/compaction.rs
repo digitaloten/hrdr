@@ -9,8 +9,8 @@
 use anyhow::{Result, bail};
 
 use crate::{
-    Agent, AgentEvent, AgentRegistry, ChatMessage, MessageOrigin, Role, drain_stream,
-    flatten_tool_protocol, is_context_overflow, is_transient, retry_after_hint, retry_backoff,
+    Agent, AgentEvent, AgentRegistry, ChatMessage, MessageOrigin, RetryBudget, Role, drain_stream,
+    flatten_tool_protocol, is_context_overflow,
 };
 
 /// The context-usage token count at which proactive compaction fires:
@@ -567,8 +567,13 @@ impl Agent {
         // pressure) aborts the whole turn on a hiccup that a plain retry would
         // have ridden out. Separate from `stage`, which is about shrinking the
         // request on overflow, not retrying it unchanged.
-        const MAX_COMPACT_RETRIES: usize = 3;
-        let mut transient_attempt = 0usize;
+        //
+        // Its own budget, deliberately: summarizing is a *different* model call
+        // from the round that may have triggered it, so a round that already
+        // burned nine retries has not thereby decided that compaction gets
+        // none. The budgets that must not stack are the ones retrying the SAME
+        // request (connect and drain) — see `connect_and_drain`.
+        let mut budget = RetryBudget::new(self.retry_policy);
         let summary = loop {
             let history = match stage {
                 0 => full.clone(),
@@ -591,13 +596,15 @@ impl Agent {
             match self.plain_completion(req).await {
                 Ok(s) => break s,
                 Err(e) if is_context_overflow(&e) && stage < 4 => stage += 1,
-                Err(e) if is_transient(&e) && transient_attempt < MAX_COMPACT_RETRIES => {
-                    transient_attempt += 1;
-                    let delay =
-                        retry_after_hint(&e).unwrap_or_else(|| retry_backoff(transient_attempt));
-                    tokio::time::sleep(delay).await;
+                Err(e) => {
+                    // Silent: `compact` has no event sink (it is called from
+                    // overflow recovery and from `/compact` alike), so the retry
+                    // is reported to nobody — the caller's own notice covers the
+                    // outcome. The driver still sleeps and counts.
+                    if !budget.retry(&e, &mut |_| {}).await {
+                        return Err(e);
+                    }
                 }
-                Err(e) => return Err(e),
             }
         };
         if summary.trim().is_empty() {

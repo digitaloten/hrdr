@@ -219,26 +219,8 @@ pub(crate) async fn chat_stream(
     // header, and `build_body` never sees it.
     crate::client::log_wire("request", json!({"url": url, "body": body}));
     let resp = req.send().await.context("chat stream request failed")?;
-    let status = resp.status();
-    if !status.is_success() {
-        let retry_after = crate::client::retry_after_from_headers(resp.headers());
-        let text =
-            crate::capped_read::read_capped_text(resp, crate::capped_read::MAX_DIAGNOSTIC_BYTES)
-                .await;
-        let status_u16 = status.as_u16();
-        crate::client::log_wire(
-            "error_response",
-            json!({"status": status_u16, "body": text}),
-        );
-        return Err(anyhow::Error::new(crate::client::ChatError {
-            status: Some(status_u16),
-            retry_after,
-            kind: crate::client::classify_status(status_u16),
-            message: format!(
-                "chat endpoint returned {status}: {text}{}",
-                crate::client::retry_after_suffix_from(retry_after)
-            ),
-        }));
+    if !resp.status().is_success() {
+        return Err(crate::client::error_from_response(resp).await);
     }
 
     let stream = async_stream::try_stream! {

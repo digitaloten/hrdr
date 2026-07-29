@@ -643,6 +643,12 @@ request_timeout = 120    # seconds; connect + idle-read timeout (default: none)
 Scalars also honor `$HRDR_MAX_TOKENS` / `$HRDR_TOP_P` / `$HRDR_SEED` /
 `$HRDR_STREAM_USAGE` / `$HRDR_PROMPT_CACHE_TTL` / `$HRDR_REQUEST_TIMEOUT`.
 
+A failing model call is retried up to 10 times — waits of 5s, 10s, 20s, 40s,
+then 60s, honoring a server's `Retry-After` when it sends one. That whole
+allowance covers one assistant round, connection and stream together.
+`$HRDR_RETRY_ATTEMPTS=<n>` changes the count (`1` disables retrying); the
+schedule itself is fixed.
+
 ### MCP servers
 
 Connect [Model Context Protocol](https://modelcontextprotocol.io) servers to add

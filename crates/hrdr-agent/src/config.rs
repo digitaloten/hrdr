@@ -53,7 +53,7 @@ use crate::models::model_for_provider;
 use crate::oauth::has_oauth_credentials;
 
 use hrdr_llm::CacheMode;
-use hrdr_llm::{is_anthropic_backend, url_host};
+use hrdr_llm::{RetryPolicy, is_anthropic_backend, url_host};
 use hrdr_tools::{DEFAULT_MAX_OUTPUT, DEFAULT_MAX_OUTPUT_LINES, SandboxMode};
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -229,6 +229,15 @@ pub struct AgentConfig {
     pub temperature: Option<f32>,
     /// Safety bound on tool-call iterations per user turn.
     pub max_steps: usize,
+    /// How hard to retry a failing model call: ten attempts over ~6¼ minutes.
+    ///
+    /// Only the attempt count is exposed, and only through
+    /// `$HRDR_RETRY_ATTEMPTS` — the backoff schedule is not a knob, because a
+    /// tunable one is how a fleet of agents turns a provider's bad minute into
+    /// a retry storm. It is a field rather than a constant so tests (unit and
+    /// process-level alike) can drive the real retry loops without sleeping
+    /// through minutes of backoff.
+    pub retry: RetryPolicy,
     /// Cost budget in USD: the turn loop stops before the next model call once
     /// the session's estimated spend (incl. sub-agents) reaches it. `None` =
     /// unlimited. Estimates come from the models.dev catalog; a capped run
@@ -975,6 +984,7 @@ impl Default for AgentConfig {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             temperature: None,
             max_steps: 300,
+            retry: RetryPolicy::default(),
             max_cost: None,
             allow_unpriced: false,
             context_window: None,
@@ -1916,6 +1926,18 @@ pub(crate) const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     }),
     ("HRDR_STREAM_USAGE", |c, v| {
         c.stream_usage = env_bool(v)?;
+        Ok(())
+    }),
+    ("HRDR_RETRY_ATTEMPTS", |c, v| {
+        // The one part of the retry policy worth exposing: how long a failing
+        // provider is worth waiting for is a property of the operator's
+        // patience, not of the code. The *schedule* stays fixed (5s doubling to
+        // 60s) — a tunable backoff is how you get a retry storm.
+        let n: usize = env_parse(v, "a whole number ≥ 1 (1 disables retrying)")?;
+        if n == 0 {
+            return Err("must be at least 1 (the first attempt is not a retry)".to_string());
+        }
+        c.retry.max_attempts = n;
         Ok(())
     }),
     ("HRDR_REQUEST_TIMEOUT", |c, v| {

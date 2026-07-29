@@ -1197,6 +1197,13 @@ mod tests {
         let cfg = AgentConfig {
             cwd: cwd.clone(),
             base_url: "http://127.0.0.1:1/v1".to_string(),
+            // "Fail immediately" only holds if nothing retries: a refused
+            // connection is transient, and the shipped policy would sit through
+            // ten attempts of backoff before surfacing it.
+            retry: hrdr_agent::RetryPolicy {
+                max_attempts: 1,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let agent = Agent::new(cfg.clone()).expect("minimal test agent");
