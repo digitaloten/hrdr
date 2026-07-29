@@ -363,11 +363,48 @@ impl Tool for ShellTool {
         ctx.note_modifying_command(&before, &a.command);
         // Name the sandbox when it is what actually failed. An `EROFS` raised
         // deep inside a tool, about a path the model never named, otherwise
-        // reads as that tool being broken or absent — see `sandbox_denial_note`.
+        // reads as that tool being broken or absent — see `sandbox_denial`.
+        //
+        // …and when the sandbox is what failed, that is also the moment to offer
+        // a way past it. Ahead of the run only an allowlisted command could ask;
+        // here the refusal itself is the evidence that asking is warranted, which
+        // is what lets an unanticipated command be escalated at all instead of
+        // dead-ending in an explanation. Only when this attempt was confined
+        // (`NotEligible` — an already-approved run has nothing left to escalate,
+        // and a refused one was just answered).
+        let mut retried_unsandboxed = false;
         if let Ok(text) = &mut out
-            && let Some(note) = crate::sandbox::sandbox_denial_note(&ctx.sandbox, text)
+            && let Some(denial) = crate::sandbox::sandbox_denial(&ctx.sandbox, text)
         {
-            text.push_str(&note);
+            text.push_str(&denial.note);
+            if failed
+                && denial.kind.escalatable()
+                && escalation == crate::escalation::Escalation::NotEligible
+                && crate::escalation::consider_retry(&a.command, ctx).await
+                    == crate::escalation::Escalation::Approved
+            {
+                retried_unsandboxed = true;
+            }
+        }
+        if retried_unsandboxed {
+            let mut cmd = self.shell.command(&a.command);
+            cmd.current_dir(&ctx.cwd);
+            let before = ctx.tracked_sigs();
+            let rerun = run_streamed_command(cmd, &a.command, timeout, a.keep_ansi, ctx).await;
+            ctx.note_modifying_command(&before, &a.command);
+            // The confined attempt's output is replaced rather than appended to.
+            // It is a failure the user has just been told to disregard, and
+            // keeping both would leave the model reading two exit statuses for
+            // one command and guessing which one counts. The note says what
+            // happened so the transcript is not silently missing a run.
+            out = rerun.map(|run| {
+                format!(
+                    "{}\n\n[sandbox] the first attempt was refused by the OS sandbox; you \
+                     approved re-running this command outside it, and the output above is \
+                     that second, unconfined run.",
+                    run.output
+                )
+            });
         }
         // Say that the sandbox was not left, but only when it might explain the
         // failure. A refused escalation whose command then worked confined has

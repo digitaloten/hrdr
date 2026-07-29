@@ -900,7 +900,70 @@ pub(crate) fn gpu_device_nodes() -> Vec<std::path::PathBuf> {
     Vec::new()
 }
 
+/// Which confinement produced a failure — the machine-readable half of
+/// [`sandbox_denial`], so a caller can decide what to *do* about it rather than
+/// only what to say.
+///
+/// The distinction that matters is [`escalatable`](Self::escalatable): a denial
+/// that running outside the sandbox would actually fix, versus one where the
+/// bypass is either impossible or is itself the thing being prevented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenialKind {
+    /// A GPU node missing under `strict`.
+    GpuStrict,
+    /// ssh refusing a config file the user namespace made look root-less.
+    SshUserNamespace,
+    /// A shell cut off the network (`deny_network`).
+    NetworkDenied,
+    /// A refused write into git metadata (`deny_git_writes`).
+    GitMetadata,
+    /// An ordinary EROFS: a write outside this agent's roots.
+    WriteOutsideRoots,
+}
+
+impl DenialKind {
+    /// Whether re-running the command outside the sandbox is a coherent thing to
+    /// offer.
+    ///
+    /// Two of these are excluded on principle rather than practicality. A
+    /// [`NetworkDenied`](Self::NetworkDenied) or [`GitMetadata`](Self::GitMetadata)
+    /// failure IS the policy working: the sub-agent boundary is the feature, and
+    /// an offer to step over it would be offering to undo the thing that was
+    /// asked for. (Both are also unreachable from a prompt today — only delegated
+    /// agents carry those denials and none of them has a gate — but the reason
+    /// they stay out is the first one, which survives that changing.)
+    ///
+    /// [`GpuStrict`](Self::GpuStrict) is excluded because `strict` refuses every
+    /// bypass anyway ([`unsandboxed_execution_allowed`](crate::escalation::unsandboxed_execution_allowed)):
+    /// the mode confines reads, and no approval prompt can honestly describe
+    /// giving that away.
+    pub fn escalatable(self) -> bool {
+        matches!(self, Self::SshUserNamespace | Self::WriteOutsideRoots)
+    }
+}
+
+/// A recognized sandbox denial: what it was, and the note explaining it.
+#[derive(Debug, Clone)]
+pub struct SandboxDenial {
+    pub kind: DenialKind,
+    /// The text appended to the command's output, leading newlines included.
+    pub note: String,
+}
+
+/// The note alone, for callers that only report.
 pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<String> {
+    sandbox_denial(policy, output).map(|denial| denial.note)
+}
+
+/// Recognize a failure the sandbox caused, and say both what it was and why.
+///
+/// Every arm is deliberately narrow: a note asserting the sandbox over an
+/// ordinary error would be wrong far more often than right, and a model that
+/// believes a false explanation debugs the wrong thing.
+pub fn sandbox_denial(policy: &SandboxPolicy, output: &str) -> Option<SandboxDenial> {
+    fn denial(kind: DenialKind, note: String) -> Option<SandboxDenial> {
+        Some(SandboxDenial { kind, note })
+    }
     if policy.mode == SandboxMode::None {
         return None;
     }
@@ -922,7 +985,8 @@ pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<Strin
         .iter()
         .any(|needle| lower.contains(needle))
     {
-        return Some(
+        return denial(
+            DenialKind::GpuStrict,
             "\n\n[sandbox] `strict` mode does not bind GPU devices (`/dev/kfd`, `/dev/dri`, \
              `/dev/nvidia*`), so a card that exists on this host is invisible in here. This is \
              not a machine without a GPU and not a broken driver — it is the confinement this \
@@ -935,7 +999,8 @@ pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<Strin
     // problem on disk, and the obvious "fix" — chmod'ing a system file — is a
     // real change made for a false reason, so say what is actually happening.
     if lower.contains("bad owner or permissions") {
-        return Some(
+        return denial(
+            DenialKind::SshUserNamespace,
             "\n\n[sandbox] that is the OS sandbox's user namespace, not a broken file. It maps \
              only your uid, so root-owned files (like `/etc/ssh/ssh_config`) read as `nobody` \
              inside here, and ssh refuses any config file it cannot vouch for. The file on disk \
@@ -971,7 +1036,8 @@ pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<Strin
         .iter()
         .any(|needle| lower.contains(needle))
     {
-        return Some(
+        return denial(
+            DenialKind::NetworkDenied,
             "\n\n[sandbox] that is this agent's network being denied, not a broken resolver or an \
              offline machine — a delegated agent's shell commands have no network at all, \
              deliberately. Do NOT retry it, edit `/etc/resolv.conf`, or report the host as \
@@ -1001,8 +1067,10 @@ pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<Strin
         .iter()
         .any(|needle| lower.contains(&needle.to_ascii_lowercase()))
     {
-        return Some(format!(
-            "\n\n[sandbox] that write was into git's metadata ({}), which is READ-ONLY for a \
+        return denial(
+            DenialKind::GitMetadata,
+            format!(
+                "\n\n[sandbox] that write was into git's metadata ({}), which is READ-ONLY for a \
              sub-agent — deliberately, and this is not a fault to work around. You may read \
              history freely (`git log`, `diff`, `show`, `status`) and edit tracked files; you \
              may not commit, stage, move a ref, or install a hook. You share this working \
@@ -1010,21 +1078,25 @@ pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<Strin
              its work and any sibling's into one commit under your message. Leave your changes \
              in the tree, list the files you changed in your report, and let the parent commit \
              them.",
-            join_roots(&policy.readonly_subpaths),
-        ));
+                join_roots(&policy.readonly_subpaths),
+            ),
+        );
     }
     let where_writable = if policy.writable_roots.is_empty() {
         "nothing is writable for this agent (read-only mode)".to_string()
     } else {
         format!("writable here: {}", join_roots(&policy.writable_roots))
     };
-    Some(format!(
-        "\n\n[sandbox] the \"read-only file system\" above is hrdr's sandbox refusing a write \
+    denial(
+        DenialKind::WriteOutsideRoots,
+        format!(
+            "\n\n[sandbox] the \"read-only file system\" above is hrdr's sandbox refusing a write \
          outside this agent's roots — {where_writable}. The program is installed and working; \
          it tried to write somewhere it may not. If it was a package runner fetching a tool \
          (`npx`, `uvx`, `pipx`), run the copy already on PATH instead of downloading one. If \
          the write is genuinely needed, say so — do not report the tool as missing or broken."
-    ))
+        ),
+    )
 }
 
 /// The command `shell`/`watch` actually spawn: `cmd_str` run through `shell`,
@@ -1665,6 +1737,59 @@ mod tests {
         ] {
             assert_eq!(sandbox_denial_note(&write, ordinary), None, "{ordinary}");
         }
+    }
+
+    /// Which denials may be answered by leaving the sandbox, and which are the
+    /// sandbox doing its job. The two `false` arms are the ones that matter: a
+    /// sub-agent's network and a sub-agent's git metadata are the delegation
+    /// boundary itself, so offering to step over them would be offering to undo
+    /// the feature.
+    #[test]
+    fn only_denials_a_bypass_would_fix_are_escalatable() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let write = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+        let erofs = sandbox_denial(&write, "EROFS: read-only file system").expect("recognized");
+        assert_eq!(erofs.kind, DenialKind::WriteOutsideRoots);
+        assert!(erofs.kind.escalatable());
+
+        let ssh = sandbox_denial(&write, "Bad owner or permissions on /etc/ssh/ssh_config")
+            .expect("recognized");
+        assert_eq!(ssh.kind, DenialKind::SshUserNamespace);
+        assert!(ssh.kind.escalatable());
+
+        let mut offline = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+        offline.deny_network();
+        let net = sandbox_denial(&offline, "curl: (6) Could not resolve host: example.com")
+            .expect("recognized");
+        assert_eq!(net.kind, DenialKind::NetworkDenied);
+        assert!(!net.kind.escalatable());
+
+        let sub = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![dir.path().to_path_buf()],
+            readable_roots: Vec::new(),
+            readonly_subpaths: vec![dir.path().join(".git")],
+            allow_network: true,
+        };
+        let git = sandbox_denial(
+            &sub,
+            "error: cannot open .git/index.lock: Read-only file system",
+        )
+        .expect("recognized");
+        assert_eq!(git.kind, DenialKind::GitMetadata);
+        assert!(!git.kind.escalatable());
+
+        let strict = SandboxPolicy::for_agent(SandboxMode::Strict, dir.path(), &[]);
+        let gpu = sandbox_denial(&strict, "failed to open /dev/kfd").expect("recognized");
+        assert_eq!(gpu.kind, DenialKind::GpuStrict);
+        assert!(!gpu.kind.escalatable());
+
+        // The note half is unchanged by the split — same text, same callers.
+        assert_eq!(
+            sandbox_denial_note(&write, "EROFS: read-only file system").as_deref(),
+            Some(erofs.note.as_str())
+        );
     }
 
     /// A denied network reads as a dead machine, so the note has to say

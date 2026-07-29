@@ -147,13 +147,35 @@ impl ApprovalGate {
         self.state().listeners > 0
     }
 
+    /// [`request_with_memory`](Self::request_with_memory) with "for the session"
+    /// available — the up-front, allowlisted path, where the rule the user is
+    /// approving was written by hand in advance.
+    pub async fn request(&self, command: &str, rules: &[String], reason: &str) -> ApprovalDecision {
+        self.request_with_memory(command, rules, reason, true).await
+    }
+
     /// Ask, and wait for the answer.
     ///
     /// Never waits when nobody can answer, and never waits longer than
     /// [`timeout`](Self::with_timeout) when someone can. Both paths end in
     /// [`ApprovalDecision::Deny`]: the whole feature fails closed, so the worst
     /// case is the command running exactly as confined as it does today.
-    pub async fn request(&self, command: &str, rules: &[String], reason: &str) -> ApprovalDecision {
+    ///
+    /// `remember` is whether a "for the session" answer may become a standing
+    /// grant. False makes the gate treat that answer as
+    /// [`Once`](ApprovalDecision::Once) and record nothing, which is what a
+    /// *derived* rule needs: a label like `sh` — from `curl … | sh`, whose
+    /// segments are each individually offerable — would otherwise be remembered
+    /// and silently auto-approve every later `sh` without showing the user a
+    /// thing. A rule somebody wrote into config in advance carries an intent that
+    /// a label inferred from one failing command does not.
+    pub async fn request_with_memory(
+        &self,
+        command: &str,
+        rules: &[String],
+        reason: &str,
+        remember: bool,
+    ) -> ApprovalDecision {
         let (id, rx) = {
             let mut state = self.state();
             // Headless, permanently: no channel to a human means the answer is
@@ -165,7 +187,15 @@ impl ApprovalGate {
             // Already approved for the session — every rule of them. Partial
             // coverage still asks: `git push && git fetch` where only the push
             // was approved is a command the user has not seen.
-            if rules.iter().all(|r| state.approved_rules.contains(r)) {
+            //
+            // The emptiness guard is load-bearing, not defensive tidiness: `all`
+            // over nothing is `true`, so a caller that passed no rules would be
+            // handed a silent session-wide approval it never asked a human about.
+            // No caller does today; one arriving later must fail closed.
+            if remember
+                && !rules.is_empty()
+                && rules.iter().all(|r| state.approved_rules.contains(r))
+            {
                 return ApprovalDecision::Session;
             }
             let id = format!("esc-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -188,6 +218,9 @@ impl ApprovalGate {
             (id, rx)
         };
         match tokio::time::timeout(self.timeout, rx).await {
+            // Downgraded rather than refused: the user did say yes, and this run
+            // should proceed. What they cannot do is make it standing.
+            Ok(Ok(ApprovalDecision::Session)) if !remember => ApprovalDecision::Once,
             Ok(Ok(ApprovalDecision::Session)) => {
                 // Keyed on the RULE, not the command: the point of "for the
                 // session" is that `git push origin main` and `git push -u
