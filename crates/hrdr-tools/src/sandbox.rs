@@ -214,8 +214,13 @@ impl SandboxPolicy {
     ///
     /// Deliberately NOT read-denied. A sub-agent reviewing its own work wants
     /// `git log`, `git diff`, `git show`; every one of those reads `.git`, and
-    /// none of them can write. Codex denies reads too (`.git` is masked as an
-    /// empty directory), which also costs it every read-only git command.
+    /// none of them can write. Codex takes the same posture — an existing `.git`
+    /// is `--ro-bind`ed, readable and unwritable (`linux-sandbox/src/bwrap.rs`);
+    /// its empty-directory mask applies only to a `.git` that does not exist
+    /// yet, to stop one being created. That last part has no equivalent here:
+    /// the denial below filters on `exists()`, so a repo a sub-agent creates
+    /// itself (`git init`, `git clone` into cwd) is not covered. It is not the
+    /// user's history, which is what this guard is for.
     pub fn deny_git_writes(&mut self, cwd: &Path) {
         if self.mode == SandboxMode::None {
             return;
