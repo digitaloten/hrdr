@@ -622,8 +622,11 @@ away. Not work; guardrails on work.
   matches) and default `max_concurrent_children` is 3; opencode's child session
   runs in the same directory (its `worktree/index.ts` exists but is not
   referenced from `task.ts`); pi's exists only as a 1015-line example spawning
-  `pi --json` subprocesses with no isolation. **hrdr's git-worktree isolation is
-  unique across all four, and `task_cleanup`'s merge verification has no peer.**
+  `pi --json` subprocesses with no isolation. **hrdr matched codex and opencode
+  here deliberately in 2026-07-29: sub-agents share the working directory, and
+  the isolation this paragraph praised was removed. What replaces it is the
+  read-only `.git` for write sub-agents, which no peer has — see
+  `SandboxPolicy::deny_git_writes`.**
 - **Read-before-write that refuses.** hrdr blocks all three non-`Fresh`
   `ReadState`s. Hermes detects staleness and its own docstring says _"Does not
   block — the write still proceeds"_; pi's `write` overwrites unconditionally. A
@@ -664,7 +667,8 @@ away. Not work; guardrails on work.
   that warns instead of blocking (hermes, pi); sub-agent self-reports treated as
   facts (hermes pops `files_written` before the model sees it and answers with a
   prompt saying summaries _"are SELF-REPORTS, not verified facts"_ — hrdr's
-  `task_diff` is the mechanical answer); and skill loading that fails **open**
+  answer is that a sub-agent's edits are already in the tree, so `git diff` is
+  the mechanical check); and skill loading that fails **open**
   (opencode logs and skips a YAML error, silently drops a file that fails its
   shape check).
 

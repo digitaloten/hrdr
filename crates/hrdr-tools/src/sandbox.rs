@@ -240,15 +240,16 @@ impl SandboxPolicy {
     /// pre-sandbox behavior (see the [`ToolContext::new`](crate::ToolContext::new)
     /// rule).
     ///
-    /// This guards the **model's file tools** and nothing else. hrdr's own git
-    /// plumbing — worktree creation, the commits `task_*` makes, `task_apply`'s
-    /// copies — reaches the disk through `std::process::Command`/`std::fs` and
-    /// never comes through here, which is the whole reason the metadata rule can
-    /// be absolute without breaking a write sub-agent's commit. `shell` is not
-    /// covered either, and *cannot* be: `git commit` legitimately writes
-    /// `.git/index` and moves a ref, so the git metadata roots stay writable at
-    /// the OS layer by design. The shell half of this is only ever enforceable
-    /// there, and today it is not enforced at all.
+    /// This guards the **model's file tools** and nothing else — `shell` does not
+    /// come through here, because `git commit` legitimately writes `.git/index`
+    /// and moves a ref, and the main agent has to be able to do that. So the
+    /// metadata rule can be absolute for the file tools (no tool of the model's
+    /// ever has business writing `.git`) while git itself still works.
+    ///
+    /// The shell half is enforceable only at the OS layer, and for a write
+    /// sub-agent it now IS enforced there — see
+    /// [`deny_git_writes`](Self::deny_git_writes), which subtracts `.git` from
+    /// the writable mounts. The main agent keeps it writable, deliberately.
     pub fn check_write(&self, canon: &Path, shown: &Path) -> anyhow::Result<()> {
         if self.mode == SandboxMode::None {
             return Ok(());

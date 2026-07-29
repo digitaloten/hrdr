@@ -8,6 +8,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- **`max_readonly_subagents` now defaults to 2** (was 5). Read-only sub-agents
+  cannot race each other, but they are not free: each holds a model context,
+  spends tokens, and hands back a report the parent has to read and verify. Five
+  at once is a fan-out wider than the parent can review carefully, which is the
+  failure that makes a broad read fan-out worse than a narrow one. With the
+  write cap at 1, the defaults are now 1 writer / 2 readers.
+
+### Fixed
+
+- **Removed every reference to the deleted `task_diff`/`task_consume`/
+  `task_cleanup` tools.** Five of them were in live model-facing text and were
+  telling the model to call tools that no longer exist: the write-capable prompt
+  fragment (`write.md`) pointed at `task_consume` for bringing a sub-agent's
+  work in, `task_transcript`'s own tool description named `task_diff` twice as
+  the way to review a change, and the `git branch -D` and
+  `git worktree remove --force` guardrail refusals both offered `task_cleanup`
+  as the correct alternative. The `TASK_TOOLS` shell-guard list and its poll
+  message also still listed the removed names. Found by a delegated audit of the
+  worktree removal; the remaining stale prose it found (README's worktree
+  section, several backlog entries) is not in this change.
+- `--max-readonly-subagents` and `--max-write-subagents` `--help` text, and
+  README's example config, stated the old defaults (5 and 2).
+
 - **`.git` is read-only for write sub-agents, enforced by the OS.** The prompt
   told a sub-agent not to commit; now it cannot. A delegated writer's sandbox
   subtracts the repository's git metadata from its writable set — a `--ro-bind`

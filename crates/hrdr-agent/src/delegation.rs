@@ -2256,9 +2256,6 @@ impl hrdr_tools::Tool for TaskCancelTool {
     }
 }
 
-/// `task_diff`: review a finished write sub-agent's work in one call, instead of
-/// the parent hand-rolling the 3-command git recipe (`status --porcelain`,
-/// `log --oneline HEAD..<branch>`, `diff HEAD...<branch>`) every time.
 /// `task_transcript`: read a sub-agent's run back as plain text.
 ///
 /// Exists because the harness used to point at the `.jsonl` and say "`read` it",
@@ -2280,11 +2277,11 @@ impl hrdr_tools::Tool for TaskTranscriptTool {
     fn description(&self) -> &'static str {
         "DIAGNOSTIC: read a sub-agent's whole run back as plain text — what it was asked, what it \
          thought, every tool call with its arguments and result, and what it answered. Reach for \
-         it when something is WRONG and the result alone doesn't explain it: `task_diff` shows a \
+         it when something is WRONG and the result alone doesn't explain it: `git diff` shows a \
          change you didn't expect, a task reports success but its work says otherwise, it failed \
          or was cancelled, or it clearly misread the brief. Most tasks need none of this — the \
          result is delivered to you automatically, and a write task's work is reviewed with \
-         `task_diff` (the change) not here (the conversation). A whole run is a lot of context, so \
+         `git diff` (the change) not here (the conversation). A whole run is a lot of context, so \
          spend it when you have a question it answers. Pass a live/finished task's integer `id`, \
          or the `NNN-slug` stem of a run from an earlier session (see `task_list`); long runs page \
          with `offset`/`limit`, like `read`. Never `read` the raw `.jsonl` yourself — it is one \

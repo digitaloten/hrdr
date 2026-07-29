@@ -59,7 +59,13 @@ use hrdr_tools::{DEFAULT_MAX_OUTPUT, DEFAULT_MAX_OUTPUT_LINES, SandboxMode};
 // ── Constants ───────────────────────────────────────────────────────────────
 
 /// Default cap on concurrently running read-only sub-agents.
-pub const DEFAULT_MAX_READONLY_SUBAGENTS: usize = 5;
+///
+/// **Two.** They change nothing, so they cannot race each other — but they are
+/// not free: every one holds a model context, spends tokens, and lands a report
+/// the parent has to read and verify. Five at once was a fan-out the parent
+/// could not review carefully, which is the failure that makes a wide read
+/// fan-out worse than a narrow one. Raise it deliberately.
+pub const DEFAULT_MAX_READONLY_SUBAGENTS: usize = 2;
 /// Default cap on concurrently running write-capable sub-agents.
 ///
 /// **One.** Every sub-agent shares the parent's working tree, so two writers are

@@ -141,16 +141,15 @@ pub fn default_guardrails() -> Vec<Guardrail> {
             // Lowercase `-d` alone is untouched — git itself refuses `-d` on an
             // unmerged branch, so it isn't a foot-gun that needs a guardrail.
             r"\bgit\s+branch\b[^&|;]*\s-[a-zA-Z]*D[a-zA-Z]*\b|\bgit\s+branch\b[^&|;]*\s--delete\b[^&|;]*\s--force\b|\bgit\s+branch\b[^&|;]*\s--force\b[^&|;]*\s--delete\b",
-            "force-deleting a branch destroys any unmerged commits on it — for a sub-agent's \
-             `hrdr/task-*` branch, use `task_cleanup` (it checks the work was merged first); \
-             otherwise ask the user before deleting",
+            "force-deleting a branch destroys any unmerged commits on it — ask the user before \
+             deleting",
         ),
         (
             // `--force`/`-f` anywhere on a `git worktree remove` line (before or
             // after the path, same as the force-push rule above).
             r"\bgit\s+worktree\s+remove\b[^&|;]*\s(--force\b|-[a-zA-Z]*f\b)",
-            "force-removing a worktree discards its uncommitted changes — use `task_cleanup` \
-             for task worktrees, or drop --force so git itself refuses when dirty",
+            "force-removing a worktree discards its uncommitted changes — drop --force so git \
+             itself refuses when the worktree is dirty, or ask the user",
         ),
         (
             // `git stash drop` / `git stash clear` — `stash pop`, `stash list`,
@@ -275,10 +274,9 @@ const TASK_TOOLS: &[&str] = &[
     "task_output",
     "task_transcript",
     "task_list",
-    "task_diff",
     "task_steer",
     "task_cancel",
-    "task_cleanup",
+    "task_revive",
 ];
 
 /// Transparent command prefixes that run the program which FOLLOWS them without
@@ -287,7 +285,7 @@ const TASK_TOOLS: &[&str] = &[
 const TRANSPARENT_PREFIXES: &[&str] =
     &["sudo", "nohup", "time", "command", "exec", "builtin", "env"];
 
-const TASK_TOOL_POLL_MSG: &str = "`task_output`/`task_list`/`task_diff`/… are hrdr tools, not shell commands — running them \
+const TASK_TOOL_POLL_MSG: &str = "`task_output`/`task_list`/`task_steer`/… are hrdr tools, not shell commands — running them \
      in a shell (or under `watch`) does nothing. You never poll a background task: it delivers \
      its result and wakes you automatically when it finishes. If you have nothing else to do \
      until then, tell the user in one line what it is doing and end your turn.";
@@ -648,7 +646,7 @@ mod tests {
             "task_output 1 2>&1 | grep -q done || task_output 1 2>&1 | grep -q finished || false"
         ));
         assert!(blocked("task_list"));
-        assert!(blocked("task_diff 2"));
+        assert!(blocked("task_steer 2"));
         assert!(blocked("task_transcript 3"));
         assert!(blocked("task_cancel 1 && echo stopped"));
         assert!(blocked("echo start; task_output 3"));

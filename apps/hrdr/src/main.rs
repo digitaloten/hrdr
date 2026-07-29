@@ -95,11 +95,11 @@ struct Cli {
     #[arg(long, global = true)]
     compaction_reserved: Option<u32>,
 
-    /// Most read-only sub-agents that may run at once (default 5).
+    /// Most read-only sub-agents that may run at once (default 2).
     #[arg(long, global = true, value_name = "N")]
     max_readonly_subagents: Option<usize>,
 
-    /// Most write-capable sub-agents that may run at once (default 2) — they
+    /// Most write-capable sub-agents that may run at once (default 1) — they
     /// share the working tree, so interleaved edits race.
     #[arg(long, global = true, value_name = "N")]
     max_write_subagents: Option<usize>,

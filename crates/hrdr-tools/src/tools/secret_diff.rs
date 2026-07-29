@@ -6,8 +6,8 @@
 //! back door, and the only one left now that the bespoke read-only `git` tool
 //! is gone and git runs through the shell.
 //!
-//! So this is applied where hrdr composes a diff ITSELF and hands it to a model
-//! — `task_diff` in `hrdr-agent`, reviewing a sub-agent's branch. It is not a
+//! So this would apply where hrdr composes a diff ITSELF and hands it to a
+//! model. Nothing does today — see the note on the function. It is not a
 //! guarantee about arbitrary shell output: a model that runs `git diff` in the
 //! shell gets what git prints, exactly as `cat` would. The shell has never been
 //! a redaction boundary, and pretending otherwise would be worse than the
@@ -166,10 +166,14 @@ fn unquote_c_style(s: &str) -> String {
 /// changed — just not its content. Covers `diff`, `show`, and `log -p` output;
 /// a no-op on plain `status`/`log`/`branch` output (no diff headers).
 ///
-/// `pub` (re-exported from the crate root) so callers outside this module —
-/// `task_diff` in `hrdr-agent`, which composes its own `git diff HEAD...<branch>`
-/// rather than going through [`GitTool`] — can run the same redaction over a
-/// diff they captured themselves.
+/// `pub` (re-exported from the crate root) for callers outside this module that
+/// compose a diff themselves rather than going through [`GitTool`].
+///
+/// **Nothing calls it today.** Its one caller was `task_diff` in `hrdr-agent`,
+/// which composed `git diff HEAD...<branch>` for a sub-agent's branch; sub-agent
+/// worktrees and that tool are both gone. Kept because the redaction itself is
+/// still correct and the next tool that assembles a diff will want it — but if
+/// none arrives, this module is deletable.
 pub fn redact_secret_diffs(output: &str) -> String {
     let mut out = String::with_capacity(output.len());
     let mut lines = output.lines().peekable();
