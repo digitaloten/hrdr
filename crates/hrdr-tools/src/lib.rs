@@ -36,10 +36,7 @@ mod verification;
 mod web;
 
 pub use gate::{Gate, GateCheck, GateSource};
-pub use guardrails::{
-    Guardrail, check_guardrails, default_guardrails, rebase_against_task_worktree,
-    task_worktree_rebase_message,
-};
+pub use guardrails::{Guardrail, check_guardrails, default_guardrails};
 pub use hooks::{
     DEFAULT_HOOK_TIMEOUT_SECS, EventHook, Hook, HookEvent, HookOutcome, run_event_hooks,
     run_file_hooks,
@@ -132,20 +129,6 @@ pub struct BackgroundTask {
     /// Whether the task was cancelled by the parent (`task_cancel`) — its result
     /// (if any) is discarded, not delivered.
     pub cancelled: bool,
-    /// For a **write-capable** sub-agent: the isolated git worktree its edits
-    /// land in (nothing touches the main working dir until the parent reviews and
-    /// merges). `None` for a read-only sub-agent, which shares the main dir.
-    pub worktree: Option<PathBuf>,
-    /// The scratch branch the [`worktree`](Self::worktree) is on, if any.
-    pub branch: Option<String>,
-    /// Best-effort size summary for a finished write task — file count,
-    /// insertions/deletions (from `git diff --shortstat`), and the commit
-    /// subjects (from `git log --oneline`) — computed once, when the task
-    /// completes, and rendered into the `drain_background` delivery message so
-    /// the parent sees the scale of the result before calling `task_diff`.
-    /// `None` for a read-only task, or when the git calls failed (never blocks
-    /// or fails the delivery over this best-effort extra).
-    pub size_summary: Option<String>,
     /// The model the sub-agent runs on, for `task_list`.
     pub model: String,
     /// When the run started, for a `task_list` elapsed readout. `None` in tests /

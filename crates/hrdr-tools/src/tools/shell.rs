@@ -311,28 +311,6 @@ impl Tool for ShellTool {
         if let Some(msg) = crate::check_guardrails(&a.command, &ctx.guardrails) {
             bail!("command blocked: {msg}");
         }
-        // Path-aware, so it cannot be a pattern in the list above: rebasing your
-        // OWN checkout (`git -C . rebase origin/main`) is ordinary work, and
-        // rebasing a sub-agent's worktree is the hand-rolled integration step
-        // `task_consume` exists to replace. Same command shape; only the
-        // directory tells them apart.
-        {
-            let worktrees: Vec<(u64, std::path::PathBuf)> = ctx
-                .background_tasks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .filter_map(|t| t.worktree.clone().map(|w| (t.id, w)))
-                .collect();
-            let borrowed: Vec<(u64, &std::path::Path)> =
-                worktrees.iter().map(|(id, p)| (*id, p.as_path())).collect();
-            if let Some(id) = crate::rebase_against_task_worktree(&a.command, &borrowed) {
-                bail!(
-                    "command blocked: {}",
-                    crate::task_worktree_rebase_message(id)
-                );
-            }
-        }
         // Guardrails first, confinement second: a blocked command never runs,
         // sandboxed or not.
         let mut cmd = crate::sandbox::sandboxed_shell_command(
@@ -1179,54 +1157,6 @@ mod tests {
         assert!(
             !marker.exists(),
             "the grandchild's sleep completed — it was never actually killed"
-        );
-    }
-
-    /// The worktree-rebase block has to reach the model through `shell` itself,
-    /// and it has to leave an identically-shaped command against the parent's own
-    /// checkout alone — the directory is the only thing separating them.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_rebase_aimed_at_a_task_worktree_is_refused_by_the_shell_tool() {
-        let dir = tempfile::tempdir().unwrap();
-        let wt = dir.path().join("wt-7");
-        std::fs::create_dir_all(&wt).unwrap();
-        let ctx = ToolContext::new(dir.path().to_path_buf());
-        ctx.background_tasks
-            .lock()
-            .unwrap()
-            .push(crate::BackgroundTask {
-                id: 7,
-                worktree: Some(wt.clone()),
-                branch: Some("hrdr/task-7".to_string()),
-                ..Default::default()
-            });
-
-        let err = ShellTool::new(Shell::Bash)
-            .execute(
-                json!({"command": format!("git -C {} rebase main", wt.display())}),
-                &ctx,
-            )
-            .await
-            .expect_err("hand-rolling the integration is refused");
-        let msg = err.to_string();
-        assert!(msg.contains("task_consume 7"), "{msg}");
-
-        // The same command against the parent checkout runs. It fails (no repo
-        // here), but as a COMMAND — it was not blocked.
-        let out = ShellTool::new(Shell::Bash)
-            .execute(
-                json!({"command": format!("git -C {} rebase origin/main", dir.path().display())}),
-                &ctx,
-            )
-            .await;
-        let text = match &out {
-            Ok(t) => t.clone(),
-            Err(e) => e.to_string(),
-        };
-        assert!(
-            !text.contains("command blocked"),
-            "rebasing your own checkout must not be blocked: {text}"
         );
     }
 

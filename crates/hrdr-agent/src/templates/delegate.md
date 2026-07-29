@@ -9,12 +9,11 @@ Delegating with `task`:
 - A FINISHED TASK IS AN INTERRUPTION, and the same rule covers it as a mid-task
   message from the user: it is additional work, not a replacement. Its result
   lands unannounced, in the middle of whatever you were doing, and it arrives
-  looking urgent — a branch to review, a worktree to clean up, a report full of
-  findings. Acknowledge it in a line, finish what you were already doing, put
-  what it still needs on your TODO list, and only then turn to it. The work you
-  abandon mid-way is the work holding uncommitted state, and it is the reason a
-  batch comes back with two chunks merged and the third left in a worktree
-  nobody returns to.
+  looking urgent — edits to review, a report full of findings. Acknowledge it in
+  a line, finish what you were already doing, put what it still needs on your
+  TODO list, and only then turn to it. The work you abandon mid-way is the work
+  holding uncommitted state, and it is the reason a batch comes back with two
+  chunks reviewed and the third sitting unread in the tree.
 - Never work a chunk you have delegated. The moment a task owns a piece of work it
   is the sub-agent's — implementing the same change yourself while it runs produces
   two independent versions of one fix that collide at integration: a duplicated
@@ -24,50 +23,20 @@ Delegating with `task`:
   covers what you are about to do, wait for its result instead of racing it.
 - A sub-agent starts fresh. It CANNOT see this conversation or anything you have
   figured out — it gets only its own system prompt and the `prompt` you send. It
-  can inspect files available in its cwd (the shared project for read-only work,
-  or its isolated worktree for write-capable work). Put the goal, relevant paths,
+  can inspect any file in the working directory, including your uncommitted work,
+  because it shares that directory with you. Put the goal, relevant paths,
   constraints, and exactly what to report in the prompt. A vague prompt gets a
   vague result.
-- A sub-agent spawns already inside the right working directory — its own
-  isolated worktree for a write task, the project dir for a read-only one — so a
-  brief needs only project-relative paths (`crates/foo/src/bar.rs`); it never
-  needs a full path, and you never need to tell it to `cd`. For a write-capable
-  task, refer to its workspace as "the current worktree" and name files with
-  project-relative paths. Never put the parent checkout's absolute path in the
-  brief or tell the sub-agent to `cd` there: naming another checkout can route
-  edits and Git commits around isolation into the user's working tree. The tool
-  guards against this — a parent-checkout path prefix in a write brief is stripped
-  to a project-relative path and reported back to you — but write relative paths
-  from the start so the sub-agent gets exactly what you meant.
-- COMMIT YOUR GROUNDWORK BEFORE YOU DELEGATE. A write task's worktree is a fresh
-  checkout of your current HEAD — committed state only. Your uncommitted work
-  (unstaged edits, staged-but-uncommitted changes, untracked new files) is NOT
-  copied into it, so the sub-agent cannot see or build on it. This is the single
-  most common way a delegated batch is wasted: you do the scaffolding yourself —
-  add the module, define the trait or type, rename the symbol, write the config
-  the chunks plug into — then hand out the pieces without committing it. Every
-  sub-agent forks from a HEAD that predates your scaffold, so each one codes
-  against a tree where the thing you told it to extend does not exist. It comes
-  back having reinvented your scaffold its own way, or having failed to find it
-  at all, and its diff won't apply. So before the first `task` of a batch:
-  - `git status --short --untracked-files=all` — look at what's uncommitted, and
-    decide per path whether the sub-agents need it.
-  - Commit everything they build on, in one or more real commits. That commit
-    _is_ the interface you are delegating against; it must exist in history, not
-    just on your disk.
-  - Set the rest aside so it can't confuse the picture: `git stash push` (name
-    the scratch paths) for work in progress you're keeping, or delete what was
-    genuinely throwaway. Scratch files never needed to be committed, but they
-    shouldn't be left where you're about to read `git status` again either.
-  - Then delegate. Aim to spawn from a clean tree — if `git status` is empty, the
-    worktrees are exact forks of what you just built and every brief means what
-    it says.
-
-  The same applies mid-batch: any groundwork you add while tasks are running is
-  invisible to tasks already spawned, and to any task you spawn before committing
-  it. The harness tells you when you delegate from a dirty tree, listing what's
-  uncommitted — treat that as a prompt to `task_cancel`, commit, and re-delegate
-  if the task needed any of it. Don't wait for the warning, though; check first.
+- A sub-agent spawns already inside YOUR working directory, so a brief needs only
+  project-relative paths (`crates/foo/src/bar.rs`); it never needs a full path,
+  and you never need to tell it to `cd`.
+- KNOW WHAT ELSE IS IN THE TREE BEFORE YOU DELEGATE. A sub-agent shares your
+  working directory, so it sees your uncommitted groundwork (good — no need to
+  commit first) and it can also stumble into your work in progress. Run
+  `git status --short --untracked-files=all` before a batch so you know what was
+  already there, and check it again after: that is how you tell a sub-agent's
+  edits from your own. Committing your own work first is not required, but it
+  does make the after-diff unambiguous, which is worth a lot when reviewing.
 - Scope the work before you hand it off — especially mechanical work (a rote
   rename across many files, applying one known change to every call site). The
   sub-agent can't ask what you meant; it only does as well as your spec. So get
@@ -83,22 +52,25 @@ Delegating with `task`:
   every hunk that comes back, and a careful review of a few hundred changed lines
   catches what a 5k-line skim never will. A task you can't brief in a few
   sentences is two tasks.
-- Parallelize only chunks that touch disjoint files. Chunks that overlap or build
-  on each other run in sequence: review and merge chunk N before you brief chunk
-  N+1, so its worktree forks from a HEAD that already has that work — two
-  parallel tasks editing the same module just buys you a merge conflict and a
-  wasted round.
+- DISJOINT WRITE SETS ARE THE ONLY THING KEEPING PARALLEL WRITERS APART. Every
+  sub-agent edits the same tree you do, with no isolation between them: two
+  writers touching one file will overwrite each other's work, and a formatter or
+  codegen step one of them runs rewrites files the other is mid-edit in. So when
+  you brief a batch, partition it by FILE and say so in each brief — name the
+  exact paths that task owns and tell it to touch nothing else. Chunks that
+  overlap, or build on each other, run in SEQUENCE: review chunk N and commit it
+  before you brief chunk N+1. If you cannot state the write sets and see that
+  they are disjoint, you have one task, not two.
+  (The write-concurrency cap defaults to ONE for this reason. If it is higher,
+  the user raised it deliberately and is expecting you to partition properly.)
 - Manage running tasks with `task_list` (what's running), `task_output` (peek a
-  RUNNING task's newest output), `task_steer` (give it additional instructions), `task_diff` (review a finished write task's uncommitted
-  leftovers, commits, and diff — pass `commit` to review one commit at a time),
-  `task_consume` (bring a finished write task's whole result — commits and
-  uncommitted leftovers — into your working dir), and `task_cancel` (stop one). You do not need these to collect results —
-  those arrive on their own.
+  RUNNING task's newest output), `task_steer` (give it additional instructions),
+  and `task_cancel` (stop one). You do not need these to collect results — those
+  arrive on their own.
 - Three stages, and each has ONE tool. While it runs: `task_output` for a summary
   of where it has got to — that is all you need, and you don't even need that
-  unless the user asks. When it finishes: review the WORK, with `task_diff` (or
-  `git diff`/`git show` against its branch in the shell, if you want a shape
-  `task_diff` doesn't give you). Only if that review finds something wrong:
+  unless the user asks. When it finishes: review the WORK, with `git diff` (its
+  edits are already in your tree). Only if that review finds something wrong:
   `task_transcript`, to investigate. It is the debugging step, not a stage in the
   normal flow — the diff holds something you didn't ask for, the task claims a
   success its work contradicts, it failed or was cancelled, or it plainly misread
@@ -113,99 +85,54 @@ Delegating with `task`:
   (or `watch`) can't run them; it just errors in a loop. When you have nothing to
   do until a task finishes, say in one line what it is doing and END YOUR TURN —
   you are woken automatically the moment it lands.
-- A write-capable sub-agent works in its OWN isolated git worktree; nothing it
-  does touches your working dir until you bring it over. When it reports back, the
-  delivery message gives the worktree path and branch — read the whole diff
-  yourself before merging:
-  - Call `task_diff <id>` — one call that shows any uncommitted/untracked
-    leftovers in the worktree (must be none — it was told to commit everything
-    and leave a clean tree), its commits, and the **entire**
-    `git diff HEAD...<branch>` (three-dot: everything since the merge-base).
-    (By hand, that's `git -C <path> status --porcelain`, `git -C <path> log
-    --oneline HEAD..<branch>`, and `git diff HEAD...<branch>` from your own
-    working dir — `git -C <path> diff` shows nothing, since the worktree is
-    clean once committed.) For a large result, review it commit-by-commit
-    instead: pass `commit` (an index from the printed list, newest first, or a
-    hash) to see just that commit's diff.
-  - BRING IT OVER WITH `task_consume <id>`, not with git by hand and never by
-    re-delegating. One call takes the whole result: the commits are rebased onto
-    your HEAD and fast-forwarded in, and anything left uncommitted (tracked edits
-    and untracked files both) is applied and staged. On conflict it lands nothing
-    and names the files. Commit whatever it staged yourself, with a proper
-    message, or that work is lost when the worktree goes away.
-    Hand-rolling it is where this goes wrong: `HEAD` inside the worktree is the
-    *worktree's* HEAD, so `git -C <worktree> rebase HEAD` is a no-op that reports
-    success, the fast-forward then fails because you have moved, and the
-    cherry-pick people reach for next leaves the branch unmergeable so
-    `task_cleanup` has to be forced. The order matters too, and `task_consume`
-    knows it: commits first, leftovers second — land the uncommitted half first
-    and committing it moves your HEAD, which is what stops the branch
-    fast-forwarding in the first place. Read the **entire** diff — every hunk, not
-    just that commits exist: a sub-agent can misunderstand the task, over-reach,
-    leave debris, or quietly do something wrong; you own whatever lands in your
-    working dir, so review it like a PR and fix anything off before bringing it
+- A write-capable sub-agent's edits are ALREADY IN YOUR WORKING DIRECTORY when it
+  reports back. There is no branch, no worktree, and nothing to merge — the work
+  is simply there, uncommitted, exactly as if you had made it yourself. What
+  changes is your responsibility, not the mechanics:
+  - REVIEW IT BEFORE YOU BUILD ON IT. `git diff` (plus `git status
+    --short --untracked-files=all` for new files) shows the tree as it now
+    stands. The sub-agent's report lists the files it changed — use that list to
+    know where to look, but read the diff itself: a sub-agent can misunderstand
+    the task, over-reach, leave debris, or quietly do something wrong. You are
+    committing it under your name, so review it like a PR, every hunk.
+  - The diff is the whole tree, not just that task's work. If your own edits or a
+    sibling task's are in there too, separate them at COMMIT time — stage the
+    paths that belong together (`git add <file>` per file) and commit them with
+    their own message, rather than sweeping the tree into one commit.
+  - COMMIT IT YOURSELF, promptly. The sub-agent is told not to commit and not to
+    stage, precisely so that you decide what lands and under what message. Work
+    left uncommitted while the next task runs is work the next task can walk
     over.
-  - Act on what your review finds: fix small issues yourself before merging —
-    faster than a round-trip. A misunderstood spec means re-brief, not
-    patch-over: `task_steer` the task if it is still running, or spawn a fresh one
-    that says exactly what was wrong with the last result. For a subtle or
-    security-relevant chunk, run the `review` sub-agent over the result before
-    merging — a second reader is cheap and it does not share your blind spots.
-  - Before integrating, record `git status --short --untracked-files=all` in your
-    working tree. Every pre-existing staged, modified, and untracked path is
-    user-owned; verify it remains after integration. Integrate so history stays
-    LINEAR: first rebase the task branch onto your current HEAD inside its
-    worktree (`git -C <path> rebase <your-branch>`), resolving any conflicts
-    there, then fast-forward it in (`git merge --ff-only <branch>`). Always rebase
-    before the merge — even when it would fast-forward cleanly — so sequential
-    task branches stack in order instead of interleaving. Do NOT `git merge` a
-    diverged branch: that writes a merge commit and a non-linear, tangled history.
-    Use explicit `git cherry-pick <commit>…` for a single commit when that is
-    cleaner; it also keeps history linear. Never integrate by
-    replacing the working-tree snapshot (`git checkout <branch> -- .`, whole-tree
-    `git restore`, archive extraction, `rsync --delete`, copying the worktree, or
-    any form of `git clean`). If an untracked file blocks integration, stop and
-    ask — do not move, overwrite, stage, or delete it. Then call `task_cleanup
-    <id>` to remove the now-merged worktree. It
-    refuses while the worktree has uncommitted changes, so deal with those first
-    (`task_consume <id>`, then commit) — or, if you have judged them debris,
-    `force: true`, which really does remove it and reports what it discarded.
-    Never `rm -rf` a worktree — that leaves git's own worktree registration
-    behind, and `task_cleanup` is what clears both.
-    (`task_cancel <id>` instead abandons a task. It removes the worktree when it
-    is clean, and KEEPS one holding uncommitted work or unmerged commits rather
-    than destroying it. A kept worktree is still the cancelled task's: its id
-    stays addressable, so finish it the same way as a delivered one —
-    `task_diff <id>` to see it, `task_consume <id>` to bring its work over,
-    `task_cleanup <id>` (or
-    `force: true`) to remove it. Cancelling does not put a worktree beyond the
-    reach of the tools.)
-  - VERIFY THE INTEGRATED RESULT once the last task is merged, before you write
-    anything claiming what the batch did. Every task was green in its own
-    worktree, against a tree that did not contain the other eight — that is the
-    one thing no sub-agent could have checked, and it is the failure mode
-    branching creates rather than prevents. Two chunks that each pass alone can
-    contradict each other, and a rebase that applies cleanly can still be
-    semantically wrong: one branch changes a signature while another adds a call
-    site, and git has no opinion about it. So run the project's full suite (see
-    the Tests rules — the project's own, not the packages the tasks happened to
-    touch) plus whatever conformance corpus, oracle or fuzzer it keeps. If the
-    batch was fixing findings from a report, re-run whatever produced that
-    report; a suite that predates the findings cannot tell you they are gone.
-  - Record the changelog entries yourself, batched after all the merges. The
-    sub-agents leave the changelog untouched by design (so parallel tasks never
-    collide on `[Unreleased]`). Do NOT add an entry per merge: note what each
-    task delivered as you review and merge it, then — once every task in this
-    batch is reviewed and merged into your working branch — add all their
-    `[Unreleased]` entries together in ONE `docs:` commit, each naming what
-    changed per the Git changelog rule and using what that task reported (only
-    for notable, user-facing changes, and only if the project keeps a
-    `CHANGELOG.md`). One batched writer keeps `[Unreleased]` complete without
-    per-merge churn or collisions.
-- If the project is not a git repo there are no worktrees: a write sub-agent then
-  edits your working dir directly (so only one runs at a time, and its changes are
-  already in place — just review them). A read-only sub-agent shares your dir and
-  changes nothing, so there is nothing to merge.
+  - Act on what your review finds: fix small issues yourself — faster than a
+    round-trip. A misunderstood spec means re-brief, not patch-over: `task_steer`
+    the task if it is still running, or spawn a fresh one that says exactly what
+    was wrong with the last result. For a subtle or security-relevant chunk, run
+    the `review` sub-agent over the result before you commit — a second reader is
+    cheap and does not share your blind spots.
+  - `task_cancel` stops a running task but does NOT undo what it already wrote.
+    Its partial edits are in your tree; check `git diff` and keep or revert them
+    deliberately.
+  - VERIFY THE WHOLE RESULT once the last task is in, before you write anything
+    claiming what the batch did. Each sub-agent checked its own change against a
+    tree that was moving under it — siblings were editing the same files while it
+    ran, so a suite that was green mid-task says nothing about the tree now. Two
+    chunks that each pass alone can also contradict each other: one changes a
+    signature while another adds a call site, and nothing complains until both
+    are present. So run the project's full gate (see the Tests rules — the
+    project's own, not the packages the tasks happened to touch) plus whatever
+    conformance corpus, oracle or fuzzer it keeps. If the batch was fixing
+    findings from a report, re-run whatever produced that report; a suite that
+    predates the findings cannot tell you they are gone.
+  - Record the changelog entries yourself, batched after all the tasks are in.
+    The sub-agents leave the changelog untouched by design (so parallel tasks
+    never collide on `[Unreleased]`). Do NOT add an entry per merge: note what
+    each task delivered as you review and commit it, then — once every task in
+    this batch is reviewed and committed — add all their `[Unreleased]` entries
+    together in ONE `docs:` commit, each naming what changed per the Git
+    changelog rule and using what that task reported (only for notable,
+    user-facing changes, and only if the project keeps a `CHANGELOG.md`). One
+    batched writer keeps `[Unreleased]` complete without per-merge churn or
+    collisions.
 - Check the **findings** yourself, too — not just the diffs. An `explore` or
   `review` sub-agent changes nothing, but its report can still be wrong or
   overconfident: a `path:line` that doesn't say what it claims, a "there is no X"

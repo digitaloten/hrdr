@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- **Sub-agent worktrees are gone; every sub-agent shares your working
+  directory.** A write-capable `task` used to run in a private git worktree on
+  its own branch, and its work reached you through a review-merge-clean sequence
+  (`task_diff` → `task_consume` → `task_cleanup`). All three tools are removed,
+  along with the worktree lifecycle behind them. A sub-agent's edits now land in
+  your tree as it makes them: review with `git diff`, commit them yourself. The
+  isolation was real, and so was its cost — a rebase-and-fast-forward step that
+  refused merges it should have made (twice in one observed session, after which
+  the model hand-rolled `git cherry-pick` instead), a commit the sub-agent was
+  forced to make for the hand-off to work at all, a fresh checkout of HEAD that
+  hid the parent's uncommitted groundwork from every task, and a duplicated
+  build tree per agent that turned a full-workspace test run into 1392 spawn
+  failures. Collision avoidance is now a brief-writing rule — partition by file,
+  name the paths each task owns — backed by a concurrency cap. Neither Codex nor
+  Claude Code isolates sub-agents by default either.
+- **`max_write_subagents` now defaults to 1** (was 2). Writers share one tree,
+  so the cap is the only thing between two of them and the same file; the
+  disjoint-write-set rule in the prompt is a convention, and a convention is not
+  a lock. Raise it deliberately when the work genuinely partitions.
+- **The `git rebase HEAD` guardrail no longer points at `task_consume`.** The
+  rule stands (rebasing a branch onto its own tip is a no-op that reads as
+  success, and `-C <dir>` makes it worse); only the suggested fix changed.
+- The `committing_subagent.md` prompt fragment is merged into
+  `subagent_write.md`. One topic, and split across two files the halves had
+  drifted — one described a worktree hand-off the other denied.
+
 ### Added
 
 - **A `verify` tool that runs the gate and answers one question.** Everything

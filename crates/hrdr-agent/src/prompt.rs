@@ -35,13 +35,14 @@ mod frag {
     pub const COMMITTING: &str = include_str!("templates/committing.md");
     /// `can_write` and NOT a sub-agent: changelog ownership, push rules.
     pub const COMMITTING_MAIN: &str = include_str!("templates/committing_main.md");
-    /// `can_write` and a sub-agent: hand-back discipline.
-    pub const COMMITTING_SUBAGENT: &str = include_str!("templates/committing_subagent.md");
     /// `can_delegate`: how to use `task`, pick a model, and not duplicate work.
     pub const DELEGATE: &str = include_str!("templates/delegate.md");
     /// A sub-agent: what it can and cannot see, and that it cannot delegate on.
     pub const SUBAGENT: &str = include_str!("templates/subagent.md");
-    /// A *write* sub-agent: worktree isolation and the parent-directory trap.
+    /// A *write* sub-agent: it shares the parent's tree — write-set discipline,
+    /// and why it neither commits nor stages. Absorbed the old
+    /// `committing_subagent.md`: one topic, and split across two fragments the
+    /// two halves drifted (one described a worktree hand-off the other denied).
     pub const SUBAGENT_WRITE: &str = include_str!("templates/subagent_write.md");
 }
 
@@ -75,8 +76,8 @@ mod frag {
 ///    below Environment because the cache split is taken there, so nothing from
 ///    here down costs the shared prefix anything.
 /// 10. **Sandbox** ([`sandbox_section`]) — the confinement mode and the concrete
-///     writable roots, which name the per-agent worktree `cwd`. Exactly as
-///     volatile as the Environment block's working-directory line, so it sits
+///     writable roots, which name this agent's `cwd`. Exactly as volatile as
+///     the Environment block's working-directory line, so it sits
 ///     below it, **dead last**. The cache split is computed *before* Environment,
 ///     so appending here costs the cached prefix nothing; moving it above
 ///     Environment would push per-agent bytes into the shared prefix.
@@ -124,11 +125,12 @@ pub fn capability_sections_for(
             }
         }
         out.push((SECTION_COMMITTING, frag::COMMITTING));
-        out.push(if delegated {
-            (SECTION_COMMITTING_SUBAGENT, frag::COMMITTING_SUBAGENT)
-        } else {
-            (SECTION_COMMITTING_MAIN, frag::COMMITTING_MAIN)
-        });
+        // The sub-agent half of this used to be its own fragment; it now lives in
+        // `SUBAGENT_WRITE`, pushed below under the same gate (can_write &&
+        // delegated), so a delegated writer still gets exactly one of the two.
+        if !delegated {
+            out.push((SECTION_COMMITTING_MAIN, frag::COMMITTING_MAIN));
+        }
     }
     if can_delegate {
         out.push((SECTION_DELEGATE, frag::DELEGATE));
@@ -213,7 +215,6 @@ pub const SECTION_SHELL: &str = "shell";
 pub const SECTION_SHELL_POSIX: &str = "shell_posix";
 pub const SECTION_COMMITTING: &str = "committing";
 pub const SECTION_COMMITTING_MAIN: &str = "committing_main";
-pub const SECTION_COMMITTING_SUBAGENT: &str = "committing_subagent";
 pub const SECTION_DELEGATE: &str = "delegate";
 pub const SECTION_SUBAGENT: &str = "subagent";
 pub const SECTION_SUBAGENT_WRITE: &str = "subagent_write";
@@ -341,9 +342,9 @@ pub fn project_agent_docs_section(docs: Option<&str>) -> String {
 
 /// Append the Environment block — tool list, OS, date, working directory — to an
 /// already-assembled prompt. This is the **volatile tail** of the prompt on
-/// purpose, and it runs last of all: the working directory is the one line that
-/// differs between sibling write sub-agents (each in its own worktree), and the
-/// date changes daily, so keeping both here leaves every byte before them — the
+/// purpose, and it runs last of all: the working directory can differ per agent
+/// (a `task` may be given an explicit cwd) and the date changes daily, so
+/// keeping both here leaves every byte before them — the
 /// base prompt, persona, AGENTS.md and memory — a shared prefix that a provider
 /// cache can reuse across sessions and across siblings.
 ///
@@ -427,10 +428,10 @@ const SKILL_DESCRIPTION_MAX_CHARS: usize = 120;
 /// drop it). Naming a tool the agent does not have is how a prompt sends a model
 /// after something it cannot call.
 ///
-/// Deliberately carries **no source paths**: a write sub-agent runs in its own
-/// worktree, so a `~/proj-hrdr-abc/.hrdr/skills` line would differ per sibling and
-/// push per-agent bytes into the shared cache prefix. The `skill` tool's own
-/// result names the source, where it costs nothing shared.
+/// Deliberately carries **no source paths**: an absolute `~/proj/.hrdr/skills`
+/// line is per-machine noise in a section every agent shares, and pushes bytes
+/// that cannot be cached across projects into the shared prefix. The `skill`
+/// tool's own result names the source, where it costs nothing shared.
 pub fn skills_section(tools: &ToolRegistry, skills: &[crate::Skill]) -> String {
     // `model_invocable: false` skills are the user's alone (`:release` pushes a
     // tag): not listed, and the tool refuses them. Filtered here rather than at
@@ -1346,29 +1347,35 @@ mod tests {
         assert!(!without_shell.contains("Verifying:") && !without_shell.contains("Shell:"));
     }
 
-    /// A write SUB-AGENT is told never to `cd`/run commands in the parent project
-    /// directory its worktree was forked from — reaching there for the parent's
-    /// build cache lands its commits on the parent's `main` and captures the
-    /// parent's (empty/stale) files instead of the worktree edits. A real failure
-    /// observed with a delegated model. Gated to write sub-agents (only they have
-    /// a worktree); the main agent, which has no worktree, does not get it.
+    /// A write SUB-AGENT is told it shares the parent's working directory: change
+    /// only what the task names, never run a tree-wide rewrite, never commit. All
+    /// three are the difference between two writers coexisting and one silently
+    /// undoing the other. Gated to write sub-agents; the main agent owns the tree
+    /// and gets none of it.
     #[test]
-    fn write_subagent_prompt_forbids_commands_in_the_parent_repo() {
+    fn write_subagent_prompt_states_the_shared_tree_discipline() {
         let tools = ToolRegistry::with_defaults();
         let sub = render_system(&tools, true).unwrap(); // delegated = true
         let main = render_system(&tools, false).unwrap();
         assert!(
-            sub.contains("the parent project directory your worktree was"),
-            "the parent-repo trap is named for a write sub-agent"
+            sub.contains("SAME directory as the agent that delegated to you"),
+            "the sub-agent is told the tree is shared"
         );
         assert!(
-            sub.contains("your entire workspace"),
-            "the positive allow-list framing is present"
+            sub.contains("Change only what your task names"),
+            "the write-set rule is stated"
         );
-        assert!(sub.contains("command, git included, from this worktree"));
         assert!(
-            !main.contains("the parent project directory your worktree was"),
-            "the main agent has no worktree, so it doesn't get the clause"
+            sub.contains("Do NOT commit"),
+            "committing is the parent's job"
+        );
+        assert!(
+            sub.contains("LIST THE FILES YOU CHANGED"),
+            "the report carries the write set, since the tree cannot"
+        );
+        assert!(
+            !main.contains("SAME directory as the agent that delegated to you"),
+            "the main agent owns the tree and gets none of this"
         );
     }
 
@@ -1465,8 +1472,8 @@ mod tests {
         );
     }
 
-    /// Sub-agents run in parallel worktrees, so each appending to `[Unreleased]`
-    /// would collide on merge. A sub-agent is therefore told NOT to touch the
+    /// Sub-agents run in parallel in one tree, so each appending to
+    /// `[Unreleased]` would collide. A sub-agent is therefore told NOT to touch the
     /// changelog — it does not get the "log as you work" rule — and the main
     /// agent records the entry when it integrates the sub-agent's work.
     #[test]
@@ -1994,10 +2001,7 @@ mod tests {
             "interactive git commands need a TTY",
             &["git rebase -i", "git add -p"],
         ),
-        (
-            "rebases a branch onto its own tip",
-            &["git rebase HEAD", "task_consume"],
-        ),
+        ("rebases a branch onto its own tip", &["git rebase HEAD"]),
         ("delete far more than any task needs", &["rm -rf"]),
         (
             "stages every tracked change",
@@ -2459,57 +2463,41 @@ mod tests {
         // versions of one change that collide at integration.
         assert!(p.contains("Never work a chunk you have delegated"), "{p}");
         assert!(p.contains("Delegate a chunk or keep it, never both"), "{p}");
-        // Integration keeps history linear: rebase the task branch, then
-        // fast-forward it in — never a merge commit off a diverged branch.
-        assert!(p.contains("Integrate so history stays\n    LINEAR"), "{p}");
-        assert!(p.contains("git merge --ff-only <branch>"), "{p}");
+        // Parallel writers share one tree, so the brief must partition by file.
+        assert!(p.contains("DISJOINT WRITE SETS"), "{p}");
+        assert!(p.contains("run in SEQUENCE"), "{p}");
         // Investigate/scope before delegating mechanical work.
         assert!(p.contains("Scope the work before you hand it off"), "{p}");
         assert!(p.contains("delegate the investigation to `explore`"), "{p}");
         assert!(p.contains("Investigate, THEN delegate the change"), "{p}");
         assert!(
-            p.contains("Never put the parent checkout's absolute")
-                && p.contains("current worktree"),
-            "write-task briefs must not route sub-agents around isolation: {p}"
+            p.contains("REVIEW IT BEFORE YOU BUILD ON IT") && p.contains("COMMIT IT YOURSELF"),
+            "the parent reviews and commits what a sub-agent leaves in the tree: {p}"
         );
-        // A write task's worktree is HEAD-only: uncommitted parent work isn't in
-        // it, so the scaffolding the chunks build on must be committed BEFORE the
-        // batch is handed out, and the scratch that isn't needed set aside — a
-        // delegating agent that skips this ships every sub-agent a tree without
-        // the thing it was told to extend.
+        // A sub-agent sees the parent's uncommitted work (same tree), so there is
+        // no groundwork to commit first — but the parent must know what was
+        // already there, or it cannot tell a sub-agent's edits from its own.
         assert!(
-            p.contains("COMMIT YOUR GROUNDWORK BEFORE YOU DELEGATE")
-                && p.contains("fresh\n  checkout of your current HEAD"),
-            "the parent is told to commit groundwork before delegating: {p}"
-        );
-        assert!(
-            p.contains("Commit everything they build on")
-                && p.contains("git stash push")
-                && p.contains("Aim to spawn from a clean tree"),
-            "commit what the sub-agents need, set aside the scratch they don't: {p}"
+            p.contains("KNOW WHAT ELSE IS IN THE TREE BEFORE YOU DELEGATE")
+                && p.contains("check it again after"),
+            "the parent records the tree's state around a delegation: {p}"
         );
         // Decompose into small, reviewable chunks, sequenced when they overlap.
         assert!(
             p.contains("Break big work into small, self-contained chunks"),
             "{p}"
         );
+        // The sub-agent's edits are already in the tree, so the review is a plain
+        // `git diff` — read like a PR, then committed by the parent.
+        assert!(p.contains("ALREADY IN YOUR WORKING DIRECTORY"), "{p}");
+        assert!(p.contains("review it like a PR, every hunk"), "{p}");
         assert!(
-            p.contains("Parallelize only chunks that touch disjoint files"),
-            "{p}"
+            p.contains("git status --short --untracked-files=all"),
+            "the parent records the tree's state so it can attribute the diff: {p}"
         );
-        // Points at `task_diff`, which reads the ENTIRE diff before merging, and
-        // still tells the parent to review it like a PR.
-        assert!(p.contains("Call `task_diff <id>`"), "{p}");
-        assert!(p.contains("its commits, and the **entire**"), "{p}");
-        assert!(p.contains("`git diff HEAD...<branch>`"), "{p}");
-        assert!(p.contains("Read the **entire** diff"), "{p}");
-        assert!(p.contains("review it like a PR"), "{p}");
         assert!(
-            p.contains("git status --short --untracked-files=all")
-                && p.contains("Every pre-existing staged, modified, and untracked path")
-                && p.contains("any form of `git clean`")
-                && p.contains("If an untracked file blocks integration, stop"),
-            "integration must preserve the main tree's untracked/user-owned files: {p}"
+            p.contains("does NOT undo what it already wrote"),
+            "cancelling a writer leaves its partial edits in the tree: {p}"
         );
         // Verify the findings of read-only agents, too — not just the diffs.
         assert!(p.contains("Check the **findings** yourself"), "{p}");
@@ -2580,15 +2568,15 @@ mod tests {
             "the main agent is not told it is a sub-agent"
         );
 
-        // The fresh-checkout note (regenerate deps/caches; no secrets) is
-        // sub-agent-only.
+        // The shared-tree note is sub-agent-only.
         assert!(
-            sub.contains("fresh checkout of")
-                && sub.contains("regenerate them first")
-                && sub.contains("do not go looking for them"),
-            "sub-agent is told its worktree is a bare checkout"
+            sub.contains("no isolation and no hand-back step"),
+            "sub-agent is told its edits are live in the parent's tree"
         );
-        assert!(!main.contains("fresh checkout of"), "main is not");
+        assert!(
+            !main.contains("no isolation and no hand-back step"),
+            "main is not"
+        );
 
         // The commit-at-each-checkpoint discipline is shared by both, above the
         // delegated gate.
@@ -2606,21 +2594,18 @@ mod tests {
             "shared commit discipline reaches the main agent: {main}"
         );
 
-        // The report-back + own-work-only + no-clean-the-dirt discipline is
-        // sub-agent-only (its work reaches the main agent only through git).
+        // The don't-commit + own-work-only discipline is sub-agent-only: it shares
+        // the parent's tree, so a commit or a stage from it would sweep up work
+        // that is not its own.
         assert!(
-            sub.contains("Committing is not optional for you")
-                && sub.contains("and commit all work YOU")
-                && sub.contains(
-                    "Your `Working directory` (in the Environment section below) is authoritative"
-                )
-                && sub.contains("already active")
+            sub.contains("Do NOT commit")
+                && sub.contains("Do not stage either")
+                && sub.contains("is authoritative and already active")
                 && sub.contains("never need to `cd` into it")
                 && sub.contains("project-relative paths")
-                && sub.contains("never `cd` there")
-                && sub.contains("Never delete, overwrite, or commit a")
-                && sub.contains("instead of \"cleaning\" it"),
-            "sub-agent gets the report-back commit discipline"
+                && sub.contains("Pre-existing uncommitted changes belong to")
+                && sub.contains("Do NOT edit the changelog"),
+            "sub-agent gets the shared-tree hand-back discipline"
         );
         assert!(
             !main.contains("Committing is not optional for you"),
@@ -2645,8 +2630,8 @@ mod tests {
             !sub.contains("committed result"),
             "a read-only sub-agent must not be told to commit: {sub}"
         );
-        // The worktree/fresh-checkout note is write-only too.
-        assert!(!sub.contains("fresh checkout of"), "{sub}");
+        // The shared-tree write discipline is write-only too.
+        assert!(!sub.contains("Change only what your task names"), "{sub}");
     }
 
     /// The current date is injected so the model doesn't guess it (wrong changelog
@@ -3000,9 +2985,8 @@ mod tests {
     }
 
     /// The listing is a menu: one line per skill, name and description only. No
-    /// bodies (that is what the tool is for) and no source paths (they name a
-    /// write sub-agent's own worktree, which would differ per sibling and split
-    /// the shared cache prefix).
+    /// bodies (that is what the tool is for) and no source paths (absolute,
+    /// per-machine, and they would split the shared cache prefix).
     #[test]
     fn skills_section_lists_names_and_descriptions_only() {
         let skills = [test_skill("commit", "stage and commit the working changes")];

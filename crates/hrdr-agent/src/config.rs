@@ -60,9 +60,18 @@ use hrdr_tools::{DEFAULT_MAX_OUTPUT, DEFAULT_MAX_OUTPUT_LINES, SandboxMode};
 
 /// Default cap on concurrently running read-only sub-agents.
 pub const DEFAULT_MAX_READONLY_SUBAGENTS: usize = 5;
-/// Default cap on concurrently running write-capable sub-agents. Lower: they
-/// share the main agent's working tree, so interleaved edits are a real race.
-pub const DEFAULT_MAX_WRITE_SUBAGENTS: usize = 2;
+/// Default cap on concurrently running write-capable sub-agents.
+///
+/// **One.** Every sub-agent shares the parent's working tree, so two writers are
+/// two processes editing the same files with nothing between them — one's
+/// formatter run or `git checkout` can undo the other's work mid-flight. The cap
+/// is the only mechanism enforcing that; the disjoint-write-set rule in
+/// `delegate.md` is a brief-writing convention, and a convention is not a lock.
+///
+/// Raise it (`max_write_subagents`, `HRDR_MAX_WRITE_SUBAGENTS`, or the CLI flag)
+/// when the work genuinely partitions and you want the parallelism — that is the
+/// user's call to make, not the model's.
+pub const DEFAULT_MAX_WRITE_SUBAGENTS: usize = 1;
 
 /// Turns a completed TODO stays in the agent's list before it ages out.
 pub const DEFAULT_TODO_TTL_TURNS: u64 = 5;
