@@ -152,6 +152,14 @@ impl ShellTool {
                     &ctx.sandbox_notices,
                 )
             }
+            // Same backend, same roots, same network — one lock lifted.
+            Escalation::Approved(Widening::GitMetadata) => crate::sandbox::sandboxed_shell_command(
+                self.shell,
+                command,
+                &ctx.sandbox.allow_git_writes(),
+                &ctx.cwd,
+                &ctx.sandbox_notices,
+            ),
             Escalation::NotEligible | Escalation::Denied(_) => {
                 crate::sandbox::sandboxed_shell_command(
                     self.shell,
@@ -453,6 +461,9 @@ impl Tool for ShellTool {
                     "with the same confinement but no user namespace"
                 }
                 crate::escalation::Widening::Full => "with no OS confinement",
+                crate::escalation::Widening::GitMetadata => {
+                    "with the same confinement but git metadata writable"
+                }
             };
             out = rerun.map(|run| {
                 format!(

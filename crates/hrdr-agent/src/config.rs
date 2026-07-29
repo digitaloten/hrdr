@@ -357,6 +357,28 @@ pub struct AgentConfig {
     /// is a project decision worth writing down, not one to slip in through an
     /// environment variable a script inherited.
     pub escalate: Vec<String>,
+    /// Keep the repository's git metadata read-only for the **main** agent too,
+    /// so a commit needs the user's approval (`protect_git = true`). Default
+    /// `false`. Config-only, for the same reason as [`escalate`](Self::escalate).
+    ///
+    /// A write sub-agent is confined this way unconditionally and always has
+    /// been — it shares the parent's working directory, so a commit from one
+    /// would sweep up everybody's work in progress. This extends the same lock to
+    /// the agent the user is talking to, where the argument is different: not
+    /// that it must never commit, but that the user should see it happen. Codex
+    /// denies `.git` to every agent for exactly this reason and routes commits
+    /// through an approval; with
+    /// [`Widening::GitMetadata`](hrdr_tools::Widening::GitMetadata) hrdr can do
+    /// the same.
+    ///
+    /// **Off by default, deliberately.** The threat it answers is the weakest of
+    /// the set: this is the agent whose arbitrary shell commands the user is
+    /// already trusting, so the lock buys a checkpoint rather than a boundary.
+    /// What it costs is a prompt on every commit — genuinely worth it for someone
+    /// running long unattended sessions on a repo they care about, and pure
+    /// friction for someone who commits twenty times an hour. That is a judgement
+    /// about how a particular person works, so it is theirs to make.
+    pub protect_git: bool,
     /// Post-edit hooks from `[[hooks]]` in config (formatters, mostly).
     pub hooks: Vec<HookConfig>,
     /// Post-edit LSP diagnostics (default `true`): after a mutating tool
@@ -793,6 +815,9 @@ pub(crate) struct FileConfig {
     /// run-outside-the-sandbox prompt.
     #[serde(default)]
     pub(crate) escalate: Vec<String>,
+    /// `protect_git = true` — keep git metadata read-only for the main agent too,
+    /// so commits go through an approval.
+    pub(crate) protect_git: Option<bool>,
     #[serde(default)]
     pub(crate) hooks: Vec<HookConfig>,
     pub(crate) tool_output: Option<ToolOutputConfig>,
@@ -1006,6 +1031,7 @@ impl Default for AgentConfig {
             providers: HashMap::new(),
             guardrails: Vec::new(),
             escalate: Vec::new(),
+            protect_git: false,
             hooks: Vec::new(),
             tool_max_bytes: DEFAULT_MAX_OUTPUT,
             tool_max_lines: DEFAULT_MAX_OUTPUT_LINES,
@@ -1678,6 +1704,9 @@ impl AgentConfig {
         }
         if !fc.guardrails.is_empty() {
             self.guardrails = fc.guardrails;
+        }
+        if let Some(protect_git) = fc.protect_git {
+            self.protect_git = protect_git;
         }
         if !fc.escalate.is_empty() {
             self.escalate = fc.escalate;

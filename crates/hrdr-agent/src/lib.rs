@@ -1671,7 +1671,15 @@ impl Agent {
         // ref write would move `main` with nothing in the harness noticing. The
         // prompt already says don't commit; this is what makes it true. Reads
         // stay open, so `git log`/`diff`/`show`/`status` all still work.
-        if config.delegated && !config.read_only {
+        //
+        // `protect_git` extends the same lock to the main agent, where it means
+        // something different: not "you may never commit" but "the user sees it
+        // when you do". A refused commit there is escalatable
+        // (`Widening::GitMetadata`) and a sub-agent's is not, because a sub-agent
+        // has no gate to ask through — one flag, two outcomes, decided by who
+        // holds the gate rather than by a second setting that could disagree.
+        sandbox.delegated = config.delegated;
+        if !config.read_only && (config.delegated || config.protect_git) {
             sandbox.deny_git_writes(&config.cwd);
         }
         // A sub-agent's shell gets no network; the parent's keeps it.

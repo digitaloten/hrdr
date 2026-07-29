@@ -106,7 +106,7 @@ impl std::fmt::Display for SandboxMode {
 /// A resolved confinement policy: the mode plus the concrete, canonicalized
 /// root sets. Built once per agent in `Agent::new`; `ToolContext` holds it
 /// behind an Arc so tool calls share it cheaply.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SandboxPolicy {
     pub mode: SandboxMode,
     /// Canonicalized (via [`canonicalize_nearest`]) writable roots. Empty when
@@ -131,6 +131,26 @@ pub struct SandboxPolicy {
     /// in the parent process and are untouched by it, which is what makes the
     /// denial affordable (see [`deny_network`](Self::deny_network)).
     pub allow_network: bool,
+    /// Whether this policy belongs to a sub-agent.
+    ///
+    /// Carried because the same *mechanism* means two different things depending
+    /// on who is confined by it, and the explanation owed to each differs. A
+    /// sub-agent refused a git metadata write has hit the delegation boundary and
+    /// must be told to hand its changes back; a main agent refused the same write
+    /// has hit a consent checkpoint it can ask its way through. Inferring this
+    /// from another field (every delegated agent also loses the network) would
+    /// work today and silently stop being true the first time those two are set
+    /// apart.
+    pub delegated: bool,
+    /// Writable roots that [`deny_git_writes`](Self::deny_git_writes) removed,
+    /// kept so an approved widening can put them back.
+    ///
+    /// Only ever non-empty when hrdr itself is running inside a linked worktree,
+    /// where committing needs the *parent* repo's `objects`/`refs` directories
+    /// (see [`git_metadata_roots`]). Clearing `readonly_subpaths` alone would not
+    /// restore those, so a commit approved by the user would still die on EROFS
+    /// somewhere the prompt never mentioned.
+    pub restored_git_roots: Vec<PathBuf>,
 }
 
 impl SandboxPolicy {
@@ -144,6 +164,8 @@ impl SandboxPolicy {
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         }
     }
 
@@ -185,6 +207,8 @@ impl SandboxPolicy {
             readable_roots,
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         }
     }
 
@@ -228,8 +252,17 @@ impl SandboxPolicy {
         let metadata = git_metadata_roots(cwd);
         if !metadata.is_empty() {
             let denied = canonical_roots(metadata);
-            self.writable_roots
-                .retain(|root| !denied.iter().any(|d| root == d));
+            self.writable_roots.retain(|root| {
+                let drop = denied.iter().any(|d| root == d);
+                if drop {
+                    // Remembered, not discarded: an approved
+                    // `Widening::GitMetadata` has to put these back, or a commit
+                    // the user consented to would still die on EROFS inside the
+                    // parent repo's object store.
+                    self.restored_git_roots.push(root.clone());
+                }
+                !drop
+            });
         }
         let mut denied: Vec<PathBuf> = self
             .writable_roots
@@ -240,6 +273,30 @@ impl SandboxPolicy {
         denied.sort();
         denied.dedup();
         self.readonly_subpaths = denied;
+    }
+
+    /// The same policy with git metadata writable again — what an approved
+    /// [`Widening::GitMetadata`](crate::escalation::Widening::GitMetadata) runs
+    /// under.
+    ///
+    /// Exactly undoes [`deny_git_writes`](Self::deny_git_writes) and nothing
+    /// else: the read-only subtraction is dropped and the metadata roots it
+    /// removed go back. Writable roots, readable roots, the mode and the network
+    /// rule are untouched, so this restores the ability to commit and grants
+    /// nothing beyond it.
+    ///
+    /// Order matters on the way back: the restored roots are appended and the
+    /// whole set re-canonicalized, so a root already covered by a broader one is
+    /// dropped rather than duplicated.
+    pub fn allow_git_writes(&self) -> Self {
+        let mut restored = self.clone();
+        restored.readonly_subpaths.clear();
+        if !restored.restored_git_roots.is_empty() {
+            let mut roots = std::mem::take(&mut restored.writable_roots);
+            roots.append(&mut restored.restored_git_roots);
+            restored.writable_roots = canonical_roots(roots);
+        }
+        restored
     }
 
     /// Cut this agent's shell children off the network: no socket a command it
@@ -964,20 +1021,27 @@ impl DenialKind {
     /// Whether re-running the command outside the sandbox is a coherent thing to
     /// offer.
     ///
-    /// Two of these are excluded on principle rather than practicality. A
-    /// [`NetworkDenied`](Self::NetworkDenied) or [`GitMetadata`](Self::GitMetadata)
-    /// failure IS the policy working: the sub-agent boundary is the feature, and
-    /// an offer to step over it would be offering to undo the thing that was
-    /// asked for. (Both are also unreachable from a prompt today — only delegated
-    /// agents carry those denials and none of them has a gate — but the reason
-    /// they stay out is the first one, which survives that changing.)
+    /// [`NetworkDenied`](Self::NetworkDenied) is excluded on principle: a
+    /// delegated agent's shell has no network *by design*, so offering to step
+    /// over that is offering to undo the thing that was asked for.
     ///
     /// [`GpuStrict`](Self::GpuStrict) is excluded because `strict` refuses every
-    /// bypass anyway ([`unsandboxed_execution_allowed`](crate::escalation::unsandboxed_execution_allowed)):
-    /// the mode confines reads, and no approval prompt can honestly describe
-    /// giving that away.
+    /// widening anyway — the mode confines reads, and no approval prompt can
+    /// honestly describe giving that away.
+    ///
+    /// [`GitMetadata`](Self::GitMetadata) **is** escalatable, and the asymmetry
+    /// with the network is the point. For a sub-agent it is a boundary, and one
+    /// that stays shut — a sub-agent has no [`ApprovalGate`](crate::ApprovalGate),
+    /// so nothing it runs can reach a prompt at all. For a main agent under a
+    /// uniform `.git` denial it is not a boundary but a consent checkpoint: the
+    /// user is meant to be asked before history moves, and being asked is the
+    /// whole feature. One flag cannot say both, so this says "a widening exists
+    /// that would fix it" and the gate decides who may use it.
     pub fn escalatable(self) -> bool {
-        matches!(self, Self::SshUserNamespace | Self::WriteOutsideRoots)
+        matches!(
+            self,
+            Self::SshUserNamespace | Self::WriteOutsideRoots | Self::GitMetadata
+        )
     }
 }
 
@@ -1119,6 +1183,24 @@ pub fn sandbox_denial(policy: &SandboxPolicy, output: &str) -> Option<SandboxDen
         .iter()
         .any(|needle| lower.contains(&needle.to_ascii_lowercase()))
     {
+        // The same refusal means two different things, so it gets two different
+        // explanations. For a main agent under a uniform `.git` denial the write
+        // is not forbidden, it is unconsented — and telling that agent to hand
+        // its changes back to a parent it does not have would be nonsense.
+        if !policy.delegated {
+            return denial(
+                DenialKind::GitMetadata,
+                format!(
+                    "\n\n[sandbox] that write was into git's metadata ({}), which this session \
+                     keeps read-only so that history never moves without the user agreeing to \
+                     it. Nothing is broken and there is nothing to work around: you may read \
+                     history freely and edit tracked files, and a commit is offered to the user \
+                     for approval when you make one. If one was just offered and declined, take \
+                     that as the answer — leave the work in the tree and say what you changed.",
+                    join_roots(&policy.readonly_subpaths),
+                ),
+            );
+        }
         return denial(
             DenialKind::GitMetadata,
             format!(
@@ -1730,6 +1812,8 @@ pub(crate) fn confined_ctx(dir: &Path, mode: SandboxMode) -> crate::ToolContext 
         readable_roots: vec![root],
         readonly_subpaths: Vec::new(),
         allow_network: true,
+        delegated: false,
+        restored_git_roots: Vec::new(),
     });
     ctx
 }
@@ -1823,6 +1907,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: vec![dir.path().join(".git")],
             allow_network: true,
+            delegated: true,
+            restored_git_roots: Vec::new(),
         };
         let git = sandbox_denial(
             &sub,
@@ -1830,7 +1916,31 @@ mod tests {
         )
         .expect("recognized");
         assert_eq!(git.kind, DenialKind::GitMetadata);
-        assert!(!git.kind.escalatable());
+        // Escalatable as a *kind* — a widening exists that would fix it — while
+        // staying unreachable for the sub-agent this policy belongs to, which has
+        // no gate to ask through. Its note says exactly that.
+        assert!(git.kind.escalatable());
+        assert!(
+            git.note.contains("READ-ONLY for a sub-agent"),
+            "{}",
+            git.note
+        );
+        assert!(git.note.contains("let the parent commit"), "{}", git.note);
+
+        // The same refusal to a MAIN agent is a consent checkpoint rather than a
+        // boundary, and must not tell it to hand work to a parent it does not
+        // have.
+        let mut protected = sub.clone();
+        protected.delegated = false;
+        let main = sandbox_denial(
+            &protected,
+            "error: cannot open .git/index.lock: Read-only file system",
+        )
+        .expect("recognized");
+        assert_eq!(main.kind, DenialKind::GitMetadata);
+        assert!(!main.note.contains("sub-agent"), "{}", main.note);
+        assert!(!main.note.contains("parent"), "{}", main.note);
+        assert!(main.note.contains("approval"), "{}", main.note);
 
         let strict = SandboxPolicy::for_agent(SandboxMode::Strict, dir.path(), &[]);
         let gpu = sandbox_denial(&strict, "failed to open /dev/kfd").expect("recognized");
@@ -2090,6 +2200,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         check_write(&policy, &common.join("index")).unwrap_err();
         check_write(&policy, &common.join("refs").join("heads").join("main")).unwrap_err();
@@ -2118,6 +2230,8 @@ mod tests {
             readable_roots: vec![root],
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
 
         for refused in [
@@ -2169,6 +2283,8 @@ mod tests {
             readable_roots: vec![canonicalize_nearest(dir.path())],
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         check_read(&read_policy, &dir.path().join(".git").join("config")).unwrap();
 
@@ -2218,6 +2334,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
 
         // The model's tools: its own source file yes; the worktree's `.git`
@@ -2279,6 +2397,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         let args = argv(&bwrap_args(
             SandboxMode::Write,
@@ -2605,6 +2725,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         assert_eq!(
             seatbelt_profile(SandboxMode::Write, &policy),
@@ -2630,6 +2752,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         assert!(
             seatbelt_profile(SandboxMode::Write, &odd)
@@ -2646,6 +2770,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         assert!(
             !seatbelt_profile(SandboxMode::Write, &empty).contains("file-write*"),
@@ -2670,6 +2796,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         policy.deny_network();
         let profile = seatbelt_profile(SandboxMode::Write, &policy);
@@ -2708,6 +2836,8 @@ mod tests {
             readable_roots: vec![PathBuf::from("/work/wt")],
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         assert_eq!(
             seatbelt_profile(SandboxMode::Strict, &policy),
@@ -2739,6 +2869,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         let args = argv(&seatbelt_args(&policy, crate::Shell::Bash, "echo hi"));
         assert_eq!(args[0], "-p");
@@ -2767,6 +2899,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
 
         let target = canonicalize_nearest(outside.path()).join("escaped");
@@ -2918,6 +3052,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         });
 
         std::fs::write(wt.join("f.txt"), "hi").unwrap();
@@ -3387,6 +3523,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
 
         let target = outside.path().join("escaped");
@@ -3468,6 +3606,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         let mine = notices();
         let run = |policy: &SandboxPolicy, notices: &SandboxNotices| {
@@ -3516,6 +3656,8 @@ mod tests {
             readable_roots: vec![canonicalize_nearest(dir.path())],
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         let mine = notices();
 

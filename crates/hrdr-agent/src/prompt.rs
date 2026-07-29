@@ -2997,6 +2997,8 @@ mod tests {
             readable_roots: roots.clone(),
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         assert!(
             !sandbox_section(&plain).contains("READ-ONLY"),
@@ -3036,6 +3038,8 @@ mod tests {
                 readable_roots: roots,
                 readonly_subpaths: Vec::new(),
                 allow_network: true,
+                delegated: false,
+                restored_git_roots: Vec::new(),
             };
             if !allow_network {
                 policy.deny_network();
@@ -3081,6 +3085,8 @@ mod tests {
             readable_roots: vec![std::path::PathBuf::from("/work/wt-1")],
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         let s = sandbox_section(&policy);
         assert!(
@@ -3101,6 +3107,8 @@ mod tests {
             readable_roots: vec![std::path::PathBuf::from("/work/ro")],
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         let s = sandbox_section(&ro);
         assert!(s.contains("Mode: read"));
@@ -3119,6 +3127,8 @@ mod tests {
             readable_roots: vec![std::path::PathBuf::from("/work/ro")],
             readonly_subpaths: Vec::new(),
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         let s = sandbox_section(&strict);
         assert!(s.contains("Mode: strict"));

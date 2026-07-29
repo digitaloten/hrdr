@@ -334,6 +334,16 @@ pub(crate) enum Widening {
     /// genuinely about the boundary rather than the mechanism — a write that has
     /// to land outside every writable root.
     Full,
+    /// Keep every part of the policy except the git-metadata subtraction, which
+    /// is lifted for this one command
+    /// ([`allow_git_writes`](crate::sandbox::SandboxPolicy::allow_git_writes)).
+    ///
+    /// The rung that makes a uniform `.git` denial usable. Codex denies git
+    /// metadata to every agent and routes commits through an approval; this is
+    /// that route. Narrower than either rung above — the confinement is intact,
+    /// including the network, and the only thing handed back is the ability to
+    /// write the repository's own metadata.
+    GitMetadata,
 }
 
 impl Widening {
@@ -346,6 +356,10 @@ impl Widening {
                  root-owned config files"
             }
             Self::Full => "runs with NO OS confinement at all: the whole filesystem, writable",
+            Self::GitMetadata => {
+                "keeps this agent's confinement exactly as it is, and lifts only the read-only \
+                 lock on the repository's git metadata — so this command may move history"
+            }
         }
     }
 }
@@ -467,6 +481,12 @@ pub(crate) fn widening_for(
     policy: &SandboxPolicy,
 ) -> Option<Widening> {
     use crate::sandbox::DenialKind;
+    // The narrowest rung of all, and the only one that answers this denial:
+    // no backend change and no bypass restores a subtraction, so nothing else
+    // would make the write land.
+    if kind == DenialKind::GitMetadata {
+        return widening_allowed(Widening::GitMetadata, policy).then_some(Widening::GitMetadata);
+    }
     if kind == DenialKind::SshUserNamespace
         && crate::sandbox::userns_free_backend_available()
         && widening_allowed(Widening::NoUserNamespace, policy)
@@ -506,6 +526,10 @@ pub(crate) fn widening_allowed(widening: Widening, policy: &SandboxPolicy) -> bo
     match widening {
         Widening::NoUserNamespace => policy.mode != SandboxMode::Strict && policy.allow_network,
         Widening::Full => unsandboxed_execution_allowed(policy),
+        // Nothing to lift, nothing to offer: without a subtraction this rung is
+        // the policy it already has, and a prompt asking to remove a lock that is
+        // not there would be pure noise.
+        Widening::GitMetadata => !policy.readonly_subpaths.is_empty(),
     }
 }
 
@@ -815,6 +839,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: vec![dir.path().join(".git")],
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         assert!(!unsandboxed_execution_allowed(&sub));
 
@@ -1108,6 +1134,8 @@ mod tests {
             readable_roots: Vec::new(),
             readonly_subpaths: vec![dir.path().join(".git")],
             allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
         };
         assert!(!widening_allowed(Widening::Full, &carved));
         assert!(widening_allowed(Widening::NoUserNamespace, &carved));
@@ -1159,6 +1187,66 @@ mod tests {
             !status.success() && !probe.exists(),
             "the narrow widening let a write escape the policy's roots"
         );
+    }
+
+    /// The git rung: offered for the metadata denial and for nothing else, and
+    /// only where there is actually a lock to lift.
+    #[test]
+    fn the_git_rung_is_offered_only_where_a_lock_exists() {
+        use crate::sandbox::DenialKind;
+        let dir = tempfile::tempdir().unwrap();
+
+        let locked = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![dir.path().to_path_buf()],
+            readable_roots: Vec::new(),
+            readonly_subpaths: vec![dir.path().join(".git")],
+            allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
+        };
+        assert_eq!(
+            widening_for(DenialKind::GitMetadata, &locked),
+            Some(Widening::GitMetadata)
+        );
+        // Nothing else answers this denial: no backend change and no bypass can
+        // restore a subtraction, so the git rung is the only rung.
+        assert!(widening_allowed(Widening::GitMetadata, &locked));
+
+        // With no lock there is nothing to lift, so nothing to ask about.
+        let plain = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+        assert!(!widening_allowed(Widening::GitMetadata, &plain));
+        assert_eq!(widening_for(DenialKind::GitMetadata, &plain), None);
+    }
+
+    /// Lifting the lock restores exactly the ability to commit and nothing else.
+    #[test]
+    fn allowing_git_writes_undoes_the_denial_and_no_more() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let mut policy = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![dir.path().to_path_buf()],
+            readable_roots: vec![dir.path().to_path_buf()],
+            readonly_subpaths: Vec::new(),
+            allow_network: true,
+            delegated: false,
+            restored_git_roots: Vec::new(),
+        };
+        policy.deny_git_writes(dir.path());
+        assert!(
+            !policy.readonly_subpaths.is_empty(),
+            "the denial did not take"
+        );
+
+        let freed = policy.allow_git_writes();
+        assert!(freed.readonly_subpaths.is_empty());
+        // Everything else is carried across untouched — this rung is about one
+        // lock, not about the boundary.
+        assert_eq!(freed.mode, policy.mode);
+        assert_eq!(freed.allow_network, policy.allow_network);
+        assert_eq!(freed.readable_roots, policy.readable_roots);
+        assert!(freed.writable_roots.contains(&dir.path().to_path_buf()));
     }
 
     /// The policy guard is not relaxed either: a mode or a subtraction that a
