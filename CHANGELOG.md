@@ -30,6 +30,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`git push`/`fetch`/`clone` over ssh works inside the sandbox again.**
+  Unprivileged bwrap must create a user namespace, and one maps only the
+  invoking uid — so every root-owned file inside it reads as uid 65534
+  (`nobody`). OpenSSH validates its config files' ownership
+  (`st_uid != 0 && st_uid != getuid()`), so `/etc/ssh/ssh_config` and anything
+  it `Include`s were refused and ssh died before connecting, with
+  `Bad owner or permissions on /etc/ssh/ssh_config.d/...`. Nothing was wrong on
+  disk — the files are `root:root 0644` and work fine outside the sandbox — and
+  the error invites a `chmod` of a system file that would not have helped. hrdr
+  now points git at `ssh -F <your ~/.ssh/config, else /dev/null>`, which per
+  ssh(1) skips the system-wide config entirely, so the files that only _look_
+  wrong are never opened; a `~/.ssh/config` is owned by the invoking uid and
+  still passes, so Host aliases and identities survive. An explicit
+  `GIT_SSH_COMMAND` is left alone. Not fixable by dropping `--unshare-user`
+  (bwrap creates the namespace regardless) or by mapping root (needs a
+  privileged helper), and Codex has the same constraint. A bare `ssh` in a shell
+  command still hits it, and now gets a note saying what is actually happening
+  instead of suggesting a chmod.
+
 - **`gpu_device_nodes()` now compiles on macOS and Windows.** The function
   (which reads `/dev` for GPU compute devices to bind them into the sandbox) was
   gated `#[cfg(target_os = "linux")]` but called from non-gated code paths in

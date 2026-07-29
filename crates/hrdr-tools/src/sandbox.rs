@@ -875,6 +875,20 @@ pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<Strin
                 .to_string(),
         );
     }
+    // OpenSSH refusing a config file it cannot vouch for. Not a permissions
+    // problem on disk, and the obvious "fix" — chmod'ing a system file — is a
+    // real change made for a false reason, so say what is actually happening.
+    if lower.contains("bad owner or permissions") {
+        return Some(
+            "\n\n[sandbox] that is the OS sandbox's user namespace, not a broken file. It maps \
+             only your uid, so root-owned files (like `/etc/ssh/ssh_config`) read as `nobody` \
+             inside here, and ssh refuses any config file it cannot vouch for. The file on disk \
+             is fine — do NOT chmod or chown it. `git` over ssh already works (hrdr points it at \
+             `ssh -F`, which skips the system config); for a bare `ssh`, pass `-F ~/.ssh/config` \
+             (or `-F /dev/null`) yourself."
+                .to_string(),
+        );
+    }
     if !lower.contains("read-only file system") && !lower.contains("erofs") {
         return None;
     }
@@ -977,6 +991,9 @@ fn shell_command_with_backend(
         OsSandboxBackend::Bwrap => {
             let mut cmd = tokio::process::Command::new("bwrap");
             cmd.args(bwrap_args(policy.mode, policy, cwd, shell, cmd_str));
+            if let Some(ssh) = git_ssh_command_for_userns() {
+                cmd.env("GIT_SSH_COMMAND", ssh);
+            }
             cmd
         }
         #[cfg(target_os = "linux")]
@@ -1125,6 +1142,54 @@ fn install_landlock_rules(
         return Err(std::io::Error::other("landlock not enforced"));
     }
     Ok(())
+}
+
+/// `GIT_SSH_COMMAND` that survives bwrap's user namespace, or `None` when the
+/// caller already set one.
+///
+/// **The problem.** Unprivileged bwrap has to create a user namespace, and one
+/// maps only the invoking uid — so every root-owned file inside it reads as uid
+/// 65534 (`nobody`). OpenSSH validates its config files' ownership:
+///
+/// ```c
+/// if (((sb.st_uid != 0 && sb.st_uid != getuid()) || (sb.st_mode & 022) != 0))
+///     fatal("Bad owner or permissions on %s", filename);
+/// ```
+///
+/// 65534 is neither, so `/etc/ssh/ssh_config` (and anything it `Include`s) is
+/// refused and ssh dies before connecting. Nothing is wrong on disk: the file is
+/// `root:root 0644` and reads correctly outside the sandbox. The effect is that
+/// **every `git push`/`fetch`/`clone` over ssh fails inside the sandbox**, with
+/// an error that points at a system file and invites the user to `chmod` it —
+/// which would not help and is a real permissions change made for a false
+/// reason. This is not fixable by dropping `--unshare-user` (bwrap creates the
+/// namespace regardless when unprivileged) or by mapping root (that needs a
+/// privileged helper).
+///
+/// **The fix.** `ssh -F <file>` makes ssh ignore the system-wide config
+/// entirely, per ssh(1) — so the unreadable-looking files are never opened. The
+/// user's own `~/.ssh/config` is owned by the invoking uid, which maps to itself,
+/// so it still passes the check and their Host aliases and identities survive.
+/// Without one, `/dev/null` gives ssh its compiled-in defaults.
+///
+/// Not set when the caller already exported `GIT_SSH_COMMAND`: an explicit
+/// setting is a decision, and silently rewriting it would be worse than the bug.
+/// Only `git` is covered — a bare `ssh` in a shell command still hits this, which
+/// is what [`sandbox_denial_note`] explains when it does.
+fn git_ssh_command_for_userns() -> Option<std::ffi::OsString> {
+    if std::env::var_os("GIT_SSH_COMMAND").is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    let user_config = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".ssh").join("config"))
+        .filter(|p| p.is_file());
+    let path = match &user_config {
+        Some(p) => p.to_string_lossy().into_owned(),
+        None => "/dev/null".to_string(),
+    };
+    // Quoted: git splits this value with shell rules, so a `$HOME` containing a
+    // space would otherwise arrive as two arguments.
+    Some(format!("ssh -F {}", shell_words::quote(&path)).into())
 }
 
 /// The full bwrap argv (everything after `argv[0]`) for `mode`.
@@ -2474,6 +2539,76 @@ mod tests {
             !marker.exists(),
             "the backgrounded grandchild survived the group kill"
         );
+    }
+
+    /// bwrap's user namespace makes every root-owned file read as `nobody`, and
+    /// OpenSSH refuses a config file it cannot vouch for — so `git push` over ssh
+    /// dies inside the sandbox with an error that points at a system file.
+    ///
+    /// Proved end to end against the real backend, because the whole failure is a
+    /// property of the namespace and an argv assertion would not see it: plain
+    /// `ssh -G` fails in here, and it succeeds with the override hrdr installs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ssh_works_in_the_sandbox_despite_the_user_namespace() {
+        let Some(shell) = bwrap_shell() else { return };
+        if which::which("ssh").is_err() {
+            return; // no ssh on this host — nothing to prove
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = confined_ctx(dir.path(), SandboxMode::Write);
+        let run = |command: &str| {
+            let ctx = ctx.clone();
+            let command = command.to_string();
+            async move {
+                use crate::Tool as _;
+                crate::ShellTool::new(shell)
+                    .execute(serde_json::json!({"command": command}), &ctx)
+                    .await
+                    .map_err(|e| e.to_string())
+                    .unwrap_or_else(|e| e)
+            }
+        };
+
+        // The bug, reproduced: ssh reading the system config sees root-owned
+        // files as `nobody` and bails. Skipped if this host's ssh config happens
+        // not to trip the check (no system config, or an unusual layout).
+        let bare = run("ssh -G example.invalid 2>&1").await;
+        if !bare.to_lowercase().contains("bad owner or permissions") {
+            return;
+        }
+
+        // …and the fix: `-F` makes ssh skip the system config entirely, which is
+        // exactly what `git_ssh_command_for_userns` hands git.
+        let fixed = run("ssh -F /dev/null -G example.invalid 2>&1").await;
+        assert!(
+            !fixed.to_lowercase().contains("bad owner or permissions"),
+            "-F must bypass the unreadable system config: {fixed}"
+        );
+        assert!(fixed.contains("host example.invalid"), "{fixed}");
+
+        // The note explains it rather than inviting a chmod of a system file.
+        let note = sandbox_denial_note(&ctx.sandbox, &bare).expect("a note is owed");
+        assert!(note.contains("do NOT chmod"), "{note}");
+        assert!(note.contains("user namespace"), "{note}");
+    }
+
+    /// An explicit `GIT_SSH_COMMAND` is a decision; the sandbox must not rewrite
+    /// it. (Serialised with the unset case below by running both here — they
+    /// share one process-global env.)
+    #[test]
+    fn the_git_ssh_override_defers_to_an_explicit_one() {
+        // SAFETY: set and removed within this body. The var IS process-global and
+        // the bwrap tests call `git_ssh_command_for_userns` indirectly, so one of
+        // them may observe it set during this window — harmless, because they run
+        // `echo`/`touch` and never reach git or ssh.
+        unsafe { std::env::set_var("GIT_SSH_COMMAND", "ssh -i /custom/key") };
+        assert_eq!(git_ssh_command_for_userns(), None, "an explicit value wins");
+        unsafe { std::env::remove_var("GIT_SSH_COMMAND") };
+
+        let installed = git_ssh_command_for_userns().expect("set when unset");
+        let installed = installed.to_string_lossy().into_owned();
+        assert!(installed.starts_with("ssh -F "), "{installed}");
     }
 
     /// The claim the whole delegation model rests on, proved against the real
