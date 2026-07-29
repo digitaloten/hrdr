@@ -292,6 +292,13 @@ fn positional_args<'a>(tokens: &[&'a str]) -> Vec<&'a str> {
 /// asked for", and a guard that depends on a caller elsewhere staying correct is
 /// the kind that stops being true.
 ///
+/// This is the guard for [`Widening::Full`] specifically. The narrow rung is
+/// judged separately by [`widening_allowed`], and the difference matters: a
+/// non-empty `readonly_subpaths` blocks a full bypass forever, because no bypass
+/// can preserve a subtraction — but the narrow rung *does* preserve it, so
+/// treating the two alike would mean an agent with read-only git metadata could
+/// never escalate anything, however narrow and however unrelated.
+///
 /// [`SandboxMode::Read`] deliberately does NOT refuse. It reads broadly already,
 /// so a bypass widens only writes — which is precisely the widening being
 /// consented to.
@@ -472,13 +479,33 @@ pub(crate) fn widening_for(
 /// Whether moving the boundary this far would give away something the approval
 /// prompt does not describe.
 ///
-/// For [`Widening::Full`] this is [`unsandboxed_execution_allowed`] — the
-/// original guard, unchanged. [`Widening::NoUserNamespace`] shares it for now;
-/// the whole point of the narrow rung is that it *could* be permitted where a
-/// full bypass is not, and separating the two is its own change.
+/// The two rungs answer differently, which is the point of having two. The
+/// question is the same one [`unsandboxed_execution_allowed`] asks — would this
+/// hand out something nobody consented to — but a change of *mechanism* keeps
+/// far more than a change of *boundary*, so it survives conditions that refuse a
+/// full bypass.
+///
+/// [`Widening::NoUserNamespace`] moves the command from bwrap to Landlock, and
+/// what carries across decides this:
+///
+/// * **Writable roots and read-only subpaths: preserved.** `install_landlock_rules`
+///   installs both, and Landlock resolves an access against the most specific
+///   matching hierarchy, so a rule on `<cwd>/.git` still overrides the one on
+///   `<cwd>`. A deny-list carved out of a writable root therefore does NOT
+///   refuse this rung — where it does refuse [`Widening::Full`], which has no way
+///   to preserve a subtraction. This is what makes the rung reachable for an
+///   agent whose git metadata is read-only.
+/// * **Reads: not confined at all.** Landlock has no read axis, so
+///   [`SandboxMode::Strict`] — the one mode that confines reads — would be
+///   silently widened. Refused, for the same reason `Full` is.
+/// * **Network: only partly confined.** The ruleset reaches TCP `bind`/`connect`
+///   and stops, so UDP, DNS, QUIC/HTTP3 and raw sockets survive it. A policy that
+///   denies the network would come back partly restored, which is a widening on
+///   an axis the prompt does not mention. Refused.
 pub(crate) fn widening_allowed(widening: Widening, policy: &SandboxPolicy) -> bool {
     match widening {
-        Widening::NoUserNamespace | Widening::Full => unsandboxed_execution_allowed(policy),
+        Widening::NoUserNamespace => policy.mode != SandboxMode::Strict && policy.allow_network,
+        Widening::Full => unsandboxed_execution_allowed(policy),
     }
 }
 
@@ -1065,6 +1092,41 @@ mod tests {
         let strict = SandboxPolicy::for_agent(SandboxMode::Strict, dir.path(), &[]);
         assert_eq!(widening_for(DenialKind::SshUserNamespace, &strict), None);
         assert_eq!(widening_for(DenialKind::WriteOutsideRoots, &strict), None);
+    }
+
+    /// The two rungs are judged on what each one actually preserves, not alike.
+    /// This is the unlock for a uniform `.git` denial: an agent whose git
+    /// metadata is read-only can still take the narrow rung, because Landlock
+    /// installs that subtraction too — where a full bypass could never preserve
+    /// it and stays refused.
+    #[test]
+    fn the_narrow_rung_survives_a_subtraction_that_forbids_a_full_bypass() {
+        let dir = tempfile::tempdir().unwrap();
+        let carved = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![dir.path().to_path_buf()],
+            readable_roots: Vec::new(),
+            readonly_subpaths: vec![dir.path().join(".git")],
+            allow_network: true,
+        };
+        assert!(!widening_allowed(Widening::Full, &carved));
+        assert!(widening_allowed(Widening::NoUserNamespace, &carved));
+
+        // The other two axes refuse both rungs, and for reasons that are about
+        // what Landlock cannot express rather than about the subtraction.
+        // Reads: Landlock has no read axis at all.
+        let strict = SandboxPolicy::for_agent(SandboxMode::Strict, dir.path(), &[]);
+        assert!(!widening_allowed(Widening::NoUserNamespace, &strict));
+        // Network: the ruleset reaches TCP and stops, so a denial would come
+        // back partly restored — UDP, DNS, QUIC.
+        let mut offline = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+        offline.deny_network();
+        assert!(!widening_allowed(Widening::NoUserNamespace, &offline));
+
+        // And the ordinary case still permits both.
+        let write = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+        assert!(widening_allowed(Widening::Full, &write));
+        assert!(widening_allowed(Widening::NoUserNamespace, &write));
     }
 
     /// The narrow rung has to keep the policy it claims to keep. Asserted on the
