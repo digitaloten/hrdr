@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- **Sub-agents no longer get the `memory` tool.** Writing durable memory is the
+  main agent's concern: it has the conversation the fact came out of, it can
+  tell a stable preference from something local to one task, and it is the one
+  still around next session to be corrected by what it wrote. A sub-agent has a
+  narrow brief it can misread and is gone in two minutes — and `scope: "global"`
+  resolves to one directory shared by every project on the machine, loaded into
+  every future session's prompt. **Reading is unchanged**: the memory index is
+  still resolved and loaded for sub-agents too, as context they should let
+  correct them. The save-it instruction moved out of the write-capable prompt
+  fragment into its own `memory.md`, pushed only when the tool is registered — a
+  prompt that tells a model to use a tool it was not given costs a refused call
+  and a turn spent working out why.
+
 - **`max_readonly_subagents` now defaults to 2** (was 5). Read-only sub-agents
   cannot race each other, but they are not free: each holds a model context,
   spends tokens, and hands back a report the parent has to read and verify. Five

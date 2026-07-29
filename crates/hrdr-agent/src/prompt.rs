@@ -25,8 +25,13 @@ mod frag {
     /// content, safety. Byte-identical for every agent hrdr runs — main or sub,
     /// read-only or write — which is what makes it the shared cache prefix.
     pub const BASE: &str = include_str!("templates/base.md");
-    /// `can_write`: memory-saving, scope, editing, tests, debugging, git.
+    /// `can_write`: scope, editing, tests, debugging, git.
     pub const WRITE: &str = include_str!("templates/write.md");
+    /// The `memory` tool is registered — how to save a durable fact. Its own
+    /// fragment rather than part of `WRITE`, because the tool is main-agent-only
+    /// and telling a sub-agent to "save it with the `memory` tool" would name a
+    /// tool it does not have.
+    pub const MEMORY: &str = include_str!("templates/memory.md");
     /// `can_write` + a shell on PATH.
     pub const SHELL: &str = include_str!("templates/shell.md");
     /// …and that shell is plain POSIX `sh`, not bash.
@@ -222,6 +227,7 @@ pub const SECTION_SUBAGENT_WRITE: &str = "subagent_write";
 // load. After the capability group because it is gated on that tool being
 // registered, and before the persona because every profile in a project sees the
 // same skills. See `skills_section`.
+pub const SECTION_MEMORY: &str = "memory";
 pub const SECTION_SKILLS: &str = "skills";
 pub const SECTION_PERSONA: &str = "persona";
 pub const SECTION_ENVIRONMENT: &str = "environment";
@@ -432,6 +438,23 @@ const SKILL_DESCRIPTION_MAX_CHARS: usize = 120;
 /// line is per-machine noise in a section every agent shares, and pushes bytes
 /// that cannot be cached across projects into the shared prefix. The `skill`
 /// tool's own result names the source, where it costs nothing shared.
+/// How to save a durable fact — present only when the `memory` tool actually is.
+///
+/// Sub-agents do not get that tool (memory is the main agent's concern: it has
+/// the conversation, and it is the one still around next session), so they must
+/// not get the instruction either. A prompt that tells a model to use a tool it
+/// was not given costs a refused call and a turn spent working out why.
+///
+/// Reading memory is unaffected and stays in the base prompt: the index is
+/// loaded for every agent, sub-agents included, as context they should let
+/// correct them.
+pub fn memory_section(tools: &ToolRegistry) -> String {
+    if !tools.defs().iter().any(|d| d.function.name == "memory") {
+        return String::new();
+    }
+    format!("\n\n{}", frag::MEMORY.replace("\r\n", "\n").trim_end())
+}
+
 pub fn skills_section(tools: &ToolRegistry, skills: &[crate::Skill]) -> String {
     // `model_invocable: false` skills are the user's alone (`:release` pushes a
     // tag): not listed, and the tool refuses them. Filtered here rather than at
@@ -1683,24 +1706,38 @@ mod tests {
         assert!(p.contains("New behaviour ships with its test"));
     }
 
-    /// The prompt tells the agent it has durable memory and to use it: the
-    /// "recall it" half is unconditional (a read-only agent benefits too), while
-    /// the "save with the `memory` tool" half is `can_write`-gated — `memory` is
-    /// a write tool a read-only agent does not have.
+    /// The two halves of memory are gated differently, and must be.
+    ///
+    /// RECALL is unconditional — every agent, sub-agents included, is handed the
+    /// index and told to let it correct them. SAVE follows the `memory` tool: a
+    /// sub-agent does not get that tool (`Agent::new` skips it when `delegated`),
+    /// so it must not be told to use one.
     #[test]
     fn the_prompt_encourages_durable_memory() {
         let tools = ToolRegistry::with_defaults();
         let write = render_system(&tools, false).unwrap();
-        assert!(write.contains("durable memory that persists across sessions"));
-        assert!(write.contains("Save durable, reusable facts with the `memory` tool"));
+        let sub = render_system(&tools, true).unwrap();
+        for p in [&write, &sub] {
+            assert!(
+                p.contains("durable memory that persists across sessions"),
+                "recall is unconditional — a sub-agent reads memory too"
+            );
+        }
+        // The save half is not in any capability fragment any more; it rides the
+        // tool.
+        assert!(!write.contains("Save durable, reusable facts"), "{write}");
 
-        // A read-only agent still gets the recall half, but not the save half.
-        let mut ro_tools = ToolRegistry::with_defaults();
-        let ro_names = ro_tools.read_only_names();
-        ro_tools.retain_only(&ro_names);
-        let ro = render_system(&ro_tools, false).unwrap();
-        assert!(ro.contains("durable memory that persists across sessions"));
-        assert!(!ro.contains("Save durable, reusable facts with the `memory` tool"));
+        let mut with_memory = ToolRegistry::with_defaults();
+        with_memory.register(std::sync::Arc::new(hrdr_tools::MemoryTool));
+        let s = memory_section(&with_memory);
+        assert!(
+            s.contains("Save durable, reusable facts with the `memory` tool"),
+            "{s}"
+        );
+
+        // No tool, no instruction — a prompt that names a tool the agent was not
+        // given costs a refused call and a turn spent working out why.
+        assert!(memory_section(&ToolRegistry::with_defaults()).is_empty());
     }
 
     /// A shell-capable agent gets the verify loop, and is told to let the

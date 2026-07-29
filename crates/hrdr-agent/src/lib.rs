@@ -1273,8 +1273,8 @@ fn build_system_prompt_sections(
 ) -> Result<prompt::SystemPrompt> {
     use prompt::{
         SECTION_BASE, SECTION_ENVIRONMENT, SECTION_GATE, SECTION_GLOBAL_AGENTS_MD,
-        SECTION_GLOBAL_MEMORY, SECTION_PERSONA, SECTION_PROJECT_AGENTS_MD, SECTION_PROJECT_MEMORY,
-        SECTION_SANDBOX, SECTION_SKILLS,
+        SECTION_GLOBAL_MEMORY, SECTION_MEMORY, SECTION_PERSONA, SECTION_PROJECT_AGENTS_MD,
+        SECTION_PROJECT_MEMORY, SECTION_SANDBOX, SECTION_SKILLS,
     };
     let mut p = prompt::SystemPrompt::default();
     // 1. identical for every agent hrdr runs
@@ -1289,6 +1289,14 @@ fn build_system_prompt_sections(
         global_memory_section(memory.global.as_deref()),
     );
     // 4-5. project scope: identical across every agent working this project
+    // NOTE: these bytes come off disk from the working tree, which a write
+    // sub-agent can edit — so a sub-agent can author instructions the parent
+    // reads back as project conventions on its next prompt rebuild (`/clear`,
+    // `set_cwd`, a new agent). Left open deliberately: AGENTS.md is also how a
+    // project legitimately carries instructions and prompt-processing detail, and
+    // narrowing it would cost that. Revisit if the injection path ever matters
+    // more than the feature — the `memory` tool went the other way (main agent
+    // only) because it had no such second use.
     p.push(
         SECTION_PROJECT_AGENTS_MD,
         prompt::project_agent_docs_section(docs.project.as_deref()),
@@ -1304,7 +1312,11 @@ fn build_system_prompt_sections(
     for (name, body) in prompt::capability_sections(tools, delegated) {
         p.push(name, prompt::section_text(body));
     }
-    // 7. what the `skill` tool can load — names and one-liners, no bodies. Gated
+    // 7. how to SAVE a durable fact — gated on the `memory` tool being registered,
+    // which a delegated agent's is not. Reading memory is separate: the index sits
+    // in sections 3 and 5 and every agent gets it.
+    p.push(SECTION_MEMORY, prompt::memory_section(tools));
+    // 8. what the `skill` tool can load — names and one-liners, no bodies. Gated
     // on that tool being registered (see `prompt::skills_section`), and above the
     // persona because every profile working this project sees the same skills.
     p.push(SECTION_SKILLS, prompt::skills_section(tools, skills));
