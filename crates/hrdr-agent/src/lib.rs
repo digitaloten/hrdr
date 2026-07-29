@@ -1635,6 +1635,24 @@ impl Agent {
         if config.delegated && !config.read_only {
             sandbox.deny_git_writes(&config.cwd);
         }
+        // A sub-agent's shell gets no network; the parent's keeps it.
+        //
+        // Not gated on `read_only` the way the git denial above is, and the
+        // asymmetry is deliberate: the git denial is about *writes*, so a
+        // read-only agent already cannot commit and needs nothing further, while
+        // an `explore` or `review` agent's shell has exactly as little business
+        // opening a socket as a writer's — arguably less, since reading a
+        // codebase needs no network at all. Both are delegated, so both lose it.
+        //
+        // It costs a sub-agent nothing, because its real network needs never went
+        // through a shell: `web_fetch` and `web_search` run in this process, on
+        // this side of the sandbox, and keep working. What is removed is raw
+        // network from a delegated shell — exfiltration surface with no matching
+        // use. The main agent keeps it because it is the one that runs `git
+        // push`/`pull`/`fetch`.
+        if config.delegated {
+            sandbox.deny_network();
+        }
         ctx.sandbox = Arc::new(sandbox);
         ctx.max_output = config.tool_max_bytes;
         ctx.max_output_lines = config.tool_max_lines;

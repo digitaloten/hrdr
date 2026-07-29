@@ -8,6 +8,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- **A sub-agent's shell has no network.** Its real network needs never went
+  through a shell — `web_fetch` and `web_search` run in the hrdr process, on
+  this side of the sandbox, and keep working — so what is removed is raw network
+  from a delegated shell, which is exfiltration surface with no matching use.
+  The main agent keeps its network: it is the one that runs
+  `git push`/`pull`/`fetch`. Enforced per backend: `--unshare-net` on bwrap (a
+  fresh netns with only its own loopback, so a service on the host's loopback is
+  unreachable too), the `(allow network*)` line simply omitted on Seatbelt where
+  `(deny default)` already answers, and TCP bind/connect denied on Landlock.
+  Landlock is a **partial** enforcement and says so: ABI v4 added exactly two
+  network rights and v5 adds none, so UDP (DNS, QUIC/HTTP3), raw and ICMP
+  sockets are outside what it can express — that backend queues a degradation
+  notice rather than claiming a boundary it does not have. Applies to read-only
+  sub-agents too: an `explore` agent has less business opening a socket than a
+  writer, not more. The sub-agent's Sandbox prompt block names what still works
+  before what does not, and a blocked call gets a note so a DNS failure is not
+  misread as a broken host.
+
 - **Sub-agents no longer get the `memory` tool.** Writing durable memory is the
   main agent's concern: it has the conversation the fact came out of, it can
   tell a stable preference from something local to one task, and it is the one

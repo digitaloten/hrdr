@@ -584,6 +584,30 @@ fn git_lockdown_line(policy: &hrdr_tools::SandboxPolicy) -> String {
         .to_string()
 }
 
+/// The no-network line, for a policy with the denial installed (any sub-agent).
+/// Empty otherwise, so the main agent's Sandbox block is byte-identical to what
+/// it always was.
+///
+/// It names what still works before what does not, and that order is the point:
+/// a model told only "no network" reports the machine as offline or spends a
+/// turn on the resolver, where one told `web_fetch`/`web_search` are right here
+/// and unaffected simply uses them. Those tools run in the hrdr parent process,
+/// outside the child's network namespace, which is why the denial costs a
+/// sub-agent nothing it actually needed.
+fn network_lockdown_line(policy: &hrdr_tools::SandboxPolicy) -> String {
+    if policy.allow_network {
+        return String::new();
+    }
+    "\n- Your shell commands have NO network. `web_fetch` (read a URL) and `web_search` still \
+     work — they run outside this sandbox, and they are how you reach the network from here. \
+     What does not work is a shell command that opens a socket: `curl`, `git clone`/`fetch`/\
+     `push`, and any package install that downloads. Those fail as if the machine were offline; \
+     that is the sandbox, not a broken host, so do not debug DNS or retry. If the task genuinely \
+     needs one, say so in your report — the agent that delegated to you has the network and can \
+     run it."
+        .to_string()
+}
+
 /// The sandbox declaration — mode plus the concrete roots — as a prompt section.
 /// Empty (→ dropped by [`SystemPrompt::push`]) when the mode is `None`, so an
 /// unconfined agent is told nothing about a boundary it does not have.
@@ -611,18 +635,20 @@ pub fn sandbox_section(policy: &hrdr_tools::SandboxPolicy) -> String {
              - Mode: write — reads are unrestricted; writes are enforced by the OS and the tools.\n\
              - You may write ONLY under:\n{}\n\
              - Writing anywhere else is refused. If a task appears to require writing outside \
-             these roots, stop and say so instead of attempting it.{}",
+             these roots, stop and say so instead of attempting it.{}{}",
             roots(&policy.writable_roots),
             git_lockdown_line(policy),
+            network_lockdown_line(policy),
         ),
-        hrdr_tools::SandboxMode::Read => String::from(
+        hrdr_tools::SandboxMode::Read => format!(
             "\n\nSandbox:\n\
              - Mode: read — this agent may read anything but write NOTHING.\n\
              - Reads are unrestricted, so run the tools you need: `git log`/`diff`/`blame`, \
              a linter, a checker, anything that only inspects.\n\
              - Every write is refused, everywhere — there is no writable root at all. Do not \
              attempt to create, edit or delete a file, and do not try to work around it; \
-             report what you found instead.",
+             report what you found instead.{}",
+            network_lockdown_line(policy),
         ),
         hrdr_tools::SandboxMode::Strict => format!(
             "\n\nSandbox:\n\
@@ -631,8 +657,9 @@ pub fn sandbox_section(policy: &hrdr_tools::SandboxPolicy) -> String {
              - You may read ONLY under:\n{}\n\
              - Reads elsewhere and all writes are refused. Paths outside are not merely \
              protected but ABSENT, so a tool installed elsewhere on this machine will report \
-             `command not found` — that is the mode, not a broken install.",
-            roots(&policy.readable_roots)
+             `command not found` — that is the mode, not a broken install.{}",
+            roots(&policy.readable_roots),
+            network_lockdown_line(policy),
         ),
     }
 }
@@ -2969,6 +2996,7 @@ mod tests {
             writable_roots: roots.clone(),
             readable_roots: roots.clone(),
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
         assert!(
             !sandbox_section(&plain).contains("READ-ONLY"),
@@ -2994,6 +3022,52 @@ mod tests {
         );
     }
 
+    /// A sub-agent is told its shell has no network, in the same breath as the
+    /// two tools that do — a model told only what it has lost reports the
+    /// machine as offline, where one told `web_fetch`/`web_search` are right
+    /// here simply uses them.
+    #[test]
+    fn the_sandbox_section_names_the_network_denial_and_what_still_works() {
+        let policy = |mode, allow_network: bool| {
+            let roots = vec![std::path::PathBuf::from("/tmp/proj")];
+            let mut policy = hrdr_tools::SandboxPolicy {
+                mode,
+                writable_roots: roots.clone(),
+                readable_roots: roots,
+                readonly_subpaths: Vec::new(),
+                allow_network: true,
+            };
+            if !allow_network {
+                policy.deny_network();
+            }
+            policy
+        };
+        assert!(
+            !sandbox_section(&policy(hrdr_tools::SandboxMode::Write, true)).contains("NO network"),
+            "the main agent pushes and fetches; its block must not say otherwise"
+        );
+
+        // Every mode a delegated agent can get, not just `write`: a read-only
+        // `explore` agent loses the network too, and its section is a separate
+        // arm that could quietly not carry the line.
+        for mode in [
+            hrdr_tools::SandboxMode::Write,
+            hrdr_tools::SandboxMode::Read,
+            hrdr_tools::SandboxMode::Strict,
+        ] {
+            let s = sandbox_section(&policy(mode, false));
+            assert!(s.contains("NO network"), "{mode}: {s}");
+            assert!(
+                s.contains("`web_fetch`") && s.contains("`web_search`"),
+                "it names the way out that still works: {mode}: {s}"
+            );
+            assert!(
+                s.contains("not a broken host"),
+                "…and pre-empts the misdiagnosis: {mode}: {s}"
+            );
+        }
+    }
+
     /// The model is told its boundary positively, and every writable root is
     /// named — a root the prompt omits is a refusal the model cannot predict.
     #[test]
@@ -3006,6 +3080,7 @@ mod tests {
             ],
             readable_roots: vec![std::path::PathBuf::from("/work/wt-1")],
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
         let s = sandbox_section(&policy);
         assert!(
@@ -3025,6 +3100,7 @@ mod tests {
             writable_roots: Vec::new(),
             readable_roots: vec![std::path::PathBuf::from("/work/ro")],
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
         let s = sandbox_section(&ro);
         assert!(s.contains("Mode: read"));
@@ -3042,6 +3118,7 @@ mod tests {
             writable_roots: Vec::new(),
             readable_roots: vec![std::path::PathBuf::from("/work/ro")],
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
         let s = sandbox_section(&strict);
         assert!(s.contains("Mode: strict"));

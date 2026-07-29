@@ -312,9 +312,14 @@ Declared when the sandbox was specced and deliberately left out of v1, plus what
 bring-up turned up. All eight verified still open. The rules that govern this
 work are under [Standing constraints](#standing-constraints).
 
-- **No network axis.** Verified: no `--unshare-net` anywhere, and the Seatbelt
-  profile emits `(allow network*)`. The declared route was seccomp on Linux;
-  note Codex has since moved past that to a MITM proxy with netns routing
+- **No network axis for the MAIN agent.** Partly closed 2026-07-29: a delegated
+  sub-agent's shell now has no network (`SandboxPolicy::deny_network` →
+  `--unshare-net` on bwrap, the `(allow network*)` line omitted on Seatbelt, and
+  TCP bind/connect denied on Landlock — which cannot express UDP, so that
+  backend queues a degradation notice). What remains open is the main agent and
+  a user-facing knob: it keeps full network because it is the one that runs
+  `git push`/`pull`/`fetch`. The declared route was seccomp on Linux; note Codex
+  has since moved past that to a MITM proxy with netns routing
   (`codex-rs/network-proxy/`: `proxy.rs` 80 KB, `runtime.rs` 71 KB, `socks5.rs`
   42 KB, `certs.rs` 35 KB) — and that its network approval is
   `Stage::Experimental, default_enabled: false`, so the default codex experience
@@ -668,9 +673,8 @@ away. Not work; guardrails on work.
   facts (hermes pops `files_written` before the model sees it and answers with a
   prompt saying summaries _"are SELF-REPORTS, not verified facts"_ — hrdr's
   answer is that a sub-agent's edits are already in the tree, so `git diff` is
-  the mechanical check); and skill loading that fails **open**
-  (opencode logs and skips a YAML error, silently drops a file that fails its
-  shape check).
+  the mechanical check); and skill loading that fails **open** (opencode logs
+  and skips a YAML error, silently drops a file that fails its shape check).
 
 ---
 

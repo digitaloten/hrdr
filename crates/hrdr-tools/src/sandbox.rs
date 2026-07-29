@@ -123,6 +123,14 @@ pub struct SandboxPolicy {
     /// `deny`) rather than only in the file tools, because the thing being
     /// stopped is `git`, and git runs through `shell`.
     pub readonly_subpaths: Vec<PathBuf>,
+    /// Whether this agent's shell children may reach the network. True for
+    /// every agent unless [`deny_network`](Self::deny_network) says otherwise —
+    /// which `Agent::new` says only for a delegated one.
+    ///
+    /// Purely about *shell children*: hrdr's own `web_fetch`/`web_search` run
+    /// in the parent process and are untouched by it, which is what makes the
+    /// denial affordable (see [`deny_network`](Self::deny_network)).
+    pub allow_network: bool,
 }
 
 impl SandboxPolicy {
@@ -135,6 +143,7 @@ impl SandboxPolicy {
             writable_roots: Vec::new(),
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         }
     }
 
@@ -175,6 +184,7 @@ impl SandboxPolicy {
             writable_roots,
             readable_roots,
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         }
     }
 
@@ -225,6 +235,33 @@ impl SandboxPolicy {
         denied.sort();
         denied.dedup();
         self.readonly_subpaths = denied;
+    }
+
+    /// Cut this agent's shell children off the network: no socket a command it
+    /// spawns opens can leave the machine.
+    ///
+    /// Installed for **sub-agents**, and the reason it costs them nothing is
+    /// that a delegated agent's legitimate network needs are already served by
+    /// tools that do not go through here. `web_fetch` and `web_search` run
+    /// in-process in the hrdr parent, whose sockets this never touches — so a
+    /// sub-agent that has to read a page or search still can. What is left is
+    /// raw network from a shell command: exfiltration surface with no matching
+    /// use, on an agent whose whole job is to change files in a directory it was
+    /// handed.
+    ///
+    /// The main agent keeps the network, deliberately: it is the one that runs
+    /// `git push`/`pull`/`fetch`, and those are exactly the network operations
+    /// the delegation model reserves to the parent — the same split
+    /// [`deny_git_writes`](Self::deny_git_writes) makes for history.
+    ///
+    /// Mode `None` is left alone for the same reason it is there: no OS wrapper
+    /// runs at all, so a policy claiming no network would be describing a
+    /// boundary nothing enforces.
+    pub fn deny_network(&mut self) {
+        if self.mode == SandboxMode::None {
+            return;
+        }
+        self.allow_network = false;
     }
 
     /// Err unless `canon` (already run through [`canonicalize_nearest`]) is
@@ -612,6 +649,20 @@ const STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE: &str = "sandbox: Landlock cannot co
      strict-mode agent's shell commands are write-confined only, so paths outside its readable \
      roots remain readable.";
 
+/// Emitted when an agent whose policy denies the network runs a shell command on
+/// Landlock: the ruleset denies TCP `bind`/`connect` and nothing else, so UDP —
+/// DNS and QUIC/HTTP3 with it — raw sockets and ICMP still leave the machine.
+///
+/// bwrap's `--unshare-net` has no such hole, which is why this is a *degradation*
+/// notice and not a description of the feature. Said out loud on the same
+/// principle as the notice above: a boundary that is quietly narrower than it
+/// claims is worse than one whose limits are stated.
+#[cfg(target_os = "linux")]
+const NETWORK_PARTIAL_UNDER_LANDLOCK_NOTICE: &str = "sandbox: Landlock can deny only TCP \
+     bind/connect — this agent's shell commands are cut off from HTTP(S), git and ssh, but UDP \
+     (DNS, QUIC/HTTP3) and raw sockets are not blocked on this backend. Install bubblewrap for a \
+     complete network denial.";
+
 /// The OS mechanism available to confine *shell children* on this machine.
 ///
 /// The file tools are guarded in-process regardless; this is only about the
@@ -889,6 +940,44 @@ pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<Strin
                 .to_string(),
         );
     }
+    // A shell cut off the network (a sub-agent — see `deny_network`). Nothing in
+    // the failure says "sandbox": the child sits in an empty network namespace,
+    // so the resolver times out or the connect finds no route, and curl, git,
+    // cargo, npm and pip all report that as a name it could not resolve or an
+    // unreachable network. That is what a machine with a dead link looks like,
+    // and a model that believes it starts debugging DNS or declaring the host
+    // offline in its report.
+    //
+    // Narrow on purpose, like the EROFS case below: only failures that name
+    // resolution or routing produce, never a bare "connection refused" or
+    // "permission denied" — those are ordinary errors on a working machine
+    // (a service that is not up yet, a file that is not yours) and a note
+    // asserting the sandbox over them would be wrong far more often than right.
+    if !policy.allow_network
+        && [
+            "could not resolve host",
+            "could not resolve proxy",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "nodename nor servname provided",
+            "network is unreachable",
+            "no route to host",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return Some(
+            "\n\n[sandbox] that is this agent's network being denied, not a broken resolver or an \
+             offline machine — a delegated agent's shell commands have no network at all, \
+             deliberately. Do NOT retry it, edit `/etc/resolv.conf`, or report the host as \
+             offline. What still works: `web_fetch` to read a URL and `web_search` to search, \
+             both of which run outside this sandbox and are the right way to reach the network \
+             from here. Anything genuinely needing a network shell command — cloning a repo, \
+             installing a dependency, pushing — belongs to the agent that delegated to you: say \
+             so in your report and let it run."
+                .to_string(),
+        );
+    }
     if !lower.contains("read-only file system") && !lower.contains("erofs") {
         return None;
     }
@@ -1009,6 +1098,13 @@ fn shell_command_with_backend(
             if policy.mode == SandboxMode::Strict {
                 notices.set(STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE.to_string());
             }
+            // Same admission for the other axis this backend cannot fully carry:
+            // the ruleset reaches TCP and stops there (see
+            // `install_landlock_rules`), so a denial that is absolute under bwrap
+            // is partial here.
+            if !policy.allow_network {
+                notices.set(NETWORK_PARTIAL_UNDER_LANDLOCK_NOTICE.to_string());
+            }
             landlock_command(shell, cmd_str, policy)
         }
         // `Landlock` is unreachable off Linux (detection never returns it),
@@ -1071,12 +1167,13 @@ fn landlock_command(
         .filter(|path| path.exists())
         .cloned()
         .collect();
+    let allow_network = policy.allow_network;
     // SAFETY: the closure runs in the forked child before `exec`. It issues
     // landlock/prctl syscalls and builds the ruleset from data moved in
     // beforehand; it shares no lock, handle, or global with the parent, and it
     // never spawns a thread.
     unsafe {
-        cmd.pre_exec(move || install_landlock_rules(&writable, &readonly));
+        cmd.pre_exec(move || install_landlock_rules(&writable, &readonly, allow_network));
     }
     cmd
 }
@@ -1088,24 +1185,47 @@ fn landlock_command(
 /// `BestEffort` compatibility means an older kernel silently enforces the
 /// subset of ABI v5 it understands — but a kernel that enforces *nothing*
 /// fails the spawn rather than running the command unconfined.
+///
+/// `allow_network` false handles [`landlock::AccessNet`] and grants no
+/// [`landlock::NetPort`] rule, which is how a Landlock ruleset says "none": ABI
+/// v4 added exactly two network rights, TCP `bind` and TCP `connect`, and v5
+/// adds none. That covers the traffic anyone actually leaves with — HTTP(S),
+/// git, ssh, every package registry — but it is **not** the whole network, and
+/// the gap is admitted rather than papered over: UDP (so DNS, and QUIC/HTTP3),
+/// raw and ICMP sockets, and anything already-connected are outside what
+/// Landlock can express, so this backend confines the network less than bwrap's
+/// `--unshare-net` does. [`NETWORK_PARTIAL_UNDER_LANDLOCK_NOTICE`] tells the
+/// agent so.
 #[cfg(target_os = "linux")]
 fn install_landlock_rules(
     writable_roots: &[PathBuf],
     readonly_subpaths: &[PathBuf],
+    allow_network: bool,
 ) -> std::io::Result<()> {
     use landlock::{
-        ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreatedAttr,
-        RulesetStatus, path_beneath_rules,
+        ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
     };
 
     let abi = ABI::V5;
     let access_rw = AccessFs::from_all(abi);
     let access_ro = AccessFs::from_read(abi);
 
-    let mut ruleset = Ruleset::default()
+    let mut base = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(access_rw)
-        .map_err(std::io::Error::other)?
+        .map_err(std::io::Error::other)?;
+    // Handled but never granted to any port: a right the ruleset handles and no
+    // rule allows is denied outright. Only when the network is denied — handling
+    // the right and then allowing every port would be the same permission at
+    // twice the cost, and on a pre-6.7 kernel `BestEffort` would drop it anyway.
+    if !allow_network {
+        base = base
+            .handle_access(AccessNet::from_all(abi))
+            .map_err(std::io::Error::other)?;
+    }
+
+    let mut ruleset = base
         .create()
         .map_err(std::io::Error::other)?
         .add_rules(path_beneath_rules(["/"], access_ro))
@@ -1275,6 +1395,15 @@ fn bwrap_args(
         SandboxMode::None => {}
     }
     push(&mut args, &["--unshare-user", "--unshare-pid"]);
+    // The namespace flags are the one place argv order carries no meaning —
+    // bwrap unshares everything it was asked for in one go, before it lays down
+    // a single mount — so this belongs with its siblings rather than woven into
+    // the mount sequence above. `--unshare-net` leaves the child a fresh network
+    // namespace with nothing but its own loopback: no route off the machine, and
+    // no reach into a service listening on the host's loopback either.
+    if !policy.allow_network {
+        push(&mut args, &["--unshare-net"]);
+    }
     args.push("--chdir".into());
     // Canonicalized so the child lands in the directory that was actually
     // bound, even when the inherited cwd reaches it through a symlink alias.
@@ -1363,9 +1492,10 @@ fn seatbelt_args(
 ///
 /// `Write` reads everywhere and writes only under the policy's writable roots;
 /// `Read` narrows reads to the system directories an interpreter or compiler
-/// needs plus the readable roots, and grants no writes at all. Network stays
-/// allowed in both, matching the Linux backends — the network axis is a
-/// declared follow-up, not v1.
+/// needs plus the readable roots, and grants no writes at all. Network is
+/// allowed unless the policy denies it ([`SandboxPolicy::deny_network`]), in
+/// which case the `(allow network*)` line is simply absent and `(deny default)`
+/// answers instead.
 ///
 /// **Caveat carried from the spec:** the `Read` variant is author-written and
 /// **unvalidated** — no Mac was available when this landed, so it has never
@@ -1443,7 +1573,15 @@ fn seatbelt_profile(mode: SandboxMode, policy: &SandboxPolicy) -> String {
         // Unreachable: `sandboxed_shell_command` returns before it gets here.
         SandboxMode::None => {}
     }
-    profile.push_str("(allow network*)\n");
+    // Omission IS the denial here: the profile opens with `(deny default)`, so
+    // an operation nothing allows is already refused, and an explicit
+    // `(deny network*)` would add a line that changes no decision. Unlike the
+    // `.git` case above there is no earlier `allow` to subtract from — that one
+    // needs its trailing `deny` precisely because SBPL is last-match-wins and
+    // `(allow file-write* …)` came first.
+    if policy.allow_network {
+        profile.push_str("(allow network*)\n");
+    }
     profile
 }
 
@@ -1462,6 +1600,7 @@ pub(crate) fn confined_ctx(dir: &Path, mode: SandboxMode) -> crate::ToolContext 
         writable_roots: vec![root.clone()],
         readable_roots: vec![root],
         readonly_subpaths: Vec::new(),
+        allow_network: true,
     });
     ctx
 }
@@ -1520,6 +1659,54 @@ mod tests {
             "",
         ] {
             assert_eq!(sandbox_denial_note(&write, ordinary), None, "{ordinary}");
+        }
+    }
+
+    /// A denied network reads as a dead machine, so the note has to say
+    /// otherwise — and has to point at the tools that still work, or the model
+    /// concludes it cannot reach the web at all and reports the task as
+    /// impossible.
+    #[test]
+    fn a_denied_network_is_named_as_the_sandbox_and_points_at_the_web_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sub = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+        sub.deny_network();
+
+        for failure in [
+            "curl: (6) Could not resolve host: api.example.com",
+            "fatal: unable to access 'https://github.com/o/r/': Could not resolve host: github.com",
+            "pip install foo\nTemporary failure in name resolution",
+            "ping: connect: Network is unreachable",
+        ] {
+            let note = sandbox_denial_note(&sub, failure).unwrap_or_else(|| panic!("{failure}"));
+            assert!(note.contains("[sandbox]"), "{note}");
+            assert!(
+                note.contains("web_fetch") && note.contains("web_search"),
+                "{note}"
+            );
+            assert!(
+                note.contains("do not debug") || note.contains("Do NOT"),
+                "{note}"
+            );
+            // The main agent has the network, and that is where the work goes.
+            assert!(note.contains("delegated to you"), "{note}");
+        }
+
+        // The parent keeps its network, so the same output from it is an ordinary
+        // failure and must not be blamed on a boundary it does not have.
+        let parent = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+        assert_eq!(
+            sandbox_denial_note(&parent, "curl: (6) Could not resolve host: api.example.com"),
+            None
+        );
+
+        // Narrow, like the EROFS case: these are what a machine says when a
+        // service is down or a file is not yours, not what the sandbox says.
+        for ordinary in [
+            "curl: (7) Failed to connect to localhost port 8080: Connection refused",
+            "bind: Permission denied",
+        ] {
+            assert_eq!(sandbox_denial_note(&sub, ordinary), None, "{ordinary}");
         }
     }
 
@@ -1720,6 +1907,7 @@ mod tests {
             ),
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
         check_write(&policy, &common.join("index")).unwrap_err();
         check_write(&policy, &common.join("refs").join("heads").join("main")).unwrap_err();
@@ -1747,6 +1935,7 @@ mod tests {
             writable_roots: vec![root.clone()],
             readable_roots: vec![root],
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
 
         for refused in [
@@ -1797,6 +1986,7 @@ mod tests {
             writable_roots: Vec::new(),
             readable_roots: vec![canonicalize_nearest(dir.path())],
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
         check_read(&read_policy, &dir.path().join(".git").join("config")).unwrap();
 
@@ -1845,6 +2035,7 @@ mod tests {
             writable_roots: canonical_roots(roots),
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
 
         // The model's tools: its own source file yes; the worktree's `.git`
@@ -1905,6 +2096,7 @@ mod tests {
             writable_roots: vec![one.clone(), two.clone()],
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
         let args = argv(&bwrap_args(
             SandboxMode::Write,
@@ -1974,6 +2166,64 @@ mod tests {
             .unwrap();
         assert!(ro_root < mount_at(&args, "--bind", &one).unwrap());
         assert!(ro_root < mount_at(&args, "--bind", &two).unwrap());
+    }
+
+    /// The network axis in the argv: absent for an agent that keeps the network
+    /// (the main one), `--unshare-net` for one that does not (any sub-agent).
+    ///
+    /// The flag is asserted to sit inside the argv proper — before the `--` that
+    /// ends bwrap's own options — because after it, it would be an argument to
+    /// the shell instead of an option to bwrap, and the command would run with
+    /// its network intact and no error at all.
+    #[test]
+    fn bwrap_unshares_the_network_only_when_the_policy_denies_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+        let allowed = argv(&bwrap_args(
+            SandboxMode::Write,
+            &policy,
+            dir.path(),
+            crate::Shell::Bash,
+            "echo hi",
+        ));
+        assert!(
+            !allowed.iter().any(|a| a == "--unshare-net"),
+            "the main agent runs git push/fetch: {allowed:?}"
+        );
+
+        policy.deny_network();
+        for mode in [SandboxMode::Write, SandboxMode::Read, SandboxMode::Strict] {
+            let args = argv(&bwrap_args(
+                mode,
+                &policy,
+                dir.path(),
+                crate::Shell::Bash,
+                "echo hi",
+            ));
+            let net = args
+                .iter()
+                .position(|a| a == "--unshare-net")
+                .unwrap_or_else(|| panic!("{mode}: no network denial in {args:?}"));
+            let sep = args.iter().position(|a| a == "--").expect("the separator");
+            assert!(
+                net < sep,
+                "{mode}: the flag reaches bash, not bwrap: {args:?}"
+            );
+            // It travels with the other namespace flags rather than in the middle
+            // of the mount sequence, where a reader would have to work out
+            // whether its position mattered.
+            assert_eq!(args[net - 1], "--unshare-pid", "{args:?}");
+        }
+    }
+
+    /// Mode `None` has no OS wrapper to carry a denial, so the policy must not
+    /// claim one — the prompt line and the denial note both read this flag, and
+    /// an unconfined agent told it has no network would be told a falsehood.
+    #[test]
+    fn denying_the_network_is_a_no_op_when_unconfined() {
+        let mut policy = SandboxPolicy::unconfined();
+        policy.deny_network();
+        assert!(policy.allow_network, "nothing enforces it in mode None");
     }
 
     /// `read` is a WRITE restriction, not a read one: the whole filesystem is
@@ -2172,6 +2422,7 @@ mod tests {
             writable_roots: vec![PathBuf::from("/work/wt"), PathBuf::from("/tmp/scratch")],
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
         assert_eq!(
             seatbelt_profile(SandboxMode::Write, &policy),
@@ -2196,6 +2447,7 @@ mod tests {
             writable_roots: vec![PathBuf::from("/work/we\"ird")],
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
         assert!(
             seatbelt_profile(SandboxMode::Write, &odd)
@@ -2211,11 +2463,57 @@ mod tests {
             writable_roots: Vec::new(),
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
         assert!(
             !seatbelt_profile(SandboxMode::Write, &empty).contains("file-write*"),
             "an empty root set must stay closed, not open"
         );
+    }
+
+    /// A sub-agent's profile simply stops saying `(allow network*)`, and the
+    /// `(deny default)` it opens with is what refuses the socket.
+    ///
+    /// Asserted as the WHOLE profile rather than as a missing substring, because
+    /// what has to be true is that nothing else moved: an SBPL profile is
+    /// last-match-wins, so a stray later `allow` would undo this silently and a
+    /// `contains` check would never see it. The trailing `deny` the `.git`
+    /// denial needs is the case that proves the rule — it exists only because an
+    /// `(allow file-write* …)` came before it.
+    #[test]
+    fn seatbelt_omits_the_network_allowance_when_the_policy_denies_it() {
+        let mut policy = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![PathBuf::from("/work/wt")],
+            readable_roots: Vec::new(),
+            readonly_subpaths: Vec::new(),
+            allow_network: true,
+        };
+        policy.deny_network();
+        let profile = seatbelt_profile(SandboxMode::Write, &policy);
+        assert_eq!(
+            profile,
+            concat!(
+                "(version 1)\n",
+                "(deny default)\n",
+                "(allow process-fork)\n",
+                "(allow process-exec*)\n",
+                "(allow signal)\n",
+                "(allow sysctl-read)\n",
+                "(allow mach-lookup)\n",
+                "(allow ipc-posix*)\n",
+                "(allow file-read*)\n",
+                "(allow file-write* (subpath \"/work/wt\"))\n",
+            )
+        );
+        assert!(!profile.contains("network"), "{profile}");
+
+        // Every mode, not just the one a write sub-agent gets: a read-only
+        // `explore` agent is delegated too, and loses the network with it.
+        for mode in [SandboxMode::Read, SandboxMode::Strict] {
+            let profile = seatbelt_profile(mode, &policy);
+            assert!(!profile.contains("network"), "{mode}: {profile}");
+        }
     }
 
     /// Read mode grants no writes at all and narrows reads to the system
@@ -2227,6 +2525,7 @@ mod tests {
             writable_roots: Vec::new(),
             readable_roots: vec![PathBuf::from("/work/wt")],
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
         assert_eq!(
             seatbelt_profile(SandboxMode::Strict, &policy),
@@ -2257,6 +2556,7 @@ mod tests {
             writable_roots: vec![PathBuf::from("/work/wt")],
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
         let args = argv(&seatbelt_args(&policy, crate::Shell::Bash, "echo hi"));
         assert_eq!(args[0], "-p");
@@ -2284,6 +2584,7 @@ mod tests {
             writable_roots: vec![canonicalize_nearest(dir.path())],
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
 
         let target = canonicalize_nearest(outside.path()).join("escaped");
@@ -2434,6 +2735,7 @@ mod tests {
             writable_roots: roots,
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         });
 
         std::fs::write(wt.join("f.txt"), "hi").unwrap();
@@ -2702,6 +3004,64 @@ mod tests {
         );
     }
 
+    /// The other half of the sub-agent's boundary, proved the same way: a
+    /// delegated shell cannot open a socket, and the identical command with the
+    /// network allowed can.
+    ///
+    /// The target is a listener **this test bound itself** on loopback, chosen
+    /// because it needs no external service — a CI runner with no egress would
+    /// fail an internet probe for the wrong reason — and because it cannot pass
+    /// by accident: `--unshare-net` hands the child a private network namespace
+    /// whose loopback is its own, so the connect that succeeds outside finds
+    /// nothing listening inside. Nothing else on the machine produces that
+    /// difference between two otherwise identical runs.
+    ///
+    /// Never accepted, deliberately: the kernel completes the handshake out of
+    /// the listen backlog, so there is no server thread to start or to join.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_subagent_shell_has_no_network() {
+        let Some(shell) = bwrap_shell() else { return };
+        if shell != crate::Shell::Bash {
+            return; // the probe is bash's `/dev/tcp`; POSIX sh has no equivalent
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let port = listener.local_addr().unwrap().port();
+        let probe = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo CONNECTED");
+        // `/dev/tcp` is a bash *compile-time* feature (`--enable-net-redirections`).
+        // A bash built without it fails both arms and would turn this into a test
+        // that passes while proving nothing, so ask the host's bash first.
+        let host = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&probe)
+            .output()
+            .expect("bash");
+        if !host.status.success() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = confined_ctx(dir.path(), SandboxMode::Write);
+        let allowed = run_shell(shell, &ctx, &probe).await;
+        assert!(
+            allowed.contains("CONNECTED"),
+            "the main agent keeps its network — it is the one that pushes: {allowed}"
+        );
+
+        let mut policy = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+        policy.deny_network();
+        ctx.sandbox = std::sync::Arc::new(policy);
+        let denied = run_shell(shell, &ctx, &probe).await;
+        assert!(
+            !denied.contains("CONNECTED"),
+            "a delegated shell must not reach a socket: {denied}"
+        );
+        assert!(
+            denied.contains("[exit status"),
+            "…and it fails rather than quietly doing nothing: {denied}"
+        );
+    }
+
     /// The main agent keeps full authority: nothing is subtracted unless
     /// `deny_git_writes` is called, and `Agent::new` calls it only for a
     /// delegated writer.
@@ -2769,6 +3129,7 @@ mod tests {
             writable_roots: vec![canonicalize_nearest(dir.path())],
             readable_roots: Vec::new(),
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
 
         let target = outside.path().join("escaped");
@@ -2807,6 +3168,85 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&inside).unwrap().trim(), "x");
     }
 
+    /// The fallback backend's half of the network denial, against the real
+    /// kernel: ABI v4 gave Landlock exactly two network rights, and handling
+    /// `AccessNet` while granting no port is how a ruleset spells "no TCP".
+    ///
+    /// Run here rather than trusted from the API docs because the failure mode
+    /// this guards against is a ruleset that *builds* and enforces nothing —
+    /// `BestEffort` downgrades silently, so only a real connect proves it.
+    ///
+    /// And the notice is asserted alongside, because what this backend cannot do
+    /// matters as much as what it can: UDP and raw sockets are outside
+    /// Landlock's vocabulary, so the denial here is narrower than bwrap's and
+    /// the agent is told so.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn landlock_denies_tcp_and_admits_what_it_cannot_reach() {
+        if !std::fs::read_to_string("/sys/kernel/security/lsm")
+            .unwrap_or_default()
+            .contains("landlock")
+        {
+            return; // best-effort: exercise the real backend when available
+        }
+        if crate::Shell::detect() != Some(crate::Shell::Bash) {
+            return; // the probe is bash's `/dev/tcp`
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let port = listener.local_addr().unwrap().port();
+        let probe = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo CONNECTED");
+        let host = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&probe)
+            .output()
+            .expect("bash");
+        if !host.status.success() {
+            return; // a bash without `--enable-net-redirections` proves nothing
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![canonicalize_nearest(dir.path())],
+            readable_roots: Vec::new(),
+            readonly_subpaths: Vec::new(),
+            allow_network: true,
+        };
+        let mine = notices();
+        let run = |policy: &SandboxPolicy, notices: &SandboxNotices| {
+            let mut cmd = shell_command_with_backend(
+                OsSandboxBackend::Landlock,
+                crate::Shell::Bash,
+                &probe,
+                policy,
+                dir.path(),
+                notices,
+            );
+            cmd.current_dir(dir.path());
+            async move { cmd.output().await.unwrap() }
+        };
+
+        let out = run(&policy, &mine).await;
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("CONNECTED"),
+            "an agent that keeps its network still connects: {out:?}"
+        );
+
+        policy.deny_network();
+        let out = run(&policy, &mine).await;
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(!out.status.success(), "the connect was allowed: {out:?}");
+        assert!(stderr.contains("Permission denied"), "{stderr}");
+
+        let queued = drain(&mine);
+        assert!(
+            queued
+                .iter()
+                .any(|n| n == NETWORK_PARTIAL_UNDER_LANDLOCK_NOTICE),
+            "the UDP/raw-socket gap is admitted, not hidden: {queued:?}"
+        );
+    }
+
     /// Landlock has no read axis, so a read-mode agent's shell commands are
     /// only write-confined — which must never be silent.
     #[cfg(target_os = "linux")]
@@ -2818,6 +3258,7 @@ mod tests {
             writable_roots: Vec::new(),
             readable_roots: vec![canonicalize_nearest(dir.path())],
             readonly_subpaths: Vec::new(),
+            allow_network: true,
         };
         let mine = notices();
 
