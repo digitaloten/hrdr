@@ -37,7 +37,10 @@ mod tools;
 mod verification;
 mod web;
 
-pub use approval::{APPROVAL_TIMEOUT_SECS, ApprovalDecision, ApprovalGate, ApprovalRequest};
+pub use approval::{
+    APPROVAL_TIMEOUT_SECS, ApprovalDecision, ApprovalGate, ApprovalRequest, EscalationDecision,
+    EscalationLog,
+};
 pub use escalation::{EscalationPolicy, EscalationRule, unsandboxed_execution_allowed};
 pub use gate::{Gate, GateCheck, GateSource};
 pub use guardrails::{Guardrail, check_guardrails, default_guardrails};
@@ -266,6 +269,9 @@ pub struct ToolContext {
     /// the clone every tool call gets writes into the same queue the agent
     /// drains.
     pub sandbox_notices: Arc<SandboxNotices>,
+    /// Consent decisions this agent has made, drained by the turn loop into the
+    /// durable transcript. Per agent for the same reason as `sandbox_notices`.
+    pub escalations: Arc<EscalationLog>,
     /// Where `shell` asks whether an eligible command may run OUTSIDE the OS
     /// sandbox, and waits for the answer (see [`ApprovalGate`]).
     ///
@@ -316,6 +322,7 @@ impl ToolContext {
             lsp: None,
             sandbox: Arc::new(SandboxPolicy::unconfined()),
             sandbox_notices: Arc::new(SandboxNotices::default()),
+            escalations: Arc::new(EscalationLog::default()),
             approvals: None,
             test_nudge: Arc::new(Mutex::new(TestNudgeState::default())),
             verification: Arc::new(Mutex::new(VerificationLedger::default())),

@@ -1000,6 +1000,24 @@ fn event_json(ev: &AgentEvent) -> String {
         } => {
             json!({"type": "approval_requested", "id": id, "command": command, "reason": reason, "rules": rules})
         }
+        AgentEvent::EscalationDecided {
+            command,
+            reason,
+            rules,
+            decision,
+        } => {
+            json!({
+                "type": "escalation_decided",
+                "command": command,
+                "reason": reason,
+                "rules": rules,
+                "decision": match decision {
+                    hrdr_tools::ApprovalDecision::Once => "once",
+                    hrdr_tools::ApprovalDecision::Session => "session",
+                    hrdr_tools::ApprovalDecision::Deny => "deny",
+                },
+            })
+        }
         AgentEvent::TurnDone => json!({"type": "done"}),
     };
     v.to_string()

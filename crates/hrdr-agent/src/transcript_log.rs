@@ -93,6 +93,18 @@ pub enum Record {
     Error {
         msg: String,
     },
+    /// A human agreed (or refused) to move this agent's sandbox boundary for one
+    /// command. The audit half of escalation: without it nothing on disk says a
+    /// command ran with less confinement than the session's policy describes.
+    EscalationDecided {
+        command: String,
+        reason: String,
+        rules: Vec<String>,
+        /// `"once"`, `"session"` or `"deny"` — the wire spelling of
+        /// `ApprovalDecision`, kept as a string so the record format does not
+        /// depend on that enum's layout.
+        decision: String,
+    },
     End {
         status: EndStatus,
         /// Byte length of the sub-agent's trimmed text output at the terminal
@@ -134,6 +146,24 @@ impl Record {
                 ok: *ok,
             }),
             AgentEvent::Notice(n) => Some(Record::Notice { msg: n.clone() }),
+            // The one approval signal that IS persisted: a decision, not a
+            // question. See `Record::EscalationDecided`.
+            AgentEvent::EscalationDecided {
+                command,
+                reason,
+                rules,
+                decision,
+            } => Some(Record::EscalationDecided {
+                command: command.clone(),
+                reason: reason.clone(),
+                rules: rules.clone(),
+                decision: match decision {
+                    hrdr_tools::ApprovalDecision::Once => "once",
+                    hrdr_tools::ApprovalDecision::Session => "session",
+                    hrdr_tools::ApprovalDecision::Deny => "deny",
+                }
+                .to_string(),
+            }),
             AgentEvent::Steered(s) => Some(Record::Steered { text: s.clone() }),
             // An approval request is a question in flight, not a record of what
             // happened: by the time anyone replays this transcript it has been
@@ -184,6 +214,21 @@ impl Record {
             Record::Notice { msg } => Some(AgentEvent::Notice(msg.clone())),
             Record::Steered { text } => Some(AgentEvent::Steered(text.clone())),
             Record::Error { msg } => Some(AgentEvent::Notice(msg.clone())),
+            // Replayed as a notice rather than round-tripped. The record exists
+            // to be *read* — by a person auditing what was consented to — and
+            // `apply_event` deliberately folds the decision into nothing, so
+            // reconstructing the original event would make it vanish from the
+            // rendered transcript it is supposed to document.
+            Record::EscalationDecided {
+                command, decision, ..
+            } => Some(AgentEvent::Notice(format!(
+                "[escalation] `{command}` — {}",
+                match decision.as_str() {
+                    "once" => "approved for this run",
+                    "session" => "approved for the session",
+                    _ => "refused",
+                }
+            ))),
             Record::End { .. } => None,
         }
     }

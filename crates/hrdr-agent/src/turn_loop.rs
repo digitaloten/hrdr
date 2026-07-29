@@ -533,6 +533,18 @@ impl Agent {
             if let Some(warning) = self.ctx.sandbox_notices.take() {
                 on_event(AgentEvent::Notice(warning));
             }
+            // Consent decisions, on the same channel and for the same reason: a
+            // tool call several crates down has something the run's durable
+            // record must carry, and no way to emit an event itself. Drained
+            // rather than read — a decision is persisted exactly once.
+            for decided in self.ctx.escalations.take() {
+                on_event(AgentEvent::EscalationDecided {
+                    command: decided.command,
+                    reason: decided.reason,
+                    rules: decided.rules,
+                    decision: decided.decision,
+                });
+            }
 
             // Emit usage for the status bar + auto-compaction. Prefer the
             // server's reported counts; when it doesn't send any (e.g. a server

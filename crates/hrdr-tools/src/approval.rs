@@ -41,6 +41,52 @@ pub enum ApprovalDecision {
     Deny,
 }
 
+/// A consent decision that has been made, for the durable record.
+///
+/// The approval *question* is UI state and deliberately not persisted — by the
+/// time anyone replays a transcript it has been answered. The **answer** is a
+/// different thing: it is the moment a human agreed to move the boundary, and
+/// without it nothing on disk says a command ran with less confinement than the
+/// session's policy describes. Recorded for denials too, since "the user was
+/// asked and said no" is exactly as much a fact about the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EscalationDecision {
+    /// The command verbatim, as approved.
+    pub command: String,
+    /// What the user was told they were agreeing to.
+    pub reason: String,
+    /// The labels the answer was keyed on.
+    pub rules: Vec<String>,
+    /// Whether it was granted, and whether it was remembered.
+    pub decision: ApprovalDecision,
+}
+
+/// Decisions made by this agent, waiting to be drained into its transcript.
+///
+/// Same shape and same reasoning as [`SandboxNotices`](crate::SandboxNotices):
+/// a tool call deep in `hrdr-tools` has something the agent must record, and no
+/// way to emit an event itself. This is the agent's OWN channel — a sibling's
+/// consent is a sibling's record.
+#[derive(Debug, Default)]
+pub struct EscalationLog {
+    entries: Mutex<Vec<EscalationDecision>>,
+}
+
+impl EscalationLog {
+    pub(crate) fn push(&self, decision: EscalationDecision) {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(decision);
+    }
+
+    /// Take everything recorded so far. Draining rather than reading, because a
+    /// decision must be persisted exactly once.
+    pub fn take(&self) -> Vec<EscalationDecision> {
+        std::mem::take(&mut *self.entries.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
 /// One question waiting on a human, as a frontend receives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRequest {

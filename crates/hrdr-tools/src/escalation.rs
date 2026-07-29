@@ -412,10 +412,42 @@ pub(crate) async fn consider(command: &str, ctx: &crate::ToolContext) -> Escalat
     // a denial that names the user namespace as the cause.
     let widening = Widening::Full;
     let reason = escalation_reason(&rules, widening);
-    match gate.request(command, &rules, &reason).await {
+    let decision = gate.request(command, &rules, &reason).await;
+    record(ctx, command, &reason, &rules, decision);
+    match decision {
         ApprovalDecision::Once | ApprovalDecision::Session => Escalation::Approved(widening),
         ApprovalDecision::Deny => Escalation::Denied(rules),
     }
+}
+
+/// Put a consent decision in this agent's durable record.
+///
+/// Written for denials as well as grants: "the user was asked and said no" is
+/// exactly as much a fact about the run as a yes, and a log that only kept the
+/// yeses would make a session that refused ten times look like one that was never
+/// asked. Skipped when nobody could have answered — a headless run denies without
+/// a human in the loop, and recording that as a decision would put consent in the
+/// log that nobody gave.
+fn record(
+    ctx: &crate::ToolContext,
+    command: &str,
+    reason: &str,
+    rules: &[String],
+    decision: ApprovalDecision,
+) {
+    let asked = ctx
+        .approvals
+        .as_deref()
+        .is_some_and(|gate| gate.can_answer());
+    if !asked {
+        return;
+    }
+    ctx.escalations.push(crate::EscalationDecision {
+        command: command.to_string(),
+        reason: reason.to_string(),
+        rules: rules.to_vec(),
+        decision,
+    });
 }
 
 /// Ask about re-running a command the sandbox has *already* refused.
@@ -460,10 +492,11 @@ pub(crate) async fn consider_retry(
     // are derived from whatever the model happened to run, and `curl … | sh`
     // yields a perfectly offerable `sh` segment whose *standing* approval would
     // be a blank cheque. One failing command justifies one bypass.
-    match gate
+    let decision = gate
         .request_with_memory(command, &rules, &reason, false)
-        .await
-    {
+        .await;
+    record(ctx, command, &reason, &rules, decision);
+    match decision {
         ApprovalDecision::Once | ApprovalDecision::Session => Escalation::Approved(widening),
         ApprovalDecision::Deny => Escalation::Denied(rules),
     }
@@ -1186,6 +1219,68 @@ mod tests {
         assert!(
             !status.success() && !probe.exists(),
             "the narrow widening let a write escape the policy's roots"
+        );
+    }
+
+    /// Every consent decision leaves a record — grants AND refusals. A log that
+    /// kept only the yeses would make a session that refused ten times look like
+    /// one that was never asked.
+    #[tokio::test]
+    async fn a_consent_decision_is_recorded_either_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, gate, mut rx) = gated_ctx(dir.path(), SandboxMode::Write, true);
+        let answering = gate.clone();
+        tokio::spawn(async move {
+            let mut approve = true;
+            while let Some(req) = rx.recv().await {
+                answering.answer(
+                    &req.id,
+                    if approve {
+                        ApprovalDecision::Once
+                    } else {
+                        ApprovalDecision::Deny
+                    },
+                );
+                approve = !approve;
+            }
+        });
+
+        assert_eq!(
+            consider("git push origin main", &ctx).await,
+            Escalation::Approved(Widening::Full)
+        );
+        assert_eq!(
+            consider("git fetch", &ctx).await,
+            Escalation::Denied(vec!["git fetch".to_string()])
+        );
+
+        let recorded = ctx.escalations.take();
+        assert_eq!(recorded.len(), 2, "{recorded:?}");
+        assert_eq!(recorded[0].command, "git push origin main");
+        assert_eq!(recorded[0].decision, ApprovalDecision::Once);
+        assert_eq!(recorded[1].command, "git fetch");
+        assert_eq!(recorded[1].decision, ApprovalDecision::Deny);
+        // What the user was told is kept with what they answered — a record of
+        // consent that omits the question is not a record of consent.
+        assert!(!recorded[0].reason.is_empty());
+
+        // Draining is exactly-once: a decision must not be persisted twice.
+        assert!(ctx.escalations.take().is_empty());
+    }
+
+    /// A headless run denies with no human in the loop, so there is no decision
+    /// to record. Writing one would put consent in the log that nobody gave.
+    #[tokio::test]
+    async fn an_automatic_denial_is_not_recorded_as_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _gate, _rx) = gated_ctx(dir.path(), SandboxMode::Write, false);
+        assert_eq!(
+            consider("git push origin main", &ctx).await,
+            Escalation::Denied(vec!["git push".to_string()])
+        );
+        assert!(
+            ctx.escalations.take().is_empty(),
+            "a denial nobody was asked about was logged as a decision"
         );
     }
 

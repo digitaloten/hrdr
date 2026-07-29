@@ -847,6 +847,24 @@ pub enum AgentEvent {
         /// remembered under.
         rules: Vec<String>,
     },
+    /// A consent decision was made: the user was asked whether a command could
+    /// run with the boundary moved, and answered.
+    ///
+    /// Unlike [`ApprovalRequested`](Self::ApprovalRequested), which is a question
+    /// in flight and deliberately not persisted, this is the durable record that
+    /// a human agreed (or refused) to move the boundary. Emitted only when
+    /// somebody could actually answer — a headless run's automatic denial is not
+    /// a decision anyone made.
+    EscalationDecided {
+        /// The command verbatim, as approved.
+        command: String,
+        /// What the user was told they were agreeing to.
+        reason: String,
+        /// The labels the answer was keyed on.
+        rules: Vec<String>,
+        /// Granted once, granted for the session, or refused.
+        decision: hrdr_tools::ApprovalDecision,
+    },
     /// The model produced a final answer with no further tool calls.
     TurnDone,
 }

@@ -679,7 +679,11 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
         // the frontend owns until it is answered. Folding it into the transcript
         // would leave a permanent "may I?" in a conversation whose next entry is
         // the answer in the form of the command's result.
+        // Both are records rather than conversation: the question is UI state,
+        // and the decision belongs in the durable log (`transcript_log`), not in
+        // a message list the model is shown.
         AgentEvent::ApprovalRequested { .. }
+        | AgentEvent::EscalationDecided { .. }
         | AgentEvent::Usage { .. }
         | AgentEvent::History(_)
         | AgentEvent::TurnDone
