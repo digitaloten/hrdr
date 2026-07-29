@@ -838,6 +838,12 @@ pub(crate) fn gpu_device_nodes() -> Vec<std::path::PathBuf> {
     out
 }
 
+/// GPU devices don't exist on non-Linux — the loop is a no-op.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn gpu_device_nodes() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
 pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<String> {
     if policy.mode == SandboxMode::None {
         return None;

@@ -30,6 +30,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`gpu_device_nodes()` now compiles on macOS and Windows.** The function
+  (which reads `/dev` for GPU compute devices to bind them into the sandbox) was
+  gated `#[cfg(target_os = "linux")]` but called from non-gated code paths in
+  `bwrap_args` and `install_landlock_rules`, breaking the clippy/test/smoke jobs
+  on both platforms. A non-Linux stub returns an empty vec — no GPU devices to
+  bind on those OSes — matching the existing `sweep_stale_scratch` pattern.
+
 - **Removed every reference to the deleted `task_diff`/`task_consume`/
   `task_cleanup` tools.** Five of them were in live model-facing text and were
   telling the model to call tools that no longer exist: the write-capable prompt
