@@ -6008,6 +6008,23 @@ async fn ask(
     String,
     tokio::task::JoinHandle<hrdr_tools::ApprovalDecision>,
 ) {
+    ask_with_memory(h, gate, rx, command, rules, true).await
+}
+
+/// [`ask`] with control over whether a "for the session" answer would be
+/// honoured — the difference between an allowlisted request and a retry offer
+/// keyed on a derived rule.
+async fn ask_with_memory(
+    h: &mut Harness,
+    gate: &Arc<hrdr_tools::ApprovalGate>,
+    rx: &mut mpsc::UnboundedReceiver<hrdr_tools::ApprovalRequest>,
+    command: &str,
+    rules: &[&str],
+    remember: bool,
+) -> (
+    String,
+    tokio::task::JoinHandle<hrdr_tools::ApprovalDecision>,
+) {
     let asked = gate.clone();
     let cmd = command.to_string();
     let rules: Vec<String> = rules.iter().map(|r| r.to_string()).collect();
@@ -6015,7 +6032,11 @@ async fn ask(
         "runs outside the OS sandbox — matched rule (`{}`)",
         rules.join("`, `")
     );
-    let handle = tokio::spawn(async move { asked.request(&cmd, &rules, &reason).await });
+    let handle = tokio::spawn(async move {
+        asked
+            .request_with_memory(&cmd, &rules, &reason, remember)
+            .await
+    });
     let req = rx.recv().await.expect("the gate publishes the request");
     let id = req.id.clone();
     h.inject(hrdr_agent::AgentEvent::ApprovalRequested {
@@ -6023,6 +6044,7 @@ async fn ask(
         command: req.command,
         reason: req.reason,
         rules: req.rules,
+        allow_session: req.allow_session,
     });
     (id, handle)
 }
@@ -6065,12 +6087,15 @@ async fn an_approval_request_opens_a_modal_naming_the_command_and_the_grant() {
         "the command is shown verbatim:\n{screen}"
     );
     assert!(
-        screen.contains("OUTSIDE the OS sandbox"),
+        screen.contains("less confinement"),
         "the modal says what is being asked:\n{screen}"
     );
+    // What approving GRANTS comes from the request's own `reason` now, because
+    // severity differs per rung — see `Widening::describes`. The modal no longer
+    // hard-codes a sentence that would be false for the narrow rungs.
     assert!(
-        screen.contains("NO sandbox at all"),
-        "…and in plain words what approving grants:\n{screen}"
+        screen.contains("runs outside the OS sandbox"),
+        "…and shows the request's own description of the grant:\n{screen}"
     );
     assert!(
         screen.contains("Matched rule"),
@@ -6088,6 +6113,93 @@ async fn an_approval_request_opens_a_modal_naming_the_command_and_the_grant() {
         hrdr_tools::ApprovalDecision::Deny,
         "Esc denies"
     );
+}
+
+/// A request the gate will not remember must not OFFER to remember it.
+///
+/// A retry offer is keyed on a rule derived from whatever the model happened to
+/// run, and the gate downgrades a `Session` answer there to a one-off. Showing
+/// the button anyway would let the user believe they had settled the question for
+/// the session and then be asked again on the very next command — so the row is
+/// gone, and so is the sentence explaining what it would have remembered.
+#[tokio::test]
+async fn a_request_that_cannot_be_remembered_offers_no_session_choice() {
+    let (mut h, gate, mut rx) = approval_harness(60_000).await;
+    let (_id, waiting) = ask_with_memory(
+        &mut h,
+        &gate,
+        &mut rx,
+        "cargo test --workspace",
+        &["cargo test"],
+        false,
+    )
+    .await;
+
+    let screen = h.render();
+    assert!(
+        screen.contains("cargo test --workspace"),
+        "the command is still shown verbatim:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Approve for the session"),
+        "a choice the gate would downgrade was offered anyway:\n{screen}"
+    );
+    assert!(
+        !screen.contains("would remember"),
+        "the session explanation outlived the choice it explains:\n{screen}"
+    );
+    assert!(
+        screen.contains("Approve once"),
+        "the one-off grant is still on offer:\n{screen}"
+    );
+
+    // Two rows, and the highlight still starts on Deny. A hardcoded index would
+    // have landed on "Approve once" the moment a row was dropped.
+    let modal = h.app.approval_modal.as_ref().expect("the modal is open");
+    assert_eq!(modal.choices().len(), 2);
+    assert_eq!(
+        modal.decision(),
+        hrdr_tools::ApprovalDecision::Deny,
+        "the default highlight must stay Deny when a row is dropped"
+    );
+
+    // Enter therefore denies, as it does with all three rows present.
+    h.press(KeyCode::Enter);
+    assert_eq!(waiting.await.unwrap(), hrdr_tools::ApprovalDecision::Deny);
+}
+
+/// A consent decision is part of the run, so it shows up in the transcript —
+/// this is the audit trail being visible rather than only on disk.
+#[tokio::test]
+async fn a_consent_decision_appears_in_the_transcript() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    h.inject(hrdr_agent::AgentEvent::EscalationDecided {
+        command: "git push origin main".to_string(),
+        reason: "runs outside the OS sandbox".to_string(),
+        rules: vec!["git push".to_string()],
+        decision: hrdr_tools::ApprovalDecision::Once,
+    });
+    let screen = h.render();
+    assert!(
+        screen.contains("git push origin main"),
+        "the decision names the command it was about:\n{screen}"
+    );
+    assert!(
+        screen.contains("approved for this run"),
+        "…and what was decided:\n{screen}"
+    );
+
+    // A refusal is recorded just as visibly: a transcript that showed only the
+    // grants would read as though nothing was ever declined.
+    h.inject(hrdr_agent::AgentEvent::EscalationDecided {
+        command: "cargo test".to_string(),
+        reason: "the OS sandbox refused this command".to_string(),
+        rules: vec!["cargo test".to_string()],
+        decision: hrdr_tools::ApprovalDecision::Deny,
+    });
+    let screen = h.render();
+    assert!(screen.contains("refused"), "{screen}");
 }
 
 /// A long command is wrapped, never elided. A `git push … ; rm -rf …` whose tail

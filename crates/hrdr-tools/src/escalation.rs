@@ -347,7 +347,15 @@ pub(crate) enum Widening {
 }
 
 impl Widening {
-    /// One line for the approval prompt: what the user is being asked to give up.
+    /// What the user is being asked to give up, in the words the approval dialog
+    /// shows.
+    ///
+    /// The **only** description of a grant's severity, deliberately. Both
+    /// frontends used to hard-code "approving runs it with NO sandbox at all",
+    /// which was true when there was one rung and became false the moment there
+    /// were three — a dialog telling the user they were handing over the whole
+    /// filesystem while the command actually ran fully confined. Severity varies
+    /// per rung, so it is described per rung, once.
     fn describes(self) -> &'static str {
         match self {
             Self::NoUserNamespace => {
@@ -355,7 +363,11 @@ impl Widening {
                  drops the user namespace — which is the part that makes ssh refuse \
                  root-owned config files"
             }
-            Self::Full => "runs with NO OS confinement at all: the whole filesystem, writable",
+            Self::Full => {
+                "runs with NO OS confinement at all: unconfined, as you, with full access to \
+                 your files, your keys and the network. Every other command hrdr runs stays \
+                 inside the sandbox"
+            }
             Self::GitMetadata => {
                 "keeps this agent's confinement exactly as it is, and lifts only the read-only \
                  lock on the repository's git metadata — so this command may move history"
@@ -589,17 +601,17 @@ pub(crate) fn retry_rules(command: &str) -> Option<Vec<String>> {
 
 /// Why the user is being asked *after* a failure, as distinct from before one.
 ///
-/// Two things the user cannot weigh without being told, so both are said: the
-/// command has already run once (approving means running it again), and this
-/// answer covers only this run however the frontend labels its buttons — see
-/// [`consider_retry`]. The second sentence is the honest version of a UI that
-/// still offers "always allow"; making the button itself disappear needs a field
-/// on `ApprovalRequest` and a change in every frontend.
+/// Says the command has already run once, because approving means running it
+/// again and the user cannot weigh that without being told.
+///
+/// It does NOT say "this is not remembered for the session" any more. That was
+/// prose apologising for a button the frontends should never have shown;
+/// `ApprovalRequest::allow_session` now carries it, and they omit the choice
+/// instead.
 fn retry_reason(widening: Widening) -> String {
     format!(
         "the OS sandbox refused this command — re-run it with less confinement? It has \
-         already run once and failed. This {}. The approval covers only this one run; it is \
-         not remembered for the session.",
+         already run once and failed. This {}.",
         widening.describes(),
     )
 }

@@ -846,6 +846,10 @@ pub enum AgentEvent {
         /// The escalation rules it matched, and what an "always allow" answer is
         /// remembered under.
         rules: Vec<String>,
+        /// Whether an "always allow" answer will really be honoured as standing.
+        /// False for a derived rule; a frontend must omit that choice rather
+        /// than offer one that silently means something else.
+        allow_session: bool,
     },
     /// A consent decision was made: the user was asked whether a command could
     /// run with the boundary moved, and answered.

@@ -283,6 +283,15 @@ pub enum ServerMsg {
         /// The rules it matched. Shown so "for the session" can name what it
         /// would remember, and it is what that memory is keyed on.
         rules: Vec<String>,
+        /// Whether a "for the session" answer will really be honoured as
+        /// standing. False for a derived rule — the client must omit that choice,
+        /// not show one that quietly means "once".
+        ///
+        /// Defaulted on the wire so an older client's frames still parse; it
+        /// reads as "the session choice is available", which is what every
+        /// request meant before this existed.
+        #[serde(default = "crate::default_true")]
+        allow_session: bool,
     },
     /// Nothing is waiting on `id` any more — another client answered it, or it
     /// timed out inside the blocked tool call. A client showing that request
@@ -295,6 +304,15 @@ pub enum ServerMsg {
     Error {
         message: String,
     },
+}
+
+/// Serde default for a boolean whose historical meaning was "yes".
+///
+/// `allow_session` was added after the wire format shipped; a frame without it
+/// came from a build where every request offered the session choice, so absent
+/// must read as `true` rather than as `bool::default()`.
+pub(crate) fn default_true() -> bool {
+    true
 }
 
 /// What the user said about one escalation request. Mirrors
@@ -520,6 +538,7 @@ mod tests {
                 command: command.to_string(),
                 reason: "runs outside the OS sandbox".into(),
                 rules: vec!["git push".into()],
+                allow_session: true,
             },
         };
         let json = serde_json::to_string(&frame).unwrap();
@@ -529,6 +548,31 @@ mod tests {
         };
         assert_eq!(round, command, "the command changed in transit");
         assert_eq!(back, frame);
+    }
+
+    /// `allow_session` is newer than the wire format, so a frame without it must
+    /// still parse — and must read as `true`, which is what every request meant
+    /// before the field existed. Defaulting to `false` would silently strip the
+    /// session choice from an older server's requests.
+    #[test]
+    fn an_approval_frame_without_allow_session_still_parses_as_available() {
+        let json = r#"{"seq":1,"type":"approval_requested","id":"esc-1",
+            "command":"git push","reason":"why","rules":["git push"]}"#;
+        let frame: ServerFrame = serde_json::from_str(json).unwrap();
+        let ServerMsg::ApprovalRequested { allow_session, .. } = &frame.msg else {
+            panic!("wrong variant: {:?}", frame.msg);
+        };
+        assert!(allow_session, "an absent flag must not remove the choice");
+
+        // And an explicit `false` survives the round trip, or the retry path's
+        // whole point is lost between server and client.
+        let json = r#"{"seq":1,"type":"approval_requested","id":"esc-1","command":"cargo test",
+            "reason":"why","rules":["cargo test"],"allow_session":false}"#;
+        let frame: ServerFrame = serde_json::from_str(json).unwrap();
+        let ServerMsg::ApprovalRequested { allow_session, .. } = &frame.msg else {
+            panic!("wrong variant: {:?}", frame.msg);
+        };
+        assert!(!allow_session);
     }
 
     /// The decision names on the wire, pinned: a client and server that disagree

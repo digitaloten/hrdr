@@ -370,6 +370,7 @@ pub fn build_approval_requested(
     command: String,
     reason: String,
     rules: Vec<String>,
+    allow_session: bool,
 ) -> ServerFrame {
     ServerFrame {
         seq,
@@ -378,6 +379,7 @@ pub fn build_approval_requested(
             command,
             reason,
             rules,
+            allow_session,
         },
     }
 }

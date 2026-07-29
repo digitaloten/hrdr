@@ -559,19 +559,10 @@ fn draw_approval_modal(
 
     let mut lines = vec![
         Line::from(Span::styled(
-            "⚠  Run this command OUTSIDE the OS sandbox?",
+            "⚠  Run this command with less confinement?",
             Style::default()
                 .fg(theme.error)
                 .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        // Plain words for the actual grant. Not "elevated permissions" — nothing
-        // is being elevated; the confinement is simply being removed.
-        Line::from(Span::styled(
-            "Approving runs it with NO sandbox at all: unconfined, as you, with \
-             full access to your files, your keys and the network. Every other \
-             command hrdr runs stays inside the sandbox.",
-            Style::default().fg(theme.warn),
         )),
         Line::from(""),
         Line::from(Span::styled("Command", Style::default().fg(theme.dim))),
@@ -580,18 +571,28 @@ fn draw_approval_modal(
             Style::default().fg(theme.user).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
+        // The severity of the grant, in the warn colour, because `reason` is now
+        // where it lives. There is deliberately no hard-coded "runs with NO
+        // sandbox at all" above: that was true of the only rung that existed when
+        // it was written and false of the two narrower ones added since, so a
+        // dialog carrying it would have promised the user's whole filesystem away
+        // while the command actually ran fully confined. `Widening::describes` is
+        // the single source of that sentence.
         Line::from(Span::styled(
             req.reason.clone(),
-            Style::default().fg(theme.dim),
+            Style::default().fg(theme.warn),
         )),
         Line::from(""),
-        // Named so "approve for the session" has a visible meaning: this is what
-        // else that answer waves through later, without asking again.
-        Line::from(Span::styled(
+    ];
+    // Named so "approve for the session" has a visible meaning: this is what else
+    // that answer waves through later, without asking again. Omitted with the
+    // choice itself — see `approval_choices`.
+    if req.allow_session {
+        lines.push(Line::from(Span::styled(
             format!(
                 "Matched {}: {} — this is what \"for the session\" would remember, \
-                 and every later command matching it would then run outside the \
-                 sandbox without asking.",
+                 and every later command matching it would then run the same way \
+                 without asking.",
                 if req.rules.len() == 1 {
                     "rule"
                 } else {
@@ -604,10 +605,10 @@ fn draw_approval_modal(
                     .join(", "),
             ),
             Style::default().fg(theme.dim),
-        )),
-        Line::from(""),
-    ];
-    for (i, (_, label, detail)) in crate::app::APPROVAL_CHOICES.iter().enumerate() {
+        )));
+        lines.push(Line::from(""));
+    }
+    for (i, (_, label, detail)) in modal.choices().iter().enumerate() {
         let selected = i == modal.selected;
         let mark = if selected { "❯ " } else { "  " };
         let style = if selected {

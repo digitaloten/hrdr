@@ -1154,6 +1154,7 @@ impl Agent {
                         command: req.command,
                         reason: req.reason,
                         rules: req.rules,
+                        allow_session: req.allow_session,
                     });
                 }
             }

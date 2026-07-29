@@ -997,8 +997,9 @@ fn event_json(ev: &AgentEvent) -> String {
             command,
             reason,
             rules,
+            allow_session,
         } => {
-            json!({"type": "approval_requested", "id": id, "command": command, "reason": reason, "rules": rules})
+            json!({"type": "approval_requested", "id": id, "command": command, "reason": reason, "rules": rules, "allow_session": allow_session})
         }
         AgentEvent::EscalationDecided {
             command,

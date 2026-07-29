@@ -679,11 +679,21 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
         // the frontend owns until it is answered. Folding it into the transcript
         // would leave a permanent "may I?" in a conversation whose next entry is
         // the answer in the form of the command's result.
-        // Both are records rather than conversation: the question is UI state,
-        // and the decision belongs in the durable log (`transcript_log`), not in
-        // a message list the model is shown.
+        // A decision the user made is part of the run, and the transcript is
+        // where a person looks to see what happened in it — so it folds to a
+        // notice, live and on replay alike. (The *question* stays out: it is UI
+        // state, and by the time anyone reads this it has been answered.)
+        AgentEvent::EscalationDecided {
+            command, decision, ..
+        } => transcript.push(Entry::notice(format!(
+            "escalation: `{command}` — {}",
+            match decision {
+                hrdr_tools::ApprovalDecision::Once => "approved for this run",
+                hrdr_tools::ApprovalDecision::Session => "approved for the session",
+                hrdr_tools::ApprovalDecision::Deny => "refused, so it ran confined",
+            }
+        ))),
         AgentEvent::ApprovalRequested { .. }
-        | AgentEvent::EscalationDecided { .. }
         | AgentEvent::Usage { .. }
         | AgentEvent::History(_)
         | AgentEvent::TurnDone

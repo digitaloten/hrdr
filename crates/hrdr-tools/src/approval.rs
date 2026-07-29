@@ -100,6 +100,15 @@ pub struct ApprovalRequest {
     /// The rules it matched. Shown so "always allow" can name what it is
     /// remembering, and it is what the session memory is keyed on.
     pub rules: Vec<String>,
+    /// Whether an [`ApprovalDecision::Session`] answer will actually be honoured
+    /// as standing.
+    ///
+    /// `false` for a derived rule (see
+    /// [`request_with_memory`](ApprovalGate::request_with_memory)), where the gate
+    /// downgrades that answer to a one-off. A frontend must not offer a choice
+    /// that silently means something else, so this is on the request rather than
+    /// left to prose in `reason`: the button has to go, not be explained away.
+    pub allow_session: bool,
 }
 
 #[derive(Default)]
@@ -253,6 +262,7 @@ impl ApprovalGate {
                 command: command.to_string(),
                 reason: reason.to_string(),
                 rules: rules.to_vec(),
+                allow_session: remember,
             };
             if self.tx.send(request).is_err() {
                 // The receiving end is gone, so the request reached nobody

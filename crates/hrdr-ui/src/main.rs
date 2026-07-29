@@ -22,6 +22,10 @@ struct ApprovalPrompt {
     command: String,
     reason: String,
     rules: Vec<String>,
+    /// Whether "approve for the session" will really be honoured as standing. The
+    /// button is omitted when it would not be — a choice that quietly means
+    /// something narrower than its label is worse than no choice.
+    allow_session: bool,
 }
 
 /// The two approve buttons stay inert for this long after the dialog appears.
@@ -324,12 +328,7 @@ fn approval_modal(ui: Signal<UiState>, prompt: &ApprovalPrompt, queued: usize) -
                 style { {approval_css()} }
 
                 div { style:"color:#e94560;font-weight:bold;font-size:16px;margin-bottom:0.5rem;",
-                    "⚠ Run this command OUTSIDE the OS sandbox?"
-                }
-                div { style:"color:#f0a500;font-size:14px;line-height:1.5;margin-bottom:0.75rem;",
-                    "Approving runs it with NO sandbox at all: unconfined, as you, with full \
-                     access to your files, your keys and the network. Every other command hrdr \
-                     runs stays inside the sandbox."
+                    "⚠ Run this command with less confinement?"
                 }
 
                 div { style:"color:#888;font-size:12px;text-transform:uppercase;letter-spacing:0.05em;", "Command" }
@@ -344,14 +343,22 @@ fn approval_modal(ui: Signal<UiState>, prompt: &ApprovalPrompt, queued: usize) -
                     "{prompt.command}"
                 }
 
-                div { style:"color:#aaa;font-size:13px;line-height:1.5;margin-bottom:0.5rem;",
+                // The severity of the grant, and the only place it is described.
+                // There is deliberately no hard-coded "runs with NO sandbox at
+                // all" above: that was true of the only rung that existed when it
+                // was written and false of the two narrower ones added since, so a
+                // dialog carrying it would have promised the user's whole
+                // filesystem away while the command actually ran fully confined.
+                div { style:"color:#f0a500;font-size:14px;line-height:1.5;margin-bottom:0.75rem;",
                     "{prompt.reason}"
                 }
-                div { style:"color:#888;font-size:13px;line-height:1.5;margin-bottom:0.75rem;",
-                    "Matched {rule_word}: "
-                    code { style:"color:#4ecca3;", "{rules}" }
-                    " — this is what “approve for the session” would remember, and every later \
-                     command matching it would then run outside the sandbox without asking."
+                if prompt.allow_session {
+                    div { style:"color:#888;font-size:13px;line-height:1.5;margin-bottom:0.75rem;",
+                        "Matched {rule_word}: "
+                        code { style:"color:#4ecca3;", "{rules}" }
+                        " — this is what “approve for the session” would remember, and every \
+                         later command matching it would then run the same way without asking."
+                    }
                 }
 
                 if queued > 0 {
@@ -382,15 +389,17 @@ fn approval_modal(ui: Signal<UiState>, prompt: &ApprovalPrompt, queued: usize) -
                         },
                         "Approve once"
                     }
-                    button {
-                        class: "hrdr-approve",
-                        style:"padding:0.5rem 1rem;background:#0f3460;color:#e0e0e0;\
-                               border:1px solid #e94560;border-radius:4px;cursor:pointer;font-size:14px;",
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            answer_approval(ui, WireApprovalDecision::Session);
-                        },
-                        "Approve for the session"
+                    if prompt.allow_session {
+                        button {
+                            class: "hrdr-approve",
+                            style:"padding:0.5rem 1rem;background:#0f3460;color:#e0e0e0;\
+                                   border:1px solid #e94560;border-radius:4px;cursor:pointer;font-size:14px;",
+                            onclick: move |evt| {
+                                evt.stop_propagation();
+                                answer_approval(ui, WireApprovalDecision::Session);
+                            },
+                            "Approve for the session"
+                        }
                     }
                 }
                 div { style:"color:#666;font-size:12px;margin-top:0.5rem;",
@@ -449,12 +458,14 @@ impl UiState {
                 command,
                 reason,
                 rules,
+                allow_session,
             } => {
                 let prompt = ApprovalPrompt {
                     id: id.clone(),
                     command: command.clone(),
                     reason: reason.clone(),
                     rules: rules.clone(),
+                    allow_session: *allow_session,
                 };
                 match self.approval {
                     Some(_) => self.approval_queue.push_back(prompt),

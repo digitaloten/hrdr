@@ -543,6 +543,7 @@ impl WebSession {
                 command,
                 reason,
                 rules,
+                allow_session,
             } = &ev
                 && let Ok(mut queue) = approvals.lock()
             {
@@ -551,6 +552,7 @@ impl WebSession {
                     command: command.clone(),
                     reason: reason.clone(),
                     rules: rules.clone(),
+                    allow_session: *allow_session,
                 });
             }
             notify.notify_one();
@@ -572,8 +574,14 @@ impl WebSession {
         };
         for req in filed {
             let seq = self.next_seq();
-            let frame =
-                build_approval_requested(seq, req.id.clone(), req.command, req.reason, req.rules);
+            let frame = build_approval_requested(
+                seq,
+                req.id.clone(),
+                req.command,
+                req.reason,
+                req.rules,
+                req.allow_session,
+            );
             self.emit_raw(frame);
             self.open_approvals.push(req.id);
         }
@@ -1795,6 +1803,7 @@ mod tests {
             command: req.command,
             reason: req.reason,
             rules: req.rules,
+            allow_session: req.allow_session,
         });
         session.tick();
         (id, waiting)
@@ -1835,6 +1844,7 @@ mod tests {
                 command,
                 reason,
                 rules,
+                ..
             },
         ] = published[..]
         else {

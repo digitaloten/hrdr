@@ -664,6 +664,7 @@ async fn file_request(
             command: command.to_string(),
             reason: "why this is being asked".to_string(),
             rules: vec!["git push".to_string()],
+            allow_session: true,
         });
     (id, waiting)
 }

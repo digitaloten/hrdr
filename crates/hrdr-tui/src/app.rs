@@ -109,14 +109,42 @@ pub(crate) const APPROVAL_CHOICES: [(hrdr_tools::ApprovalDecision, &str, &str); 
     ),
 ];
 
-/// Where the highlight starts: **Deny**.
+/// The answers offered for one request, which is not always all three.
+///
+/// "Approve for the session" is omitted when the gate will not honour it — a
+/// retry offer keyed on a *derived* rule, where a `Session` answer is downgraded
+/// to a one-off (see `ApprovalGate::request_with_memory`). Offering a choice that
+/// silently means something narrower than its label is worse than not offering
+/// it: the user would believe they had settled the question for the session and
+/// be asked again on the next command.
+///
+/// Deny is always last, which is what keeps [`approval_default_choice`] honest.
+pub(crate) fn approval_choices(
+    req: &hrdr_tools::ApprovalRequest,
+) -> Vec<(hrdr_tools::ApprovalDecision, &'static str, &'static str)> {
+    APPROVAL_CHOICES
+        .into_iter()
+        .filter(|(decision, _, _)| {
+            req.allow_session || *decision != hrdr_tools::ApprovalDecision::Session
+        })
+        .collect()
+}
+
+/// Where the highlight starts: **Deny**, whichever choices are on offer.
 ///
 /// The modal opens unannounced, in the middle of a turn, on top of an input box
 /// the user may be mid-sentence in. A reflexive Enter is therefore a real key
 /// press to plan for, and the only safe thing for it to mean is "no" — the
 /// alternative is a keystroke aimed at the composer granting a command
 /// unconfined access to the machine.
-pub(crate) const APPROVAL_DEFAULT_CHOICE: usize = 2;
+///
+/// Computed from the list rather than written as a constant: dropping a row would
+/// otherwise slide the highlight onto whatever moved into the last slot, and a
+/// hardcoded index that lands on "approve" is exactly the bug this defaults
+/// against.
+pub(crate) fn approval_default_choice(req: &hrdr_tools::ApprovalRequest) -> usize {
+    approval_choices(req).len().saturating_sub(1)
+}
 
 /// The open escalation-approval modal; while `Some`, it captures every key.
 ///
@@ -131,7 +159,7 @@ pub(crate) struct ApprovalModal {
     /// The request, exactly as the gate published it. Answered by `id`, so a
     /// late answer can never resolve some *other* request.
     pub(crate) req: hrdr_tools::ApprovalRequest,
-    /// Highlighted row, an index into [`APPROVAL_CHOICES`].
+    /// Highlighted row, an index into [`ApprovalModal::choices`].
     pub(crate) selected: usize,
     /// First body line rendered, for a command taller than the modal. The
     /// command is never truncated to fit (see `draw_approval_modal`), so on a
@@ -141,16 +169,27 @@ pub(crate) struct ApprovalModal {
 
 impl ApprovalModal {
     fn new(req: hrdr_tools::ApprovalRequest) -> Self {
+        let selected = approval_default_choice(&req);
         Self {
             req,
-            selected: APPROVAL_DEFAULT_CHOICE,
+            selected,
             scroll: 0,
         }
     }
 
-    /// The highlighted decision.
+    /// The answers this request offers — not always all three, see
+    /// [`approval_choices`].
+    pub(crate) fn choices(
+        &self,
+    ) -> Vec<(hrdr_tools::ApprovalDecision, &'static str, &'static str)> {
+        approval_choices(&self.req)
+    }
+
+    /// The highlighted decision. Clamped, and clamping toward the LAST row is
+    /// deliberate: that row is Deny.
     pub(crate) fn decision(&self) -> hrdr_tools::ApprovalDecision {
-        APPROVAL_CHOICES[self.selected.min(APPROVAL_CHOICES.len() - 1)].0
+        let choices = self.choices();
+        choices[self.selected.min(choices.len() - 1)].0
     }
 }
 
@@ -1035,7 +1074,11 @@ impl App {
     /// whole machine.
     fn approval_modal_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let last = APPROVAL_CHOICES.len() - 1;
+        // Per request, not a constant: a retry offer has two rows, not three.
+        let last = self
+            .approval_modal
+            .as_ref()
+            .map_or(0, |m| m.choices().len().saturating_sub(1));
         match key.code {
             // Dismissing a dialog is not consenting to it.
             KeyCode::Esc => self.answer_open_approval(hrdr_tools::ApprovalDecision::Deny),
@@ -2657,6 +2700,7 @@ impl App {
             command,
             reason,
             rules,
+            allow_session,
         } = &ev
         {
             self.open_approval(hrdr_tools::ApprovalRequest {
@@ -2664,6 +2708,7 @@ impl App {
                 command: command.clone(),
                 reason: reason.clone(),
                 rules: rules.clone(),
+                allow_session: *allow_session,
             });
         }
         // The event is already recorded on the agent's own entry — its transcript,

@@ -214,21 +214,25 @@ impl Record {
             Record::Notice { msg } => Some(AgentEvent::Notice(msg.clone())),
             Record::Steered { text } => Some(AgentEvent::Steered(text.clone())),
             Record::Error { msg } => Some(AgentEvent::Notice(msg.clone())),
-            // Replayed as a notice rather than round-tripped. The record exists
-            // to be *read* — by a person auditing what was consented to — and
-            // `apply_event` deliberately folds the decision into nothing, so
-            // reconstructing the original event would make it vanish from the
-            // rendered transcript it is supposed to document.
+            // Round-tripped, because `apply_event` renders this event: a replayed
+            // transcript shows the decision exactly where the live one did. An
+            // unrecognised spelling reads as a refusal — the conservative way to
+            // be wrong about a consent record.
             Record::EscalationDecided {
-                command, decision, ..
-            } => Some(AgentEvent::Notice(format!(
-                "[escalation] `{command}` — {}",
-                match decision.as_str() {
-                    "once" => "approved for this run",
-                    "session" => "approved for the session",
-                    _ => "refused",
-                }
-            ))),
+                command,
+                reason,
+                rules,
+                decision,
+            } => Some(AgentEvent::EscalationDecided {
+                command: command.clone(),
+                reason: reason.clone(),
+                rules: rules.clone(),
+                decision: match decision.as_str() {
+                    "once" => hrdr_tools::ApprovalDecision::Once,
+                    "session" => hrdr_tools::ApprovalDecision::Session,
+                    _ => hrdr_tools::ApprovalDecision::Deny,
+                },
+            }),
             Record::End { .. } => None,
         }
     }
