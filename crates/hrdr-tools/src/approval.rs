@@ -154,7 +154,7 @@ impl ApprovalGate {
     /// [`ApprovalDecision::Deny`]: the whole feature fails closed, so the worst
     /// case is the command running exactly as confined as it does today.
     pub async fn request(&self, command: &str, rules: &[String], reason: &str) -> ApprovalDecision {
-        let rx = {
+        let (id, rx) = {
             let mut state = self.state();
             // Headless, permanently: no channel to a human means the answer is
             // no, and it is no *now*. Waiting out a timeout nobody could ever
@@ -185,7 +185,7 @@ impl ApprovalGate {
                 self.state().pending.remove(&id);
                 return ApprovalDecision::Deny;
             }
-            rx
+            (id, rx)
         };
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(ApprovalDecision::Session)) => {
@@ -196,8 +196,52 @@ impl ApprovalGate {
                 ApprovalDecision::Session
             }
             Ok(Ok(decision)) => decision,
-            // Timed out, or the sender was dropped without answering.
-            _ => ApprovalDecision::Deny,
+            // Timed out, or the sender was dropped without answering. Drop the
+            // entry here rather than leaving it for whoever polls `is_pending`:
+            // the map holds a `oneshot::Sender` per request, and a session where
+            // the user lets prompts expire would otherwise accumulate one
+            // apiece with nothing obliged to come back for them.
+            _ => {
+                self.state().pending.remove(&id);
+                ApprovalDecision::Deny
+            }
+        }
+    }
+
+    /// How many requests are still waiting, for the leak assertions in the
+    /// tests. A gate that accumulates entries nobody will ever answer is a slow
+    /// leak of `oneshot::Sender`s, and the only way to catch that is to count.
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.state().pending.len()
+    }
+
+    /// Whether `id` is still waiting on an answer.
+    ///
+    /// The timeout fires *inside* [`request`](Self::request), which has no way to
+    /// tell a frontend: the only channel out of here carries requests, and
+    /// widening it into an enum would ripple through `AgentEvent` and every
+    /// frontend that matches on it. So a frontend that is showing a request
+    /// checks this instead, and closes the dialog when it goes false — otherwise
+    /// the modal sits there soliciting consent for a decision that was made a
+    /// minute ago without it.
+    ///
+    /// False also for an id that was answered, which is the same thing from the
+    /// caller's side: nothing is waiting on it.
+    pub fn is_pending(&self, id: &str) -> bool {
+        let mut state = self.state();
+        match state.pending.get(id) {
+            // The entry outlived its waiter: `request` timed out and returned, or
+            // the whole tool call was cancelled — Ctrl+C on a turn with a prompt
+            // open — and its future went with it. Either way the receiver is
+            // dropped and nobody is listening. Reaped here rather than left to
+            // accumulate over a session.
+            Some(tx) if tx.is_closed() => {
+                state.pending.remove(id);
+                false
+            }
+            Some(_) => true,
+            None => false,
         }
     }
 
@@ -264,8 +308,21 @@ mod tests {
         assert_eq!(req.command, "git push");
         assert_eq!(req.rules, vec!["git push".to_string()]);
         assert!(!req.id.is_empty());
+        // What a frontend showing this request polls: still live now…
+        assert!(gate.is_pending(&req.id));
         assert_eq!(waiting.await.unwrap(), ApprovalDecision::Deny);
-        // The pending entry is not leaked behind the timeout.
+        // The entry is dropped by `request` itself, at the moment it gives up.
+        // Asserted BEFORE `is_pending`, which reaps a dead entry as a side
+        // effect of looking — check it after and this passes whether or not
+        // `request` cleans up, which is how the leak survived slice 1.
+        assert_eq!(
+            gate.pending_len(),
+            0,
+            "the timed-out entry is not leaked: one `oneshot::Sender` per \
+             ignored prompt would accumulate for the life of the session"
+        );
+        // …and not after the timeout, which is how the dialog learns to close.
+        assert!(!gate.is_pending(&req.id));
         assert!(!gate.answer(&req.id, ApprovalDecision::Once));
     }
 

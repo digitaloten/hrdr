@@ -5939,3 +5939,368 @@ async fn the_todo_panel_hides_while_a_sub_agent_is_running() {
         "main-agent todos reappear when sub-agent done:\n{screen}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Escalation approvals (the "may this run OUTSIDE the sandbox?" modal)
+// ---------------------------------------------------------------------------
+
+/// A gate the test owns, with a timeout it can actually wait out.
+///
+/// The session agent's own gate is the real one and is used where registration
+/// itself is under test; everything else swaps in one of these so the expiry
+/// paths cost milliseconds instead of a minute, and so the test can read the
+/// request the gate published (the agent keeps its own receiver).
+fn test_gate(
+    timeout_ms: u64,
+) -> (
+    Arc<hrdr_tools::ApprovalGate>,
+    mpsc::UnboundedReceiver<hrdr_tools::ApprovalRequest>,
+) {
+    hrdr_tools::ApprovalGate::with_timeout(
+        hrdr_tools::EscalationPolicy::with_extra(&[]),
+        std::time::Duration::from_millis(timeout_ms),
+    )
+}
+
+/// File a request the way the `shell` tool does, and deliver it the way a running
+/// turn does — the gate publishes it, the turn republishes it as an `AgentEvent`.
+///
+/// The returned handle is the blocked tool call: awaiting it is how a test learns
+/// what decision actually reached the thing that was waiting.
+async fn ask(
+    h: &mut Harness,
+    gate: &Arc<hrdr_tools::ApprovalGate>,
+    rx: &mut mpsc::UnboundedReceiver<hrdr_tools::ApprovalRequest>,
+    command: &str,
+    rules: &[&str],
+) -> (
+    String,
+    tokio::task::JoinHandle<hrdr_tools::ApprovalDecision>,
+) {
+    let asked = gate.clone();
+    let cmd = command.to_string();
+    let rules: Vec<String> = rules.iter().map(|r| r.to_string()).collect();
+    let reason = format!(
+        "runs outside the OS sandbox — matched rule (`{}`)",
+        rules.join("`, `")
+    );
+    let handle = tokio::spawn(async move { asked.request(&cmd, &rules, &reason).await });
+    let req = rx.recv().await.expect("the gate publishes the request");
+    let id = req.id.clone();
+    h.inject(hrdr_agent::AgentEvent::ApprovalRequested {
+        id: req.id,
+        command: req.command,
+        reason: req.reason,
+        rules: req.rules,
+    });
+    (id, handle)
+}
+
+/// Put the app in the state an approval can reach it in: a turn is running (a
+/// tool call is what asks), with a gate the test can answer through.
+async fn approval_harness(
+    timeout_ms: u64,
+) -> (
+    Harness,
+    Arc<hrdr_tools::ApprovalGate>,
+    mpsc::UnboundedReceiver<hrdr_tools::ApprovalRequest>,
+) {
+    let mut h = Harness::new(vec![]).await;
+    let (gate, rx) = test_gate(timeout_ms);
+    h.app.set_approval_gate_for_test(gate.clone());
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    (h, gate, rx)
+}
+
+/// The request opens the modal, and the modal says — in full — what is being
+/// consented to: the command verbatim, that approving means NO sandbox, and which
+/// rule matched (so "for the session" has a visible meaning).
+#[tokio::test]
+async fn an_approval_request_opens_a_modal_naming_the_command_and_the_grant() {
+    let (mut h, gate, mut rx) = approval_harness(60_000).await;
+    let (_id, waiting) = ask(
+        &mut h,
+        &gate,
+        &mut rx,
+        "git push origin main",
+        &["git push"],
+    )
+    .await;
+    assert!(h.app.approval_modal.is_some(), "the request opens a modal");
+
+    let screen = h.render();
+    assert!(
+        screen.contains("git push origin main"),
+        "the command is shown verbatim:\n{screen}"
+    );
+    assert!(
+        screen.contains("OUTSIDE the OS sandbox"),
+        "the modal says what is being asked:\n{screen}"
+    );
+    assert!(
+        screen.contains("NO sandbox at all"),
+        "…and in plain words what approving grants:\n{screen}"
+    );
+    assert!(
+        screen.contains("Matched rule"),
+        "the matched rule is named:\n{screen}"
+    );
+    assert!(
+        screen.contains("Approve for the session"),
+        "all three answers are offered:\n{screen}"
+    );
+
+    // Leave nothing blocked behind the test.
+    h.press(KeyCode::Esc);
+    assert_eq!(
+        waiting.await.unwrap(),
+        hrdr_tools::ApprovalDecision::Deny,
+        "Esc denies"
+    );
+}
+
+/// A long command is wrapped, never elided. A `git push … ; rm -rf …` whose tail
+/// is cut off is a consent dialog that lies about what it is asking for, so the
+/// end of the command must be on screen as surely as the start.
+#[tokio::test]
+async fn a_long_command_keeps_its_tail_in_the_approval_modal() {
+    let (mut h, gate, mut rx) = approval_harness(60_000).await;
+    let command = "git push origin refs/heads/a-very-long-branch-name-that-runs-past-the-modal \
+                   --set-upstream --no-verify ; echo TAIL_MARKER_VISIBLE";
+    let (_id, waiting) = ask(&mut h, &gate, &mut rx, command, &["git push"]).await;
+
+    let screen = h.render();
+    assert!(
+        screen.contains("TAIL_MARKER_VISIBLE"),
+        "the end of the command is on screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains('…'),
+        "nothing about the command is elided:\n{screen}"
+    );
+
+    h.press(KeyCode::Esc);
+    waiting.await.unwrap();
+}
+
+/// Each of the three answers reaches the gate as itself, and reaches the tool
+/// call that was blocked on *that id*.
+#[tokio::test]
+async fn each_answer_sends_its_own_decision() {
+    // Up from the default (Deny, the bottom row) to the row under test.
+    for (ups, expected) in [
+        (2, hrdr_tools::ApprovalDecision::Once),
+        (1, hrdr_tools::ApprovalDecision::Session),
+        (0, hrdr_tools::ApprovalDecision::Deny),
+    ] {
+        let (mut h, gate, mut rx) = approval_harness(60_000).await;
+        let (id, waiting) = ask(&mut h, &gate, &mut rx, "git push", &["git push"]).await;
+        for _ in 0..ups {
+            h.press(KeyCode::Up);
+        }
+        h.press(KeyCode::Enter);
+        assert!(
+            h.app.approval_modal.is_none(),
+            "answering closes the modal ({expected:?})"
+        );
+        assert_eq!(waiting.await.unwrap(), expected, "the blocked call got it");
+        assert!(
+            !gate.is_pending(&id),
+            "the request is settled, not left waiting ({expected:?})"
+        );
+    }
+}
+
+/// Enter on an untouched modal denies: it opens over the input box mid-turn, so a
+/// reflexive Enter aimed at the composer must not grant a command the machine.
+#[tokio::test]
+async fn the_default_answer_is_deny() {
+    let (mut h, gate, mut rx) = approval_harness(60_000).await;
+    let (_id, waiting) = ask(&mut h, &gate, &mut rx, "git push", &["git push"]).await;
+    h.press(KeyCode::Enter);
+    assert_eq!(waiting.await.unwrap(), hrdr_tools::ApprovalDecision::Deny);
+}
+
+/// Esc denies. Dismissing a dialog is not consenting to it.
+#[tokio::test]
+async fn esc_denies_the_open_approval() {
+    let (mut h, gate, mut rx) = approval_harness(60_000).await;
+    let (_id, waiting) = ask(&mut h, &gate, &mut rx, "git push", &["git push"]).await;
+    h.press(KeyCode::Esc);
+    assert!(h.app.approval_modal.is_none(), "Esc closes the modal");
+    assert_eq!(waiting.await.unwrap(), hrdr_tools::ApprovalDecision::Deny);
+    let screen = h.render();
+    assert!(
+        screen.contains("denied"),
+        "the transcript records the decision:\n{screen}"
+    );
+}
+
+/// The modal captures every key while it is open — nothing types through it into
+/// the composer, and no bare letter is a shortcut for "yes".
+#[tokio::test]
+async fn the_approval_modal_captures_every_key() {
+    let (mut h, gate, mut rx) = approval_harness(60_000).await;
+    h.type_str("half a message");
+    let (_id, waiting) = ask(&mut h, &gate, &mut rx, "git push", &["git push"]).await;
+
+    for c in ['y', 'n', 'a', 'x'] {
+        h.press(KeyCode::Char(c));
+    }
+    assert_eq!(
+        h.app.editor.content(),
+        "half a message",
+        "keystrokes did not leak into the composer"
+    );
+    assert!(
+        h.app.approval_modal.is_some(),
+        "…and no bare letter answered the dialog"
+    );
+
+    h.press(KeyCode::Esc);
+    assert_eq!(waiting.await.unwrap(), hrdr_tools::ApprovalDecision::Deny);
+}
+
+/// Two eligible commands in one tool batch each block their own call, so a second
+/// request can neither be dropped nor open a second modal: it queues, and the
+/// answer to the first opens it.
+#[tokio::test]
+async fn a_second_request_queues_and_opens_after_the_first_is_answered() {
+    let (mut h, gate, mut rx) = approval_harness(60_000).await;
+    let (first_id, first) = ask(&mut h, &gate, &mut rx, "git push", &["git push"]).await;
+    let (second_id, second) = ask(&mut h, &gate, &mut rx, "git fetch --all", &["git fetch"]).await;
+
+    assert_eq!(h.app.approval_queue.len(), 1, "the second one queued");
+    let modal_id = |h: &Harness| h.app.approval_modal.as_ref().unwrap().req.id.clone();
+    assert_eq!(modal_id(&h), first_id, "the first one is on screen");
+    let screen = h.render();
+    assert!(
+        screen.contains("1 more waiting"),
+        "the queue is visible:\n{screen}"
+    );
+
+    // Approve the first; the second takes the screen, still unanswered.
+    h.press(KeyCode::Up);
+    h.press(KeyCode::Up);
+    h.press(KeyCode::Enter);
+    assert_eq!(first.await.unwrap(), hrdr_tools::ApprovalDecision::Once);
+    assert_eq!(modal_id(&h), second_id, "the queued one opened");
+    assert!(h.app.approval_queue.is_empty());
+    let screen = h.render();
+    assert!(
+        screen.contains("git fetch --all"),
+        "showing the second command:\n{screen}"
+    );
+
+    h.press(KeyCode::Esc);
+    assert_eq!(second.await.unwrap(), hrdr_tools::ApprovalDecision::Deny);
+}
+
+/// The gate denies on its own after its timeout, from inside the blocked tool
+/// call — which has no way to tell a frontend. So the modal polls, and closes:
+/// one that stayed open would be soliciting consent for a decision already made
+/// without it, and the keystroke answering it would resolve nothing.
+#[tokio::test]
+async fn an_expired_approval_closes_itself_and_a_late_answer_grants_nothing() {
+    let (mut h, gate, mut rx) = approval_harness(30).await;
+    let (id, waiting) = ask(&mut h, &gate, &mut rx, "git push", &["git push"]).await;
+    assert_eq!(
+        waiting.await.unwrap(),
+        hrdr_tools::ApprovalDecision::Deny,
+        "the gate denied it on the timeout"
+    );
+
+    // The user was still deciding. Their answer must not grant anything…
+    assert!(h.app.approval_modal.is_some(), "the modal is still up");
+    h.press(KeyCode::Up);
+    h.press(KeyCode::Up);
+    h.press(KeyCode::Enter);
+    assert!(!gate.is_pending(&id));
+    let screen = h.render();
+    assert!(
+        screen.contains("timed out before you answered"),
+        "and they are told why nothing happened:\n{screen}"
+    );
+
+    // …and had they not pressed anything, the driver's poll closes it for them.
+    let (mut h, gate, mut rx) = approval_harness(30).await;
+    let (_id, waiting) = ask(&mut h, &gate, &mut rx, "git push", &["git push"]).await;
+    waiting.await.unwrap();
+    h.app.prune_expired_approvals();
+    assert!(
+        h.app.approval_modal.is_none(),
+        "the expired modal closed itself"
+    );
+    let screen = h.render();
+    assert!(screen.contains("timed out"), "…and said so:\n{screen}");
+}
+
+/// An expired request that never reached the screen is dropped from the queue
+/// rather than opened, and the answer to a live one still finds it.
+#[tokio::test]
+async fn a_queued_request_that_expired_is_not_opened() {
+    let (mut h, gate, mut rx) = approval_harness(60_000).await;
+    let (_first, first) = ask(&mut h, &gate, &mut rx, "git push", &["git push"]).await;
+    let (second_id, second) = ask(&mut h, &gate, &mut rx, "git fetch", &["git fetch"]).await;
+
+    // The queued one times out while the first is still on screen (answered here
+    // by the gate directly, which is what its own timeout does).
+    assert!(gate.answer(&second_id, hrdr_tools::ApprovalDecision::Deny));
+    assert_eq!(second.await.unwrap(), hrdr_tools::ApprovalDecision::Deny);
+
+    h.press(KeyCode::Esc);
+    assert_eq!(first.await.unwrap(), hrdr_tools::ApprovalDecision::Deny);
+    assert!(
+        h.app.approval_modal.is_none(),
+        "the settled request is not re-asked"
+    );
+    assert!(h.app.approval_queue.is_empty());
+}
+
+/// A pending approval belongs to the tool call blocked on it, not to the turn or
+/// the conversation: neither the turn ending nor a `/clear` may lose it, and the
+/// registration that makes it answerable at all survives both.
+#[tokio::test]
+async fn approvals_survive_a_turn_boundary_and_a_clear() {
+    let (mut h, gate, mut rx) = approval_harness(60_000).await;
+    let (open_id, open) = ask(&mut h, &gate, &mut rx, "git push", &["git push"]).await;
+    let (_queued_id, queued) = ask(&mut h, &gate, &mut rx, "git fetch", &["git fetch"]).await;
+
+    h.app.on_turn_msg(TurnMsg::Done(None));
+    assert_eq!(
+        h.app.approval_modal.as_ref().map(|m| m.req.id.clone()),
+        Some(open_id.clone()),
+        "the turn ending did not close the dialog"
+    );
+    assert_eq!(h.app.approval_queue.len(), 1, "nor drop the queued one");
+
+    h.app.clear_all();
+    assert_eq!(
+        h.app.approval_modal.as_ref().map(|m| m.req.id.clone()),
+        Some(open_id),
+        "/clear resets the conversation, not a blocked tool call"
+    );
+    assert_eq!(h.app.approval_queue.len(), 1);
+    assert!(gate.can_answer(), "the frontend is still registered");
+
+    h.press(KeyCode::Esc);
+    assert_eq!(open.await.unwrap(), hrdr_tools::ApprovalDecision::Deny);
+    h.press(KeyCode::Esc);
+    assert_eq!(queued.await.unwrap(), hrdr_tools::ApprovalDecision::Deny);
+}
+
+/// The TUI declares itself able to answer at startup and hands that back when it
+/// goes away. Both halves matter: without the first every request is denied on
+/// the spot, and without the second every later request waits out the full
+/// timeout with nobody there to answer it.
+#[tokio::test]
+async fn the_tui_registers_with_the_gate_and_unregisters_on_exit() {
+    let h = Harness::new(vec![]).await;
+    let gate = h
+        .app
+        .approval_gate_for_test()
+        .expect("the session's agent has a gate");
+    assert!(gate.can_answer(), "registered at startup");
+    drop(h);
+    assert!(!gate.can_answer(), "unregistered on exit");
+}

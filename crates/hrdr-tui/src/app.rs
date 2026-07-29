@@ -85,6 +85,75 @@ pub(crate) enum LoginModal {
     },
 }
 
+/// The three answers to an escalation request, in the order they are listed, each
+/// with the one-line consequence shown beside it.
+///
+/// Fixed and exhaustive: this is [`hrdr_tools::ApprovalDecision`] with prose, and
+/// it must stay that way — a choice the user cannot see is a choice they cannot
+/// weigh.
+pub(crate) const APPROVAL_CHOICES: [(hrdr_tools::ApprovalDecision, &str, &str); 3] = [
+    (
+        hrdr_tools::ApprovalDecision::Once,
+        "Approve once",
+        "this command, this one time",
+    ),
+    (
+        hrdr_tools::ApprovalDecision::Session,
+        "Approve for the session",
+        "and every later command matching the rule, without asking",
+    ),
+    (
+        hrdr_tools::ApprovalDecision::Deny,
+        "Deny",
+        "run it inside the sandbox, exactly as everything else does",
+    ),
+];
+
+/// Where the highlight starts: **Deny**.
+///
+/// The modal opens unannounced, in the middle of a turn, on top of an input box
+/// the user may be mid-sentence in. A reflexive Enter is therefore a real key
+/// press to plan for, and the only safe thing for it to mean is "no" — the
+/// alternative is a keystroke aimed at the composer granting a command
+/// unconfined access to the machine.
+pub(crate) const APPROVAL_DEFAULT_CHOICE: usize = 2;
+
+/// The open escalation-approval modal; while `Some`, it captures every key.
+///
+/// Deliberately **not** a [`Selector<T>`](selector::Selector) like the six
+/// pickers beside it. A `Selector` is a fuzzy-filtered list, and both halves of
+/// that are wrong here: typing would edit a filter (so the keys this modal must
+/// swallow would instead have a visible effect), and a filter can empty the list
+/// — a consent dialog whose "Deny" row can be typed off the screen. Three fixed
+/// rows and an index is the whole state machine, so it is written out rather
+/// than bent out of the generic one.
+pub(crate) struct ApprovalModal {
+    /// The request, exactly as the gate published it. Answered by `id`, so a
+    /// late answer can never resolve some *other* request.
+    pub(crate) req: hrdr_tools::ApprovalRequest,
+    /// Highlighted row, an index into [`APPROVAL_CHOICES`].
+    pub(crate) selected: usize,
+    /// First body line rendered, for a command taller than the modal. The
+    /// command is never truncated to fit (see `draw_approval_modal`), so on a
+    /// short terminal there has to be a way to reach the rest of it.
+    pub(crate) scroll: u16,
+}
+
+impl ApprovalModal {
+    fn new(req: hrdr_tools::ApprovalRequest) -> Self {
+        Self {
+            req,
+            selected: APPROVAL_DEFAULT_CHOICE,
+            scroll: 0,
+        }
+    }
+
+    /// The highlighted decision.
+    pub(crate) fn decision(&self) -> hrdr_tools::ApprovalDecision {
+        APPROVAL_CHOICES[self.selected.min(APPROVAL_CHOICES.len() - 1)].0
+    }
+}
+
 // The display-mode enums live in the shared `hrdr-app` core so every frontend
 // resolve/persist these settings identically.
 pub(crate) use hrdr_app::{StatusBarMode, TimestampStyle};
@@ -409,6 +478,26 @@ pub(crate) struct App {
     /// The open `/login` modal (provider list, then masked key entry); while
     /// `Some`, it captures every key (and pasted text, for the key field).
     pub(crate) login_modal: Option<LoginModal>,
+    /// The open escalation-approval modal; while `Some`, it captures every key.
+    pub(crate) approval_modal: Option<ApprovalModal>,
+    /// Requests that arrived while another was already on screen.
+    ///
+    /// Two shell calls in one tool batch can both be eligible, and each blocks
+    /// its own tool call until answered — so a second request can never be
+    /// dropped, and two modals cannot both own the keyboard. It queues, and the
+    /// answer to one opens the next.
+    pub(crate) approval_queue: std::collections::VecDeque<hrdr_tools::ApprovalRequest>,
+    /// The agent's approval gate, taken once at startup.
+    ///
+    /// Answers go through **this**, never `Agent::answer_approval`: the turn task
+    /// holds the agent lock for the whole turn, and the tool call waiting on this
+    /// answer is inside that turn — so a frontend that had to take the lock to
+    /// answer would wait for the very turn it is trying to unblock. Same reason
+    /// the steering queue is held here as an `Arc` rather than read off the agent.
+    ///
+    /// `None` only if the agent has no gate at all (a delegated sub-agent, which
+    /// never escalates); the session's agent always does.
+    approvals: Option<Arc<hrdr_tools::ApprovalGate>>,
     /// Monotonic id for browser logins — bumped per launch so a stale/duplicate
     /// login's late result is rejected by [`LoginModal::Authorizing`].
     pub(crate) next_login_id: u64,
@@ -567,6 +656,14 @@ impl App {
         config.todo_ttl = todo_ttl;
         let cfg = config.clone();
         let agent = Agent::new(config)?;
+        // Say, once, that there is someone here to ask. Until a frontend does,
+        // the gate answers every escalation request with an instant denial (which
+        // is the right answer for a headless run) — registering is the whole
+        // difference between that and a prompt.
+        let approvals = agent.approval_gate();
+        if let Some(gate) = &approvals {
+            gate.register_frontend();
+        }
         let todos = agent.todos();
         let registry = agent.registry();
         let background_tasks = agent.background_tasks();
@@ -661,6 +758,9 @@ impl App {
             effort_selector: None,
             skill_selector: None,
             login_modal: None,
+            approval_modal: None,
+            approval_queue: std::collections::VecDeque::new(),
+            approvals,
             next_login_id: 0,
             browser_login_task: None,
             user_shell: None,
@@ -825,6 +925,171 @@ impl App {
         })
     }
 
+    // ---- escalation approvals ----------------------------------------------
+
+    /// Show an escalation request, or queue it behind the one already on screen.
+    fn open_approval(&mut self, req: hrdr_tools::ApprovalRequest) {
+        if self.approval_modal.is_some() {
+            self.approval_queue.push_back(req);
+            return;
+        }
+        self.approval_modal = Some(ApprovalModal::new(req));
+    }
+
+    /// Show the next queued request, skipping any that stopped waiting while it
+    /// sat in the queue — the gate's timeout runs from when the request was
+    /// *filed*, not from when this modal got round to it.
+    fn open_next_approval(&mut self) {
+        while let Some(req) = self.approval_queue.pop_front() {
+            if self.is_approval_live(&req.id) {
+                self.approval_modal = Some(ApprovalModal::new(req));
+                return;
+            }
+        }
+    }
+
+    /// Whether the gate is still waiting on an answer to `id`.
+    fn is_approval_live(&self, id: &str) -> bool {
+        self.approvals
+            .as_ref()
+            .is_some_and(|gate| gate.is_pending(id))
+    }
+
+    /// Answer the open request and move on to any queued one.
+    ///
+    /// Straight through the gate `Arc` — see [`Self::approvals`] for why this
+    /// cannot go via the agent. Keyed by the request's own id, so an answer that
+    /// arrives after its request expired resolves *nothing* rather than the next
+    /// person's question.
+    fn answer_open_approval(&mut self, decision: hrdr_tools::ApprovalDecision) {
+        let Some(modal) = self.approval_modal.take() else {
+            return;
+        };
+        let answered = self
+            .approvals
+            .as_ref()
+            .is_some_and(|gate| gate.answer(&modal.req.id, decision));
+        let command = modal.req.command;
+        let note = match (answered, decision) {
+            // The transcript is the only record of a decision this consequential,
+            // so every outcome writes one — including the ones the user did not
+            // consciously make.
+            (true, hrdr_tools::ApprovalDecision::Once) => {
+                format!("approved once — `{command}` will run OUTSIDE the sandbox")
+            }
+            (true, hrdr_tools::ApprovalDecision::Session) => format!(
+                "approved for this session — `{}` may run OUTSIDE the sandbox without asking again",
+                modal.req.rules.join("`, `")
+            ),
+            (true, hrdr_tools::ApprovalDecision::Deny) => {
+                format!("denied — `{command}` ran inside the sandbox")
+            }
+            // The minute ran out first. Say so plainly: the user pressed a key and
+            // it did nothing, and a dialog that swallows that is worse than one
+            // that admits it.
+            (false, _) => format!(
+                "the approval for `{command}` timed out before you answered — it ran inside the \
+                 sandbox"
+            ),
+        };
+        self.push_entry(Entry::notice(note));
+        self.open_next_approval();
+    }
+
+    /// Drop any request the gate has stopped waiting on.
+    ///
+    /// Polled from the driver's loop rather than pushed, because the timeout
+    /// fires inside the blocked tool call, which has no channel to a frontend
+    /// (see [`hrdr_tools::ApprovalGate::is_pending`]). Without it the modal keeps
+    /// asking for consent to a command that already ran confined a minute ago —
+    /// and the next keystroke would answer nothing.
+    pub(crate) fn prune_expired_approvals(&mut self) {
+        if let Some(modal) = &self.approval_modal
+            && !self.is_approval_live(&modal.req.id)
+        {
+            let command = self
+                .approval_modal
+                .take()
+                .map(|m| m.req.command)
+                .unwrap_or_default();
+            self.push_entry(Entry::notice(format!(
+                "the approval for `{command}` timed out — it ran inside the sandbox"
+            )));
+            self.open_next_approval();
+        }
+        // A queued request can expire without ever being shown; `open_next_approval`
+        // skips those, and this keeps them from accumulating in the meantime.
+        let queued = std::mem::take(&mut self.approval_queue);
+        self.approval_queue = queued
+            .into_iter()
+            .filter(|req| self.is_approval_live(&req.id))
+            .collect();
+    }
+
+    /// Route one key to the open approval modal: Up/Down move the highlight,
+    /// Enter answers with it, Esc / Ctrl+C deny, PgUp/PgDn scroll a long command.
+    ///
+    /// Every other key is swallowed — including plain letters. There is no `y` /
+    /// `n` shortcut on purpose: this modal appears without warning over an input
+    /// box, and a single unmodified letter must not be able to hand a command the
+    /// whole machine.
+    fn approval_modal_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let last = APPROVAL_CHOICES.len() - 1;
+        match key.code {
+            // Dismissing a dialog is not consenting to it.
+            KeyCode::Esc => self.answer_open_approval(hrdr_tools::ApprovalDecision::Deny),
+            KeyCode::Char('c') if ctrl => {
+                self.answer_open_approval(hrdr_tools::ApprovalDecision::Deny)
+            }
+            KeyCode::Enter => {
+                let decision = self
+                    .approval_modal
+                    .as_ref()
+                    .map(|m| m.decision())
+                    .unwrap_or(hrdr_tools::ApprovalDecision::Deny);
+                self.answer_open_approval(decision);
+            }
+            KeyCode::Up => {
+                if let Some(m) = &mut self.approval_modal {
+                    m.selected = m.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(m) = &mut self.approval_modal {
+                    m.selected = (m.selected + 1).min(last);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(m) = &mut self.approval_modal {
+                    m.scroll = m.scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(m) = &mut self.approval_modal {
+                    m.scroll = m.scroll.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The gate this frontend answers through (tests inject their own, with a
+    /// short timeout, so the expiry paths don't cost a minute each).
+    #[cfg(test)]
+    pub(crate) fn approval_gate_for_test(&self) -> Option<Arc<hrdr_tools::ApprovalGate>> {
+        self.approvals.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_approval_gate_for_test(&mut self, gate: Arc<hrdr_tools::ApprovalGate>) {
+        if let Some(old) = self.approvals.take() {
+            old.unregister_frontend();
+        }
+        gate.register_frontend();
+        self.approvals = Some(gate);
+    }
+
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> Action {
         if key.kind == KeyEventKind::Release {
             return Action::None;
@@ -850,6 +1115,16 @@ impl App {
                 return Action::None;
             }
             self.pending_fork = None;
+        }
+
+        // The approval modal outranks every picker: a tool call is blocked behind
+        // it and the gate denies itself in a minute, so it cannot sit behind a
+        // `/model` list the user happened to leave open. A key meant for that
+        // picker landing here is safe in the one direction that matters — Esc
+        // denies, and nothing else grants.
+        if self.approval_modal.is_some() {
+            self.approval_modal_key(key);
+            return Action::None;
         }
 
         // The `/model` selector modal captures every key while it is open.
@@ -2373,11 +2648,45 @@ impl App {
         if let AgentEvent::History(messages) = &ev {
             self.persist_mid_turn(messages.clone());
         }
+        // A tool call is blocked on this one right now, inside the running turn.
+        // It is the only event this frontend has to *act* on rather than render:
+        // the transcript reducer ignores it (there is nothing to fold), and the
+        // dialog it opens is the only thing that can unblock the call.
+        if let AgentEvent::ApprovalRequested {
+            id,
+            command,
+            reason,
+            rules,
+        } = &ev
+        {
+            self.open_approval(hrdr_tools::ApprovalRequest {
+                id: id.clone(),
+                command: command.clone(),
+                reason: reason.clone(),
+                rules: rules.clone(),
+            });
+        }
         // The event is already recorded on the agent's own entry — its transcript,
         // its counters and its turn clock — by the turn that produced it
         // (`AgentRegistry::start_turn`), for every agent alike. Nothing is folded
         // here; this wake-up only brings the panes up to date with that record.
         self.sync_panes();
+    }
+}
+
+impl Drop for App {
+    /// Hand the approval gate back when the TUI goes away.
+    ///
+    /// A registered frontend that stops listening is worse than one that never
+    /// registered: `can_answer()` stays true, so every later request waits out
+    /// the full 60s timeout instead of being denied on the spot. Done in `Drop`
+    /// rather than on the quit path because every way out of the TUI — `/exit`,
+    /// a broken event stream, an error bubbling out of `run`, a panic unwind —
+    /// passes through here, and only some of them pass through the quit path.
+    fn drop(&mut self) {
+        if let Some(gate) = &self.approvals {
+            gate.unregister_frontend();
+        }
     }
 }
 

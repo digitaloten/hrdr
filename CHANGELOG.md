@@ -137,6 +137,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The TUI can now approve an escalation.** The seam from the previous entry
+  gets its answerer: an eligible command opens a modal naming the exact command
+  and what approving it means — it runs **outside** the sandbox, unconfined, as
+  you — with three outcomes (once / for the session / deny). The command is
+  shown verbatim and wrapped, never truncated, because a consent dialog that
+  elides the tail of `git push … ; rm -rf ~` is one that lies; a command taller
+  than the terminal scrolls instead. The highlight starts on **Deny**: the modal
+  opens unannounced over an input box, so a reflexive Enter is a real key press
+  to plan for, and there are no single-letter shortcuts for the same reason. It
+  captures every key while open and outranks the other pickers, so a blocked
+  tool call cannot sit behind a `/model` list. Concurrent requests queue; an
+  unanswered one expires on the gate's own 60s clock, closes itself, and says
+  the command ran confined; answering after that grants nothing, since decisions
+  are keyed by request id. Registration is handed back in `Drop`, which is the
+  one path every exit takes — a registered frontend that goes away is worse than
+  one that never registered, because requests would then wait out the full
+  minute rather than being denied on the spot.
+
 - **Escalation: the groundwork for running a command outside the sandbox
   (plumbing only — every request is denied today).** hrdr confines every shell
   command, and unprivileged bwrap's user namespace is what makes `git push` over
