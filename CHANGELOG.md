@@ -137,6 +137,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The web frontend can approve an escalation too.**
+  `ServerMsg::ApprovalRequested` / `ApprovalClosed` and
+  `ClientMsg::AnswerApproval` carry the question and the answer, and the Dioxus
+  UI grows the same modal the TUI has — command verbatim and wrapped rather than
+  truncated, plain words for what is granted (outside the sandbox, unconfined,
+  as you), and deny as the safe default. Registration with the gate is an RAII
+  guard taken as the socket's first act _after_ the auth check, so a client can
+  only answer once authenticated and the registration cannot outlive the
+  connection down any exit path. Unlike the TUI there can be several clients or
+  none: the gate refcounts listeners, every connected client sees the request,
+  the first answer wins, and the losers are told the question closed rather than
+  left holding a live dialog. The browser's version of the reflexive-keypress
+  hazard gets its own answer — deny is first in tab order and autofocused, and
+  the approve buttons hold `pointer-events: none` for 600ms after mount so a
+  click already in flight passes through to the backdrop, which denies.
+
 - **The TUI can now approve an escalation.** The seam from the previous entry
   gets its answerer: an eligible command opens a modal naming the exact command
   and what approving it means — it runs **outside** the sandbox, unconfined, as

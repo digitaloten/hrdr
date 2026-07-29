@@ -265,10 +265,49 @@ pub enum ServerMsg {
     },
     /// Resume accepted: client state is current up to `seq`; deltas follow.
     Resumed {},
+    /// A tool is blocked on a human: may this command run **outside** the OS
+    /// sandbox? Mirrors `hrdr_agent::AgentEvent::ApprovalRequested`.
+    ///
+    /// Broadcast to every connected client, because any of them may be the one
+    /// sitting in front of it. Answered with [`ClientMsg::AnswerApproval`]
+    /// quoting `id`; the first answer wins and the rest are told so with
+    /// [`ServerMsg::ApprovalClosed`].
+    ApprovalRequested {
+        /// Quote this back when answering. Unique for the session.
+        id: String,
+        /// The command verbatim — what the user is asked to allow must be what
+        /// runs, so it is neither normalized here nor shortened on screen.
+        command: String,
+        /// One line saying why it is being asked, ready to render as-is.
+        reason: String,
+        /// The rules it matched. Shown so "for the session" can name what it
+        /// would remember, and it is what that memory is keyed on.
+        rules: Vec<String>,
+    },
+    /// Nothing is waiting on `id` any more — another client answered it, or it
+    /// timed out inside the blocked tool call. A client showing that request
+    /// must take the dialog down: it is soliciting consent for a decision that
+    /// has already been made.
+    ApprovalClosed {
+        id: String,
+    },
     /// Auth failed / connection refused; the socket closes after this.
     Error {
         message: String,
     },
+}
+
+/// What the user said about one escalation request. Mirrors
+/// `hrdr_tools::ApprovalDecision`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireApprovalDecision {
+    /// Yes, this once.
+    Once,
+    /// Yes, and stop asking for the matched rules for the rest of the session.
+    Session,
+    /// No — run it inside the sandbox, as everything else runs.
+    Deny,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,6 +352,17 @@ pub enum ClientMsg {
     Resume {
         seq: u64,
     },
+    /// Answer an open [`ServerMsg::ApprovalRequested`]. Keyed by `id`, so an
+    /// answer that arrives after its request expired resolves *nothing* rather
+    /// than the next question in its place.
+    ///
+    /// This one message can hand a command the whole machine, so it is only
+    /// reachable on an authenticated socket — the WS upgrade is refused before
+    /// this frame has anywhere to arrive.
+    AnswerApproval {
+        id: String,
+        decision: WireApprovalDecision,
+    },
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -353,6 +403,19 @@ mod tests {
             ),
             // Resume.
             ("resume", r#"{"type":"resume","seq":41}"#),
+            // Escalation approval, both directions.
+            (
+                "approval_requested",
+                r#"{"seq":77,"type":"approval_requested","id":"esc-1","command":"git push origin main","reason":"runs outside the OS sandbox","rules":["git push"]}"#,
+            ),
+            (
+                "approval_closed",
+                r#"{"seq":78,"type":"approval_closed","id":"esc-1"}"#,
+            ),
+            (
+                "answer_approval",
+                r#"{"type":"answer_approval","id":"esc-1","decision":"session"}"#,
+            ),
         ];
 
         for (name, json) in examples {
@@ -421,11 +484,67 @@ mod tests {
                 pane: WirePaneId::Sub(3),
             },
             ClientMsg::Resume { seq: 42 },
+            ClientMsg::AnswerApproval {
+                id: "esc-1".into(),
+                decision: WireApprovalDecision::Once,
+            },
+            ClientMsg::AnswerApproval {
+                id: "esc-2".into(),
+                decision: WireApprovalDecision::Session,
+            },
+            ClientMsg::AnswerApproval {
+                id: "esc-3".into(),
+                decision: WireApprovalDecision::Deny,
+            },
         ];
         for msg in cases {
             let json = serde_json::to_string(&msg).unwrap();
             let back: ClientMsg = serde_json::from_str(&json).unwrap();
             assert_eq!(msg, back, "round-trip: {json}");
+        }
+    }
+
+    /// An approval request must survive the wire **verbatim**: this is a consent
+    /// dialog's only source of truth, and a command that is re-encoded, escaped
+    /// or shortened in transit is a dialog that asks about something other than
+    /// what runs.
+    #[test]
+    fn approval_request_carries_the_command_untouched() {
+        // Newlines, quotes, a `;` tail, non-ASCII — everything a naive
+        // serializer might mangle.
+        let command = "git push origin main \"my branch\"\n  ; rm -rf ~/proj-ü";
+        let frame = ServerFrame {
+            seq: 9,
+            msg: ServerMsg::ApprovalRequested {
+                id: "esc-1".into(),
+                command: command.to_string(),
+                reason: "runs outside the OS sandbox".into(),
+                rules: vec!["git push".into()],
+            },
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        let back: ServerFrame = serde_json::from_str(&json).unwrap();
+        let ServerMsg::ApprovalRequested { command: round, .. } = &back.msg else {
+            panic!("wrong variant: {:?}", back.msg);
+        };
+        assert_eq!(round, command, "the command changed in transit");
+        assert_eq!(back, frame);
+    }
+
+    /// The decision names on the wire, pinned: a client and server that disagree
+    /// about which string means `deny` is a consent bug, not a parse error.
+    #[test]
+    fn approval_decision_wire_names() {
+        for (decision, name) in [
+            (WireApprovalDecision::Once, r#""once""#),
+            (WireApprovalDecision::Session, r#""session""#),
+            (WireApprovalDecision::Deny, r#""deny""#),
+        ] {
+            assert_eq!(serde_json::to_string(&decision).unwrap(), name);
+            assert_eq!(
+                serde_json::from_str::<WireApprovalDecision>(name).unwrap(),
+                decision
+            );
         }
     }
 }

@@ -17,8 +17,8 @@ use hrdr_protocol::{PaneTranscript, ServerFrame, WirePane, WirePaneId};
 use tokio::sync::{Mutex, Notify, broadcast};
 
 use crate::convert::{
-    build_entries, build_notice, build_panes, build_snapshot, build_status, wire_entry_view,
-    wire_pane, wire_pane_id, wire_status,
+    build_approval_closed, build_approval_requested, build_entries, build_notice, build_panes,
+    build_snapshot, build_status, wire_entry_view, wire_pane, wire_pane_id, wire_status,
 };
 
 /// How many frames the replay buffer holds (for resume-after-reconnect).
@@ -35,6 +35,48 @@ const BRANCH_CACHE_TTL: Duration = Duration::from_secs(5);
 /// [`WebSession::persist_mid_turn`]). A long turn is persisted as it goes, but not
 /// on every one of its rounds.
 const MIDTURN_SAVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// One frontend's registration with the escalation approval gate, handed back
+/// when it is dropped.
+///
+/// The gate counts listeners rather than holding a flag, because a session can
+/// have a TUI and any number of browser tabs attached at once — and it is the
+/// count that decides whether an escalation request is *asked* or refused where
+/// it stands. Both ways of getting that wrong hurt:
+///
+/// * a leaked registration leaves `can_answer()` true with nobody there, so
+///   every later request waits out the full 60s before denying itself;
+/// * a missing one denies requests while a user sits looking at the page.
+///
+/// So the pairing is not left to the socket handler's control flow. Registering
+/// is the *only* way to build one of these and unregistering is what dropping
+/// one does, which makes the pair unbreakable across every exit from
+/// `handle_socket` — a failed first send, a closed socket, an error, an aborted
+/// task, a panic unwind. The same reason the TUI hands its registration back in
+/// `Drop` rather than on the quit path.
+pub struct ApprovalListener(Option<Arc<hrdr_tools::ApprovalGate>>);
+
+impl ApprovalListener {
+    /// Say that this connection can answer approval requests, for as long as
+    /// the returned value is alive.
+    ///
+    /// `None` (a session whose agent has no gate) is a listener that counts for
+    /// nothing, so callers need no branch of their own.
+    pub fn register(gate: Option<Arc<hrdr_tools::ApprovalGate>>) -> Self {
+        if let Some(gate) = &gate {
+            gate.register_frontend();
+        }
+        Self(gate)
+    }
+}
+
+impl Drop for ApprovalListener {
+    fn drop(&mut self) {
+        if let Some(gate) = &self.0 {
+            gate.unregister_frontend();
+        }
+    }
+}
 
 /// Shared, cloneable handle to a `WebSession`.
 #[derive(Clone)]
@@ -135,6 +177,31 @@ pub struct WebSession {
     /// [`MIDTURN_SAVE_INTERVAL`].
     last_midturn_save: Option<Instant>,
 
+    /// The agent's escalation approval gate, taken once at startup.
+    ///
+    /// Clients answer through **this**, never `Agent::answer_approval`: the turn
+    /// task holds the agent lock for the whole turn and the blocked tool call is
+    /// inside that turn, so a frontend that had to take the lock would wait for
+    /// the very turn it is trying to unblock.
+    ///
+    /// `None` only for an agent with no gate at all (a delegated sub-agent,
+    /// which never escalates); the session's own agent always has one.
+    approvals: Option<Arc<hrdr_tools::ApprovalGate>>,
+    /// Requests filed by the running turn, waiting to be published.
+    ///
+    /// Written from the turn task's event callback (which is a plain sync
+    /// closure and cannot take the session lock) and drained by [`Self::tick`] —
+    /// the same shape [`Self::mid_turn_history`] uses for the same reason. The
+    /// hook notifies the tick loop, so "waiting" is a matter of microseconds.
+    approval_inbox: Arc<std::sync::Mutex<VecDeque<hrdr_tools::ApprovalRequest>>>,
+    /// Ids published to the clients and not yet closed.
+    ///
+    /// Polled rather than pushed for the expiry case: the gate's timeout fires
+    /// *inside* the blocked tool call, which has no channel to a frontend (see
+    /// [`hrdr_tools::ApprovalGate::is_pending`]), so the only way a dialog learns
+    /// its question is over is somebody looking.
+    open_approvals: Vec<String>,
+
     tick_notify: Arc<Notify>,
 }
 
@@ -153,7 +220,11 @@ impl WebSession {
         // conversation ran on has to be resolvable to an endpoint here).
         let cfg = config.clone();
 
-        let agent = Arc::new(tokio::sync::Mutex::new(Agent::new(config)?));
+        let agent = Agent::new(config)?;
+        // Taken before the agent goes behind its lock: a frontend must be able to
+        // reach the gate *without* that lock (see the field's doc comment).
+        let approvals = agent.approval_gate();
+        let agent = Arc::new(tokio::sync::Mutex::new(agent));
         let steering = hrdr_agent::steering_queue();
 
         let (model_name, provider, base_url, usage) = {
@@ -212,6 +283,9 @@ impl WebSession {
             branch_cache: None,
             mid_turn_history: Default::default(),
             last_midturn_save: None,
+            approvals,
+            approval_inbox: Default::default(),
+            open_approvals: Vec::new(),
             tick_notify: Arc::new(Notify::new()),
         })
     }
@@ -300,6 +374,10 @@ impl WebSession {
 
     /// The main tick: fold events, diff transcripts, rebuild panes+status.
     pub fn tick(&mut self) {
+        // 0. Approvals first: a tool call is blocked on each of these and the gate
+        // denies itself in a minute, so they cannot wait behind a transcript diff.
+        self.pump_approvals();
+
         // 1. Tell the registry whether the main agent is running.
         let main_running = self.main_turn_running();
         self.live.update(MAIN_KEY, |e| e.running = main_running);
@@ -443,6 +521,7 @@ impl WebSession {
     /// agent's own record, and a pane is built by replaying that.
     fn event_hook(&self, key: u64) -> impl FnMut(hrdr_agent::AgentEvent) + Send + 'static {
         let history = self.mid_turn_history.clone();
+        let approvals = self.approval_inbox.clone();
         let notify = self.tick_notify.clone();
         move |ev| {
             // The agent committed a round and sent its history: stash it for the
@@ -455,8 +534,139 @@ impl WebSession {
             {
                 *cell = Some(messages.clone());
             }
+            // A tool call is blocked on this one *right now*, inside the running
+            // turn. Unlike every other event it is not folded into a transcript
+            // (the reducer ignores it): it is a question, and publishing it is the
+            // only thing that can unblock the call.
+            if let hrdr_agent::AgentEvent::ApprovalRequested {
+                id,
+                command,
+                reason,
+                rules,
+            } = &ev
+                && let Ok(mut queue) = approvals.lock()
+            {
+                queue.push_back(hrdr_tools::ApprovalRequest {
+                    id: id.clone(),
+                    command: command.clone(),
+                    reason: reason.clone(),
+                    rules: rules.clone(),
+                });
+            }
             notify.notify_one();
         }
+    }
+
+    // ── escalation approvals ───────────────────────────────────────────────
+
+    /// Publish newly-filed requests, and close the ones nothing is waiting on
+    /// any more. Runs on every tick.
+    ///
+    /// Both halves broadcast: any connected client may be the one sitting in
+    /// front of the screen, so all of them are shown the question and all of them
+    /// are told when it is over.
+    fn pump_approvals(&mut self) {
+        let filed: Vec<hrdr_tools::ApprovalRequest> = match self.approval_inbox.lock() {
+            Ok(mut queue) => queue.drain(..).collect(),
+            Err(_) => return,
+        };
+        for req in filed {
+            let seq = self.next_seq();
+            let frame =
+                build_approval_requested(seq, req.id.clone(), req.command, req.reason, req.rules);
+            self.emit_raw(frame);
+            self.open_approvals.push(req.id);
+        }
+
+        // Anything the gate has stopped waiting on: it timed out inside the tool
+        // call, or the whole call was cancelled. Without this the dialogs stay up
+        // soliciting consent for a decision made a minute ago without them.
+        let expired: Vec<String> = self
+            .open_approvals
+            .iter()
+            .filter(|id| !self.is_approval_live(id))
+            .cloned()
+            .collect();
+        for id in expired {
+            self.close_approval(&id);
+        }
+    }
+
+    /// Whether the gate is still waiting on an answer to `id`.
+    fn is_approval_live(&self, id: &str) -> bool {
+        self.approvals
+            .as_ref()
+            .is_some_and(|gate| gate.is_pending(id))
+    }
+
+    /// Tell every client that `id` is over, once.
+    fn close_approval(&mut self, id: &str) {
+        let Some(pos) = self.open_approvals.iter().position(|open| open == id) else {
+            // Already closed — a second answer for the same id, or a prune that
+            // raced the answer. Nothing more to say and nobody to say it to.
+            return;
+        };
+        self.open_approvals.remove(pos);
+        let seq = self.next_seq();
+        let frame = build_approval_closed(seq, id.to_string());
+        self.emit_raw(frame);
+    }
+
+    /// Answer an open request, straight through the gate `Arc`.
+    ///
+    /// Returns whether this answer is the one that resolved it. `false` means the
+    /// id is unknown to the gate: another client got there first, or the minute
+    /// ran out while the user was deciding. Either way the question is closed for
+    /// everyone — a client that lost the race must not be left holding a live
+    /// dialog.
+    pub fn answer_approval(&mut self, id: &str, decision: hrdr_tools::ApprovalDecision) -> bool {
+        let answered = self
+            .approvals
+            .as_ref()
+            .is_some_and(|gate| gate.answer(id, decision));
+        self.close_approval(id);
+
+        // A decision this consequential leaves a record, exactly as it does in the
+        // TUI — including the ones nobody consciously made.
+        let note = match (answered, decision) {
+            (true, hrdr_tools::ApprovalDecision::Once) => {
+                "approved once — the command will run OUTSIDE the sandbox"
+            }
+            (true, hrdr_tools::ApprovalDecision::Session) => {
+                "approved for this session — matching commands may run OUTSIDE the sandbox \
+                 without asking again"
+            }
+            (true, hrdr_tools::ApprovalDecision::Deny) => {
+                "denied — the command ran inside the sandbox"
+            }
+            // Not ours to answer. Say so rather than swallow it: the user pressed a
+            // button and it did nothing.
+            (false, _) => {
+                "that approval was already answered or timed out — the command ran inside the \
+                 sandbox"
+            }
+        };
+        let seq = self.next_seq();
+        let frame = build_notice(seq, note.to_string());
+        self.emit_raw(frame);
+        answered
+    }
+
+    /// The gate this session answers through, for a frontend that is attaching
+    /// ([`ApprovalListener::register`]).
+    pub fn approval_gate(&self) -> Option<Arc<hrdr_tools::ApprovalGate>> {
+        self.approvals.clone()
+    }
+
+    /// Feed one agent event through this session's frontend hook — the very path
+    /// [`AgentRegistry::start_turn`] drives during a turn.
+    ///
+    /// Public so a test outside this crate can exercise the approval path
+    /// end-to-end (real gate, real request, real frames) without a live model
+    /// answering with a tool call.
+    #[doc(hidden)]
+    pub fn deliver_agent_event(&self, ev: hrdr_agent::AgentEvent) {
+        (self.event_hook(MAIN_KEY))(ev);
     }
 
     // ── cancel ─────────────────────────────────────────────────────────────
@@ -1028,6 +1238,9 @@ mod tests {
             branch_cache: None,
             mid_turn_history: Default::default(),
             last_midturn_save: None,
+            approvals: None,
+            approval_inbox: Default::default(),
+            open_approvals: Vec::new(),
             tick_notify: Arc::new(Notify::new()),
         };
         (session, rx)
@@ -1515,6 +1728,250 @@ mod tests {
             let wire_json = serde_json::to_value(&wire_entry).unwrap();
             assert_eq!(core_json, wire_json, "JSON mismatch for {:?}", entry.kind);
         }
+    }
+
+    // ── escalation approvals ───────────────────────────────────────────────
+
+    /// A session whose gate is one this test owns — same type, same code, just a
+    /// timeout short enough that the expiry path does not cost a minute.
+    ///
+    /// The returned receiver is the one the *agent* would hold: the turn loop
+    /// drains it and re-emits each request as an `AgentEvent`, which is what
+    /// these tests hand to `deliver_agent_event`. Keeping it here is how a test
+    /// learns the id the gate minted.
+    fn session_with_gate(
+        timeout_ms: u64,
+    ) -> (
+        WebSession,
+        broadcast::Receiver<ServerFrame>,
+        Arc<hrdr_tools::ApprovalGate>,
+        tokio::sync::mpsc::UnboundedReceiver<hrdr_tools::ApprovalRequest>,
+    ) {
+        let (mut session, rx) = test_session();
+        let (gate, req_rx) = hrdr_tools::ApprovalGate::with_timeout(
+            hrdr_tools::EscalationPolicy::with_extra(&[]),
+            Duration::from_millis(timeout_ms),
+        );
+        session.approvals = Some(gate.clone());
+        (session, rx, gate, req_rx)
+    }
+
+    /// A command with everything a dialog might be tempted to shorten: long, and
+    /// with a tail that changes what consenting to it means.
+    const LONG_COMMAND: &str = "git push origin main --force-with-lease --set-upstream \
+                                --no-verify --push-option=ci.skip ; rm -rf ~/projects";
+
+    /// File a request on `gate` and publish it through the session exactly as a
+    /// running turn would: the tool call blocks, the turn loop reads the request
+    /// off the gate's channel and emits an `AgentEvent`, the session's hook takes
+    /// it from there.
+    async fn file_and_publish(
+        session: &mut WebSession,
+        gate: &Arc<hrdr_tools::ApprovalGate>,
+        req_rx: &mut tokio::sync::mpsc::UnboundedReceiver<hrdr_tools::ApprovalRequest>,
+        command: &str,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<hrdr_tools::ApprovalDecision>,
+    ) {
+        let asked = gate.clone();
+        let command_owned = command.to_string();
+        let waiting = tokio::spawn(async move {
+            asked
+                .request(&command_owned, &["git push".to_string()], "why")
+                .await
+        });
+        let req = req_rx.recv().await.expect("the gate published the request");
+        let id = req.id.clone();
+        session.deliver_agent_event(AgentEvent::ApprovalRequested {
+            id: req.id,
+            command: req.command,
+            reason: req.reason,
+            rules: req.rules,
+        });
+        session.tick();
+        (id, waiting)
+    }
+
+    fn approval_frames(frames: &[ServerFrame]) -> Vec<&hrdr_protocol::ServerMsg> {
+        frames
+            .iter()
+            .map(|f| &f.msg)
+            .filter(|m| {
+                matches!(
+                    m,
+                    hrdr_protocol::ServerMsg::ApprovalRequested { .. }
+                        | hrdr_protocol::ServerMsg::ApprovalClosed { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// The request reaches the clients, and the command reaches them **whole**.
+    ///
+    /// The one thing this frame may never do is elide: a consent dialog that cuts
+    /// the tail off `git push … ; rm -rf ~` asks about a command other than the
+    /// one that would run.
+    #[tokio::test]
+    async fn a_filed_request_is_broadcast_with_the_command_untruncated() {
+        let (mut session, mut rx, gate, mut req_rx) = session_with_gate(60_000);
+        // Somebody is listening, or the gate refuses before publishing anything.
+        gate.register_frontend();
+
+        let (id, _waiting) = file_and_publish(&mut session, &gate, &mut req_rx, LONG_COMMAND).await;
+
+        let frames = drain_vec(&mut rx);
+        let published = approval_frames(&frames);
+        let [
+            hrdr_protocol::ServerMsg::ApprovalRequested {
+                id: got_id,
+                command,
+                reason,
+                rules,
+            },
+        ] = published[..]
+        else {
+            panic!("expected exactly one approval frame, got {published:?}");
+        };
+        assert_eq!(got_id, &id);
+        assert_eq!(
+            command, LONG_COMMAND,
+            "the command must cross the wire verbatim — no truncation, no normalization"
+        );
+        assert!(!reason.is_empty(), "the reason is rendered as-is");
+        assert_eq!(rules, &["git push".to_string()]);
+    }
+
+    /// Each answer resolves the waiting tool call with what the user actually
+    /// said, against the id they said it about.
+    #[tokio::test]
+    async fn each_answer_resolves_the_gate_with_that_decision() {
+        for decision in [
+            hrdr_tools::ApprovalDecision::Once,
+            hrdr_tools::ApprovalDecision::Session,
+            hrdr_tools::ApprovalDecision::Deny,
+        ] {
+            let (mut session, mut rx, gate, mut req_rx) = session_with_gate(60_000);
+            gate.register_frontend();
+            let (id, waiting) =
+                file_and_publish(&mut session, &gate, &mut req_rx, "git push").await;
+            drain(&mut rx);
+
+            assert!(
+                session.answer_approval(&id, decision),
+                "{decision:?} should resolve the pending request"
+            );
+            assert_eq!(waiting.await.unwrap(), decision);
+
+            // And the clients are told the question is over.
+            let frames = drain_vec(&mut rx);
+            assert!(
+                frames.iter().any(|f| matches!(
+                    &f.msg,
+                    hrdr_protocol::ServerMsg::ApprovalClosed { id: closed } if closed == &id
+                )),
+                "answering must close the dialog on every client: {frames:?}"
+            );
+        }
+    }
+
+    /// An answer quoting the wrong id resolves nothing. The waiting call is still
+    /// waiting, and the real question is still open.
+    #[tokio::test]
+    async fn an_answer_for_another_id_resolves_nothing() {
+        let (mut session, _rx, gate, mut req_rx) = session_with_gate(60_000);
+        gate.register_frontend();
+        let (id, waiting) = file_and_publish(&mut session, &gate, &mut req_rx, "git push").await;
+
+        assert!(
+            !session.answer_approval("esc-999", hrdr_tools::ApprovalDecision::Once),
+            "an unknown id is not answerable"
+        );
+        assert!(gate.is_pending(&id), "the real request is untouched");
+        assert!(session.answer_approval(&id, hrdr_tools::ApprovalDecision::Deny));
+        assert_eq!(waiting.await.unwrap(), hrdr_tools::ApprovalDecision::Deny);
+    }
+
+    /// Two clients see one question; the first answer wins and the second is
+    /// refused — cleanly, with the loser's dialog taken down rather than left
+    /// live.
+    #[tokio::test]
+    async fn two_clients_see_it_and_the_first_answer_wins() {
+        let (mut session, mut rx_a, gate, mut req_rx) = session_with_gate(60_000);
+        // Two browser tabs, two registrations, two subscriptions.
+        gate.register_frontend();
+        gate.register_frontend();
+        let mut rx_b = session.broadcast.subscribe();
+
+        let (id, waiting) = file_and_publish(&mut session, &gate, &mut req_rx, LONG_COMMAND).await;
+
+        for (who, rx) in [("A", &mut rx_a), ("B", &mut rx_b)] {
+            let frames = drain_vec(rx);
+            assert!(
+                frames.iter().any(|f| matches!(
+                    &f.msg,
+                    hrdr_protocol::ServerMsg::ApprovalRequested { id: got, command, .. }
+                        if got == &id && command == LONG_COMMAND
+                )),
+                "client {who} did not see the request: {frames:?}"
+            );
+        }
+
+        // A answers first.
+        assert!(session.answer_approval(&id, hrdr_tools::ApprovalDecision::Once));
+        assert_eq!(waiting.await.unwrap(), hrdr_tools::ApprovalDecision::Once);
+
+        // B's answer, sent before its dialog closed, is refused — and resolves
+        // nothing, so A's decision stands.
+        assert!(
+            !session.answer_approval(&id, hrdr_tools::ApprovalDecision::Deny),
+            "the second answer must not resolve anything"
+        );
+
+        // B was told the question is closed exactly once — a second `closed` per
+        // late answer would be noise the client cannot interpret.
+        let closes = drain_vec(&mut rx_b)
+            .iter()
+            .filter(|f| {
+                matches!(
+                    &f.msg,
+                    hrdr_protocol::ServerMsg::ApprovalClosed { id: closed } if closed == &id
+                )
+            })
+            .count();
+        assert_eq!(closes, 1, "B should be told once that the question is over");
+    }
+
+    /// The gate times out inside the blocked tool call, which has no way to say
+    /// so. The tick notices and takes the dialogs down — otherwise they sit there
+    /// asking for consent to a decision made a minute ago without them.
+    #[tokio::test]
+    async fn an_expired_request_closes_the_dialogs() {
+        let (mut session, mut rx, gate, mut req_rx) = session_with_gate(30);
+        gate.register_frontend();
+        let (id, waiting) = file_and_publish(&mut session, &gate, &mut req_rx, "git push").await;
+        drain(&mut rx);
+
+        assert_eq!(waiting.await.unwrap(), hrdr_tools::ApprovalDecision::Deny);
+        session.tick();
+
+        let frames = drain_vec(&mut rx);
+        assert!(
+            frames.iter().any(|f| matches!(
+                &f.msg,
+                hrdr_protocol::ServerMsg::ApprovalClosed { id: closed } if closed == &id
+            )),
+            "an expired request must close: {frames:?}"
+        );
+
+        // And it closes once, not on every tick for the rest of the session.
+        drain(&mut rx);
+        session.tick();
+        session.tick();
+        assert!(
+            approval_frames(&drain_vec(&mut rx)).is_empty(),
+            "a closed request must not be re-announced every tick"
+        );
     }
 
     fn drain(rx: &mut broadcast::Receiver<ServerFrame>) {
