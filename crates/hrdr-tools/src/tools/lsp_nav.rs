@@ -559,27 +559,42 @@ mod tests {
 
         let mut fut = Box::pin(commit_planned(&ctx, &planned));
         let mut task_cx = TaskContext::from_waker(Waker::noop());
-        let mut reached = false;
-        for _ in 0..200 {
-            assert!(
-                fut.as_mut().poll(&mut task_cx).is_pending(),
-                "the commit must not finish before we cancel it"
-            );
-            if tokio::fs::read_to_string(&one).await.unwrap() == "one new\n" {
-                reached = true;
-                break;
+
+        // Poll until SOMETHING is on disk, then cancel. Deliberately not "until
+        // exactly one file is on disk": a single poll can drive `commit_planned`
+        // through both writes before it next returns `Pending`, and a test that
+        // assumed otherwise failed under load with `two new` where it wanted `two
+        // old`. How many writes land before the cancel is a scheduling detail; the
+        // property is that every one of them is undone.
+        let written_at_cancel = {
+            let mut written: Vec<&std::path::Path> = Vec::new();
+            for _ in 0..200 {
+                assert!(
+                    fut.as_mut().poll(&mut task_cx).is_pending(),
+                    "the commit must not finish before we cancel it"
+                );
+                written = [one.as_path(), two.as_path()]
+                    .into_iter()
+                    .filter(|path| {
+                        std::fs::read_to_string(path).is_ok_and(|text| text.ends_with(" new\n"))
+                    })
+                    .collect();
+                if !written.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert!(reached, "the first file was never written");
-        assert_eq!(
-            tokio::fs::read_to_string(&two).await.unwrap(),
-            "two old\n",
-            "the second file must not be written yet, or this tests nothing"
+            written.len()
+        };
+        assert!(
+            written_at_cancel > 0,
+            "no file was ever written, so the rollback under test never had anything to undo"
         );
 
         drop(fut);
 
+        // Both, whichever of them had been written: a cancelled rename restores
+        // every file it touched.
         assert_eq!(
             tokio::fs::read_to_string(&one).await.unwrap(),
             "one old\n",

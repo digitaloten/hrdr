@@ -452,7 +452,7 @@ fn isolated_data_home() -> DataHomeGuard {
     unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
     DataHomeGuard {
         _lock: guard,
-        _tmp: tmp,
+        tmp: Some(tmp),
     }
 }
 
@@ -460,7 +460,7 @@ fn isolated_data_home() -> DataHomeGuard {
 /// the process-wide roots back when the test ends.
 struct DataHomeGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
-    _tmp: tempfile::TempDir,
+    tmp: Option<tempfile::TempDir>,
 }
 
 impl Drop for DataHomeGuard {
@@ -471,6 +471,26 @@ impl Drop for DataHomeGuard {
         unsafe {
             std::env::set_var("XDG_DATA_HOME", data);
             std::env::set_var("XDG_CONFIG_HOME", config);
+        }
+        // The root is left on disk rather than deleted, and that is the point.
+        //
+        // These vars are process-global while the lock is only held by tests that
+        // ASK for a private root, so a sibling test running in parallel resolves
+        // its session path into this directory without ever taking the lock.
+        // `Session::save` creates the directory and then writes into it; delete
+        // the root between those two steps and that sibling's autosave fails with
+        // ENOENT, it pushes a "conversation is not safely stored" notice into its
+        // transcript, and any assertion of that test's on-screen rows shifts by
+        // three lines. That was a real, rare failure of
+        // `read_only_tool_calls_run_concurrently_in_order`, and nothing about it
+        // was a bug in autosave.
+        //
+        // Restoring the vars above closes the window for paths resolved *after*
+        // this point; leaking the directory closes it for the ones already
+        // resolved. The cost is one temp dir per isolating test in a test binary,
+        // which the OS reclaims from `/tmp`.
+        if let Some(tmp) = self.tmp.take() {
+            let _ = tmp.keep();
         }
     }
 }
@@ -595,17 +615,28 @@ async fn read_only_tool_calls_run_concurrently_in_order() {
     ])
     .await;
     h.submit("scan the project").await;
+    // Asserted on the transcript, not the screen — same reason as
+    // `two_tool_calls_in_one_turn_both_run`: a tool block sits well above the
+    // final reply, and anything that adds rows (a notice, a longer result)
+    // scrolls it off the top of a 30-row terminal. What this test is about is
+    // that both concurrent calls landed, in call order; the viewport is not the
+    // place to ask.
+    let tools: Vec<String> = h
+        .app
+        .transcript()
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntryKind::Tool { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tools,
+        ["glob", "grep"],
+        "both read-only tools ran, in order"
+    );
+    // The final reply is the newest entry, so it IS reliably on screen.
     let screen = h.render();
-    assert!(
-        screen.contains("glob"),
-        "glob missing:
-{screen}"
-    );
-    assert!(
-        screen.contains("grep"),
-        "grep missing:
-{screen}"
-    );
     assert!(
         screen.contains("Both read."),
         "final reply missing:
