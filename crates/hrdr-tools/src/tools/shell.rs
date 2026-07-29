@@ -122,6 +122,47 @@ impl ShellTool {
     pub fn new(shell: Shell) -> Self {
         Self { shell }
     }
+
+    /// The command to spawn, given how far the boundary has been moved for it.
+    ///
+    /// One place decides this, because it is called twice — once for the first
+    /// attempt and once for an approved retry — and the two must not be able to
+    /// disagree about what a given [`Widening`](crate::escalation::Widening)
+    /// means.
+    fn command_for(
+        &self,
+        command: &str,
+        escalation: &crate::escalation::Escalation,
+        ctx: &ToolContext,
+    ) -> tokio::process::Command {
+        use crate::escalation::{Escalation, Widening};
+        match escalation {
+            // No OS wrapper at all, so the user namespace that makes ssh refuse
+            // `/etc/ssh/ssh_config` is never created. Byte-identical to how every
+            // command ran before the sandbox existed.
+            Escalation::Approved(Widening::Full) => self.shell.command(command),
+            // Still confined — same roots, same read-only subpaths, same network
+            // rule — just by a mechanism that needs no namespace.
+            Escalation::Approved(Widening::NoUserNamespace) => {
+                crate::sandbox::shell_command_without_userns(
+                    self.shell,
+                    command,
+                    &ctx.sandbox,
+                    &ctx.cwd,
+                    &ctx.sandbox_notices,
+                )
+            }
+            Escalation::NotEligible | Escalation::Denied(_) => {
+                crate::sandbox::sandboxed_shell_command(
+                    self.shell,
+                    command,
+                    &ctx.sandbox,
+                    &ctx.cwd,
+                    &ctx.sandbox_notices,
+                )
+            }
+        }
+    }
 }
 
 const BASH_DESC: &str = "Run a shell command via `bash -c` in the working directory. Use for build, test, \
@@ -317,20 +358,7 @@ impl Tool for ShellTool {
         // leave the sandbox; escalation widens the boundary, it does not repeal
         // the rules.
         let escalation = crate::escalation::consider(&a.command, ctx).await;
-        let mut cmd = if escalation == crate::escalation::Escalation::Approved {
-            // The whole point: no OS wrapper at all, so the user namespace that
-            // makes ssh refuse `/etc/ssh/ssh_config` is never created. Byte-identical
-            // to how every command ran before the sandbox existed.
-            self.shell.command(&a.command)
-        } else {
-            crate::sandbox::sandboxed_shell_command(
-                self.shell,
-                &a.command,
-                &ctx.sandbox,
-                &ctx.cwd,
-                &ctx.sandbox_notices,
-            )
-        };
+        let mut cmd = self.command_for(&a.command, &escalation, ctx);
         cmd.current_dir(&ctx.cwd);
         // `shell` opts out of the registry's deadline (see `timeout_secs`), so it
         // applies the same floor itself rather than inheriting it.
@@ -372,22 +400,45 @@ impl Tool for ShellTool {
         // dead-ending in an explanation. Only when this attempt was confined
         // (`NotEligible` — an already-approved run has nothing left to escalate,
         // and a refused one was just answered).
-        let mut retried_unsandboxed = false;
+        let mut retry_with: Option<crate::escalation::Widening> = None;
         if let Ok(text) = &mut out
             && let Some(denial) = crate::sandbox::sandbox_denial(&ctx.sandbox, text)
         {
             text.push_str(&denial.note);
+            // Which rung of the ladder is left. An attempt that was already
+            // confined starts at the narrowest one that could fix this denial; an
+            // attempt that ALREADY took the narrow rung and still failed has
+            // learned something — the mechanism was not the problem — so the only
+            // thing left to offer is the full bypass. After a full bypass there is
+            // nothing left at all.
+            let next = match &escalation {
+                crate::escalation::Escalation::NotEligible => {
+                    crate::escalation::widening_for(denial.kind, &ctx.sandbox)
+                }
+                crate::escalation::Escalation::Approved(
+                    crate::escalation::Widening::NoUserNamespace,
+                ) => crate::escalation::widening_allowed(
+                    crate::escalation::Widening::Full,
+                    &ctx.sandbox,
+                )
+                .then_some(crate::escalation::Widening::Full),
+                _ => None,
+            };
             if failed
                 && denial.kind.escalatable()
-                && escalation == crate::escalation::Escalation::NotEligible
-                && crate::escalation::consider_retry(&a.command, ctx).await
-                    == crate::escalation::Escalation::Approved
+                && let Some(widening) = next
+                && crate::escalation::consider_retry(&a.command, ctx, widening).await
+                    == crate::escalation::Escalation::Approved(widening)
             {
-                retried_unsandboxed = true;
+                retry_with = Some(widening);
             }
         }
-        if retried_unsandboxed {
-            let mut cmd = self.shell.command(&a.command);
+        if let Some(widening) = retry_with {
+            let mut cmd = self.command_for(
+                &a.command,
+                &crate::escalation::Escalation::Approved(widening),
+                ctx,
+            );
             cmd.current_dir(&ctx.cwd);
             let before = ctx.tracked_sigs();
             let rerun = run_streamed_command(cmd, &a.command, timeout, a.keep_ansi, ctx).await;
@@ -397,11 +448,17 @@ impl Tool for ShellTool {
             // keeping both would leave the model reading two exit statuses for
             // one command and guessing which one counts. The note says what
             // happened so the transcript is not silently missing a run.
+            let how = match widening {
+                crate::escalation::Widening::NoUserNamespace => {
+                    "with the same confinement but no user namespace"
+                }
+                crate::escalation::Widening::Full => "with no OS confinement",
+            };
             out = rerun.map(|run| {
                 format!(
                     "{}\n\n[sandbox] the first attempt was refused by the OS sandbox; you \
-                     approved re-running this command outside it, and the output above is \
-                     that second, unconfined run.",
+                     approved re-running this command {how}, and the output above is that \
+                     second run.",
                     run.output
                 )
             });

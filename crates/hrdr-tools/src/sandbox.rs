@@ -792,10 +792,7 @@ fn userns_probe_succeeds(bwrap: &Path) -> bool {
 /// confined" notice supersedes it.
 #[cfg(target_os = "linux")]
 fn without_bwrap(why: &'static str) -> Detection {
-    if std::fs::read_to_string("/sys/kernel/security/lsm")
-        .unwrap_or_default()
-        .contains("landlock")
-    {
+    if landlock_available() {
         Detection {
             backend: OsSandboxBackend::Landlock,
             degraded: Some(why),
@@ -806,6 +803,66 @@ fn without_bwrap(why: &'static str) -> Detection {
             degraded: Some(NO_OS_SANDBOX_NOTICE),
         }
     }
+}
+
+/// Whether this kernel has the Landlock LSM enabled — the authoritative answer
+/// being the list of active LSMs, not a probe.
+#[cfg(target_os = "linux")]
+fn landlock_available() -> bool {
+    std::fs::read_to_string("/sys/kernel/security/lsm")
+        .unwrap_or_default()
+        .contains("landlock")
+}
+
+/// Whether this host can confine a command *without* building a user namespace.
+///
+/// The question behind [`Widening::NoUserNamespace`](crate::escalation::Widening::NoUserNamespace):
+/// unprivileged bwrap must create a user namespace, and that namespace is the
+/// entire cause of the ssh failure this feature exists for. Landlock confines the
+/// same writable roots and the same read-only subpaths with no namespace at all,
+/// so where it is available a command can be moved off bwrap instead of out of
+/// the sandbox.
+///
+/// Only meaningful when bwrap is what we would otherwise use. On Seatbelt there
+/// is no user namespace to escape, and on Landlock we are already there — in both
+/// cases the narrow widening would be a no-op offered as though it were a fix, so
+/// it is not offered.
+pub fn userns_free_backend_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        detect_backend() == OsSandboxBackend::Bwrap && landlock_available()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// [`sandboxed_shell_command`], confined by a backend that builds no user
+/// namespace.
+///
+/// The delivery half of [`userns_free_backend_available`]; call only when that
+/// returned true. Everything the policy says still applies — the writable roots,
+/// the read-only subpaths, the network denial as far as Landlock can express it
+/// — so this is a change of *mechanism*, not of boundary.
+pub fn shell_command_without_userns(
+    shell: crate::Shell,
+    cmd_str: &str,
+    policy: &SandboxPolicy,
+    cwd: &Path,
+    notices: &SandboxNotices,
+) -> tokio::process::Command {
+    if policy.mode == SandboxMode::None {
+        return shell.command(cmd_str);
+    }
+    shell_command_with_backend(
+        OsSandboxBackend::Landlock,
+        shell,
+        cmd_str,
+        policy,
+        cwd,
+        notices,
+    )
 }
 
 /// macOS: Seatbelt whenever the system wrapper is where it belongs (§3.7).
@@ -838,24 +895,6 @@ fn detect_backend_uncached() -> Detection {
     }
 }
 
-/// A note to append when a sandboxed command's output looks like the SANDBOX
-/// refused a write, rather than the program failing on its own terms.
-///
-/// The confinement is a read-only bind mount, so a blocked write surfaces as
-/// `EROFS` / "Read-only file system" — from deep inside whatever tool was
-/// running, describing a path the model never mentioned. That reads as a broken
-/// or missing tool, and a model acts on it as one.
-///
-/// The case this was written for: `npx prettier --write …` on a machine where
-/// `prettier` is installed and on `PATH`. `npx` ignored it, tried to fetch the
-/// package into `~/.npm/_cacache`, and got `EROFS`. The model concluded
-/// "prettier is not available in this environment" — a false statement about the
-/// machine — and silently skipped formatting the file it had just written.
-///
-/// Deliberately narrow. Only `EROFS`/"read-only file system" triggers it: those
-/// are all but unheard of on a developer's box outside a sandbox, whereas a
-/// bare "Permission denied" is a normal error this must not editorialize over.
-/// `None` when unconfined, or when nothing in the output matches.
 /// The GPU/compute device nodes present on this host, for the sandbox to bind
 /// through.
 ///
@@ -957,9 +996,22 @@ pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<Strin
 
 /// Recognize a failure the sandbox caused, and say both what it was and why.
 ///
-/// Every arm is deliberately narrow: a note asserting the sandbox over an
-/// ordinary error would be wrong far more often than right, and a model that
-/// believes a false explanation debugs the wrong thing.
+/// The confinement is a read-only bind mount, so a blocked write surfaces as
+/// `EROFS` / "Read-only file system" — from deep inside whatever tool was
+/// running, describing a path the model never mentioned. That reads as a broken
+/// or missing tool, and a model acts on it as one.
+///
+/// The case this was written for: `npx prettier --write …` on a machine where
+/// `prettier` is installed and on `PATH`. `npx` ignored it, tried to fetch the
+/// package into `~/.npm/_cacache`, and got `EROFS`. The model concluded
+/// "prettier is not available in this environment" — a false statement about the
+/// machine — and silently skipped formatting the file it had just written.
+///
+/// Every arm is deliberately narrow: only `EROFS`/"read-only file system"
+/// triggers the write case, because those are all but unheard of on a
+/// developer's box outside a sandbox, whereas a bare "Permission denied" is a
+/// normal error this must not editorialize over. `None` when unconfined, or when
+/// nothing in the output matches.
 pub fn sandbox_denial(policy: &SandboxPolicy, output: &str) -> Option<SandboxDenial> {
     fn denial(kind: DenialKind, note: String) -> Option<SandboxDenial> {
         Some(SandboxDenial { kind, note })
