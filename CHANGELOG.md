@@ -8,6 +8,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- **`.git` is read-only for write sub-agents, enforced by the OS.** The prompt
+  told a sub-agent not to commit; now it cannot. A delegated writer's sandbox
+  subtracts the repository's git metadata from its writable set — a `--ro-bind`
+  layered after the writable binds under bwrap, a nested read-only rule under
+  Landlock (which resolves to the most specific matching hierarchy), a trailing
+  `deny file-write*` under Seatbelt. Reads stay wide open, deliberately:
+  `git log`, `diff`, `show` and `status` all still work, because a sub-agent
+  reviewing its own change needs them and none of them writes. What fails is
+  committing, staging, moving a ref, and installing a hook. This closes the
+  widening introduced when sub-agents moved into the parent's working directory:
+  they inherited the parent's sandbox roots, which put `.git` inside a writable
+  root for the first time. Since sub-agents share one tree, a commit from one
+  would sweep the parent's work in progress and any sibling's half-finished edit
+  into a single commit under its own message — and nothing in the harness would
+  have noticed a sub-agent moving `refs/heads/main`. Modelled on Codex, which
+  protects `.git` under every writable root; hrdr denies writes only, where
+  Codex masks the directory entirely and loses read-only git with it. The
+  sub-agent's Sandbox prompt block states the boundary up front, and an EROFS
+  from git now gets a specific note rather than the generic "outside your
+  writable roots" one.
+
 - **Sub-agent worktrees are gone; every sub-agent shares your working
   directory.** A write-capable `task` used to run in a private git worktree on
   its own branch, and its work reached you through a review-merge-clean sequence

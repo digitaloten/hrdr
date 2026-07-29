@@ -114,6 +114,15 @@ pub struct SandboxPolicy {
     pub writable_roots: Vec<PathBuf>,
     /// Canonicalized readable roots; only consulted in `Read` mode.
     pub readable_roots: Vec<PathBuf>,
+    /// Paths *inside* a writable root that stay read-only anyway — the
+    /// subtraction that [`deny_git_writes`](Self::deny_git_writes) installs for a
+    /// write sub-agent. Empty for every other agent.
+    ///
+    /// Enforced at the OS layer (a `--ro-bind` after the writable binds, a
+    /// read-only Landlock rule nested inside the writable one, a trailing SBPL
+    /// `deny`) rather than only in the file tools, because the thing being
+    /// stopped is `git`, and git runs through `shell`.
+    pub readonly_subpaths: Vec<PathBuf>,
 }
 
 impl SandboxPolicy {
@@ -125,6 +134,7 @@ impl SandboxPolicy {
             mode: SandboxMode::None,
             writable_roots: Vec::new(),
             readable_roots: Vec::new(),
+            readonly_subpaths: Vec::new(),
         }
     }
 
@@ -164,7 +174,57 @@ impl SandboxPolicy {
             mode,
             writable_roots,
             readable_roots,
+            readonly_subpaths: Vec::new(),
         }
+    }
+
+    /// Make the repository's git metadata read-only for this agent: it may read
+    /// history, run `git log`/`diff`/`status`, and change tracked files, but it
+    /// cannot commit, move a ref, stage, or install a hook.
+    ///
+    /// Installed for **write sub-agents only**, and it is what makes the
+    /// delegation model's central claim enforceable rather than merely stated.
+    /// The prompt tells a sub-agent not to commit; this is why it cannot. A
+    /// commit from a sub-agent would sweep the whole shared tree — the parent's
+    /// work in progress, a sibling's half-finished edit — into one commit under
+    /// its own message, and the parent would have no way to take it apart
+    /// afterwards. Ref writes are worse: nothing else in the harness would notice
+    /// a sub-agent moving `refs/heads/main`.
+    ///
+    /// Two halves, because the writable set is not a single directory:
+    ///
+    /// 1. **Drop the metadata roots.** When hrdr itself runs inside a linked
+    ///    worktree, `for_agent` added the parent repo's `objects`/`refs` dirs so
+    ///    that commits work at all ([`git_metadata_roots`]). A sub-agent that
+    ///    does not commit needs none of them, and leaving them would be a hole in
+    ///    the parent `.git` that the `<cwd>/.git` denial below does not cover.
+    /// 2. **Deny `<root>/.git` inside each remaining writable root.** As a path
+    ///    rather than a name: the check that matters happens in the kernel, which
+    ///    knows nothing about basenames.
+    ///
+    /// Deliberately NOT read-denied. A sub-agent reviewing its own work wants
+    /// `git log`, `git diff`, `git show`; every one of those reads `.git`, and
+    /// none of them can write. Codex denies reads too (`.git` is masked as an
+    /// empty directory), which also costs it every read-only git command.
+    pub fn deny_git_writes(&mut self, cwd: &Path) {
+        if self.mode == SandboxMode::None {
+            return;
+        }
+        let metadata = git_metadata_roots(cwd);
+        if !metadata.is_empty() {
+            let denied = canonical_roots(metadata);
+            self.writable_roots
+                .retain(|root| !denied.iter().any(|d| root == d));
+        }
+        let mut denied: Vec<PathBuf> = self
+            .writable_roots
+            .iter()
+            .map(|root| canonicalize_nearest(&root.join(".git")))
+            .filter(|dot_git| dot_git.exists())
+            .collect();
+        denied.sort();
+        denied.dedup();
+        self.readonly_subpaths = denied;
     }
 
     /// Err unless `canon` (already run through [`canonicalize_nearest`]) is
@@ -811,6 +871,33 @@ pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<Strin
     if !lower.contains("read-only file system") && !lower.contains("erofs") {
         return None;
     }
+    // A refused git metadata write is the one EROFS with a specific, correct
+    // answer, and the generic note below sends the reader looking for a missing
+    // writable root instead. Nothing is broken and nothing is missing: this
+    // agent is not the one that commits.
+    if !policy.readonly_subpaths.is_empty()
+        && [
+            ".git/",
+            "packed-refs",
+            "index.lock",
+            "objects",
+            "refs/heads",
+        ]
+        .iter()
+        .any(|needle| lower.contains(&needle.to_ascii_lowercase()))
+    {
+        return Some(format!(
+            "\n\n[sandbox] that write was into git's metadata ({}), which is READ-ONLY for a \
+             sub-agent — deliberately, and this is not a fault to work around. You may read \
+             history freely (`git log`, `diff`, `show`, `status`) and edit tracked files; you \
+             may not commit, stage, move a ref, or install a hook. You share this working \
+             directory with the agent that delegated to you, so a commit from you would sweep \
+             its work and any sibling's into one commit under your message. Leave your changes \
+             in the tree, list the files you changed in your report, and let the parent commit \
+             them.",
+            join_roots(&policy.readonly_subpaths),
+        ));
+    }
     let where_writable = if policy.writable_roots.is_empty() {
         "nothing is writable for this agent (read-only mode)".to_string()
     } else {
@@ -954,12 +1041,18 @@ fn landlock_command(
         .filter(|root| root.exists())
         .cloned()
         .collect();
+    let readonly: Vec<PathBuf> = policy
+        .readonly_subpaths
+        .iter()
+        .filter(|path| path.exists())
+        .cloned()
+        .collect();
     // SAFETY: the closure runs in the forked child before `exec`. It issues
     // landlock/prctl syscalls and builds the ruleset from data moved in
     // beforehand; it shares no lock, handle, or global with the parent, and it
     // never spawns a thread.
     unsafe {
-        cmd.pre_exec(move || install_landlock_rules(&writable));
+        cmd.pre_exec(move || install_landlock_rules(&writable, &readonly));
     }
     cmd
 }
@@ -972,7 +1065,10 @@ fn landlock_command(
 /// subset of ABI v5 it understands — but a kernel that enforces *nothing*
 /// fails the spawn rather than running the command unconfined.
 #[cfg(target_os = "linux")]
-fn install_landlock_rules(writable_roots: &[PathBuf]) -> std::io::Result<()> {
+fn install_landlock_rules(
+    writable_roots: &[PathBuf],
+    readonly_subpaths: &[PathBuf],
+) -> std::io::Result<()> {
     use landlock::{
         ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreatedAttr,
         RulesetStatus, path_beneath_rules,
@@ -1004,6 +1100,15 @@ fn install_landlock_rules(writable_roots: &[PathBuf]) -> std::io::Result<()> {
     if !writable_roots.is_empty() {
         ruleset = ruleset
             .add_rules(path_beneath_rules(writable_roots, access_rw))
+            .map_err(std::io::Error::other)?;
+    }
+    // Nested inside a writable root, and read-only: Landlock resolves an access
+    // request against the MOST SPECIFIC matching hierarchy, so a rule on
+    // `<cwd>/.git` overrides the one on `<cwd>`. Added last for readability
+    // only — unlike bwrap's argv, rule order carries no meaning here.
+    if !readonly_subpaths.is_empty() {
+        ruleset = ruleset
+            .add_rules(path_beneath_rules(readonly_subpaths, access_ro))
             .map_err(std::io::Error::other)?;
     }
 
@@ -1067,6 +1172,14 @@ fn bwrap_args(
             // shape Codex gives its `read-only` mode.
             for root in policy.writable_roots.iter().filter(|root| root.exists()) {
                 bind(&mut args, "--bind", root);
+            }
+            // …and take back the parts of them that must not be writable, AFTER
+            // the binds above — bwrap applies mounts in argv order and the last
+            // one wins, so this ordering is the whole mechanism. For a write
+            // sub-agent that is `<cwd>/.git`: it can edit tracked files, and
+            // `git commit` fails on the object write.
+            for path in policy.readonly_subpaths.iter().filter(|p| p.exists()) {
+                bind(&mut args, "--ro-bind", path);
             }
         }
         SandboxMode::Strict => {
@@ -1234,6 +1347,13 @@ fn seatbelt_profile(mode: SandboxMode, policy: &SandboxPolicy) -> String {
                 let writes = subpaths(&policy.writable_roots);
                 profile.push_str(&format!("(allow file-write* {writes})\n"));
             }
+            // Subtract what must stay read-only inside those roots. SBPL is
+            // last-match-wins, so this `deny` after the `allow` above is what
+            // makes a write sub-agent's `<cwd>/.git` unwritable.
+            if !policy.readonly_subpaths.is_empty() {
+                let denied = subpaths(&policy.readonly_subpaths);
+                profile.push_str(&format!("(deny file-write* {denied})\n"));
+            }
         }
         SandboxMode::Strict => {
             let reads = subpaths(&policy.readable_roots);
@@ -1269,6 +1389,7 @@ pub(crate) fn confined_ctx(dir: &Path, mode: SandboxMode) -> crate::ToolContext 
         mode,
         writable_roots: vec![root.clone()],
         readable_roots: vec![root],
+        readonly_subpaths: Vec::new(),
     });
     ctx
 }
@@ -1526,6 +1647,7 @@ mod tests {
                 std::iter::once(wt.clone()).chain(roots).collect::<Vec<_>>(),
             ),
             readable_roots: Vec::new(),
+            readonly_subpaths: Vec::new(),
         };
         check_write(&policy, &common.join("index")).unwrap_err();
         check_write(&policy, &common.join("refs").join("heads").join("main")).unwrap_err();
@@ -1552,6 +1674,7 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: vec![root.clone()],
             readable_roots: vec![root],
+            readonly_subpaths: Vec::new(),
         };
 
         for refused in [
@@ -1601,6 +1724,7 @@ mod tests {
             mode: SandboxMode::Read,
             writable_roots: Vec::new(),
             readable_roots: vec![canonicalize_nearest(dir.path())],
+            readonly_subpaths: Vec::new(),
         };
         check_read(&read_policy, &dir.path().join(".git").join("config")).unwrap();
 
@@ -1624,14 +1748,17 @@ mod tests {
         }
     }
 
-    /// The guard's contract is *where writes land*, not who typed the path — and
-    /// what keeps that honest here is the seam: hrdr's own git plumbing reaches
-    /// the disk through `std::process::Command`/`std::fs` and never calls
-    /// `check_write`. So with the policy a write sub-agent really gets, the file
-    /// tools are refused the worktree's `.git` while the commit that same
-    /// sub-agent exists to make still lands.
+    /// hrdr can itself be launched inside a linked worktree (the user made one,
+    /// or another harness did). The MAIN agent must still be able to commit
+    /// there, which is what [`git_metadata_roots`] grants — while the file tools
+    /// stay refused that same `.git`, because `check_write` answers on where the
+    /// write lands and hrdr's git plumbing does not go through it.
+    ///
+    /// Not the sub-agent case: a delegated writer has `deny_git_writes` applied
+    /// on top and cannot commit anywhere (see
+    /// `a_subagent_can_edit_files_but_not_commit`).
     #[test]
-    fn a_write_sub_agent_still_commits_under_the_metadata_guard() {
+    fn hrdr_inside_a_linked_worktree_still_commits_under_the_metadata_guard() {
         if which::which("git").is_err() {
             return; // best-effort: exercise the real backend when available
         }
@@ -1645,6 +1772,7 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: canonical_roots(roots),
             readable_roots: Vec::new(),
+            readonly_subpaths: Vec::new(),
         };
 
         // The model's tools: its own source file yes; the worktree's `.git`
@@ -1704,6 +1832,7 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: vec![one.clone(), two.clone()],
             readable_roots: Vec::new(),
+            readonly_subpaths: Vec::new(),
         };
         let args = argv(&bwrap_args(
             SandboxMode::Write,
@@ -1970,6 +2099,7 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: vec![PathBuf::from("/work/wt"), PathBuf::from("/tmp/scratch")],
             readable_roots: Vec::new(),
+            readonly_subpaths: Vec::new(),
         };
         assert_eq!(
             seatbelt_profile(SandboxMode::Write, &policy),
@@ -1993,6 +2123,7 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: vec![PathBuf::from("/work/we\"ird")],
             readable_roots: Vec::new(),
+            readonly_subpaths: Vec::new(),
         };
         assert!(
             seatbelt_profile(SandboxMode::Write, &odd)
@@ -2007,6 +2138,7 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: Vec::new(),
             readable_roots: Vec::new(),
+            readonly_subpaths: Vec::new(),
         };
         assert!(
             !seatbelt_profile(SandboxMode::Write, &empty).contains("file-write*"),
@@ -2022,6 +2154,7 @@ mod tests {
             mode: SandboxMode::Strict,
             writable_roots: Vec::new(),
             readable_roots: vec![PathBuf::from("/work/wt")],
+            readonly_subpaths: Vec::new(),
         };
         assert_eq!(
             seatbelt_profile(SandboxMode::Strict, &policy),
@@ -2051,6 +2184,7 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: vec![PathBuf::from("/work/wt")],
             readable_roots: Vec::new(),
+            readonly_subpaths: Vec::new(),
         };
         let args = argv(&seatbelt_args(&policy, crate::Shell::Bash, "echo hi"));
         assert_eq!(args[0], "-p");
@@ -2077,6 +2211,7 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: vec![canonicalize_nearest(dir.path())],
             readable_roots: Vec::new(),
+            readonly_subpaths: Vec::new(),
         };
 
         let target = canonicalize_nearest(outside.path()).join("escaped");
@@ -2198,13 +2333,13 @@ mod tests {
         let _ = std::fs::remove_file(&in_scratch);
     }
 
-    /// The point of the whole feature: a sub-agent can commit its own work in
-    /// its worktree, and cannot commit to the parent repo — the escape that
-    /// started this. Only the §3.3 metadata roots are writable, never the
-    /// parent `.git` itself.
+    /// hrdr launched inside a linked worktree commits THERE and nowhere else:
+    /// [`git_metadata_roots`] grants the shared object store and the `hrdr/` ref
+    /// namespace, never the parent `.git` itself, so a commit against the parent
+    /// checkout is still refused at the OS layer.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn worktree_commit_succeeds_but_parent_commit_is_blocked() {
+    async fn a_linked_worktree_commits_but_the_parent_repo_stays_blocked() {
         let Some(shell) = bwrap_shell() else { return };
         if which::which("git").is_err() {
             return; // best-effort: exercise the real backend when available
@@ -2226,6 +2361,7 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: roots,
             readable_roots: Vec::new(),
+            readonly_subpaths: Vec::new(),
         });
 
         std::fs::write(wt.join("f.txt"), "hi").unwrap();
@@ -2333,6 +2469,122 @@ mod tests {
         );
     }
 
+    /// The claim the whole delegation model rests on, proved against the real
+    /// OS backend rather than against the argv: a write sub-agent can change
+    /// tracked files and read history, and CANNOT commit.
+    ///
+    /// Not an argv assertion on purpose. `--ro-bind` after `--bind` is only the
+    /// mechanism on one backend; what must hold is that `git commit` fails, and
+    /// that is a property of whatever backend this machine actually runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_subagent_can_edit_files_but_not_commit() {
+        let Some(shell) = bwrap_shell() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let repo = canonicalize_nearest(dir.path());
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "before\n").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-qm", "init"]);
+        if !repo.join(".git").is_dir() {
+            return; // git unavailable — nothing to prove
+        }
+
+        let mut policy = SandboxPolicy::for_agent(SandboxMode::Write, &repo, &[]);
+        policy.deny_git_writes(&repo);
+        assert_eq!(
+            policy.readonly_subpaths,
+            vec![repo.join(".git")],
+            "the repo's own .git is what gets subtracted"
+        );
+        let mut ctx = crate::ToolContext::new(repo.clone());
+        ctx.sandbox = std::sync::Arc::new(policy);
+        let run = |command: String| {
+            let ctx = ctx.clone();
+            async move {
+                use crate::Tool as _;
+                crate::ShellTool::new(shell)
+                    .execute(serde_json::json!({"command": command}), &ctx)
+                    .await
+                    .map_err(|e| e.to_string())
+                    .unwrap_or_else(|e| e)
+            }
+        };
+
+        // Reading history is untouched — a sub-agent reviewing its own work
+        // needs `log`/`diff`/`status`, and none of them writes.
+        let log = run("git log --oneline".to_string()).await;
+        assert!(log.contains("init"), "history stays readable: {log}");
+
+        // Editing a tracked file is the sub-agent's whole job.
+        let edit = run("printf after > f.txt".to_string()).await;
+        assert!(!edit.to_lowercase().contains("read-only"), "{edit}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("f.txt")).unwrap(),
+            "after"
+        );
+
+        // …and `git status` sees it, through the same read-only .git.
+        let status = run("git status --short".to_string()).await;
+        assert!(status.contains("f.txt"), "{status}");
+
+        // The line that matters. Staging writes the index; committing writes an
+        // object and moves a ref. Both live in `.git`.
+        let commit = run("git add f.txt && git commit -m nope".to_string()).await;
+        assert!(
+            commit.to_lowercase().contains("read-only"),
+            "a sub-agent must not be able to commit: {commit}"
+        );
+        let head = git(&["log", "--oneline"]);
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).lines().count(),
+            1,
+            "history is exactly where the parent left it"
+        );
+
+        // Moving a ref directly is the same wall, reached another way.
+        let ref_write = run("git update-ref refs/heads/main HEAD".to_string()).await;
+        assert!(
+            ref_write.to_lowercase().contains("read-only"),
+            "ref writes are refused too: {ref_write}"
+        );
+    }
+
+    /// The main agent keeps full authority: nothing is subtracted unless
+    /// `deny_git_writes` is called, and `Agent::new` calls it only for a
+    /// delegated writer.
+    #[test]
+    fn a_plain_write_policy_subtracts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let policy = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+        assert!(
+            policy.readonly_subpaths.is_empty(),
+            "the parent commits; it must not be locked out of its own repository"
+        );
+    }
+
+    /// A repo-less directory has nothing to subtract, and asking for the denial
+    /// must not invent a path that does not exist (bwrap would fail the spawn on
+    /// a missing bind source).
+    #[test]
+    fn denying_git_writes_without_a_repo_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+        policy.deny_git_writes(dir.path());
+        assert!(policy.readonly_subpaths.is_empty());
+    }
+
     /// Every notice assertion below owns its own channel, so none of them can
     /// interleave with another — which is what the process-global cell used to
     /// need a test-only mutex for.
@@ -2374,6 +2626,7 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: vec![canonicalize_nearest(dir.path())],
             readable_roots: Vec::new(),
+            readonly_subpaths: Vec::new(),
         };
 
         let target = outside.path().join("escaped");
@@ -2422,6 +2675,7 @@ mod tests {
             mode: SandboxMode::Strict,
             writable_roots: Vec::new(),
             readable_roots: vec![canonicalize_nearest(dir.path())],
+            readonly_subpaths: Vec::new(),
         };
         let mine = notices();
 

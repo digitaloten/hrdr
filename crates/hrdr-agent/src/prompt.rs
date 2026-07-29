@@ -540,6 +540,27 @@ pub fn gate_section(gate: &hrdr_tools::Gate, tools: &ToolRegistry) -> String {
     )
 }
 
+/// The `.git`-is-read-only line, for a policy that has the denial installed
+/// (a write sub-agent). Empty otherwise, so the main agent's Sandbox block is
+/// byte-identical to what it always was.
+///
+/// Stated as a capability boundary rather than a warning: a model that knows
+/// `git commit` cannot work here reports its files and stops, where one that
+/// discovers it through an EROFS spends a turn deciding whether the repository
+/// is broken.
+fn git_lockdown_line(policy: &hrdr_tools::SandboxPolicy) -> String {
+    if policy.readonly_subpaths.is_empty() {
+        return String::new();
+    }
+    "\n- Git metadata (`.git`) is READ-ONLY for you. Read history freely — `git log`, `git \
+     diff`, `git show`, `git status` all work — but you cannot commit, stage, move a ref, or \
+     install a hook, and attempting it fails with a read-only filesystem error rather than \
+     doing anything. This is deliberate: you share this working directory with the agent that \
+     delegated to you, so a commit from you would sweep up its work and any sibling's. Leave \
+     your changes in the tree and name the files you changed in your report."
+        .to_string()
+}
+
 /// The sandbox declaration — mode plus the concrete roots — as a prompt section.
 /// Empty (→ dropped by [`SystemPrompt::push`]) when the mode is `None`, so an
 /// unconfined agent is told nothing about a boundary it does not have.
@@ -567,8 +588,9 @@ pub fn sandbox_section(policy: &hrdr_tools::SandboxPolicy) -> String {
              - Mode: write — reads are unrestricted; writes are enforced by the OS and the tools.\n\
              - You may write ONLY under:\n{}\n\
              - Writing anywhere else is refused. If a task appears to require writing outside \
-             these roots, stop and say so instead of attempting it.",
-            roots(&policy.writable_roots)
+             these roots, stop and say so instead of attempting it.{}",
+            roots(&policy.writable_roots),
+            git_lockdown_line(policy),
         ),
         hrdr_tools::SandboxMode::Read => String::from(
             "\n\nSandbox:\n\
@@ -2898,6 +2920,43 @@ mod tests {
         );
     }
 
+    /// A write sub-agent is told `.git` is read-only BEFORE it tries to commit.
+    /// Discovering it through an EROFS costs a turn spent deciding whether the
+    /// repository is broken — the failure the sandbox notice exists to catch,
+    /// and cheaper to prevent than to explain.
+    #[test]
+    fn the_sandbox_section_names_the_git_lockdown_only_when_it_applies() {
+        let roots = vec![std::path::PathBuf::from("/tmp/proj")];
+        let plain = hrdr_tools::SandboxPolicy {
+            mode: hrdr_tools::SandboxMode::Write,
+            writable_roots: roots.clone(),
+            readable_roots: roots.clone(),
+            readonly_subpaths: Vec::new(),
+        };
+        assert!(
+            !sandbox_section(&plain).contains("READ-ONLY"),
+            "the parent commits, and its block must not say otherwise"
+        );
+
+        let sub = hrdr_tools::SandboxPolicy {
+            readonly_subpaths: vec![std::path::PathBuf::from("/tmp/proj/.git")],
+            ..plain
+        };
+        let s = sandbox_section(&sub);
+        assert!(
+            s.contains("Git metadata (`.git`) is READ-ONLY for you"),
+            "{s}"
+        );
+        assert!(
+            s.contains("`git log`") && s.contains("cannot commit"),
+            "it separates what still works from what does not: {s}"
+        );
+        assert!(
+            s.contains("name the files you changed"),
+            "and says what to do instead: {s}"
+        );
+    }
+
     /// The model is told its boundary positively, and every writable root is
     /// named — a root the prompt omits is a refusal the model cannot predict.
     #[test]
@@ -2909,6 +2968,7 @@ mod tests {
                 std::path::PathBuf::from("/scratch/hrdr"),
             ],
             readable_roots: vec![std::path::PathBuf::from("/work/wt-1")],
+            readonly_subpaths: Vec::new(),
         };
         let s = sandbox_section(&policy);
         assert!(
@@ -2927,6 +2987,7 @@ mod tests {
             mode: hrdr_tools::SandboxMode::Read,
             writable_roots: Vec::new(),
             readable_roots: vec![std::path::PathBuf::from("/work/ro")],
+            readonly_subpaths: Vec::new(),
         };
         let s = sandbox_section(&ro);
         assert!(s.contains("Mode: read"));
@@ -2943,6 +3004,7 @@ mod tests {
             mode: hrdr_tools::SandboxMode::Strict,
             writable_roots: Vec::new(),
             readable_roots: vec![std::path::PathBuf::from("/work/ro")],
+            readonly_subpaths: Vec::new(),
         };
         let s = sandbox_section(&strict);
         assert!(s.contains("Mode: strict"));

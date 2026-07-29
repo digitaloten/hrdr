@@ -1607,11 +1607,23 @@ impl Agent {
         // and revived alike all come through this constructor, so there is no
         // second place a mode could be decided (see `effective_sandbox`).
         let sandbox_mode = crate::config::effective_sandbox(config.sandbox, config.read_only);
-        ctx.sandbox = Arc::new(hrdr_tools::SandboxPolicy::for_agent(
+        let mut sandbox = hrdr_tools::SandboxPolicy::for_agent(
             sandbox_mode,
             &config.cwd,
             &config.sandbox_writable_roots,
-        ));
+        );
+        // A sub-agent may change files; only the parent may change history.
+        //
+        // Sub-agents share the parent's working directory, so a commit from one
+        // would sweep the parent's work in progress and any sibling's
+        // half-finished edit into a single commit under its own message — and a
+        // ref write would move `main` with nothing in the harness noticing. The
+        // prompt already says don't commit; this is what makes it true. Reads
+        // stay open, so `git log`/`diff`/`show`/`status` all still work.
+        if config.delegated && !config.read_only {
+            sandbox.deny_git_writes(&config.cwd);
+        }
+        ctx.sandbox = Arc::new(sandbox);
         ctx.max_output = config.tool_max_bytes;
         ctx.max_output_lines = config.tool_max_lines;
         if let Some((proj, glob)) = &mem_dirs {
