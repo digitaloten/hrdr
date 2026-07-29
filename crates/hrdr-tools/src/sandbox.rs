@@ -2804,6 +2804,81 @@ mod tests {
         assert!(out.contains("visible.txt"), "{out}");
     }
 
+    /// An approved escalation really does run OUTSIDE the sandbox, proved
+    /// against the real backend rather than against a flag.
+    ///
+    /// The probe is a write to a path the policy does not make writable: inside
+    /// the sandbox the mount is read-only and it cannot land, outside there is no
+    /// mount at all and it does. Same shape as
+    /// `a_subagent_can_edit_files_but_not_commit` — assert the *property* the
+    /// backend enforces, not the argv one backend happens to build. Stub the
+    /// bypass in `ShellTool::execute` (send the approved arm through
+    /// `sandboxed_shell_command` too) and the second half of this fails on
+    /// `the approved write did not land`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_approved_escalation_runs_outside_the_sandbox() {
+        let Some(shell) = bwrap_shell() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        // A rule for the probe rather than a git command: `git push` needs a
+        // remote, and what is under test is the confinement, not git.
+        let (gate, mut rx) =
+            crate::ApprovalGate::new(crate::EscalationPolicy::from_rules(["touch"]));
+        let mut ctx = confined_ctx(dir.path(), SandboxMode::Write);
+        ctx.approvals = Some(gate.clone());
+
+        // Denied first — nobody is registered, so this is exactly what a
+        // headless run does. The write must die in the kernel, and the model
+        // must be told why.
+        let denied_target = outside.path().join("denied");
+        let out = run_shell(shell, &ctx, &format!("touch {}", denied_target.display())).await;
+        assert!(!denied_target.exists(), "the denied write landed: {out}");
+        assert!(out.contains("Read-only file system"), "{out}");
+        assert!(out.contains("eligible to run OUTSIDE"), "{out}");
+        assert!(out.contains("Do NOT retry"), "{out}");
+
+        // Now with a frontend that approves. Same command, same policy; the only
+        // difference is the answer.
+        gate.register_frontend();
+        let answering = gate.clone();
+        let seen = tokio::spawn(async move {
+            let req = rx.recv().await.expect("the request reaches the frontend");
+            answering.answer(&req.id, crate::ApprovalDecision::Once);
+            req
+        });
+        let approved_target = outside.path().join("approved");
+        let out = run_shell(shell, &ctx, &format!("touch {}", approved_target.display())).await;
+        assert!(
+            approved_target.exists(),
+            "the approved write did not land — it ran confined: {out}"
+        );
+        assert!(!out.contains("[exit status"), "{out}");
+        assert!(!out.contains("[sandbox]"), "{out}");
+
+        // What the frontend was handed is the command as typed, with the rule it
+        // matched — the two things slice 2 has to render.
+        let req = seen.await.unwrap();
+        assert!(req.command.contains("touch"), "{req:?}");
+        assert_eq!(req.rules, vec!["touch".to_string()]);
+
+        // A compound command with one ineligible segment is never offered at
+        // all, even to a frontend that approves everything — the property that
+        // keeps the allowlist from being an arbitrary-code escape.
+        let escape_target = outside.path().join("escape");
+        let out = run_shell(
+            shell,
+            &ctx,
+            &format!(
+                "touch {t} && sh -c 'touch {t}2'",
+                t = escape_target.display()
+            ),
+        )
+        .await;
+        assert!(!escape_target.exists(), "a compound command escaped: {out}");
+    }
+
     /// The timeout still reaps the whole tree through bwrap:
     /// `--die-with-parent` plus the pid-namespace init mean killing the spawn
     /// group takes every descendant with it.

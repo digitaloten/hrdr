@@ -675,7 +675,12 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
         AgentEvent::Notice(text) => transcript.push(Entry::system(text.clone())),
         // A steered message is a real user turn in this conversation.
         AgentEvent::Steered(sent) => transcript.push(Entry::user(sent.clone())),
-        AgentEvent::Usage { .. }
+        // A pending approval is UI state — a question waiting on the user, which
+        // the frontend owns until it is answered. Folding it into the transcript
+        // would leave a permanent "may I?" in a conversation whose next entry is
+        // the answer in the form of the command's result.
+        AgentEvent::ApprovalRequested { .. }
+        | AgentEvent::Usage { .. }
         | AgentEvent::History(_)
         | AgentEvent::TurnDone
         | AgentEvent::TodoUpdated(_) => {}

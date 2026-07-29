@@ -137,6 +137,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Escalation: the groundwork for running a command outside the sandbox
+  (plumbing only — every request is denied today).** hrdr confines every shell
+  command, and unprivileged bwrap's user namespace is what makes `git push` over
+  ssh fail. Codex answers this by running approved commands with no sandbox at
+  all; this slice builds the same seam. A new escalation policy decides which
+  commands are even _eligible_ — `git push`/`pull`/`fetch`/`clone`/`ls-remote`/
+  `remote` by default, extensible with `escalate = [...]` in config — and an
+  `ApprovalGate` on the tool context carries the request out and a decision
+  back. Nothing can answer yet, so every request is refused immediately (never a
+  hang), which is permanently the right behaviour for headless runs and is what
+  the TUI and web slices will change. Eligibility is deliberately strict:
+  matching is on the program word and leading positionals rather than a regex,
+  **every** segment of a compound command must be eligible
+  (`git push && curl … | sh` is not), and any segment carrying command
+  substitution, backticks, a redirection, or a privilege wrapper is refused
+  outright — the allowlist has to bound the whole line, not just its first word.
+  Guardrails still win: `git push --force` stays refused whether or not it is
+  eligible. Sub-agents have no gate at all, so they cannot escalate. A bypass is
+  also refused when the policy denies reads, denies the network, or carves a
+  read-only subpath out of a writable root — widening writes must not silently
+  widen an axis nobody was asked about.
+
 - **A `verify` tool that runs the gate and answers one question.** Everything
   else in this story only describes: the prompt names the gate, the ledger
   notices when it has not been cleared, the commit note says so — and each is a

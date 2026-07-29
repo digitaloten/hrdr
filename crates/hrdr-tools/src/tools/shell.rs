@@ -312,14 +312,25 @@ impl Tool for ShellTool {
             bail!("command blocked: {msg}");
         }
         // Guardrails first, confinement second: a blocked command never runs,
-        // sandboxed or not.
-        let mut cmd = crate::sandbox::sandboxed_shell_command(
-            self.shell,
-            &a.command,
-            &ctx.sandbox,
-            &ctx.cwd,
-            &ctx.sandbox_notices,
-        );
+        // sandboxed or not — and it is never offered for escalation either.
+        // `git push --force` is refused whether or not `git push` is eligible to
+        // leave the sandbox; escalation widens the boundary, it does not repeal
+        // the rules.
+        let escalation = crate::escalation::consider(&a.command, ctx).await;
+        let mut cmd = if escalation == crate::escalation::Escalation::Approved {
+            // The whole point: no OS wrapper at all, so the user namespace that
+            // makes ssh refuse `/etc/ssh/ssh_config` is never created. Byte-identical
+            // to how every command ran before the sandbox existed.
+            self.shell.command(&a.command)
+        } else {
+            crate::sandbox::sandboxed_shell_command(
+                self.shell,
+                &a.command,
+                &ctx.sandbox,
+                &ctx.cwd,
+                &ctx.sandbox_notices,
+            )
+        };
         cmd.current_dir(&ctx.cwd);
         // `shell` opts out of the registry's deadline (see `timeout_secs`), so it
         // applies the same floor itself rather than inheriting it.
@@ -341,9 +352,12 @@ impl Tool for ShellTool {
         // `shell` reports the output and lets the model judge the exit code, so
         // the run's `passed` flag is dropped here — `verify` is the caller that
         // needs it (see [`CommandRun`]).
-        let mut out = run_streamed_command(cmd, &a.command, timeout, a.keep_ansi, ctx)
-            .await
-            .map(|run| run.output);
+        let run = run_streamed_command(cmd, &a.command, timeout, a.keep_ansi, ctx).await;
+        // Kept before the text is unwrapped: whether the command *succeeded* is
+        // a separate fact from what it printed (see [`CommandRun`]), and the
+        // escalation note below is owed only to a failure.
+        let failed = run.as_ref().is_ok_and(|r| !r.passed);
+        let mut out = run.map(|run| run.output);
         // Also on failure: a command that exited non-zero (or timed out) may
         // still have rewritten files before it died.
         ctx.note_modifying_command(&before, &a.command);
@@ -354,6 +368,16 @@ impl Tool for ShellTool {
             && let Some(note) = crate::sandbox::sandbox_denial_note(&ctx.sandbox, text)
         {
             text.push_str(&note);
+        }
+        // Say that the sandbox was not left, but only when it might explain the
+        // failure. A refused escalation whose command then worked confined has
+        // nothing to report, and a note on every successful `git push` would be
+        // noise the model learns to skip.
+        if let crate::escalation::Escalation::Denied(rules) = &escalation
+            && failed
+            && let Ok(text) = &mut out
+        {
+            text.push_str(&crate::escalation::escalation_denied_note(rules));
         }
         // The deadline the call asked for was not the one it got. Said even when
         // the command finished comfortably — the point is that the next call

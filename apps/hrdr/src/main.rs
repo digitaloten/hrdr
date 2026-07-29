@@ -986,6 +986,20 @@ fn event_json(ev: &AgentEvent) -> String {
                 "cost_partial": cost_partial,
             })
         }
+        // Unreachable from `hrdr run`: a request is only published once a
+        // frontend has registered as able to answer, and this one cannot — a
+        // headless run has no user to ask, so escalation is refused before
+        // anything is emitted. Serialized rather than dropped so a `--json`
+        // consumer that DOES drive approvals (over the same stream, one day)
+        // sees the same shape every other event has.
+        AgentEvent::ApprovalRequested {
+            id,
+            command,
+            reason,
+            rules,
+        } => {
+            json!({"type": "approval_requested", "id": id, "command": command, "reason": reason, "rules": rules})
+        }
         AgentEvent::TurnDone => json!({"type": "done"}),
     };
     v.to_string()

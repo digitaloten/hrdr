@@ -824,6 +824,29 @@ pub enum AgentEvent {
     /// new list so a frontend or event log reader can see the state without
     /// reaching into the shared Arc.
     TodoUpdated(Vec<hrdr_tools::TodoItem>),
+    /// A tool is waiting on the user: may this command run OUTSIDE the OS
+    /// sandbox? Emitted the moment the request is filed, while the tool call
+    /// blocks on the answer.
+    ///
+    /// Answered with [`Agent::answer_approval`] (or, without the agent lock,
+    /// through [`Agent::approval_gate`]) quoting `id`. Unanswered, it denies
+    /// itself after [`hrdr_tools::APPROVAL_TIMEOUT_SECS`] — a turn is never
+    /// hung by one of these.
+    ///
+    /// Only reachable once a frontend has registered interest with the gate;
+    /// with nobody able to answer, a request is denied before it is ever
+    /// published, which is what makes headless runs unaffected.
+    ApprovalRequested {
+        /// Quote this back when answering.
+        id: String,
+        /// The command verbatim — what is approved must be what runs.
+        command: String,
+        /// One line saying why it is being asked, ready to show as-is.
+        reason: String,
+        /// The escalation rules it matched, and what an "always allow" answer is
+        /// remembered under.
+        rules: Vec<String>,
+    },
     /// The model produced a final answer with no further tool calls.
     TurnDone,
 }
@@ -1077,6 +1100,18 @@ pub struct Agent {
     /// event-less entries become the post-edit file hooks in `ctx.hooks`).
     /// Arc: cloned into each tool call's future for the pre/post tool events.
     event_hooks: Arc<Vec<hrdr_tools::EventHook>>,
+    /// This agent's escalation approval gate — the same `Arc` its tool context
+    /// holds. `None` for a delegated sub-agent, which never escalates.
+    ///
+    /// Kept so a frontend can reach the gate ([`Self::approval_gate`]) and
+    /// answer *without* the agent lock: the turn task holds that lock for the
+    /// whole turn, and an answer that had to wait for the turn to end could
+    /// never unblock the tool call waiting inside it.
+    approvals: Option<Arc<hrdr_tools::ApprovalGate>>,
+    /// Approval requests filed by this agent's tools, drained by the tool-batch
+    /// loop into [`AgentEvent::ApprovalRequested`]. `None` alongside
+    /// `approvals`.
+    approval_rx: Option<tokio::sync::mpsc::UnboundedReceiver<hrdr_tools::ApprovalRequest>>,
 }
 
 /// Append a sub-agent persona (its role / operating instructions) after the base
@@ -1713,6 +1748,24 @@ impl Agent {
             );
             ctx.guardrails = Arc::new(rails);
         }
+        // The escalation gate: the main agent's only, and its absence is what
+        // makes a sub-agent unable to escalate (see `ToolContext::approvals`).
+        //
+        // A sub-agent has no user to ask — it runs behind a `task` call the
+        // parent made, and the person who would answer is watching the parent's
+        // turn. Giving it a gate would mean either a prompt nobody attributed to
+        // it or a wait nobody could end, and it is the agent whose network and
+        // git metadata are already denied on purpose. So: no gate, no
+        // eligibility, sandboxed exactly as before.
+        let (approvals, approval_rx) = if config.delegated {
+            (None, None)
+        } else {
+            let (gate, rx) = hrdr_tools::ApprovalGate::new(
+                hrdr_tools::EscalationPolicy::with_extra(&config.escalate),
+            );
+            ctx.approvals = Some(Arc::clone(&gate));
+            (Some(gate), Some(rx))
+        };
         let project_docs = gather_agent_docs(&config.cwd);
         let project_docs_changed = false;
         let memory = mem_dirs
@@ -1845,7 +1898,36 @@ impl Agent {
             max_cost: config.max_cost,
             allow_unpriced: config.allow_unpriced,
             event_hooks,
+            approvals,
+            approval_rx,
         })
+    }
+
+    /// This agent's escalation approval gate, or `None` for a sub-agent (which
+    /// never escalates).
+    ///
+    /// A frontend takes this **once, before it starts a turn**, and keeps it:
+    /// registering interest ([`hrdr_tools::ApprovalGate::register_frontend`]) is
+    /// what makes an approval answerable at all, and answering through the
+    /// returned `Arc` needs no lock on the agent — which matters, because the
+    /// turn task holds that lock for the whole turn and the tool call waiting on
+    /// the answer is inside it. The same reason [`AgentEvent::History`] is pushed
+    /// to frontends rather than read back off the agent.
+    pub fn approval_gate(&self) -> Option<Arc<hrdr_tools::ApprovalGate>> {
+        self.approvals.clone()
+    }
+
+    /// Answer a pending [`AgentEvent::ApprovalRequested`] by id, waking the tool
+    /// call blocked on it. `false` when the id is unknown — already answered, or
+    /// timed out while the user was deciding.
+    ///
+    /// Convenience over [`approval_gate`](Self::approval_gate) for a caller that
+    /// already holds the agent; a frontend answering mid-turn must use the gate
+    /// directly (see the note there).
+    pub fn answer_approval(&self, id: &str, decision: hrdr_tools::ApprovalDecision) -> bool {
+        self.approvals
+            .as_ref()
+            .is_some_and(|gate| gate.answer(id, decision))
     }
 
     /// Names of the sub-agents this agent can delegate to (for `@name` mention
@@ -3182,6 +3264,47 @@ mod tests {
         let message = warning["message"].as_str().unwrap();
         assert!(message.starts_with("110 more model row(s)"), "{message}");
         assert!(message.contains("narrow with `query`"), "{message}");
+    }
+
+    /// The single switch for escalation: the main agent has a gate, a delegated
+    /// sub-agent has none — so nothing a sub-agent runs is ever eligible to
+    /// leave the sandbox, whatever it types.
+    ///
+    /// Asserted on the agent AND on the tool context it hands every call,
+    /// because the context is what `shell` actually reads; the two must not be
+    /// able to disagree.
+    #[test]
+    fn only_the_main_agent_gets_an_approval_gate() {
+        let main = Agent::new(AgentConfig::default()).unwrap();
+        assert!(main.approval_gate().is_some());
+        assert!(main.ctx.approvals.is_some());
+        // Nothing can answer yet — no frontend has registered — which is what
+        // makes every request in this slice an immediate denial.
+        assert!(!main.approval_gate().unwrap().can_answer());
+
+        let sub = Agent::new(subagent_base_config(&AgentConfig::default())).unwrap();
+        assert!(sub.approval_gate().is_none());
+        assert!(sub.ctx.approvals.is_none());
+        // …and answering by id on an agent with no gate is a no-op, not a panic.
+        assert!(!sub.answer_approval("esc-1", hrdr_tools::ApprovalDecision::Once));
+    }
+
+    /// The `escalate` config key reaches the gate's rule set, on top of the
+    /// built-in git rules rather than replacing them.
+    #[test]
+    fn config_escalate_rules_reach_the_gate() {
+        let agent = Agent::new(AgentConfig {
+            escalate: vec!["gh pr create".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        let policy = agent.approval_gate().unwrap();
+        let policy = policy.policy();
+        assert_eq!(
+            policy.matching_rules("gh pr create --fill"),
+            Some(vec!["gh pr create".to_string()])
+        );
+        assert!(policy.matching_rules("git push origin main").is_some());
     }
 
     /// The delegation guidance reaches an agent that can actually delegate.

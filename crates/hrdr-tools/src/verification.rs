@@ -367,7 +367,12 @@ pub(crate) fn segments(command: &str) -> impl Iterator<Item = String> + '_ {
 /// A segment's tokens with the noise that does not change what it runs removed:
 /// leading environment assignments, wrapper programs, and everything from the
 /// first redirection on (`> out.log`, `2>` left over from `2>&1`).
-fn arguments(segment: &str) -> Vec<&str> {
+///
+/// Shared with [`escalation`](crate::escalation), which decides eligibility on
+/// the program a segment really runs. One normalization, so a wrapper this list
+/// learns about cannot be known to one caller and not the other — `rtk git push`
+/// has to read as `git push` in both.
+pub(crate) fn arguments(segment: &str) -> Vec<&str> {
     /// Programs that run another program without changing what it is.
     const WRAPPERS: &[&str] = &["sudo", "env", "time", "nice", "ionice", "npx", "rtk"];
 

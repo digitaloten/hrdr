@@ -135,7 +135,13 @@ impl Record {
             }),
             AgentEvent::Notice(n) => Some(Record::Notice { msg: n.clone() }),
             AgentEvent::Steered(s) => Some(Record::Steered { text: s.clone() }),
-            AgentEvent::Usage { .. }
+            // An approval request is a question in flight, not a record of what
+            // happened: by the time anyone replays this transcript it has been
+            // answered one way or the other, and the answer shows up as the
+            // command's own result. Nothing to persist. (A sub-agent never files
+            // one at all — it has no gate.)
+            AgentEvent::ApprovalRequested { .. }
+            | AgentEvent::Usage { .. }
             | AgentEvent::History(_)
             | AgentEvent::TodoUpdated(_)
             | AgentEvent::TurnDone => None,

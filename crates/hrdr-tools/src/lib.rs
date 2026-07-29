@@ -22,6 +22,8 @@ use async_trait::async_trait;
 use hrdr_llm::ToolDef;
 
 mod ansi;
+mod approval;
+mod escalation;
 mod gate;
 mod guardrails;
 mod hooks;
@@ -35,6 +37,8 @@ mod tools;
 mod verification;
 mod web;
 
+pub use approval::{APPROVAL_TIMEOUT_SECS, ApprovalDecision, ApprovalGate, ApprovalRequest};
+pub use escalation::{EscalationPolicy, EscalationRule, unsandboxed_execution_allowed};
 pub use gate::{Gate, GateCheck, GateSource};
 pub use guardrails::{Guardrail, check_guardrails, default_guardrails};
 pub use hooks::{
@@ -262,6 +266,18 @@ pub struct ToolContext {
     /// the clone every tool call gets writes into the same queue the agent
     /// drains.
     pub sandbox_notices: Arc<SandboxNotices>,
+    /// Where `shell` asks whether an eligible command may run OUTSIDE the OS
+    /// sandbox, and waits for the answer (see [`ApprovalGate`]).
+    ///
+    /// `None` means *no escalation*, and it is the only switch: a delegated
+    /// sub-agent is never given one, so it cannot ask, cannot be approved, and
+    /// runs exactly as confined as it did before this existed. A second flag
+    /// saying the same thing could disagree with this one.
+    ///
+    /// `ToolContext::new` leaves it `None` — the bare constructor (tests,
+    /// embedders) escalates nothing, matching how [`sandbox`](Self::sandbox)
+    /// starts unconfined until `Agent::new` says otherwise.
+    pub approvals: Option<Arc<ApprovalGate>>,
     /// State for the post-edit test nudge: whether this session has added a test
     /// yet, and which paths have already been reminded. Shared with the file
     /// tools through [`apply_file_change`](crate::tools::apply_file_change), which
@@ -300,6 +316,7 @@ impl ToolContext {
             lsp: None,
             sandbox: Arc::new(SandboxPolicy::unconfined()),
             sandbox_notices: Arc::new(SandboxNotices::default()),
+            approvals: None,
             test_nudge: Arc::new(Mutex::new(TestNudgeState::default())),
             verification: Arc::new(Mutex::new(VerificationLedger::default())),
             enforce_timeout_floor: true,
