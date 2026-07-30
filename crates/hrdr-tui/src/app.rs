@@ -1944,6 +1944,11 @@ impl App {
         // checkpoint uses (skips if the agent lock is still busy; a later
         // save, or the one on quit, catches up).
         self.autosave();
+        // Settle any tool calls left mid-execution when the turn was cancelled.
+        // The turn was aborted before `finish_tool_call` could emit a `ToolEnd`
+        // event, so those entries keep `done: false` and spin forever.
+        self.sync_panes();
+        hrdr_agent::settle_restored_tools(&mut self.panes.main_mut().state.transcript);
     }
 
     /// Quit the session. If a turn is running, cancel it first — which
