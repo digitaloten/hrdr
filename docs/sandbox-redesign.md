@@ -219,7 +219,6 @@ ignored. `references` 2, `definition` 0, `rename` 0, `copy` 0, `move` 0,
 | `definition`, `references`, `rename` | nothing — available and unused (2 calls / 9350) |
 | `copy`, `move`, `delete`             | `cp` / `mv` / `rm`, guardrail-checked           |
 | `watch`                              | shell                                           |
-| `replace`                            | `edit`, or `sed -i` for multi-file — see below  |
 
 **There is no `git` tool to remove** — it was added in `c677b88` and deleted
 since; only a stale doc reference in `secret_diff.rs:170` survives (itself dead
@@ -255,23 +254,21 @@ in jail, which has no shell and would otherwise be unable to search or orient.
 - **`todo`**, **`verify`** — pure harness state, and the verification ledger's
   only input. `verify` is the thinnest survivor.
 
-### Dropping `replace` has a real cost — recorded, not relitigated
+### Why `replace` survives a cut it looks like it should fail
 
-Unlike `ls` or `copy`, `replace` was not a thin wrapper: it is the multi-file
-mechanical-edit path, and `edit` takes **one edit per call** (there is no
-`edits[]` batch). So a twenty-file rename becomes twenty `edit` calls or one
-`sed -i`, and models will reach for the `sed`.
+Low usage — 88 calls against `edit`'s 1331 — and it is kept anyway, because
+usage is not the test. Unlike `ls` or `copy` it is not a thin wrapper: it is the
+**multi-file mechanical-edit path**, and `edit` takes one edit per call (there
+is no `edits[]` batch). Without it a twenty-file rename becomes twenty `edit`
+calls or one `sed -i`, and the model reaches for the `sed`.
 
-That loses, on exactly the operation most likely to break a build: atomicity,
-post-edit hooks (formatters), LSP diagnostics, the read-before-mutate guard, and
-a clear failure when the pattern matches nothing — `sed` silently no-ops.
+What that would lose, on exactly the operation most likely to break a build:
+atomicity, post-edit hooks (formatters), LSP diagnostics, the read-before-mutate
+guard, and a clear failure when the pattern matches nothing — `sed` silently
+no-ops.
 
-Two mitigations, neither blocking:
-
-- **`verify` becomes load-bearing.** It is what catches a `sed` that did the
-  wrong thing, which strengthens the case for keeping it.
-- **An `edits[]` batch on `edit`** (already a deferred backlog item) would keep
-  multi-file mechanical changes on the guarded path. Worth more now than it was.
+So it stays for the same reason `write` and `edit` do: it carries guarantees
+shell has no equivalent for. Rarely needed is not the same as not worth having.
 
 ### Secret filtering moves to shell
 
@@ -540,8 +537,15 @@ the plan assumes the stated recommendation for the rest.
 - **Nothing is writable in jail** — not cwd, not `/tmp`.
 - **Mode name is `jail`**, replacing `strict`. Clean break, no alias.
 - **Tools removed** for every mode: `definition`, `references`, `rename`,
-  `copy`, `move`, `delete`, `git`, `watch`. `grep`/`find`/`tree`/`ls` become
-  jail-only.
+  `copy`, `move`, `delete`, `watch`. (There is no `git` tool to remove — it was
+  deleted before this work; see the tool-surface section.)
+  `grep`/`find`/`tree`/`ls` become **jail-only**, so the jail set is not a
+  subset of the normal one.
+- **The non-jail set** is `read`, `write`, `edit`, `replace`, `shell`, `todo`,
+  `verify` — plus `skill`, `memory`, `task*` and the web tools where scoped.
+  **`replace` is kept** despite low usage: it is the only multi-file
+  mechanical-edit path and `edit` has no batch form, so dropping it would push
+  mechanical refactors onto `sed -i`.
 - **Jail needs no OS backend** — nothing it can run spawns a subprocess, so the
   hard-failure requirement decided earlier is moot and jail works on every
   platform.
@@ -560,8 +564,8 @@ the plan assumes the stated recommendation for the rest.
 6. Drop the file-tool `.git` guard (`PROTECTED_METADATA_DIRS`)? — assumed
    **yes**; `shell` bypasses it anyway, and it refuses legitimate `git config` /
    `.git/info/exclude` edits.
-7. Does `verify` stay? — assumed **yes**, and now more strongly: with `replace`
-   gone, `verify` is what catches a `sed -i` that did the wrong thing.
+7. Does `verify` stay? — assumed **yes**. The verification ledger's only input,
+   and the thinnest survivor of the cut.
 
 ### To verify before building
 
