@@ -819,8 +819,6 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf8_lossy(&raw).into_owned()))
 }
 
-/// The UTF-16 column of byte offset `byte_col` within `line` (for building a
-
 /// The byte offset of UTF-16 column `utf16_col` within `line` (clamped to the
 /// line's end).
 fn utf16_to_byte_col(line: &str, utf16_col: u32) -> usize {

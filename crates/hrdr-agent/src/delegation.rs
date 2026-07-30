@@ -1525,36 +1525,6 @@ fn workspace_members(root: &std::path::Path) -> Option<Vec<String>> {
     (!out.is_empty()).then_some(out)
 }
 
-/// One sub-agent run found on disk under `subagents/<main-id>/`: the pair of a
-/// `<stem>.jsonl` crash-trail and its (optional) `<stem>.json` snapshot.
-struct DiskRun {
-    /// The `NNN-slug` file stem — the id `task_revive` / `task_output` address it by.
-    stem: String,
-    /// The run's label (its snapshot's session name, else the jsonl `Start` record).
-    label: String,
-    /// The run reached a terminal `End` record (`done` vs `running`/`orphaned`).
-    done: bool,
-}
-
-/// A sub-agent conversation resolved for `task_revive`: the messages, identity
-/// and working directory to hydrate a fresh agent from.
-/// Produced live-first (from a retained [`AgentEntry`]) or from disk
-/// ([`revive_target_from_disk`]).
-struct RevivedState {
-    messages: Vec<ChatMessage>,
-    /// The identity the run was on — re-resolved to its own endpoint/key on spawn
-    /// (it may be a different provider than the parent is on now).
-    reference: ModelRef,
-    /// The working dir the run was recorded in.
-    cwd: PathBuf,
-    /// The run's own tool scope: `true` for a read-only sub-agent, whose revived
-    /// registry must be pruned the same way its original one was.
-    read_only: bool,
-    usage: AgentUsage,
-    session_cost: f64,
-    label: String,
-}
-
 pub(crate) struct SteerTool {
     pub(crate) live: AgentRegistry,
 }

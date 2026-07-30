@@ -176,8 +176,6 @@ fn has_lookaround(pattern: &str) -> bool {
     })
 }
 
-/// The full `rg` argument list for these args (pattern and search path last).
-
 /// Compile `a.pattern` into a `Regex`, honoring `literal` (escape to a fixed
 /// string, e.g. for `foo(bar)`, `a.b`, `$var`) and `case_insensitive`.
 fn compile_pattern(a: &GrepArgs) -> Result<regex::Regex> {

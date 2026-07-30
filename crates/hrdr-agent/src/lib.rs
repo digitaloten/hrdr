@@ -100,7 +100,7 @@ mod delegation;
 pub(crate) use delegation::{
     BACKGROUND_REPORT_MAX_BYTES, ChildDirCell, REVIEW_PROMPT, SubagentSlots, apply_model_ref,
     apply_task_overrides, child_context_window, child_transcript_id, named_spec_ref,
-    open_next_subagent_transcript_from, resolve_child_dir,
+    resolve_child_dir,
 };
 pub(crate) use delegation::{
     BgHandles, SteerTool, SubagentTool, TaskCancelTool, bg_handles, subagent_base_config,
@@ -187,7 +187,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use futures_util::FutureExt;
 use futures_util::StreamExt;
 use hrdr_llm::{
@@ -10694,7 +10694,7 @@ mod tests {
                 "delivered result: {result}"
             );
 
-            let (path, events) = read_events(ts_dir.path());
+            let (_path, events) = read_events(ts_dir.path());
             assert!(
                 matches!(&events[0], transcript_log::Record::Start { prompt, .. } if prompt == "do the sub task"),
                 "first event is a background Start with the full prompt: {:?}",
@@ -10738,7 +10738,7 @@ mod tests {
                 "the failure is delivered as the result: {result}"
             );
 
-            let (path, events) = read_events(ts_dir.path());
+            let (_path, events) = read_events(ts_dir.path());
             assert!(
                 events
                     .iter()
