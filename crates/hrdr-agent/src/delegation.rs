@@ -507,9 +507,8 @@ fn spawn_background(
     };
     Ok(format!(
         "Started background task #{id} ({label}) — it runs concurrently in the background. \
-         You will be notified automatically, and its result will be delivered to you when it \
-         finishes; continue with your other work — do not poll or wait. If you have nothing to \
-         do until it finishes, tell the user in one line what it is doing and end your turn.{isolation}"
+         You will be woken automatically when it finishes; do not continue working until its \
+         result is reviewed. End your turn now.{isolation}"
     ))
 }
 
@@ -1046,9 +1045,10 @@ impl SubagentTool {
              implementation. The sub-agent has the normal tools (read/write/edit/bash/grep/…) \
              but can't itself delegate. Every task runs in the **background**: this call returns \
              immediately with a task id and the sub-agent's result is delivered to you \
-             automatically when it finishes — keep working, spawn more, or (if you can't proceed \
-             until it's done) tell the user in one line what it's doing and end your turn. Never \
-             poll or wait. Issue several `task` calls at once to run sub-agents in **parallel**. \
+             automatically when it finishes. After spawning, tell the user in one line what you \
+             delegated and end your turn — only continue working once the delegated work is \
+             finished and reviewed. Never poll or wait. Issue several `task` calls at once to \
+             run sub-agents in **parallel** (batch them before ending your turn). \
              Every sub-agent works in YOUR working directory: a write-capable one's edits land \
              in your tree as it makes them, so review them with `git diff` when it reports back \
              and commit them yourself. Give parallel write tasks DISJOINT sets of files — there \

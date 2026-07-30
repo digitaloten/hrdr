@@ -3521,8 +3521,8 @@ mod tests {
         );
         assert!(system.contains("never guess an id"));
         assert!(
-            system.contains("do not duplicate it yourself"),
-            "delegated work must not be repeated by the parent"
+            system.contains("end your turn"),
+            "delegated work must end the parent's turn"
         );
         assert!(
             system.contains("current: true"),
@@ -10860,20 +10860,19 @@ mod tests {
                 "returns immediately: {out}"
             );
             // The contract: the delegating agent sees (a) it started + runs
-            // concurrently, and (b) the result will be automatically
-            // notified/delivered — so it must continue working, not poll/wait.
+            // concurrently, and (b) it will be woken automatically — so it
+            // must end its turn now and not continue working.
             assert!(
                 out.contains("runs concurrently in the background"),
                 "contract (a): concurrent background execution: {out}"
             );
             assert!(
-                out.contains("You will be notified automatically")
-                    && out.contains("its result will be delivered to you"),
-                "contract (b): auto-notify/deliver: {out}"
+                out.contains("will be woken automatically"),
+                "contract (b): auto-wake: {out}"
             );
             assert!(
-                out.contains("do not poll or wait"),
-                "contract (b): do not poll/wait: {out}"
+                out.contains("End your turn now"),
+                "contract (b): end turn now: {out}"
             );
             // Nested/sub-agent delegation is structurally impossible: a
             // sub-agent's config sets `subagents = false` (no task tool), so a

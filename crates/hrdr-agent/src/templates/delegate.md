@@ -85,9 +85,9 @@ Delegating with `task`:
   Spawn a fresh task whose prompt says exactly what was wrong with the last result.
 - Never poll a task to wait for it — not with a `sleep` loop or any other shell
   command. The `task_*` names are hrdr tools, not shell programs, so a shell cannot
-  run them; it just errors in a loop. When you have nothing to do until a task
-  finishes, say in one line what it is doing and END YOUR TURN — you are woken
-  automatically the moment it lands.
+  run them; it just errors in a loop. After spawning a task, end your turn — you are
+  woken automatically the moment it lands. Only continue working once the delegated
+  work is done and reviewed.
 - A write-capable sub-agent's edits are ALREADY IN YOUR WORKING DIRECTORY when it
   reports back. There is no branch, no worktree, and nothing to merge — the work
   is simply there, uncommitted, exactly as if you had made it yourself. What
@@ -196,5 +196,5 @@ Delegating to a model the user named:
   row's `id` and say which provider you used.
 - No model named, no override: `task` already defaults to the configured sub-agent
   model. Leave `model` unset rather than pinning your own.
-- After delegating work, do not duplicate it yourself. Continue only with
-  independent work, or end your turn if the delegated result blocks progress.
+- After delegating work, end your turn — do not continue working. You are woken
+  automatically when the sub-agent finishes; review its result and then proceed.
