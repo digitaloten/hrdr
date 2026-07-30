@@ -781,6 +781,45 @@ whole is not.
 Anything else a project needs goes in `sandbox_writable_roots`, which already
 exists.
 
+### How Codex handles the same problem
+
+Worth recording, because our answer looks looser than theirs and the reason
+matters.
+
+**Codex has the identical restriction.** `WorkspaceWrite`
+(`protocol/src/permissions.rs:1660-1685`) grants project roots, `/tmp` unless
+excluded, `$TMPDIR` unless excluded, and the user's configured `writable_roots`
+— and there is **no package-cache grant anywhere in its codebase**.
+`cargo build` on an uncached dependency hits `~/.cargo/registry` read-only there
+too.
+
+Two things make it bite harder, not less: network is `Restricted` by default, so
+the fetch fails before the cache write does; and the designed answer is
+`require_escalated` / `with_additional_permissions` — the model asks, the user
+approves, and the command runs with that widening. The scoped variant exists for
+exactly this shape, granting one path for one command, intersected against what
+was requested.
+
+**So the two designs put the friction in different places.** Codex keeps a
+narrow default and pays a prompt per dependency fetch, which also means
+unattended runs are blocked (no listener, so the request is denied). This plan
+pays a wider default and no prompt, which works unattended. Ours is the reading
+consistent with "cautionary, not a requirement".
+
+**The risk we are accepting, stated.** Permanently-writable caches are a
+cross-project contamination vector: poison `~/.cargo/registry` or
+`~/.npm/_cacache` and builds in _other_ projects are affected, including ones
+the user later runs by hand. That escapes the project boundary durably, which is
+more than an agent confined to cwd can otherwise do.
+
+What blunts it enough to accept: both caches are **content-addressed and
+integrity-checked** — cargo verifies `.crate` files against the index checksum
+before extraction, npm's `_cacache` is keyed by integrity hash — so writing
+garbage there fails verification rather than executing. And an agent with
+`shell`, network and cwd write can already add a dependency whose `build.rs`
+does anything, so the grant is a different route to something already reachable,
+not a new capability.
+
 ## Deletions
 
 `readonly_subpaths`, `deny_git_writes`, `allow_git_writes`,
