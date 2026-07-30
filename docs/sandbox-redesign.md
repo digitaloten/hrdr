@@ -194,6 +194,83 @@ nothing.
 Still to verify: `proc.rs:331,381` spawns bash at two sites — confirm no
 jail-reachable tool reaches it.
 
+## Tool surface
+
+A separate decision from confinement, folded in here because the two interact:
+the jail tool set only makes sense alongside the non-jail one.
+
+**More tools is not more capability — it is more to choose between.** Good
+models are strong at shell, and a dedicated tool earns its place only when it
+carries a guarantee shell cannot: atomicity, a harness invariant, or a
+capability that has no shell equivalent.
+
+Usage across 139 stored transcripts (9350 tool calls) informed this but did
+**not** decide it. Frequency measures what was in front of the model, not what
+it needed — `grep` at 1860 calls proves availability, not necessity. The number
+that does carry weight is the reverse case: a tool that was available and still
+ignored. `references` 2, `definition` 0, `rename` 0, `copy` 0, `move` 0,
+`delete` 3, `watch` 4.
+
+### Removed
+
+| Tool                                 | Replaced by                                     |
+| ------------------------------------ | ----------------------------------------------- |
+| `definition`, `references`, `rename` | nothing — available and unused (2 calls / 9350) |
+| `copy`, `move`, `delete`             | `cp` / `mv` / `rm`, guardrail-checked           |
+| `git`                                | `git` via shell — see below                     |
+| `watch`                              | shell                                           |
+
+Dropping the **`git` tool loses no protection**: guardrails are enforced at the
+shell layer (`shell.rs:311` calls `check_guardrails` before anything runs), so
+blanket staging, force-push and hook-skipping stay blocked through shell.
+
+Deleting the nav tools deletes `lsp_nav.rs`. **`lsp.rs` must survive** —
+post-edit diagnostics use the same client, and that feature is valuable and well
+used. It simply is not a _tool_. Anyone deleting "the LSP code" wholesale would
+kill it silently.
+
+### Jail-only
+
+`grep`, `find`, `tree`, `ls` are removed from every other mode and kept **only**
+in jail, which has no shell and would otherwise be unable to search or orient.
+
+> **The jail tool set is not a subset of the normal one.** Jail holds four tools
+> no other mode gets. Without this written down, a later cleanup will "fix" the
+> inconsistency by putting `shell` into jail or deleting the search tools as
+> dead code. Both would be wrong.
+
+### Kept, and why shell is not enough
+
+- **`read`** — populates the read-state `edit` consults for the
+  read-before-mutate guard (`edit.rs:154`); via `cat` every edit would look
+  stale. It is also the whole of jail's read confinement, which is what makes
+  jail backend-free.
+- **`write` / `edit`** — atomic writes, post-edit hooks, LSP diagnostics,
+  secret-diff redaction, and a precise failure when an anchor does not match.
+  `sed -i` is none of those and silently no-ops on a bad pattern.
+- **`todo`**, **`verify`** — pure harness state, and the verification ledger's
+  only input. `verify` is the thinnest survivor.
+- **`replace`** — kept provisionally. 88 calls against `edit`'s 1331, and it
+  overlaps `edit`; the same atomicity argument applies, so it is not free to
+  drop. Next candidate if the surface needs trimming further.
+
+### Secret filtering moves to shell
+
+`grep` filters credential files out of its own output (`grep_line_is_secret`,
+`lib.rs:1222`); **`shell.rs` has no secret handling at all**. So removing `grep`
+from non-jail modes would let `rg -n "token" .` print `.env` into context.
+
+That is not the regression it looks like — it was never a boundary. `shell`
+already permits `cat ~/.ssh/id_rsa` today and guardrails do not stop it, so the
+filter was a courtesy on one path while the front door stood open. What remains
+is the **accidental** case: a broad search spilling secrets into context, and
+therefore to the model provider, with nobody intending it.
+
+So: **lift `grep_line_is_secret` onto the shell output path.** Existing tested
+code, applied where it covers every command rather than one tool. Removing
+`grep` then costs nothing and the protection ends up strictly wider than
+today's.
+
 ## Prompt surfaces
 
 **A jailed agent loads no instruction from the working tree.** Built-ins plus
@@ -417,6 +494,8 @@ Mostly-deletion first, so each slice is independently reviewable.
    opt-out, harness notes outside the envelope.
 7. **`sandbox` on agent profiles** + precedence + the audit agent and its
    persona template.
+8. **Tool surface.** Delete the unused tools, make `grep`/`find`/`tree`/`ls`
+   jail-only, and lift `grep_line_is_secret` onto the shell output path.
 
 ## Accepted losses
 
@@ -431,16 +510,49 @@ Mostly-deletion first, so each slice is independently reviewable.
 
 ## Open decisions
 
-Numbered as asked, so answers can be terse. The plan currently assumes the
-recommendation in each.
+Answers can be terse. **Settled** items are recorded so they are not reopened;
+the plan assumes the stated recommendation for the rest.
 
-1. Does `read` deny shell network? — assumed **yes**.
-2. Does `jail` keep `shell`/`verify`/LSP? — assumed **no**.
-3. Fold in per-session `tool_output_dir`? — assumed **yes** (prerequisite).
-4. Does `sandbox: jail` imply the read-only tool set? — assumed **yes**.
-5. Wrapping as a config knob as well as mode-driven? — assumed **yes**.
-6. Strict without bwrap → hard failure. — **answered yes.**
-7. Agent name: `prisoner` / `audit` / `quarantine`? — assumed `audit`.
-8. Startup notice describing what `jail` now implies? — assumed **yes**.
-9. Drop the file-tool `.git` guard (`PROTECTED_METADATA_DIRS`)? — assumed
-   **yes**.
+### Settled
+
+- **Jail's tool set** is fixed: `read`, `grep`, `find`, `tree`, `ls`. No
+  `shell`, `verify`, LSP, `web_fetch`/`web_search`, MCP, `task` or `memory`. A
+  profile cannot widen it.
+- **Nothing is writable in jail** — not cwd, not `/tmp`.
+- **Mode name is `jail`**, replacing `strict`. Clean break, no alias.
+- **Tools removed** for every mode: `definition`, `references`, `rename`,
+  `copy`, `move`, `delete`, `git`, `watch`. `grep`/`find`/`tree`/`ls` become
+  jail-only.
+- **Jail needs no OS backend** — nothing it can run spawns a subprocess, so the
+  hard-failure requirement decided earlier is moot and jail works on every
+  platform.
+
+### Still assumed
+
+1. Does `read` deny shell network? — assumed **yes** (otherwise `explore` and
+   `review` _gain_ a socket they do not have today).
+2. Fold in per-session `tool_output_dir`? — assumed **yes**; it is a
+   prerequisite, since jail would otherwise read other sessions' spooled output.
+3. Wrapping as a config knob as well as mode-driven? — assumed **yes**.
+4. Agent name — `jail` makes `prisoner` internally consistent, so the earlier
+   objection is weaker. Whatever it is called, the persona text should not lean
+   on punishment framing: that shapes behaviour without improving rigour.
+5. Startup notice describing what `jail` implies? — assumed **yes**.
+6. Drop the file-tool `.git` guard (`PROTECTED_METADATA_DIRS`)? — assumed
+   **yes**; `shell` bypasses it anyway, and it refuses legitimate `git config` /
+   `.git/info/exclude` edits.
+7. Is `replace` kept? — assumed **yes, provisionally**. 88 calls against
+   `edit`'s 1331, and it overlaps `edit`; the atomicity argument still applies,
+   so it is not free to drop.
+8. Does `verify` stay? — assumed **yes**. The verification ledger's only input,
+   and the thinnest survivor of the cut.
+
+### To verify before building
+
+- **`proc.rs:331,381`** spawns bash at two sites — confirm no jail-reachable
+  tool reaches it. If one does, it needs the same treatment as `grep`.
+- **The `Rg` grep backend may now be dead.** With `grep` jail-only and jail
+  forced to `Builtin`, nothing calls `Rg`. If so, delete it and the
+  PCRE2/lookaround support with it — which makes the earlier "keep `rg` outside
+  jail" reasoning moot, since there is no outside-jail `grep` left. Confirm
+  before writing code either way.
