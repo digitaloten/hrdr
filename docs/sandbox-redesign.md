@@ -713,37 +713,74 @@ well be correct — a remote frontend running arbitrary local commands is a
 different security question from a local terminal doing it — but it means the
 relief valve does not exist for web users, and they have no escalation either.
 
-## `write` mode must be able to fetch dependencies
+## `write` mode must be able to fetch dependencies — verified
 
-A gap escalation was band-aiding, and it has to be fixed in the same pass or
-removing escalation makes `write` mode worse than it is today.
+A gap escalation was band-aiding. It has to be fixed in the same pass, or
+removing escalation makes `write` mode worse than today. **Everything below was
+reproduced, not reasoned about**, by running the commands under a bwrap sandbox
+with the same roots `write` mode grants (`cwd`, `/tmp`, scratch, tool-output).
 
-Writable roots are `cwd`, `temp_dir`, scratch and tool-output
-(`sandbox.rs:199`). That excludes every package-manager cache:
+### `cargo build` — fails on any uncached dependency
 
-| Command                 | Writes to                           |
-| ----------------------- | ----------------------------------- |
-| `cargo build` (new dep) | `~/.cargo/registry`, `~/.cargo/git` |
-| `npm install`           | `~/.npm/_cacache`                   |
-| `pip install`           | `~/.cache/pip`                      |
-| `go build`              | `~/go/pkg/mod`                      |
+```
+error: failed to open `~/.cargo/registry/cache/index.crates.io-*/anyhow-1.0.75.crate`
+Caused by: Read-only file system (os error 30)
+```
 
-This is the **documented founding incident** of the EROFS note:
-`npx prettier --write` tried to fetch into `~/.npm/_cacache`, got EROFS, and the
-model concluded _"prettier is not available in this environment"_ and silently
-skipped formatting. The note's own advice — "run the copy already on PATH
-instead of downloading one" — is a workaround for a mode that cannot build a
-project with an uncached dependency.
+Note _where_ it fails: the download **succeeds** — network is fine — and it dies
+writing the crate into the cache. A build whose dependencies happen to be cached
+passes, which is why this is easy to miss: it works on a warm machine and fails
+on a cold one, or the first time a dependency is added.
 
-**So `write` mode's writable roots gain the toolchain caches.** Fetching your
-own dependencies is part of working on your own project, which is what "full
-authority over the project" has to mean if the mode is to be usable.
+Fix verified: binding `~/.cargo/registry` and `~/.cargo/git` writable makes the
+same build succeed.
 
-**One precision:** grant `~/.cargo/registry` and `~/.cargo/git`, **not
-`~/.cargo`**. The parent holds `config.toml`, which cargo reads back as build
-configuration, including directives that execute code. Same for
-`~/.npm/_cacache` over `~/.npm`. The caches are data; the parents are
-configuration. Anything else a project needs goes in `sandbox_writable_roots`.
+**Corrected assumption:** an earlier draft of this plan also demanded
+`~/.cargo/.package-cache`, reasoning by analogy with git taking
+`.git/packed-refs` unconditionally. That is **wrong** — cargo tolerates the lock
+file read-only, and the build completes without it. Two directories are enough.
+
+### `npm i` — fails, and needs two paths
+
+```
+npm error code EROFS
+npm error path /home/mxaddict/.npm/_cacache/tmp/0b23206c
+npm error rofs Invalid response body while trying to fetch https://registry.npmjs.org/ms
+npm error Log files were not written due to an error writing to the directory: ~/.npm/_logs
+```
+
+This is the **founding incident of `sandbox_denial_note`, reproduced live** —
+the same `npx prettier` shape that made a model report prettier as unavailable
+and skip formatting.
+
+`_cacache` alone is **not** enough: npm also needs `~/.npm/_logs`, and says so
+in the same failure. Fix verified: binding `~/.npm` writable makes `npm i`
+succeed.
+
+### The list, and why the shape differs per tool
+
+| Grant                                   | Why not the parent                                          |
+| --------------------------------------- | ----------------------------------------------------------- |
+| `~/.cargo/registry`, `~/.cargo/git`     | **narrow, deliberately** — see below                        |
+| `~/.npm` (whole)                        | holds only caches and logs; config is `~/.npmrc`, elsewhere |
+| `~/.cache` (pip, uv, yarn, go-build, …) | it is the XDG cache root; that is what it is for            |
+| `~/go/pkg/mod`                          | the module cache                                            |
+
+**`~/.cargo` must not be granted wholesale.** On this machine it holds `bin/`
+(the toolchain — writable means the agent can replace `cargo` itself),
+`config.toml` (build configuration, including directives that execute code),
+`.crates.toml`, and `credentials.toml` — which is a **symlink into
+`~/.secrets/`**. That last one also confirms why the roots check must
+canonicalise first: a write to `~/.cargo/credentials.toml` resolves into a
+secrets directory that no root mentions.
+
+`~/.npm` is the opposite case and it is worth stating so nobody "tidies" it into
+symmetry: it contains `_cacache`, `_logs`, `_npx`, `_prebuilds` and a timestamp
+file — no configuration at all. Granting it whole is safe; granting `~/.cargo`
+whole is not.
+
+Anything else a project needs goes in `sandbox_writable_roots`, which already
+exists.
 
 ## Deletions
 
