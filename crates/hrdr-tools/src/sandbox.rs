@@ -3,7 +3,8 @@
 //! Two layers share one vocabulary. [`SandboxPolicy`] is the resolved boundary
 //! — a mode plus concrete, canonicalized root sets — consulted by the
 //! in-process file tools (software guard) and, on Linux, handed to the OS for
-//! shell children (bwrap/Landlock). This module owns the vocabulary, the path
+//! shell children (Landlock on Linux, Seatbelt on macOS). This module owns the
+//! vocabulary, the path
 //! mechanics, and — via [`sandboxed_shell_command`] — the OS wrapper the
 //! `shell` and `watch` tools spawn through.
 //!
@@ -23,7 +24,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::{canonicalize_nearest, tool_output_dir};
 
 /// How much of the filesystem an agent may touch. Enforced by the OS for
-/// shell children (bwrap/Landlock/Seatbelt) and by a software path-guard for
+/// shell children (Landlock/Seatbelt) and by a software path-guard for
 /// the in-process file tools.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -114,14 +115,6 @@ pub struct SandboxPolicy {
     pub writable_roots: Vec<PathBuf>,
     /// Canonicalized readable roots; only consulted in `Read` mode.
     pub readable_roots: Vec<PathBuf>,
-    /// Whether this agent's shell children may reach the network. True for
-    /// every agent unless [`deny_network`](Self::deny_network) says otherwise —
-    /// which `Agent::new` says only for a delegated one.
-    ///
-    /// Purely about *shell children*: hrdr's own `web_fetch`/`web_search` run
-    /// in the parent process and are untouched by it, which is what makes the
-    /// denial affordable (see [`deny_network`](Self::deny_network)).
-    pub allow_network: bool,
     /// Which of [`writable_roots`](Self::writable_roots) are package-manager
     /// caches ([`package_cache_roots`]).
     ///
@@ -149,7 +142,6 @@ impl SandboxPolicy {
             mode: SandboxMode::None,
             writable_roots: Vec::new(),
             readable_roots: Vec::new(),
-            allow_network: true,
             cache_roots: Vec::new(),
         }
     }
@@ -202,7 +194,6 @@ impl SandboxPolicy {
             mode,
             writable_roots,
             readable_roots,
-            allow_network: true,
             cache_roots,
         }
     }
@@ -229,33 +220,6 @@ impl SandboxPolicy {
             ", plus this machine's package-manager caches (cargo, npm, pip, go, … \
              — so dependency fetches and builds work without asking)"
         }
-    }
-
-    /// Cut this agent's shell children off the network: no socket a command it
-    /// spawns opens can leave the machine.
-    ///
-    /// Installed for **sub-agents**, and the reason it costs them nothing is
-    /// that a delegated agent's legitimate network needs are already served by
-    /// tools that do not go through here. `web_fetch` and `web_search` run
-    /// in-process in the hrdr parent, whose sockets this never touches — so a
-    /// sub-agent that has to read a page or search still can. What is left is
-    /// raw network from a shell command: exfiltration surface with no matching
-    /// use, on an agent whose whole job is to change files in a directory it was
-    /// handed.
-    ///
-    /// The main agent keeps the network, deliberately: it is the one that runs
-    /// `git push`/`pull`/`fetch`, and those are exactly the network operations
-    /// the delegation model reserves to the parent — the same split
-    /// [`deny_git_writes`](Self::deny_git_writes) makes for history.
-    ///
-    /// Mode `None` is left alone for the same reason it is there: no OS wrapper
-    /// runs at all, so a policy claiming no network would be describing a
-    /// boundary nothing enforces.
-    pub fn deny_network(&mut self) {
-        if self.mode == SandboxMode::None {
-            return;
-        }
-        self.allow_network = false;
     }
 
     /// Err unless `canon` (already run through [`canonicalize_nearest`]) is under
@@ -507,8 +471,9 @@ fn git_metadata_roots(cwd: &Path) -> Vec<PathBuf> {
     }
     let refs = common.join("refs").join("heads").join("hrdr");
     let logs = common.join("logs").join("refs").join("heads").join("hrdr");
-    // They must exist to be bind-mounted (bwrap) and to canonicalize to
-    // themselves; git creates them lazily on the first task branch.
+    // They must exist to be granted (a Landlock rule is added by opening the
+    // path) and to canonicalize to themselves; git creates them lazily on the
+    // first task branch.
     let _ = std::fs::create_dir_all(&refs);
     let _ = std::fs::create_dir_all(&logs);
     vec![gitdir, common.join("objects"), refs, logs]
@@ -815,30 +780,13 @@ impl SandboxNotices {
 }
 
 /// Emitted when a confined agent's shell command runs without any OS-level
-/// confinement — no bwrap and no Landlock, a macOS whose
+/// confinement — a Linux kernel without Landlock, a macOS whose
 /// `/usr/bin/sandbox-exec` is gone, or Windows.
 /// Never silently pretend to sandbox: the file tools stay guarded, the shell
 /// does not.
 const NO_OS_SANDBOX_NOTICE: &str = "sandbox: no OS-level sandbox is available on this system — \
      shell commands are NOT OS-confined; the file tools remain guarded. Use --sandbox none to \
      silence this.";
-
-/// Emitted when `bwrap(1)` is not installed and Landlock catches the fall.
-///
-/// Linux-only, like the two notices below it: nothing off Linux can fall back
-/// to Landlock, and an unused const is a `-D warnings` failure on the other CI
-/// runners.
-#[cfg(target_os = "linux")]
-const BWRAP_MISSING_NOTICE: &str = "sandbox: bwrap not found — falling back to Landlock: writes \
-     are still confined, but reads are not, and strict-mode agents degrade to write-only \
-     confinement for shell commands. Install bubblewrap for full confinement.";
-
-/// Emitted when bwrap is installed but the kernel/distro forbids unprivileged
-/// user namespaces, so it cannot build a mount namespace.
-#[cfg(target_os = "linux")]
-const USERNS_DISABLED_NOTICE: &str = "sandbox: unprivileged user namespaces are disabled on this \
-     system — falling back to Landlock: writes are still confined, but reads are not, and \
-     strict-mode agents degrade to write-only confinement for shell commands.";
 
 /// Emitted in addition to the fallback notice when a **strict-mode** agent runs
 /// a shell command on Landlock: the ruleset confines writes only, so this agent
@@ -853,154 +801,50 @@ const STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE: &str = "sandbox: Landlock cannot co
      strict-mode agent's shell commands are write-confined only, so paths outside its readable \
      roots remain readable.";
 
-/// Emitted when an agent whose policy denies the network runs a shell command on
-/// Landlock: the ruleset denies TCP `bind`/`connect` and nothing else, so UDP —
-/// DNS and QUIC/HTTP3 with it — raw sockets and ICMP still leave the machine.
-///
-/// bwrap's `--unshare-net` has no such hole, which is why this is a *degradation*
-/// notice and not a description of the feature. Said out loud on the same
-/// principle as the notice above: a boundary that is quietly narrower than it
-/// claims is worse than one whose limits are stated.
-#[cfg(target_os = "linux")]
-const NETWORK_PARTIAL_UNDER_LANDLOCK_NOTICE: &str = "sandbox: Landlock can deny only TCP \
-     bind/connect — this agent's shell commands are cut off from HTTP(S), git and ssh, but UDP \
-     (DNS, QUIC/HTTP3) and raw sockets are not blocked on this backend. Install bubblewrap for a \
-     complete network denial.";
-
 /// The OS mechanism available to confine *shell children* on this machine.
 ///
 /// The file tools are guarded in-process regardless; this is only about the
-/// subprocesses `shell` and `watch` spawn, which the software guard cannot see
-/// inside of. On Linux bwrap is primary because it is the only mechanism there
-/// that can confine reads as well as writes; on macOS there is one option.
+/// subprocesses `shell` spawns, which the software guard cannot see inside of.
+/// One mechanism per platform: Landlock on Linux, Seatbelt on macOS, nothing
+/// anywhere else.
+///
+/// **bwrap used to be primary on Linux and is deleted.** It had exactly two
+/// capabilities Landlock lacks — mount-based read confinement, and a complete
+/// network denial via `--unshare-net` — and both are gone: no mode confines the
+/// network any more, and read confinement is enforced in-process by
+/// [`SandboxPolicy::check_read`] for the one mode that wants it. What bwrap
+/// brought in exchange was a mandatory user namespace, and that namespace *was*
+/// the ssh failure class this module spent an escalation ladder working around
+/// (`/etc/ssh/ssh_config` reading as uid 65534, so every `git push` over ssh
+/// died). Deleting the mechanism deleted the bug.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OsSandboxBackend {
-    /// `bwrap(1)` — a mount namespace built per command (§3.6.1).
-    Bwrap,
     /// Landlock LSM rules the child applies to itself. Writes only.
     Landlock,
-    /// macOS `sandbox-exec(1)` with a generated SBPL profile (§3.7).
+    /// macOS `sandbox-exec(1)` with a generated SBPL profile.
     Seatbelt,
     /// Nothing available: the shell runs unconfined and says so.
     None,
 }
 
-/// What backend detection concluded: the mechanism to use, plus the §5 notice
-/// owed to the user when that mechanism is a step down from bwrap.
-///
-/// The notice is *stored* here rather than emitted during detection, because
-/// detection is lazy and global while the notice is about a specific confined
-/// command: a session that runs unsandboxed (`--sandbox none`) must never be
-/// told its sandbox degraded.
-#[derive(Clone, Copy, Debug)]
-struct Detection {
-    backend: OsSandboxBackend,
-    /// `None` when the primary backend was available and nothing was lost.
-    ///
-    /// Only the Linux Landlock arm consumes it — a step *down* is a Linux-only
-    /// concept, since macOS either has Seatbelt or has nothing — so off Linux
-    /// it is written and never read, and `-D warnings` on the macOS/Windows CI
-    /// runners would otherwise fail the build.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    degraded: Option<&'static str>,
-}
-
-/// The detection result for this process, probed once and cached — the probe
-/// spawns a process, and a shell tool call must not pay for that every time.
-fn detection() -> Detection {
-    static DETECTION: OnceLock<Detection> = OnceLock::new();
-    *DETECTION.get_or_init(detect_backend_uncached)
-}
-
-/// The backend this process uses (§3.5).
+/// The backend this process uses, resolved once and cached.
 pub fn detect_backend() -> OsSandboxBackend {
-    detection().backend
+    static BACKEND: OnceLock<OsSandboxBackend> = OnceLock::new();
+    *BACKEND.get_or_init(detect_backend_uncached)
 }
 
-/// Linux: bwrap if it exists *and* unprivileged user namespaces are usable
-/// (a kernel/distro switch — the binary being installed proves nothing), else
-/// Landlock if the LSM is enabled, else nothing.
-#[cfg(target_os = "linux")]
-fn detect_backend_uncached() -> Detection {
-    match which::which("bwrap") {
-        Ok(bwrap) if userns_probe_succeeds(&bwrap) => Detection {
-            backend: OsSandboxBackend::Bwrap,
-            degraded: None,
-        },
-        Ok(_) => without_bwrap(USERNS_DISABLED_NOTICE),
-        Err(_) => without_bwrap(BWRAP_MISSING_NOTICE),
-    }
-}
-
-/// Run the smallest possible sandbox and see whether the kernel allows it.
-/// Mirrors Codex's `SYSTEM_BWRAP_PROBE_TIMEOUT` / `_POLL_INTERVAL` loop: spawn
-/// with null stdio, poll, kill on the deadline. A hung probe must not hang the
-/// session, so a timeout counts as failure.
-#[cfg(target_os = "linux")]
-fn userns_probe_succeeds(bwrap: &Path) -> bool {
-    use std::process::Stdio;
-    use std::time::{Duration, Instant};
-
-    const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
-    const PROBE_POLL: Duration = Duration::from_millis(50);
-
-    let Ok(mut child) = std::process::Command::new(bwrap)
-        .args([
-            "--unshare-user",
-            "--unshare-pid",
-            "--ro-bind",
-            "/",
-            "/",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--",
-            "/bin/true",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-    let deadline = Instant::now() + PROBE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) => {}
-            Err(_) => return false,
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return false;
-        }
-        std::thread::sleep(PROBE_POLL);
-    }
-}
-
-/// Step 3 of §3.5: bwrap is unusable, so Landlock if the kernel has the LSM
-/// enabled (the list of active LSMs is the authoritative answer), else
-/// nothing.
+/// Linux: Landlock if the LSM is enabled, else nothing.
 ///
-/// `why` explains the bwrap failure, and both of its spellings promise a
-/// Landlock fallback — so it is only the right thing to say when Landlock
-/// actually catches the fall. With no backend at all, the blunter "not
-/// confined" notice supersedes it.
+/// Kernel 5.13+ (July 2021). Below that the shell runs unconfined with a notice,
+/// the same posture Windows has — Debian 12 ships 6.1 and RHEL 9 ships 5.14, so
+/// the band is narrow, but it is a real regression for anyone on an older kernel
+/// who used to have bwrap and the notice must say so plainly.
 #[cfg(target_os = "linux")]
-fn without_bwrap(why: &'static str) -> Detection {
+fn detect_backend_uncached() -> OsSandboxBackend {
     if landlock_available() {
-        Detection {
-            backend: OsSandboxBackend::Landlock,
-            degraded: Some(why),
-        }
+        OsSandboxBackend::Landlock
     } else {
-        Detection {
-            backend: OsSandboxBackend::None,
-            degraded: Some(NO_OS_SANDBOX_NOTICE),
-        }
+        OsSandboxBackend::None
     }
 }
 
@@ -1014,40 +858,28 @@ fn landlock_available() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn detect_backend_uncached() -> Detection {
+fn detect_backend_uncached() -> OsSandboxBackend {
     if Path::new(SEATBELT_PROGRAM).exists() {
-        Detection {
-            backend: OsSandboxBackend::Seatbelt,
-            degraded: None,
-        }
+        OsSandboxBackend::Seatbelt
     } else {
-        Detection {
-            backend: OsSandboxBackend::None,
-            degraded: Some(NO_OS_SANDBOX_NOTICE),
-        }
+        OsSandboxBackend::None
     }
 }
 
 /// Every other platform: nothing. Windows stays software-layer-only in v1.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn detect_backend_uncached() -> Detection {
-    Detection {
-        backend: OsSandboxBackend::None,
-        degraded: Some(NO_OS_SANDBOX_NOTICE),
-    }
+fn detect_backend_uncached() -> OsSandboxBackend {
+    OsSandboxBackend::None
 }
 
 /// The GPU/compute device nodes present on this host, for the sandbox to bind
 /// through.
 ///
-/// `bwrap --dev /dev` mounts a *fresh, minimal* devtmpfs — `null`, `zero`,
-/// `random`, `tty` and little else — so every accelerator on the machine
-/// disappears inside the sandbox no matter how permissive the mode is. That is
-/// not a policy anyone chose: `Write` and `Read` both mount all of `/` and are
-/// meant to leave the host as visible as it really is. Without this a ROCm build
-/// fails on `/dev/kfd`, a CUDA one on `/dev/nvidiactl`, and the error names a
-/// missing device rather than a sandbox — which reads as "this machine has no
-/// GPU" and sends the agent off to work around a problem it does not have.
+/// A GPU node is opened **read-write** to submit work at all, so a ruleset that
+/// grants only read access leaves the card unusable — and the failure names a
+/// missing device rather than a sandbox, which reads as "this machine has no GPU"
+/// and sends the agent off to work around a problem it does not have. A ROCm
+/// build dies on `/dev/kfd`, a CUDA one on `/dev/nvidiactl`.
 ///
 /// Matched by name rather than a fixed list because the numbered nodes
 /// (`nvidia0`, `nvidia1`, …) depend on how many cards are installed. Read live:
@@ -1088,10 +920,6 @@ pub(crate) fn gpu_device_nodes() -> Vec<std::path::PathBuf> {
 pub enum DenialKind {
     /// A GPU node missing under `strict`.
     GpuStrict,
-    /// ssh refusing a config file the user namespace made look root-less.
-    SshUserNamespace,
-    /// A shell cut off the network (`deny_network`).
-    NetworkDenied,
     /// An ordinary EROFS: a write outside this agent's roots.
     WriteOutsideRoots,
 }
@@ -1162,60 +990,6 @@ pub fn sandbox_denial(policy: &SandboxPolicy, output: &str) -> Option<SandboxDen
                 .to_string(),
         );
     }
-    // OpenSSH refusing a config file it cannot vouch for. Not a permissions
-    // problem on disk, and the obvious "fix" — chmod'ing a system file — is a
-    // real change made for a false reason, so say what is actually happening.
-    if lower.contains("bad owner or permissions") {
-        return denial(
-            DenialKind::SshUserNamespace,
-            "\n\n[sandbox] that is the OS sandbox's user namespace, not a broken file. It maps \
-             only your uid, so root-owned files (like `/etc/ssh/ssh_config`) read as `nobody` \
-             inside here, and ssh refuses any config file it cannot vouch for. The file on disk \
-             is fine — do NOT chmod or chown it. `git` over ssh already works (hrdr points it at \
-             `ssh -F`, which skips the system config); for a bare `ssh`, pass `-F ~/.ssh/config` \
-             (or `-F /dev/null`) yourself."
-                .to_string(),
-        );
-    }
-    // A shell cut off the network (a sub-agent — see `deny_network`). Nothing in
-    // the failure says "sandbox": the child sits in an empty network namespace,
-    // so the resolver times out or the connect finds no route, and curl, git,
-    // cargo, npm and pip all report that as a name it could not resolve or an
-    // unreachable network. That is what a machine with a dead link looks like,
-    // and a model that believes it starts debugging DNS or declaring the host
-    // offline in its report.
-    //
-    // Narrow on purpose, like the EROFS case below: only failures that name
-    // resolution or routing produce, never a bare "connection refused" or
-    // "permission denied" — those are ordinary errors on a working machine
-    // (a service that is not up yet, a file that is not yours) and a note
-    // asserting the sandbox over them would be wrong far more often than right.
-    if !policy.allow_network
-        && [
-            "could not resolve host",
-            "could not resolve proxy",
-            "temporary failure in name resolution",
-            "name or service not known",
-            "nodename nor servname provided",
-            "network is unreachable",
-            "no route to host",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
-    {
-        return denial(
-            DenialKind::NetworkDenied,
-            "\n\n[sandbox] that is this agent's network being denied, not a broken resolver or an \
-             offline machine — a delegated agent's shell commands have no network at all, \
-             deliberately. Do NOT retry it, edit `/etc/resolv.conf`, or report the host as \
-             offline. What still works: `web_fetch` to read a URL and `web_search` to search, \
-             both of which run outside this sandbox and are the right way to reach the network \
-             from here. Anything genuinely needing a network shell command — cloning a repo, \
-             installing a dependency, pushing — belongs to the agent that delegated to you: say \
-             so in your report and let it run."
-                .to_string(),
-        );
-    }
     if !lower.contains("read-only file system") && !lower.contains("erofs") {
         return None;
     }
@@ -1249,34 +1023,32 @@ pub fn sandbox_denial(policy: &SandboxPolicy, output: &str) -> Option<SandboxDen
 /// [`crate::Shell::command`] returns today, so the unsandboxed path is
 /// byte-identical to the pre-sandbox behavior.
 ///
-/// The caller still owns cwd, stdio, timeouts and process groups: bwrap
-/// inherits the cwd, passes stdio through untouched, propagates the child's
-/// exit status, and `--die-with-parent` plus the pid-namespace init mean the
-/// existing group-kill still reaches every descendant.
+/// The caller still owns cwd, stdio, timeouts and process groups: every backend
+/// left inherits the cwd, passes stdio through untouched, propagates the child's
+/// exit status, and the existing group-kill still reaches every descendant.
 ///
-/// `cwd` is passed explicitly (rather than read off the policy) because the
-/// policy holds *roots*, and the roots of a write agent include several
-/// directories that are not where the command should start. `notices` is the
-/// **calling agent's** channel ([`crate::ToolContext::sandbox_notices`]): every
-/// degradation this discovers is owed to that agent and to no other.
+/// The caller keeps owning cwd — every backend left inherits the process's, so
+/// there is nothing for this to pass down (bwrap needed a `--chdir` and is gone).
+/// `notices` is the **calling agent's** channel
+/// ([`crate::ToolContext::sandbox_notices`]): every degradation this discovers is
+/// owed to that agent and to no other.
 pub fn sandboxed_shell_command(
     shell: crate::Shell,
     cmd_str: &str,
     policy: &SandboxPolicy,
-    cwd: &Path,
     notices: &SandboxNotices,
 ) -> tokio::process::Command {
     if policy.mode == SandboxMode::None {
         return shell.command(cmd_str);
     }
-    shell_command_with_backend(detect_backend(), shell, cmd_str, policy, cwd, notices)
+    shell_command_with_backend(detect_backend(), shell, cmd_str, policy, notices)
 }
 
 /// [`sandboxed_shell_command`] with the backend chosen for it.
 ///
-/// Split out so the fallback arms are reachable on a machine whose detection
-/// would never pick them: on a host with a working bwrap, Landlock is dead
-/// code that no test could otherwise execute.
+/// Split out so an arm is reachable on a machine whose detection would never pick
+/// it — the Seatbelt arm on Linux, the Landlock arm on a kernel without the LSM —
+/// which is otherwise code no test could execute.
 ///
 /// Every arm that ends up running a command with less confinement than the
 /// mode asks for sets its §5 notice *first* — the one rule this layer may
@@ -1294,37 +1066,16 @@ fn shell_command_with_backend(
     shell: crate::Shell,
     cmd_str: &str,
     policy: &SandboxPolicy,
-    cwd: &Path,
     notices: &SandboxNotices,
 ) -> tokio::process::Command {
     match backend {
-        OsSandboxBackend::Bwrap => {
-            let mut cmd = tokio::process::Command::new("bwrap");
-            cmd.args(bwrap_args(policy.mode, policy, cwd, shell, cmd_str));
-            if let Some(ssh) = git_ssh_command_for_userns() {
-                cmd.env("GIT_SSH_COMMAND", ssh);
-            }
-            cmd
-        }
         #[cfg(target_os = "linux")]
         OsSandboxBackend::Landlock => {
-            // Why we are down here rather than on bwrap (§3.5 defers this to
-            // the first command that actually needs a backend).
-            if let Some(why) = detection().degraded {
-                notices.set(why.to_string());
-            }
             // Landlock has no read axis. `Read` does not need one (no writable
             // roots IS the whole mode), but `Strict` does — so only it gets the
             // explicit admission of the gap.
             if policy.mode == SandboxMode::Strict {
                 notices.set(STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE.to_string());
-            }
-            // Same admission for the other axis this backend cannot fully carry:
-            // the ruleset reaches TCP and stops there (see
-            // `install_landlock_rules`), so a denial that is absolute under bwrap
-            // is partial here.
-            if !policy.allow_network {
-                notices.set(NETWORK_PARTIAL_UNDER_LANDLOCK_NOTICE.to_string());
             }
             landlock_command(shell, cmd_str, policy)
         }
@@ -1359,10 +1110,12 @@ fn shell_command_with_backend(
 /// unsandboxed, but the child confines *itself* between fork and exec, so the
 /// ruleset covers the shell and every descendant it goes on to spawn.
 ///
-/// Weaker than bwrap in two ways, both decided and both noticed: reads are
-/// unrestricted (Landlock's read axis cannot express "everything except…"
-/// without enumerating the filesystem), and a blocked write surfaces as
-/// EACCES rather than a read-only mount.
+/// One limit, decided and noticed: reads are unrestricted, because Landlock's
+/// read axis cannot express "everything except…" without enumerating the
+/// filesystem. That costs `Read` nothing (no writable roots IS the whole mode)
+/// and costs `Strict` its read confinement for shell children, which
+/// [`STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE`] admits. A blocked write surfaces as
+/// EACCES rather than EROFS.
 ///
 /// In `Read` mode the policy's writable roots are empty, which is exactly
 /// right here: the child may then write nowhere at all but `/dev/null`.
@@ -1382,13 +1135,12 @@ fn landlock_command(
         .filter(|root| root.exists())
         .cloned()
         .collect();
-    let allow_network = policy.allow_network;
     // SAFETY: the closure runs in the forked child before `exec`. It issues
     // landlock/prctl syscalls and builds the ruleset from data moved in
     // beforehand; it shares no lock, handle, or global with the parent, and it
     // never spawns a thread.
     unsafe {
-        cmd.pre_exec(move || install_landlock_rules(&writable, allow_network));
+        cmd.pre_exec(move || install_landlock_rules(&writable));
     }
     cmd
 }
@@ -1401,40 +1153,27 @@ fn landlock_command(
 /// subset of ABI v5 it understands — but a kernel that enforces *nothing*
 /// fails the spawn rather than running the command unconfined.
 ///
-/// `allow_network` false handles [`landlock::AccessNet`] and grants no
-/// [`landlock::NetPort`] rule, which is how a Landlock ruleset says "none": ABI
-/// v4 added exactly two network rights, TCP `bind` and TCP `connect`, and v5
-/// adds none. That covers the traffic anyone actually leaves with — HTTP(S),
-/// git, ssh, every package registry — but it is **not** the whole network, and
-/// the gap is admitted rather than papered over: UDP (so DNS, and QUIC/HTTP3),
-/// raw and ICMP sockets, and anything already-connected are outside what
-/// Landlock can express, so this backend confines the network less than bwrap's
-/// `--unshare-net` does. [`NETWORK_PARTIAL_UNDER_LANDLOCK_NOTICE`] tells the
-/// agent so.
+/// **No network handling at all**, deliberately: the sandbox confines the
+/// filesystem and nothing else. `AccessNet` reached only TCP `bind`/`connect`
+/// (ABI v4 added exactly two network rights and v5 adds none), so UDP — DNS and
+/// QUIC/HTTP3 with it — raw sockets and anything already connected were outside
+/// what it could express. A boundary that partial was a vestigial field rather
+/// than a feature; if network confinement returns it needs a real threat model.
 #[cfg(target_os = "linux")]
-fn install_landlock_rules(writable_roots: &[PathBuf], allow_network: bool) -> std::io::Result<()> {
+fn install_landlock_rules(writable_roots: &[PathBuf]) -> std::io::Result<()> {
     use landlock::{
-        ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
+        ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreatedAttr,
+        RulesetStatus, path_beneath_rules,
     };
 
     let abi = ABI::V5;
     let access_rw = AccessFs::from_all(abi);
     let access_ro = AccessFs::from_read(abi);
 
-    let mut base = Ruleset::default()
+    let base = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(access_rw)
         .map_err(std::io::Error::other)?;
-    // Handled but never granted to any port: a right the ruleset handles and no
-    // rule allows is denied outright. Only when the network is denied — handling
-    // the right and then allowing every port would be the same permission at
-    // twice the cost, and on a pre-6.7 kernel `BestEffort` would drop it anyway.
-    if !allow_network {
-        base = base
-            .handle_access(AccessNet::from_all(abi))
-            .map_err(std::io::Error::other)?;
-    }
 
     let mut ruleset = base
         .create()
@@ -1443,10 +1182,9 @@ fn install_landlock_rules(writable_roots: &[PathBuf], allow_network: bool) -> st
         .map_err(std::io::Error::other)?
         .add_rules(path_beneath_rules(["/dev/null"], access_rw))
         .map_err(std::io::Error::other)?
-        // Same reasoning as the bwrap `--dev-bind` above, for the fallback
-        // backend: a GPU node is opened read-write to submit work at all, so
-        // read access alone leaves it unusable. Landlock has no `/dev` remount
-        // to undo — the nodes are visible — but the ruleset would deny the open.
+        // A GPU node is opened read-write to submit work at all, so read access
+        // alone leaves it unusable: the nodes are visible, but the ruleset would
+        // otherwise deny the open. See `gpu_device_nodes`.
         .add_rules(path_beneath_rules(gpu_device_nodes(), access_rw))
         .map_err(std::io::Error::other)?
         // Codex calls this `set_no_new_privs`, deprecated since its pin.
@@ -1465,188 +1203,6 @@ fn install_landlock_rules(writable_roots: &[PathBuf], allow_network: bool) -> st
     Ok(())
 }
 
-/// `GIT_SSH_COMMAND` that survives bwrap's user namespace, or `None` when the
-/// caller already set one.
-///
-/// **The problem.** Unprivileged bwrap has to create a user namespace, and one
-/// maps only the invoking uid — so every root-owned file inside it reads as uid
-/// 65534 (`nobody`). OpenSSH validates its config files' ownership:
-///
-/// ```c
-/// if (((sb.st_uid != 0 && sb.st_uid != getuid()) || (sb.st_mode & 022) != 0))
-///     fatal("Bad owner or permissions on %s", filename);
-/// ```
-///
-/// 65534 is neither, so `/etc/ssh/ssh_config` (and anything it `Include`s) is
-/// refused and ssh dies before connecting. Nothing is wrong on disk: the file is
-/// `root:root 0644` and reads correctly outside the sandbox. The effect is that
-/// **every `git push`/`fetch`/`clone` over ssh fails inside the sandbox**, with
-/// an error that points at a system file and invites the user to `chmod` it —
-/// which would not help and is a real permissions change made for a false
-/// reason. This is not fixable by dropping `--unshare-user` (bwrap creates the
-/// namespace regardless when unprivileged) or by mapping root (that needs a
-/// privileged helper).
-///
-/// **The fix.** `ssh -F <file>` makes ssh ignore the system-wide config
-/// entirely, per ssh(1) — so the unreadable-looking files are never opened. The
-/// user's own `~/.ssh/config` is owned by the invoking uid, which maps to itself,
-/// so it still passes the check and their Host aliases and identities survive.
-/// Without one, `/dev/null` gives ssh its compiled-in defaults.
-///
-/// Not set when the caller already exported `GIT_SSH_COMMAND`: an explicit
-/// setting is a decision, and silently rewriting it would be worse than the bug.
-/// Only `git` is covered — a bare `ssh` in a shell command still hits this, which
-/// is what [`sandbox_denial_note`] explains when it does.
-fn git_ssh_command_for_userns() -> Option<std::ffi::OsString> {
-    if std::env::var_os("GIT_SSH_COMMAND").is_some_and(|v| !v.is_empty()) {
-        return None;
-    }
-    let user_config = std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".ssh").join("config"))
-        .filter(|p| p.is_file());
-    let path = match &user_config {
-        Some(p) => p.to_string_lossy().into_owned(),
-        None => "/dev/null".to_string(),
-    };
-    // Quoted: git splits this value with shell rules, so a `$HOME` containing a
-    // space would otherwise arrive as two arguments.
-    Some(format!("ssh -F {}", shell_words::quote(&path)).into())
-}
-
-/// The full bwrap argv (everything after `argv[0]`) for `mode`.
-///
-/// **Argument order is semantics**: bwrap applies mounts in argv order and a
-/// later mount shadows an earlier one. In `Write` mode the read-only root must
-/// come first so the writable binds layer on top of it; in `Read` mode the
-/// private `/tmp` must come *before* the cwd/scratch/tool-output binds, since
-/// those can live under `/tmp` and a tmpfs mounted after them hides them (a
-/// cwd under `/tmp` then makes even `--chdir` fail). The environment is
-/// inherited whole (no `--clearenv`): PATH/HOME/CARGO_HOME must survive.
-fn bwrap_args(
-    mode: SandboxMode,
-    policy: &SandboxPolicy,
-    cwd: &Path,
-    shell: crate::Shell,
-    cmd_str: &str,
-) -> Vec<std::ffi::OsString> {
-    /// `flags` verbatim.
-    fn push(args: &mut Vec<std::ffi::OsString>, flags: &[&str]) {
-        args.extend(flags.iter().map(std::ffi::OsString::from));
-    }
-    /// `<flag> <path> <path>` — every bwrap mount is source-then-destination,
-    /// and every mount here keeps the path it already has.
-    fn bind(args: &mut Vec<std::ffi::OsString>, flag: &str, path: &Path) {
-        args.push(flag.into());
-        args.push(path.into());
-        args.push(path.into());
-    }
-
-    let mut args: Vec<std::ffi::OsString> = Vec::new();
-    push(&mut args, &["--new-session", "--die-with-parent"]);
-    match mode {
-        SandboxMode::Write | SandboxMode::Read => {
-            // Everything readable, nothing writable…
-            push(
-                &mut args,
-                &["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"],
-            );
-            // The accelerators `--dev` just hid, put back. `--dev-bind` rather
-            // than `--ro-bind`: these are opened read-write even to submit work,
-            // so a read-only bind is the same as not having them. This is not a
-            // writable *root* — no file of the user's is reachable through a
-            // GPU character device — so it stands in `Read` mode too, which
-            // otherwise has no `--bind` at all.
-            for dev in gpu_device_nodes() {
-                bind(&mut args, "--dev-bind", &dev);
-            }
-            // …then punch the writable roots through, in policy order. `Read`
-            // has none — that is exactly what makes it read-only — so the loop
-            // is a no-op there and the whole filesystem stays read-only. Same
-            // shape Codex gives its `read-only` mode.
-            for root in policy.writable_roots.iter().filter(|root| root.exists()) {
-                bind(&mut args, "--bind", root);
-            }
-        }
-        SandboxMode::Strict => {
-            // Only the system dirs an interpreter/compiler needs exist at
-            // all; `/home`, `/opt`, `/var`, … are simply absent, so reads
-            // there fail with ENOENT — stronger than EROFS.
-            for system in ["/usr", "/etc"] {
-                let path = Path::new(system);
-                if path.is_dir() {
-                    bind(&mut args, "--ro-bind", path);
-                }
-            }
-            args.extend(usr_merge_compat_args());
-            push(&mut args, &["--tmpfs", "/tmp"]);
-            for root in policy.readable_roots.iter().filter(|root| root.exists()) {
-                bind(&mut args, "--ro-bind", root);
-            }
-            push(&mut args, &["--dev", "/dev", "--proc", "/proc"]);
-        }
-        // Unreachable: `sandboxed_shell_command` returns before it gets here.
-        SandboxMode::None => {}
-    }
-    push(&mut args, &["--unshare-user", "--unshare-pid"]);
-    // The namespace flags are the one place argv order carries no meaning —
-    // bwrap unshares everything it was asked for in one go, before it lays down
-    // a single mount — so this belongs with its siblings rather than woven into
-    // the mount sequence above. `--unshare-net` leaves the child a fresh network
-    // namespace with nothing but its own loopback: no route off the machine, and
-    // no reach into a service listening on the host's loopback either.
-    if !policy.allow_network {
-        push(&mut args, &["--unshare-net"]);
-    }
-    args.push("--chdir".into());
-    // Canonicalized so the child lands in the directory that was actually
-    // bound, even when the inherited cwd reaches it through a symlink alias.
-    args.push(canonicalize_nearest(cwd).into());
-    args.push("--".into());
-    args.push(shell.program().into());
-    args.extend(shell.invoke_args().iter().map(std::ffi::OsString::from));
-    args.push(cmd_str.into());
-    args
-}
-
-/// `/bin`, `/sbin`, `/lib`, `/lib64` for the Read-mode mount set.
-///
-/// On a usr-merged distro these are symlinks into `/usr`, and bind-mounting a
-/// symlink source manufactures a real directory at the target — which breaks
-/// the merge and hides the real binaries. So: recreate the symlink with
-/// `--symlink`, reading its **actual** target rather than guessing
-/// `usr/<basename>` (on Arch `/sbin → usr/bin` and `/lib64 → usr/lib`, neither
-/// of which the guess produces). A real directory is bound read-only; an
-/// absent path contributes nothing.
-fn usr_merge_compat_args() -> Vec<std::ffi::OsString> {
-    let mut args: Vec<std::ffi::OsString> = Vec::new();
-    for compat in ["/bin", "/sbin", "/lib", "/lib64"] {
-        let path = Path::new(compat);
-        let Ok(meta) = std::fs::symlink_metadata(path) else {
-            continue; // absent
-        };
-        if meta.file_type().is_symlink() {
-            let Ok(target) = std::fs::read_link(path) else {
-                continue;
-            };
-            args.push("--symlink".into());
-            args.push(target.into());
-            args.push(path.into());
-        } else if meta.is_dir() {
-            args.push("--ro-bind".into());
-            args.push(path.into());
-            args.push(path.into());
-        }
-    }
-    args
-}
-
-// The three Seatbelt items below are the macOS backend's building blocks, and
-// they are deliberately **not** `cfg(target_os = "macos")`: profile and argv
-// construction is pure string work, so keeping it compiled everywhere is what
-// lets the tests that pin its exact text run on a Linux developer machine and
-// in Linux CI, where the macOS arm itself cannot. Off macOS nothing but those
-// tests calls them, hence the `dead_code` waiver.
-
 /// macOS's sandbox wrapper, by absolute path.
 ///
 /// Pinned rather than looked up on `PATH` — exactly as Codex does
@@ -1659,9 +1215,9 @@ const SEATBELT_PROGRAM: &str = "/usr/bin/sandbox-exec";
 /// The full `sandbox-exec` argv (everything after `argv[0]`): the generated
 /// profile, then the shell invocation it applies to.
 ///
-/// Unlike bwrap there is no `--chdir` to pass — Seatbelt only filters syscalls,
-/// so the child inherits the cwd the caller sets on the `Command`, and stdio,
-/// exit status, timeouts and group-kill are untouched.
+/// There is no `--chdir` to pass — Seatbelt only filters syscalls, so the child
+/// inherits the cwd the caller sets on the `Command`, and stdio, exit status,
+/// timeouts and group-kill are untouched.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn seatbelt_args(
     policy: &SandboxPolicy,
@@ -1685,10 +1241,8 @@ fn seatbelt_args(
 ///
 /// `Write` reads everywhere and writes only under the policy's writable roots;
 /// `Read` narrows reads to the system directories an interpreter or compiler
-/// needs plus the readable roots, and grants no writes at all. Network is
-/// allowed unless the policy denies it ([`SandboxPolicy::deny_network`]), in
-/// which case the `(allow network*)` line is simply absent and `(deny default)`
-/// answers instead.
+/// needs plus the readable roots, and grants no writes at all. The network is
+/// always allowed: no mode confines it.
 ///
 /// **Caveat carried from the spec:** the `Read` variant is author-written and
 /// **unvalidated** — no Mac was available when this landed, so it has never
@@ -1765,9 +1319,9 @@ fn seatbelt_profile(mode: SandboxMode, policy: &SandboxPolicy) -> String {
     // `.git` case above there is no earlier `allow` to subtract from — that one
     // needs its trailing `deny` precisely because SBPL is last-match-wins and
     // `(allow file-write* …)` came first.
-    if policy.allow_network {
-        profile.push_str("(allow network*)\n");
-    }
+    // The network is never confined, in any mode — so this is unconditional
+    // rather than a policy question.
+    profile.push_str("(allow network*)\n");
     profile
 }
 
@@ -1785,7 +1339,6 @@ pub(crate) fn confined_ctx(dir: &Path, mode: SandboxMode) -> crate::ToolContext 
         mode,
         writable_roots: vec![root.clone()],
         readable_roots: vec![root],
-        allow_network: true,
         cache_roots: Vec::new(),
     });
     ctx
@@ -1866,7 +1419,7 @@ mod tests {
         let named = policy.project_writable_roots();
         for cache in &policy.cache_roots {
             assert!(
-                !named.iter().any(|n| *n == cache.as_path()),
+                !named.contains(&cache.as_path()),
                 "{} must not be listed to the model",
                 cache.display()
             );
@@ -2007,15 +1560,14 @@ mod tests {
             erofs.note
         );
 
-        let ssh = sandbox_denial(&write, "Bad owner or permissions on /etc/ssh/ssh_config")
-            .expect("recognized");
-        assert_eq!(ssh.kind, DenialKind::SshUserNamespace);
-
-        let mut offline = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
-        offline.deny_network();
-        let net = sandbox_denial(&offline, "curl: (6) Could not resolve host: example.com")
-            .expect("recognized");
-        assert_eq!(net.kind, DenialKind::NetworkDenied);
+        // Not ours any more: the network is never confined, and the ssh
+        // ownership complaint died with the user namespace that caused it.
+        for foreign in [
+            "curl: (6) Could not resolve host: example.com",
+            "Bad owner or permissions on /etc/ssh/ssh_config",
+        ] {
+            assert_eq!(sandbox_denial_note(&write, foreign), None, "{foreign}");
+        }
 
         let strict = SandboxPolicy::for_agent(SandboxMode::Strict, dir.path(), &[]);
         let gpu = sandbox_denial(&strict, "failed to open /dev/kfd").expect("recognized");
@@ -2051,51 +1603,33 @@ mod tests {
         }
     }
 
-    /// A denied network reads as a dead machine, so the note has to say
-    /// otherwise — and has to point at the tools that still work, or the model
-    /// concludes it cannot reach the web at all and reports the task as
-    /// impossible.
+    /// **No mode confines the network, so no network failure is ever the
+    /// sandbox's.** A resolver timeout or an unreachable route is what a machine
+    /// with a dead link looks like, and claiming the sandbox did it would send the
+    /// model debugging DNS in the one direction that cannot help.
+    ///
+    /// The confinement was deleted rather than kept, because in the mode that
+    /// mattered it was never a boundary: a delegated agent reports to an agent that
+    /// *does* have a network, so injected text reaching a sub-agent propagates to
+    /// the parent through its report and the parent can curl. It bought one hop of
+    /// latency, not containment.
     #[test]
-    fn a_denied_network_is_named_as_the_sandbox_and_points_at_the_web_tools() {
+    fn a_network_failure_is_never_attributed_to_the_sandbox() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sub = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
-        sub.deny_network();
-
-        for failure in [
-            "curl: (6) Could not resolve host: api.example.com",
-            "fatal: unable to access 'https://github.com/o/r/': Could not resolve host: github.com",
-            "pip install foo\nTemporary failure in name resolution",
-            "ping: connect: Network is unreachable",
-        ] {
-            let note = sandbox_denial_note(&sub, failure).unwrap_or_else(|| panic!("{failure}"));
-            assert!(note.contains("[sandbox]"), "{note}");
-            assert!(
-                note.contains("web_fetch") && note.contains("web_search"),
-                "{note}"
-            );
-            assert!(
-                note.contains("do not debug") || note.contains("Do NOT"),
-                "{note}"
-            );
-            // The main agent has the network, and that is where the work goes.
-            assert!(note.contains("delegated to you"), "{note}");
-        }
-
-        // The parent keeps its network, so the same output from it is an ordinary
-        // failure and must not be blamed on a boundary it does not have.
-        let parent = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
-        assert_eq!(
-            sandbox_denial_note(&parent, "curl: (6) Could not resolve host: api.example.com"),
-            None
-        );
-
-        // Narrow, like the EROFS case: these are what a machine says when a
-        // service is down or a file is not yours, not what the sandbox says.
-        for ordinary in [
-            "curl: (7) Failed to connect to localhost port 8080: Connection refused",
-            "bind: Permission denied",
-        ] {
-            assert_eq!(sandbox_denial_note(&sub, ordinary), None, "{ordinary}");
+        for mode in [SandboxMode::Write, SandboxMode::Read, SandboxMode::Strict] {
+            let policy = SandboxPolicy::for_agent(mode, dir.path(), &[]);
+            for failure in [
+                "curl: (6) Could not resolve host: api.example.com",
+                "fatal: unable to access 'https://github.com/o/r/': Could not resolve host",
+                "pip install foo\nTemporary failure in name resolution",
+                "ping: connect: Network is unreachable",
+            ] {
+                assert_eq!(
+                    sandbox_denial_note(&policy, failure),
+                    None,
+                    "{mode:?} does not confine the network: {failure}"
+                );
+            }
         }
     }
 
@@ -2297,7 +1831,6 @@ mod tests {
                 std::iter::once(wt.clone()).chain(roots).collect::<Vec<_>>(),
             ),
             readable_roots: Vec::new(),
-            allow_network: true,
             cache_roots: Vec::new(),
         };
         check_write(&policy, &common.join("index")).unwrap_err();
@@ -2327,7 +1860,6 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: vec![root.clone()],
             readable_roots: vec![root],
-            allow_network: true,
             cache_roots: Vec::new(),
         };
 
@@ -2380,7 +1912,6 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: canonical_roots(roots),
             readable_roots: Vec::new(),
-            allow_network: true,
             cache_roots: Vec::new(),
         };
 
@@ -2414,254 +1945,6 @@ mod tests {
         );
     }
 
-    /// The argv as strings, for readable assertions.
-    fn argv(args: &[std::ffi::OsString]) -> Vec<String> {
-        args.iter().map(|a| a.to_string_lossy().into()).collect()
-    }
-
-    /// The index of the mount `<flag> <path> <path>` triple, or `None`.
-    fn mount_at(args: &[String], flag: &str, path: &Path) -> Option<usize> {
-        let shown = path.display().to_string();
-        args.windows(3)
-            .position(|w| w[0] == flag && w[1] == shown && w[2] == shown)
-    }
-
-    #[test]
-    fn bwrap_write_args_are_exactly_the_spec() {
-        let dir = tempfile::tempdir().unwrap();
-        let one = dir.path().join("one");
-        let two = dir.path().join("two");
-        std::fs::create_dir(&one).unwrap();
-        std::fs::create_dir(&two).unwrap();
-        let policy = SandboxPolicy {
-            mode: SandboxMode::Write,
-            writable_roots: vec![one.clone(), two.clone()],
-            readable_roots: Vec::new(),
-            allow_network: true,
-            cache_roots: Vec::new(),
-        };
-        let args = argv(&bwrap_args(
-            SandboxMode::Write,
-            &policy,
-            dir.path(),
-            crate::Shell::Bash,
-            "echo hi",
-        ));
-
-        let chdir = canonicalize_nearest(dir.path()).display().to_string();
-        let expected: Vec<String> = [
-            "--new-session",
-            "--die-with-parent",
-            "--ro-bind",
-            "/",
-            "/",
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-        ]
-        .iter()
-        .map(|a| a.to_string())
-        // The GPU binds are derived, not hardcoded: which nodes exist is a
-        // property of the host, so a literal list would pass on this machine and
-        // fail on a runner with no card (or a second one). Their POSITION is
-        // still pinned — after the `/dev` remount they undo, before the writable
-        // roots — which is the part that has to be right.
-        .chain(
-            gpu_device_nodes()
-                .iter()
-                .flat_map(|d| {
-                    let p = d.display().to_string();
-                    ["--dev-bind".to_string(), p.clone(), p]
-                })
-                .collect::<Vec<_>>(),
-        )
-        .chain(
-            [
-                "--bind",
-                &one.display().to_string(),
-                &one.display().to_string(),
-                "--bind",
-                &two.display().to_string(),
-                &two.display().to_string(),
-                "--unshare-user",
-                "--unshare-pid",
-                "--chdir",
-                &chdir,
-                "--",
-                "bash",
-                "-c",
-                "echo hi",
-            ]
-            .iter()
-            .map(|a| a.to_string())
-            .collect::<Vec<_>>(),
-        )
-        .collect();
-        assert_eq!(args, expected);
-
-        // Order is semantics: the read-only root must be mounted before the
-        // writable binds layer over it, or they are shadowed away.
-        let ro_root = args
-            .windows(3)
-            .position(|w| w[0] == "--ro-bind" && w[1] == "/" && w[2] == "/")
-            .unwrap();
-        assert!(ro_root < mount_at(&args, "--bind", &one).unwrap());
-        assert!(ro_root < mount_at(&args, "--bind", &two).unwrap());
-    }
-
-    /// The network axis in the argv: absent for an agent that keeps the network
-    /// (the main one), `--unshare-net` for one that does not (any sub-agent).
-    ///
-    /// The flag is asserted to sit inside the argv proper — before the `--` that
-    /// ends bwrap's own options — because after it, it would be an argument to
-    /// the shell instead of an option to bwrap, and the command would run with
-    /// its network intact and no error at all.
-    #[test]
-    fn bwrap_unshares_the_network_only_when_the_policy_denies_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut policy = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
-        let allowed = argv(&bwrap_args(
-            SandboxMode::Write,
-            &policy,
-            dir.path(),
-            crate::Shell::Bash,
-            "echo hi",
-        ));
-        assert!(
-            !allowed.iter().any(|a| a == "--unshare-net"),
-            "the main agent runs git push/fetch: {allowed:?}"
-        );
-
-        policy.deny_network();
-        for mode in [SandboxMode::Write, SandboxMode::Read, SandboxMode::Strict] {
-            let args = argv(&bwrap_args(
-                mode,
-                &policy,
-                dir.path(),
-                crate::Shell::Bash,
-                "echo hi",
-            ));
-            let net = args
-                .iter()
-                .position(|a| a == "--unshare-net")
-                .unwrap_or_else(|| panic!("{mode}: no network denial in {args:?}"));
-            let sep = args.iter().position(|a| a == "--").expect("the separator");
-            assert!(
-                net < sep,
-                "{mode}: the flag reaches bash, not bwrap: {args:?}"
-            );
-            // It travels with the other namespace flags rather than in the middle
-            // of the mount sequence, where a reader would have to work out
-            // whether its position mattered.
-            assert_eq!(args[net - 1], "--unshare-pid", "{args:?}");
-        }
-    }
-
-    /// Mode `None` has no OS wrapper to carry a denial, so the policy must not
-    /// claim one — the prompt line and the denial note both read this flag, and
-    /// an unconfined agent told it has no network would be told a falsehood.
-    #[test]
-    fn denying_the_network_is_a_no_op_when_unconfined() {
-        let mut policy = SandboxPolicy::unconfined();
-        policy.deny_network();
-        assert!(policy.allow_network, "nothing enforces it in mode None");
-    }
-
-    /// `read` is a WRITE restriction, not a read one: the whole filesystem is
-    /// bound read-only and nothing is writable anywhere.
-    ///
-    /// This is the shape Codex gives its own `read-only` mode, and hrdr adopted
-    /// it after the previous behavior (mount only `/usr` + `/etc`, the current
-    /// [`SandboxMode::Strict`]) left a read-only agent's shell unable to see the
-    /// tools the user had installed — `~/.cargo/bin`, a version-managed node, a
-    /// Homebrew or Nix prefix — and reporting "command not found" for them.
-    #[test]
-    fn bwrap_read_args_bind_the_whole_filesystem_read_only_and_nothing_writable() {
-        let dir = tempfile::tempdir().unwrap();
-        let policy = SandboxPolicy::for_agent(SandboxMode::Read, dir.path(), &[]);
-        assert!(
-            policy.writable_roots.is_empty(),
-            "no writable root is what makes it read-only"
-        );
-        let args = argv(&bwrap_args(
-            SandboxMode::Read,
-            &policy,
-            dir.path(),
-            crate::Shell::Bash,
-            "echo hi",
-        ));
-
-        // The whole filesystem, read-only — so every PATH entry resolves.
-        assert!(
-            args.windows(3).any(|w| w == ["--ro-bind", "/", "/"]),
-            "{args:?}"
-        );
-        // …and not one writable bind, anywhere.
-        assert!(
-            !args.iter().any(|a| a == "--bind"),
-            "read mode writes nothing: {args:?}"
-        );
-        // No private /tmp either: that is strict mode's isolation, and mounting
-        // a tmpfs here would hide a real /tmp the tools legitimately read.
-        assert!(!args.iter().any(|a| a == "--tmpfs"), "{args:?}");
-    }
-
-    /// `--dev` mounts a fresh minimal devtmpfs, which silently deletes every
-    /// accelerator on the host from the sandbox's view. `Write` and `Read` both
-    /// mount all of `/` and are meant to show the machine as it is, so the GPU
-    /// nodes are bound back through — and with `--dev-bind`, because a compute
-    /// device is opened read-write to submit work at all, making a read-only
-    /// bind identical to not having it.
-    ///
-    /// Skipped when the host has no GPU: there is nothing to assert about a
-    /// machine with no such device, and asserting the *absence* would pass for
-    /// the wrong reason on every CI runner.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn bwrap_binds_gpu_devices_back_through_the_fresh_dev_mount() {
-        let devices = gpu_device_nodes();
-        if devices.is_empty() {
-            return; // no GPU on this host — nothing this test can observe
-        }
-        let dir = tempfile::tempdir().unwrap();
-        for mode in [SandboxMode::Write, SandboxMode::Read] {
-            let policy = SandboxPolicy::for_agent(mode, dir.path(), &[]);
-            let args = argv(&bwrap_args(
-                mode,
-                &policy,
-                dir.path(),
-                crate::Shell::Bash,
-                "rocminfo",
-            ));
-            // `--dev /dev` is still there — this adds to it rather than
-            // replacing it, so `/dev/null` and friends keep working.
-            assert!(args.windows(2).any(|w| w == ["--dev", "/dev"]), "{args:?}");
-            for dev in &devices {
-                let d = dev.to_string_lossy().to_string();
-                let bound = args
-                    .windows(3)
-                    .any(|w| w[0] == "--dev-bind" && w[1] == d && w[2] == d);
-                assert!(bound, "{mode:?} must bind {d} back through: {args:?}");
-            }
-        }
-        // Strict is the deliberate exception: it confines by leaving things out,
-        // and `sandbox_denial_note` explains the absence rather than the mount
-        // set quietly papering over it.
-        let policy = SandboxPolicy::for_agent(SandboxMode::Strict, dir.path(), &[]);
-        let args = argv(&bwrap_args(
-            SandboxMode::Strict,
-            &policy,
-            dir.path(),
-            crate::Shell::Bash,
-            "rocminfo",
-        ));
-        assert!(
-            !args.iter().any(|a| a == "--dev-bind"),
-            "strict binds no devices: {args:?}"
-        );
-    }
-
     /// A GPU failure under `strict` reads exactly like a machine with no GPU —
     /// HIP says the device is missing, not that a sandbox hid it — so the note
     /// has to name the cause. Under the modes that DO bind the devices there is
@@ -2684,86 +1967,12 @@ mod tests {
         }
     }
 
-    /// Linux-only: the Strict profile's mount set is built from what the *host*
-    /// filesystem really has — `/usr`, `/etc`, and whatever `/bin` turns out to
-    /// be — through `.exists()`/`symlink_metadata` filters. Off Linux those
-    /// paths are absent (Windows) or shaped differently, so the builder
-    /// correctly emits a different argv and there is nothing to assert against:
-    /// bwrap only ever runs on Linux. Its Write sibling above stays
-    /// cross-platform because every path it names is a tempdir or the literal
-    /// `/` bind the builder emits unconditionally.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn bwrap_strict_args_omit_rw_binds_and_private_tmp() {
-        let dir = tempfile::tempdir().unwrap();
-        let policy = SandboxPolicy::for_agent(SandboxMode::Strict, dir.path(), &[]);
-        let args = argv(&bwrap_args(
-            SandboxMode::Strict,
-            &policy,
-            dir.path(),
-            crate::Shell::Bash,
-            "echo hi",
-        ));
-
-        assert!(
-            !args.iter().any(|a| a == "--bind"),
-            "read mode writes nothing: {args:?}"
-        );
-        assert!(
-            mount_at(&args, "--ro-bind", Path::new("/usr")).is_some(),
-            "{args:?}"
-        );
-
-        // `--tmpfs /tmp` must precede every readable-root bind: the scratch
-        // dir (and the tool-output dir in its fallback location) live under
-        // `/tmp`, and a tmpfs mounted after them hides them.
-        let tmpfs = args
-            .windows(2)
-            .position(|w| w[0] == "--tmpfs" && w[1] == "/tmp")
-            .expect("read mode gets a private /tmp");
-        for root in &policy.readable_roots {
-            let at = mount_at(&args, "--ro-bind", root)
-                .unwrap_or_else(|| panic!("{} is not bound: {args:?}", root.display()));
-            assert!(
-                tmpfs < at,
-                "--tmpfs /tmp ({tmpfs}) must precede {} ({at})",
-                root.display()
-            );
-        }
-
-        // `/bin` is a symlink on usr-merged distros: recreate it as one,
-        // pointing where it really points — a bind would manufacture a real
-        // directory and break the merge.
-        if let Ok(meta) = std::fs::symlink_metadata("/bin") {
-            if meta.file_type().is_symlink() {
-                let target = std::fs::read_link("/bin").unwrap().display().to_string();
-                assert!(
-                    args.windows(3)
-                        .any(|w| w[0] == "--symlink" && w[1] == target && w[2] == "/bin"),
-                    "expected --symlink {target} /bin in {args:?}"
-                );
-            } else if meta.is_dir() {
-                assert!(
-                    mount_at(&args, "--ro-bind", Path::new("/bin")).is_some(),
-                    "{args:?}"
-                );
-            }
-        }
-
-        assert_eq!(args[args.len() - 4..], ["--", "bash", "-c", "echo hi"]);
-    }
-
-    /// The Write profile names every writable root and nothing else, and the
-    /// rest of it is the spec's text byte for byte. Pure string work, so it
-    /// runs on every platform — the macOS arm cannot be exercised off macOS,
-    /// but the profile it would hand to `sandbox-exec` can.
     #[test]
     fn seatbelt_profile_lists_every_writable_root() {
         let policy = SandboxPolicy {
             mode: SandboxMode::Write,
             writable_roots: vec![PathBuf::from("/work/wt"), PathBuf::from("/tmp/scratch")],
             readable_roots: Vec::new(),
-            allow_network: true,
             cache_roots: Vec::new(),
         };
         assert_eq!(
@@ -2788,7 +1997,6 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: vec![PathBuf::from("/work/we\"ird")],
             readable_roots: Vec::new(),
-            allow_network: true,
             cache_roots: Vec::new(),
         };
         assert!(
@@ -2804,7 +2012,6 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: Vec::new(),
             readable_roots: Vec::new(),
-            allow_network: true,
             cache_roots: Vec::new(),
         };
         assert!(
@@ -2813,28 +2020,28 @@ mod tests {
         );
     }
 
-    /// A sub-agent's profile simply stops saying `(allow network*)`, and the
-    /// `(deny default)` it opens with is what refuses the socket.
+    /// The argv as strings, for readable assertions.
+    fn argv(args: &[std::ffi::OsString]) -> Vec<String> {
+        args.iter().map(|a| a.to_string_lossy().into()).collect()
+    }
+
+    /// Every profile says `(allow network*)`, in every mode — the sandbox confines
+    /// the filesystem and nothing else.
     ///
-    /// Asserted as the WHOLE profile rather than as a missing substring, because
-    /// what has to be true is that nothing else moved: an SBPL profile is
-    /// last-match-wins, so a stray later `allow` would undo this silently and a
-    /// `contains` check would never see it. The trailing `deny` the `.git`
-    /// denial needs is the case that proves the rule — it exists only because an
-    /// `(allow file-write* …)` came before it.
+    /// Asserted as the WHOLE profile rather than as a substring, because what has
+    /// to be true is that nothing else moved: SBPL is last-match-wins, so a stray
+    /// later `deny` would undo an earlier `allow` silently and a `contains` check
+    /// would never see it.
     #[test]
-    fn seatbelt_omits_the_network_allowance_when_the_policy_denies_it() {
-        let mut policy = SandboxPolicy {
+    fn every_seatbelt_profile_allows_the_network() {
+        let policy = SandboxPolicy {
             mode: SandboxMode::Write,
             writable_roots: vec![PathBuf::from("/work/wt")],
             readable_roots: Vec::new(),
-            allow_network: true,
             cache_roots: Vec::new(),
         };
-        policy.deny_network();
-        let profile = seatbelt_profile(SandboxMode::Write, &policy);
         assert_eq!(
-            profile,
+            seatbelt_profile(SandboxMode::Write, &policy),
             concat!(
                 "(version 1)\n",
                 "(deny default)\n",
@@ -2846,15 +2053,14 @@ mod tests {
                 "(allow ipc-posix*)\n",
                 "(allow file-read*)\n",
                 "(allow file-write* (subpath \"/work/wt\"))\n",
+                "(allow network*)\n",
             )
         );
-        assert!(!profile.contains("network"), "{profile}");
-
-        // Every mode, not just the one a write sub-agent gets: a read-only
-        // `explore` agent is delegated too, and loses the network with it.
         for mode in [SandboxMode::Read, SandboxMode::Strict] {
-            let profile = seatbelt_profile(mode, &policy);
-            assert!(!profile.contains("network"), "{mode}: {profile}");
+            assert!(
+                seatbelt_profile(mode, &policy).contains("(allow network*)"),
+                "{mode} must not confine the network"
+            );
         }
     }
 
@@ -2866,7 +2072,6 @@ mod tests {
             mode: SandboxMode::Strict,
             writable_roots: Vec::new(),
             readable_roots: vec![PathBuf::from("/work/wt")],
-            allow_network: true,
             cache_roots: Vec::new(),
         };
         assert_eq!(
@@ -2897,7 +2102,6 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: vec![PathBuf::from("/work/wt")],
             readable_roots: Vec::new(),
-            allow_network: true,
             cache_roots: Vec::new(),
         };
         let args = argv(&seatbelt_args(&policy, crate::Shell::Bash, "echo hi"));
@@ -2925,7 +2129,6 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: vec![canonicalize_nearest(dir.path())],
             readable_roots: Vec::new(),
-            allow_network: true,
             cache_roots: Vec::new(),
         };
 
@@ -2935,7 +2138,6 @@ mod tests {
             shell,
             &format!("echo x > {}", target.display()),
             &policy,
-            dir.path(),
             &notices(),
         );
         cmd.current_dir(dir.path());
@@ -2951,7 +2153,6 @@ mod tests {
             shell,
             &format!("echo x > {}", inside.display()),
             &policy,
-            dir.path(),
             &notices(),
         );
         cmd.current_dir(dir.path());
@@ -2964,11 +2165,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&inside).unwrap().trim(), "x");
     }
 
-    /// The canonical skip guard for the end-to-end tests: the real backend
-    /// when this machine has one, plus a shell to run through it.
+    /// The canonical skip guard for the end-to-end tests: this machine's real
+    /// backend when it has one, plus a shell to run through it.
     #[cfg(target_os = "linux")]
-    fn bwrap_shell() -> Option<crate::Shell> {
-        if detect_backend() != OsSandboxBackend::Bwrap {
+    fn confined_shell() -> Option<crate::Shell> {
+        if detect_backend() == OsSandboxBackend::None {
             return None; // best-effort: exercise the real backend when available
         }
         crate::Shell::detect()
@@ -2992,17 +2193,26 @@ mod tests {
     /// is the escape that motivated the whole feature, at the shell layer.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn shell_write_outside_roots_hits_a_readonly_fs() {
-        let Some(shell) = bwrap_shell() else { return };
+    async fn shell_write_outside_roots_is_refused_by_the_kernel() {
+        let Some(shell) = confined_shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         // A `for_agent` policy would bind `env::temp_dir()` writable and the
         // second tempdir with it; confine to the cwd alone.
         let ctx = confined_ctx(dir.path(), SandboxMode::Write);
 
+        // The wording is the backend's, not ours: Landlock refuses the open with
+        // EACCES, where bwrap's read-only mount said EROFS. Both are asserted
+        // because the *property* is what matters — the write does not land — and a
+        // test pinned to one backend's errno would fail on the other for no reason.
+        let refused =
+            |out: &str| out.contains("Read-only file system") || out.contains("Permission denied");
+
         let target = outside.path().join("escaped");
         let out = run_shell(shell, &ctx, &format!("echo x > {}", target.display())).await;
-        assert!(out.contains("Read-only file system"), "{out}");
+        assert!(refused(&out), "{out}");
         assert!(!target.exists(), "the write landed anyway");
 
         // …including the shape actually observed in the wild: `cd` out first.
@@ -3012,7 +2222,7 @@ mod tests {
             &format!("cd {} && echo x > escaped2", outside.path().display()),
         )
         .await;
-        assert!(out.contains("Read-only file system"), "{out}");
+        assert!(refused(&out), "{out}");
         assert!(!outside.path().join("escaped2").exists());
     }
 
@@ -3020,8 +2230,10 @@ mod tests {
     /// writable inside the sandbox, or no build would survive it.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn shell_write_in_cwd_and_tmp_succeeds_under_bwrap() {
-        let Some(shell) = bwrap_shell() else { return };
+    async fn shell_write_in_cwd_and_tmp_succeeds_confined() {
+        let Some(shell) = confined_shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = crate::ToolContext::new(dir.path().to_path_buf());
         ctx.sandbox = std::sync::Arc::new(SandboxPolicy::for_agent(
@@ -3031,7 +2243,7 @@ mod tests {
         ));
 
         let in_cwd = dir.path().join("in-cwd");
-        let in_scratch = session_scratch_dir().join("bwrap-write-probe");
+        let in_scratch = session_scratch_dir().join("confined-write-probe");
         let out = run_shell(
             shell,
             &ctx,
@@ -3055,7 +2267,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_linked_worktree_commits_but_the_parent_repo_stays_blocked() {
-        let Some(shell) = bwrap_shell() else { return };
+        let Some(shell) = confined_shell() else {
+            return;
+        };
         if which::which("git").is_err() {
             return; // best-effort: exercise the real backend when available
         }
@@ -3076,7 +2290,6 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: roots,
             readable_roots: Vec::new(),
-            allow_network: true,
             cache_roots: Vec::new(),
         });
 
@@ -3128,37 +2341,66 @@ mod tests {
         );
     }
 
-    /// Read mode does not merely refuse writes — the rest of the filesystem
-    /// is not mounted at all, so an outside path is ENOENT rather than EROFS.
-    /// (`/usr` and `/etc` stay readable by design; probe `/home`.)
+    /// **`strict` no longer confines a shell's reads, and says so out loud.**
+    ///
+    /// It used to: bwrap mounted only `/usr` and `/etc`, so `/home` was ENOENT
+    /// rather than merely unreadable. Landlock has no read axis it can express as
+    /// "everything except…", so with bwrap deleted a strict-mode *shell command*
+    /// is write-confined only. The in-process guard
+    /// ([`SandboxPolicy::check_read`]) still confines the read-only file tools,
+    /// which is where the mode's confinement actually lives — and the notice is the
+    /// point of this test: a boundary quietly narrower than it claims is worse than
+    /// one whose limits are stated.
+    ///
+    /// The gap closes for good when `strict` loses `shell` altogether (it becomes
+    /// `jail`, whose tool set spawns no subprocess at all), at which point this
+    /// test and the notice both go.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn strict_mode_cannot_even_see_outside_paths() {
-        let Some(shell) = bwrap_shell() else { return };
+    async fn strict_mode_shell_reads_are_only_write_confined_and_it_says_so() {
+        let Some(shell) = confined_shell() else {
+            return;
+        };
+        if detect_backend() != OsSandboxBackend::Landlock {
+            return; // the admission is Landlock's; nothing else to check here
+        }
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("visible.txt"), "x").unwrap();
         let ctx = confined_ctx(dir.path(), SandboxMode::Strict);
 
-        let out = run_shell(shell, &ctx, "ls /home").await;
-        assert!(out.contains("No such file or directory"), "{out}");
-
         let out = run_shell(shell, &ctx, "ls").await;
         assert!(out.contains("visible.txt"), "{out}");
+
+        // The file tools ARE still confined — that is where the mode lives now.
+        let outside = Path::new("/etc/hostname");
+        assert!(
+            ctx.sandbox.check_read(outside, outside).is_err(),
+            "check_read is the strict guard that survives"
+        );
+
+        // And the shell's weaker boundary is admitted, not hidden.
+        let queued = drain(&ctx.sandbox_notices);
+        assert!(
+            queued
+                .iter()
+                .any(|n| n == STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE),
+            "the lost read confinement must be stated: {queued:?}"
+        );
     }
 
-    /// The timeout still reaps the whole tree through bwrap:
-    /// `--die-with-parent` plus the pid-namespace init mean killing the spawn
-    /// group takes every descendant with it.
+    /// The timeout still reaps the whole tree with a backend in the way.
     ///
-    /// The sibling test in `shell.rs` probes the backgrounded grandchild by
-    /// pid; that cannot work here, because `--unshare-pid` makes the pid the
-    /// child records a *namespace* pid that means something else on the host.
-    /// The marker file is the portable proof: it only appears if the
-    /// grandchild outlived the kill.
+    /// Landlock adds no process wrapper — the shell is the direct child, confining
+    /// itself between fork and exec — so the existing group-kill reaches every
+    /// descendant exactly as it does unsandboxed. Kept as a marker-file test rather
+    /// than a pid probe because it also covers Seatbelt, which does interpose a
+    /// wrapper process: the marker only appears if the grandchild outlived the kill.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn timeout_kill_reaches_through_bwrap() {
-        let Some(shell) = bwrap_shell() else { return };
+    async fn timeout_kill_reaches_through_the_sandbox() {
+        let Some(shell) = confined_shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = confined_ctx(dir.path(), SandboxMode::Write);
         ctx.enforce_timeout_floor = false;
@@ -3185,74 +2427,29 @@ mod tests {
         );
     }
 
-    /// bwrap's user namespace makes every root-owned file read as `nobody`, and
-    /// OpenSSH refuses a config file it cannot vouch for — so `git push` over ssh
-    /// dies inside the sandbox with an error that points at a system file.
+    /// **The ssh / user-namespace failure class is gone, and a bare
+    /// "bad owner or permissions" must not be blamed on the sandbox any more.**
     ///
-    /// Proved end to end against the real backend, because the whole failure is a
-    /// property of the namespace and an argv assertion would not see it: plain
-    /// `ssh -G` fails in here, and it succeeds with the override hrdr installs.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn ssh_works_in_the_sandbox_despite_the_user_namespace() {
-        let Some(shell) = bwrap_shell() else { return };
-        if which::which("ssh").is_err() {
-            return; // no ssh on this host — nothing to prove
-        }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let ctx = confined_ctx(dir.path(), SandboxMode::Write);
-        let run = |command: &str| {
-            let ctx = ctx.clone();
-            let command = command.to_string();
-            async move {
-                use crate::Tool as _;
-                crate::ShellTool::new(shell)
-                    .execute(serde_json::json!({"command": command}), &ctx)
-                    .await
-                    .map_err(|e| e.to_string())
-                    .unwrap_or_else(|e| e)
-            }
-        };
-
-        // The bug, reproduced: ssh reading the system config sees root-owned
-        // files as `nobody` and bails. Skipped if this host's ssh config happens
-        // not to trip the check (no system config, or an unusual layout).
-        let bare = run("ssh -G example.invalid 2>&1").await;
-        if !bare.to_lowercase().contains("bad owner or permissions") {
-            return;
-        }
-
-        // …and the fix: `-F` makes ssh skip the system config entirely, which is
-        // exactly what `git_ssh_command_for_userns` hands git.
-        let fixed = run("ssh -F /dev/null -G example.invalid 2>&1").await;
-        assert!(
-            !fixed.to_lowercase().contains("bad owner or permissions"),
-            "-F must bypass the unreadable system config: {fixed}"
-        );
-        assert!(fixed.contains("host example.invalid"), "{fixed}");
-
-        // The note explains it rather than inviting a chmod of a system file.
-        let note = sandbox_denial_note(&ctx.sandbox, &bare).expect("a note is owed");
-        assert!(note.contains("do NOT chmod"), "{note}");
-        assert!(note.contains("user namespace"), "{note}");
-    }
-
-    /// An explicit `GIT_SSH_COMMAND` is a decision; the sandbox must not rewrite
-    /// it. (Serialised with the unset case below by running both here — they
-    /// share one process-global env.)
+    /// It was bwrap's doing: an unprivileged user namespace maps only the invoking
+    /// uid, so every root-owned file inside read as `nobody`, and OpenSSH refuses
+    /// any config file it cannot vouch for — killing every `git push` over ssh with
+    /// an error that pointed at `/etc/ssh/ssh_config` and invited a `chmod` of a
+    /// system file. That was the founding case for the whole escalation ladder.
+    /// Deleting bwrap deleted it: no namespace, no misread ownership.
+    ///
+    /// So the denial note for it is deleted too. On a machine with no namespace
+    /// involved, that message means the user's own `~/.ssh/config` really is
+    /// group-writable — a true local problem hrdr must report as-is rather than
+    /// editorialize over.
     #[test]
-    fn the_git_ssh_override_defers_to_an_explicit_one() {
-        // SAFETY: set and removed within this body. The var IS process-global and
-        // the bwrap tests call `git_ssh_command_for_userns` indirectly, so one of
-        // them may observe it set during this window — harmless, because they run
-        // `echo`/`touch` and never reach git or ssh.
-        unsafe { std::env::set_var("GIT_SSH_COMMAND", "ssh -i /custom/key") };
-        assert_eq!(git_ssh_command_for_userns(), None, "an explicit value wins");
-        unsafe { std::env::remove_var("GIT_SSH_COMMAND") };
-
-        let installed = git_ssh_command_for_userns().expect("set when unset");
-        let installed = installed.to_string_lossy().into_owned();
-        assert!(installed.starts_with("ssh -F "), "{installed}");
+    fn an_ssh_ownership_complaint_is_no_longer_blamed_on_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+        assert_eq!(
+            sandbox_denial_note(&write, "Bad owner or permissions on /etc/ssh/ssh_config"),
+            None,
+            "no user namespace, no sandbox explanation to offer"
+        );
     }
 
     /// A confined agent can commit its own work, proved against the real OS
@@ -3267,7 +2464,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_confined_agent_can_commit_its_own_work() {
-        let Some(shell) = bwrap_shell() else { return };
+        let Some(shell) = confined_shell() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let repo = canonicalize_nearest(dir.path());
         let git = |args: &[&str]| {
@@ -3330,62 +2529,47 @@ mod tests {
         );
     }
 
-    /// The other half of the sub-agent's boundary, proved the same way: a
-    /// delegated shell cannot open a socket, and the identical command with the
-    /// network allowed can.
+    /// **A confined shell still reaches the network, in every mode.** Proved
+    /// against the real backend, because the denial it replaces was also real:
+    /// bwrap handed the child a private network namespace, so a `/dev/tcp` connect
+    /// to a listener on the host's own loopback found nothing there.
     ///
-    /// The target is a listener **this test bound itself** on loopback, chosen
-    /// because it needs no external service — a CI runner with no egress would
-    /// fail an internet probe for the wrong reason — and because it cannot pass
-    /// by accident: `--unshare-net` hands the child a private network namespace
-    /// whose loopback is its own, so the connect that succeeds outside finds
-    /// nothing listening inside. Nothing else on the machine produces that
-    /// difference between two otherwise identical runs.
-    ///
-    /// Never accepted, deliberately: the kernel completes the handshake out of
-    /// the listen backlog, so there is no server thread to start or to join.
+    /// The listener is one this test bound itself, so nothing external is needed
+    /// and a CI runner with no egress cannot fail it for the wrong reason. Never
+    /// accepted, deliberately: the kernel completes the handshake out of the listen
+    /// backlog, so there is no server thread to start or join.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn a_subagent_shell_has_no_network() {
-        let Some(shell) = bwrap_shell() else { return };
+    async fn a_confined_shell_still_reaches_the_network() {
+        let Some(shell) = confined_shell() else {
+            return;
+        };
         if shell != crate::Shell::Bash {
             return; // the probe is bash's `/dev/tcp`; POSIX sh has no equivalent
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
         let port = listener.local_addr().unwrap().port();
         let probe = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo CONNECTED");
-        // `/dev/tcp` is a bash *compile-time* feature (`--enable-net-redirections`).
-        // A bash built without it fails both arms and would turn this into a test
-        // that passes while proving nothing, so ask the host's bash first.
         let host = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(&probe)
+            .args(["-c", &probe])
             .output()
             .expect("bash");
         if !host.status.success() {
-            return;
+            return; // a bash without `--enable-net-redirections` proves nothing
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let mut ctx = confined_ctx(dir.path(), SandboxMode::Write);
-        let allowed = run_shell(shell, &ctx, &probe).await;
-        assert!(
-            allowed.contains("CONNECTED"),
-            "the main agent keeps its network — it is the one that pushes: {allowed}"
-        );
-
-        let mut policy = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
-        policy.deny_network();
-        ctx.sandbox = std::sync::Arc::new(policy);
-        let denied = run_shell(shell, &ctx, &probe).await;
-        assert!(
-            !denied.contains("CONNECTED"),
-            "a delegated shell must not reach a socket: {denied}"
-        );
-        assert!(
-            denied.contains("[exit status"),
-            "…and it fails rather than quietly doing nothing: {denied}"
-        );
+        let mine = notices();
+        for mode in [SandboxMode::Write, SandboxMode::Read] {
+            let policy = SandboxPolicy::for_agent(mode, dir.path(), &[]);
+            let mut cmd = sandboxed_shell_command(shell, &probe, &policy, &mine);
+            cmd.current_dir(dir.path());
+            let out = cmd.output().await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("CONNECTED"),
+                "{mode} must not confine the network: {out:?}"
+            );
+        }
     }
 
     /// Every notice assertion below owns its own channel, so none of them can
@@ -3429,7 +2613,6 @@ mod tests {
             mode: SandboxMode::Write,
             writable_roots: vec![canonicalize_nearest(dir.path())],
             readable_roots: Vec::new(),
-            allow_network: true,
             cache_roots: Vec::new(),
         };
 
@@ -3439,7 +2622,6 @@ mod tests {
             shell,
             &format!("echo x > {}", target.display()),
             &policy,
-            dir.path(),
             &notices(),
         );
         cmd.current_dir(dir.path());
@@ -3456,7 +2638,6 @@ mod tests {
             shell,
             &format!("echo x > {}", inside.display()),
             &policy,
-            dir.path(),
             &notices(),
         );
         cmd.current_dir(dir.path());
@@ -3469,85 +2650,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&inside).unwrap().trim(), "x");
     }
 
-    /// The fallback backend's half of the network denial, against the real
-    /// kernel: ABI v4 gave Landlock exactly two network rights, and handling
-    /// `AccessNet` while granting no port is how a ruleset spells "no TCP".
-    ///
-    /// Run here rather than trusted from the API docs because the failure mode
-    /// this guards against is a ruleset that *builds* and enforces nothing —
-    /// `BestEffort` downgrades silently, so only a real connect proves it.
-    ///
-    /// And the notice is asserted alongside, because what this backend cannot do
-    /// matters as much as what it can: UDP and raw sockets are outside
-    /// Landlock's vocabulary, so the denial here is narrower than bwrap's and
-    /// the agent is told so.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn landlock_denies_tcp_and_admits_what_it_cannot_reach() {
-        if !std::fs::read_to_string("/sys/kernel/security/lsm")
-            .unwrap_or_default()
-            .contains("landlock")
-        {
-            return; // best-effort: exercise the real backend when available
-        }
-        if crate::Shell::detect() != Some(crate::Shell::Bash) {
-            return; // the probe is bash's `/dev/tcp`
-        }
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
-        let port = listener.local_addr().unwrap().port();
-        let probe = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo CONNECTED");
-        let host = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(&probe)
-            .output()
-            .expect("bash");
-        if !host.status.success() {
-            return; // a bash without `--enable-net-redirections` proves nothing
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut policy = SandboxPolicy {
-            mode: SandboxMode::Write,
-            writable_roots: vec![canonicalize_nearest(dir.path())],
-            readable_roots: Vec::new(),
-            allow_network: true,
-            cache_roots: Vec::new(),
-        };
-        let mine = notices();
-        let run = |policy: &SandboxPolicy, notices: &SandboxNotices| {
-            let mut cmd = shell_command_with_backend(
-                OsSandboxBackend::Landlock,
-                crate::Shell::Bash,
-                &probe,
-                policy,
-                dir.path(),
-                notices,
-            );
-            cmd.current_dir(dir.path());
-            async move { cmd.output().await.unwrap() }
-        };
-
-        let out = run(&policy, &mine).await;
-        assert!(
-            String::from_utf8_lossy(&out.stdout).contains("CONNECTED"),
-            "an agent that keeps its network still connects: {out:?}"
-        );
-
-        policy.deny_network();
-        let out = run(&policy, &mine).await;
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        assert!(!out.status.success(), "the connect was allowed: {out:?}");
-        assert!(stderr.contains("Permission denied"), "{stderr}");
-
-        let queued = drain(&mine);
-        assert!(
-            queued
-                .iter()
-                .any(|n| n == NETWORK_PARTIAL_UNDER_LANDLOCK_NOTICE),
-            "the UDP/raw-socket gap is admitted, not hidden: {queued:?}"
-        );
-    }
-
     /// Landlock has no read axis, so a read-mode agent's shell commands are
     /// only write-confined — which must never be silent.
     #[cfg(target_os = "linux")]
@@ -3558,7 +2660,6 @@ mod tests {
             mode: SandboxMode::Strict,
             writable_roots: Vec::new(),
             readable_roots: vec![canonicalize_nearest(dir.path())],
-            allow_network: true,
             cache_roots: Vec::new(),
         };
         let mine = notices();
@@ -3568,7 +2669,6 @@ mod tests {
             crate::Shell::Bash,
             "true",
             &policy,
-            dir.path(),
             &mine,
         );
         // Whatever else this host queued first (the reason bwrap was skipped,
@@ -3589,7 +2689,6 @@ mod tests {
             crate::Shell::Bash,
             "true",
             &policy,
-            dir.path(),
             &sibling,
         );
         let theirs = drain(&sibling);
@@ -3614,7 +2713,6 @@ mod tests {
             crate::Shell::Bash,
             "true",
             &policy,
-            dir.path(),
             &mine,
         );
         assert_eq!(
@@ -3628,7 +2726,6 @@ mod tests {
             crate::Shell::Bash,
             "true",
             &policy,
-            dir.path(),
             &mine,
         );
         assert_eq!(
@@ -3645,7 +2742,6 @@ mod tests {
             crate::Shell::Bash,
             "true",
             &policy,
-            dir.path(),
             &sibling,
         );
         assert_eq!(sibling.take().as_deref(), Some(NO_OS_SANDBOX_NOTICE));
@@ -3678,18 +2774,6 @@ mod tests {
         );
         #[cfg(target_os = "linux")]
         {
-            assert_eq!(
-                BWRAP_MISSING_NOTICE,
-                "sandbox: bwrap not found — falling back to Landlock: writes are still confined, \
-                 but reads are not, and strict-mode agents degrade to write-only confinement for \
-                 shell commands. Install bubblewrap for full confinement."
-            );
-            assert_eq!(
-                USERNS_DISABLED_NOTICE,
-                "sandbox: unprivileged user namespaces are disabled on this system — falling back \
-                 to Landlock: writes are still confined, but reads are not, and strict-mode \
-                 agents degrade to write-only confinement for shell commands."
-            );
             assert_eq!(
                 STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE,
                 "sandbox: Landlock cannot confine reads — this strict-mode agent's shell \

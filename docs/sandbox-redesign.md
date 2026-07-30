@@ -997,8 +997,11 @@ Mostly-deletion first, so each slice is independently reviewable.
    - Add the `!command`-is-unsandboxed test here too: it becomes the only
      remaining relief valve and is untested today.
 2. ~~**`tool_output_dir` per session.**~~ **DONE.**
-3. **Delete bwrap and the network axis.** Write/Read→Landlock (Seatbelt on
-   macOS), jail→no backend. Removes `bwrap_args`, `usr_merge_compat_args`, the
+3. ~~**Delete bwrap and the network axis.** Write/Read→Landlock (Seatbelt on
+   macOS), jail→no backend.~~ **DONE** — with one carry-over: `strict` still has
+   a `shell`, so its shell reads are only write-confined under Landlock and
+   `STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE` says so. Slice 4 removes the shell
+   and the notice together. Removes `bwrap_args`, `usr_merge_compat_args`, the
    userns probe, `git_ssh_command_for_userns`, `allow_network`, `deny_network`,
    and the `DenialKind` cascade down to a single arm.
 4. **Mode → tool set.** Pin jail to the fixed five, and make the cap unwidenable

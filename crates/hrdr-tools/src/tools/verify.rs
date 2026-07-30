@@ -141,7 +141,6 @@ impl Tool for VerifyTool {
                 self.shell,
                 &check.command,
                 &ctx.sandbox,
-                &ctx.cwd,
                 &ctx.sandbox_notices,
             );
             cmd.current_dir(&ctx.cwd);

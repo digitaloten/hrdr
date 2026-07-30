@@ -317,7 +317,6 @@ impl Tool for ShellTool {
             self.shell,
             &a.command,
             &ctx.sandbox,
-            &ctx.cwd,
             &ctx.sandbox_notices,
         );
         cmd.current_dir(&ctx.cwd);

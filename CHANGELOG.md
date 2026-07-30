@@ -8,6 +8,57 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- **bwrap is deleted. Linux confines with Landlock, macOS with Seatbelt, and
+  nothing else needs installing.** bwrap had exactly two capabilities Landlock
+  lacks — mount-based read confinement, and a complete network denial via
+  `--unshare-net` — and both are gone: no mode confines the network any more,
+  and read confinement is enforced in-process by the file tools for the one mode
+  that wants it.
+
+  What bwrap charged for that was a mandatory user namespace, and **that
+  namespace was the entire ssh failure class** this project spent an escalation
+  ladder working around: an unprivileged namespace maps only the invoking uid,
+  so `/etc/ssh/ssh_config` read as `nobody`, OpenSSH refused it, and every
+  `git push`/`fetch`/`clone` over ssh died pointing at a system file and
+  inviting a `chmod` that would not have helped. Deleting the mechanism deleted
+  the bug — along with the `GIT_SSH_COMMAND` workaround, the unprivileged-userns
+  probe (a subprocess at first confined command), the bwrap-missing and
+  userns-disabled degradation notices, and the argv-order-is-semantics mount
+  builder.
+
+  **Cost, stated:** Landlock needs kernel 5.13+ (July 2021). Below that, Linux
+  falls to unconfined-with-a-notice, the posture Windows already has. Debian 12
+  ships 6.1 and RHEL 9 ships 5.14, so the band is narrow — but it is a real
+  regression for anyone on an older kernel who had bwrap installed. A blocked
+  write now surfaces as `EACCES` rather than `EROFS`; the denial note recognises
+  both.
+
+  **One carry-over, named rather than hidden:** `strict` mode's _shell commands_
+  are write-confined only under Landlock, because its read axis cannot express
+  "everything except…" — so a strict agent's shell can still read outside its
+  roots, and a notice says so on every such command. The read-only file tools
+  are still confined (that is where the mode's confinement lives). It closes
+  when `strict` loses `shell` altogether.
+
+- **The sandbox no longer confines the network, in any mode.**
+  `SandboxPolicy::allow_network`, `deny_network()`, the Landlock `AccessNet`
+  handling, Seatbelt's conditional `(allow network*)`, the partial-denial notice
+  and the `NetworkDenied` denial kind all go, along with the sub-agent
+  no-network prompt paragraph.
+
+  In the mode that mattered it was never a boundary: a delegated agent reports
+  to an agent that _does_ have a network, so injected text reaching a sub-agent
+  propagates to the parent through its report and the parent can curl. It bought
+  one hop of latency, not containment. It was also dead weight where it looked
+  strongest — nothing in a strictly-confined agent's tool set can open a socket
+  in the first place.
+
+  **What is genuinely given up:** defence in depth against the low-effort
+  accidental case, and a bandwidth difference (`web_fetch` is a GET behind an
+  SSRF guard, so exfiltration through it is URL-length-bounded, where
+  `curl -d @file` is not). Accepted knowingly. If network confinement returns it
+  should be a designed feature with a threat model, not a vestigial field.
+
 - **The tool-output spool is per session, not per user.** Truncated tool output
   spills its full copy to a file under `$XDG_RUNTIME_DIR` (or a
   login-name-scoped temp subdirectory) so the model can `read` or `grep` it

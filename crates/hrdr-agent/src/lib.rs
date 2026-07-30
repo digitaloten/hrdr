@@ -1605,7 +1605,7 @@ impl Agent {
             // The trade this makes, stated plainly because it is real: the
             // read-only guarantee now rests on the OS sandbox rather than on the
             // tool set. Where no OS sandbox is available — Windows, a macOS
-            // without `sandbox-exec`, a Linux with neither bwrap nor Landlock —
+            // without `sandbox-exec`, a Linux kernel without Landlock —
             // `NO_OS_SANDBOX_NOTICE` already says shell commands are not
             // confined, and on Landlock a read-mode agent degrades to
             // write-confinement. On those systems a read-only agent's shell can
@@ -1623,37 +1623,26 @@ impl Agent {
         // and revived alike all come through this constructor, so there is no
         // second place a mode could be decided (see `effective_sandbox`).
         let sandbox_mode = crate::config::effective_sandbox(config.sandbox, config.read_only);
-        let mut sandbox = hrdr_tools::SandboxPolicy::for_agent(
+        let sandbox = hrdr_tools::SandboxPolicy::for_agent(
             sandbox_mode,
             &config.cwd,
             &config.sandbox_writable_roots,
         );
-        // No git lock, for anybody. An agent working in the user's project — main
-        // or delegated — is assumed to have authority over that project, and a
-        // sub-agent told to commit its own work should be able to. The lock that
-        // used to sit here refused the *file tools* a write that `shell` walked
-        // straight around, so it stopped the honest path and nothing else.
-        // Coordination between concurrent writers is a prompt rule (and the
-        // default cap of one write sub-agent), not a mount.
+        // No git lock and no network confinement, for anybody. An agent working in
+        // the user's project — main or delegated — is assumed to have authority
+        // over that project: it commits, it pushes, it fetches dependencies. The
+        // sandbox stops it reaching *outside* the project, and nothing else.
         //
-        // A sub-agent's shell gets no network; the parent's keeps it.
+        // The lock that used to sit here refused the *file tools* a write that
+        // `shell` walked straight around, so it stopped the honest path only.
+        // Coordination between concurrent writers is a prompt rule (and the default
+        // cap of one write sub-agent), not a mount.
         //
-        // Not gated on `read_only` the way the git denial above is, and the
-        // asymmetry is deliberate: the git denial is about *writes*, so a
-        // read-only agent already cannot commit and needs nothing further, while
-        // an `explore` or `review` agent's shell has exactly as little business
-        // opening a socket as a writer's — arguably less, since reading a
-        // codebase needs no network at all. Both are delegated, so both lose it.
-        //
-        // It costs a sub-agent nothing, because its real network needs never went
-        // through a shell: `web_fetch` and `web_search` run in this process, on
-        // this side of the sandbox, and keep working. What is removed is raw
-        // network from a delegated shell — exfiltration surface with no matching
-        // use. The main agent keeps it because it is the one that runs `git
-        // push`/`pull`/`fetch`.
-        if config.delegated {
-            sandbox.deny_network();
-        }
+        // The network denial that used to sit here was never a boundary either: a
+        // delegated agent reports to an agent that *does* have a network, so
+        // injected text reaching a sub-agent propagates to the parent through its
+        // report and the parent can curl. It bought one hop of latency, not
+        // containment.
         ctx.sandbox = Arc::new(sandbox);
         ctx.max_output = config.tool_max_bytes;
         ctx.max_output_lines = config.tool_max_lines;
