@@ -50,9 +50,10 @@ cost of denying it is near zero: `web_fetch`/`web_search` run in-process and are
 unaffected, so a read agent that needs the web still has it. Override if you
 want `read` to keep shell network.
 
-**Jail's tool set is exactly the read-only tools**: `read`, `grep`, `glob`,
-`ls`, `tree`. No `shell`, no `verify`, no LSP, no `web_fetch`/`web_search`, no
-MCP, no `task`, no `memory`. _You read, you do not run._
+**Jail's tool set is exactly the read-only tools**: `read`, `grep`, `find`,
+`ls`, `tree` (`find` is the glob tool). No `shell`, no `verify`, no LSP, no
+`web_fetch`/`web_search`, no MCP, no `task`, no `memory`. _You read, you do not
+run._
 
 That is also the honest answer to why nothing is writable: with no execution
 there is nothing that needs a writable `/tmp`. Had `shell` survived, `cargo`,
@@ -120,7 +121,7 @@ Resolution, in order:
 1. An explicit `tools` list on the profile wins.
 2. Otherwise `read_only` selects the read-only set.
 3. **`jail` is not derived from either.** It is a fixed set — `read`, `grep`,
-   `glob`, `ls`, `tree` — and a profile's `tools` list cannot widen it. An
+   `find`, `ls`, `tree` — and a profile's `tools` list cannot widen it. An
    allow-list that a profile could extend is one edit away from putting `shell`
    back inside the jail.
 
@@ -217,12 +218,15 @@ ignored. `references` 2, `definition` 0, `rename` 0, `copy` 0, `move` 0,
 | ------------------------------------ | ----------------------------------------------- |
 | `definition`, `references`, `rename` | nothing — available and unused (2 calls / 9350) |
 | `copy`, `move`, `delete`             | `cp` / `mv` / `rm`, guardrail-checked           |
-| `git`                                | `git` via shell — see below                     |
 | `watch`                              | shell                                           |
+| `replace`                            | `edit`, or `sed -i` for multi-file — see below  |
 
-Dropping the **`git` tool loses no protection**: guardrails are enforced at the
-shell layer (`shell.rs:311` calls `check_guardrails` before anything runs), so
-blanket staging, force-push and hook-skipping stay blocked through shell.
+**There is no `git` tool to remove** — it was added in `c677b88` and deleted
+since; only a stale doc reference in `secret_diff.rs:170` survives (itself dead
+code). It is named here because the usage figures below include it, and that is
+a trap worth marking: git already runs through `shell`, where guardrails apply
+(`shell.rs:311` calls `check_guardrails` before anything runs), so blanket
+staging, force-push and hook-skipping stay blocked without a dedicated tool.
 
 Deleting the nav tools deletes `lsp_nav.rs`. **`lsp.rs` must survive** —
 post-edit diagnostics use the same client, and that feature is valuable and well
@@ -250,9 +254,24 @@ in jail, which has no shell and would otherwise be unable to search or orient.
   `sed -i` is none of those and silently no-ops on a bad pattern.
 - **`todo`**, **`verify`** — pure harness state, and the verification ledger's
   only input. `verify` is the thinnest survivor.
-- **`replace`** — kept provisionally. 88 calls against `edit`'s 1331, and it
-  overlaps `edit`; the same atomicity argument applies, so it is not free to
-  drop. Next candidate if the surface needs trimming further.
+
+### Dropping `replace` has a real cost — recorded, not relitigated
+
+Unlike `ls` or `copy`, `replace` was not a thin wrapper: it is the multi-file
+mechanical-edit path, and `edit` takes **one edit per call** (there is no
+`edits[]` batch). So a twenty-file rename becomes twenty `edit` calls or one
+`sed -i`, and models will reach for the `sed`.
+
+That loses, on exactly the operation most likely to break a build: atomicity,
+post-edit hooks (formatters), LSP diagnostics, the read-before-mutate guard, and
+a clear failure when the pattern matches nothing — `sed` silently no-ops.
+
+Two mitigations, neither blocking:
+
+- **`verify` becomes load-bearing.** It is what catches a `sed` that did the
+  wrong thing, which strengthens the case for keeping it.
+- **An `edits[]` batch on `edit`** (already a deferred backlog item) would keep
+  multi-file mechanical changes on the guarded path. Worth more now than it was.
 
 ### Secret filtering moves to shell
 
@@ -541,11 +560,8 @@ the plan assumes the stated recommendation for the rest.
 6. Drop the file-tool `.git` guard (`PROTECTED_METADATA_DIRS`)? — assumed
    **yes**; `shell` bypasses it anyway, and it refuses legitimate `git config` /
    `.git/info/exclude` edits.
-7. Is `replace` kept? — assumed **yes, provisionally**. 88 calls against
-   `edit`'s 1331, and it overlaps `edit`; the atomicity argument still applies,
-   so it is not free to drop.
-8. Does `verify` stay? — assumed **yes**. The verification ledger's only input,
-   and the thinnest survivor of the cut.
+7. Does `verify` stay? — assumed **yes**, and now more strongly: with `replace`
+   gone, `verify` is what catches a `sed -i` that did the wrong thing.
 
 ### To verify before building
 
