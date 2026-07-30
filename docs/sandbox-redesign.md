@@ -46,7 +46,7 @@ exists to inspect third-party code you are unwilling to expose to.
 | Project `AGENTS.md` / skills | yes           | yes                            | yes                 | **no**                   |
 | Tool results wrapped         | no            | opt-in (config)                | opt-in (config)     | **always**               |
 | Escalation eligible          | n/a           | yes                            | yes                 | **never**                |
-| Backend                      | none          | Landlock preferred             | **bwrap** preferred | **none needed** ²        |
+| Backend                      | none          | Landlock preferred             | **bwrap** preferred | **none needed**          |
 
 ¹ **Assumption to confirm.** Your sketch put network removal only in `jail`. But
 every delegated agent loses shell network today, and `explore`/`review` are
@@ -124,12 +124,11 @@ Two axes that are currently tangled and must stay distinct:
 
 Resolution, in order:
 
-1. An explicit `tools` list on the profile wins.
-2. Otherwise `read_only` selects the read-only set.
-3. **`jail` is not derived from either.** It is a fixed set — `read`, `grep`,
-   `find`, `ls`, `tree` — and a profile's `tools` list cannot widen it. An
-   allow-list that a profile could extend is one edit away from putting `shell`
-   back inside the jail.
+1. **`jail` caps everything, and is applied last.** It is a fixed set — `read`,
+   `grep`, `find`, `ls`, `tree` — and nothing below can widen it.
+2. Otherwise, an explicit `tools` list on the profile wins.
+3. Otherwise `read_only` selects the read-only set. An allow-list that a profile
+   could extend is one edit away from putting `shell` back inside the jail.
 
 Point 3 is not belt-and-braces. `web_fetch` and `web_search` run **in the hrdr
 parent process, outside the sandbox** — `deny_network`'s own doc says so, which
@@ -151,28 +150,33 @@ children are unconfined by the OS. `check_read` runs in-process and validates
 the path the model _named_; it cannot constrain how a helper walks the
 filesystem once started.
 
-Resolution, in two parts:
+**Resolution: delete both subprocess backends.** `grep` becomes `Builtin`-only.
 
-**Delete the POSIX `grep` backend outright.** It only runs when `rg` is absent,
-so it never runs on a dev machine; it is exercised in CI only, and it has
-already shipped a real bug — the `--exclude-dir=.*` trap its own comment at
+The POSIX `grep` backend has earned it outright — it only runs when `rg` is
+absent, so never on a dev machine; it is exercised in CI only, and it has
+already shipped a real bug, the `--exclude-dir=.*` trap its own comment at
 `grep.rs:618` records as having reached a tag. `Builtin` covers that case
 strictly better: it walks with the `ignore` crate (ripgrep's own walker), so it
 is gitignore-aware, honours `hidden`/`no_ignore`, skips secret files via
 `secret_file_reason`, and routes its path through `ctx.resolve_read`.
 
-**Keep `rg`, but force `Builtin` in jail.** Deleting `rg` everywhere would cost
-two things that need not be paid outside jail:
+`Rg` goes for a reason that only became visible later: **`grep` is jail-only,
+and jail is forced to `Builtin`, so nothing calls `Rg` at all.** An earlier
+revision of this plan argued for keeping it — lookaround via PCRE2, and speed on
+large repos — on the premise that non-jail agents would still have `grep`. They
+will not. There is no outside-jail `grep` left to be fast.
 
-- **Lookaround.** Rust's `regex` crate deliberately has none; `rg` gets it via
-  PCRE2 (`ripgrep_args_add_pcre2_only_for_lookaround_patterns`). Builtin-only
-  makes `(?<=foo)bar` a hard error in every mode.
-- **Speed.** `Builtin` is a sequential walk with `read_to_string` per file and
-  no literal prefilter. Fine for an audit; noticeable on every search in a large
-  repo, and `grep` is among the most-used tools.
+**This costs lookaround, and that is a decision, not a detail.** Rust's `regex`
+crate deliberately has no lookaround; `rg` supplied it via PCRE2
+(`ripgrep_args_add_pcre2_only_for_lookaround_patterns`). Builtin-only makes
+`(?<=foo)bar` a hard error in jail — the one mode that still has `grep`. Audits
+rarely need lookaround and the error is clear, but if you want it, `Rg` has to
+stay and jail has to route its spawn through a sandbox, which reinstates jail's
+need for bwrap and its Linux-only limitation. See the open decisions.
 
-And an unconfined `rg` **violates nothing** in `write`/`read`, because neither
-mode confines reads. The unconfined spawn is only a policy breach in `jail`.
+`Builtin` being a sequential walk with `read_to_string` per file and no literal
+prefilter is then simply what `grep` is. Acceptable for an audit; it is no
+longer on the hot path for normal work, because normal work uses `shell`.
 
 ### The jail tool set, audited
 
@@ -198,8 +202,8 @@ it.** A future tool shelling out directly would silently punch the same hole and
 no test would notice. Worth a test that asserts the jail tool set spawns
 nothing.
 
-Still to verify: `proc.rs:331,381` spawns bash at two sites — confirm no
-jail-reachable tool reaches it.
+Checked: `proc.rs:331,381` spawn bash inside `#[tokio::test]` functions only —
+tests, not a production path. Nothing jail-reachable reaches them.
 
 ## Tool surface
 
@@ -610,16 +614,25 @@ does this. Stated here so nobody later "fixes" it.
 dropping the file-tool `.git` guard, since `shell` bypasses it anyway and it
 refuses legitimate `git config` / `.git/info/exclude` edits).
 
-Also deleted, because jail requires bwrap and hard-fails without it:
-`STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE` (there is no degraded path left to warn
-about). And `DenialKind::GpuStrict` with its note — a denial note is built from
-command output, and with no execution in jail no such output exists. Jail is in
-fact unreachable for **every** `sandbox_denial` arm; those notes now serve
-`write` and `read` only.
+Also deleted, all because **jail spawns no subprocess and therefore uses no OS
+backend**:
 
-Kept: `readable_roots`, `check_read`, the jail bwrap mount set,
-`git_ssh_command_for_userns`, the `SshUserNamespace` note, `git_metadata_roots`
-(a linked worktree still needs the parent's object store writable to commit).
+- **The jail (ex-`Strict`) bwrap mount set** — the `/usr` + `/etc` read-only
+  binds, the tmpfs `/tmp`, the read-only root binds, and the
+  `usr_merge_compat_args` helper. `sandboxed_shell_command` is never called in
+  jail, so `bwrap_args`' Strict arm is unreachable. An earlier revision of this
+  plan listed it as _kept_, which contradicted jail needing no backend.
+- **`STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE`** — there is no jail-under-Landlock
+  path to warn about, because there is no jail-under-anything path.
+- **`DenialKind::GpuStrict` and its note** — a denial note is built from command
+  output, and jail produces none. Jail is in fact unreachable for **every**
+  `sandbox_denial` arm; those notes now serve `write` and `read` only.
+
+Kept: `readable_roots` and `check_read` — in jail they are the _whole_ of the
+confinement, not a supplement to it. Also `git_ssh_command_for_userns`, the
+`SshUserNamespace` note (both live on `write`'s bwrap fallback), and
+`git_metadata_roots` (a linked worktree still needs the parent's object store
+writable to commit).
 
 ### Renaming `strict` to `jail` is a clean break
 
@@ -634,8 +647,8 @@ help.
 **`tool_output_dir` must become per-session.** It is per-user today
 (`context.md` §2.5), and it is a readable root — so a jailed agent could read
 spooled shell output from other sessions on other projects, flatly contradicting
-"only its own cwd". Strict's readable set is `cwd` + _this session's_ output
-dir. Scratch drops out of jail entirely: nothing can write it.
+"only its own cwd". Jail's readable set is `cwd` + _this session's_ output dir.
+Scratch drops out of jail entirely: nothing can write it.
 
 Large results are spooled by the parent process, outside the sandbox, so
 spooling still works with nothing writable. The agent only needs to _read_ the
@@ -648,10 +661,11 @@ Mostly-deletion first, so each slice is independently reviewable.
 1. **Remove the `.git` lock.** `protect_git`, `deny_git_writes` and friends;
    collapse `Widening` to one grant; delete `DEFAULT_RULES`.
 2. **`tool_output_dir` per session.**
-3. **Mode → backend.** Write→Landlock, Read→bwrap, Strict→bwrap-required with
-   the eager probe and both failure sites. Mode → shell network.
-4. **Mode → tool set.** Pin jail to the fixed read-only set; the read-only
-   implication.
+3. **Mode → backend.** Write→Landlock, Read→bwrap, jail→none (delete the Strict
+   bwrap arm and its mount helpers). Mode → shell network. No eager probe and no
+   hard-failure path — both belonged to the superseded bwrap-required design.
+4. **Mode → tool set.** Pin jail to the fixed five, and make the cap unwidenable
+   by a profile's `tools` list.
 5. **Mode → prompt surfaces.** No working-tree instructions in jail, gated at
    discovery so `set_cwd` cannot re-seed.
 6. **Unified tool-result wrapping.** Policy flag, registry choke point, per-tool
@@ -705,29 +719,36 @@ the plan assumes the stated recommendation for the rest.
   hard-failure requirement decided earlier is moot and jail works on every
   platform.
 
-### Still assumed
+### Needs your input
 
-1. Does `read` deny shell network? — assumed **yes** (otherwise `explore` and
-   `review` _gain_ a socket they do not have today).
-2. Fold in per-session `tool_output_dir`? — assumed **yes**; it is a
-   prerequisite, since jail would otherwise read other sessions' spooled output.
-3. Wrapping as a config knob as well as mode-driven? — assumed **yes**.
-4. Agent name — `jail` makes `prisoner` internally consistent, so the earlier
-   objection is weaker. Whatever it is called, the persona text should not lean
-   on punishment framing: that shapes behaviour without improving rigour.
-5. Startup notice describing what `jail` implies? — assumed **yes**.
-6. Drop the file-tool `.git` guard (`PROTECTED_METADATA_DIRS`)? — assumed
-   **yes**; `shell` bypasses it anyway, and it refuses legitimate `git config` /
-   `.git/info/exclude` edits.
-7. Does `verify` stay? — assumed **yes**. The verification ledger's only input,
-   and the thinnest survivor of the cut.
+Sharpened by the full review — these are the ones where a different answer
+changes what gets built, in rough order of consequence.
+
+1. **Does `grep` keep lookaround?** Builtin-only drops it. Keeping it means
+   keeping `Rg`, which means jail must route a subprocess through a sandbox,
+   which reinstates jail's bwrap requirement and its Linux-only limitation. The
+   whole "jail works everywhere" property hangs on this. Assumed: **drop
+   lookaround**.
+2. **How does a jailed agent get a narrower readable root than the session
+   cwd?** `task` has no `cwd`, so "audit `vendor/sketchy`" reads the whole
+   project — see the section above. Needs a mechanism; blocks the audit agent
+   being useful for its stated purpose.
+3. **Does `read` deny shell network?** A real behaviour change for `explore` and
+   `review`. Assumed: **yes**.
+4. **Drop the file-tool `.git` guard?** Security-adjacent removal, so worth an
+   explicit yes. Assumed: **yes**.
+5. **The audit agent's name.** Assumed: `audit`, but `jail` makes `prisoner`
+   coherent. Whatever it is, keep punishment framing out of the persona text.
+
+### Assumed, low stakes — say nothing and these stand
+
+- Per-session `tool_output_dir` — **yes**, it is a prerequisite for jail's
+  readable set.
+- Tool-result wrapping as a config knob as well as mode-driven — **yes**, one
+  bool.
+- A startup notice describing what `jail` implies — **yes**.
+- `verify` stays — **yes**; the verification ledger's only input.
 
 ### To verify before building
 
-- **`proc.rs:331,381`** spawns bash at two sites — confirm no jail-reachable
-  tool reaches it. If one does, it needs the same treatment as `grep`.
-- **The `Rg` grep backend may now be dead.** With `grep` jail-only and jail
-  forced to `Builtin`, nothing calls `Rg`. If so, delete it and the
-  PCRE2/lookaround support with it — which makes the earlier "keep `rg` outside
-  jail" reasoning moot, since there is no outside-jail `grep` left. Confirm
-  before writing code either way.
+Nothing outstanding — both former items are resolved in the body.
