@@ -50,6 +50,13 @@ struct ReadArgs {
 
 #[async_trait]
 impl Tool for ReadTool {
+    /// The file itself — in an audit, provenance per byte is the whole point.
+    fn output_source(&self, args: &serde_json::Value) -> String {
+        args.get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("file {p}"))
+            .unwrap_or_else(|| "file".to_string())
+    }
     fn read_only(&self) -> bool {
         true
     }

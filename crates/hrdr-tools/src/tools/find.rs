@@ -22,6 +22,12 @@ struct FindArgs {
 
 #[async_trait]
 impl Tool for FindTool {
+    /// The glob that produced these paths.
+    fn output_source(&self, args: &serde_json::Value) -> String {
+        let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("*");
+        format!("glob {pattern:?}")
+    }
+
     fn read_only(&self) -> bool {
         true
     }

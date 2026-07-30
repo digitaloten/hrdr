@@ -88,6 +88,23 @@ const GREP_MAX_CONTEXT: usize = 10;
 
 #[async_trait]
 impl Tool for GrepTool {
+    /// Pattern and path, so a hit's provenance travels with it.
+    fn output_source(&self, args: &serde_json::Value) -> String {
+        let field = |k: &str| {
+            args.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let path = field("path");
+        let path = if path.is_empty() {
+            ".".to_string()
+        } else {
+            path
+        };
+        format!("grep {:?} in {path}", field("pattern"))
+    }
+
     fn read_only(&self) -> bool {
         true
     }

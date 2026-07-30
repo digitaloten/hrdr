@@ -15,8 +15,9 @@
 //! writing a script and running it, `git -c alias.x='!…'`, environment tricks —
 //! and no pattern set catches them all. Treat it as a seatbelt, not a lock. The
 //! defense against a hostile *instruction* is not letting untrusted text reach a
-//! shell in the first place (see the untrusted-content marking on the read/web
-//! tools), not this list.
+//! shell in the first place — an agent auditing code it does not trust gets no
+//! shell at all (`SandboxMode::Jail`), and every result it does get is marked as
+//! untrusted content (`SandboxPolicy::wrap_tool_results`). Not this list.
 
 use regex::Regex;
 

@@ -31,6 +31,12 @@ pub(crate) struct McpTool {
 
 #[async_trait]
 impl Tool for McpTool {
+    /// Already wrapped by `execute`: a third-party server's response is untrusted
+    /// by construction, whatever mode the agent runs in.
+    fn wraps_own_output(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         self.exposed_name
     }

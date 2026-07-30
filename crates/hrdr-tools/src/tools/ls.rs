@@ -17,6 +17,12 @@ struct LsArgs {
 
 #[async_trait]
 impl Tool for LsTool {
+    /// The directory listed — a hostile *filename* is a real injection vector.
+    fn output_source(&self, args: &serde_json::Value) -> String {
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        format!("listing of {path}")
+    }
+
     fn read_only(&self) -> bool {
         true
     }

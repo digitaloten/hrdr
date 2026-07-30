@@ -1662,11 +1662,17 @@ impl Agent {
         }
         let mut ctx = ToolContext::new(config.cwd.clone());
         ctx.lsp = lsp;
-        let sandbox = hrdr_tools::SandboxPolicy::for_agent(
+        let mut sandbox = hrdr_tools::SandboxPolicy::for_agent(
             sandbox_mode,
             &config.cwd,
             &config.sandbox_writable_roots,
         );
+        // Config can turn the untrusted-content envelope on outside jail, but never
+        // off inside it: `for_agent` already set it for the mode, and this only ever
+        // ORs. A knob that could switch it off in jail would let a config file
+        // silently remove the marking from the one mode whose whole premise is that
+        // the content is hostile.
+        sandbox.wrap_tool_results |= config.wrap_tool_results;
         // No git lock and no network confinement, for anybody. An agent working in
         // the user's project — main or delegated — is assumed to have authority
         // over that project: it commits, it pushes, it fetches dependencies. The

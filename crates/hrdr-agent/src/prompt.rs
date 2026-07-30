@@ -3029,6 +3029,7 @@ mod tests {
             writable_roots: roots.clone(),
             readable_roots: roots.clone(),
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
         let s = sandbox_section(&plain);
         assert!(
@@ -3080,6 +3081,7 @@ mod tests {
                 writable_roots: roots.clone(),
                 readable_roots: roots.clone(),
                 cache_roots: Vec::new(),
+                wrap_tool_results: false,
             });
             // `jail` may state that it has no network — it holds no tool that could
             // open one — but no mode may describe the *sandbox* as confining it.
@@ -3108,6 +3110,7 @@ mod tests {
             ],
             readable_roots: vec![std::path::PathBuf::from("/work/wt-1")],
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
         let s = sandbox_section(&policy);
         assert!(
@@ -3127,6 +3130,7 @@ mod tests {
             writable_roots: Vec::new(),
             readable_roots: vec![std::path::PathBuf::from("/work/ro")],
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
         let s = sandbox_section(&ro);
         assert!(s.contains("Mode: read"));
@@ -3144,6 +3148,7 @@ mod tests {
             writable_roots: Vec::new(),
             readable_roots: vec![std::path::PathBuf::from("/work/ro")],
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
         let s = sandbox_section(&strict);
         assert!(s.contains("Mode: jail"));

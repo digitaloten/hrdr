@@ -46,6 +46,12 @@ struct Collected {
 
 #[async_trait]
 impl Tool for TreeTool {
+    /// The directory walked — as with `ls`, the names themselves are content.
+    fn output_source(&self, args: &serde_json::Value) -> String {
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        format!("tree of {path}")
+    }
+
     fn read_only(&self) -> bool {
         true
     }

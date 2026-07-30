@@ -126,6 +126,19 @@ pub struct SandboxPolicy {
     pub writable_roots: Vec<PathBuf>,
     /// Canonicalized readable roots; only consulted in `Read` mode.
     pub readable_roots: Vec<PathBuf>,
+    /// Whether every tool result is wrapped in an untrusted-content envelope
+    /// ([`crate::wrap_untrusted`]) before the model sees it.
+    ///
+    /// Always true in [`SandboxMode::Jail`], where the premise is that the content
+    /// under audit may try to act through the agent, and where the envelope's
+    /// `source` label is exactly what you want attached to every byte. Settable
+    /// from config in the other modes too — it is one bool, and wanting it does not
+    /// mean wanting a whole different mode.
+    ///
+    /// **Read in exactly one place**, [`crate::ToolRegistry::execute`], because
+    /// that is the only place every tool passes through. Two readers would be two
+    /// chances to disagree about whether a payload was already wrapped.
+    pub wrap_tool_results: bool,
     /// Which of [`writable_roots`](Self::writable_roots) are package-manager
     /// caches ([`package_cache_roots`]).
     ///
@@ -154,6 +167,7 @@ impl SandboxPolicy {
             writable_roots: Vec::new(),
             readable_roots: Vec::new(),
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         }
     }
 
@@ -206,6 +220,9 @@ impl SandboxPolicy {
             writable_roots,
             readable_roots,
             cache_roots,
+            // Jail always wraps: the content it reads is the thing being distrusted.
+            // Every other mode starts off and is turned on from config.
+            wrap_tool_results: mode == SandboxMode::Jail,
         }
     }
 
@@ -1256,6 +1273,7 @@ pub(crate) fn confined_ctx(dir: &Path, mode: SandboxMode) -> crate::ToolContext 
         writable_roots: vec![root.clone()],
         readable_roots: vec![root],
         cache_roots: Vec::new(),
+        wrap_tool_results: false,
     });
     ctx
 }
@@ -1742,6 +1760,7 @@ mod tests {
             ),
             readable_roots: Vec::new(),
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
         check_write(&policy, &common.join("index")).unwrap_err();
         check_write(&policy, &common.join("refs").join("heads").join("main")).unwrap_err();
@@ -1771,6 +1790,7 @@ mod tests {
             writable_roots: vec![root.clone()],
             readable_roots: vec![root],
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
 
         for allowed in [
@@ -1823,6 +1843,7 @@ mod tests {
             writable_roots: canonical_roots(roots),
             readable_roots: Vec::new(),
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
 
         check_write(&policy, &wt.join("f.txt")).unwrap();
@@ -1862,6 +1883,7 @@ mod tests {
             writable_roots: vec![PathBuf::from("/work/wt"), PathBuf::from("/tmp/scratch")],
             readable_roots: Vec::new(),
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
         assert_eq!(
             seatbelt_profile(SandboxMode::Write, &policy),
@@ -1886,6 +1908,7 @@ mod tests {
             writable_roots: vec![PathBuf::from("/work/we\"ird")],
             readable_roots: Vec::new(),
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
         assert!(
             seatbelt_profile(SandboxMode::Write, &odd)
@@ -1901,6 +1924,7 @@ mod tests {
             writable_roots: Vec::new(),
             readable_roots: Vec::new(),
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
         assert!(
             !seatbelt_profile(SandboxMode::Write, &empty).contains("file-write*"),
@@ -1927,6 +1951,7 @@ mod tests {
             writable_roots: vec![PathBuf::from("/work/wt")],
             readable_roots: Vec::new(),
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
         assert_eq!(
             seatbelt_profile(SandboxMode::Write, &policy),
@@ -1961,6 +1986,7 @@ mod tests {
             writable_roots: Vec::new(),
             readable_roots: vec![PathBuf::from("/work/wt")],
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
         assert_eq!(
             seatbelt_profile(SandboxMode::Jail, &policy),
@@ -1991,6 +2017,7 @@ mod tests {
             writable_roots: vec![PathBuf::from("/work/wt")],
             readable_roots: Vec::new(),
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
         let args = argv(&seatbelt_args(&policy, crate::Shell::Bash, "echo hi"));
         assert_eq!(args[0], "-p");
@@ -2018,6 +2045,7 @@ mod tests {
             writable_roots: vec![canonicalize_nearest(dir.path())],
             readable_roots: Vec::new(),
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
 
         let target = canonicalize_nearest(outside.path()).join("escaped");
@@ -2179,6 +2207,7 @@ mod tests {
             writable_roots: roots,
             readable_roots: Vec::new(),
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         });
 
         std::fs::write(wt.join("f.txt"), "hi").unwrap();
@@ -2477,6 +2506,7 @@ mod tests {
             writable_roots: vec![canonicalize_nearest(dir.path())],
             readable_roots: Vec::new(),
             cache_roots: Vec::new(),
+            wrap_tool_results: false,
         };
 
         let target = outside.path().join("escaped");

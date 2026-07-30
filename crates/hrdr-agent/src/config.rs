@@ -446,10 +446,21 @@ pub struct AgentConfig {
     /// [`effective_sandbox`], once, in `Agent::new`.
     pub sandbox: SandboxMode,
     /// Extra directories a confined agent may write to on top of the built-in
-    /// writable roots (cwd, temp, scratch, tool-output, git metadata) — the
-    /// escape hatch for build caches like `~/.cargo` that a cold build writes.
+    /// writable roots (cwd, temp, scratch, tool-output, git metadata, the
+    /// package-manager caches) — the escape hatch for a **bespoke** layout the
+    /// defaults do not cover, not the mechanism by which mainstream tooling works.
     /// Absolute paths only; a relative entry is a config-file error.
     pub sandbox_writable_roots: Vec<PathBuf>,
+    /// Wrap every tool result in an untrusted-content envelope
+    /// (`wrap_tool_results = true`). Default `false`; always on in
+    /// [`SandboxMode::Jail`] regardless, where the content under audit is the thing
+    /// being distrusted.
+    ///
+    /// One bool rather than a mode, because wanting provenance markers on tool
+    /// output does not mean wanting a read-only agent with no shell. The cost is
+    /// tokens and a little noise on every result, which is why it is off by
+    /// default.
+    pub wrap_tool_results: bool,
     /// Shared cell holding the parent session's sub-agent transcript directory
     /// (`sessions/<slug>/subagents/<id>/`), resolved lazily because the session
     /// id is assigned on first autosave, not at construction. The `task` tool
@@ -771,6 +782,8 @@ pub(crate) struct FileConfig {
     pub(crate) sandbox: Option<SandboxMode>,
     #[serde(default)]
     pub(crate) sandbox_writable_roots: Vec<String>,
+    /// `wrap_tool_results = true` — mark every tool result as untrusted content.
+    pub(crate) wrap_tool_results: Option<bool>,
     #[serde(default)]
     pub(crate) providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
@@ -1009,6 +1022,7 @@ impl Default for AgentConfig {
             read_only: false,
             sandbox: SandboxMode::Write,
             sandbox_writable_roots: Vec::new(),
+            wrap_tool_results: false,
             child_transcript_dir: None,
             lsp: true,
             lsp_wait_secs: None,
@@ -1644,6 +1658,9 @@ impl AgentConfig {
         }
         if let Some(v) = fc.sandbox {
             self.sandbox = v;
+        }
+        if let Some(wrap) = fc.wrap_tool_results {
+            self.wrap_tool_results = wrap;
         }
         if !fc.sandbox_writable_roots.is_empty() {
             self.sandbox_writable_roots = fc

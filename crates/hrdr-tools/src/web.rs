@@ -186,6 +186,12 @@ struct FetchArgs {
 
 #[async_trait]
 impl Tool for WebFetchTool {
+    /// Already wrapped by `execute` — see [`Tool::wraps_own_output`] for why this
+    /// is a declared property and not a sniff at the output.
+    fn wraps_own_output(&self) -> bool {
+        true
+    }
+
     fn read_only(&self) -> bool {
         true
     }
@@ -283,6 +289,12 @@ struct SearchArgs {
 
 #[async_trait]
 impl Tool for WebSearchTool {
+    /// Already wrapped by `execute` — see [`Tool::wraps_own_output`] for why this
+    /// is a declared property and not a sniff at the output.
+    fn wraps_own_output(&self) -> bool {
+        true
+    }
+
     fn read_only(&self) -> bool {
         true
     }
