@@ -306,34 +306,66 @@ watches them without asking anyone. And the user can **steer a sub-agent
 directly**, via `@agent` mention completion ranked against `agent_names`
 (`completion.rs:59`) and routed by `prepare_outgoing_via` (`app.rs:2292`).
 
-| Tool              | Audience                               | Verdict           |
-| ----------------- | -------------------------------------- | ----------------- |
-| `task`            | model                                  | keep              |
-| `task_steer`      | model, no substitute                   | keep              |
-| `task_cancel`     | model, no substitute                   | keep              |
-| `task_revive`     | model — convenience over re-delegating | weak              |
-| `task_list`       | only as `task_revive`'s on-disk index  | falls with revive |
-| `task_transcript` | model self-diagnosis                   | weak — see below  |
-| `task_output`     | **none**                               | **remove**        |
+| Tool              | Audience                            | Verdict    |
+| ----------------- | ----------------------------------- | ---------- |
+| `task`            | model                               | **keep**   |
+| `task_steer`      | model, no substitute                | **keep**   |
+| `task_cancel`     | model, no substitute                | **keep**   |
+| `task_output`     | none                                | **remove** |
+| `task_transcript` | none — report + `git diff` cover it | **remove** |
+| `task_revive`     | none — reviving a tainted context   | **remove** |
+| `task_list`       | none — nothing left to index        | **remove** |
+
+Seven becomes **three**; ten before the worktree removal.
 
 **`task_output` has no audience.** The user reads the pane live and can act on
-it directly; the model gets results delivered automatically and its own
+it directly; the model gets results delivered automatically, and the tool's own
 description says _"you never need to poll."_
 
-**`task_list` is not a status tool any more.** Its live half serves nobody —
-panes cover the user, auto-delivery covers the model. Only the on-disk half
-(`NNN-slug` stems, `orphaned` markers) has a purpose, and that purpose is
-feeding `task_revive`. The two stand or fall together.
+**`task_transcript` is covered by what already arrives.** A finished task
+reports back, and its changes are in the working directory — the report says
+what it claims and `git diff` says what it did. The delta between those two IS
+the diagnosis signal; the conversation is not needed to see it.
+
+**`task_revive` is actively harmful where it is most tempting.** A run that went
+wrong is exactly a run whose context contains the wrong reasoning, and models
+anchor on their own prior output. Reviving it continues from the turn that
+failed. Starting fresh with a better brief is both cheaper to reason about and
+more likely to work.
+
+**`task_list` falls with revive.** Its live half serves nobody — panes cover the
+user, auto-delivery covers the model. Its on-disk half (`NNN-slug` stems,
+`orphaned` markers) existed solely to index runs for revive, and nothing else
+consumes them: worktree GC went with `aac1787`, and the user's panes read the
+transcript files from disk directly rather than through a model tool.
 
 **`task_steer` and `task_cancel` survive, and the distinction matters:**
-`@agent` is the _user_ steering. `task_steer` is the _model_ redirecting a
+`@agent` is the _user_ steering. These are the _model_ redirecting or stopping a
 sub-agent on something it learned — the spec was wrong, a sibling's finding
-changed the brief. No user action substitutes for a model-initiated redirect,
-and `task_cancel` is the model's only stop valve.
+changed the brief, the task became redundant. No user action substitutes for a
+model-initiated one. They do not depend on `task_list`: `task` already returns
+`"Started background task #{id} (label)"` (`delegation.rs:528`).
 
-Minimum defensible set is **three** (`task`, `task_steer`, `task_cancel`);
-**five** if cross-session continuation is wanted (`+ task_revive`, `+ task_list`
-reduced to on-disk only).
+### Two consequences to carry forward
+
+**Gap #4 must be fixed structurally, which was always the plan.** `context.md`
+§1 #4 says the fix should _"make a failed `verify` structural in the hand-back,
+not dependent on the model choosing to mention it."_ Keeping `task_transcript`
+left a tempting wrong answer available — "the model can go read what happened."
+Removing it forces the right one.
+
+**An interrupted write sub-agent is a real edge.** A session closed mid-run
+leaves changes in the tree with no report, and with transcript and revive both
+gone the model cannot learn what it was doing. The user has the pane and
+re-briefs. That is consistent with keeping the user in the loop, but it should
+be a known limitation rather than a discovery.
+
+**Implementation trap.** `c2cd73b` exists because the previous tool deletion
+left five references in live model-facing text. This one starts with at least
+five: `templates/delegate.md` lines 66, 70, 74 and 82, plus `task_steer`'s own
+error string (`delegation.rs:2162`) which reads `(see \`task_list\`)`. Removing
+the tools without sweeping these tells the model to call things that do not
+exist.
 
 ### `task_transcript` is not a worktree leftover
 
@@ -594,8 +626,10 @@ Mostly-deletion first, so each slice is independently reviewable.
    opt-out, harness notes outside the envelope.
 7. **`sandbox` on agent profiles** + precedence + the audit agent and its
    persona template.
-8. **Tool surface.** Delete the unused tools, make `grep`/`find`/`tree`/`ls`
-   jail-only, and lift `grep_line_is_secret` onto the shell output path.
+8. **Tool surface.** Delete the unused tools, cut the `task` family to three,
+   make `grep`/`find`/`tree`/`ls` jail-only, and lift `grep_line_is_secret` onto
+   the shell output path. **Sweep model-facing text** — `templates/delegate.md`
+   and `task_steer`'s error string still name the removed tools.
 
 ## Accepted losses
 
@@ -630,9 +664,11 @@ the plan assumes the stated recommendation for the rest.
   **`replace` is kept** despite low usage: it is the only multi-file
   mechanical-edit path and `edit` has no batch form, so dropping it would push
   mechanical refactors onto `sed -i`.
-- **`task_output` is removed** — no audience: the user watches sub-agent panes
-  live and can steer them directly with `@agent`, and the model gets results
-  delivered automatically.
+- **The `task` family is three tools**: `task`, `task_steer`, `task_cancel`.
+  `task_output`, `task_transcript`, `task_revive` and `task_list` are all
+  removed — the user watches sub-agent panes live and steers them with `@agent`,
+  results are delivered automatically, and reviving a failed run continues from
+  the reasoning that failed.
 - **Jail needs no OS backend** — nothing it can run spawns a subprocess, so the
   hard-failure requirement decided earlier is moot and jail works on every
   platform.
@@ -653,14 +689,6 @@ the plan assumes the stated recommendation for the rest.
    `.git/info/exclude` edits.
 7. Does `verify` stay? — assumed **yes**. The verification ledger's only input,
    and the thinnest survivor of the cut.
-
-### Task family — still to decide
-
-- **`task_revive` and `task_list`**: keep both (five tools) or drop both
-  (three)? They are coupled — `task_list`'s only remaining purpose is indexing
-  on-disk runs for revive.
-- **`task_transcript`**: drop it, and accept that gap #4's fix must not depend
-  on it?
 
 ### To verify before building
 
