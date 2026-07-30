@@ -473,7 +473,20 @@ impl AgentRegistry {
             if let Some(e) = v.iter().find(|e| e.key == key)
                 && let Ok(mut q) = e.steering.lock()
             {
-                q.push_back(msg);
+                // When the user types multiple lines while the agent is running,
+                // each `spawn_turn` call pushes a separate message on the queue.
+                // Merging adjacent messages avoids splitting them into separate
+                // user turns — each of which carries the full system prompt and
+                // tool definitions, and would be delivered as a separate
+                // round-trip — for a burst of lines that are really one thought.
+                if let Some(last) = q.back_mut() {
+                    last.display.push('\n');
+                    last.display.push_str(&msg.display);
+                    last.sent.push('\n');
+                    last.sent.push_str(&msg.sent);
+                } else {
+                    q.push_back(msg);
+                }
             }
         });
     }

@@ -1469,10 +1469,10 @@ async fn a_queued_message_rides_in_with_the_tool_results() {
     assert!(!h.app.running(), "no follow-up turn was spawned");
 }
 
-/// A cancelled turn drops the message it was carrying rather than leaking it
-/// into the next one.
+/// Esc cancels only the turn in flight — pending messages survive and launch
+/// the next turn.
 #[tokio::test]
-async fn cancelling_drops_an_undelivered_steer() {
+async fn cancelling_preserves_pending_steering() {
     let mut h = Harness::new(vec![]).await;
     h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     h.type_str("never mind");
@@ -1480,40 +1480,38 @@ async fn cancelling_drops_an_undelivered_steer() {
     assert_eq!(h.app.steering_len_for_test(), 1);
 
     h.app.cancel_turn();
-    assert!(h.app.pending().is_empty());
-    assert_eq!(h.app.steering_len_for_test(), 0, "the agent's copy too");
+    // The message stays in the queue — Esc cancels only the current turn, not
+    // what was waiting for it.
+    assert!(!h.app.pending().is_empty());
+    assert_eq!(h.app.steering_len_for_test(), 1, "the message survives");
 }
 
-/// Several mid-turn submits queue up and are sent one per completed turn, in the
-/// order they were typed.
+/// Several mid-turn submits queue up and are merged into a single message —
+/// each line the user types while waiting is one thought, not separate turns.
 #[tokio::test]
-async fn queued_messages_are_sent_fifo_one_turn_at_a_time() {
+async fn queued_messages_merge_and_survive_cancel() {
     let mut h = Harness::new(vec![]).await;
     h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     for msg in ["one", "two"] {
         h.type_str(msg);
         h.press(KeyCode::Enter);
     }
-    // Queued in the order typed, not dumped into the transcript at submit.
-    assert_eq!(h.app.pending(), ["one", "two"]);
+    // Merged at enqueue time, so only one entry in the queue.
+    assert_eq!(h.app.pending(), ["one\ntwo"]);
 
-    // The turn ends: a fresh turn is spawned to drain the queue, oldest first.
-    // The agent takes messages off its own queue as `run` delivers them (the head
-    // is the opener), so nothing is popped synchronously here.
+    // The turn ends: a fresh turn is spawned to drain the queue.
     h.app.on_turn_msg(TurnMsg::Done(None));
     assert!(
         h.app.running(),
         "a fresh turn was spawned to drain the queue"
     );
-    assert_eq!(
-        h.app.pending(),
-        ["one", "two"],
-        "still FIFO on the agent's queue, for run to drain oldest first"
-    );
 
-    // Cancelling drops what is still waiting rather than sending it later.
+    // Cancelling preserves the queued messages — Esc only kills the in-flight turn.
     h.app.cancel_turn();
-    assert!(h.app.pending().is_empty(), "a cancel discards the queue");
+    assert!(
+        !h.app.pending().is_empty(),
+        "queued messages survive cancel"
+    );
 }
 
 /// Regression: meta lines, the thinking spinner, stats lines, and queued-message

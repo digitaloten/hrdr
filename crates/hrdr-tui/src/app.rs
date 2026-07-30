@@ -1875,9 +1875,6 @@ impl App {
             self.quit_reap = Some(handle);
         }
         self.registry.end_turn(hrdr_agent::MAIN_KEY);
-        // Undelivered messages would otherwise leak into the next turn.
-        let dropped = self.registry.clear_pending(hrdr_agent::MAIN_KEY);
-        self.push_entry(Entry::system(hrdr_app::cancel_message(dropped)));
         // The turn never reached `Done`, so nothing has autosaved the visible
         // user message + whatever partial reply streamed in before the
         // cancel. Persist it now — the same best-effort save every other
@@ -1889,6 +1886,23 @@ impl App {
         // event, so those entries keep `done: false` and spin forever.
         self.sync_panes();
         hrdr_agent::settle_restored_tools(&mut self.panes.main_mut().state.transcript);
+        // If the user typed while the turn was running, those messages are still
+        // in the steering queue. Run them now rather than dropping them — Esc
+        // cancels only the turn that was in flight, not what was waiting for it.
+        let pending = self.registry.pending(hrdr_agent::MAIN_KEY);
+        if !pending.is_empty() {
+            // Sync the pending display into the transcript so the UI shows what
+            // was typed, then launch a new turn.
+            self.push_entry(Entry::notice(format!(
+                "cancelled — {} pending message(s) queued for the next turn",
+                pending.len()
+            )));
+            // Don't enqueue anything — the messages are already there. Just
+            // launch the turn; `run` will drain them.
+            self.launch_turn();
+        } else {
+            self.push_entry(Entry::system(hrdr_app::cancel_message(0)));
+        }
     }
 
     /// Quit the session. If a turn is running, cancel it first — which

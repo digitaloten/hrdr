@@ -2612,7 +2612,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
 /// adds that).
 fn text_lines(text: &str, style: Style) -> Vec<Line<'static>> {
     text.split('\n')
-        .map(|raw| Line::from(Span::styled(raw.to_string(), style)))
+        .map(|raw| Line::from(Span::styled(raw.replace('\t', "    "), style)))
         .collect()
 }
 
