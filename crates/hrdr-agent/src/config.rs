@@ -417,7 +417,8 @@ pub struct AgentConfig {
     /// Explicit `(project, global)` memory roots that override the cwd-derived
     /// ones. Set for a delegated sub-agent so it shares the **parent's** project
     /// memory rather than keying the project scope by its own cwd — a write
-    /// sub-agent runs in a worktree, whose slug would otherwise resolve to a
+    /// sub-agent may run in a narrower `cwd` than the parent, whose slug would
+    /// otherwise resolve to a
     /// throwaway, empty project scope instead of the repo's. `None` = derive from
     /// cwd (the main agent's path). Runtime-only; not read from config.
     pub memory_roots: Option<(PathBuf, PathBuf)>,
@@ -1800,13 +1801,19 @@ impl AgentConfig {
 /// - A read-only agent takes `read`: broad reads, no writable root anywhere.
 ///   That is what makes it read-only now that it has a shell — the tool set no
 ///   longer does it.
-/// - …unless the session asked for `strict`, which is the same no-write
-///   guarantee with reads confined as well. Only a read-only agent can honour
-///   it; see the next rule.
+/// - …unless the session asked for `jail`, which adds confined reads AND a
+///   read-only tool set with no shell. Only a read-only agent can honour it; see
+///   the next rule.
 /// - A write-capable agent must be able to write, so it floors at `write` even
-///   when the session default is `read` or `strict` — its writable roots are
-///   what confine it. A `strict` session therefore means "strict for the agents
-///   that can be, `write` for the ones that must write", not "nothing can run".
+///   when the session default is `read` or `jail` — its writable roots are what
+///   confine it. A `jail` session therefore means "jail for the agents that can
+///   be, `write` for the ones that must write", not "nothing can run".
+///
+///   That floor is a real footgun for `jail` specifically, since somebody typing
+///   it is asking to be contained and would otherwise be handed a full-write
+///   session without being told. `Agent::new` emits a notice when it bites, and
+///   points at the `prisoner` agent — whose own declared mode is absolute and
+///   therefore never floored.
 pub fn effective_sandbox(session: SandboxMode, read_only: bool) -> SandboxMode {
     match (session, read_only) {
         (SandboxMode::None, _) => SandboxMode::None,

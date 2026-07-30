@@ -512,6 +512,10 @@ pub(crate) async fn run_streamed_command(
     // swallowed: output that vanished with no explanation reads as a broken command,
     // and a model that cannot tell "filtered" from "no matches" re-runs the search.
     let mut secrets_dropped: usize = 0;
+    // The shape the per-line path filter cannot see: `git diff` names `.env` ONCE, in
+    // a header, and then prints its contents as `+SECRET=…` lines that name no file
+    // at all. See `DiffRedactor`.
+    let mut redactor = crate::tools::secret_diff::DiffRedactor::default();
 
     macro_rules! ingest_line {
         ($line:expr) => {{
@@ -525,10 +529,21 @@ pub(crate) async fn run_streamed_command(
             // `cat ~/.ssh/id_rsa` and guardrails do not stop it. See
             // `grep_line_is_secret`, which used to filter the `grep` tool's own
             // output — one path, while this front door stood open.
-            if crate::grep_line_is_secret(line, &ctx.cwd) {
+            // A diff header both opens a section and ends the previous one, so it is
+            // always emitted — the model should see THAT a credential file changed,
+            // just not what is in it.
+            use crate::tools::secret_diff::LineAction;
+            let action = redactor.observe(line, &ctx.cwd);
+            if crate::grep_line_is_secret(line, &ctx.cwd) || action == LineAction::Drop {
                 // A block expression, not a `continue`: this macro expands inside an
                 // async body where the enclosing loop is not always the one a
                 // `continue` would target.
+                secrets_dropped += 1;
+            } else if action == LineAction::ReplaceWithMarker {
+                let marker = crate::tools::secret_diff::REDACTED_DIFF_MARKER;
+                ctx.emit(format!("{marker}\n"));
+                head.push_str(marker);
+                head.push('\n');
                 secrets_dropped += 1;
             } else {
                 // Stream to the UI (unchanged from current behaviour).

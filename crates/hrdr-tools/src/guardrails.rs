@@ -271,12 +271,20 @@ pub fn check_guardrails<'a>(command: &str, rails: &'a [Guardrail]) -> Option<&'a
 const MAX_NESTED_PAYLOAD_BYTES: usize = 64 * 1024;
 /// never run them — a model that shells one out is (wrongly) trying to poll a
 /// background task, which just errors in a loop.
+/// Kept as the FULL historical set, not just the three tools that exist. A model
+/// trained on an older hrdr (or on another harness) reaches for `task_output` or
+/// `task_list` by name, and shelling out a tool that no longer exists produces
+/// `command not found` — which reads as a broken machine rather than as a tool it
+/// should not be shelling out at all. Both mistakes want the same correction.
 const TASK_TOOLS: &[&str] = &[
+    "task",
+    "task_steer",
+    "task_cancel",
+    // Removed tools. A model that names one is making two mistakes at once, and the
+    // message below answers the one that matters: you never poll a task.
     "task_output",
     "task_transcript",
     "task_list",
-    "task_steer",
-    "task_cancel",
     "task_revive",
 ];
 
@@ -286,14 +294,16 @@ const TASK_TOOLS: &[&str] = &[
 const TRANSPARENT_PREFIXES: &[&str] =
     &["sudo", "nohup", "time", "command", "exec", "builtin", "env"];
 
-const TASK_TOOL_POLL_MSG: &str = "`task_output`/`task_list`/`task_steer`/… are hrdr tools, not shell commands — running them \
-     in a shell (or under `watch`) does nothing. You never poll a background task: it delivers \
-     its result and wakes you automatically when it finishes. If you have nothing else to do \
-     until then, tell the user in one line what it is doing and end your turn.";
+const TASK_TOOL_POLL_MSG: &str = "the `task_*` names are hrdr tools, not shell commands — running one in a shell does \
+     nothing. There is no way to poll a background task and no need for one: it delivers its \
+     result and wakes you automatically when it finishes. (`task_output`, `task_list`, \
+     `task_transcript` and `task_revive` no longer exist at all — `task`, `task_steer` and \
+     `task_cancel` are the whole family.) If you have nothing else to do until then, tell the \
+     user in one line what it is doing and end your turn.";
 
 /// Whether `command` runs one of hrdr's `task_*` tools as a program. Splits on
 /// UNQUOTED shell control operators (`| & ; ( )` and newlines) so a quoted or
-/// argument occurrence is not mistaken for a program call — `grep 'x&' task_output`
+/// argument occurrence is not mistaken for a program call — `grep 'x&' task_steer`
 /// (the `&` is inside quotes) and `cat task_list.md` (an argument) are both left
 /// alone — then compares each segment's leading program word (an exact match, so
 /// `task_output.sh` or `/usr/bin/task_output` are different programs) against the

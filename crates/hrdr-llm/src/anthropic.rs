@@ -95,7 +95,7 @@ pub(crate) fn build_body(
             // Two breakpoints when the caller gave a boundary: one closing the
             // stable prefix (everything up to the environment block) and the
             // rolling one at the end. Sibling write sub-agents share a persona
-            // but each has its own worktree `cwd`, so the tail differs while
+            // but a scoped sibling can have a narrower `cwd`, so the tail can differ while
             // everything above it does not — without the first breakpoint that
             // shared prefix is re-sent for every one of them.
             if blocks.len() > 1 {
@@ -910,7 +910,7 @@ mod tests {
 
     /// A caller-supplied boundary splits the system prompt into a cached stable
     /// prefix and a volatile tail, and marks BOTH — the extra breakpoint is what
-    /// lets sibling write sub-agents (same persona, different worktree `cwd`)
+    /// lets sibling write sub-agents (same persona, possibly different `cwd`)
     /// stop re-sending everything above their environment block.
     #[test]
     fn a_system_cache_split_yields_two_marked_blocks() {

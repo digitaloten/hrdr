@@ -6,7 +6,8 @@ shipped; slices 3–9 outstanding — the checklist at the end tracks it.
 Supersedes the escalation ladder shipped in `97ab735`, `cd4b597`, `e9e753f`, and
 the `.git` lock from `899ecd2`.
 
-Against `docs/context.md`'s open items: **§2.3** (network unconditionally
+Against the open items in the (now deleted) `docs/context.md`, whose surviving
+entries were folded into `docs/backlog.md`: **§2.3** (network unconditionally
 allowed) and **§2.4** (`.git` protection delegated-only) are closed outright,
 and **§2.5** (`tool_output_dir` per-user) is closed by a prerequisite here.
 **§2.1** (`AGENTS.md` writable and read back as instruction) and **§2.2**
@@ -422,9 +423,10 @@ worktree mentions remain in `delegation.rs`, all prose.
 `git diff` (the change) not here (the conversation)"_ — a sentence that points
 at the shared-tree review path, i.e. it was rewritten for the current model.
 
-Its live use is an **open** harness gap: `context.md` §1 #4 records that in
-session-8, two of three fix sub-agents called `verify`, got `Err`, and reported
-success anyway. Catching that means reading the sub-agent's run.
+Its live use is an **open** harness gap: the harness-gap list (now backlog
+top-of-list #2) records that in session-8, two of three fix sub-agents called
+`verify`, got `Err`, and reported success anyway. Catching that means reading
+the sub-agent's run.
 
 It can still go — transcripts are JSONL on disk and non-jail agents have
 `shell`, so `cat`/`jq` reaches them minus the folded rendering. But if it does,
@@ -494,7 +496,7 @@ authors are not trusted, so loading a file they wrote into the system prompt
 hands the adversary the system prompt, and there is no second use left to
 protect.
 
-Project skills are the worse of the three, and this closes `context.md` §2.2:
+Project skills are the worse of the three, and this closes the audit's §2.2:
 they are discovered **before** built-ins and shadow them by name, with
 `model_invocable` defaulting true — so a repo can ship `.hrdr/skills/commit.md`
 and replace the vetted `:commit` outright.
@@ -633,7 +635,7 @@ and merely noisy when it is ours. A weaker version of the data-never-instruction
 rule belongs in the **base** prompt for every agent. Related but separate:
 `AGENTS.md` currently arrives with no trust framing at all, where memory arrives
 under `MEMORY_PREAMBLE`'s "trust them but verify" — adding a comparable frame
-would close the softer form of `context.md` §2.1. Both are follow-ups, not part
+would close the softer form of the audit's §2.1. Both are follow-ups, not part
 of this.
 
 ### One residual, written down rather than assumed
@@ -970,11 +972,11 @@ help.
 
 ## Prerequisite
 
-**`tool_output_dir` must become per-session.** It is per-user today
-(`context.md` §2.5), and it is a readable root — so a jailed agent could read
-spooled shell output from other sessions on other projects, flatly contradicting
-"only its own cwd". Jail's readable set is `cwd` + _this session's_ output dir.
-Scratch drops out of jail entirely: nothing can write it.
+**`tool_output_dir` must become per-session.** It is per-user today (the audit's
+§2.5), and it is a readable root — so a jailed agent could read spooled shell
+output from other sessions on other projects, flatly contradicting "only its own
+cwd". Jail's readable set is `cwd` + _this session's_ output dir. Scratch drops
+out of jail entirely: nothing can write it.
 
 Large results are spooled by the parent process, outside the sandbox, so
 spooling still works with nothing writable. The agent only needs to _read_ the

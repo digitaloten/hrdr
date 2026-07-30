@@ -308,7 +308,51 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   failure that makes a broad read fan-out worse than a narrow one. With the
   write cap at 1, the defaults are now 1 writer / 2 readers.
 
+### Removed
+
+- **Three `BackgroundTask` fields nothing read** (`model`, `started`,
+  `transcript`) — written on every sub-agent spawn for `task_list`'s elapsed
+  readout and `task_output`'s fallback, both of which are gone. `pub`, so no
+  dead-code warning flagged them.
+
+- **`docs/context.md`**, a dated open-items file from 2026-07-29 whose sandbox
+  sections this work closed. Its surviving entries — the harness-gap list, the
+  unguarded single-path `git restore`, the two repo-writable instruction
+  surfaces (project `AGENTS.md` and skill shadowing, both closed for `jail`
+  only), and the known-good list — are folded into `docs/backlog.md`, which is
+  again the only backlog. Entries there whose subject no longer exists are
+  annotated where the reasoning still teaches something and deleted where it
+  does not.
+
 ### Fixed
+
+- **A `git diff` that touches a credential file no longer prints its contents.**
+  The per-line filter added with the tool-surface cut catches search output
+  (`path:NN:…` naming a secret file) but not a diff, where `.env` is named
+  **once** in a header and its contents arrive as `+TOKEN=…` lines that name
+  nothing at all. `redact_secret_diffs` already handled that shape and had been
+  dead code since its only caller (`task_diff`) was deleted; it is now wired in,
+  with a streaming twin (`DiffRedactor`) because `shell` ingests lines as the
+  command runs and never holds a whole diff. The section header survives — the
+  model should see _that_ a credential file changed — and the withheld hunk is
+  replaced by one marker.
+
+- **`--sandbox jail` on a write-capable session says that it cannot be
+  honoured.** Jail has no shell and no writers, so a write-capable agent floors
+  at `write` (as it does for `read`). That floor is right, but silently handing
+  someone who typed the word meaning "contain me" a session with full project
+  write, the package caches and a network — with nothing on screen — inverts the
+  request. It now emits a notice naming what it fell back to, and both ways to
+  actually get jail: the `prisoner` agent, whose declared mode is never floored,
+  or any read-only agent.
+
+- **The guardrail that catches a `task_*` tool shelled out as a command** still
+  listed the four removed names and named them in its message. Kept as the full
+  historical set on purpose — a model trained on an older hrdr reaches for
+  `task_output` by name, and `command not found` reads as a broken machine
+  rather than as a tool it should not be shelling out — but the message now says
+  which three exist. The oversized-report note stopped pointing at
+  `task_transcript` and points at the working tree instead.
 
 - **`shell` output no longer spills credential files into the transcript.** The
   `grep` tool filtered secret files out of its own results; `shell` — which

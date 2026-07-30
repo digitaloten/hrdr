@@ -306,9 +306,6 @@ fn spawn_background(
             result: None,
             delivered: false,
             cancelled: false,
-            model: model_for_live.clone(),
-            started: Some(std::time::Instant::now()),
-            transcript: transcript_path.clone(),
         });
     }
     let ts_inner = transcript.clone();
@@ -444,13 +441,17 @@ fn spawn_background(
                         let over_budget = report.len() > BACKGROUND_REPORT_MAX_BYTES;
                         let mut text =
                             hrdr_tools::truncate_middle(report, BACKGROUND_REPORT_MAX_BYTES);
-                        if over_budget && let Some(p) = &transcript_path {
-                            text.push_str(&format!(
-                                "\n\n(truncated — `task_transcript` with this task's id reads the \
-                                 whole run, rendered; the raw file at {} is one JSON record per \
-                                 streamed token, don't `read` it)",
-                                p.display()
-                            ));
+                        if over_budget {
+                            // No pointer at the raw transcript, deliberately. It is one
+                            // JSON record per streamed token — the same run at many times
+                            // the size — and what the report was too long to say is
+                            // answered better by the tree: the report claims, `git diff`
+                            // shows. Naming the file would invite a `read` of it.
+                            text.push_str(
+                                "\n\n(truncated — this is the head and tail of a long report. \
+                                 What it changed is in your working directory: check \
+                                 `git status --short` and `git diff`.)",
+                            );
                         }
                         text
                     }
@@ -1248,8 +1249,9 @@ impl hrdr_tools::Tool for SubagentTool {
             // never from the interactive last-used store, which would make the same
             // sub-agent run a different model for each developer.
             //
-            // Worktree isolation is applied to *every* write-capable sub-agent
-            // below, by capability — there is no per-profile opt-in/out.
+            // Confinement is applied by MODE below, not per profile — except for a
+            // profile that declares its own (`sandbox:`), which is absolute; see
+            // `SubagentProfile::sandbox`.
             cfg = config_for_agent_profile(&cfg, profile)
                 .map_err(|e| anyhow::anyhow!("subagent '{}': {e:#}", profile.name))?;
         }

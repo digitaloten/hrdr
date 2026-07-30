@@ -1805,6 +1805,25 @@ impl Agent {
         // An `AGENTS.md` hrdr found and did not load is a user instruction silently
         // missing from the prompt — the same channel carries it, for the same reason.
         pending_notices.extend(project_docs.skipped.iter().map(|s| s.notice()));
+        // `--sandbox jail` asked for the audit posture and this agent cannot have it:
+        // jail's tool set has no shell, no writers and no network, so a
+        // write-capable agent under it could not work at all, and `effective_sandbox`
+        // floors it at `write`. That floor is right — but silently handing someone
+        // who typed `jail` a full-write session is the opposite of what they asked
+        // for, and they would not find out. So say it, and name the way to actually
+        // get jail.
+        if config.sandbox == hrdr_tools::SandboxMode::Jail
+            && sandbox_mode != hrdr_tools::SandboxMode::Jail
+        {
+            pending_notices.push(format!(
+                "sandbox: `jail` needs a read-only agent — it has no shell and no writers, so a \
+                 write-capable agent cannot run under it. This session is confined to `{}` \
+                 instead. To audit untrusted code, delegate it: `task` with the `prisoner` \
+                 agent, which is jailed whatever the session says. `--agent explore` (or any \
+                 read-only agent) honours `jail` directly.",
+                sandbox_mode
+            ));
+        }
         // An agent whose profile declares its own mode overrides the session's,
         // `--yolo` included — and says so. The override is right (you spawned
         // `prisoner` precisely to contain something, so a session flag aimed at
@@ -3228,6 +3247,55 @@ mod tests {
         let message = warning["message"].as_str().unwrap();
         assert!(message.starts_with("110 more model row(s)"), "{message}");
         assert!(message.contains("narrow with `query`"), "{message}");
+    }
+
+    /// **`--sandbox jail` on a write-capable session floors at `write` — and says
+    /// so.** The floor is deliberate: jail has no shell and no writers, so an agent
+    /// that must write could not run at all under it.
+    ///
+    /// The notice is the part under test, because the failure without it is silent
+    /// and inverted: somebody typed the word that means "contain me" and got a
+    /// session with full project write, the package caches and a network, with
+    /// nothing on screen to say the request had been declined.
+    #[tokio::test]
+    async fn a_write_capable_session_cannot_be_jailed_and_is_told_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            sandbox: hrdr_tools::SandboxMode::Jail,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(agent.ctx.sandbox.mode, hrdr_tools::SandboxMode::Write);
+
+        let notice = agent
+            .take_pending_notices()
+            .into_iter()
+            .find(|n| n.starts_with("sandbox:"))
+            .expect("the declined request is announced");
+        assert!(notice.contains("needs a read-only agent"), "{notice}");
+        assert!(notice.contains("confined to `write`"), "{notice}");
+        // …and names both ways to actually get jail.
+        assert!(notice.contains("prisoner"), "{notice}");
+        assert!(notice.contains("--agent explore"), "{notice}");
+
+        // A read-only agent in the same session gets what was asked for, silently —
+        // nothing was declined, so there is nothing to announce.
+        let mut reader = Agent::new(AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            sandbox: hrdr_tools::SandboxMode::Jail,
+            read_only: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(reader.ctx.sandbox.mode, hrdr_tools::SandboxMode::Jail);
+        assert!(
+            !reader
+                .take_pending_notices()
+                .iter()
+                .any(|n| n.contains("needs a read-only agent")),
+            "nothing was declined for a read-only agent"
+        );
     }
 
     /// **A declared mode is absolute — it beats `--yolo`.**
@@ -11230,7 +11298,7 @@ mod tests {
         /// [`super::super::BACKGROUND_REPORT_MAX_BYTES`] and, since it actually
         /// got cut, carries a pointer at the durable transcript for the rest.
         #[tokio::test]
-        async fn background_task_oversized_report_is_middle_truncated_with_transcript_pointer() {
+        async fn background_task_oversized_report_is_middle_truncated_and_points_at_the_tree() {
             use super::super::BACKGROUND_REPORT_MAX_BYTES;
             use hrdr_tools::Tool;
             let big = "y".repeat(BACKGROUND_REPORT_MAX_BYTES + 5_000);
@@ -11260,11 +11328,15 @@ mod tests {
                 "carries truncate_middle's marker: {}",
                 &result[..result.len().min(200)]
             );
-            assert!(
-                result.contains("`task_transcript`") && result.contains("don't `read` it"),
-                "a truncated report points at the rendering tool, not the raw jsonl: {}",
-                &result[result.len().saturating_sub(300)..]
-            );
+            // It points at the WORKING TREE, not at the raw jsonl. There is no
+            // transcript tool to render that file any more, and pointing at the file
+            // itself would invite a `read` of one JSON record per streamed token —
+            // the same run at many times the size. What the over-long report could
+            // not say is answered better by the diff anyway.
+            let tail = &result[result.len().saturating_sub(300)..];
+            assert!(tail.contains("git diff"), "{tail}");
+            assert!(!tail.contains(".jsonl"), "{tail}");
+            assert!(!tail.contains("task_transcript"), "{tail}");
         }
 
         /// A write-capable sub-agent shares the parent's working dir, and the

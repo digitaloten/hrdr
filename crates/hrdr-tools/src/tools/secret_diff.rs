@@ -22,9 +22,14 @@
 /// `diff --git "a/my dir/.env" "b/my dir/.env"` — so this can't just scan for
 /// literal `" b/"`; it tokenizes the two (possibly quoted) paths and unquotes
 /// whichever one is quoted. [`forbidden_flag`] separately refuses
+/// What replaces a withheld hunk. Shared with `shell`'s streaming redaction so
+/// the two paths cannot describe the same thing differently.
+pub(crate) const REDACTED_DIFF_MARKER: &str =
+    "[redacted: this file is a credential/secret store — its diff is withheld]";
+
 /// `--no-prefix`/`--src-prefix`/`--dst-prefix`, which would otherwise strip the
 /// `a/`/`b/` markers this still relies on to tell the two tokens apart.
-fn diff_section_path(line: &str) -> Option<String> {
+pub(crate) fn diff_section_path(line: &str) -> Option<String> {
     if let Some(rest) = line.strip_prefix("diff --git ") {
         if let Some((_a, remainder)) = take_diff_header_token(rest)
             && let Some((b, _)) = take_diff_header_token(remainder)
@@ -161,19 +166,73 @@ fn unquote_c_style(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The streaming half of [`redact_secret_diffs`]: the same state machine, fed one
+/// line at a time.
+///
+/// `shell` ingests output as the command runs, so it never holds a whole diff to
+/// pass to the batch version — and a `git diff` that touches `.env` names the file
+/// once in a header and then prints its contents as `+SECRET=…` lines that name
+/// nothing at all. A per-line path filter cannot see those; this can.
+///
+/// A struct rather than two loose `bool`s because the caller is a macro expanded at
+/// several sites, and the last expansion made a plain assignment look dead.
+#[derive(Debug, Default)]
+pub(crate) struct DiffRedactor {
+    /// Inside the hunk body of a section for a credential file.
+    redacting: bool,
+    /// This section's marker has been emitted, so it is not repeated per line.
+    marked: bool,
+}
+
+/// What the caller should do with a line.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LineAction {
+    /// Emit it unchanged.
+    Keep,
+    /// Drop it, and emit [`REDACTED_DIFF_MARKER`] in its place.
+    ReplaceWithMarker,
+    /// Drop it silently — the marker for this section is already out.
+    Drop,
+}
+
+impl DiffRedactor {
+    /// Classify `line`, updating the section state. `cwd` anchors the relative path
+    /// a diff header carries.
+    pub(crate) fn observe(&mut self, line: &str, cwd: &std::path::Path) -> LineAction {
+        if let Some(path) = diff_section_path(line) {
+            // A header both closes the previous section and opens the next, and is
+            // always kept: the model should see THAT a credential file changed.
+            self.redacting =
+                crate::secret_file_reason(&crate::canonicalize_nearest(&cwd.join(path))).is_some();
+            self.marked = false;
+            return LineAction::Keep;
+        }
+        if !self.redacting {
+            return LineAction::Keep;
+        }
+        if self.marked {
+            LineAction::Drop
+        } else {
+            self.marked = true;
+            LineAction::ReplaceWithMarker
+        }
+    }
+}
+
 /// Redact the hunk body of any diff section whose file is a credential/secret
 /// store, keeping the section header so the model still sees *that* the file
 /// changed — just not its content. Covers `diff`, `show`, and `log -p` output;
 /// a no-op on plain `status`/`log`/`branch` output (no diff headers).
 ///
-/// `pub` (re-exported from the crate root) for callers outside this module that
-/// compose a diff themselves rather than going through [`GitTool`].
+/// The shape a line-oriented path filter misses: a `git diff` that touches
+/// `.env` names the file once in a header the filter would let through, and then
+/// prints its contents as `+SECRET=…` lines that name nothing at all.
 ///
-/// **Nothing calls it today.** Its one caller was `task_diff` in `hrdr-agent`,
-/// which composed `git diff HEAD...<branch>` for a sub-agent's branch; sub-agent
-/// worktrees and that tool are both gone. Kept because the redaction itself is
-/// still correct and the next tool that assembles a diff will want it — but if
-/// none arrives, this module is deletable.
+/// `pub` (re-exported from the crate root) for a caller that has a whole diff in
+/// hand. `shell` cannot use it — it ingests one line at a time as the command
+/// streams — so it runs the same state machine incrementally over
+/// [`diff_section_path`]; the two must stay in step, and
+/// `a_secret_diff_is_redacted_line_by_line_too` is what keeps them there.
 pub fn redact_secret_diffs(output: &str) -> String {
     let mut out = String::with_capacity(output.len());
     let mut lines = output.lines().peekable();
@@ -186,9 +245,8 @@ pub fn redact_secret_diffs(output: &str) -> String {
         out.push_str(line);
         out.push('\n');
         if crate::secret_file_reason(std::path::Path::new(&path)).is_some() {
-            out.push_str(
-                "[redacted: this file is a credential/secret store — its diff is withheld]\n",
-            );
+            out.push_str(REDACTED_DIFF_MARKER);
+            out.push('\n');
             // Drop the rest of this section (up to the next `diff` header / EOF).
             while let Some(peek) = lines.peek() {
                 if diff_section_path(peek).is_some() {
@@ -199,4 +257,72 @@ pub fn redact_secret_diffs(output: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A `git diff` that touches a credential file must not print its contents**,
+    /// and the streaming path has to reach the same answer as the batch one.
+    ///
+    /// The two exist because `shell` never holds a whole diff — it ingests lines as
+    /// the command runs — and a state machine duplicated in two places is one that
+    /// drifts. This is what keeps them in step.
+    ///
+    /// It is also the leak a per-line PATH filter cannot catch: the file is named
+    /// once, in a header, and its contents arrive as `+TOKEN=…` lines naming nothing.
+    #[test]
+    fn a_secret_diff_is_redacted_line_by_line_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "TOKEN=live\n").unwrap();
+        std::fs::write(dir.path().join("src.rs"), "fn main() {}\n").unwrap();
+        let diff = "\
+diff --git a/.env b/.env
+index 111..222 100644
+--- a/.env
++++ b/.env
+@@ -1 +1 @@
+-TOKEN=old
++TOKEN=live
+diff --git a/src.rs b/src.rs
+index 333..444 100644
+--- a/src.rs
++++ b/src.rs
+@@ -1 +1 @@
+-fn main() {}
++fn main() { work() }
+";
+
+        // Streamed one line at a time, the way `shell` sees it.
+        let mut redactor = DiffRedactor::default();
+        let mut streamed = String::new();
+        for line in diff.lines() {
+            match redactor.observe(line, dir.path()) {
+                LineAction::Keep => {
+                    streamed.push_str(line);
+                    streamed.push('\n');
+                }
+                LineAction::ReplaceWithMarker => {
+                    streamed.push_str(REDACTED_DIFF_MARKER);
+                    streamed.push('\n');
+                }
+                LineAction::Drop => {}
+            }
+        }
+
+        for out in [&streamed, &redact_secret_diffs(diff)] {
+            // The secret is gone, and its `-`/`+` lines with it.
+            assert!(!out.contains("TOKEN=live"), "{out}");
+            assert!(!out.contains("TOKEN=old"), "{out}");
+            // …but the model still learns THAT the file changed, and why it is blank.
+            assert!(out.contains("diff --git a/.env b/.env"), "{out}");
+            assert!(out.contains(REDACTED_DIFF_MARKER), "{out}");
+            // Once per section, not once per dropped line.
+            assert_eq!(out.matches(REDACTED_DIFF_MARKER).count(), 1, "{out}");
+            // And the section AFTER it survives: a redaction must not swallow the
+            // rest of the diff.
+            assert!(out.contains("+fn main() { work() }"), "{out}");
+        }
+    }
 }

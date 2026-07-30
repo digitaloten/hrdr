@@ -113,9 +113,10 @@ struct Cli {
     /// unrestricted, writes confined to the working directory, temp/scratch,
     /// tool output and the package-manager caches), `read` (what read-only
     /// agents get: reads unrestricted, writes refused everywhere), `jail`
-    /// (read-only tools only — no shell, no network, and reads confined to the
-    /// working directory, for auditing code you do not trust), or `none`, also
-    /// spelled `yolo` (no confinement at all).
+    /// (read-only tools only — no shell, no network, reads confined to the
+    /// working directory; for auditing code you do not trust, and only a
+    /// read-only agent can run under it, so a write-capable session floors at
+    /// `write` and says so), or `none`, also spelled `yolo` (no confinement).
     #[arg(long, global = true, value_name = "write|read|jail|none")]
     sandbox: Option<String>,
 

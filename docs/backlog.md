@@ -16,6 +16,16 @@ everything that was actionable without a decision, and those entries are
 the two decisions it surfaced, are under
 [Cleared in the 2026-07-27 pass](#cleared-in-the-2026-07-27-pass).
 
+**Pruned again 2026-07-30**, by the sandbox redesign (`5c9f675`..`c114a6a`). It
+closed most of [Sandbox follow-ups](#sandbox-follow-ups) and the first two
+top-of-list items, mostly by deleting the mechanism rather than finishing it —
+see
+[Cleared in the 2026-07-30 sandbox redesign](#cleared-in-the-2026-07-30-sandbox-redesign).
+The same pass folded `docs/context.md` (a dated open-items file from 2026-07-29)
+into this one and deleted it, so this is again the only backlog. Entries whose
+subject no longer exists are annotated where the reasoning still teaches
+something and deleted where it does not.
+
 Conventions:
 
 - **Symbol names, not line numbers.** Line numbers rot — the old docs cited
@@ -36,45 +46,49 @@ Conventions:
 ## Top of the list
 
 The five that were here are all shipped — see
-[Cleared in the 2026-07-27 pass](#cleared-in-the-2026-07-27-pass). What is left
-at the top now needs a decision, not just work.
+[Cleared in the 2026-07-27 pass](#cleared-in-the-2026-07-27-pass). Items 1 and 2
+closed on 2026-07-30 with the sandbox redesign, both by **deletion**: the
+file-tool metadata guard is gone (it refused the honest path while `shell`
+walked round it), so there is no list to extend; and there is no `git` tool, so
+nothing runs outside `sandboxed_shell_command`. What is left needs a decision,
+not work.
 
-1. **Decide whether the metadata guard covers the harness-config trees.** The
-   guard ships protecting `.git` only (`0598439` narrowed it deliberately).
-   `.hrdr`, `.claude` and `.opencode` are the same hazard on paper — hrdr's own
-   loaders read `.hrdr/skills` and `.hrdr/agents` back as instruction, so
-   authoring one is the model writing its own next system prompt, and codex
-   protects its own `.codex` for exactly that reason. Against it: "add a project
-   skill for this repo" is an ordinary request, and `shell` reaches those paths
-   regardless, so the refusal is a speed bump for a compromised model and a wall
-   for an honest one. `PROTECTED_METADATA_DIRS` is a one-name const and
-   `protected_metadata_dir` already keeps the root-relative arm the extra names
-   would need (a write sub-agent's cwd is `<repo>/.hrdr/worktrees/wt-N`, so a
-   whole-path test on those names would refuse every write it makes). One line
-   plus tests, either way — **the question is policy, not effort.**
-2. **Re-evaluate the `git` tool now that Read mode exists.** Needs a call on
-   what read-only agents get. The old entry claimed `git -C /elsewhere log`
-   succeeds in `read` mode; **it does not** — a leading flag in the subcommand
-   slot (`-C`, `-c`, `--git-dir`) is refused with a dedicated test
-   (`refuses_a_leading_flag_in_the_subcommand_slot`), and `FORBIDDEN_ANY` blocks
-   `-c`, `--config-env`, `--ext-diff`, `--textconv`, `--exec`, `--output`,
-   `--upload-pack`, `--receive-pack`. The real residual: **only `shell` and
-   `watch` go through `sandboxed_shell_command`**, so `GitTool`'s
-   `Command::new("git")` runs with no OS confinement at all, bounded only by its
-   own allow-list and git's repo-relative semantics. With the sandbox shipped
-   the codex-style alternative is possible — give read-only agents a confined
-   `shell` and let the 9-verb allow-list shrink or go — but that is a decision
-   about the read-only tool surface, not a refactor.
-3. **Full `AGENTS.md` injection scanning, if wanted.** The cheap 80% shipped
-   (`2bee4bf`): a skipped file now surfaces as a notice naming path and size,
-   and the block header states the files come from the project tree and cannot
-   override the cardinal rules or the user. What is still open is hermes'
-   `_scan_context_content` — blocking a file with a `[BLOCKED: …]` placeholder
-   on an injection heuristic. Deliberately deferred: a regex scanner over
-   project docs false-positives on exactly the repos a coding agent gets pointed
-   at (security tooling, shell-hardening guides, this file), and hermes needed
-   three scopes to make it tolerable. **Wants evidence of a real attempt
-   first.**
+1. **Full `AGENTS.md` injection scanning, if wanted.** The cheap 80% shipped
+   (`2bee4bf`): a skipped file surfaces as a notice naming path and size, and
+   the block header states the files come from the project tree and cannot
+   override the cardinal rules or the user. A jailed agent now skips the
+   project's `AGENTS.md` and skills entirely, which covers the untrusted-repo
+   case. What is still open is hermes' `_scan_context_content` — blocking a file
+   with a `[BLOCKED: …]` placeholder on an injection heuristic. Deliberately
+   deferred: a regex scanner over project docs false-positives on exactly the
+   repos a coding agent gets pointed at (security tooling, shell-hardening
+   guides, this file), and hermes needed three scopes to make it tolerable.
+   **Wants evidence of a real attempt first.**
+2. **Delegation has no post-merge verification hook.** Every sub-agent checks
+   its own change against a tree the others are also editing; nothing checks the
+   union. `verify` exists, so the hook has somewhere to point: after the last
+   task in a batch, run the gate. Sharpened by a real observation — two of three
+   fix sub-agents called `verify`, got `Err`, and reported success anyway — and
+   now _forced_, because `task_transcript` is gone: the fix has to be structural
+   in the hand-back rather than "the parent can go read what happened".
+3. **The test nudge has no teeth.** Fired 3/3 in one session, obeyed 1/3. With
+   `verify` in place it has somewhere to escalate to instead of staying
+   advisory.
+4. **The evidence gate checks presence, not relevance.** A `verification` field
+   containing "git log shows 3 commits" satisfies a claim it does not support.
+   Weakest of the set — whether evidence _answers_ its claim is a semantic
+   judgement a string check cannot make. One observation behind it; worth
+   leaving until there is a second.
+5. **`git restore <path>` / `git checkout <path>` is unguarded, and the
+   don't-discard-others'-work rule is sub-agent-only.** The guardrails block the
+   whole-tree forms (`git checkout .`, `git restore .`) but not the single-path
+   form — the one that discards someone else's uncommitted work file by file.
+   And `templates/subagent_write.md` forbids `git checkout`/`restore`/`stash`
+   while `write.md` does not, though the main agent has more authority and the
+   same need. Both surfaced by a real incident: a concurrent hrdr session was
+   editing a file, an unexpected `M` appeared in `git status`, and it was
+   restored away on the assumption that the only other writer was a sub-agent.
+   Recovered because the other session had committed it.
 
 ---
 
@@ -191,6 +205,36 @@ outlier is most likely to be a mistake rather than a stance.
 
 ### Permissions, isolation, and state
 
+**Instruction surfaces a repo can write, outside `jail`.** From the 2026-07-29
+sub-agent attack-surface audit (traced against codex `81da9de`). `jail` closed
+both for the untrusted-repo case — it loads neither — but every other mode still
+reads them, and that is a deliberate trade rather than an oversight:
+
+- **Project `AGENTS.md` is writable by a write sub-agent** and read back as
+  project conventions on the parent's next prompt rebuild (`/clear`, `set_cwd`,
+  a new agent), **with no trust framing** — unlike memory, which arrives under
+  `MEMORY_PREAMBLE`'s "trust them but verify". Left open on purpose: `AGENTS.md`
+  is also how a project legitimately carries instructions, and narrowing it
+  costs that. A `// NOTE:` sits on the push site in
+  `build_system_prompt_sections`. The cheap half is a trust frame comparable to
+  memory's — that is the actual open item, not the write.
+- **Project skills shadow built-ins by name.** `skill_dirs` includes
+  `cwd/.hrdr/skills`, `cwd/.claude/commands`, `cwd/.opencode/command`, all under
+  the writable cwd; project files are discovered _before_ built-ins and win,
+  with `model_invocable` defaulting true, so `.hrdr/skills/commit.md` silently
+  replaces the vetted `:commit`. Re-runs on every `set_cwd`/`clear` and in every
+  new `Agent::new`. Same shape as `AGENTS.md` but with a **weaker second use** —
+  a project skill is a convenience where `AGENTS.md` is a core feature — which
+  makes it the stronger candidate of the two if either is closed.
+
+**Two smaller confinement gaps, verified and unchanged:**
+
+- **`std::env::temp_dir()` is granted whole** in `write` mode, not just
+  `session_scratch_dir()`. Broader than the stated need, and pre-existing.
+- **`shell` runs unconfined where no OS backend exists** — Windows always, Linux
+  without Landlock. The file tools stay guarded and `NO_OS_SANDBOX_NOTICE`
+  fires, so it is admitted rather than silent.
+
 - **One permission evaluator instead of four unrelated mechanisms.** Opencode
   has a single primitive — an ordered `{permission, pattern, action}` list
   evaluated `findLast`-wins with globbing on both fields — and gets plan mode,
@@ -215,8 +259,15 @@ outlier is most likely to be a mistake rather than a stance.
   about _read_ visibility. _Caveat:_ hrdr's write sub-agents legitimately read
   the parent repo (shared `Cargo.lock`, `~/.cargo`, `/usr/lib`), so the
   allow-list may need to be large enough that the signal isn't worth it.
-- **Per-call permission escalation.** Codex's shell schemas carry
-  `sandbox_permissions`, `justification`, `prefix_rule` and
+- **Per-call permission escalation.** Still open, and note that hrdr **built and
+  then deleted** an approval gate on 2026-07-30 — the mechanism existed for
+  widening the _sandbox_, whose motivating failure (bwrap's user namespace
+  breaking ssh) was removed rather than routed around. This item is the
+  different, narrower question of overriding a **guardrail**, and it survives
+  that deletion. Anyone rebuilding a gate should read why the last one went: it
+  only ever helped when a human was present to answer, and a human who is
+  present can run the command themselves (`!command`). Codex's shell schemas
+  carry `sandbox_permissions`, `justification`, `prefix_rule` and
   `additional_permissions`, with outcomes `ApprovedForSession` and
   `ApprovedExecpolicyAmendment` (the latter appending a durable rule to
   `$CODEX_HOME/rules/default.rules`). hrdr's guardrails are terminal `bail!`
@@ -250,19 +301,11 @@ outlier is most likely to be a mistake rather than a stance.
   session), backing up to `.bak.<ts>` instead of clobbering; hrdr has no
   equivalent (verified: no drift/round-trip/`.bak` logic in `memory.rs`). Both
   fold into the memory-drift item below.
-- **Gate LSP tool registration on the project having a matching server.**
-  Verified still true: `definition`/`references`/`rename` are registered
-  whenever `config.lsp || config.lsp_shared`, and
-  `project_lsp_extensions(&config.cwd)` is computed **a few lines later** purely
-  to decide pre-warming. In a Ruby, PHP, Java or docs-only tree hrdr ships three
-  tool schemas whose only possible outcome is a failed call, with the
-  information to suppress them already in hand. This is hermes' `check_fn`
-  pattern (a tool absent from the schema unless a predicate passes, TTL-cached
-  30 s) applied where hrdr has the same shape of problem. _Caveat:_ it makes the
-  tool set — and the prompt — vary with cwd contents, one more axis of prefix
-  divergence, and the manifest probe would wrongly hide the tools in a monorepo
-  whose `Cargo.toml` is one directory down. **Gate on the union of _configured_
-  server extensions, not the pre-warm heuristic.**
+- ~~**Gate LSP tool registration on the project having a matching server.**~~
+  **Moot 2026-07-30:** `definition`/`references`/`rename` are deleted (2 calls
+  in 9,350 — available and ignored), so there are no LSP tool schemas to gate.
+  The diagnostics path, which is the valuable half, was never a tool and is
+  unchanged.
 - **Per-provider tool-JSON-schema rewriting — file, don't build.** Opencode
   rewrites every tool schema per model before the wire, with three quirks and a
   reason each: OpenAI/Azure sanitisation; Moonshot/Kimi strip every sibling key
@@ -308,64 +351,73 @@ outlier is most likely to be a mistake rather than a stance.
 
 ## Sandbox follow-ups
 
-Declared when the sandbox was specced and deliberately left out of v1, plus what
-bring-up turned up. All eight verified still open. The rules that govern this
-work are under [Standing constraints](#standing-constraints).
+**Most of this list closed on 2026-07-30 with the sandbox redesign** (nine
+slices, `5c9f675`..`c114a6a`; `docs/sandbox-redesign.md` is the decision
+record). What closed and how:
 
-- **No network axis for the MAIN agent.** Partly closed 2026-07-29: a delegated
-  sub-agent's shell now has no network (`SandboxPolicy::deny_network` →
-  `--unshare-net` on bwrap, the `(allow network*)` line omitted on Seatbelt, and
-  TCP bind/connect denied on Landlock — which cannot express UDP, so that
-  backend queues a degradation notice). What remains open is the main agent and
-  a user-facing knob: it keeps full network because it is the one that runs
-  `git push`/`pull`/`fetch`. The declared route was seccomp on Linux; note Codex
-  has since moved past that to a MITM proxy with netns routing
-  (`codex-rs/network-proxy/`: `proxy.rs` 80 KB, `runtime.rs` 71 KB, `socks5.rs`
-  42 KB, `certs.rs` 35 KB) — and that its network approval is
-  `Stage::Experimental, default_enabled: false`, so the default codex experience
-  is _network denied by the sandbox, no prompt_. **Revisit the mechanism before
-  building the old plan.**
-- **Bundled `bwrap`.** Verified: `which::which("bwrap")`, no bundled copy. Hosts
-  without bubblewrap degrade to Landlock (weaker: no read axis). Codex ships its
-  own (`linux-sandbox/src/bundled_bwrap.rs`); doing the same removes the most
-  common degradation. Note `linux-sandbox/src/bwrap.rs` is **102 KB** — not a
-  thin wrapper.
-- **Curated read allow-list for `write` mode.** Reads are unrestricted there by
-  decision, so a shell command can read `~/.ssh`: verified that
-  `guard_secret_read` is called only from the file tools (`read`, `grep`,
-  `lsp_nav`) and has **no shell-side equivalent**. A read allow-list, or a
-  secret-path deny-list applied at the mount level, closes it.
-- **Windows has no OS layer.** Software path-guard only, permanently for v1;
-  AppContainer or a restricted token is the eventual answer (Codex has
-  `windows-sandbox-rs/`). Until then every Windows session gets the
-  `NO_OS_SANDBOX_NOTICE`.
-- **No shell-command pre-flight.** A write outside the roots reaches the model
-  as the kernel's `Read-only file system`, not as an explanation. A heuristic
-  parser (codex's `parse_command.rs`) could say "this would write outside your
-  roots" first — in front of the sandbox, never instead of it. Shares its
-  dependency with the shell-parsing finding above.
-- **The `git` tool is outside the boundary.** See top-of-list #2 — only `shell`
-  and `watch` are wrapped by `sandboxed_shell_command`, and what read-only
-  agents should get instead is a decision, not a refactor.
-- **macOS Seatbelt has never run.** The profile is pure-tested only; the e2e
-  test is `cfg(target_os = "macos")` and no Mac was available. It is also a
-  coarsening of codex's `seatbelt_base_policy.sbpl` — no `pseudo-tty`, no
-  `/dev/null` write, no `iokit-open`/`user-preference-read` — so the first real
-  run should read a denial as **"profile too tight"** before "sandbox broken";
-  pty and `/dev/null` writes are the likely first additions.
+- **No network axis** — closed by _deletion_, not by building it. No mode
+  confines the network in any direction now. In the mode that mattered it was
+  never a boundary (a delegated agent reports to a parent that has a network, so
+  injected text propagates through the report), and it was dead weight in
+  `jail`, whose tool set holds nothing that can open a socket. Codex's
+  MITM-proxy route is still the reference if it ever returns — as a designed
+  feature with a threat model, not a vestigial field.
+- **Bundled `bwrap`** — moot: bwrap is deleted. Linux confines with Landlock,
+  macOS with Seatbelt, and there is nothing to install. The kernel floor moved
+  to 5.13 in exchange.
+- **Curated read allow-list for `write` mode** — still the honest gap, but the
+  shape changed. A `shell` command in `write` mode can still
+  `cat ~/.ssh/id_rsa`. What did land is narrower and real: `shell` output now
+  drops lines naming a credential file AND redacts the hunk body of a diff
+  touching one (`DiffRedactor`), so the _accidental_ leak — a broad `rg`, a
+  `git diff` of `.env` — no longer reaches the transcript. Deliberate
+  exfiltration is untouched and admits it.
+- **No shell-command pre-flight** — still open, and cheaper than it was: the
+  EROFS note now names the remedy (`sandbox_writable_roots`,
+  `--sandbox-writable-root`, `!command`), which was most of what a pre-flight
+  would have said.
+- **The `git` tool is outside the boundary** — moot: there is no `git` tool, and
+  `shell` is wrapped.
+- **macOS Seatbelt has never run** — STILL OPEN and now the only untested
+  backend on a supported platform. Read a first-run denial as "profile too
+  tight" before "sandbox broken"; pty and `/dev/null` writes are the likely
+  first additions.
+- **Windows has no OS layer** — STILL OPEN, unchanged. Software path-guard only;
+  every Windows session gets `NO_OS_SANDBOX_NOTICE`.
 
-**Where codex's sandbox has moved past hrdr's** (context for any of the above,
-not separate items): its policy is no longer "writable roots" but a
-precedence-ordered entry list of `{path, access, missing_path_behavior}` with
-`Read|Write|Deny`, most-specific-wins and **deny beats write beats read**, paths
-as globs or symbolic tokens
+Opened by the redesign:
+
+- **The sub-agent `<stem>.json` snapshot is written and never read.** It existed
+  for `task_revive`, which is gone. Its only reader now is its own test
+  (`background_subagent_persists_its_own_session_state`). Deleting it removes a
+  per-turn-boundary write; keeping it keeps a crash-durable record of what a
+  sub-agent actually said. Decide, rather than leaving a file nobody loads — and
+  note that the panes read the sibling `.jsonl`, not this.
+- **`--sandbox jail` cannot apply to a write-capable session**, so it floors at
+  `write` and emits a notice pointing at the `prisoner` agent. That is honest
+  but it is not what the word means. A jailed _main_ agent is coherent (five
+  tools, no shell — an audit session), and the write floor exists for sub-agents
+  that must write. Worth revisiting as "session jail means jail, and a
+  write-capable sub-agent under it is the thing that floors".
+- **`jail` loses `git log` on the audited repo** — real provenance value, and
+  the accepted cost of having no subprocess. Argues for a narrow read-only git
+  capability later, not a general shell.
+- **Package caches are writable and shared across projects.** Content-addressed
+  and integrity-checked, which is what makes it acceptable, but poisoning
+  `~/.cargo/registry` affects builds the user later runs by hand. Revisit if a
+  per-project cache overlay ever gets cheap.
+
+**Where codex's sandbox has moved past hrdr's** (context, not separate items):
+its policy is a precedence-ordered entry list of
+`{path, access, missing_path_behavior}` with `Read|Write|Deny`,
+most-specific-wins and **deny beats write beats read**, paths as globs or
+symbolic tokens
 (`Root, Minimal, ProjectRoots{subpath}, Tmpdir, SlashTmp, Unknown` — `Unknown`
 retained so newer config degrades to warn-and-ignore); named permission profiles
-with `extends` inheritance versus hrdr's flat three-value `SandboxMode`; and a
-fourth mode hrdr has no slot for, `PermissionProfile::External { network }` —
+with `extends` inheritance versus hrdr's flat four-value `SandboxMode`; and a
+mode hrdr has no slot for, `PermissionProfile::External { network }` —
 "filesystem isolation is enforced by an external caller", which hrdr's
-`SandboxMode::None` conflates with "unsandboxed", losing the ability to keep the
-network axis while disabling the FS layer.
+`SandboxMode::None` conflates with "unsandboxed".
 
 ---
 
@@ -482,8 +534,8 @@ Not bugs; things whose surprise is worth having written down.
   `Agent::new` with a linked-worktree cwd creates those two dirs in the
   **parent** `.git` at construction time. Harmless (git ignores empty ref dirs),
   but constructing an agent is not read-only with respect to the repo.
-- **A worktree commit can print a `packed-refs.lock` EROFS line.** Ref
-  maintenance triggered by a commit inside a sandboxed worktree may fail to
+- **A commit from a linked worktree can print a `packed-refs.lock` EROFS line.**
+  Ref maintenance triggered by a commit inside a confined worktree may fail to
   create `<parent>/.git/packed-refs.lock` while the commit itself lands and
   exits 0. Observed during bring-up, asserted by no test — treat it as possible,
   not guaranteed, and **do not widen the roots to silence it**.
@@ -590,12 +642,14 @@ with the reason, don't re-file the finding.
 - **Cron / scheduled runs.** Hermes' `cron/scheduler.py` is 194 KB around an
   in-process 60-second poll thread inside a long-lived gateway daemon under
   launchd/systemd. It presupposes a resident daemon hrdr does not have and does
-  not want; scheduled work for a coding agent lives in CI, and `watch` covers
-  the intra-session case. Note the second-order cost hermes paid: cron sessions
-  poisoned session-search ranking badly enough to need a demotion tier. The one
-  detail worth stealing if hrdr ever ships anything scheduled is the _posture_ —
-  cron runs get `skip_memory=True` unconditionally because _"cron system prompts
-  would corrupt user representations"_, and approvals fail **closed** there.
+  not want; scheduled work for a coding agent lives in CI, and the intra-session
+  case is "say what you are waiting on and end the turn" (there is no polling
+  tool: `watch` was deleted 2026-07-30). Note the second-order cost hermes paid:
+  cron sessions poisoned session-search ranking badly enough to need a demotion
+  tier. The one detail worth stealing if hrdr ever ships anything scheduled is
+  the _posture_ — cron runs get `skip_memory=True` unconditionally because
+  _"cron system prompts would corrupt user representations"_, and approvals fail
+  **closed** there.
 - **Auto-downloading `rg`/`fd`.** See the grep-backend item above: rejected on
   distribution grounds (single static binary) and because the degradation ladder
   is a feature on locked-down machines — **not** because auto-download is
@@ -620,6 +674,26 @@ call-site branching), `Transport` (`mcp/types.rs`), `GrepBackend`, `ModelRef`,
 From the comparison, and only the ones a future change could plausibly trade
 away. Not work; guardrails on work.
 
+**Checked and correct as-is — do not "fix" these:**
+
+- `git_metadata_roots` (`sandbox.rs`) serves hrdr **itself** being launched
+  inside a user's linked worktree, where the agent must still commit. Its
+  sibling `enclosing_git_dir` does the same for an agent scoped _below_ a repo
+  root (a `task` with a narrow `cwd`). Both are pinned by tests; neither is dead
+  code left over from the removed sub-agent worktrees.
+- The `git worktree remove --force` and `git branch -D` guardrails protect a
+  _user's_ own worktrees and branches generically — they were never about
+  sub-agent worktrees.
+- The `git rebase HEAD` guardrail is a generic `-C <dir>` footgun rule, not
+  task-specific.
+- **`memory.rs` writing outside the sandbox roots is correct.** That is where
+  memory lives, and routing it through `check_write` would break the feature.
+  The audit framed this as a bypass to plug; it is not one. What was separable
+  was _authority_, and that is handled (`313eb0e`: `memory` is main-agent-only).
+- Session and transcript persistence carry no removed fields and neither uses
+  `deny_unknown_fields`, so an old file still loads. Relevant every time a
+  record type loses a variant — as `Record::EscalationDecided` just did.
+
 - **Sub-agent filesystem isolation — all four peers lack it.** codex has two
   generations of sub-agent tooling and no worktrees; hermes' children share the
   parent's cwd while its own tool description claims _"separate working
@@ -629,9 +703,10 @@ away. Not work; guardrails on work.
   referenced from `task.ts`); pi's exists only as a 1015-line example spawning
   `pi --json` subprocesses with no isolation. **hrdr matched codex and opencode
   here deliberately in 2026-07-29: sub-agents share the working directory, and
-  the isolation this paragraph praised was removed. What replaces it is the
-  read-only `.git` for write sub-agents, which no peer has — see
-  `SandboxPolicy::deny_git_writes`.**
+  the isolation this paragraph praised was removed. The read-only `.git` that
+  briefly replaced it went too (2026-07-30) — it refused the file tools a write
+  `shell` walked round. What a sub-agent's scope is now: its `cwd`, which `task`
+  can narrow, enforced by the kernel.**
 - **Read-before-write that refuses.** hrdr blocks all three non-`Fresh`
   `ReadState`s. Hermes detects staleness and its own docstring says _"Does not
   block — the write still proceeds"_; pi's `write` overwrites unconditionally. A
@@ -793,6 +868,12 @@ items — they are rules.
 What the three source docs got wrong, found by re-verifying every claim. Kept
 because a backlog that quietly fixes its own errors teaches nothing.
 
+**These are a dated record (2026-07-27), not current facts.** Several describe
+code that has since been deleted: there is no `git` tool (#1, #2), the tool
+count in #6 predates the 2026-07-30 cut of ten tools, and the guardrail count in
+#3 has moved. Read them as "what was corrected then", and check the code for
+now.
+
 1. **`git -C /elsewhere log` does not succeed.** The sandbox follow-up asserted
    it did, in `read` mode. Leading flags in the subcommand slot (`-C`, `-c`,
    `--git-dir`) are refused with a dedicated test, and `FORBIDDEN_ANY` blocks
@@ -866,6 +947,51 @@ What survives is the part that would otherwise be relearned:
   been whole-path rather than root-relative, and did block "add a project skill"
   even when it was correct. Narrowed to `.git`; the rest is a decision at the
   top of this file.
+
+## Cleared in the 2026-07-30 sandbox redesign
+
+Nine slices, `5c9f675`..`c114a6a`, ≈9,000 lines net removed.
+`docs/sandbox-redesign.md` is the decision record and stays; the code is the
+truth. `docs/context.md` was folded into this file and deleted, per this file's
+own convention.
+
+Closed **by deletion**, which is the shape of most of it: the `.git` lock, all
+of escalation, the network axis, bwrap, `DenialKind`, ten tools, and `grep`'s
+two subprocess backends. Also shipped: `jail` mode with a fixed five-tool set,
+the `prisoner` agent, per-profile `sandbox:`, per-session `tool_output_dir`,
+package-manager cache roots, `--sandbox-writable-root`, unified
+untrusted-content wrapping, and `task`'s `cwd`.
+
+What survives that would otherwise be relearned:
+
+- **Deleting a mechanism can be the fix.** The escalation ladder existed for one
+  failure — bwrap's user namespace making ssh refuse `/etc/ssh/ssh_config` — and
+  removing bwrap removed the failure. Two large features (a consent gate with an
+  audit trail, a widening ladder) were answering a problem the redesign deleted.
+  Ask what a mechanism is _for_ before improving it.
+- **A guard the front door bypasses stops only the honest path.** The `.git`
+  file-tool lock refused `write`/`edit` a path `shell` reached in one step,
+  while refusing legitimate `.git/info/exclude` edits and user-requested hooks.
+  Same reasoning killed the network denial: it bought one hop of latency, not
+  containment, because the sub-agent reports to a parent that has a network.
+- **"Available and ignored" is the only usage figure worth acting on.** That a
+  tool the model was handed gets called measures availability. `references` 2
+  calls in 9,350, `definition` 0, `rename` 0, `watch` 4 — that measures need.
+- **Removing a tool means auditing what it was the only home for.** `grep`
+  filtered credential files out of its own output; deleting it from every
+  non-jail mode would have left `shell` — the actual search path — with no
+  secret handling at all. The filter moved to `shell` and grew a diff-aware
+  half.
+- **Confinement that a mode's tool set makes unreachable is not confinement.**
+  `web_fetch`/`web_search`/MCP run in the hrdr parent, outside the sandbox, so a
+  "confined" agent holding them had a working network egress. Jail's boundary is
+  its tool set as much as its roots.
+- **A floor that silently inverts a request needs a notice.** `--sandbox jail`
+  on a write-capable session floors at `write`; without saying so, somebody who
+  typed the word meaning "contain me" gets full project write and never learns.
+- **`cargo` here runs through a wrapper that indents `error:` lines**, so
+  `grep -E "^error"` reports a false pass. Read its summary line. This cost a
+  follow-up commit.
 
 ## Record: closed efforts
 

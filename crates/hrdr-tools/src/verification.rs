@@ -296,7 +296,7 @@ pub(crate) fn is_git_commit(command: &str) -> bool {
             return false;
         }
         // `git -C <dir> -c k=v commit …`: both global flags take a value, and
-        // skipping them is what keeps a sub-agent's `git -C <worktree> commit`
+        // skipping them is what keeps a scoped agent's `git -C <dir> commit`
         // recognisable.
         let mut skip = false;
         for token in rest {

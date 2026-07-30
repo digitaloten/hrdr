@@ -206,7 +206,7 @@ impl LspRegistry {
     /// time, or the file is clean.
     pub async fn diagnostics_note(&self, path: &Path, content: &str) -> Option<String> {
         // Only files inside the workspace the servers were initialized
-        // against. A worktree-isolated sub-agent's tree (or a temp-dir
+        // against. A sub-agent scoped to a subdirectory (or a temp-dir
         // scratch file) sits outside the servers' rootUri, where diagnostics
         // are server-dependent — some analyze, some return nothing, some
         // complain about a file "not in the workspace". Skipping is the
@@ -1342,7 +1342,7 @@ mod tests {
 
     /// Paths outside the registry's root are skipped before any server is
     /// consulted (or spawned): the servers were initialized against the root
-    /// workspace, so out-of-root files — a worktree-isolated sub-agent's
+    /// workspace, so out-of-root files — a scoped sub-agent's
     /// tree, temp-dir scratch files — get deliberately-uniform silence
     /// instead of server-dependent behavior.
     #[tokio::test]
