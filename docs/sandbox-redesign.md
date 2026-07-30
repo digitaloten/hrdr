@@ -778,8 +778,45 @@ symmetry: it contains `_cacache`, `_logs`, `_npx`, `_prebuilds` and a timestamp
 file — no configuration at all. Granting it whole is safe; granting `~/.cargo`
 whole is not.
 
-Anything else a project needs goes in `sandbox_writable_roots`, which already
-exists.
+### Decided: defaults, a good error, and config + CLI
+
+Three parts, and deliberately **no runtime machinery** — no gate, no prompt, no
+re-run semantics.
+
+1. **The five defaults above**, which cover Rust, Node, Python and Go silently.
+2. **The EROFS denial note names the remedy.** It already explains that the
+   sandbox refused the write and the tool is not broken; it must also say _how
+   to allow it_ — naming `sandbox_writable_roots` and the flag. An error that
+   explains the cause and withholds the fix is half an error.
+3. **Configurable both ways.** `sandbox_writable_roots` already exists in
+   config; there is **no CLI flag today**, so one is added:
+   `--sandbox-writable-root <PATH>`, repeatable, kebab-case of the config key
+   like every other flag.
+
+**Merge semantics: append, never replace.** Effective roots are the built-in
+defaults, plus config, plus flags — `canonical_roots` already de-nests and
+dedupes, so overlap is free. A flag that replaced the defaults would silently
+break `cargo build` for anyone who used it to add one path.
+
+### The `exists()` trap this walks into
+
+`for_agent` filters extras by `.exists()` (`sandbox.rs:201`) and skips what is
+absent. That is right for user-supplied paths — "a user config typo is not worth
+failing a session over" — and **wrong for the cache defaults**.
+
+On a fresh machine `~/.npm` does not exist yet. The grant is therefore silently
+dropped, and npm cannot create the directory either, because `$HOME` is not
+writable. So the first `npm i` on a new machine fails _despite_ the default
+being present, with the same EROFS as if nothing had been granted.
+
+So the built-in cache roots must be **created if absent** before the roots are
+built — the same treatment `session_scratch_dir` already gets — with failures
+ignored so a read-only `$HOME` degrades rather than aborting. User-supplied
+extras keep today's silent-skip behaviour; the distinction is that hrdr owns the
+defaults and can vouch for them, and does not own a path someone typed.
+
+Anything beyond the defaults — `~/.gradle`, `~/.m2`, `~/.gem`, `~/.nuget`,
+`~/.pub-cache` — is one config line or one flag.
 
 ### How Codex handles the same problem
 
