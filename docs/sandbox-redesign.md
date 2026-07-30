@@ -1025,9 +1025,9 @@ Mostly-deletion first, so each slice is independently reviewable.
    still claims the read-only tool set excludes `shell`.~~ **DONE** — `sandbox:`
    works in `[[subagent]]` config and in agent-file frontmatter; the override
    carries a notice naming both modes. Only `prisoner` declares one.
-8. **`task` gains `cwd`** — optional, required for jail, canonicalised and
+8. ~~**`task` gains `cwd`** — optional, required for jail, canonicalised and
    contained to the caller's cwd; plus the enclosing-repo `.git` fix for scoped
-   write sub-agents.
+   write sub-agents.~~ **DONE.**
 9. **Tool surface.** Delete the unused tools, cut the `task` family to three,
    make `grep`/`find`/`tree`/`ls` jail-only, and lift `grep_line_is_secret` onto
    the shell output path. **Sweep model-facing text** — `templates/delegate.md`

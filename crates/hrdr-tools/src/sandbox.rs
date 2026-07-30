@@ -202,6 +202,7 @@ impl SandboxPolicy {
             let caches = package_cache_roots();
             let mut roots = vec![cwd.to_path_buf(), std::env::temp_dir(), scratch, output];
             roots.extend(git_metadata_roots(cwd));
+            roots.extend(enclosing_git_dir(cwd));
             roots.extend(caches.iter().cloned());
             roots.extend(extras.iter().filter(|p| p.exists()).cloned());
             let roots = canonical_roots(roots);
@@ -505,6 +506,38 @@ fn git_metadata_roots(cwd: &Path) -> Vec<PathBuf> {
     let _ = std::fs::create_dir_all(&refs);
     let _ = std::fs::create_dir_all(&logs);
     vec![gitdir, common.join("objects"), refs, logs]
+}
+
+/// The `.git` directory of the repository `cwd` sits **inside**, when it is above
+/// `cwd` rather than under it. Empty for a repo root (whose `.git` is already
+/// covered by the cwd root) and for a directory in no repo at all.
+///
+/// Needed the moment a write agent's cwd can be *narrower* than the repository —
+/// which `task`'s `cwd` argument introduced. Scope a write sub-agent to
+/// `crates/foo` and the repo's `.git` is above its only writable root, so
+/// `git add`/`commit` die on an EROFS deep inside git, about a path nobody
+/// mentioned. Granting the metadata directory restores committing without
+/// widening what the agent may *edit*: files outside its cwd stay read-only, which
+/// is the entire point of scoping it.
+///
+/// Deliberately not the enclosing repo's whole worktree, and deliberately the
+/// resolved `.git` — a linked worktree's `<cwd>/.git` is a *file*, handled by
+/// [`git_metadata_roots`] instead.
+fn enclosing_git_dir(cwd: &Path) -> Option<PathBuf> {
+    let mut dir = canonicalize_nearest(cwd).parent().map(Path::to_path_buf);
+    while let Some(d) = dir {
+        let dot_git = d.join(".git");
+        if dot_git.is_dir() {
+            return Some(dot_git);
+        }
+        // A `.git` *file* here is a linked worktree's pointer, and following it is
+        // `git_metadata_roots`'s job — with a narrower grant than the whole gitdir.
+        if dot_git.is_file() {
+            return None;
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    None
 }
 
 /// Home directory, cross-platform (`$HOME`, else `%USERPROFILE%`). `None` in an
@@ -1505,6 +1538,80 @@ mod tests {
         assert_eq!(
             sandbox_denial_note(&jail, "hipErrorNoDevice: failed to open /dev/kfd"),
             None
+        );
+    }
+
+    /// **A write agent scoped to a subdirectory can still commit.**
+    ///
+    /// `task`'s `cwd` argument introduced the case: narrow a write sub-agent to
+    /// `crates/foo` and the repository's `.git` sits *above* its only writable root,
+    /// so `git add`/`commit` die on an EROFS deep inside git about a path nobody
+    /// mentioned. [`enclosing_git_dir`] grants exactly that and nothing wider.
+    ///
+    /// Asserted on the resolver rather than through a `for_agent` policy, because
+    /// every path a test can build lives under `env::temp_dir()` — itself a writable
+    /// root — so the interesting grant would be swallowed as redundant and the
+    /// interesting refusal would pass for the wrong reason.
+    #[test]
+    fn a_write_agent_scoped_below_the_repo_root_can_still_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = canonicalize_nearest(dir.path());
+        std::fs::create_dir_all(repo.join(".git").join("refs")).unwrap();
+        let scoped = repo.join("crates").join("foo");
+        std::fs::create_dir_all(scoped.join("src")).unwrap();
+
+        // Scoped below the root: the repo's metadata is granted.
+        assert_eq!(
+            enclosing_git_dir(&scoped),
+            Some(repo.join(".git")),
+            "a scoped write agent must be able to commit"
+        );
+        // At the root: `.git` is already under the cwd, so nothing is added — a
+        // redundant root would only make the refusal message longer.
+        assert_eq!(enclosing_git_dir(&repo), None);
+        // In no repository at all: nothing to grant.
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(enclosing_git_dir(&canonicalize_nearest(bare.path())), None);
+
+        // A linked worktree's `.git` is a FILE, and following it is
+        // `git_metadata_roots`'s job — with a much narrower grant than the whole
+        // gitdir. This resolver must not hand over the parent's metadata wholesale.
+        let wt = tempfile::tempdir().unwrap();
+        let wt = canonicalize_nearest(wt.path());
+        std::fs::write(wt.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
+        let inside = wt.join("crates");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert_eq!(enclosing_git_dir(&inside), None);
+
+        // And the policy really does carry it: `check_write` on the metadata passes
+        // for an agent whose cwd is the narrow one.
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: canonical_roots(
+                std::iter::once(scoped.clone())
+                    .chain(enclosing_git_dir(&scoped))
+                    .collect(),
+            ),
+            readable_roots: Vec::new(),
+            cache_roots: Vec::new(),
+            wrap_tool_results: false,
+        };
+        for path in [
+            scoped.join("src").join("lib.rs"),
+            repo.join(".git").join("index"),
+            repo.join(".git").join("refs").join("heads").join("main"),
+        ] {
+            policy
+                .check_write(&canonicalize_nearest(&path), &path)
+                .unwrap_or_else(|e| panic!("{} must be writable: {e}", path.display()));
+        }
+        // A sibling crate is not: the grant is the metadata, not the repository.
+        let sibling = repo.join("crates").join("bar").join("src").join("lib.rs");
+        assert!(
+            policy
+                .check_write(&canonicalize_nearest(&sibling), &sibling)
+                .is_err(),
+            "scoping must still mean something"
         );
     }
 
