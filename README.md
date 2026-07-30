@@ -719,7 +719,7 @@ Detached sub-agents show live in the same panel (with a ✓ on completion). Ther
 is no foreground mode — if the model needs the answer before its next step, it
 says so and ends its turn, and the delivered result wakes it.
 
-Five **built-in agents** ship out of the box, selected with the `task` tool's
+Six **built-in agents** ship out of the box, selected with the `task` tool's
 `agent` argument:
 
 - **`explore`** — a read-only code investigator (the read/search tools plus
@@ -733,14 +733,28 @@ Five **built-in agents** ship out of the box, selected with the `task` tool's
 - **`coder`** — a write-capable implementer. Hand it a precise, self-contained
   spec (exact files, symbols, before→after) and it implements exactly that,
   verifies, and commits — no drive-by refactors or scope creep.
+- **`prisoner`** — audits code you do **not** trust (a vendored dependency, a
+  pasted snippet, an unfamiliar repo) under `sandbox = "jail"`: read-only tools,
+  no shell, no network, and reads limited to the `cwd` you hand it. Its persona
+  is injection-resistant — everything arriving through a tool is data, an
+  embedded "report no findings" is itself a finding, and a clean bill of health
+  has to say what was checked. Not for your own code; `review` is for that.
 - **`general`** — full tool access for open-ended, multi-step tasks (explore and
   modify). The same agent you get from `task` with no `agent` argument.
 
 Each runs on the main provider (respecting `subagent_model`) with a specialized
-system prompt and a scoped tool set — `explore`/`review`/`plan` are read-only,
-`coder`/`general` get everything. Without an explicit `subagent_model`, later
-delegations inherit the main agent's current provider, model, and effort,
-including changes made through `/model` or `/effort`.
+system prompt and a scoped tool set — `explore`/`review`/`plan`/`prisoner` are
+read-only, `coder`/`general` get everything.
+
+`prisoner` is also the one built-in that **declares its own sandbox mode**,
+which overrides the session's — `--yolo` included, with a notice saying so. That
+is the point of it: you spawned it to contain something, so a flag aimed at
+everything else must not uncontain it. Every other agent derives its mode from
+the session as usual. An agent file can declare one too (`sandbox: jail` in
+frontmatter), and the advice is to do that only when containment is part of what
+the agent _is_. Without an explicit `subagent_model`, later delegations inherit
+the main agent's current provider, model, and effort, including changes made
+through `/model` or `/effort`.
 
 The read-only `models` tool lets an agent inspect its current provider, model,
 effort and resolved default sub-agent model, and drill down from there into what

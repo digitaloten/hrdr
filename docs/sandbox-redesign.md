@@ -1020,10 +1020,11 @@ Mostly-deletion first, so each slice is independently reviewable.
    and `verify` wrap their own payload (they append imperative notes), the rest
    go through `ToolRegistry::execute`, and `wraps_own_output()` is a declared
    property so a forged first line cannot suppress an envelope.
-7. **`sandbox` on agent profiles** + precedence + the `prisoner` agent and its
+7. ~~**`sandbox` on agent profiles** + precedence + the `prisoner` agent and its
    persona template. Also fix `SubagentProfile::read_only`'s field doc, which
-   still claims the read-only tool set excludes `shell` — the mode does that job
-   now, and read-only agents do have a shell.
+   still claims the read-only tool set excludes `shell`.~~ **DONE** — `sandbox:`
+   works in `[[subagent]]` config and in agent-file frontmatter; the override
+   carries a notice naming both modes. Only `prisoner` declares one.
 8. **`task` gains `cwd`** — optional, required for jail, canonicalised and
    contained to the caller's cwd; plus the enclosing-repo `.git` fix for scoped
    write sub-agents.

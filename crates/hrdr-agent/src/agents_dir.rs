@@ -250,6 +250,20 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Result<Option<Subage
     // discovered profile can tell "unset" from "set false" (see
     // `SubagentProfile::read_only`).
     let read_only = fm.get("read_only").map(is_true);
+    // `sandbox: jail` in an agent file, same vocabulary as the config key and the
+    // flag. An unrecognised value is `None` rather than an error — the same lenient
+    // posture as the rest of frontmatter — so a typo derives from the session
+    // instead of failing the file. It is worth a notice, hence the warning.
+    let sandbox = fm.get("sandbox").and_then(|v| {
+        let raw = v.scalar();
+        match raw.parse::<hrdr_tools::SandboxMode>() {
+            Ok(mode) => Some(mode),
+            Err(reason) => {
+                eprintln!("warning: agent `{name}`: {reason} — deriving from the session instead");
+                None
+            }
+        }
+    });
     // Only an allow-list form is honored (Claude/hrdr). opencode's boolean
     // `tools:` map is nested, so it parses to an empty list here and is ignored.
     let tools = fm.get("tools").map(|v| v.list()).filter(|l| !l.is_empty());
@@ -261,6 +275,7 @@ pub fn parse_agent_file(text: &str, filename_stem: &str) -> Result<Option<Subage
         description,
         prompt,
         read_only,
+        sandbox,
         tools,
         temperature,
         effort,

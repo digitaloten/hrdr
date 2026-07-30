@@ -445,6 +445,17 @@ pub struct AgentConfig {
     /// this plus its [`read_only`](Self::read_only) flag via
     /// [`effective_sandbox`], once, in `Agent::new`.
     pub sandbox: SandboxMode,
+    /// The mode this agent's **profile declared**, if it declared one, and the
+    /// session mode it displaced — kept only so `Agent::new` can say that it did.
+    ///
+    /// A pair rather than a bool, because the notice has to name both: "declares
+    /// `jail`, overriding the session's `none`" is actionable where "sandbox
+    /// overridden" is a puzzle. `None` for every agent that derives normally, which
+    /// is all of them but `prisoner`.
+    pub declared_sandbox: Option<SandboxMode>,
+    /// The session's own mode, before a profile's declaration displaced it — see
+    /// [`declared_sandbox`](Self::declared_sandbox).
+    pub session_sandbox: SandboxMode,
     /// Extra directories a confined agent may write to on top of the built-in
     /// writable roots (cwd, temp, scratch, tool-output, git metadata, the
     /// package-manager caches) — the escape hatch for a **bespoke** layout the
@@ -496,14 +507,41 @@ pub struct SubagentProfile {
     /// prompt (its role). Omit to reuse the main agent's prompt unchanged.
     #[serde(default)]
     pub prompt: Option<String>,
-    /// Restrict this sub-agent to the read-only tool set (read/grep/find/ls/web
-    /// — no write/edit/shell). Ignored when `tools` is set explicitly.
-    /// `None` means "not specified by this profile" — distinct from `Some(false)`
-    /// — so overlaying a profile onto a built-in (e.g. pinning `review`'s model)
+    /// Restrict this sub-agent to the read-only tool set — the observing tools
+    /// **plus a shell**, since the confinement that makes it read-only is the
+    /// sandbox (`SandboxMode::Read` grants no writable root at all), not the absence
+    /// of a shell. Without one, an `explore` or `review` agent could not run the
+    /// thing reviewing a change is mostly made of: `git log`, `git diff`, a linter,
+    /// a test. Ignored when `tools` is set explicitly.
+    ///
+    /// `None` means "not specified by this profile" — distinct from `Some(false)` —
+    /// so overlaying a profile onto a built-in (e.g. pinning `review`'s model)
     /// doesn't silently clear a built-in's `read_only = true`. Use
     /// [`is_read_only`](Self::is_read_only) to read the effective value.
     #[serde(default)]
     pub read_only: Option<bool>,
+    /// Filesystem confinement this agent runs under, **regardless of the session's
+    /// mode** — including `--yolo`.
+    ///
+    /// > **A declared mode is absolute; an undeclared one derives from the session
+    /// > exactly as [`effective_sandbox`] does.**
+    ///
+    /// Not "strictest of both": a `--sandbox jail` session with a write-capable
+    /// agent would resolve to jail and the agent could not write at all, and the
+    /// write floor in `effective_sandbox` exists for good reason. And not
+    /// "loosest of both" either, which is the consequence worth stating: **a
+    /// declared mode ignores `--yolo`.** `--yolo` plus the `prisoner` agent gives
+    /// you a contained prisoner, because containment is what that agent *is* — you
+    /// spawned it precisely to contain something. That reverses "session `none` wins
+    /// everywhere", so it is not done quietly: overriding the session emits a
+    /// notice.
+    ///
+    /// Therefore: **declare a mode only when containment is part of the agent's
+    /// identity.** `prisoner` declares `jail`. `coder`, `explore`, `review`, `plan`
+    /// and `general` declare nothing and keep deriving, so `--yolo` still means yolo
+    /// for them.
+    #[serde(default)]
+    pub sandbox: Option<SandboxMode>,
     /// Explicit tool allow-list for this sub-agent (overrides `read_only`).
     /// Omit for the full default tool set.
     #[serde(default)]
@@ -1021,6 +1059,8 @@ impl Default for AgentConfig {
             allowed_tools: None,
             read_only: false,
             sandbox: SandboxMode::Write,
+            declared_sandbox: None,
+            session_sandbox: SandboxMode::Write,
             sandbox_writable_roots: Vec::new(),
             wrap_tool_results: false,
             child_transcript_dir: None,
