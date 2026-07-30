@@ -508,7 +508,8 @@ fn spawn_background(
     Ok(format!(
         "Started background task #{id} ({label}) — it runs concurrently in the background. \
          You will be woken automatically when it finishes; do not continue working until its \
-         result is reviewed. End your turn now.{isolation}"
+         result is reviewed. End your turn once you have spawned everything you mean to run \
+         in parallel.{isolation}"
     ))
 }
 

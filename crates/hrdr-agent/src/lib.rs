@@ -10861,7 +10861,8 @@ mod tests {
             );
             // The contract: the delegating agent sees (a) it started + runs
             // concurrently, and (b) it will be woken automatically — so it
-            // must end its turn now and not continue working.
+            // must end its turn rather than continue working, but only once
+            // it has spawned every task it wants running in parallel.
             assert!(
                 out.contains("runs concurrently in the background"),
                 "contract (a): concurrent background execution: {out}"
@@ -10871,8 +10872,8 @@ mod tests {
                 "contract (b): auto-wake: {out}"
             );
             assert!(
-                out.contains("End your turn now"),
-                "contract (b): end turn now: {out}"
+                out.contains("End your turn once you have spawned everything"),
+                "contract (b): end the turn, after batching parallel spawns: {out}"
             );
             // Nested/sub-agent delegation is structurally impossible: a
             // sub-agent's config sets `subagents = false` (no task tool), so a
