@@ -896,6 +896,14 @@ fn finish(
 /// Run a user-typed shell command with no sandbox and no guardrails — the
 /// user's own shell, not the model's. Returns the full [`CommandRun`] so the
 /// caller can format the history note and result.
+///
+/// "No guardrails" means the configured command rules in [`ToolContext`], which
+/// the caller empties. It does **not** mean unfiltered: the secret-file line
+/// filter and the diff redactor live in [`run_streamed_command`] itself and
+/// apply here too, so `!ls` will not show the user a line naming `.env` and
+/// `!git diff` comes back redacted. That is deliberate — this output is put
+/// into the model's history as well as on the user's screen — but it is not
+/// what "no guardrails" says on its own.
 pub async fn run_user_command(
     shell: Shell,
     command: &str,
