@@ -44,8 +44,7 @@ const EXIT: Duration = Duration::from_secs(30);
 const DRAIN: Duration = Duration::from_secs(2);
 
 /// Check whether a pty can be allocated. Returns `false` when the Landlock
-/// sandbox inherited from the parent hrdr process blocks `/dev/ptmx` — the
-/// test can then return `Ok(())` instead of reporting a false failure.
+/// sandbox inherited from the parent hrdr process blocks `/dev/ptmx`.
 fn pty_available() -> bool {
     native_pty_system()
         .openpty(PtySize {
@@ -55,6 +54,25 @@ fn pty_available() -> bool {
             pixel_height: 0,
         })
         .is_ok()
+}
+
+/// Whether to skip a pty test for want of a pty — **never in CI**.
+///
+/// Locally this is the common case: hrdr running these tests under its own
+/// Landlock sandbox cannot open `/dev/ptmx`, and reporting that as a failure
+/// says nothing about the code. On a runner there is no such sandbox, so a
+/// missing pty is a broken environment and the only useful thing a test can do
+/// is fail. A skip that cannot tell those apart converts an infrastructure
+/// failure into a green tick, which is the one outcome worse than either.
+fn skip_for_want_of_a_pty() -> bool {
+    if pty_available() {
+        return false;
+    }
+    if std::env::var_os("CI").is_some() {
+        return false;
+    }
+    eprintln!("skipping: no pty available (a Landlock sandbox blocks /dev/ptmx)");
+    true
 }
 
 /// Strip ANSI escape sequences, so assertions read the *text* on the screen rather
@@ -116,9 +134,9 @@ struct Run {
 
 /// Run the TUI in a pty: wait for it to paint, type `keys`, and see it out.
 ///
-/// Panics on pty allocation failure — call [`pty_available`] first to skip
-/// the test when a Landlock sandbox inherited from the parent hrdr process
-/// blocks `/dev/ptmx`.
+/// Panics on pty allocation failure — call [`skip_for_want_of_a_pty`] first,
+/// which skips outside CI when a Landlock sandbox inherited from the parent
+/// hrdr process blocks `/dev/ptmx`.
 fn run_tui(keys: &str) -> Run {
     let home = tempfile::tempdir().expect("temp home");
     let project = tempfile::tempdir().expect("temp project");
@@ -303,8 +321,7 @@ fn run_tui(keys: &str) -> Run {
 /// unexercised until a user ran it.
 #[test]
 fn the_tui_starts_paints_and_exits_cleanly() -> Result<(), String> {
-    if !pty_available() {
-        eprintln!("skipping: Landlock sandbox blocks /dev/ptmx");
+    if skip_for_want_of_a_pty() {
         return Ok(());
     }
     let Run {
@@ -346,8 +363,7 @@ fn the_tui_starts_paints_and_exits_cleanly() -> Result<(), String> {
 /// connection error.
 #[test]
 fn an_unreachable_endpoint_does_not_take_the_tui_down() -> Result<(), String> {
-    if !pty_available() {
-        eprintln!("skipping: Landlock sandbox blocks /dev/ptmx");
+    if skip_for_want_of_a_pty() {
         return Ok(());
     }
     let Run {
@@ -572,8 +588,7 @@ impl Session {
 ///    renders on screen; the app then quits cleanly.
 #[test]
 fn a_submitted_prompt_streams_its_reply() -> Result<(), String> {
-    if !pty_available() {
-        eprintln!("skipping: Landlock sandbox blocks /dev/ptmx");
+    if skip_for_want_of_a_pty() {
         return Ok(());
     }
     let server = MockServer::start(vec![Chat::Sse(vec![
@@ -608,8 +623,7 @@ fn a_submitted_prompt_streams_its_reply() -> Result<(), String> {
 ///    cleanly.
 #[test]
 fn escape_cancels_a_turn_without_killing_the_app() -> Result<(), String> {
-    if !pty_available() {
-        eprintln!("skipping: Landlock sandbox blocks /dev/ptmx");
+    if skip_for_want_of_a_pty() {
         return Ok(());
     }
     // Open the stream with a visible marker, then hold it: the turn stays
@@ -657,8 +671,7 @@ fn escape_cancels_a_turn_without_killing_the_app() -> Result<(), String> {
 /// asserts exits cleanly with the terminal restored.
 #[test]
 fn resize_is_survived_and_eof_exits_cleanly() -> Result<(), String> {
-    if !pty_available() {
-        eprintln!("skipping: Landlock sandbox blocks /dev/ptmx");
+    if skip_for_want_of_a_pty() {
         return Ok(());
     }
     let server = MockServer::start(vec![]);

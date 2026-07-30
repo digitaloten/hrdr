@@ -6,6 +6,62 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Esc stops.** Cancelling a turn launched a fresh one to drain any messages
+  typed while it ran, so Esc started work instead of ending it — stopping a
+  runaway agent took two presses, and the second only worked if the queue
+  happened to be empty. Those messages now go back into the composer, where they
+  are visible and editable: not sent, not dropped, and not left to ride out
+  silently on whatever turn came next.
+
+- **A cancelled turn can no longer end the turn that replaced it.** A turn's
+  `RunGuard` runs whenever the runtime next polls the aborted task, which can be
+  after its replacement has started; it then marked the agent idle mid-turn,
+  stopping the loader and letting a second concurrent turn start on the one
+  agent. Turns now carry a generation, and a guard that no longer owns the agent
+  stands down.
+
+- **Tab-indented output no longer clumps against the margin.** Only one of the
+  paths that render raw text expanded tabs, and not the ones that carry the
+  most: `read` results, diffs, `!command` output, `write` bodies and
+  syntax-highlighted code all now go through one `expand_tabs`.
+
+- **`!command` output keeps its lines.** The settled block ran the output
+  through a one-line preview helper, which replaced every newline with a space —
+  `!git log` rendered as a single wrapped line, and the model's history note got
+  the same flattened blob. Its line budget was also the model's default of 50,
+  so anything longer collapsed to 50 lines and a spool pointer.
+
+- **`!command` output can no longer arrive after its block has closed.** The
+  live stream and the settle were sent from different tasks onto one channel;
+  the stream is now drained before the block is settled.
+
+- **Tab characters in transcript text no longer clump up.** `text_lines` expands
+  them to four spaces.
+
+- **Several queued messages become one turn, not several.** Each mid-turn submit
+  used to become its own user turn, carrying the full system prompt and tool
+  definitions every time; adjacent messages are now merged.
+
+### Changed
+
+- **`!command` is no longer on the model's 300-second timeout.** It inherited
+  the tool timeout when it moved onto the shared shell path, which killed the
+  process group — `!tail -f` and `!npm run dev` died at five minutes. The user's
+  own shell now runs until they stop it.
+
+- **The pty tests fail in CI rather than skipping.** They skip locally when
+  hrdr's own Landlock sandbox blocks `/dev/ptmx`, which says nothing about the
+  code; on a runner a missing pty is a broken environment, and a skip that
+  cannot tell the two apart turns that into a green tick.
+
+- **Test sandboxes override `XDG_RUNTIME_DIR`**, so session spool directories
+  land inside the sandbox instead of the real `/run/user/$UID`.
+
+- Comments describing bwrap's behaviour as current were replaced with their
+  Landlock-era equivalents; bwrap itself was deleted in 0.9.0.
+
 ## [0.9.1] - 2026-07-31
 
 ### Fixed
@@ -5262,7 +5318,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/kryptic-sh/hrdr/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/kryptic-sh/hrdr/compare/v0.8.5...v0.9.0
 [0.8.5]: https://github.com/kryptic-sh/hrdr/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/kryptic-sh/hrdr/compare/v0.8.3...v0.8.4
