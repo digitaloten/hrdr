@@ -1658,7 +1658,6 @@ dependencies = [
  "hrdr-app",
  "hrdr-protocol",
  "hrdr-test-support",
- "hrdr-tools",
  "rand 0.10.2",
  "rusqlite",
  "rust-embed",

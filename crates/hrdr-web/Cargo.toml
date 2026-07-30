@@ -15,9 +15,6 @@ ui = ["rust-embed"]
 hrdr-protocol.workspace = true
 hrdr-app.workspace = true
 hrdr-agent.workspace = true
-# The escalation approval gate: a frontend registers with it and answers
-# through it directly (never via the agent, whose lock the running turn holds).
-hrdr-tools.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 serde.workspace = true

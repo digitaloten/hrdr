@@ -955,12 +955,6 @@ pub(crate) fn gpu_device_nodes() -> Vec<std::path::PathBuf> {
     out
 }
 
-/// GPU devices don't exist on non-Linux — the loop is a no-op.
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn gpu_device_nodes() -> Vec<std::path::PathBuf> {
-    Vec::new()
-}
-
 /// The note alone — the only thing any caller wants, now that there is exactly one
 /// kind of denial to report.
 ///
@@ -1035,6 +1029,16 @@ pub fn sandboxed_shell_command(
 /// that never ran a shell command is not told its own sandbox degraded, and one
 /// that did is not silenced by whoever got here first. Backend detection is cached
 /// process-wide; the notice is not, so every command re-earns it.
+///
+/// `policy` is read only by the two real backends, and each is behind its own
+/// `cfg` — so on a platform with neither (Windows) every use of it compiles out
+/// and `-D warnings` calls the parameter unused. Waived rather than renamed:
+/// `_policy` would read as "this function ignores the policy", which is false
+/// everywhere it matters.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    allow(unused_variables)
+)]
 fn shell_command_with_backend(
     backend: OsSandboxBackend,
     shell: crate::Shell,
