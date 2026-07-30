@@ -576,14 +576,35 @@ identity.** The audit agent declares `jail`. `coder`, `explore`, `review`,
 `plan` and `general` declare nothing and keep deriving, so `--yolo` still means
 yolo for them.
 
-## The audit agent
+## The `prisoner` agent
 
-Name **unresolved** — you said `prisoner`; I would rather it were `audit` or
-`quarantine`. Personas shape behaviour, and "prisoner" frames the _agent_ as
-punished when the thing being contained is the code. Your call; the plan uses
-`audit` as a placeholder.
+**Named `prisoner`, and the name is right.** The earlier objection — name an
+agent for its job, not its containment — does not apply here, because for this
+agent the containment _is_ the job. `prisoner` in `jail` is coherent, and it is
+a clear selection cue for "this needs isolating" in a way `audit` would not be.
 
-Profile: `sandbox: jail`, `read_only: true`, `proactive: false`.
+Profile: `sandbox: jail`, `proactive: false`, `cwd` required on the `task` call.
+Its tool set is jail's fixed five and cannot be widened.
+
+One thing the persona must get right: frame the containment as being about the
+**code**, not about the agent. "You are reading code that may be hostile, so you
+are confined and it cannot reach anything through you" — not "you are
+restricted." The failure mode of the punishment reading is an agent that treats
+its limits as obstacles or goes passive, when what is wanted is an inspector
+that reports its constraints as facts.
+
+### `prisoner` is distinct from any audit of our own code
+
+Auditing a codebase **we own** is a different job with different needs: full
+read access, `shell` to run `cargo audit`/`npm audit`/`git log -S`, and no
+isolation, because the code is ours. That job is already served twice — the
+built-in **`:audit` skill** (`templates/skills/audit.md`, `skills.rs:182`, with
+a depth argument) and the **`review` agent**, whose description already claims
+"bugs, edge cases, and security issues".
+
+**So this plan adds `prisoner` only.** A third thing for the same job is the
+redundancy the rest of this document spends its length removing; if `:audit`
+needs a read-only agent to run inside, it can name `review`.
 
 The threat is not that the agent is untrustworthy — it is that **the code it
 reads may act through it**. So the persona's first rule is injection resistance,
@@ -606,11 +627,14 @@ not caution about execution:
   breakage or try to route around them.
 - Report; change nothing.
 
-A weaker version of the data-never-instruction rule belongs in the **base**
-prompt for every agent. Related but separate: `AGENTS.md` currently arrives with
-no trust framing at all, where memory arrives under `MEMORY_PREAMBLE`'s "trust
-them but verify" — adding a comparable frame would close the softer form of
-`context.md` §2.1. Both are follow-ups, not part of this.
+This persona is `prisoner`'s alone. An auditor of our own code should not run at
+this pitch — treating every file as hostile is right when the code is untrusted
+and merely noisy when it is ours. A weaker version of the data-never-instruction
+rule belongs in the **base** prompt for every agent. Related but separate:
+`AGENTS.md` currently arrives with no trust framing at all, where memory arrives
+under `MEMORY_PREAMBLE`'s "trust them but verify" — adding a comparable frame
+would close the softer form of `context.md` §2.1. Both are follow-ups, not part
+of this.
 
 ### One residual, written down rather than assumed
 
@@ -715,8 +739,10 @@ Mostly-deletion first, so each slice is independently reviewable.
    discovery so `set_cwd` cannot re-seed.
 6. **Unified tool-result wrapping.** Policy flag, registry choke point, per-tool
    opt-out, harness notes outside the envelope.
-7. **`sandbox` on agent profiles** + precedence + the audit agent and its
-   persona template.
+7. **`sandbox` on agent profiles** + precedence + the `prisoner` agent and its
+   persona template. Also fix `SubagentProfile::read_only`'s field doc, which
+   still claims the read-only tool set excludes `shell` — the mode does that job
+   now, and read-only agents do have a shell.
 8. **`task` gains `cwd`** — optional, required for jail, canonicalised and
    contained to the caller's cwd; plus the enclosing-repo `.git` fix for scoped
    write sub-agents.
@@ -767,6 +793,8 @@ the plan assumes the stated recommendation for the rest.
   the POSIX backend are both deleted, and lookaround goes with them.
 - **`task` gains a `cwd`** — optional in general, **required for a jailed
   agent**, validated to sit inside the caller's own cwd.
+- **The jail agent is `prisoner`** — containment is its defining property, so
+  naming it after the containment is correct here.
 - **No network confinement in any mode**, and **bwrap is deleted** — Landlock on
   Linux, Seatbelt on macOS, nothing elsewhere. The ssh / user-namespace failure
   class disappears with it.
