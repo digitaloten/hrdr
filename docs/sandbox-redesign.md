@@ -24,37 +24,31 @@ Two consequences, stated up front because they reverse shipped behaviour:
 - **The `.git` lock goes.** A sub-agent told to commit its own work should be
   able to. Coordination between concurrent writers is a prompt rule, not a
   mount.
-- **Escalation shrinks.** Its motivating failure (bwrap's user namespace
-  breaking ssh) is fixed at the cause by running Write mode on Landlock, not
-  routed around by a widening rung.
+- **Escalation shrinks to one grant.** Its motivating failure — bwrap's user
+  namespace breaking ssh — is not worked around but _deleted_: bwrap goes
+  entirely, so the namespace that caused it never exists.
 
 One mode is the exception, and it is the reason the read axis survives: `jail`
 exists to inspect third-party code you are unwilling to expose to.
 
 ## Mode matrix
 
-| Axis                         | `none` (yolo) | `write`                        | `read`              | `jail`                   |
-| ---------------------------- | ------------- | ------------------------------ | ------------------- | ------------------------ |
-| Writes                       | everywhere    | cwd, temp, scratch, output dir | **none**            | **none**                 |
-| Reads                        | everywhere    | everywhere                     | everywhere          | **cwd + own output dir** |
-| Shell network                | yes           | yes                            | **no** ¹            | **no**                   |
-| `web_fetch` / `web_search`   | yes           | yes                            | yes                 | **no**                   |
-| MCP tools                    | yes           | yes                            | yes                 | **no**                   |
-| `shell` / `verify` / LSP     | yes           | yes                            | yes                 | **no**                   |
-| `task`                       | yes           | yes                            | yes                 | **no**                   |
-| `memory`                     | main only     | main only                      | main only           | **no**                   |
-| Project `AGENTS.md` / skills | yes           | yes                            | yes                 | **no**                   |
-| Tool results wrapped         | no            | opt-in (config)                | opt-in (config)     | **always**               |
-| Escalation eligible          | n/a           | yes                            | yes                 | **never**                |
-| Backend                      | none          | Landlock preferred             | **bwrap** preferred | **none needed**          |
+| Axis                         | `none` (yolo) | `write`                        | `read`          | `jail`                   |
+| ---------------------------- | ------------- | ------------------------------ | --------------- | ------------------------ |
+| Writes                       | everywhere    | cwd, temp, scratch, output dir | **none**        | **none**                 |
+| Reads                        | everywhere    | everywhere                     | everywhere      | **cwd + own output dir** |
+| `web_fetch` / `web_search`   | yes           | yes                            | yes             | **no**                   |
+| MCP tools                    | yes           | yes                            | yes             | **no**                   |
+| `shell` / `verify` / LSP     | yes           | yes                            | yes             | **no**                   |
+| `task`                       | yes           | yes                            | yes             | **no**                   |
+| `memory`                     | main only     | main only                      | main only       | **no**                   |
+| Project `AGENTS.md` / skills | yes           | yes                            | yes             | **no**                   |
+| Tool results wrapped         | no            | opt-in (config)                | opt-in (config) | **always**               |
+| Escalation eligible          | n/a           | yes                            | yes             | **never**                |
+| Backend                      | none          | Landlock                       | Landlock        | **none needed**          |
 
-¹ **Assumption to confirm.** Your sketch put network removal only in `jail`. But
-every delegated agent loses shell network today, and `explore`/`review` are
-read-only sub-agents — so a per-mode network property would _widen_ them, giving
-agents that read your whole filesystem a socket they do not currently have. The
-cost of denying it is near zero: `web_fetch`/`web_search` run in-process and are
-unaffected, so a read agent that needs the web still has it. Override if you
-want `read` to keep shell network.
+**There is no network axis.** The sandbox does not confine the network in any
+mode — see "Network confinement is removed" below.
 
 **Jail's tool set is exactly the read-only tools**: `read`, `grep`, `find`,
 `ls`, `tree` (`find` is the glob tool). No `shell`, no `verify`, no LSP, no
@@ -69,51 +63,65 @@ the tool, with an `EROFS` the model would misread as a broken toolchain.
 The accepted loss is `git log` on the audited repo — real provenance value. That
 argues for a narrow read-only git capability later, not a general shell now.
 
-### Why the backend differs per mode
+### Network confinement is removed
 
-- **`write` prefers Landlock** because Landlock builds **no user namespace**.
-  That namespace is the entire cause of the ssh failure: it maps only the
-  invoking uid, root-owned files read as `nobody`, OpenSSH refuses
-  `/etc/ssh/ssh_config`, `git push` dies. On Landlock, `git push` simply works.
-- **`read` prefers bwrap**, which inverts the usual argument. Landlock's network
-  rights are ABI v4 TCP `bind`/`connect` and nothing else, so UDP, DNS, QUIC and
-  raw sockets escape it; `--unshare-net` does not. And the userns cost is
-  irrelevant here, because a mode with no network never touches ssh.
-- **`jail` needs no backend at all.** See below: with `grep` on the built-in
-  walker, no jail tool spawns a subprocess, so there is nothing for an OS
-  sandbox to confine. Its confinement is in-process, by construction.
+No mode confines the network. `SandboxPolicy::allow_network`, `deny_network()`,
+`--unshare-net`, Landlock's `AccessNet` handling, Seatbelt's conditional
+`(allow network*)`, `NETWORK_PARTIAL_UNDER_LANDLOCK_NOTICE` and
+`DenialKind::NetworkDenied` with its note all go.
 
-### Fallbacks
+Two reasons, and the second is the one that makes it safe:
 
-| Mode    | Primary  | Fallback                                    | If neither           |
-| ------- | -------- | ------------------------------------------- | -------------------- |
-| `write` | Landlock | bwrap + `GIT_SSH_COMMAND` workaround + note | unconfined + note    |
-| `read`  | bwrap    | Landlock, TCP-only denial + loud note       | unconfined + note    |
-| `jail`  | n/a      | n/a                                         | n/a — works anywhere |
+**In `jail` it was already dead code.** Nothing in jail's tool set can open a
+socket — no `shell`, no `web_fetch`/`web_search`, no MCP, and no subprocess at
+all once `grep` is `Builtin`-only. Jail's network denial _was_ the tool removal;
+`--unshare-net` on top of it confined nothing.
 
-Landlock needs kernel 5.13+; the `write` fallback keeps
-`git_ssh_command_for_userns` and its `SshUserNamespace` denial note alive on
-that path, so neither is deleted.
+**In `read` it was never a boundary.** A delegated agent reports to an agent
+that _does_ have network. Injected text reaching `explore` propagates to the
+parent through its report, and the parent can curl. Denying the sub-agent a
+socket bought one hop of latency, not containment. ("Trusted workspace" is the
+weaker half of the argument, since a workspace contains `node_modules` and
+`vendor/` nobody here wrote — but it does not need to carry the case.)
 
-### There is no jail hard failure — and that is the better outcome
+**What is genuinely given up:** defence in depth against the low-effort
+accidental case, and a bandwidth difference — `web_fetch` is a GET behind an
+SSRF guard, so exfiltration through it is URL-length-bounded, where
+`curl -d @file` is not. Accepted knowingly. If network confinement returns it
+should be a designed feature with a real threat model, not a vestigial field.
 
-An earlier revision of this plan required bwrap for `jail` and exited non-zero
-without it. Removing `grep`'s subprocess makes that unnecessary and, more
-usefully, makes jail **available on macOS and Windows** where bwrap does not
-exist at all. The audit mode goes from Linux-only to universal.
+### Backends: Landlock on Linux, Seatbelt on macOS, nothing elsewhere
 
-`detect_backend()` stays lazy everywhere; nothing needs an eager probe.
+bwrap had exactly two capabilities Landlock lacks, and both are now gone:
 
-**Stated honestly:** jail has no OS backstop, so a bug in a read tool's path
-handling would be an escape. That is acceptable here, and the reason is who the
-adversary is. With zero execution, their only lever is text in files — read
-confinement guards against _our_ tool bugs, not against the attacker, whose
-actual surface is the injection that the untrusted-content wrapper and the
-persona address. Requiring bwrap for a mode with no child process would be a
-talisman that does nothing.
+1. **Mount-based read confinement** — needed only by `jail`, which enforces
+   reads in-process through `check_read`.
+2. **Complete network denial** — `--unshare-net` covered UDP, DNS, QUIC and raw
+   sockets where Landlock reaches only TCP `bind`/`connect`. There is no network
+   confinement any more.
 
-Same logic retires `--unshare-net` in jail: nothing runs, so nothing can open a
-socket. **Jail's network denial _is_ the tool removal.**
+So **bwrap has no remaining unique role and is deleted**: `bwrap_args` and its
+argv-order-is-semantics discipline, `usr_merge_compat_args`, the GPU
+`--dev-bind` handling, the unprivileged-userns probe, `BWRAP_MISSING_NOTICE`,
+`USERNS_DISABLED_NOTICE`, and with them `git_ssh_command_for_userns` and the
+`SshUserNamespace` denial note.
+
+That last pair is worth dwelling on: **the entire ssh / user-namespace failure
+class disappears**. It is what motivated escalation in the first place, and the
+fix turns out not to be a workaround or a widening rung but the removal of the
+mechanism that caused it.
+
+| Mode    | Linux                                                     | macOS    | Elsewhere         |
+| ------- | --------------------------------------------------------- | -------- | ----------------- |
+| `write` | Landlock                                                  | Seatbelt | unconfined + note |
+| `read`  | Landlock                                                  | Seatbelt | unconfined + note |
+| `jail`  | none needed — confinement is in-process on every platform |          |                   |
+
+**Cost, stated:** Landlock needs kernel 5.13+ (July 2021). Below that, Linux
+falls to unconfined-with-a-notice, the same posture Windows has today. Debian 12
+ships 6.1 and RHEL 9 ships 5.14, so the band is narrow — but it is a real
+regression for anyone on an older kernel who has bwrap, and the notice must say
+so plainly.
 
 ## Tool sets
 
@@ -639,9 +647,16 @@ does this. Stated here so nobody later "fixes" it.
 `restored_git_roots`, `protect_git`, `SandboxPolicy::delegated`,
 `DenialKind::GitMetadata` and both its notes, `Widening` (all rungs),
 `DEFAULT_RULES`, per-agent-role `deny_network` (replaced by mode-driven),
-`PROTECTED_METADATA_DIRS` / `protected_metadata_dir` (**assumption to confirm**:
-dropping the file-tool `.git` guard, since `shell` bypasses it anyway and it
-refuses legitimate `git config` / `.git/info/exclude` edits).
+`PROTECTED_METADATA_DIRS` / `protected_metadata_dir` — the file-tool `.git`
+guard. It refused any write whose canonical path contained a `.git` component,
+for the model's file tools only. `shell` always walked straight around it, and
+guardrails do not cover `.git/hooks` writes either — so it stopped the honest
+path and nothing else, while refusing legitimate `git config` and
+`.git/info/exclude` edits and hooks the user had asked for.
+
+**No replacement is added.** If installing a git hook ever warrants oversight,
+it belongs at the shell layer where guardrails and the approval gate already run
+— not in the file tools, which are the one path a determined caller never needs.
 
 Also deleted, all because **jail spawns no subprocess and therefore uses no OS
 backend**:
@@ -690,9 +705,10 @@ Mostly-deletion first, so each slice is independently reviewable.
 1. **Remove the `.git` lock.** `protect_git`, `deny_git_writes` and friends;
    collapse `Widening` to one grant; delete `DEFAULT_RULES`.
 2. **`tool_output_dir` per session.**
-3. **Mode → backend.** Write→Landlock, Read→bwrap, jail→none (delete the Strict
-   bwrap arm and its mount helpers). Mode → shell network. No eager probe and no
-   hard-failure path — both belonged to the superseded bwrap-required design.
+3. **Delete bwrap and the network axis.** Write/Read→Landlock (Seatbelt on
+   macOS), jail→no backend. Removes `bwrap_args`, `usr_merge_compat_args`, the
+   userns probe, `git_ssh_command_for_userns`, `allow_network`, `deny_network`,
+   and the `DenialKind` cascade down to a single arm.
 4. **Mode → tool set.** Pin jail to the fixed five, and make the cap unwidenable
    by a profile's `tools` list.
 5. **Mode → prompt surfaces.** No working-tree instructions in jail, gated at
@@ -751,20 +767,27 @@ the plan assumes the stated recommendation for the rest.
   the POSIX backend are both deleted, and lookaround goes with them.
 - **`task` gains a `cwd`** — optional in general, **required for a jailed
   agent**, validated to sit inside the caller's own cwd.
+- **No network confinement in any mode**, and **bwrap is deleted** — Landlock on
+  Linux, Seatbelt on macOS, nothing elsewhere. The ssh / user-namespace failure
+  class disappears with it.
+- **The file-tool `.git` guard is deleted** (`PROTECTED_METADATA_DIRS`) —
+  `shell` bypassed it, so it stopped only the honest path.
 - **Jail needs no OS backend** — nothing it can run spawns a subprocess, so the
   hard-failure requirement decided earlier is moot and jail works on every
   platform.
 
 ### Needs your input
 
-Three left. None blocks the deletion slices, so building can start.
+One left, and it does not block anything.
 
-1. **Does `read` deny shell network?** A real behaviour change for `explore` and
-   `review`. Assumed: **yes**.
-2. **Drop the file-tool `.git` guard?** Security-adjacent removal, so worth an
-   explicit yes. Assumed: **yes**.
-3. **The audit agent's name.** Assumed: `audit`, but `jail` makes `prisoner`
-   coherent. Whatever it is, keep punishment framing out of the persona text.
+**The audit agent's name.** Assumed: `audit`. The practical argument is
+selection — the model picks an agent from name plus description, so
+`task(agent: "audit")` is guessable from "check this dependency for anything
+malicious" where `task(agent: "prisoner")` names the containment rather than the
+job. Every other built-in is named for what it does: `explore`, `review`,
+`plan`, `coder`. Against that, `jail` makes `prisoner` internally coherent.
+Whichever it is, keep punishment framing out of the persona text: the agent
+should read as an inspector who happens to be contained, not an inmate.
 
 ### Assumed, low stakes — say nothing and these stand
 
