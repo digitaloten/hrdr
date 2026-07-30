@@ -717,6 +717,7 @@ pub(crate) async fn run_streamed_command(
     // exit status. Kept as its own flag because it decides `Ok` vs `Err` below,
     // and `status` is consumed by the exit-code notes in between.
     let timed_out = status.is_none();
+    let exit_code = status.as_ref().and_then(|s| s.code());
     if let Some(s) = status
         && !s.success()
     {
@@ -806,14 +807,14 @@ pub(crate) async fn run_streamed_command(
 
     // Nothing produced.
     if total_lines == 0 {
-        return finish(format!("(no output){notes}"), timed_out, passed);
+        return finish(format!("(no output){notes}"), timed_out, passed, exit_code);
     }
 
     // Within both display caps: return the full in-memory view (no pointer needed).
     if total_bytes <= ctx.max_output && total_lines <= ctx.max_output_lines {
         // head holds all lines in this branch.
         let out = head.trim_end();
-        return finish(format!("{out}{notes}"), timed_out, passed);
+        return finish(format!("{out}{notes}"), timed_out, passed, exit_code);
     }
 
     // Over the display cap: emit head + overflow pointer + tail, via the shared
@@ -846,7 +847,7 @@ pub(crate) async fn run_streamed_command(
         total_lines,
         total_bytes,
     );
-    finish(format!("{body}{notes}"), timed_out, passed)
+    finish(format!("{body}{notes}"), timed_out, passed, exit_code)
 }
 
 /// What a finished command produced.
@@ -857,9 +858,10 @@ pub(crate) async fn run_streamed_command(
 /// and answered. Whether it *succeeded* is a separate fact, and `verify` needs
 /// it: reconstructing it by grepping for `[exit status:` in output the tool just
 /// assembled holds only until a command's own output contains that string.
-pub(crate) struct CommandRun {
+pub struct CommandRun {
     pub output: String,
     pub passed: bool,
+    pub exit_code: Option<i32>,
 }
 
 /// The tool result for a finished run: `Ok` normally, `Err` when the deadline
@@ -875,14 +877,34 @@ pub(crate) struct CommandRun {
 /// The partial output rides the error rather than being dropped: it is often the
 /// whole diagnosis (which test hung, how far the build got), and an error that
 /// discards it forces a re-run of the command that just cost the deadline.
-fn finish(body: String, timed_out: bool, passed: bool) -> Result<CommandRun> {
+fn finish(
+    body: String,
+    timed_out: bool,
+    passed: bool,
+    exit_code: Option<i32>,
+) -> Result<CommandRun> {
     if timed_out {
         bail!("{body}");
     }
     Ok(CommandRun {
         output: body,
         passed,
+        exit_code,
     })
+}
+
+/// Run a user-typed shell command with no sandbox and no guardrails — the
+/// user's own shell, not the model's. Returns the full [`CommandRun`] so the
+/// caller can format the history note and result.
+pub async fn run_user_command(
+    shell: Shell,
+    command: &str,
+    timeout: Duration,
+    keep_ansi: bool,
+    ctx: &ToolContext,
+) -> Result<CommandRun> {
+    let cmd = shell.command(command);
+    run_streamed_command(cmd, command, timeout, keep_ansi, ctx).await
 }
 
 /// Trim already-bounded display text down to `max_bytes` and `max_lines`,

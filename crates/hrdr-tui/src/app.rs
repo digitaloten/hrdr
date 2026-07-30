@@ -1189,7 +1189,7 @@ impl App {
         self.record_local(AgentEvent::ToolStart {
             id: id.clone(),
             name: "shell".to_string(),
-            args: format!("! {command}"),
+            args: serde_json::json!({"command": command}).to_string(),
         });
         let task_id = id.clone();
         if self
@@ -1203,134 +1203,74 @@ impl App {
             return;
         }
         let cwd = hrdr_app::agent_cwd(&self.agent);
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<String>(256);
+        let mut ctx = hrdr_tools::ToolContext::new(&cwd);
+        ctx.stream = Some(stream_tx);
+        ctx.max_output = 50_000;
+        ctx.guardrails = Arc::new(Vec::new()); // user's own shell — no guardrails
         let tx = self.tx.clone();
         let task_command = command.clone();
-        let spawn_command = command.clone();
+        let timeout = std::time::Duration::from_secs(hrdr_tools::DEFAULT_TOOL_TIMEOUT_SECS);
         let handle = tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut child = shell.command(&spawn_command);
-            child
-                .current_dir(&cwd)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true);
-            let mut child = match child.spawn() {
-                Ok(c) => c,
+            // Forward live output to the TUI as ToolOutput events.
+            let fwd_tx = tx.clone();
+            let fwd_id = task_id.clone();
+            tokio::spawn(async move {
+                while let Some(chunk) = stream_rx.recv().await {
+                    let _ = fwd_tx
+                        .send(TurnMsg::UserShell(
+                            AgentEvent::ToolOutput {
+                                id: fwd_id.clone(),
+                                chunk,
+                            },
+                            None,
+                        ))
+                        .await;
+                }
+            });
+            match hrdr_tools::run_user_command(shell, &task_command, timeout, true, &ctx).await {
+                Ok(run) => {
+                    let exit = run
+                        .exit_code
+                        .map_or_else(|| "?".to_string(), |c| c.to_string());
+                    // Bound what lands in the transcript result + history (the
+                    // live stream already showed everything).
+                    let bounded = hrdr_tools::truncate_inline(&run.output, 50_000);
+                    let result = if bounded.trim().is_empty() {
+                        format!("(no output — exit {exit})")
+                    } else {
+                        bounded.clone()
+                    };
+                    let note = format!(
+                        "I ran `{task_command}` in the shell (exit {exit}). Output:\n\n```\n{}\n```",
+                        bounded.trim_end()
+                    );
+                    let _ = tx
+                        .send(TurnMsg::UserShell(
+                            AgentEvent::ToolEnd {
+                                id: task_id,
+                                name: "shell".to_string(),
+                                result,
+                                ok: run.passed,
+                            },
+                            Some(note),
+                        ))
+                        .await;
+                }
                 Err(e) => {
                     let _ = tx
                         .send(TurnMsg::UserShell(
                             AgentEvent::ToolEnd {
                                 id: task_id,
                                 name: "shell".to_string(),
-                                result: format!("couldn't run {}: {e}", shell.program()),
+                                result: format!("(error: {e})"),
                                 ok: false,
                             },
                             None,
                         ))
                         .await;
-                    return;
-                }
-            };
-            // Stream stdout and stderr as they arrive, accumulating a bounded
-            // copy for the result + the model's history note.
-            //
-            // The in-memory buffer is capped independently of the pipes: a
-            // runaway command (`!cat huge.bin`) must not grow `out` without
-            // bound while the process is still running — the final display
-            // cap (`truncate_inline`, 50_000 chars) only kicks in after exit,
-            // by which point an uncapped `out` could already have pushed
-            // memory toward OOM. Once `out` reaches `MAX_BUFFERED` (well above
-            // the 50_000-char display cap, so nothing visible is lost), stop
-            // growing it and stop forwarding further chunks for display — but
-            // keep reading from the child's pipes so they don't back up and
-            // deadlock the process.
-            const MAX_BUFFERED: usize = 256 * 1024;
-            let mut out = String::new();
-            let mut stdout = child.stdout.take();
-            let mut stderr = child.stderr.take();
-            let mut buf_out = [0u8; 4096];
-            let mut buf_err = [0u8; 4096];
-            let mut open_out = stdout.is_some();
-            let mut open_err = stderr.is_some();
-            while open_out || open_err {
-                tokio::select! {
-                    r = async { stdout.as_mut().unwrap().read(&mut buf_out).await }, if open_out => {
-                        match r {
-                            Ok(0) | Err(_) => open_out = false,
-                            Ok(n) => {
-                                if out.len() < MAX_BUFFERED {
-                                    let chunk = String::from_utf8_lossy(&buf_out[..n]).into_owned();
-                                    out.push_str(&chunk);
-                                    let _ = tx.send(TurnMsg::UserShell(
-                                        AgentEvent::ToolOutput {
-                                            id: task_id.clone(),
-                                            chunk,
-                                        },
-                                        None,
-                                    )).await;
-                                }
-                            }
-                        }
-                    }
-                    r = async { stderr.as_mut().unwrap().read(&mut buf_err).await }, if open_err => {
-                        match r {
-                            Ok(0) | Err(_) => open_err = false,
-                            Ok(n) => {
-                                if out.len() < MAX_BUFFERED {
-                                    let chunk = String::from_utf8_lossy(&buf_err[..n]).into_owned();
-                                    out.push_str(&chunk);
-                                    let _ = tx.send(TurnMsg::UserShell(
-                                        AgentEvent::ToolOutput {
-                                            id: task_id.clone(),
-                                            chunk,
-                                        },
-                                        None,
-                                    )).await;
-                                }
-                            }
-                        }
-                    }
                 }
             }
-            let status = child.wait().await;
-            let ok = status.as_ref().is_ok_and(std::process::ExitStatus::success);
-            // Bound what lands in the transcript result + history (the live
-            // stream above already showed everything).
-            let bounded = hrdr_tools::truncate_inline(&out, 50_000);
-            let result = if out.trim().is_empty() {
-                match &status {
-                    Ok(st) => format!("(no output — exit {})", st.code().unwrap_or(-1)),
-                    Err(e) => format!("(no output — {e})"),
-                }
-            } else {
-                bounded.clone()
-            };
-            // The note for the model: the next request carries what the user
-            // ran and saw. It rides the ToolEnd so the UI loop commits it
-            // through the normal history + autosave plumbing.
-            let exit = match &status {
-                Ok(st) => st.code().map_or_else(|| "?".to_string(), |c| c.to_string()),
-                Err(e) => format!("spawn error: {e}"),
-            };
-            let note = format!(
-                "I ran `{task_command}` in the shell (exit {exit}). Output:
-```
-{}
-```",
-                bounded.trim_end()
-            );
-            let _ = tx
-                .send(TurnMsg::UserShell(
-                    AgentEvent::ToolEnd {
-                        id: task_id,
-                        name: "shell".to_string(),
-                        result,
-                        ok,
-                    },
-                    Some(note),
-                ))
-                .await;
         });
         self.user_shell = Some(UserShell {
             id,
