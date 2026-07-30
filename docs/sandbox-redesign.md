@@ -346,6 +346,38 @@ changed the brief, the task became redundant. No user action substitutes for a
 model-initiated one. They do not depend on `task_list`: `task` already returns
 `"Started background task #{id} (label)"` (`delegation.rs:528`).
 
+### An unknown id must answer with the valid ones
+
+Removing `task_list` leaves a gap: a model that loses an id — compaction dropped
+the `task` result, or it simply misremembers — has nothing to ask. So the error
+path carries what the tool used to.
+
+`task_steer` and `task_cancel` get three arms:
+
+| Situation                  | Response                                                           |
+| -------------------------- | ------------------------------------------------------------------ |
+| Unknown id                 | say so, then list the running tasks (id, label, status)            |
+| Known id, already finished | say it finished, then list what _is_ still running                 |
+| Nothing running at all     | say that explicitly — the most useful answer, and it stops a retry |
+
+This is an existing convention, not a new one: `unknown_tool_message`
+(`lib.rs:1609`) already names the mistake, suggests the nearest match,
+enumerates what is available, and handles the empty case in as many words. Copy
+its shape.
+
+Note the current message must change regardless — `delegation.rs:2162` reads
+`no running background task #{id} (see \`task_list\`)`, pointing at a tool that
+will not exist.
+
+**Delete the tool, keep the renderer.** `task_list`'s formatting logic becomes
+the helper these error paths call. The listing was never the problem; having it
+behind a schema entry the model had to consider on every turn was.
+
+That makes the removal a strict improvement rather than a trade: the information
+arrives exactly when it is needed, and costs nothing when it is not. The tool
+descriptions should still say ids come from `task`'s return value, so the model
+does not fish for the list by deliberately passing a bad id.
+
 ### Two consequences to carry forward
 
 **Gap #4 must be fixed structurally, which was always the plan.** `context.md`
