@@ -911,6 +911,31 @@ pub fn available_shell_tools() -> Vec<std::sync::Arc<dyn Tool>> {
 #[cfg(test)]
 mod tests {
 
+    /// The exit-status line carries a NUMBER, not the platform's rendering of
+    /// `ExitStatus`.
+    ///
+    /// `format!("{status}")` reads "exit status: 3" on Unix and "exit code: 3" on
+    /// Windows, so interpolating it gave the model `[exit status: exit code: 3]`
+    /// there — and three tests pinned the Unix spelling, which is how it stayed
+    /// unnoticed until the Windows runner ran them. The model reads this line on
+    /// every failure; it should say the same thing everywhere.
+    #[tokio::test]
+    async fn the_exit_status_line_is_the_code_not_the_platform_wording() {
+        let Some(shell) = Shell::detect() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let out = ShellTool::new(shell)
+            .execute(serde_json::json!({"command": "exit 3"}), &ctx)
+            .await
+            .expect("a non-zero exit is still a result");
+        assert!(out.contains("[exit status: 3]"), "{out}");
+        // The shape the bug produced, on either platform's wording.
+        assert!(!out.contains("exit code:"), "{out}");
+        assert!(!out.contains("exit status: exit"), "{out}");
+    }
+
     /// **A shell that is present but cannot run anything is not a shell.**
     ///
     /// `detect` used to answer from `which` alone, which is wrong on Windows:
