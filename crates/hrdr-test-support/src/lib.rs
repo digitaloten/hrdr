@@ -55,7 +55,7 @@ fn sandbox_user_state() {
     // A process with this pid is long gone; start from nothing.
     let _ = std::fs::remove_dir_all(&root);
     let home = root.join("home");
-    for dir in ["home", "data", "config", "state", "cache"] {
+    for dir in ["home", "data", "config", "state", "cache", "runtime"] {
         std::fs::create_dir_all(root.join(dir)).expect("a test sandbox is creatable");
     }
 
@@ -75,6 +75,11 @@ fn sandbox_user_state() {
         std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
         std::env::set_var("XDG_STATE_HOME", root.join("state"));
         std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
+        // hrdr's `tool_output_base()` reads `XDG_RUNTIME_DIR`; override it so
+        // session spool directories land under the test sandbox instead of the
+        // real `/run/user/$UID`, which a Landlock sandbox inherited from the
+        // parent process (the hrdr agent) would otherwise block.
+        std::env::set_var("XDG_RUNTIME_DIR", root.join("runtime"));
         // No test reaches models.dev. Building an `Agent` warms the catalog in the
         // background, which is right in production and wrong in a test suite:
         // hundreds of agents would each open a network request, making the suite
