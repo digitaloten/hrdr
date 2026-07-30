@@ -843,11 +843,18 @@ spool.
 
 Mostly-deletion first, so each slice is independently reviewable.
 
-1. **Remove the `.git` lock and all of escalation.** `protect_git`,
-   `deny_git_writes` and friends; `escalation.rs`, `approval.rs`, the protocol
-   frames, both frontend modals, the consent audit trail. 1b. **Widen `write`
-   mode's roots** to the toolchain caches, so the mode can build a project with
-   an uncached dependency.
+1. **Remove the `.git` lock and all of escalation, and widen `write`'s roots —
+   one slice, in this order.**
+   - Widen `write` mode's writable roots to the toolchain caches **first**. The
+     post-denial retry offer is currently the only thing that rescues a failed
+     `cargo build` (verified reproducible above); remove escalation before
+     widening and there is a window where every uncached dependency fetch fails
+     with no relief valve at all.
+   - Then `protect_git`, `deny_git_writes` and friends; `escalation.rs`,
+     `approval.rs`, the protocol frames, both frontend modals, the consent audit
+     trail.
+   - Add the `!command`-is-unsandboxed test here too: it becomes the only
+     remaining relief valve and is untested today.
 2. **`tool_output_dir` per session.**
 3. **Delete bwrap and the network axis.** Write/Read→Landlock (Seatbelt on
    macOS), jail→no backend. Removes `bwrap_args`, `usr_merge_compat_args`, the
