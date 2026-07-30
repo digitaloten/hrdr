@@ -163,8 +163,8 @@ pub async fn run(
     // Session retention: a background worker compresses idle sessions and purges
     // old auto-named ones. First pass 30s after start (out of the way of launch),
     // then hourly. Peer-safe via each session's open-lock, so several instances
-    // coexist. The sweep is blocking fs I/O, so it runs on a blocking thread. See
-    // docs/session-retention.md.
+    // coexist. The sweep is blocking fs I/O, so it runs on a blocking thread —
+    // `hrdr_agent::sweep_sessions` is the whole of it.
     let compress_after = config.session_compress_after.filter(|&t| t > 0);
     let purge_after = config.session_purge_after.filter(|&t| t > 0);
     if compress_after.is_some() || purge_after.is_some() {

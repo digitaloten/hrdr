@@ -83,7 +83,7 @@ pub const DEFAULT_MAX_WRITE_SUBAGENTS: usize = 1;
 pub const DEFAULT_TODO_TTL_TURNS: u64 = 5;
 
 /// Session-retention defaults (seconds): compress after a week idle, purge an
-/// auto-named session after a month idle. See `docs/session-retention.md`.
+/// auto-named session after a month idle (see [`sweep_sessions`](crate::sweep_sessions)).
 pub const DEFAULT_SESSION_COMPRESS_AFTER: u64 = 7 * 24 * 60 * 60;
 pub const DEFAULT_SESSION_PURGE_AFTER: u64 = 30 * 24 * 60 * 60;
 
@@ -277,7 +277,7 @@ pub struct AgentConfig {
     pub request_timeout: Option<u64>,
     /// Session retention: compress a session file whose mtime is older than this
     /// many seconds (zstd). `None` or `0` disables compression. Default one week.
-    /// See `docs/session-retention.md`.
+    /// Swept by [`sweep_sessions`](crate::sweep_sessions).
     pub session_compress_after: Option<u64>,
     /// Session retention: purge an AUTO-NAMED session whose mtime is older than
     /// this many seconds. `None` or `0` disables purging. User-named sessions are

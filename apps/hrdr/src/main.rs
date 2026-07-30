@@ -182,7 +182,7 @@ struct Cli {
     todo_ttl: Option<u64>,
 
     /// Compress a session file idle longer than this many seconds (0 disables;
-    /// default one week). See docs/session-retention.md.
+    /// default one week).
     #[arg(long, global = true)]
     session_compress_after: Option<u64>,
 

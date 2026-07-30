@@ -1202,7 +1202,7 @@ pub fn list_sessions() -> Vec<SessionMeta> {
 
 // ── retention: compress idle sessions, purge old auto-named ones ──────────────
 //
-// See `docs/session-retention.md`. A background worker calls [`sweep_sessions`]
+// A background worker calls [`sweep_sessions`]
 // every hour. It is peer-safe: multiple hrdr instances can run at once, and the
 // sweep acts on a session only if it can take that session's open-lock — which
 // fails (skipped) when a live instance is using it or another sweeper is on it.
