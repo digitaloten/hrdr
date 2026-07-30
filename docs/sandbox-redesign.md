@@ -1028,10 +1028,10 @@ Mostly-deletion first, so each slice is independently reviewable.
 8. ~~**`task` gains `cwd`** — optional, required for jail, canonicalised and
    contained to the caller's cwd; plus the enclosing-repo `.git` fix for scoped
    write sub-agents.~~ **DONE.**
-9. **Tool surface.** Delete the unused tools, cut the `task` family to three,
+9. ~~**Tool surface.** Delete the unused tools, cut the `task` family to three,
    make `grep`/`find`/`tree`/`ls` jail-only, and lift `grep_line_is_secret` onto
-   the shell output path. **Sweep model-facing text** — `templates/delegate.md`
-   and `task_steer`'s error string still name the removed tools.
+   the shell output path. **Sweep model-facing text.**~~ **DONE** — and `grep`
+   lost its `Rg`/POSIX backends with it, so nothing in jail spawns a subprocess.
 
 ## Accepted losses
 

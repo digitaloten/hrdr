@@ -1219,7 +1219,10 @@ mod tests {
         // workflow it has no way to carry out.
         assert!(!p.contains("Releasing"), "{p}");
         // The read/search workflow and the working-directory safety line remain.
-        assert!(p.contains("`grep`/`find`/`ls`/`tree`/`read`"), "{p}");
+        assert!(
+            p.contains("`shell` (`rg`, `git grep`, `ls`) and `read`"),
+            "{p}"
+        );
         assert!(p.contains("working directory is your home base"), "{p}");
         // And so do the rules that bind *any* agent, whatever it can reach: a
         // read-only sub-agent still reports its findings (and can still lie about
@@ -1259,7 +1262,10 @@ mod tests {
         let also_known: [(&str, bool); 5] = [
             ("models", true),
             ("skill", true),
-            ("shell", false),
+            // `shell` counts as available to a read-only agent: it IS in that tool
+            // set (the sandbox is what makes the agent read-only, not the absence of
+            // a command line), so a prompt line naming it is safe for everyone.
+            ("shell", true),
             ("task", false),
             ("memory", false),
         ];
@@ -1289,7 +1295,7 @@ mod tests {
         }
         // Not vacuous: these are the mentions the defect was about. If a rewording
         // removes them, this fails and whoever reworded reads the paragraph above.
-        for expected in ["grep", "read", "todo"] {
+        for expected in ["read", "todo", "shell"] {
             assert!(
                 found.contains(&expected),
                 "expected the unconditional block to still name `{expected}`; \
@@ -1700,29 +1706,34 @@ mod tests {
         );
     }
 
-    /// Waiting on something outside hrdr is `watch`'s job, and the prompt says so.
+    /// Waiting on something outside hrdr means ENDING THE TURN, and the prompt says
+    /// so — because there is no polling tool any more, and the two things a model
+    /// does without being told are both bad: it sleeps in the shell (which tells it
+    /// nothing until the sleep ends, and gets killed at the shell timeout), or it
+    /// runs a check-think-sleep-check loop, paying a full model round-trip for every
+    /// look at a CI run that takes half an hour.
     ///
-    /// A model that doesn't know the tool exists does one of two things, and both
-    /// are bad: it sleeps in the shell (which tells it nothing until the sleep ends,
-    /// and gets killed at the shell timeout), or it runs a check-think-sleep-check
-    /// loop, paying a full model round-trip for every look at a CI run that takes
-    /// half an hour. The tool schema alone doesn't fix that — the *habit* has to be
-    /// named.
+    /// `watch` used to be the answer and is gone: 4 calls across 9,350, and every
+    /// one of them was a thing `shell` plus ending the turn does without a tool.
+    /// Removing it without naming the replacement habit would leave the sleep loop
+    /// as the model's only idea.
     #[test]
-    fn the_prompt_points_at_watch_for_waiting() {
+    fn the_prompt_says_to_end_the_turn_rather_than_wait() {
         let tools = ToolRegistry::with_defaults();
         let p = render_system(&tools, false).unwrap();
         assert!(
-            p.contains("is what `watch` is for"),
-            "waiting on CI/a deploy/a build must name the tool that does it"
+            p.contains("is NOT your turn to spend"),
+            "waiting on CI/a deploy/a build must not look like work: {p}"
         );
-        // The shape of a check: a command whose *exit code* is the answer.
-        assert!(p.contains("answers the question with\n  its exit code"));
-        // And the two habits it replaces.
+        assert!(p.contains("END\n  YOUR TURN"), "{p}");
+        // The habits it replaces are named, or the model invents them again.
+        assert!(p.contains("check-think-sleep-check loop"), "{p}");
         assert!(
-            p.contains("Don't poll it yourself"),
-            "the point is to stop the check-think-sleep-check loop: {p}"
+            p.contains("say how to check it (the exact command)"),
+            "ending the turn is only useful if it hands the check over: {p}"
         );
+        // And the tool it replaces is not offered.
+        assert!(!tools.defs().iter().any(|d| d.function.name == "watch"));
     }
 
     /// The prompt forbids the cheapest way to make a red test green: changing the

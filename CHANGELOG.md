@@ -8,6 +8,59 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- **Ten tools removed: `move`, `copy`, `delete`, `watch`, `definition`,
+  `references`, `rename`, `task_list`, `task_output`, `task_transcript`,
+  `task_revive` — and `grep`/`find`/`ls`/`tree` are now jail-only.**
+
+  More tools is not more capability, it is more to choose between on every turn.
+  A dedicated tool earns its place only when it carries a guarantee shell
+  cannot: atomicity, a harness invariant, or a capability with no shell
+  equivalent. `read`, `write`, `edit`, `replace`, `todo` and `verify` all pass
+  that test; these did not.
+
+  The evidence was **not** usage frequency, which measures what was in front of
+  the model rather than what it needed. It was the reverse case — tools that
+  were available and still ignored: `references` 2 calls in 9,350, `definition`
+  0, `rename` 0, `copy` 0, `move` 0, `delete` 3, `watch` 4. So `mv`/`cp`/`rm`
+  through `shell` (guardrail-checked), `rg`/`ls` in one call, and "end your
+  turn" instead of polling. Post-edit **LSP diagnostics are untouched** — that
+  is the valuable half of the LSP work and needs no tool.
+
+  `grep`/`find`/`ls`/`tree` survive **only in `jail`**, which has no shell and
+  could otherwise neither search nor orient. The jail set is therefore _not_ a
+  subset of the normal one, which is written down in the code so a later
+  "cleanup" does not reconcile it in either direction.
+
+  The `task` family is **three tools**: `task`, `task_steer`, `task_cancel`. The
+  four that went had no audience — the user watches each sub-agent's own pane
+  live and steers with `@agent`, and the model gets results delivered
+  automatically (`task_output`'s own description said "you never need to poll").
+  `task_transcript` is covered by what already arrives: the report says what a
+  task claims and `git diff` says what it did, and the delta between them _is_
+  the diagnosis signal. `task_revive` was actively harmful where it was most
+  tempting — a run that went wrong is exactly a run whose context holds the
+  wrong reasoning, and models anchor on their own prior output.
+
+  Removing `task_list` left a real gap, so the listing moved into the errors
+  that need it: `task_steer`/`task_cancel` given an unknown id now say so **and
+  list what is running**, and say plainly when nothing is — the most useful of
+  the three answers, because it stops a retry loop.
+
+- **`grep` is a pure-Rust walker: the ripgrep and POSIX backends are gone.**
+  Both spawned through a bare `Command::new`, **not** through the sandbox
+  wrapper, so those children were unconfined by the OS — and `check_read`
+  validates the path the model _named_, not how a helper walks the filesystem
+  once started. In the one mode that still has `grep`, that is precisely the
+  boundary. With them gone, **nothing in jail spawns a subprocess**, which is
+  what makes its confinement complete on every platform with no OS backend at
+  all.
+
+  The POSIX backend had earned it independently: it only ran when `rg` was
+  absent, so never on a dev machine, exercised in CI alone — and it shipped a
+  real bug that reached a tag. This costs **look-around** (`(?<=foo)bar`), which
+  Rust's `regex` crate deliberately lacks and ripgrep supplied via PCRE2; it is
+  now a clear error naming the alternatives rather than a parse failure.
+
 - **A jailed agent loads no instruction out of the working tree.** `AGENTS.md`
   up the ancestor chain and the three project skill directories (`.hrdr/skills`,
   `.claude/commands`, `.opencode/command`) are not read at all in
@@ -256,6 +309,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   write cap at 1, the defaults are now 1 writer / 2 readers.
 
 ### Fixed
+
+- **`shell` output no longer spills credential files into the transcript.** The
+  `grep` tool filtered secret files out of its own results; `shell` — which
+  every non-jailed agent uses, and which `rg -n "token" .` runs through — had no
+  secret handling at all, so removing `grep` from those modes would have left
+  the leak wide open. The filter is lifted onto the shell output path, before
+  the UI, the in-memory buffer or the spool sees a line, which makes the
+  protection strictly wider than it was. Withheld lines are **counted and
+  reported**, since output that vanishes with no explanation reads as a broken
+  command and gets the search re-run.
+
+  Not a boundary, and it says so: `shell` permits `cat ~/.ssh/id_rsa` and
+  guardrails do not stop it. What this stops is the **accidental** case — a
+  broad search spilling credentials into context, and therefore to the model
+  provider, with nobody intending it.
 
 - **`!command` is pinned as unsandboxed by a test.** It always was — a command
   the _user_ typed carries the user's authority, not the agent's — but nothing

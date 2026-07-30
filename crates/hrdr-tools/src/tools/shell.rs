@@ -508,68 +508,88 @@ pub(crate) async fn run_streamed_command(
     let overflow_dir = crate::tool_output_dir();
     let mut overflow_path: Option<std::path::PathBuf> = None;
     let mut overflow_file: Option<std::fs::File> = None;
+    // Lines dropped for naming a credential file. Counted rather than silently
+    // swallowed: output that vanished with no explanation reads as a broken command,
+    // and a model that cannot tell "filtered" from "no matches" re-runs the search.
+    let mut secrets_dropped: usize = 0;
 
     macro_rules! ingest_line {
         ($line:expr) => {{
             let line: &str = $line;
-            // Stream to the UI (unchanged from current behaviour).
-            ctx.emit(format!("{line}\n"));
-
-            total_lines += 1;
-            total_bytes += line.len() + 1; // +1 for the newline
-
-            // Accumulate in-memory head + tail.
-            if head.len() < head_budget {
-                head.push_str(line);
-                head.push('\n');
+            // Drop a line that names a credential file before it reaches anything —
+            // the UI, the in-memory head/tail, or the spool. `rg -n "token" .` and
+            // `grep -R secret` are how a broad search spills `.env` into the model's
+            // context, and therefore to the model provider, with nobody intending it.
+            //
+            // A courtesy against the accidental case, not a boundary: `shell` permits
+            // `cat ~/.ssh/id_rsa` and guardrails do not stop it. See
+            // `grep_line_is_secret`, which used to filter the `grep` tool's own
+            // output — one path, while this front door stood open.
+            if crate::grep_line_is_secret(line, &ctx.cwd) {
+                // A block expression, not a `continue`: this macro expands inside an
+                // async body where the enclosing loop is not always the one a
+                // `continue` would target.
+                secrets_dropped += 1;
             } else {
-                let entry = format!("{line}\n");
-                tail_bytes += entry.len();
-                tail.push_back(entry);
-                // Evict oldest tail entries to stay within the tail budget.
-                while tail_bytes > tail_budget {
-                    if let Some(front) = tail.pop_front() {
-                        tail_bytes -= front.len();
-                    } else {
-                        break;
-                    }
-                }
-            }
+                // Stream to the UI (unchanged from current behaviour).
+                ctx.emit(format!("{line}\n"));
 
-            let over_cap = total_bytes > ctx.max_output || total_lines > ctx.max_output_lines;
-            if overflow_file.is_none() {
-                if over_cap {
-                    // First time over a cap: open the file and seed it with
-                    // everything ingested so far (verbatim in `head`) in one
-                    // write, rather than having written every line from the
-                    // start regardless of whether it would ever be needed.
-                    let _ = std::fs::create_dir_all(&overflow_dir);
-                    let stamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0);
-                    static COUNTER: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
-                    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let p = overflow_dir.join(format!("shell-{stamp}-{seq}.txt"));
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .open(&p)
-                    {
-                        use std::io::Write as _;
-                        let _ = f.write_all(head.as_bytes());
-                        overflow_path = Some(p);
-                        overflow_file = Some(f);
+                total_lines += 1;
+                total_bytes += line.len() + 1; // +1 for the newline
+
+                // Accumulate in-memory head + tail.
+                if head.len() < head_budget {
+                    head.push_str(line);
+                    head.push('\n');
+                } else {
+                    let entry = format!("{line}\n");
+                    tail_bytes += entry.len();
+                    tail.push_back(entry);
+                    // Evict oldest tail entries to stay within the tail budget.
+                    while tail_bytes > tail_budget {
+                        if let Some(front) = tail.pop_front() {
+                            tail_bytes -= front.len();
+                        } else {
+                            break;
+                        }
                     }
                 }
-            } else if let Some(f) = &mut overflow_file {
-                // Already over the cap and the file is open: keep it in sync
-                // one line at a time (it was already seeded with everything
-                // up to the line that tripped `over_cap` above).
-                use std::io::Write as _;
-                let _ = f.write_all(line.as_bytes());
-                let _ = f.write_all(b"\n");
+
+                let over_cap = total_bytes > ctx.max_output || total_lines > ctx.max_output_lines;
+                if overflow_file.is_none() {
+                    if over_cap {
+                        // First time over a cap: open the file and seed it with
+                        // everything ingested so far (verbatim in `head`) in one
+                        // write, rather than having written every line from the
+                        // start regardless of whether it would ever be needed.
+                        let _ = std::fs::create_dir_all(&overflow_dir);
+                        let stamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        static COUNTER: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let p = overflow_dir.join(format!("shell-{stamp}-{seq}.txt"));
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .open(&p)
+                        {
+                            use std::io::Write as _;
+                            let _ = f.write_all(head.as_bytes());
+                            overflow_path = Some(p);
+                            overflow_file = Some(f);
+                        }
+                    }
+                } else if let Some(f) = &mut overflow_file {
+                    // Already over the cap and the file is open: keep it in sync
+                    // one line at a time (it was already seeded with everything
+                    // up to the line that tripped `over_cap` above).
+                    use std::io::Write as _;
+                    let _ = f.write_all(line.as_bytes());
+                    let _ = f.write_all(b"\n");
+                }
             }
         }};
     }
@@ -716,6 +736,22 @@ pub(crate) async fn run_streamed_command(
             notes.push('\n');
             notes.push_str(&note);
         }
+    }
+
+    // Say when the filter took something, so output that vanished is not read as a
+    // broken command or as "no matches" — either of which gets the search re-run.
+    if secrets_dropped > 0 {
+        let plural = if secrets_dropped == 1 {
+            "line"
+        } else {
+            "lines"
+        };
+        notes.push_str(&format!(
+            "\n[hrdr] {secrets_dropped} output {plural} naming a credential file (`.env`, a \
+             key, a `.pem`) were withheld, so secrets do not enter the transcript. The command \
+             ran normally and this is not an error. If you need to know that such a file \
+             exists, list it (`ls`) rather than printing its contents."
+        ));
     }
 
     // Nothing produced.

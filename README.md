@@ -147,23 +147,28 @@ native desktop/mobile shell, and read-only observer auth.
   internal history to Claude's wire format — unlocking native prompt caching.
   The server owns chat-template application; hrdr only ever sends structured
   `messages[]` + `tools[]`.
-- **Efficient, adaptive tool set.** `read`, `write`, `edit`, `replace`
-  (project-wide substitution with a diff and a `dry_run`), `move`, `copy`,
-  `delete`, `find`, `ls`, `tree`, `grep`, `git` (read-only:
-  status/diff/log/show/blame/…), `todo`, `fetch`, `search`, `skill` (load one of
-  the user's / project's reusable procedures — see "Skills"), a shell, and any
-  MCP-server tools. The read tools keep **credential/secret files** off-limits —
-  unlike the same access through the shell, which has no such guard. Writes are
-  confined by a **sandbox that is on by default** — a path guard on the file
-  tools plus kernel confinement for shell children (bubblewrap/Landlock on
-  Linux, Seatbelt on macOS) — while reads stay broad by design (see "Sandbox").
-  Token-bounded outputs and line-numbered reads for precise edits — and when
-  `shell`/`grep`/`git` output overflows, the **full** result is saved to a temp
-  file and the model is pointed at it (`read`/`grep`) instead of losing the
-  overflow. Tools that shell out are **presence-aware**: the single `shell` tool
-  runs `bash` (falling back to POSIX `sh`), and `grep` uses ripgrep → POSIX grep
-  → a built-in walker — so the model is only ever offered tools it can actually
-  run.
+- **A deliberately small tool set.** `read`, `write`, `edit`, `replace`
+  (project-wide substitution with a diff and a `dry_run`), `todo`, `verify`,
+  `fetch`, `search`, `skill` (load one of the user's / project's reusable
+  procedures — see "Skills"), a shell, and any MCP-server tools. More tools is
+  not more capability, it is more to choose between on every turn: a dedicated
+  tool earns its place only when it carries a guarantee the shell cannot —
+  atomicity, a harness invariant, or something with no shell equivalent. So
+  `move`/`copy`/ `delete` are `mv`/`cp`/`rm` (guardrail-checked),
+  `grep`/`find`/`ls`/`tree` are `rg`/`ls` in one call, `watch` is ending your
+  turn, and the LSP `definition`/ `references`/`rename` lookups are gone (2
+  calls in 9,350 — available and ignored). The four search tools survive
+  **only** in `jail` mode, which has no shell at all. `shell` output keeps
+  **credential/secret files** out of the transcript, so a broad `rg -n token .`
+  cannot spill `.env` into the model's context. Writes are confined by a
+  **sandbox that is on by default** — a path guard on the file tools plus kernel
+  confinement for shell children (Landlock on Linux, Seatbelt on macOS) — while
+  reads stay broad by design (see "Sandbox"). Token-bounded outputs and
+  line-numbered reads for precise edits — and when `shell` output overflows, the
+  **full** result is saved to a per-session temp file and the model is pointed
+  at it instead of losing the overflow. The `shell` tool is presence-aware: it
+  runs `bash`, falling back to POSIX `sh`, so the model is only offered a shell
+  it can actually use.
 - **Pluggable input discipline.** Default is a plain, claude-style input (always
   typing; `Enter` sends, `Shift+Enter` / `\`+`Enter` insert a newline, `Ctrl+G`
   opens `$EDITOR`, readline-ish `Ctrl+A`/`Ctrl+E`/`Ctrl+W`). `--vim` swaps in a
@@ -702,7 +707,7 @@ implementation, so the main conversation stays clean. The sub-agent has its own
 context and the normal tools, runs to completion, and returns its summary as the
 result (its tool activity streams live). A concise summary comes back inline; a
 large report is instead **saved to a file** and the parent gets a preview + a
-pointer to `read`/`grep` it — so it doesn't flood the main context. Issuing
+pointer to `read` it — so it doesn't flood the main context. Issuing
 several `task` calls in one turn runs the sub-agents **in parallel** — e.g.
 explore several areas of the codebase at once. While they run, the TUI shows a
 **live sub-agent panel**: one row per running sub-agent. Each row is a link —
@@ -1208,13 +1213,14 @@ The built-in rust-analyzer is started with
 `target/rust-analyzer/` instead of contending with the `cargo` the model runs in
 `shell` over one `target/` lock.
 
-The same warm servers back three **model tools**: `definition` and `references`
-(read-only lookups — the model gives a file, a 1-based line, and the symbol text
-on that line; results come back as `path:line:col`), and `rename`, which applies
-the server-computed workspace edit through the normal write path — so formatter
-hooks and post-edit diagnostics run per touched file, and edits are validated
-atomically before anything is written. Read-only sub-agents (`explore`,
-`review`) get the lookups; `rename` is pruned with the other writers.
+The same warm servers used to back three model tools — `definition`,
+`references` and `rename` — and those are **gone**. Across 139 stored
+transcripts they were called twice in 9,350 tool calls: available and ignored,
+which is the only usage figure worth acting on (that a tool the model was handed
+gets called measures availability, not need). The models reached for `grep` and
+`shell` instead. The diagnostics feature is untouched and is the valuable half:
+it runs on every edit, through the same warm servers, and needs no tool of its
+own.
 
 ### Theme
 

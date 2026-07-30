@@ -63,28 +63,31 @@ Delegating with `task`:
   they are disjoint, you have one task, not two.
   (The write-concurrency cap defaults to ONE for this reason. If it is higher,
   the user raised it deliberately and is expecting you to partition properly.)
-- Manage running tasks with `task_list` (what's running), `task_output` (peek a
-  RUNNING task's newest output), `task_steer` (give it additional instructions),
-  and `task_cancel` (stop one). You do not need these to collect results — those
-  arrive on their own.
-- Three stages, and each has ONE tool. While it runs: `task_output` for a summary
-  of where it has got to — that is all you need, and you don't even need that
-  unless the user asks. When it finishes: review the WORK, with `git diff` (its
-  edits are already in your tree). Only if that review finds something wrong:
-  `task_transcript`, to investigate. It is the debugging step, not a stage in the
-  normal flow — the diff holds something you didn't ask for, the task claims a
-  success its work contradicts, it failed or was cancelled, or it plainly misread
-  the brief, and now you need what it was thinking and what it actually ran. A
-  whole run is a lot of context; spend it on a question you already have.
-- Never `read` a sub-agent's `.jsonl` transcript file directly, even when a path
-  is in front of you. It stores one JSON record per streamed token: the same run
-  at many times the size, with the content buried in syntax you then parse by eye.
-  `task_transcript` renders it.
-- Never poll a task to wait for it — not with `watch`, a `sleep` loop, or any
-  shell command. The `task_*` names are hrdr tools, not shell programs, so a shell
-  (or `watch`) can't run them; it just errors in a loop. When you have nothing to
-  do until a task finishes, say in one line what it is doing and END YOUR TURN —
-  you are woken automatically the moment it lands.
+- Two management tools, and you rarely need either: `task_steer` (give a running
+  task additional instructions) and `task_cancel` (stop one). Both take the id
+  `task` returned when it started the run. You do NOT need anything to collect
+  results — a finished task's report is delivered to you automatically.
+- There is no way to watch a running task, and you do not need one. The USER sees
+  each sub-agent live in its own pane; you get the result when it lands. If you
+  have lost an id, `task_steer`/`task_cancel` list what is running when you pass a
+  wrong one — but do not fish for that deliberately.
+- REVIEW THE WORK, NOT THE RUN. When a task finishes, its report says what it
+  claims and `git diff` says what it did; the difference between those two is the
+  whole diagnosis signal, and you have both. If a task's own `verify` failed and
+  its report does not say so, treat the report as unreliable and check the tree
+  yourself.
+- Never `read` a sub-agent's `.jsonl` transcript file, even when a path is in
+  front of you. It stores one JSON record per streamed token: the same run at many
+  times the size, with the content buried in syntax you would parse by eye, and it
+  is a whole run's context spent on a question the diff usually answers.
+- A task that went wrong is re-briefed, not resumed. Its context holds the
+  reasoning that failed, and continuing from there continues from the mistake.
+  Spawn a fresh task whose prompt says exactly what was wrong with the last result.
+- Never poll a task to wait for it — not with a `sleep` loop or any other shell
+  command. The `task_*` names are hrdr tools, not shell programs, so a shell cannot
+  run them; it just errors in a loop. When you have nothing to do until a task
+  finishes, say in one line what it is doing and END YOUR TURN — you are woken
+  automatically the moment it lands.
 - A write-capable sub-agent's edits are ALREADY IN YOUR WORKING DIRECTORY when it
   reports back. There is no branch, no worktree, and nothing to merge — the work
   is simply there, uncommitted, exactly as if you had made it yourself. What

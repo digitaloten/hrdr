@@ -275,7 +275,7 @@ impl TranscriptLog {
     /// be wrong — the transcript dir is keyed by *session id* and so survives a
     /// resume, while the id counter restarts at 0 in each process, so a resumed
     /// session would append a fresh run onto a previous run's file. That yields a
-    /// file with two `Start`s and two `End`s, and makes [`is_complete`] report a
+    /// file with two `Start`s and two `End`s, and makes an orphan check report a
     /// genuinely orphaned run as complete — defeating the whole point of the log.
     pub fn create(dir: &Path, id: &str) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
@@ -514,46 +514,6 @@ fn text_lines(path: &Path) -> Option<impl Iterator<Item = String>> {
     )
 }
 
-/// Whether a transcript file ends in an `End` record. A file with no `End` line
-/// is an orphan: the sub-agent crashed or is still running. The disk-aware
-/// `task_list` reads this to report a resumable run as `done` vs `orphaned`.
-///
-/// The last *parsable* record decides: a torn fragment at the tail (a full disk
-/// during the final append) must not turn a completed run into an orphan.
-pub fn is_complete(path: &Path) -> bool {
-    let Some(lines) = text_lines(path) else {
-        return false;
-    };
-    let mut last = None;
-    for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(rec) = serde_json::from_str::<Record>(&line) {
-            last = Some(rec);
-        }
-    }
-    matches!(last, Some(Record::End { .. }))
-}
-
-/// The opening [`Record::Start`] of a transcript, if it has one. The disk-aware
-/// `task_list` uses it to label a run whose `.json` snapshot is absent (a run
-/// that crashed before its first `History`-triggered save). `Start` is always
-/// the first record a sub-agent run writes, so only the first non-empty line is
-/// inspected.
-pub fn read_start(path: &Path) -> Option<Record> {
-    for line in text_lines(path)? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        return match serde_json::from_str::<Record>(&line) {
-            Ok(rec @ Record::Start { .. }) => Some(rec),
-            _ => None,
-        };
-    }
-    None
-}
-
 /// Read a sub-agent transcript file and fold it into a Vec<Entry> using the
 /// SAME reducer as the main transcript, so the on-disk sub-agent record renders
 /// identically (tool args + results intact). Best-effort: unparsable lines are skipped.
@@ -719,35 +679,6 @@ mod tests {
         assert!(tool.3, "ok flag survives");
     }
 
-    /// A run owns its file. The dir is keyed by session id and survives a resume,
-    /// but the id counter restarts at 0 each process — so without exclusive
-    /// creation a resumed session's first task would append onto the previous
-    /// run's log, producing a file with two `Start`s and making an orphaned run
-    /// look complete.
-    #[test]
-    fn create_refuses_to_reuse_an_existing_run_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut first = TranscriptLog::create(dir.path(), "000-sub-task").unwrap();
-        first.write(&Record::Start {
-            model: "m".into(),
-            label: "sub-task".into(),
-            prompt: "first run".into(),
-        });
-        // No End: the first run crashed. It must stay an identifiable orphan.
-        drop(first);
-
-        let err = match TranscriptLog::create(dir.path(), "000-sub-task") {
-            Ok(_) => panic!("an id already on disk must not be reopened"),
-            Err(e) => e,
-        };
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-
-        let path = dir.path().join("000-sub-task.jsonl");
-        assert!(!is_complete(&path), "the crashed run is still an orphan");
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(body.lines().count(), 1, "untouched by the second attempt");
-    }
-
     #[cfg(unix)]
     #[test]
     fn transcript_is_owner_only() {
@@ -763,43 +694,6 @@ mod tests {
         // The transcript carries the sub-agent's full prompt and output.
         assert_eq!(file_mode & 0o777, 0o600, "transcript must be 0600");
         assert_eq!(dir_mode & 0o777, 0o700, "transcript dir must be 0700");
-    }
-
-    #[test]
-    fn is_complete_flags_orphan_and_preserves_partial_text() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("002-x.jsonl");
-        // One run holds one handle for its whole life — the file is never
-        // reopened, so this mirrors the real spawn paths.
-        let mut t = TranscriptLog::create(dir.path(), "002-x").unwrap();
-        t.write(&Record::Start {
-            model: "m".into(),
-            label: "l".into(),
-            prompt: "p".into(),
-        });
-        t.write(&Record::Text {
-            chunk: "done work".into(),
-        });
-        // Streamed text is coalesced, so what is on disk mid-run is what has
-        // reached a boundary. The run's owner asserts one at every round
-        // (`AgentRegistry::record` on a no-record event, `end_turn`), which is
-        // what makes a crash trail worth reading; assert it by hand here.
-        t.flush();
-
-        // Mid-run, before any End: an orphan whose completed work is on disk.
-        assert!(!is_complete(&path), "no End line => orphan");
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            body.contains("done work"),
-            "partial work survives the crash"
-        );
-
-        // The terminal event lands on the same handle the run has held all along.
-        t.write(&Record::End {
-            status: EndStatus::Failed,
-            bytes: 9,
-        });
-        assert!(is_complete(&path), "End line => complete");
     }
 
     /// A sub-agent transcript is a pure fold of the `AgentEvent` stream. This
@@ -986,64 +880,6 @@ mod tests {
                 .any(|e| matches!(&e.kind, crate::EntryKind::Tool { name, .. } if name == "shell")),
             "the record that followed the fragment is no longer swallowed: {entries:?}"
         );
-    }
-
-    /// A tear is not character-aligned, so a torn line can hold half a multi-byte
-    /// character. `BufRead::lines()` yields `Err` for that, and the readers'
-    /// `map_while(ok)` dropped the ENTIRE rest of the file — a resumed session
-    /// silently lost every record after the damage.
-    #[test]
-    fn read_survives_a_line_that_is_not_valid_utf8() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("006-mojibake.jsonl");
-        let mut raw = Vec::new();
-        raw.extend_from_slice(br#"{"t":"text","chunk":"first"}"#);
-        raw.push(b'\n');
-        // A record cut in the middle of a 3-byte character.
-        raw.extend_from_slice(b"{\"t\":\"text\",\"chunk\":\"\xe2\x82\n");
-        raw.extend_from_slice(br#"{"t":"text","chunk":"second"}"#);
-        raw.push(b'\n');
-        raw.extend_from_slice(br#"{"t":"end","status":"ok","bytes":0}"#);
-        raw.push(b'\n');
-        std::fs::write(&path, &raw).unwrap();
-
-        let (entries, skipped) = fold_transcript(&path);
-        assert_eq!(skipped, 1);
-        let text: String = entries
-            .iter()
-            .filter_map(|e| match &e.kind {
-                crate::EntryKind::Assistant(s) => Some(s.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            text.contains("first") && text.contains("second"),
-            "the read did not stop at the bad line: {entries:?}"
-        );
-        assert!(
-            is_complete(&path),
-            "a run whose End is behind a torn line is still complete"
-        );
-    }
-
-    /// A tear at the very tail must not turn a finished run into an orphan: the
-    /// last *parsable* record decides.
-    #[test]
-    fn is_complete_ignores_a_torn_tail() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("007-tail.jsonl");
-        let mut t = TranscriptLog::append(&path).unwrap();
-        t.write(&Record::End {
-            status: EndStatus::Ok,
-            bytes: 1,
-        });
-        drop(t);
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        f.write_all(b"{\"t\":\"reas").unwrap();
-        assert!(is_complete(&path));
     }
 
     /// One serialized writer per file: every append goes through the one
@@ -1326,11 +1162,6 @@ mod tests {
     }
 
     #[test]
-    fn is_complete_is_false_for_missing_file() {
-        assert!(!is_complete(Path::new("/nonexistent/does/not/exist.jsonl")));
-    }
-
-    #[test]
     fn open_error_is_returned_not_panicked() {
         // A path whose parent cannot be created (a file where a dir is needed).
         let dir = tempfile::tempdir().unwrap();
@@ -1338,5 +1169,67 @@ mod tests {
         std::fs::write(&blocker, b"x").unwrap();
         let bad_dir = blocker.join("subdir"); // parent is a file
         assert!(TranscriptLog::create(&bad_dir, "id").is_err());
+    }
+
+    /// A run owns its file. The dir is keyed by session id and survives a resume,
+    /// but the id counter restarts at 0 each process — so without exclusive
+    /// creation a resumed session's first task would append onto the previous
+    /// run's log, producing a file with two `Start`s and making an orphaned run
+    /// look complete.
+    #[test]
+    fn create_refuses_to_reuse_an_existing_run_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = TranscriptLog::create(dir.path(), "000-sub-task").unwrap();
+        first.write(&Record::Start {
+            model: "m".into(),
+            label: "sub-task".into(),
+            prompt: "first run".into(),
+        });
+        // No End: the first run crashed. It must stay an identifiable orphan.
+        drop(first);
+
+        let err = match TranscriptLog::create(dir.path(), "000-sub-task") {
+            Ok(_) => panic!("an id already on disk must not be reopened"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+        let path = dir.path().join("000-sub-task.jsonl");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 1, "untouched by the second attempt");
+    }
+
+    /// A tear is not character-aligned, so a torn line can hold half a multi-byte
+    /// character. `BufRead::lines()` yields `Err` for that, and the readers'
+    /// `map_while(ok)` dropped the ENTIRE rest of the file — a resumed session
+    /// silently lost every record after the damage.
+    #[test]
+    fn read_survives_a_line_that_is_not_valid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("006-mojibake.jsonl");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(br#"{"t":"text","chunk":"first"}"#);
+        raw.push(b'\n');
+        // A record cut in the middle of a 3-byte character.
+        raw.extend_from_slice(b"{\"t\":\"text\",\"chunk\":\"\xe2\x82\n");
+        raw.extend_from_slice(br#"{"t":"text","chunk":"second"}"#);
+        raw.push(b'\n');
+        raw.extend_from_slice(br#"{"t":"end","status":"ok","bytes":0}"#);
+        raw.push(b'\n');
+        std::fs::write(&path, &raw).unwrap();
+
+        let (entries, skipped) = fold_transcript(&path);
+        assert_eq!(skipped, 1);
+        let text: String = entries
+            .iter()
+            .filter_map(|e| match &e.kind {
+                crate::EntryKind::Assistant(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains("first") && text.contains("second"),
+            "the read did not stop at the bad line: {entries:?}"
+        );
     }
 }

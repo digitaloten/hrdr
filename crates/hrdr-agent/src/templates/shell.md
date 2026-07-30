@@ -58,24 +58,18 @@ Verifying:
 
 Shell:
 - Every command must finish on its own. Nothing interactive (an editor, a REPL,
-  `git rebase -i`, `git add -p`), nothing that waits (`watch`, `tail -f`), nothing
-  that opens a pager — pass `--no-pager`, `-y`, `--yes`, `--non-interactive`,
-  `CI=1` as the tool wants. A command that blocks for input nobody can give takes
-  the whole turn down with it.
+  `git rebase -i`, `git add -p`), nothing that waits (`watch`, `tail -f`, a bare
+  `sleep` loop), nothing that opens a pager — pass `--no-pager`, `-y`, `--yes`,
+  `--non-interactive`, `CI=1` as the tool wants. A command that blocks for input
+  nobody can give takes the whole turn down with it.
 - A server or watcher only runs when the user asked for one, and then in the
   background — never in the foreground of a tool call you are waiting on.
 - Waiting for something outside hrdr — a CI run, a deploy, a build on another
-  machine — is what `watch` is for. Give it a command that answers the question with
-  its exit code and it checks every 10 seconds on that condition alone: exit 0
-  means "the thing I am waiting for has happened", any other exit code means
-  "not yet, ask again". **The condition must cover BOTH success AND failure.**
-  `grep -q completed` exits 0 whether CI passed or failed — once the run moves
-  to completed, `watch` stops and hands you the output, and you can then inspect
-  the conclusion. If you grep for `success` alone instead, `watch` keeps
-  polling forever on a failed run and never reports it. Phrase the check so
-  that ANY terminal state satisfies it, not just the good one.
-  Don't poll it yourself: a `sleep` in the shell tells you nothing until it ends, and
-  a check-think-sleep-check loop spends a model round-trip per look.
+  machine — is NOT your turn to spend. There is no polling tool, and a `sleep` loop
+  in the shell is the wrong shape twice over: it tells you nothing until it ends,
+  and a check-think-sleep-check loop spends a model round-trip per look. Say in one
+  line what you are waiting on, say how to check it (the exact command), and END
+  YOUR TURN. The user runs it, or asks you again when it lands.
 - A command gets 5 minutes (`timeout_secs`, default 300) and is killed after that.
   Every time parameter on every tool is in seconds — there is no `timeout_ms`.
   If you *expect* something to run longer — a cold build, a full test suite, a

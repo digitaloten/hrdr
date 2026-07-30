@@ -51,9 +51,8 @@ pub use memory::MemoryTool;
 pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
 pub use test_nudge::{TEST_NUDGE_NOTE, TestNudgeState};
 pub use tools::{
-    CopyTool, DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_VERIFY_TIMEOUT_SECS, DefinitionTool, DeleteTool,
-    EditTool, FindTool, GrepTool, LsTool, MoveTool, ReadTool, ReferencesTool, RenameTool,
-    ReplaceTool, Shell, ShellTool, TodoTool, TreeTool, VerifyTool, WatchTool, WriteTool,
+    DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_VERIFY_TIMEOUT_SECS, EditTool, FindTool, GrepTool, LsTool,
+    ReadTool, ReplaceTool, Shell, ShellTool, TodoTool, TreeTool, VerifyTool, WriteTool,
     available_shell_tools, redact_secret_diffs,
 };
 pub use verification::{CheckKind, Scope, VerificationLedger};
@@ -1186,15 +1185,25 @@ pub(crate) fn guard_secret_read(path: &std::path::Path) -> Result<()> {
 }
 
 /// Whether a search-output line (`path:NN:…`, a match, or `path-NN-…`, `-C`
-/// context) names a secret file, so the grep backends can drop it before
-/// returning. `cwd` anchors a relative path token.
+/// context) names a secret file, so it can be dropped before the model sees it.
+/// `cwd` anchors a relative path token.
 ///
-/// Context lines matter as much as match lines here: with `context > 0`, a
-/// `.env` line adjacent to a match is emitted as `path-NN-SECRET=value` —
-/// the `-`-delimited form — and a filter that only recognised `path:NN:…`
-/// would let that content straight through even though the *match* line for
-/// the same file was dropped. [`line_path_token`] recognises either
-/// delimiter, so both shapes are caught.
+/// **Applied to `shell` output**, which is where searching actually happens now:
+/// the `grep` tool filtered its own output while `shell` — which every non-jailed
+/// agent uses, and which `rg -n token .` runs through — had no secret handling at
+/// all. Lifting the filter here makes the protection strictly wider than it was.
+///
+/// This is a courtesy against the **accidental** case, and it is worth saying so:
+/// it was never a boundary. `shell` permits `cat ~/.ssh/id_rsa` today and
+/// guardrails do not stop it, so a determined caller walks around this in one step.
+/// What it does stop is a broad search spilling credentials into the context — and
+/// therefore to the model provider — with nobody intending it.
+///
+/// Context lines matter as much as match lines: with `-C`, a `.env` line adjacent
+/// to a match is emitted as `path-NN-SECRET=value`, the `-`-delimited form, and a
+/// filter that only recognised `path:NN:…` would let that straight through even
+/// though the *match* line for the same file was dropped. [`line_path_token`]
+/// recognises either delimiter.
 pub(crate) fn grep_line_is_secret(line: &str, cwd: &std::path::Path) -> bool {
     let Some(tok) = line_path_token(line) else {
         return false; // `--` group separators and unrecognized lines ride along
@@ -1445,6 +1454,20 @@ pub(crate) fn timeout_floor_note(asked: u64, used: u64) -> String {
 /// and the next agent someone writes with `sandbox: jail` silently gets a network.
 pub const JAIL_TOOLS: [&str; 5] = ["read", "grep", "find", "ls", "tree"];
 
+/// The four tools that exist **only** for jail, and are removed from every other
+/// mode: `grep`, `find`, `ls`, `tree`.
+///
+/// Every other mode has `shell`, which does all four better and in one call — and
+/// more tools is not more capability, it is more to choose between on every turn.
+/// The evidence for cutting them was not usage (a tool the model was handed gets
+/// called; that measures availability) but the reverse case: tools that were
+/// available and still ignored.
+///
+/// They survive for jail because jail has no shell and would otherwise be unable
+/// to search or orient at all. That is what makes [`JAIL_TOOLS`] *not* a subset of
+/// the normal set — see its doc.
+pub const JAIL_ONLY_TOOLS: [&str; 4] = ["grep", "find", "ls", "tree"];
+
 /// Ordered registry of tools, keyed by name.
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
@@ -1471,9 +1494,6 @@ impl ToolRegistry {
         r.register(Arc::new(ReadTool));
         r.register(Arc::new(WriteTool));
         r.register(Arc::new(EditTool));
-        r.register(Arc::new(MoveTool));
-        r.register(Arc::new(DeleteTool));
-        r.register(Arc::new(CopyTool));
         r.register(Arc::new(ReplaceTool));
         // The shell tool is presence-gated so the model is only offered a shell
         // it can actually use (`bash`, then POSIX `sh`; on Windows that means
@@ -1488,12 +1508,11 @@ impl ToolRegistry {
         if let Some(shell) = r.shell() {
             r.register(Arc::new(VerifyTool::new(shell)));
         }
-        r.register(Arc::new(GrepTool::detect()));
+        r.register(Arc::new(GrepTool));
         r.register(Arc::new(FindTool));
         r.register(Arc::new(LsTool));
         r.register(Arc::new(TreeTool));
         r.register(Arc::new(TodoTool));
-        r.register(Arc::new(WatchTool));
         r.register(Arc::new(WebFetchTool));
         r.register(Arc::new(WebSearchTool));
         r
@@ -1543,6 +1562,13 @@ impl ToolRegistry {
         let keep = |n: &str| allowed.iter().any(|a| a == n);
         self.order.retain(|n| keep(n));
         self.tools.retain(|n, _| keep(n));
+    }
+
+    /// Drop the [`JAIL_ONLY_TOOLS`] — what every mode but jail does.
+    pub fn drop_jail_only_tools(&mut self) {
+        let drop = |n: &str| JAIL_ONLY_TOOLS.contains(&n);
+        self.order.retain(|n| !drop(n));
+        self.tools.retain(|n, _| !drop(n));
     }
 
     /// Cap the registry to the fixed [`JAIL_TOOLS`] set.
@@ -2778,8 +2804,6 @@ mod tests {
         assert!(!RoTool.repeatable());
         assert!(!WriteTool.repeatable());
         assert!(!ReadTool.repeatable());
-        // `watch` is asked the same question until the answer changes.
-        assert!(WatchTool.repeatable());
     }
 
     // ---- tool scoping ----

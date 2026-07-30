@@ -1525,33 +1525,6 @@ fn workspace_members(root: &std::path::Path) -> Option<Vec<String>> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Render a background sub-agent's live event log into a human-readable peek
-/// (for `task_output`) by folding it through the SHARED transcript reducer, so
-/// the peek matches the durable on-disk record (tool args + results intact).
-fn peek_events(events: &[AgentEvent]) -> String {
-    let mut entries = Vec::new();
-    for ev in events {
-        crate::apply_event(&mut entries, ev);
-    }
-    // The SAME rendering `task_transcript` returns. A peek used to go through
-    // `transcript_to_text`, which prints `[tool: read]` and drops the arguments
-    // and the result — so the two tools described one run in two vocabularies,
-    // and the peek was the poorer of them for no reason anybody chose.
-    crate::transcript_to_plain_text(&entries, crate::TRANSCRIPT_TOOL_BODY_MAX)
-}
-
-/// Compact human duration for `task_list`: `8s`, `3m12s`, `1h4m`.
-fn fmt_elapsed(d: std::time::Duration) -> String {
-    let s = d.as_secs();
-    if s < 60 {
-        format!("{s}s")
-    } else if s < 3600 {
-        format!("{}m{}s", s / 60, s % 60)
-    } else {
-        format!("{}h{}m", s / 3600, (s % 3600) / 60)
-    }
-}
-
 /// One sub-agent run found on disk under `subagents/<main-id>/`: the pair of a
 /// `<stem>.jsonl` crash-trail and its (optional) `<stem>.json` snapshot.
 struct DiskRun {
@@ -1561,59 +1534,6 @@ struct DiskRun {
     label: String,
     /// The run reached a terminal `End` record (`done` vs `running`/`orphaned`).
     done: bool,
-}
-
-/// Scan `dir` (`subagents/<main-id>/`) for the sub-agent runs persisted there:
-/// one per `<stem>.jsonl`, with its label/cwd taken from the sibling `<stem>.json`
-/// snapshot when present (a run that reached its first `History` save) or the
-/// Whether `stem` is a well-formed run id — the `NNN-slug` shape
-/// [`child_transcript_id`] mints and [`scan_subagent_runs`] surfaces. A
-/// `task_output` / `task_revive` id comes from the model, which joins it onto the
-/// snapshot dir; rejecting a path separator, `..`, or empty string keeps that
-/// lookup inside `subagents/<main-id>/` instead of escaping it.
-fn valid_run_stem(stem: &str) -> bool {
-    !stem.is_empty()
-        && !stem.contains("..")
-        && !stem.contains(['/', '\\'])
-        && !std::path::Path::new(stem)
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-}
-
-/// jsonl's opening `Start` record otherwise. Best-effort: an unreadable dir
-/// yields nothing, so the disk fallback silently degrades to the in-memory list.
-fn scan_subagent_runs(dir: &std::path::Path) -> Vec<DiskRun> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(stem) = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let done = transcript_log::is_complete(&path);
-        // Label: prefer the snapshot (its session name IS the label), else fall
-        // back to the jsonl's opening `Start` record.
-        let json = path.with_extension("json");
-        let label = match crate::Session::load_path(&json) {
-            Ok(s) => s.state.name,
-            Err(_) => match transcript_log::read_start(&path) {
-                Some(transcript_log::Record::Start { label, .. }) => label,
-                _ => String::new(),
-            },
-        };
-        out.push(DiskRun { stem, label, done });
-    }
-    out.sort_by(|a, b| a.stem.cmp(&b.stem));
-    out
 }
 
 /// A sub-agent conversation resolved for `task_revive`: the messages, identity
@@ -1635,553 +1555,6 @@ struct RevivedState {
     label: String,
 }
 
-/// The config a revived run is rebuilt on: the base a `task` spawn uses (always
-/// write-capable — see [`subagent_base_config`]), narrowed back to the scope the
-/// run actually had.
-///
-/// `read_only` is the same field [`config_for_agent_profile`] sets from a profile
-/// and `Agent::new` resolves into a pruned registry, so a revived `explore` comes
-/// back with the reader set it was spawned with rather than the writers its
-/// profile deliberately withheld.
-fn revive_base_config(base: &AgentConfig, read_only: bool) -> AgentConfig {
-    let mut cfg = base.clone();
-    cfg.read_only = read_only;
-    cfg
-}
-
-/// Resolve a `task_revive` id to its persisted state, hydrating from the
-/// `<stem>.json` snapshot under `dir` (`subagents/<main-id>/`). This is the
-/// disk fallback the input-unification's `SessionState` persistence unlocked:
-/// the snapshot carries the real model-facing `messages` (with signed thinking
-/// blocks), so a revive continues losslessly rather than from a lossy transcript
-/// fold. The run continues in the recorded working directory.
-async fn revive_target_from_disk(dir: &std::path::Path, stem: &str) -> Result<RevivedState> {
-    if !valid_run_stem(stem) {
-        bail!("`{stem}` is not a valid run id (see `task_list`)");
-    }
-    let json = dir.join(format!("{stem}.json"));
-    if !json.exists() {
-        bail!("no sub-agent run `{stem}` on disk (see `task_list`)");
-    }
-    let state = crate::Session::load_path(&json)
-        .with_context(|| format!("loading sub-agent snapshot for `{stem}`"))?
-        .state;
-    let cwd = PathBuf::from(&state.cwd);
-    Ok(RevivedState {
-        session_cost: state.usage.cost_usd,
-        usage: state.usage,
-        messages: state.messages,
-        reference: state.model,
-        label: state.name,
-        read_only: state.read_only,
-        cwd,
-    })
-}
-
-/// `task_list`: report the background sub-agents `task` spawned — id, label,
-/// status, model and elapsed — so the parent can check on them without waiting. After a `/resume` the in-memory
-/// registry is empty, so it also scans the on-disk `subagents/<main-id>/`
-/// snapshots (deduped against the live rows) — the enumeration `task_revive`
-/// selects a resumable run from.
-pub(crate) struct TaskListTool {
-    /// The parent session's sub-agent snapshot dir cell (see
-    /// [`AgentConfig::child_transcript_dir`]); resolved at call time so the
-    /// disk scan survives a resume. `None` (or unresolved) → in-memory list only.
-    pub(crate) transcript_dir: ChildDirCell,
-}
-
-#[async_trait::async_trait]
-impl hrdr_tools::Tool for TaskListTool {
-    fn name(&self) -> &'static str {
-        "task_list"
-    }
-    fn description(&self) -> &'static str {
-        "List your background sub-agents: each one's id, label, status (running / done / \
-         cancelled). Covers both the ones live in this session and, after a `/resume`, the ones \
-         persisted on disk from earlier sessions (shown by their `NNN-slug` stem id, marked `done` \
-         or `orphaned`) — pass a stem to `task_transcript` to read one back, or to `task_revive` \
-         to re-engage it. A live task's result is delivered to you automatically; use this to \
-         check progress, not to collect results."
-    }
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({ "type": "object", "properties": {} })
-    }
-    fn read_only(&self) -> bool {
-        true
-    }
-    /// Checking on running sub-agents means asking the same question until the
-    /// answer changes — no arguments to vary, so every check is byte-identical.
-    fn repeatable(&self) -> bool {
-        true
-    }
-    async fn execute(
-        &self,
-        _args: serde_json::Value,
-        ctx: &hrdr_tools::ToolContext,
-    ) -> anyhow::Result<String> {
-        // The in-memory rows, plus the on-disk stems they already cover (a live
-        // task's transcript path names its `<stem>.jsonl`), so the disk scan below
-        // does not list a run twice.
-        let (mut rows, live_stems): (Vec<String>, std::collections::HashSet<String>) = {
-            let v = ctx
-                .background_tasks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let rows = v
-                .iter()
-                .map(|t| {
-                    let mut row = format!("#{} [{}] {}", t.id, t.status().as_str(), t.label);
-                    if !t.model.is_empty() {
-                        row.push_str(&format!("  model: {}", t.model));
-                    }
-                    if let Some(started) = t.started {
-                        row.push_str(&format!("  {}", fmt_elapsed(started.elapsed())));
-                    }
-                    row
-                })
-                .collect();
-            let stems = v
-                .iter()
-                .filter_map(|t| {
-                    t.transcript
-                        .as_ref()
-                        .and_then(|p| p.file_stem())
-                        .and_then(|s| s.to_str())
-                        .map(str::to_string)
-                })
-                .collect();
-            (rows, stems)
-        };
-        // On-disk runs from earlier sessions (post-`/resume` the registry above is
-        // empty), deduped against the live rows. A finished/orphaned run is invisible
-        // in memory but recoverable here, and this is what `task_revive` selects from.
-        if let Some(dir) = resolve_child_dir(&self.transcript_dir) {
-            let disk: Vec<String> = scan_subagent_runs(&dir)
-                .into_iter()
-                .filter(|r| !live_stems.contains(&r.stem))
-                .map(|r| {
-                    let state = if r.done { "done" } else { "orphaned" };
-                    let label = if r.label.trim().is_empty() {
-                        "sub-task"
-                    } else {
-                        r.label.trim()
-                    };
-                    let row = format!("{} [{state}] {label}", r.stem);
-                    row
-                })
-                .collect();
-            if !disk.is_empty() {
-                rows.push("On disk (from earlier sessions — revive by stem id):".to_string());
-                rows.extend(disk);
-            }
-        }
-        if rows.is_empty() {
-            return Ok("No background tasks.".to_string());
-        }
-        Ok(hrdr_tools::truncate(&rows.join("\n"), ctx.max_output))
-    }
-}
-
-/// `task_output`: peek a RUNNING sub-agent's live progress without waiting.
-///
-/// Deliberately live-only. Reading a finished run back is `task_transcript`'s job,
-/// and this tool used to do a lossy version of it too (a `NNN-slug` stem branch
-/// rendering the on-disk transcript through [`crate::transcript_to_text`], which
-/// drops each tool call's arguments and result). Two tools answering the same
-/// question at different fidelities is how a model ends up with the worse answer,
-/// so the overlap was cut rather than kept: peek here, read back there.
-pub(crate) struct TaskOutputTool {
-    pub(crate) live: AgentRegistry,
-}
-
-#[async_trait::async_trait]
-impl hrdr_tools::Tool for TaskOutputTool {
-    fn name(&self) -> &'static str {
-        "task_output"
-    }
-    fn description(&self) -> &'static str {
-        "Peek what a RUNNING background sub-agent has produced so far, by its integer `id` (from \
-         `task_list`), without blocking — for when the user asks how a task is going. Shows the \
-         newest output; the middle is dropped if it is long. The final result of a live task is \
-         delivered to you automatically when it finishes, so you never need to poll. To read a \
-         run BACK — a finished one, one from an earlier session, or any run's reasoning and tool \
-         calls in full — use `task_transcript` instead; this tool only sees live tasks."
-    }
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "integer",
-                    "description": "The live task's integer id (see `task_list`). For an on-disk run from an earlier session, use `task_transcript` with its `NNN-slug` stem."
-                }
-            },
-            "required": ["id"]
-        })
-    }
-    fn read_only(&self) -> bool {
-        true
-    }
-    /// Polling one running task's progress repeats the same `id` by definition —
-    /// the tool is asked again precisely because the output is expected to grow.
-    fn repeatable(&self) -> bool {
-        true
-    }
-    async fn execute(
-        &self,
-        args: serde_json::Value,
-        ctx: &hrdr_tools::ToolContext,
-    ) -> anyhow::Result<String> {
-        let id_val = args
-            .get("id")
-            .ok_or_else(|| anyhow::anyhow!("task_output needs an `id` (see `task_list`)"))?;
-        // Live tasks only, addressed by integer id (an all-digit string counts —
-        // the same id, differently typed). A `NNN-slug` stem is an on-disk run,
-        // which belongs to `task_transcript`: it renders reasoning and each tool
-        // call's arguments and result, where this tool's renderer would drop them.
-        let Some(id) = id_val
-            .as_u64()
-            .or_else(|| id_val.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
-        else {
-            // One message for every non-integer id. Splitting on whether the string
-            // looks like a stem would be guesswork — `valid_run_stem` only rejects
-            // path traversal, not shape — and both cases have the same answer.
-            let given = id_val.as_str().map(str::trim).unwrap_or_default();
-            anyhow::bail!(
-                "task_output takes a LIVE task's integer id (see `task_list`), and got \
-                 `{given}`. To read a run back — a finished one, or one from an earlier session \
-                 addressed by its `NNN-slug` stem — use `task_transcript`, which also shows its \
-                 reasoning and every tool call's arguments and result."
-            );
-        };
-        // Prefer the live event log; fall back to the registry entry's stored
-        // result if the task already finished and its live entry was pruned.
-        let peek = self.live.with(|v| {
-            v.iter().find(|e| e.bg_id == Some(id)).map(|e| {
-                let events = e
-                    .events
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .since(0)
-                    .0;
-                peek_events(&events)
-            })
-        });
-        if let Some(text) = peek.filter(|t| !t.is_empty()) {
-            // The TAIL, in the same rendering `task_transcript` produces: on a
-            // still-running task the newest output is its current progress, and
-            // keeping the head would hand back stale narration from the start.
-            // That framing is the only difference between the two tools.
-            return Ok(tail_lines(&text, ctx.max_output));
-        }
-        let done = {
-            let v = ctx
-                .background_tasks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            v.iter().find(|t| t.id == id).map(|t| {
-                let body = t
-                    .result
-                    .clone()
-                    .unwrap_or_else(|| format!("(task #{id} is {})", t.status().as_str()));
-                (body, t.transcript.clone())
-            })
-        };
-        match done {
-            Some((text, transcript)) => {
-                // Same reasoning as the live-peek branch above: keep the tail.
-                let mut out = hrdr_tools::truncate_middle(&text, ctx.max_output);
-                // Point at the durable transcript for the full run — richer than
-                // the stored summary, and it outlives the live event log.
-                if let Some(p) = transcript {
-                    out.push_str(&format!(
-                        "\n\n(for the whole run — its reasoning and every tool call — use \
-                         `task_transcript`; don't `read` the raw file at {}, which is one JSON record \
-                         per streamed token)",
-                        p.display()
-                    ));
-                }
-                Ok(out)
-            }
-            None => anyhow::bail!("no background task #{id} (see `task_list`)"),
-        }
-    }
-}
-
-/// `task_revive`: re-engage a finished, orphaned, or crashed sub-agent with a
-/// follow-up — the counterpart to `task_steer`, which only reaches a *running*
-/// turn. Resolution is live-first, disk-fallback:
-///
-/// * **Live** — the sub-agent is still retained in [`AgentRegistry`] (finished but
-///   not yet pruned): reuse its in-memory conversation directly (the freshest
-///   copy).
-/// * **Disk** — otherwise hydrate from the persisted `<stem>.json` snapshot under
-///   `subagents/<main-id>/` ([`revive_target_from_disk`]), which carries the real
-///   model-facing `messages`.
-///
-/// Either way it builds a FRESH agent from that state and spawns it as a
-/// background run — so the result is delivered exactly like a `task`'s. Building a
-/// fresh agent (rather than resuming the retained object) keeps the two paths one
-/// codepath and is lossless: the persisted `messages` are the conversation.
-pub(crate) struct TaskReviveTool {
-    /// Base policy for the revived sub-agent (endpoint/model overlaid live, then
-    /// moved onto the run's own identity). Same base a `task` spawn uses.
-    base: AgentConfig,
-    runtime: SharedDelegationRuntime,
-    pub(crate) bg_handles: BgHandles,
-    /// The SAME concurrency slots `task` uses, so a revive counts against the
-    /// caps rather than opening an uncounted extra sub-agent.
-    pub(crate) slots: Arc<SubagentSlots>,
-    /// Both caps, `(read-only, write-capable)` — a revived read-only run belongs
-    /// on the read-only pool, exactly as a fresh one does.
-    max_readonly: usize,
-    max_write: usize,
-    cost_total: Arc<std::sync::Mutex<f64>>,
-    cost_partial: Arc<std::sync::atomic::AtomicBool>,
-    lsp: Option<Arc<hrdr_tools::LspRegistry>>,
-    transcript_dir: ChildDirCell,
-    live: AgentRegistry,
-}
-
-impl TaskReviveTool {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        base: AgentConfig,
-        runtime: SharedDelegationRuntime,
-        bg_handles: BgHandles,
-        slots: Arc<SubagentSlots>,
-        cost_total: Arc<std::sync::Mutex<f64>>,
-        cost_partial: Arc<std::sync::atomic::AtomicBool>,
-        lsp: Option<Arc<hrdr_tools::LspRegistry>>,
-        transcript_dir: ChildDirCell,
-        live: AgentRegistry,
-    ) -> Self {
-        let max_readonly = base.max_readonly_subagents;
-        let max_write = base.max_write_subagents;
-        Self {
-            base,
-            runtime,
-            bg_handles,
-            slots,
-            max_readonly,
-            max_write,
-            cost_total,
-            cost_partial,
-            lsp,
-            transcript_dir,
-            live,
-        }
-    }
-
-    /// Live-first resolution: the in-memory state of a still-retained sub-agent,
-    /// or `None` if no live entry has that background id. Refuses a still-running
-    /// one — that is `task_steer`'s job, not revive's.
-    async fn revive_from_live(&self, bg: u64) -> Result<Option<RevivedState>> {
-        let found = self.live.with(|v| {
-            v.iter()
-                .find(|e| e.bg_id == Some(bg))
-                .map(|e| (e.key, e.running, Arc::clone(&e.agent), e.label.clone()))
-        });
-        let Some((key, running, agent, label)) = found else {
-            return Ok(None);
-        };
-        if running {
-            bail!(
-                "background task #{bg} is still running — use `task_steer` to add to its current \
-                 turn, not `task_revive`."
-            );
-        }
-        // Its freshest conversation, identity and cwd come from the retained agent.
-        let (messages, reference, cwd, read_only) = {
-            let a = agent.lock().await;
-            (
-                a.messages_owned(),
-                a.model_ref().clone(),
-                a.cwd(),
-                a.read_only(),
-            )
-        };
-        let usage = self.live.usage(key).unwrap_or_default();
-        Ok(Some(RevivedState {
-            session_cost: usage.cost_usd,
-            usage,
-            messages,
-            reference,
-            cwd,
-            read_only,
-            label,
-        }))
-    }
-
-    /// Build a fresh agent from `st` and spawn it as a background run — so the follow-up's result is delivered exactly like a
-    /// `task`'s. Synchronous, like [`spawn_background`] it wraps.
-    fn spawn(
-        &self,
-        ctx: &hrdr_tools::ToolContext,
-        prompt: String,
-        st: RevivedState,
-    ) -> Result<String> {
-        let mut cfg = revive_base_config(&self.base, st.read_only);
-        // The parent's LIVE resolved endpoint (identity + key), whole — exactly as
-        // `SubagentTool::execute` overlays it, so the revived run inherits an
-        // endpoint that agrees with itself.
-        let runtime = self
-            .runtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let live_ep = runtime.endpoint.resolved;
-        cfg.base_url = live_ep.base_url().to_string();
-        cfg.api_key = live_ep.api_key().map(str::to_string);
-        cfg.api_version = live_ep.api_version().map(str::to_string);
-        cfg.headers = live_ep.headers().to_vec();
-        cfg.model = live_ep.reference().clone();
-        cfg.effort = runtime.endpoint.effort;
-        // Move onto the run's OWN identity, re-deriving its endpoint/key (it may be
-        // a different provider than the parent is on now) and inheriting the
-        // parent's key across the same endpoint.
-        let parent_ctx = AuthContext {
-            api_key: live_ep.api_key(),
-            base_url: live_ep.base_url(),
-        };
-        apply_model_ref(&mut cfg, st.reference.clone(), Some(&parent_ctx))
-            .map_err(|e| anyhow::anyhow!("task_revive: {e:#}"))?;
-        cfg.memory_roots = ctx.memory_project.clone().zip(ctx.memory_global.clone());
-        // Continue in the directory the run was recorded in, falling back to the
-        // parent's if it has since gone away.
-        cfg.cwd = if st.cwd.exists() {
-            st.cwd.clone()
-        } else {
-            ctx.cwd.clone()
-        };
-        cfg.context_window = child_context_window(
-            cfg.context_window,
-            Some(cfg.model.provider().as_str()),
-            &cfg.base_url,
-            cfg.model.model(),
-        );
-        // Slot on the pool that matches what the revived run may DO, with the same
-        // caps a fresh `task` uses: a read-only follow-up changes nothing, so it
-        // takes the reader cap; a writer shares the working dir with everything
-        // else and takes the (small) write cap.
-        let write_capable = !cfg.read_only;
-        let (cap, kind) = if write_capable {
-            (self.max_write, "write")
-        } else {
-            (self.max_readonly, "read-only")
-        };
-        let Some(slot) = self.slots.acquire(write_capable, cap) else {
-            bail!(
-                "too many {kind} sub-agents already running (limit {cap}). Wait for one to \
-                 finish — you are notified automatically — then revive."
-            );
-        };
-        let label = if st.label.trim().is_empty() {
-            "revived-task".to_string()
-        } else {
-            st.label.clone()
-        };
-        let restore = RestoredContext {
-            messages: st.messages,
-            session_cost: st.session_cost,
-            usage: st.usage,
-        };
-        spawn_background(
-            cfg,
-            prompt,
-            label,
-            ctx.call_id.clone(),
-            slot,
-            &ctx.background_tasks,
-            &self.bg_handles,
-            Arc::clone(&self.cost_total),
-            Arc::clone(&self.cost_partial),
-            self.lsp.clone(),
-            self.transcript_dir.clone(),
-            self.live.clone(),
-            Some(restore),
-        )
-    }
-}
-
-#[async_trait::async_trait]
-impl hrdr_tools::Tool for TaskReviveTool {
-    fn name(&self) -> &'static str {
-        "task_revive"
-    }
-    fn description(&self) -> &'static str {
-        "Re-engage a finished, orphaned, or crashed sub-agent with a follow-up `prompt`, instead \
-         of re-delegating from scratch. It reuses the sub-agent's full context, so the follow-up \
-         continues where the run left off. Use it to hand review fixes back to the SAME sub-agent that did the work, or to \
-         continue a run left unfinished when the session was closed. Pass the `id` from \
-         `task_list`: a live task's integer id, or an on-disk run's `NNN-slug` stem. Runs in the \
-         background like `task` — its result is delivered to you automatically."
-    }
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": ["integer", "string"],
-                    "description": "The sub-agent to revive: a live task's integer id, or an on-disk run's `NNN-slug` stem (see `task_list`)."
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "The follow-up for the sub-agent — the next thing for it to do, with any context it needs."
-                }
-            },
-            "required": ["id", "prompt"]
-        })
-    }
-    fn read_only(&self) -> bool {
-        false
-    }
-    async fn execute(
-        &self,
-        args: serde_json::Value,
-        ctx: &hrdr_tools::ToolContext,
-    ) -> anyhow::Result<String> {
-        let id_val = args
-            .get("id")
-            .ok_or_else(|| anyhow::anyhow!("task_revive needs an `id` (see `task_list`)"))?;
-        let prompt = args
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("task_revive needs a non-empty `prompt`"))?
-            .to_string();
-
-        // Live-first: an integer (or all-digit) id names a retained in-memory run.
-        let as_int = id_val
-            .as_u64()
-            .or_else(|| id_val.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
-        if let Some(bg) = as_int {
-            if let Some(st) = self.revive_from_live(bg).await? {
-                return self.spawn(ctx, prompt, st);
-            }
-            bail!(
-                "no live background task #{bg} to revive — if it is from an earlier session, pass \
-                 the `NNN-slug` stem id shown by `task_list`."
-            );
-        }
-        // Disk fallback: a `NNN-slug` stem from an earlier session.
-        let stem = id_val
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!("task_revive needs an integer id or a stem id (see `task_list`)")
-            })?;
-        let dir = resolve_child_dir(&self.transcript_dir).ok_or_else(|| {
-            anyhow::anyhow!("no session directory yet — cannot revive `{stem}` from disk")
-        })?;
-        let st = revive_target_from_disk(&dir, stem).await?;
-        self.spawn(ctx, prompt, st)
-    }
-}
-
-/// `task_steer`: add instructions to a background sub-agent's in-flight turn.
 pub(crate) struct SteerTool {
     pub(crate) live: AgentRegistry,
 }
@@ -2195,13 +1568,14 @@ impl hrdr_tools::Tool for SteerTool {
         "Give additional instructions to a running background sub-agent. The message is queued \
          on the sub-agent's active turn and reaches it before its next model request; if its current \
          response finishes first, the retained sub-agent starts a follow-up turn with the message. \
-         Use the task id from `task` / `task_list`; finished or unknown tasks cannot be steered."
+         Use the task id `task` returned when it started the run; finished or unknown tasks cannot \
+         be steered."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "id": { "type": "integer", "description": "The running task id (see `task_list`)." },
+                "id": { "type": "integer", "description": "The running task id, as returned by `task`." },
                 "prompt": { "type": "string", "description": "Additional instructions for the sub-agent." }
             },
             "required": ["id", "prompt"]
@@ -2215,10 +1589,13 @@ impl hrdr_tools::Tool for SteerTool {
         args: serde_json::Value,
         _ctx: &hrdr_tools::ToolContext,
     ) -> anyhow::Result<String> {
-        let id = args
-            .get("id")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("task_steer needs an integer `id` (see `task_list`)"))?;
+        let id = args.get("id").and_then(|v| v.as_u64()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "task_steer needs an integer `id` — the one `task` returned when it started \
+                     the run. {}",
+                running_tasks_hint(&self.live)
+            )
+        })?;
         let prompt = args
             .get("prompt")
             .and_then(|v| v.as_str())
@@ -2238,9 +1615,47 @@ impl hrdr_tools::Tool for SteerTool {
         });
         match queued {
             Some(true) => Ok(format!("Steered background task #{id}.")),
-            Some(false) => anyhow::bail!("background task #{id} is no longer running"),
-            None => anyhow::bail!("no running background task #{id} (see `task_list`)"),
+            // Three arms, three different things to say. A finished task cannot be
+            // steered but its result is already on its way to you; an unknown id is
+            // probably a misremembered number; nothing running at all means stop.
+            Some(false) => anyhow::bail!(
+                "background task #{id} has finished, so there is nothing to steer — its result \
+                 is delivered to you automatically. {}",
+                running_tasks_hint(&self.live)
+            ),
+            None => anyhow::bail!(
+                "no background task #{id}. Ids come from `task`'s own return value. {}",
+                running_tasks_hint(&self.live)
+            ),
         }
+    }
+}
+
+/// What is still running, for an error path that has to answer "then which id?".
+///
+/// `task_list` used to be a tool, and removing it left a real gap: a model that
+/// loses an id — compaction dropped the `task` result, or it simply misremembers —
+/// had nothing to ask. So the listing moved into the errors that need it. The
+/// information now arrives exactly when it is wanted and costs nothing when it is
+/// not, rather than sitting behind a schema entry the model reconsidered every turn.
+///
+/// The empty case is the most useful answer of the three, because it stops a retry
+/// loop outright: nothing is running, so no id will work.
+fn running_tasks_hint(live: &AgentRegistry) -> String {
+    let mut rows: Vec<String> = live.with(|entries| {
+        entries
+            .iter()
+            .filter(|e| e.running && e.bg_id.is_some())
+            .map(|e| format!("#{} {}", e.bg_id.unwrap_or_default(), e.label))
+            .collect()
+    });
+    rows.sort();
+    if rows.is_empty() {
+        "Nothing is running right now, so no id will work — do not retry with another \
+         number. Results are delivered to you automatically when a task finishes."
+            .to_string()
+    } else {
+        format!("Running now: {}.", rows.join(", "))
     }
 }
 
@@ -2256,7 +1671,7 @@ impl hrdr_tools::Tool for TaskCancelTool {
         "task_cancel"
     }
     fn description(&self) -> &'static str {
-        "Cancel a running background sub-agent by its `id` (from `task_list`). This stops the \
+        "Cancel a running background sub-agent by its `id` (the one `task` returned). This stops the \
          run; it does NOT undo what the sub-agent already wrote. A write-capable sub-agent edits \
          your working directory directly, so whatever it managed before the abort is still there \
          — check `git diff` and keep or revert it deliberately. Use when the user asks to stop a \
@@ -2266,7 +1681,7 @@ impl hrdr_tools::Tool for TaskCancelTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "id": { "type": "integer", "description": "The task id (see `task_list`)." }
+                "id": { "type": "integer", "description": "The task id, as returned by `task`." }
             },
             "required": ["id"]
         })
@@ -2280,7 +1695,11 @@ impl hrdr_tools::Tool for TaskCancelTool {
         ctx: &hrdr_tools::ToolContext,
     ) -> anyhow::Result<String> {
         let id = args.get("id").and_then(|v| v.as_u64()).ok_or_else(|| {
-            anyhow::anyhow!("task_cancel needs an integer `id` (see `task_list`)")
+            anyhow::anyhow!(
+                "task_cancel needs an integer `id` — the one `task` returned when it started the \
+                 run. {}",
+                running_tasks_hint(&self.live)
+            )
         })?;
         // Abort the worker if it is still running, and AWAIT the aborted task so
         // its future is fully dropped before we report — otherwise the worker could
@@ -2316,7 +1735,10 @@ impl hrdr_tools::Tool for TaskCancelTool {
                     t.cancelled = true;
                     t.done = true;
                 }
-                None if !aborted => anyhow::bail!("no background task #{id} (see `task_list`)"),
+                None if !aborted => anyhow::bail!(
+                    "no background task #{id}. Ids come from `task`'s own return value. {}",
+                    running_tasks_hint(&self.live)
+                ),
                 None => {}
             }
         }
@@ -2334,216 +1756,6 @@ impl hrdr_tools::Tool for TaskCancelTool {
              edits. Check with `git diff` and keep or revert them yourself."
         ))
     }
-}
-
-/// `task_transcript`: read a sub-agent's run back as plain text.
-///
-/// Exists because the harness used to point at the `.jsonl` and say "`read` it",
-/// and a session did exactly that: the reply came back as one JSON record per
-/// streamed token, which is the same run at a multiple of the tokens with the
-/// content buried in syntax. The records are already folded into entries by the
-/// same reducer the panes use; this renders them.
-pub(crate) struct TaskTranscriptTool {
-    /// Where a finished/orphaned run's `<stem>.jsonl` lives, so a run from an
-    /// earlier session (post-`/resume`) is still readable. `None` → live only.
-    pub(crate) transcript_dir: ChildDirCell,
-}
-
-#[async_trait::async_trait]
-impl hrdr_tools::Tool for TaskTranscriptTool {
-    fn name(&self) -> &'static str {
-        "task_transcript"
-    }
-    fn description(&self) -> &'static str {
-        "DIAGNOSTIC: read a sub-agent's whole run back as plain text — what it was asked, what it \
-         thought, every tool call with its arguments and result, and what it answered. Reach for \
-         it when something is WRONG and the result alone doesn't explain it: `git diff` shows a \
-         change you didn't expect, a task reports success but its work says otherwise, it failed \
-         or was cancelled, or it clearly misread the brief. Most tasks need none of this — the \
-         result is delivered to you automatically, and a write task's work is reviewed with \
-         `git diff` (the change) not here (the conversation). A whole run is a lot of context, so \
-         spend it when you have a question it answers. Pass a live/finished task's integer `id`, \
-         or the `NNN-slug` stem of a run from an earlier session (see `task_list`); long runs page \
-         with `offset`/`limit`, like `read`. Never `read` the raw `.jsonl` yourself — it is one \
-         JSON record per streamed token and says the same thing at many times the size."
-    }
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": ["integer", "string"],
-                    "description": "The task id: a live task's integer id, or an on-disk run's `NNN-slug` stem (see `task_list`)."
-                },
-                "offset": {
-                    "type": "integer",
-                    "description": "1-based line to start at in the rendered transcript. Default 1."
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "How many lines to return. Default: as many as fit the output cap."
-                }
-            },
-            "required": ["id"]
-        })
-    }
-    fn read_only(&self) -> bool {
-        true
-    }
-    async fn execute(
-        &self,
-        args: serde_json::Value,
-        ctx: &hrdr_tools::ToolContext,
-    ) -> anyhow::Result<String> {
-        let id_val = args
-            .get("id")
-            .ok_or_else(|| anyhow::anyhow!("task_transcript needs an `id` (see `task_list`)"))?;
-        let offset = args
-            .get("offset")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1)
-            .max(1) as usize;
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize);
-
-        // Same dual addressing as `task_output`: an integer (or all-digit string)
-        // names a live/recently-finished task, a `NNN-slug` stem names a run on
-        // disk. Resolve either to the `.jsonl` the fold reads.
-        let path = match id_val
-            .as_u64()
-            .or_else(|| id_val.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
-        {
-            Some(id) => {
-                let from_registry = ctx
-                    .background_tasks
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .iter()
-                    .find(|t| t.id == id)
-                    .and_then(|t| t.transcript.clone());
-                from_registry.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no transcript for task #{id} — it may predate this session (try its \
-                         `NNN-slug` stem from `task_list`), or the task may not exist"
-                    )
-                })?
-            }
-            None => {
-                let stem = id_val
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "task_transcript needs an integer id or a stem id (see `task_list`)"
-                        )
-                    })?;
-                if !valid_run_stem(stem) {
-                    anyhow::bail!("`{stem}` is not a valid run id (see `task_list`)");
-                }
-                let dir = resolve_child_dir(&self.transcript_dir).ok_or_else(|| {
-                    anyhow::anyhow!("no session directory yet — cannot read `{stem}` from disk")
-                })?;
-                dir.join(format!("{stem}.jsonl"))
-            }
-        };
-        if !path.exists() {
-            anyhow::bail!(
-                "no transcript at {} — the run may have been pruned (see `task_list`)",
-                path.display()
-            );
-        }
-        let entries = transcript_log::read_transcript(&path);
-        let text = crate::transcript_to_plain_text(&entries, crate::TRANSCRIPT_TOOL_BODY_MAX);
-        if text.trim().is_empty() {
-            return Ok(format!("The run recorded no output ({}).", path.display()));
-        }
-        Ok(window_lines(&text, offset, limit, ctx.max_output))
-    }
-}
-
-/// Room left for a window's one-line header once the body has its budget.
-const WINDOW_HEADER_BUDGET: usize = 200;
-
-/// Lines `start..` of `lines`, at most `limit` of them and within `budget` bytes.
-/// Returns the joined text and how many lines it took.
-///
-/// The one place the line budget is applied — `task_output`'s tail and
-/// `task_transcript`'s page differ only in which window they ask for, and that is
-/// the whole intended difference between the two tools.
-fn take_lines(lines: &[&str], start: usize, limit: usize, budget: usize) -> (String, usize) {
-    let mut out = String::new();
-    let mut taken = 0usize;
-    for line in lines.iter().skip(start).take(limit) {
-        if out.len() + line.len() + 1 > budget {
-            break;
-        }
-        out.push_str(line);
-        out.push('\n');
-        taken += 1;
-    }
-    (out.trim_end().to_string(), taken)
-}
-
-/// `limit` lines of `text` from 1-based `offset`, with a header naming the total
-/// and the offset to continue from.
-///
-/// Paged rather than truncated: reading a run back starts at the beginning, and
-/// the reader needs to know there IS more and how to ask for it.
-fn window_lines(text: &str, offset: usize, limit: Option<usize>, max_output: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let total = lines.len();
-    let start = offset.saturating_sub(1).min(total);
-    let budget = max_output.saturating_sub(WINDOW_HEADER_BUDGET);
-    let (body, taken) = take_lines(&lines, start, limit.unwrap_or(usize::MAX), budget);
-    let last = start + taken;
-    let mut header = format!("Transcript lines {}-{last} of {total}", start + 1);
-    if last < total {
-        header.push_str(&format!(
-            " — {} more; continue with offset: {}",
-            total - last,
-            last + 1
-        ));
-    }
-    format!("{header}\n\n{body}")
-}
-
-/// The LAST lines of `text` that fit in `max_output`, headed with what was kept
-/// and where the rest is.
-///
-/// The peek's half of the split: same rendering as a page, opposite end. It says
-/// how many earlier lines it dropped, because a peek that silently starts
-/// mid-run reads like the whole run.
-fn tail_lines(text: &str, max_output: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let total = lines.len();
-    let budget = max_output.saturating_sub(WINDOW_HEADER_BUDGET);
-    // Walk back from the end while the lines still fit, then take that window
-    // forward through the shared helper.
-    let mut start = total;
-    let mut used = 0usize;
-    while start > 0 {
-        let len = lines[start - 1].len() + 1;
-        if used + len > budget {
-            break;
-        }
-        used += len;
-        start -= 1;
-    }
-    let (body, taken) = take_lines(&lines, start, usize::MAX, budget);
-    let mut header = if taken >= total {
-        format!("Progress so far — all {total} lines")
-    } else {
-        format!(
-            "Progress so far — last {taken} of {total} lines ({} earlier omitted; \
-             `task_transcript` reads the run from the start)",
-            total - taken
-        )
-    };
-    header.push_str(":\n\n");
-    format!("{header}{body}")
 }
 
 /// The full agent-profile set for `config`, layered by precedence — each source
@@ -2967,514 +2179,6 @@ impl Agent {
             v.len()
         } else {
             0
-        }
-    }
-}
-
-#[cfg(test)]
-mod revive_tests {
-    use super::*;
-    use crate::transcript_log::{EndStatus, Record, TranscriptLog};
-    use hrdr_tools::Tool;
-
-    /// A resolved dir cell pointing at `dir`, as the real one resolves post-save.
-    fn cell(dir: &std::path::Path) -> ChildDirCell {
-        Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
-            dir.to_path_buf(),
-        ))))
-    }
-
-    /// Persist one run's transcript (`Start` [+ `Text`] [+ `End`]) at
-    /// `dir/<stem>.jsonl`, as a real sub-agent run writes it.
-    fn write_run(
-        dir: &std::path::Path,
-        stem: &str,
-        label: &str,
-        text: Option<&str>,
-        complete: bool,
-    ) {
-        let mut t = TranscriptLog::create(dir, stem).unwrap();
-        t.write(&Record::Start {
-            model: "m".into(),
-            label: label.into(),
-            prompt: "do it".into(),
-        });
-        if let Some(x) = text {
-            t.write(&Record::Text { chunk: x.into() });
-        }
-        if complete {
-            t.write(&Record::End {
-                status: EndStatus::Ok,
-                bytes: 0,
-            });
-        }
-    }
-
-    /// `task_transcript` renders a run as plain text — reasoning and every tool
-    /// call with its arguments and result — instead of the raw records.
-    ///
-    /// The tool exists because a real session followed a "`read` it for the
-    /// complete run" pointer to a `.jsonl` and got one JSON record per streamed
-    /// token back. `transcript_to_text` was no substitute: it prints `[tool: edit]`
-    /// and drops the arguments and the result, which is the part you read a run
-    /// back FOR.
-    #[tokio::test]
-    async fn task_transcript_renders_a_run_without_the_json() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut t = TranscriptLog::create(dir.path(), "003-planner").unwrap();
-        t.write(&Record::Start {
-            model: "m".into(),
-            label: "Plan the protocol".into(),
-            prompt: "plan it".into(),
-        });
-        // Streamed one token per record, exactly as a live run writes it.
-        for chunk in ["I ", "should ", "read ", "the ", "codec."] {
-            t.write(&Record::Reasoning { text: chunk.into() });
-        }
-        t.write(&Record::ToolStart {
-            id: "c1".into(),
-            name: "read".into(),
-            args: r#"{"path":"src/codec.rs"}"#.into(),
-        });
-        t.write(&Record::ToolEnd {
-            id: "c1".into(),
-            name: "read".into(),
-            result: "pub fn decode() {}".into(),
-            ok: true,
-        });
-        t.write(&Record::Text {
-            chunk: "Plan: three phases.".into(),
-        });
-        t.write(&Record::End {
-            status: EndStatus::Ok,
-            bytes: 0,
-        });
-        drop(t);
-
-        let ctx = hrdr_tools::ToolContext::new(dir.path().to_path_buf());
-        let out = TaskTranscriptTool {
-            transcript_dir: cell(dir.path()),
-        }
-        .execute(serde_json::json!({"id": "003-planner"}), &ctx)
-        .await
-        .unwrap();
-
-        // No JSON: not a record key in sight.
-        assert!(
-            !out.contains("{\"t\":") && !out.contains("\"chunk\""),
-            "rendered text must carry no record syntax: {out}"
-        );
-        // The streamed deltas are joined back into readable prose.
-        assert!(
-            out.contains("I should read the codec."),
-            "reasoning is reassembled: {out}"
-        );
-        // The part `transcript_to_text` throws away: the call's args AND result.
-        assert!(out.contains("## Tool: read"), "{out}");
-        assert!(
-            out.contains(r#"{"path":"src/codec.rs"}"#),
-            "args kept: {out}"
-        );
-        assert!(out.contains("pub fn decode() {}"), "result kept: {out}");
-        assert!(out.contains("Plan: three phases."), "{out}");
-    }
-
-    /// One rendering, two windows: a peek and a page describe a run in the same
-    /// vocabulary, and differ only in which end they keep.
-    ///
-    /// `task_output` used to render through `transcript_to_text` (tool name only,
-    /// no args, no result) while `task_transcript` showed everything — so the same
-    /// run looked like two different runs depending on which tool asked, and the
-    /// one a model reaches for first was the poorer of the two.
-    #[test]
-    fn a_peek_and_a_page_render_the_same_way() {
-        use crate::{EntryKind, transcript_to_plain_text};
-        let entries = vec![
-            crate::Entry::now(EntryKind::Tool {
-                id: "c1".into(),
-                name: "read".into(),
-                args: r#"{"path":"src/codec.rs"}"#.into(),
-                result: "pub fn decode() {}".into(),
-                ok: true,
-                done: true,
-                expanded: false,
-            }),
-            crate::Entry::now(EntryKind::Assistant("done".into())),
-        ];
-        let rendered = transcript_to_plain_text(&entries, crate::TRANSCRIPT_TOOL_BODY_MAX);
-
-        // Both windows carry the args and the result — the detail the peek's old
-        // renderer dropped — and both are drawn from this one rendering.
-        let peek = tail_lines(&rendered, 10_000);
-        let page = window_lines(&rendered, 1, None, 10_000);
-        for view in [&peek, &page] {
-            assert!(view.contains("## Tool: read"), "{view}");
-            assert!(view.contains(r#"{"path":"src/codec.rs"}"#), "{view}");
-            assert!(view.contains("pub fn decode() {}"), "{view}");
-        }
-        // The difference is the framing, and each says which window it gave you.
-        assert!(peek.starts_with("Progress so far"), "{peek}");
-        assert!(page.starts_with("Transcript lines 1-"), "{page}");
-    }
-
-    /// A peek that must drop lines keeps the NEWEST ones and says how many it
-    /// dropped — a peek silently starting mid-run reads like the whole run.
-    #[test]
-    fn a_peek_keeps_the_newest_lines_and_admits_the_cut() {
-        let text: String = (1..=200).map(|i| format!("line {i}\n")).collect();
-        // A budget that fits only a handful of lines once the header is reserved.
-        let out = tail_lines(&text, 300);
-        assert!(out.contains("line 200"), "keeps the newest: {out}");
-        assert!(!out.contains("line 1\n"), "drops the oldest: {out}");
-        assert!(
-            out.contains("earlier omitted") && out.contains("task_transcript"),
-            "and names what was dropped, plus where to read it: {out}"
-        );
-    }
-
-    /// A long run pages like `read`, and says how much is left and how to ask for
-    /// it — a transcript is read from the start, so silently keeping the tail
-    /// (what a *peek* does) would hide the beginning with no sign it was cut.
-    #[tokio::test]
-    async fn task_transcript_pages_a_long_run() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut t = TranscriptLog::create(dir.path(), "004-long").unwrap();
-        t.write(&Record::Start {
-            model: "m".into(),
-            label: "long".into(),
-            prompt: "go".into(),
-        });
-        for i in 0..40 {
-            t.write(&Record::Notice {
-                msg: format!("step {i}"),
-            });
-        }
-        drop(t);
-
-        let ctx = hrdr_tools::ToolContext::new(dir.path().to_path_buf());
-        let tool = TaskTranscriptTool {
-            transcript_dir: cell(dir.path()),
-        };
-        let page = tool
-            .execute(
-                serde_json::json!({"id": "004-long", "offset": 1, "limit": 5}),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(page.starts_with("Transcript lines 1-5 of "), "{page}");
-        assert!(page.contains("continue with offset: 6"), "{page}");
-        assert!(
-            page.contains("step 0") && !page.contains("step 30"),
-            "{page}"
-        );
-
-        // The next window starts where the last one ended.
-        let next = tool
-            .execute(
-                serde_json::json!({"id": "004-long", "offset": 6, "limit": 5}),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(next.starts_with("Transcript lines 6-10 of "), "{next}");
-        assert!(!next.contains("step 0\n"), "no overlap with page 1: {next}");
-    }
-
-    /// An unknown run says so instead of returning an empty transcript, and a
-    /// live-task id with no transcript points at the stem form.
-    #[tokio::test]
-    async fn task_transcript_refuses_what_it_cannot_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = hrdr_tools::ToolContext::new(dir.path().to_path_buf());
-        let tool = TaskTranscriptTool {
-            transcript_dir: cell(dir.path()),
-        };
-        let err = tool
-            .execute(serde_json::json!({"id": "009-nope"}), &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no transcript at"), "{err}");
-        // Not a valid stem at all.
-        let err = tool
-            .execute(serde_json::json!({"id": "../escape"}), &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not a valid run id"), "{err}");
-        // An integer id with nothing in the registry.
-        let err = tool
-            .execute(serde_json::json!({"id": 42}), &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no transcript for task #42"), "{err}");
-    }
-
-    /// Persist the sibling `<stem>.json` snapshot the revive path hydrates from.
-    fn write_snapshot(
-        dir: &std::path::Path,
-        stem: &str,
-        name: &str,
-        cwd: &str,
-        messages: Vec<ChatMessage>,
-        read_only: bool,
-    ) {
-        let state = crate::SessionState {
-            name: name.to_string(),
-            cwd: cwd.to_string(),
-            messages,
-            read_only,
-            ..Default::default()
-        };
-        crate::Session::new(state.persisted())
-            .save_to_path(&dir.join(format!("{stem}.json")))
-            .unwrap();
-    }
-
-    /// `task_list` merges the on-disk snapshots with the in-memory registry and
-    /// does NOT list a run that is both live and on disk twice (the live entry's
-    /// transcript path stem identifies its on-disk pair).
-    #[tokio::test]
-    async fn task_list_merges_disk_runs_and_dedupes_live() {
-        let dir = tempfile::tempdir().unwrap();
-        // A completed run that is ALSO live this session (a registry entry whose
-        // transcript names `000-audit.jsonl`) → shown once, as the live row.
-        write_run(dir.path(), "000-audit", "audit task", Some("done"), true);
-        // An orphan with no snapshot → labelled from its `Start` record.
-        write_run(dir.path(), "001-explore", "explore auth", None, false);
-
-        let ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
-        ctx.background_tasks
-            .lock()
-            .unwrap()
-            .push(hrdr_tools::BackgroundTask {
-                id: 5,
-                label: "audit task".to_string(),
-                done: true,
-                result: Some("ok".to_string()),
-                transcript: Some(dir.path().join("000-audit.jsonl")),
-                ..Default::default()
-            });
-
-        let out = TaskListTool {
-            transcript_dir: cell(dir.path()),
-        }
-        .execute(serde_json::json!({}), &ctx)
-        .await
-        .unwrap();
-
-        assert!(out.contains("#5"), "the live row is present: {out}");
-        assert!(out.contains("On disk"), "the disk section header: {out}");
-        assert!(
-            out.contains("001-explore [orphaned] explore auth"),
-            "the orphan is listed, labelled from its Start record: {out}"
-        );
-        assert!(
-            !out.contains("000-audit"),
-            "the live-and-on-disk run is not duplicated in the disk section: {out}"
-        );
-    }
-
-    /// A model-supplied stem that tries to escape the snapshot dir (path
-    /// separators, `..`) is rejected before it is joined onto a path.
-    #[test]
-    fn run_stem_rejects_path_traversal() {
-        assert!(valid_run_stem("003-fix"));
-        assert!(valid_run_stem("000-audit"));
-        assert!(!valid_run_stem(""));
-        assert!(!valid_run_stem("../secrets"));
-        assert!(!valid_run_stem("a/b"));
-        assert!(!valid_run_stem("a\\b"));
-        assert!(!valid_run_stem(".."));
-        assert!(!valid_run_stem("/etc/passwd"));
-    }
-
-    /// An on-disk run belongs to `task_transcript`; `task_output` is live-only and
-    /// hands a stem over instead of serving a lossier copy of the same answer.
-    ///
-    /// `task_output` used to read stems itself, rendering through
-    /// `transcript_to_text` — which prints `[tool: read]` and drops the arguments
-    /// and the result. Two tools answering one question at different fidelities
-    /// means whichever the model reaches for first decides how much it learns, so
-    /// the overlap was removed rather than left to chance.
-    #[tokio::test]
-    async fn task_output_is_live_only_and_hands_a_stem_to_task_transcript() {
-        let dir = tempfile::tempdir().unwrap();
-        write_run(
-            dir.path(),
-            "003-fix",
-            "fix the bug",
-            Some("HELLO-FROM-DISK"),
-            true,
-        );
-        let ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
-
-        // Any non-integer id is refused, naming what it got and where it IS served.
-        for given in ["003-fix", "not a stem"] {
-            let err = TaskOutputTool {
-                live: AgentRegistry::new(),
-            }
-            .execute(serde_json::json!({"id": given}), &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-            assert!(
-                err.contains("integer id") && err.contains("task_transcript"),
-                "the refusal names the tool that serves it, for `{given}`: {err}"
-            );
-            assert!(err.contains(given), "and echoes what it got: {err}");
-        }
-        // An all-digit string is still that live id, differently typed.
-        assert!(
-            TaskOutputTool {
-                live: AgentRegistry::new(),
-            }
-            .execute(serde_json::json!({"id": "7"}), &ctx)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("no background task #7"),
-            "an all-digit string resolves as an integer id, not a stem"
-        );
-
-        // And the capability did not vanish with the branch: the same run reads
-        // back through `task_transcript`, with more than it had before.
-        let out = TaskTranscriptTool {
-            transcript_dir: cell(dir.path()),
-        }
-        .execute(serde_json::json!({"id": "003-fix"}), &ctx)
-        .await
-        .unwrap();
-        assert!(
-            out.contains("HELLO-FROM-DISK"),
-            "the persisted output still reads back: {out}"
-        );
-    }
-
-    /// `task_revive`'s disk fallback hydrates from the `<stem>.json` snapshot —
-    /// the real persisted messages, with their signed thinking blocks, so the
-    /// follow-up continues losslessly rather than from a lossy transcript fold.
-    #[tokio::test]
-    async fn task_revive_disk_fallback_hydrates_the_persisted_messages() {
-        let dir = tempfile::tempdir().unwrap();
-        let subdir = tempfile::tempdir().unwrap();
-        write_run(
-            subdir.path(),
-            "002-coder",
-            "add feature",
-            Some("did it"),
-            true,
-        );
-        write_snapshot(
-            subdir.path(),
-            "002-coder",
-            "add feature",
-            &dir.path().display().to_string(),
-            vec![
-                ChatMessage::user("the original brief"),
-                ChatMessage::assistant("done"),
-            ],
-            false,
-        );
-
-        let st = revive_target_from_disk(subdir.path(), "002-coder")
-            .await
-            .unwrap();
-        assert_eq!(st.label, "add feature");
-        assert_eq!(st.cwd, dir.path(), "continues in the recorded directory");
-        assert!(
-            st.messages
-                .iter()
-                .any(|m| m.content.as_deref() == Some("the original brief")),
-            "hydrates the persisted messages (with their signed thinking blocks)"
-        );
-    }
-
-    /// A revived sub-agent comes back with the capability it RAN with: the
-    /// snapshot records `read_only`, and the config the revive rebuilds it on
-    /// prunes the registry the same way its profile did.
-    ///
-    /// Pins the regression where capability was not persisted at all, so a
-    /// revived `explore`/`review`/`plan` silently gained the writers and the shell
-    /// its profile withheld — in the recorded (shared) working dir.
-    #[tokio::test]
-    async fn a_revived_read_only_run_gets_no_writers() {
-        let dir = tempfile::tempdir().unwrap();
-        // Every run's cwd is the shared working directory.
-        let cwd = dir.path().display().to_string();
-        write_run(
-            dir.path(),
-            "004-explore",
-            "explore auth",
-            Some("looked"),
-            true,
-        );
-        write_snapshot(
-            dir.path(),
-            "004-explore",
-            "explore auth",
-            &cwd,
-            vec![ChatMessage::user("look around")],
-            true,
-        );
-        write_run(dir.path(), "005-coder", "add feature", Some("did it"), true);
-        write_snapshot(
-            dir.path(),
-            "005-coder",
-            "add feature",
-            &cwd,
-            vec![ChatMessage::user("build it")],
-            false,
-        );
-
-        let base = subagent_base_config(&AgentConfig {
-            model: "local://m".parse().unwrap(),
-            ..Default::default()
-        });
-        // The tool set the revive path actually builds — asserted on the names, the
-        // registry being pruned before the sub-agent runs.
-        let tools = |st: &RevivedState| -> Vec<String> {
-            let agent = Agent::new(revive_base_config(&base, st.read_only)).unwrap();
-            let mut names: Vec<String> = agent.tools().into_iter().map(|(n, _)| n).collect();
-            names.sort();
-            names
-        };
-
-        let ro = revive_target_from_disk(dir.path(), "004-explore")
-            .await
-            .unwrap();
-        assert!(ro.read_only, "the snapshot records the read-only scope");
-        let ro_tools = tools(&ro);
-        assert!(
-            ro_tools.contains(&"read".to_string()) && ro_tools.contains(&"grep".to_string()),
-            "it is still an agent — the readers stay: {ro_tools:?}"
-        );
-        for w in ["write", "edit", "move", "delete", "copy"] {
-            assert!(
-                !ro_tools.contains(&w.to_string()),
-                "a revived read-only run must not get `{w}`: {ro_tools:?}"
-            );
-        }
-        // A shell it DOES get: read-only is the sandbox's job
-        // (`effective_sandbox` → `SandboxMode::Read`), and a revived run is
-        // scoped by the same constructor as a fresh one, so it lands here too.
-        assert!(
-            ro_tools.contains(&"shell".to_string()),
-            "a revived read-only run keeps its shell: {ro_tools:?}"
-        );
-
-        let rw = revive_target_from_disk(dir.path(), "005-coder")
-            .await
-            .unwrap();
-        assert!(!rw.read_only, "a write run is recorded as write-capable");
-        let rw_tools = tools(&rw);
-        for w in ["write", "edit", "shell"] {
-            assert!(
-                rw_tools.contains(&w.to_string()),
-                "a revived write run keeps `{w}`: {rw_tools:?}"
-            );
         }
     }
 }

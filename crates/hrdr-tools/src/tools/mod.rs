@@ -1,11 +1,9 @@
 //! The built-in tool set (read, write, edit, shell, grep, find, ls, todo, fetch, search).
 
 pub(crate) mod edit;
-pub(crate) mod fileops;
 pub(crate) mod find;
 pub(crate) mod grep;
 pub(crate) mod ls;
-pub(crate) mod lsp_nav;
 pub(crate) mod mutation;
 pub(crate) mod read;
 pub(crate) mod replace;
@@ -14,7 +12,6 @@ pub(crate) mod shell;
 pub(crate) mod todo;
 pub(crate) mod tree;
 pub(crate) mod verify;
-pub(crate) mod watch;
 pub(crate) mod write;
 
 /// Hard cap on a rendered source line, so one minified file can't blow context.
@@ -77,113 +74,6 @@ pub(crate) const BASH_LINE_CAP: usize = 8_192;
 /// What a search tool reports when nothing matched.
 pub(crate) const NO_MATCHES: &str = "(no matches)";
 
-/// How long `watch` sleeps between checks when the model doesn't say.
-///
-/// Ten seconds is the compromise: fast enough that a build finishing is noticed
-/// while the agent still has the context to act on it, slow enough not to hammer
-/// someone else's API (`gh` is rate-limited) for the half-hour a CI run can take.
-pub(crate) const DEFAULT_WATCH_INTERVAL_SECS: u64 = 10;
-/// How long `watch` waits in total before giving up. Far longer than a shell
-/// command's timeout, because waiting is the *point* — but bounded, so a condition
-/// that will never hold ends the call rather than the turn.
-pub(crate) const DEFAULT_WATCH_TIMEOUT_SECS: u64 = 30 * 60;
-/// The most a model can ask `watch` to wait. Six hours is longer than any CI run
-/// worth waiting on; past that, the agent should hand the job back to the user
-/// rather than sit on a tool call.
-pub(crate) const MAX_WATCH_TIMEOUT_SECS: u64 = 6 * 60 * 60;
-/// How long any single `watch` check gets before it is killed and read as "not
-/// yet". A check is a question, not a job — one that hangs (a network call with no
-/// timeout of its own) must not wedge the watch.
-pub(crate) const WATCH_CHECK_TIMEOUT_SECS: u64 = 120;
-
-/// Spawn `cmd` and collect its output, but *bounded*: stdin is nulled (a
-/// model-supplied command must never block reading the TUI's terminal),
-/// `kill_on_drop` is set (a cancelled turn must not leave the child running),
-/// and stdout/stderr are read into memory only up to `stdout_cap`/`stderr_cap`
-/// bytes — a pathological multi-gigabyte output is cut early instead of being
-/// fully buffered by [`tokio::process::Command::output`] and only then
-/// truncated. Returns the exit status and the (possibly capped) stdout/stderr.
-///
-/// Both streams are drained concurrently so the child never deadlocks on a full
-/// pipe; when stdout hits its cap we stop accumulating and kill the child so it
-/// can't block writing the rest. For any output that fits under the caps this is
-/// byte-for-byte identical to `output()`.
-///
-/// The fourth return value is `over_cap`: true when stdout hit its cap and the
-/// child was killed. Callers must not read the (signal-death) exit status as a
-/// failure in that case — the output is a valid truncation, not an error.
-pub(crate) async fn run_capped_output(
-    mut cmd: tokio::process::Command,
-    stdout_cap: usize,
-    stderr_cap: usize,
-) -> std::io::Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>, bool)> {
-    use tokio::io::AsyncReadExt;
-
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    // Group-spawned so the overflow kill below reaches the whole tree the
-    // child forked, not just the direct pid.
-    let (mut child, group) = crate::proc::spawn_group(&mut cmd)?;
-    let mut out = child.stdout.take().expect("stdout was piped");
-    let mut err = child.stderr.take().expect("stderr was piped");
-
-    // Drain stderr in the background (discarding anything past its cap) so the
-    // child can never block on a full stderr pipe while we read stdout.
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            match err.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if buf.len() < stderr_cap {
-                        let room = stderr_cap - buf.len();
-                        buf.extend_from_slice(&chunk[..n.min(room)]);
-                    }
-                    // Keep reading past the cap so the pipe never fills.
-                }
-            }
-        }
-        buf
-    });
-
-    // Read stdout up to its cap. If it overflows we stop reading and kill the
-    // child so it cannot wedge on a now-unread pipe.
-    let mut stdout_buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    let mut over_cap = false;
-    loop {
-        let n = out.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        if stdout_buf.len() >= stdout_cap {
-            over_cap = true;
-            break;
-        }
-        let room = stdout_cap - stdout_buf.len();
-        if n <= room {
-            stdout_buf.extend_from_slice(&chunk[..n]);
-        } else {
-            stdout_buf.extend_from_slice(&chunk[..room]);
-            over_cap = true;
-            break;
-        }
-    }
-    if over_cap {
-        // A wrapper that forked a long-lived descendant must not keep it
-        // running (or keep writing into a pipe we've stopped reading) after we
-        // bail — hence the tree kill, not just the direct child below.
-        group.kill();
-        let _ = child.start_kill();
-    }
-    let status = child.wait().await?;
-    let stderr_buf = stderr_task.await.unwrap_or_default();
-    Ok((status, stdout_buf, stderr_buf, over_cap))
-}
-
 /// Create `path`'s parent directory (and any missing ancestors), so a write to a
 /// path in a directory that doesn't exist yet succeeds. A path with no parent
 /// (a bare root) is a no-op.
@@ -232,11 +122,9 @@ pub(crate) fn rel_display<'a>(
 }
 
 pub use edit::EditTool;
-pub use fileops::{CopyTool, DeleteTool, MoveTool};
 pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
-pub use lsp_nav::{DefinitionTool, ReferencesTool, RenameTool};
 pub use read::ReadTool;
 pub use replace::ReplaceTool;
 pub use secret_diff::redact_secret_diffs;
@@ -244,7 +132,6 @@ pub use shell::{Shell, ShellTool, available_shell_tools};
 pub use todo::TodoTool;
 pub use tree::TreeTool;
 pub use verify::{DEFAULT_VERIFY_TIMEOUT_SECS, VerifyTool};
-pub use watch::WatchTool;
 pub use write::WriteTool;
 
 #[cfg(test)]

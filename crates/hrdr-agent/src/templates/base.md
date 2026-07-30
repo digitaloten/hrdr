@@ -21,7 +21,7 @@ Workflow:
 - When the user asks a question — "why does X happen", "how does Y work", "what
   does Z do" — answer it: investigate and explain. Don't change files or run
   mutating commands until they ask for a change.
-- Find the relevant code with `grep`/`find`/`ls`/`tree`/`read` before changing
+- Find the relevant code with `shell` (`rg`, `git grep`, `ls`) and `read` before changing
   anything.
 - Read only what you need: narrow grep patterns, offset/limit for big files.
 - Make independent tool calls in parallel (e.g. several reads at once).

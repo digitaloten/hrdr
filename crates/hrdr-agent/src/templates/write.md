@@ -517,11 +517,11 @@ Deleting:
   `rm -rf $(...)`, `find … -delete`, `… | xargs rm`. An unset variable expands to
   nothing, so `rm -rf "$DIR"/*` runs as `rm -rf /*`, and a glob deletes what it
   matches when it runs, not what you checked when you wrote it.
-- Don't know the names? Find out first: run the `find`/`ls` alone, read the list,
+- Don't know the names? Find out first: run the `ls`/glob alone, read the list,
   delete by name. One command must never both choose the victims and kill them.
 - `rm -rf <dir>` only on a directory you created this session, named literally —
   never a path you were handed or assembled, never `.`/`..`/`~`/`/`.
-- Look before you destroy: read the file, `ls` the directory, `git status` the
+- Look before you destroy: read the file, list the directory, `git status` the
   tree. If what's there isn't what you were told is there, stop and say so.
 - Prefer the reversible: `git rm` over `rm`, rename aside over overwrite, a new
   file over `>` onto an existing one (`>` and `tee` truncate on open — the file is

@@ -103,8 +103,7 @@ pub(crate) use delegation::{
     open_next_subagent_transcript_from, resolve_child_dir,
 };
 pub(crate) use delegation::{
-    BgHandles, SteerTool, SubagentTool, TaskCancelTool, TaskListTool, TaskOutputTool,
-    TaskReviveTool, TaskTranscriptTool, bg_handles, subagent_base_config,
+    BgHandles, SteerTool, SubagentTool, TaskCancelTool, bg_handles, subagent_base_config,
 };
 pub use delegation::{
     builtin_subagent_profiles, config_for_agent_profile, in_git_repo, list_provider_models,
@@ -1474,14 +1473,6 @@ impl Agent {
                 config.lsp_wait_secs,
             ))
         });
-        // The LSP navigation tools ride the same registry (a sub-agent's is
-        // injected after construction — `lsp_shared`). Registered before the
-        // system prompt renders so the model sees them.
-        if config.lsp || config.lsp_shared {
-            tools.register(Arc::new(hrdr_tools::DefinitionTool));
-            tools.register(Arc::new(hrdr_tools::ReferencesTool));
-            tools.register(Arc::new(hrdr_tools::RenameTool));
-        }
         // Pre-warm the project's language server(s) in the background so
         // indexing-heavy servers (rust-analyzer) overlap their warm-up with
         // the first prompt instead of missing the first edit's diagnostics.
@@ -1526,39 +1517,27 @@ impl Agent {
                 config.child_transcript_dir.clone(),
                 registry.clone(),
             );
-            // `task_revive` shares the `task` tool's concurrency slots so a revive
-            // counts against the same write cap, not an uncounted extra sub-agent.
-            let revive_tool = TaskReviveTool::new(
-                subagent_base_config(&config),
-                Arc::clone(&delegation_runtime),
-                Arc::clone(&bg_handles),
-                Arc::clone(&subagent_tool.slots),
-                Arc::clone(&cost_total),
-                Arc::clone(&cost_partial),
-                lsp.clone(),
-                config.child_transcript_dir.clone(),
-                registry.clone(),
-            );
             tools.register(Arc::new(subagent_tool));
-            // Management tools for the background sub-agents `task` spawns: check
-            // on them, peek their output, steer, revive or cancel one. They read the
-            // shared background-task registry (via the tool context) and, for cancel,
-            // the same `bg_handles` the owning agent aborts on reset. `task_list` /
-            // `task_output` also read the on-disk sub-agent snapshots, so a
-            // finished/orphaned run survives a `/resume` (they take the dir cell).
-            tools.register(Arc::new(TaskListTool {
-                transcript_dir: config.child_transcript_dir.clone(),
-            }));
-            tools.register(Arc::new(TaskOutputTool {
-                live: registry.clone(),
-            }));
-            tools.register(Arc::new(TaskTranscriptTool {
-                transcript_dir: config.child_transcript_dir.clone(),
-            }));
+            // Two management tools, and only two: the ones the MODEL needs and
+            // nothing substitutes for. `task_steer` redirects a running sub-agent on
+            // something the model just learned (the spec was wrong, a sibling's
+            // finding changed the brief); `task_cancel` stops one that became
+            // redundant. `@agent` is the *user* steering — a different actor, not a
+            // replacement.
+            //
+            // What used to be here answered questions nobody asked. `task_list` and
+            // `task_output`: the user watches each sub-agent's own pane live, and the
+            // model gets results delivered automatically — `task_output`'s own
+            // description said "you never need to poll". `task_transcript`: a finished
+            // task reports back and its changes are in the tree, so the report says
+            // what it claims and `git diff` says what it did; the delta between those
+            // two IS the diagnosis signal. `task_revive`: a run that went wrong is
+            // exactly a run whose context holds the wrong reasoning, and models anchor
+            // on their own prior output — starting fresh with a better brief is
+            // cheaper to reason about and likelier to work.
             tools.register(Arc::new(SteerTool {
                 live: registry.clone(),
             }));
-            tools.register(Arc::new(revive_tool));
             tools.register(Arc::new(TaskCancelTool {
                 bg_handles: Arc::clone(&bg_handles),
                 live: registry.clone(),
@@ -1655,6 +1634,11 @@ impl Agent {
         // in-process read guard cannot see into. See `JAIL_TOOLS`.
         if sandbox_mode == hrdr_tools::SandboxMode::Jail {
             tools.cap_to_jail_set();
+        } else {
+            // …and every other mode drops the four that exist only for jail. They
+            // are `shell`'s job everywhere a shell exists, and one call to it does
+            // all four better; carrying them costs a decision on every turn.
+            tools.drop_jail_only_tools();
         }
         let delegation_enabled = tools.defs().iter().any(|d| d.function.name == "task");
         if let Ok(mut runtime) = delegation_runtime.lock() {
@@ -5650,9 +5634,11 @@ mod tests {
         let agent = Agent::new(cfg).unwrap();
         let tools: Vec<String> = agent.tools().into_iter().map(|(n, _)| n).collect();
         assert!(tools.iter().any(|n| n == "read"));
-        assert!(tools.iter().any(|n| n == "grep"));
         assert!(!tools.iter().any(|n| n == "write"));
         assert!(!tools.iter().any(|n| n == "edit"));
+        // `grep` is NOT here: it is jail-only. Searching outside jail is `shell`'s
+        // job, where `rg` is one call away and does it better.
+        assert!(!tools.iter().any(|n| n == "grep"), "{tools:?}");
         // …and a SHELL: read-only is enforced by the sandbox
         // (`effective_sandbox` → `SandboxMode::Read`), not by withholding a
         // command line. Without one an explorer could not run `git log`, a test,
@@ -5938,9 +5924,8 @@ mod tests {
         // Read-only: no writer, no shell, no delegation. `fetch`/`search` are in
         // the set — read-only means "does not mutate the working tree", not
         // "no network". `git` is here too: its subcommands are an allow-list of
-        // read-only ones — and so are the LSP lookups (`definition`/
-        // `references`); the mutating `rename` is pruned with the writers.
-        // `skill` is here as well: it returns instructions and writes nothing —
+        // read-only ones. `skill` is here as well: it returns instructions and
+        // writes nothing —
         // what a loaded skill can then *do* is bounded by this very tool set.
         // `todo` likewise: it replaces a list held in this agent's own
         // `ToolContext` and touches nothing on disk. It is in the set because the
@@ -5949,23 +5934,15 @@ mod tests {
         // how a prompt sends a model after something it cannot call, and
         // `the_unconditional_prompt_names_only_tools_a_read_only_agent_has`
         // (in `prompt.rs`) now fails if the two ever drift apart again.
+        // Short, and deliberately so. `grep`/`find`/`ls`/`tree` are NOT here: they
+        // are jail-only now, because every other mode has `shell` — which does all
+        // four in one call and better. `definition`/`references` are gone outright
+        // (available and ignored: 2 calls in 9,350).
         let readers = [
-            "definition",
-            "fetch",
-            "find",
-            "grep",
-            "ls",
-            "models",
-            "read",
-            "references",
-            "search",
-            // A shell, sandbox-confined to reads — the bespoke read-only `git`
-            // tool this list used to carry is gone, and `git log`/`diff`/`blame`
-            // run here like every other read-only command.
-            "shell",
-            "skill",
-            "todo",
-            "tree",
+            "fetch", "models", "read", "search",
+            // A shell, sandbox-confined to reads — `git log`/`diff`/`blame`, a
+            // linter, a test all run here.
+            "shell", "skill", "todo",
         ];
         assert_eq!(tools("explore"), readers);
         assert_eq!(tools("review"), readers);
@@ -5975,9 +5952,19 @@ mod tests {
         // A general sub-agent has the full set, shell included…
         let general = tools("general");
         for t in [
-            "shell", "edit", "write", "read", "grep", "todo", "move", "delete", "copy",
+            "shell", "edit", "write", "replace", "read", "todo", "verify",
         ] {
             assert!(general.contains(&t.to_string()), "general should have {t}");
+        }
+        // …and not the tools that were cut: `shell` is how you copy, move, delete
+        // and search now, and the search four belong to jail.
+        for gone in [
+            "move", "delete", "copy", "watch", "grep", "find", "ls", "tree",
+        ] {
+            assert!(
+                !general.contains(&gone.to_string()),
+                "`{gone}` was removed: {general:?}"
+            );
         }
         // …but still cannot delegate further: sub-agents don't nest.
         assert!(
@@ -5988,7 +5975,7 @@ mod tests {
         // `coder` is write-capable like `general` — same full set, shell included.
         let coder = tools("coder");
         for t in [
-            "shell", "edit", "write", "read", "grep", "todo", "move", "delete", "copy",
+            "shell", "edit", "write", "replace", "read", "todo", "verify",
         ] {
             assert!(coder.contains(&t.to_string()), "coder should have {t}");
         }
@@ -6003,7 +5990,7 @@ mod tests {
                 t.contains(&"shell".to_string()),
                 "{ro} needs a shell to run git, a test or a linter"
             );
-            for w in ["write", "edit", "move", "delete", "copy", "replace"] {
+            for w in ["write", "edit", "replace"] {
                 assert!(!t.contains(&w.to_string()), "{ro} must not have `{w}`");
             }
             assert!(!t.contains(&"task".to_string()), "{ro} must not delegate");
@@ -6242,216 +6229,6 @@ mod tests {
         let v = reg.lock().unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].id, 2);
-    }
-
-    /// `task_list` reports id, status and worktree; `task_steer` queues additional
-    /// instructions; `task_cancel` aborts the worker and clears its live row.
-    #[tokio::test]
-    async fn task_list_and_cancel_manage_background_tasks() {
-        use super::{
-            AgentEntry, AgentRegistry, SteerTool, TaskCancelTool, TaskListTool, TurnStats,
-            bg_handles, registry, steering_queue,
-        };
-        use hrdr_tools::Tool;
-        let live = AgentRegistry::new();
-        let bg_handles = bg_handles();
-        let ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
-
-        // A running task (id 1) with a live handle + panel row, and a done one (id 2).
-        let handle =
-            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
-        bg_handles.lock().unwrap().push((1, handle));
-        {
-            let mut v = ctx.background_tasks.lock().unwrap();
-            v.push(hrdr_tools::BackgroundTask {
-                id: 1,
-                label: "running task".to_string(),
-                model: "sonnet".to_string(),
-                started: Some(std::time::Instant::now()),
-                ..Default::default()
-            });
-            v.push(hrdr_tools::BackgroundTask {
-                id: 2,
-                label: "done task".to_string(),
-                done: true,
-                result: Some("ok".to_string()),
-                ..Default::default()
-            });
-        }
-        let key = AgentRegistry::next_key();
-        live.with(|v| {
-            v.push(AgentEntry {
-                key,
-                bg_id: Some(1),
-                tool_id: None,
-                label: "running task".to_string(),
-                model: "m".to_string(),
-                provider: None,
-                base_url: String::new(),
-                effort: None,
-                auto_compact: true,
-                compaction_reserved: 0,
-                todos: Default::default(),
-                usage: crate::AgentUsage::default(),
-                events: registry::event_log(),
-                turn: TurnStats::default(),
-                agent: Arc::new(tokio::sync::Mutex::new(
-                    Agent::new(AgentConfig::default()).unwrap(),
-                )),
-                steering: steering_queue(),
-                running: true,
-                compacting: false,
-                done: false,
-                delivered: false,
-                pinned: false,
-                transcript: None,
-            });
-        });
-
-        let list = TaskListTool {
-            transcript_dir: None,
-        }
-        .execute(serde_json::json!({}), &ctx)
-        .await
-        .unwrap();
-        assert!(list.contains("#1") && list.contains("running"), "{list}");
-        assert!(
-            list.contains("model: sonnet") && list.contains("0s"),
-            "model + elapsed shown: {list}"
-        );
-        assert!(list.contains("#2") && list.contains("done"), "{list}");
-
-        let steer = SteerTool { live: live.clone() };
-        let msg = steer
-            .execute(
-                serde_json::json!({"id": 1, "prompt": "Use serde's pretty printer"}),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert_eq!(msg, "Steered background task #1.");
-        assert_eq!(
-            live.take_pending(key).map(|s| s.sent),
-            Some("Use serde's pretty printer".to_string())
-        );
-        assert!(
-            steer
-                .execute(serde_json::json!({"id": 2, "prompt": "too late"}), &ctx,)
-                .await
-                .is_err(),
-            "a finished task cannot be steered"
-        );
-
-        let cancel = TaskCancelTool {
-            bg_handles: Arc::clone(&bg_handles),
-            live: live.clone(),
-        };
-        let msg = cancel
-            .execute(serde_json::json!({"id": 1}), &ctx)
-            .await
-            .unwrap();
-        assert!(msg.contains("Cancelled background task #1"), "{msg}");
-        // The handle was removed, the entry marked cancelled, the row cleared.
-        assert!(bg_handles.lock().unwrap().is_empty());
-        let cancelled = ctx
-            .background_tasks
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|t| t.id == 1)
-            .map(|t| t.cancelled)
-            .unwrap();
-        assert!(cancelled, "entry #1 is marked cancelled");
-        let row_done = live.with(|v| v.iter().find(|e| e.bg_id == Some(1)).map(|e| e.done));
-        assert_eq!(row_done, Some(true), "live row cleared");
-
-        // Cancelling an unknown id is an error.
-        assert!(
-            cancel
-                .execute(serde_json::json!({"id": 999}), &ctx)
-                .await
-                .is_err()
-        );
-    }
-
-    /// With no live events left, `task_output` returns the stored result and
-    /// points at the durable transcript so the parent can read the full run.
-    #[tokio::test]
-    async fn task_output_falls_back_to_result_and_transcript() {
-        use super::{AgentRegistry, TaskOutputTool};
-        use hrdr_tools::Tool;
-        let ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
-        ctx.background_tasks
-            .lock()
-            .unwrap()
-            .push(hrdr_tools::BackgroundTask {
-                id: 7,
-                label: "done".to_string(),
-                done: true,
-                delivered: true,
-                result: Some("the answer".to_string()),
-                transcript: Some(std::path::PathBuf::from("/tmp/hrdr/007-done.jsonl")),
-                ..Default::default()
-            });
-        // Empty live store → falls through to the registry entry.
-        let out = TaskOutputTool {
-            live: AgentRegistry::new(),
-        }
-        .execute(serde_json::json!({"id": 7}), &ctx)
-        .await
-        .unwrap();
-        assert!(out.contains("the answer"), "shows the stored result: {out}");
-        // Points at the TOOL that renders the run, and warns off the raw file —
-        // it used to say "`read` it for the complete run", and a session did,
-        // getting one JSON record per streamed token back.
-        assert!(
-            out.contains("`task_transcript`") && out.contains("don't `read` the raw file"),
-            "points at the rendering tool, not the jsonl: {out}"
-        );
-        assert!(
-            out.contains("007-done.jsonl"),
-            "still names the file, for a human who wants it: {out}"
-        );
-    }
-
-    /// `task_output`'s peek shows a still-running task's CURRENT progress, so
-    /// an oversized stored result must be truncated in the **middle**
-    /// (`hrdr_tools::truncate_middle`), keeping the tail — head-only
-    /// `truncate` would cut exactly the newest output and keep only stale
-    /// narration from the start of the run.
-    #[tokio::test]
-    async fn task_output_peek_keeps_the_tail() {
-        use super::{AgentRegistry, TaskOutputTool};
-        use hrdr_tools::Tool;
-        let mut ctx = hrdr_tools::ToolContext::new(std::env::temp_dir());
-        ctx.max_output = 200;
-        let stale_head = "STALE-HEAD-".repeat(50);
-        let fresh_tail = "FRESH-TAIL-MARKER";
-        ctx.background_tasks
-            .lock()
-            .unwrap()
-            .push(hrdr_tools::BackgroundTask {
-                id: 9,
-                label: "long-run".to_string(),
-                done: true,
-                delivered: true,
-                result: Some(format!("{stale_head}{fresh_tail}")),
-                ..Default::default()
-            });
-        let out = TaskOutputTool {
-            live: AgentRegistry::new(),
-        }
-        .execute(serde_json::json!({"id": 9}), &ctx)
-        .await
-        .unwrap();
-        assert!(
-            out.contains("bytes omitted from the middle"),
-            "truncate_middle's marker, not truncate's head-only one: {out}"
-        );
-        assert!(
-            out.contains(fresh_tail),
-            "the tail — the run's current progress — survives truncation: {out}"
-        );
     }
 
     /// The workspace map handed to a spawned sub-agent names the real
@@ -8016,59 +7793,6 @@ mod tests {
         assert!(g.record("grep", "{q}", true, false).is_none());
         assert!(g.record("read", "{p}", true, false).is_none());
         assert!(g.record("read", "{p}", true, false).is_none());
-    }
-
-    /// Polling is repetitive by design: `watch`, and `task_output`/`task_list` on
-    /// a still-running sub-agent, are *meant* to be called with identical
-    /// arguments until the answer changes.
-    #[test]
-    fn repeat_guard_leaves_polling_tools_alone() {
-        let mut g = super::RepeatGuard::default();
-        for _ in 0..6 {
-            assert!(g.record("task_output", "{\"id\":1}", true, true).is_none());
-        }
-        // The opt-out covers the success nudge only — a poll that keeps erroring
-        // is a loop like any other.
-        assert!(g.record("watch", "{c}", false, true).is_none());
-        assert!(g.record("watch", "{c}", false, true).is_some());
-        assert!(g.refusal("watch", "{c}").is_some());
-    }
-
-    /// The opt-out lives on the tool, not in a name list the turn loop keeps in
-    /// sync — so this asserts the real registry answers, not a copy of it.
-    #[test]
-    fn only_the_polling_tools_opt_out_of_repeat_detection() {
-        let r = hrdr_tools::ToolRegistry::with_defaults();
-        assert!(r.is_repeatable("watch"));
-        // The tools this whole mechanism exists to catch must not opt out.
-        assert!(!r.is_repeatable("read"));
-        assert!(!r.is_repeatable("grep"));
-        assert!(!r.is_repeatable("shell"));
-        // An unknown name repeats like anything else.
-        assert!(!r.is_repeatable("nonexistent"));
-        // The sub-agent polls live in hrdr-agent's own registry.
-        use hrdr_tools::Tool as _;
-        assert!(
-            crate::delegation::TaskListTool {
-                transcript_dir: None
-            }
-            .repeatable()
-        );
-        assert!(
-            crate::delegation::TaskOutputTool {
-                live: AgentRegistry::new(),
-            }
-            .repeatable()
-        );
-        // `task_transcript` is the opposite case: a run's transcript is a fixed
-        // artifact, so a second identical read learns nothing and the repeat guard
-        // should say so.
-        assert!(
-            !crate::delegation::TaskTranscriptTool {
-                transcript_dir: None,
-            }
-            .repeatable()
-        );
     }
 
     // ---- repair_dangling_tool_calls (additional cases) ----
@@ -10990,7 +10714,6 @@ mod tests {
                 ),
                 "ends ok: {events:?}"
             );
-            assert!(transcript_log::is_complete(&path));
         }
 
         /// A sub-agent whose model call fails records Error then End(failed) — the
@@ -11033,7 +10756,6 @@ mod tests {
                 "ends failed: {events:?}"
             );
             // A written End line means the reader sees it as complete (failed, not orphaned).
-            assert!(transcript_log::is_complete(&path));
         }
 
         /// A background (`background: true`) sub-agent records its own transcript
@@ -11608,60 +11330,6 @@ mod tests {
             );
         }
     } // mod mock_server
-
-    /// The transcript dir is keyed by session id, so it survives a resume, while
-    /// `SUBAGENT_SEQ` restarts at 0 in each process. A resumed session's first
-    /// task therefore lands on an id a previous run already used — it must claim
-    /// the next free id rather than append onto that run's log.
-    #[test]
-    fn a_resumed_session_never_writes_into_a_previous_runs_transcript() {
-        use super::open_next_subagent_transcript_from;
-        use transcript_log::{EndStatus, Record};
-
-        let dir = tempfile::tempdir().unwrap();
-        // A previous process left an orphaned run behind (crashed: no End).
-        let mut old = transcript_log::TranscriptLog::create(dir.path(), "000-sub-task")
-            .expect("seed the previous run");
-        old.write(&Record::Start {
-            model: "m".into(),
-            label: "sub-task".into(),
-            prompt: "work from the previous session".into(),
-        });
-        drop(old);
-
-        // A fresh process starts its counter at 0 again and spawns a task with
-        // the default label, so it aims at exactly the id above.
-        let seq = std::sync::atomic::AtomicU64::new(0);
-        let mut fresh = open_next_subagent_transcript_from(&seq, dir.path(), "sub-task")
-            .expect("opens a transcript");
-        fresh.write(&Record::Start {
-            model: "m".into(),
-            label: "sub-task".into(),
-            prompt: "work from the resumed session".into(),
-        });
-        fresh.write(&Record::End {
-            status: EndStatus::Ok,
-            bytes: 0,
-        });
-        drop(fresh);
-
-        // Two distinct files, and the old orphan is untouched — still an orphan,
-        // still carrying only its own prompt.
-        let old_body = std::fs::read_to_string(dir.path().join("000-sub-task.jsonl")).unwrap();
-        assert_eq!(old_body.lines().count(), 1, "previous run not appended to");
-        assert!(old_body.contains("previous session"));
-        assert!(
-            !transcript_log::is_complete(&dir.path().join("000-sub-task.jsonl")),
-            "the crashed run must still read as an orphan"
-        );
-
-        let new_body = std::fs::read_to_string(dir.path().join("001-sub-task.jsonl"))
-            .expect("the resumed run claims the next free id");
-        assert!(new_body.contains("resumed session"));
-        assert!(transcript_log::is_complete(
-            &dir.path().join("001-sub-task.jsonl")
-        ));
-    }
 
     #[test]
     fn child_transcript_id_slugifies_and_pads() {

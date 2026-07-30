@@ -820,13 +820,6 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
 }
 
 /// The UTF-16 column of byte offset `byte_col` within `line` (for building a
-/// request position from a byte-indexed symbol match).
-pub fn byte_to_utf16_col(line: &str, byte_col: usize) -> u32 {
-    line[..byte_col.min(line.len())]
-        .chars()
-        .map(|c| c.len_utf16() as u32)
-        .sum()
-}
 
 /// The byte offset of UTF-16 column `utf16_col` within `line` (clamped to the
 /// line's end).
@@ -1523,18 +1516,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn uris_round_trip_and_utf16_columns_convert() {
-        let p = Path::new("/proj/src/a b.rs");
-        assert_eq!(uri_to_path(&file_uri(p)).unwrap(), p);
-        // Non-BMP char (🦀 = 2 UTF-16 units, 4 UTF-8 bytes).
-        let line = "let 🦀 = boom;";
-        let byte = line.find("boom").unwrap();
-        let utf16 = byte_to_utf16_col(line, byte);
-        assert_eq!(utf16, 9, "4 ascii + surrogate pair (2) + 3 ascii");
-        assert_eq!(utf16_to_byte_col(line, utf16), byte);
-    }
-
     /// Regression (MAJOR): a non-ASCII filename must round-trip through
     /// `file_uri`/`uri_to_path` intact. `uri_to_path` used to widen each raw
     /// UTF-8 byte to a `char` one at a time (`bytes[i] as char`, a Latin-1
@@ -1705,83 +1686,6 @@ mod tests {
 
     /// The navigation tools end-to-end against the scripted server:
     /// definition + references resolve `symbol` on a 1-based line, and rename
-    /// applies the server's WorkspaceEdit through the normal write path.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn nav_tools_ride_the_language_server() {
-        if which::which("python3").is_err() {
-            eprintln!("skipping: python3 not on PATH");
-            return;
-        }
-        use crate::Tool as _;
-        let dir = tempfile::tempdir().unwrap();
-        let server = dir.path().join("fake_lsp.py");
-        std::fs::write(&server, FAKE_LSP_PY).unwrap();
-        let file = dir.path().join("main.xyz");
-        std::fs::write(&file, "boom here\nuse boom\n").unwrap();
-
-        let mut ctx = crate::ToolContext::new(dir.path());
-        ctx.lsp = Some(Arc::new(LspRegistry::new(
-            dir.path().to_path_buf(),
-            vec![LspServerConfig {
-                command: "python3".to_string(),
-                args: vec![server.display().to_string()],
-                extensions: vec!["xyz".to_string()],
-                initialization_options: None,
-            }],
-            Some(5_000),
-        )));
-
-        // Definition: symbol on line 2 resolves to the first occurrence.
-        let out = crate::DefinitionTool
-            .execute(
-                serde_json::json!({"path": "main.xyz", "line": 2, "symbol": "boom"}),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(out.contains("main.xyz:1:1"), "{out}");
-
-        // References: both occurrences, counted.
-        let out = crate::ReferencesTool
-            .execute(
-                serde_json::json!({"path": "main.xyz", "line": 1, "symbol": "boom"}),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(out.starts_with("2 reference(s):"), "{out}");
-        assert!(out.contains("main.xyz:2:5"), "{out}");
-
-        // A symbol that isn't on the line is a plain, actionable error.
-        let err = crate::DefinitionTool
-            .execute(
-                serde_json::json!({"path": "main.xyz", "line": 1, "symbol": "nope"}),
-                &ctx,
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("does not appear"), "{err}");
-
-        // Rename: the server's edits land on disk through apply_file_change.
-        let out = crate::RenameTool
-            .execute(
-                serde_json::json!({"path": "main.xyz", "line": 1, "symbol": "boom",
-                                   "new_name": "blast"}),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(
-            out.contains("Renamed `boom` → `blast` in 1 file(s)"),
-            "{out}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            "blast here\nuse blast\n"
-        );
-    }
-
     /// A server that initializes fine but then stops draining its stdin must
     /// not hang the edit: the bounded write times out, diagnostics degrade to
     /// `None` (the edit still succeeds), and the server is retired so later

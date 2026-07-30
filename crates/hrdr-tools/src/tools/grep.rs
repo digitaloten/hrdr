@@ -5,36 +5,30 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{Tool, ToolContext, TruncateSide, cap_matches, truncate_saved};
+use crate::{Tool, ToolContext, TruncateSide, truncate_saved};
 
 // ---- grep ----
 
-/// Search backend, chosen once by availability.
-#[derive(Clone, Copy)]
-enum GrepBackend {
-    Rg,
-    Grep,
-    Builtin,
-}
-
-pub struct GrepTool {
-    backend: GrepBackend,
-}
-
-impl GrepTool {
-    /// Pick a search backend: ripgrep, then POSIX `grep`, then a built-in walker
-    /// (so search works even on a machine with neither installed).
-    pub fn detect() -> Self {
-        let backend = if which::which("rg").is_ok() {
-            GrepBackend::Rg
-        } else if which::which("grep").is_ok() {
-            GrepBackend::Grep
-        } else {
-            GrepBackend::Builtin
-        };
-        Self { backend }
-    }
-}
+/// A deliberately simple search tool: a pure-Rust walker, no subprocess, and
+/// **jail-only** — every other mode has `shell`, where `rg` is one call away.
+///
+/// It used to pick between ripgrep, POSIX `grep` and this walker. Both subprocess
+/// backends are deleted, and the reason is the one that matters here: they spawned
+/// through a bare `Command::new`, *not* through `sandboxed_shell_command`, so those
+/// children were unconfined by the OS. `check_read` validates the path the model
+/// *named*; it cannot constrain how a helper walks the filesystem once started —
+/// which in the one mode that still has `grep` is precisely the boundary.
+///
+/// The POSIX backend had earned it independently: it only ran when `rg` was absent,
+/// so never on a dev machine, exercised in CI alone — and it shipped a real bug that
+/// reached a tag (an `--exclude-dir=.*` trap). `Rg` goes because `grep` is jail-only
+/// now, so nothing would have called it.
+///
+/// **This costs look-around, and that is a decision rather than an oversight.**
+/// Rust's `regex` crate deliberately has none; ripgrep supplied it via PCRE2. Audits
+/// rarely need it and the error is clear, but keeping it would mean routing a
+/// subprocess out of the one mode built to have none.
+pub struct GrepTool;
 
 #[derive(Deserialize)]
 pub(crate) struct GrepArgs {
@@ -153,23 +147,21 @@ impl Tool for GrepTool {
         // Look-around needs PCRE2, which only the ripgrep backend can switch on
         // (`--pcre2`). POSIX `grep -E` and the built-in `regex` walker have no
         // equivalent, so say so instead of surfacing their regex-parse error.
-        if !a.literal && has_lookaround(&a.pattern) && !matches!(self.backend, GrepBackend::Rg) {
+        if !a.literal && has_lookaround(&a.pattern) {
             bail!(
-                "look-around requires ripgrep (--pcre2); this system's grep backend doesn't \
-                 support it\n(hint: to match this pattern as a fixed string, set `literal: true`)"
+                "look-around (`(?=`, `(?!`, `(?<=`, `(?<!`) is not supported: this tool uses \
+                 Rust's `regex`, which has none by design\n(hint: match it as a fixed string \
+                 with `literal: true`, or search for a pattern you can express without \
+                 look-around and filter the hits yourself)"
             );
         }
-        match self.backend {
-            GrepBackend::Rg => grep_ripgrep(&a, ctx).await,
-            GrepBackend::Grep => grep_posix(&a, ctx).await,
-            GrepBackend::Builtin => grep_builtin(&a, ctx),
-        }
+        grep_builtin(&a, ctx)
     }
 }
 
 /// Whether `pattern` uses a look-around group — `(?=`, `(?!`, `(?<=`, `(?<!`.
-/// Rust's `regex` crate (ripgrep's default engine, and the built-in walker's)
-/// has no look-around at all; ripgrep can switch to PCRE2, which does.
+/// Rust's `regex` crate has no look-around at all, so this earns a clear refusal
+/// rather than the crate's own parse error.
 fn has_lookaround(pattern: &str) -> bool {
     ["(?=", "(?!", "(?<=", "(?<!"].iter().any(|p| {
         // A `\(` is a literal paren, not the start of a group.
@@ -185,168 +177,6 @@ fn has_lookaround(pattern: &str) -> bool {
 }
 
 /// The full `rg` argument list for these args (pattern and search path last).
-/// Split out from the spawn so the flag wiring is unit-testable.
-fn ripgrep_args(a: &GrepArgs) -> Vec<String> {
-    let mut args: Vec<String> = ["--line-number", "--with-filename", "--no-heading"]
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    args.push("--color=never".to_string());
-    if a.multiline {
-        args.push("--multiline".to_string());
-    }
-    if a.hidden {
-        args.push("--hidden".to_string());
-    }
-    if a.no_ignore {
-        args.push("--no-ignore".to_string());
-    }
-    if a.literal {
-        args.push("-F".to_string());
-    } else if has_lookaround(&a.pattern) {
-        // Look-around is unsupported by the default engine — `(?!…)` comes back
-        // as a regex parse error. PCRE2 handles it, so switch engines up front
-        // rather than after a failed search. (An `rg` built without PCRE2
-        // rejects the flag, and that error names the cause for the model.)
-        args.push("--pcre2".to_string());
-    }
-    if a.case_insensitive {
-        args.push("-i".to_string());
-    }
-    if a.context() > 0 {
-        args.push("-C".to_string());
-        args.push(a.context().to_string());
-    }
-    if let Some(g) = &a.glob {
-        args.push("--glob".to_string());
-        args.push(g.clone());
-    }
-    args.push("--".to_string());
-    args.push(a.pattern.clone());
-    // Always pass an explicit path. With none, ripgrep reads STDIN when it isn't
-    // a TTY — and under a nulled/redirected stdin every unscoped search would
-    // silently return "(no matches)" or hang. Default to cwd, matching the POSIX
-    // backend below.
-    args.push(a.path.as_deref().unwrap_or(".").to_string());
-    args
-}
-
-async fn grep_ripgrep(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
-    let mut cmd = tokio::process::Command::new("rg");
-    cmd.args(ripgrep_args(a)).current_dir(&ctx.cwd);
-    run_search_cmd(cmd, "ripgrep", a.literal, a.max_matches(), ctx).await
-}
-
-async fn grep_posix(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
-    // POSIX grep cannot match across records. Use the same portable in-process
-    // implementation as the no-binary fallback for multiline requests.
-    if a.multiline {
-        return grep_builtin(a, ctx);
-    }
-    let mut cmd = tokio::process::Command::new("grep");
-    // `-E` and `-F` are conflicting matchers (`grep: conflicting matchers
-    // specified`, exit 2) — pass exactly one.
-    cmd.arg("-rn")
-        .arg(if a.literal { "-F" } else { "-E" })
-        .arg("--color=never")
-        .current_dir(&ctx.cwd);
-    if a.case_insensitive {
-        cmd.arg("-i");
-    }
-    // NB: `hidden` and `no_ignore` have no effect on this backend. POSIX grep
-    // has no `.gitignore` engine and no notion of "hidden", so neither was
-    // ever excluded here. Emulating the dotfile skip with `--exclude-dir=.*`
-    // is a trap: grep applies it to the command-line root too, so scoping the
-    // search at a dot-named directory (e.g. a `/tmp/.tmpXYZ` tempdir) silently
-    // matched nothing. Only the ripgrep and built-in walker backends filter.
-    if a.context() > 0 {
-        cmd.arg("-C").arg(a.context().to_string());
-    }
-    if let Some(g) = &a.glob {
-        cmd.arg(format!("--include={g}"));
-    }
-    cmd.arg("--").arg(&a.pattern);
-    cmd.arg(a.path.as_deref().unwrap_or("."));
-    run_search_cmd(cmd, "grep", a.literal, a.max_matches(), ctx).await
-}
-
-/// Run a configured search command: empty stdout means "(no matches)" (search
-/// tools exit non-zero on no match) unless stderr reports a real error;
-/// otherwise the truncated stdout. Shared postlude of the rg/grep backends.
-async fn run_search_cmd(
-    cmd: tokio::process::Command,
-    tool: &str,
-    literal: bool,
-    max_matches: usize,
-    ctx: &ToolContext,
-) -> Result<String> {
-    // `output()` would buffer the *entire* stdout before any cap ran — an
-    // unscoped `grep .` across a monorepo can be hundreds of MB — and would not
-    // kill the child on Esc. `run_capped_output` nulls stdin, sets
-    // `kill_on_drop`, and stops accumulating stdout past a generous ceiling
-    // (5× the byte budget `truncate_saved` trims to below, the same headroom the
-    // shell tool keeps in memory) so a 10 GB output is cut early. Anything that
-    // fits under the ceiling is byte-for-byte what `output()` produced.
-    let cap = ctx.max_output.saturating_mul(5).max(ctx.max_output);
-    let (_status, stdout_bytes, stderr_bytes, _over_cap) = super::run_capped_output(cmd, cap, cap)
-        .await
-        .with_context(|| format!("running {tool}"))?;
-    let raw = String::from_utf8_lossy(&stdout_bytes);
-    if raw.is_empty() {
-        let stderr = String::from_utf8_lossy(&stderr_bytes);
-        if !stderr.is_empty() {
-            bail!(
-                "{tool}: {}{}",
-                stderr.trim(),
-                regex_error_hint(&stderr, literal)
-            );
-        }
-        return Ok(super::NO_MATCHES.to_string());
-    }
-    // Drop any match lines that name a secret file (e.g. a `.env` in the tree),
-    // so a broad `grep KEY .` can't surface credentials the `read` deny-list
-    // would refuse. Best-effort: covers `path:NN:…` match lines.
-    let stdout: String = raw
-        .lines()
-        .filter(|l| !crate::grep_line_is_secret(l, &ctx.cwd))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if stdout.is_empty() {
-        return Ok(super::NO_MATCHES.to_string());
-    }
-    // Cap by match count first (with a "narrow the pattern" nudge), then by
-    // bytes as the backstop.
-    Ok(truncate_saved(
-        &cap_matches(&stdout, max_matches),
-        ctx.max_output,
-        ctx.max_output_lines,
-        TruncateSide::Head,
-        "grep",
-    ))
-}
-
-/// When a search backend rejects the pattern as an invalid regex, suggest the
-/// arg that lets the model self-correct without a user nudge: `multiline: true`
-/// for a newline-spanning pattern (ripgrep flags `\n` explicitly), or
-/// `literal: true` to match the pattern as a fixed string. Returns "" when the
-/// error isn't a regex-parse failure, so unrelated errors stay verbatim.
-fn regex_error_hint(stderr: &str, literal: bool) -> &'static str {
-    let s = stderr.to_ascii_lowercase();
-    let is_regex_err = s.contains("regex parse error")
-        || s.contains("error parsing regex")
-        || s.contains("unclosed")
-        || s.contains("not allowed in a regex");
-    if !is_regex_err {
-        return "";
-    }
-    if s.contains("multiline") || s.contains("not allowed in a regex") {
-        return "\n(hint: to match across line boundaries, set `multiline: true`)";
-    }
-    if !literal {
-        return "\n(hint: to match this pattern as a fixed string, set `literal: true`)";
-    }
-    ""
-}
 
 /// Compile `a.pattern` into a `Regex`, honoring `literal` (escape to a fixed
 /// string, e.g. for `foo(bar)`, `a.b`, `$var`) and `case_insensitive`.
@@ -630,29 +460,18 @@ mod tests {
         }
     }
 
-    /// Every backend this host can actually run, so the shared-behaviour tests
-    /// below exercise all of them instead of whichever one `detect()` would
-    /// pick — a dev machine has ripgrep, so the POSIX and built-in paths used to
-    /// run in CI only (which is how the `--exclude-dir=.*` trap below reached a
-    /// tag). A backend whose binary is absent is skipped rather than failed: a
-    /// machine without `grep` must still pass the suite.
-    fn available_backends() -> Vec<(&'static str, GrepBackend)> {
-        let mut out = Vec::new();
-        if which::which("rg").is_ok() {
-            out.push(("rg", GrepBackend::Rg));
-        }
-        if which::which("grep").is_ok() {
-            out.push(("grep", GrepBackend::Grep));
-        }
-        out.push(("builtin", GrepBackend::Builtin)); // pure Rust: always runnable
-        out
+    /// There is one backend now, and it is always runnable. Kept as a helper so the
+    /// shared-behaviour tests below read unchanged — they used to run against
+    /// ripgrep, POSIX `grep` and this walker, and the walker is the survivor.
+    fn available_backends() -> Vec<(&'static str, ())> {
+        vec![("builtin", ())]
     }
 
     #[test]
     fn multiline_defaults_to_false_and_is_in_schema() {
         let args: GrepArgs = serde_json::from_value(json!({ "pattern": "x" })).unwrap();
         assert!(!args.multiline);
-        let schema = GrepTool::detect().parameters();
+        let schema = GrepTool.parameters();
         assert_eq!(
             schema["properties"]["multiline"]["type"],
             serde_json::Value::String("boolean".into())
@@ -669,85 +488,6 @@ mod tests {
         }
         // An escaped backslash before the group doesn't escape the paren.
         assert!(has_lookaround("a\\\\(?!b)"));
-    }
-
-    /// Look-around only works under PCRE2, so the flag goes on the invocation
-    /// up front — without it `rg` fails the search with a regex parse error.
-    #[test]
-    fn ripgrep_args_add_pcre2_only_for_lookaround_patterns() {
-        let args = ripgrep_args(&plain_args("foo(?!bar)"));
-        assert!(args.contains(&"--pcre2".to_string()), "{args:?}");
-        assert!(!ripgrep_args(&plain_args("foo")).contains(&"--pcre2".to_string()));
-        // A literal search never compiles a regex, so `-F` wins and PCRE2 is
-        // pointless (the two are mutually exclusive in `rg` anyway).
-        let mut lit = plain_args("foo(?!bar)");
-        lit.literal = true;
-        let args = ripgrep_args(&lit);
-        assert!(args.contains(&"-F".to_string()), "{args:?}");
-        assert!(!args.contains(&"--pcre2".to_string()), "{args:?}");
-    }
-
-    /// The other two backends have no PCRE2 equivalent, so a look-around
-    /// pattern is refused with a message that names the reason instead of a
-    /// bare regex-parse error from grep or the `regex` crate.
-    #[tokio::test]
-    async fn non_ripgrep_backends_refuse_lookaround_with_a_clear_error() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("code.rs"), "let needle = 1;\n").unwrap();
-        let ctx = ToolContext::new(dir.path());
-        for backend in [GrepBackend::Grep, GrepBackend::Builtin] {
-            let err = GrepTool { backend }
-                .execute(json!({"pattern": "needle(?! = 2)"}), &ctx)
-                .await
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("look-around requires ripgrep"), "{err}");
-        }
-        // A literal search of the same text is not look-around, so it runs.
-        let out = GrepTool {
-            backend: GrepBackend::Builtin,
-        }
-        .execute(json!({"pattern": "needle", "literal": true}), &ctx)
-        .await
-        .unwrap();
-        assert!(out.contains("code.rs:1:let needle"), "{out}");
-    }
-
-    /// End-to-end against the real binary: with `--pcre2` wired the search
-    /// succeeds; skipped when `rg` is missing or was built without PCRE2.
-    #[tokio::test]
-    async fn ripgrep_matches_a_lookaround_pattern() {
-        if which::which("rg").is_err() {
-            return; // best-effort: exercise the real backend when available
-        }
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("code.rs"), "foo_keep\nfoo_skip\n").unwrap();
-        let ctx = ToolContext::new(dir.path());
-        let out = match grep_ripgrep(&plain_args("foo_(?!skip)"), &ctx).await {
-            Ok(out) => out,
-            // `rg` without the PCRE2 feature rejects the flag; nothing to check.
-            Err(e) if e.to_string().contains("pcre2") => return,
-            Err(e) => panic!("{e}"),
-        };
-        assert!(out.contains("code.rs:1:foo_keep"), "{out}");
-        assert!(!out.contains("foo_skip"), "{out}");
-    }
-
-    #[test]
-    fn regex_error_hint_steers_recovery() {
-        // A newline-in-regex rejection → suggest multiline, even when literal.
-        let nl = "regex parse error: the literal \"\\n\" is not allowed in a regex";
-        assert!(regex_error_hint(nl, false).contains("multiline: true"));
-        assert!(regex_error_hint(nl, true).contains("multiline: true"));
-        // A generic regex-parse failure on a non-literal search → suggest literal.
-        let bad = "regex parse error: unclosed character class";
-        assert!(regex_error_hint(bad, false).contains("literal: true"));
-        // Already literal (or a non-regex error): no misleading hint.
-        assert_eq!(regex_error_hint(bad, true), "");
-        assert_eq!(
-            regex_error_hint("some other error: permission denied", false),
-            ""
-        );
     }
 
     #[test]
@@ -793,112 +533,6 @@ mod tests {
         assert!(out.contains("full output"), "{out}");
     }
 
-    /// An unscoped search (no `path`) must search the working tree, not stdin.
-    /// ripgrep with no path argument reads STDIN when it isn't a TTY, so under a
-    /// nulled/redirected stdin an unscoped grep used to silently return
-    /// "(no matches)" — the model would wrongly conclude the symbol is absent.
-    /// Passing an explicit `.` fixes it and aligns rg with the POSIX backend.
-    #[tokio::test]
-    async fn ripgrep_without_path_searches_the_tree_not_stdin() {
-        if which::which("rg").is_err() {
-            return; // best-effort: exercise the real backend when available
-        }
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("code.rs"), "fn needle() {}\n").unwrap();
-        let ctx = ToolContext::new(dir.path());
-        let a = GrepArgs {
-            pattern: "needle".to_string(),
-            path: None,
-            glob: None,
-            context: None,
-            multiline: false,
-            hidden: false,
-            no_ignore: false,
-            literal: false,
-            case_insensitive: false,
-        };
-        let out = grep_ripgrep(&a, &ctx).await.unwrap();
-        assert!(out.contains("code.rs:1:fn needle"), "{out}");
-    }
-
-    #[tokio::test]
-    async fn ripgrep_multiline_matches_across_line_boundary() {
-        if which::which("rg").is_err() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("sample.txt"), "before\nfoo\nbar\nafter\n").unwrap();
-        let ctx = ToolContext::new(dir.path());
-        let out = grep_ripgrep(&multiline_args("foo\\nbar"), &ctx)
-            .await
-            .unwrap();
-        assert!(out.contains("sample.txt:2:foo"), "{out}");
-        assert!(out.contains("sample.txt:3:bar"), "{out}");
-    }
-
-    #[tokio::test]
-    async fn posix_backend_multiline_matches_across_line_boundary() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("sample.txt"), "before\nfoo\nbar\nafter\n").unwrap();
-        let ctx = ToolContext::new(dir.path());
-        let out = grep_posix(&multiline_args("foo\\nbar"), &ctx)
-            .await
-            .unwrap();
-        assert!(out.contains("sample.txt:2:foo"), "{out}");
-        assert!(out.contains("sample.txt:3:bar"), "{out}");
-    }
-
-    /// The new flags must reach the real `rg` binary too, not just the
-    /// built-in fallback — `rg` is the default backend whenever it's
-    /// installed (`GrepTool::detect()` prefers it), so this is the path most
-    /// real invocations take.
-    #[tokio::test]
-    async fn ripgrep_hidden_no_ignore_literal_case_insensitive_flags_wired() {
-        if which::which("rg").is_err() {
-            return; // best-effort: exercise the real backend when available
-        }
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
-        std::fs::write(dir.path().join("ignored.txt"), "NEEDLE(x) here\n").unwrap();
-        let ctx = ToolContext::new(dir.path());
-
-        // Skipped by default: gitignored.
-        let out = grep_ripgrep(&plain_args("NEEDLE(x)"), &ctx).await.unwrap();
-        assert_eq!(out, "(no matches)", "{out}");
-
-        // `no_ignore` finds it, but as a regex "NEEDLE(x)" doesn't match the
-        // literal "(x)" text (parens are a capture group, not literal chars).
-        let mut a = plain_args("NEEDLE(x)");
-        a.no_ignore = true;
-        let out = grep_ripgrep(&a, &ctx).await.unwrap();
-        assert_eq!(out, "(no matches)", "{out}");
-
-        // `literal` matches the parens verbatim.
-        a.literal = true;
-        let out = grep_ripgrep(&a, &ctx).await.unwrap();
-        assert!(out.contains("ignored.txt:1:NEEDLE(x) here"), "{out}");
-
-        // `case_insensitive` matches lowercase against the uppercase text.
-        let mut a = plain_args("needle(x)");
-        a.no_ignore = true;
-        a.literal = true;
-        a.case_insensitive = true;
-        let out = grep_ripgrep(&a, &ctx).await.unwrap();
-        assert!(out.contains("ignored.txt:1:NEEDLE(x) here"), "{out}");
-
-        // `hidden` finds a match under a dotdir.
-        std::fs::create_dir_all(dir.path().join(".hidden-dir")).unwrap();
-        std::fs::write(dir.path().join(".hidden-dir/file"), "dotneedle\n").unwrap();
-        let out = grep_ripgrep(&plain_args("dotneedle"), &ctx).await.unwrap();
-        assert_eq!(out, "(no matches)", "{out}");
-        let mut a = plain_args("dotneedle");
-        a.hidden = true;
-        // Windows paths print with `\` — normalize before asserting.
-        let out = grep_ripgrep(&a, &ctx).await.unwrap().replace('\\', "/");
-        assert!(out.contains(".hidden-dir/file:1:dotneedle"), "{out}");
-    }
-
     #[test]
     fn builtin_multiline_preserves_context_and_glob_filtering() {
         let dir = tempfile::tempdir().unwrap();
@@ -917,7 +551,7 @@ mod tests {
     /// A search scoped at an explicit path outside the project is refused
     /// before any backend runs — grep reads file contents, so an out-of-cwd
     /// root is an exfiltration vector. Backend-independent: the guard lives in
-    /// `execute`, so `GrepTool::detect()`'s chosen backend doesn't matter.
+    /// `execute`, so `GrepTool`'s chosen backend doesn't matter.
     #[tokio::test]
     async fn grep_allows_a_path_outside_cwd() {
         let cwd = tempfile::tempdir().unwrap();
@@ -925,7 +559,7 @@ mod tests {
         std::fs::write(outside.path().join("a.txt"), "needle here").unwrap();
 
         let ctx = ToolContext::new(cwd.path());
-        let out = GrepTool::detect()
+        let out = GrepTool
             .execute(
                 serde_json::json!({
                     "pattern": "needle",
@@ -936,73 +570,6 @@ mod tests {
             .await
             .expect("grepping outside cwd is allowed");
         assert!(out.contains("needle"), "got: {out}");
-    }
-
-    /// The POSIX backend must find matches under a dot-named root and honor
-    /// `literal` without a matcher conflict.
-    ///
-    /// Regression, and a CI-only one (dev machines have `rg`, runners don't,
-    /// so only CI exercised this backend): emulating the dotfile skip with
-    /// `--exclude-dir=.*` also excluded a dot-named command-line root — every
-    /// tempdir-scoped search (`/tmp/.tmpXYZ`) matched nothing, which sank the
-    /// v0.5.0 tag run on all three platforms. And `literal` appended `-F`
-    /// after `-E`: "conflicting matchers specified", exit 2.
-    #[tokio::test]
-    async fn posix_grep_searches_dot_named_roots_and_honors_literal() {
-        if which::which("grep").is_err() {
-            return; // best-effort: exercise the real backend when available
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let dot_root = dir.path().join(".dotdir");
-        std::fs::create_dir(&dot_root).unwrap();
-        std::fs::write(dot_root.join("a.txt"), "foo(bar) needle\n").unwrap();
-        let ctx = ToolContext::new(dir.path());
-
-        // A dot-named root passed explicitly is searched, not excluded.
-        let mut a = plain_args("needle");
-        a.path = Some(dot_root.to_string_lossy().to_string());
-        let out = grep_posix(&a, &ctx).await.unwrap();
-        assert!(out.contains("needle"), "dot-named root is searched: {out}");
-
-        // `literal` swaps the matcher instead of stacking `-F` onto `-E`.
-        let mut a = plain_args("foo(bar)");
-        a.path = Some(dot_root.to_string_lossy().to_string());
-        a.literal = true;
-        let out = grep_posix(&a, &ctx).await.unwrap();
-        assert!(out.contains("foo(bar)"), "literal matches verbatim: {out}");
-    }
-
-    /// With `context > 0`, a `.env` line adjacent to a match must not leak via
-    /// a `-C` context line (`path-NN-content`) — the secret filter used to
-    /// only recognise `path:NN:` match lines, so the context form rode along
-    /// unfiltered. Exercises the real POSIX-`grep` backend, not just the
-    /// builtin walker (which drops secret files entirely at the walk level).
-    #[tokio::test]
-    async fn context_lines_do_not_leak_env_secrets_via_posix_grep() {
-        if which::which("grep").is_err() {
-            return; // best-effort: exercise the real backend when available
-        }
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(".env"),
-            "BEFORE=1\nAPI_KEY=supersecret\nAFTER=1\n",
-        )
-        .unwrap();
-        let ctx = ToolContext::new(dir.path());
-        let a = GrepArgs {
-            pattern: "API_KEY".to_string(),
-            path: None,
-            glob: None,
-            context: Some(2),
-            multiline: false,
-            hidden: false,
-            no_ignore: false,
-            literal: false,
-            case_insensitive: false,
-        };
-        let out = grep_posix(&a, &ctx).await.unwrap();
-        assert!(!out.contains("supersecret"), "{out}");
-        assert!(!out.contains(".env"), "{out}");
     }
 
     /// Same guarantee for the pure-Rust builtin fallback (used when neither
@@ -1122,7 +689,7 @@ mod tests {
         std::fs::write(outside.path().join("a.txt"), "needle here").unwrap();
         let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Jail);
 
-        let err = GrepTool::detect()
+        let err = GrepTool
             .execute(
                 serde_json::json!({
                     "pattern": "needle",
@@ -1155,9 +722,9 @@ mod tests {
         std::fs::write(dir.path().join("code.rs"), "let NEEDLE = foo(bar);\n").unwrap();
         let ctx = ToolContext::new(dir.path());
 
-        for (name, backend) in available_backends() {
+        for (name, ()) in available_backends() {
             let run = |args| {
-                let tool = GrepTool { backend };
+                let tool = GrepTool;
                 let ctx = &ctx;
                 async move { tool.execute(args, ctx).await.unwrap() }
             };
@@ -1193,57 +760,6 @@ mod tests {
         }
     }
 
-    /// `hidden`/`no_ignore` across the backends. The invariant all three share
-    /// is that the toggle finds the file; only the filtering backends skip it by
-    /// default. POSIX `grep` has no `.gitignore` engine and no notion of
-    /// "hidden", so it never excluded either — see the NB in `grep_posix`, which
-    /// is why emulating the dotfile skip there was abandoned.
-    #[tokio::test]
-    async fn every_backend_finds_hidden_and_ignored_files_when_asked() {
-        let dir = tempfile::tempdir().unwrap();
-        // The `.git` dir is what makes `.gitignore` apply at all — both ripgrep
-        // and the `ignore` crate only honor git rules inside a repository.
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
-        std::fs::write(dir.path().join("ignored.txt"), "gitneedle\n").unwrap();
-        std::fs::create_dir_all(dir.path().join(".hidden-dir")).unwrap();
-        std::fs::write(dir.path().join(".hidden-dir/file.txt"), "dotneedle\n").unwrap();
-        let ctx = ToolContext::new(dir.path());
-
-        for (name, backend) in available_backends() {
-            let run = |args| {
-                let tool = GrepTool { backend };
-                let ctx = &ctx;
-                async move { tool.execute(args, ctx).await.unwrap() }
-            };
-
-            // Windows paths print with `\` — normalize before asserting.
-            let out = run(json!({"pattern": "dotneedle", "hidden": true}))
-                .await
-                .replace('\\', "/");
-            assert!(
-                out.contains(".hidden-dir/file.txt:1:dotneedle"),
-                "{name}: {out}"
-            );
-            let out = run(json!({"pattern": "gitneedle", "no_ignore": true})).await;
-            assert!(out.contains("ignored.txt:1:gitneedle"), "{name}: {out}");
-
-            if matches!(backend, GrepBackend::Grep) {
-                continue; // filters nothing by default, so nothing to skip
-            }
-            assert_eq!(
-                run(json!({"pattern": "dotneedle"})).await,
-                "(no matches)",
-                "{name}"
-            );
-            assert_eq!(
-                run(json!({"pattern": "gitneedle"})).await,
-                "(no matches)",
-                "{name}"
-            );
-        }
-    }
-
     /// `glob` reaches every backend through a different mechanism (`--glob`,
     /// `--include`, `glob::Pattern` on the walk), so pin the one thing they must
     /// agree on: only the matching files are searched.
@@ -1254,8 +770,8 @@ mod tests {
         std::fs::write(dir.path().join("notes.txt"), "needle in text\n").unwrap();
         let ctx = ToolContext::new(dir.path());
 
-        for (name, backend) in available_backends() {
-            let out = GrepTool { backend }
+        for (name, ()) in available_backends() {
+            let out = GrepTool
                 .execute(json!({"pattern": "needle", "glob": "*.rs"}), &ctx)
                 .await
                 .unwrap();
