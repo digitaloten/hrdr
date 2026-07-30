@@ -40,7 +40,7 @@ exists to inspect third-party code you are unwilling to expose to.
 | Project `AGENTS.md` / skills | yes           | yes                            | yes                 | **no**                   |
 | Tool results wrapped         | no            | opt-in (config)                | opt-in (config)     | **always**               |
 | Escalation eligible          | n/a           | yes                            | yes                 | **never**                |
-| Backend                      | none          | Landlock preferred             | **bwrap** preferred | **bwrap required**       |
+| Backend                      | none          | Landlock preferred             | **bwrap** preferred | **none needed** ²        |
 
 ¹ **Assumption to confirm.** Your sketch put network removal only in `jail`. But
 every delegated agent loses shell network today, and `explore`/`review` are
@@ -72,35 +72,41 @@ argues for a narrow read-only git capability later, not a general shell now.
   rights are ABI v4 TCP `bind`/`connect` and nothing else, so UDP, DNS, QUIC and
   raw sockets escape it; `--unshare-net` does not. And the userns cost is
   irrelevant here, because a mode with no network never touches ssh.
-- **`jail` requires bwrap.** It is the only mechanism that can confine reads.
+- **`jail` needs no backend at all.** See below: with `grep` on the built-in
+  walker, no jail tool spawns a subprocess, so there is nothing for an OS
+  sandbox to confine. Its confinement is in-process, by construction.
 
 ### Fallbacks
 
-| Mode    | Primary  | Fallback                                    | If neither        |
-| ------- | -------- | ------------------------------------------- | ----------------- |
-| `write` | Landlock | bwrap + `GIT_SSH_COMMAND` workaround + note | unconfined + note |
-| `read`  | bwrap    | Landlock, TCP-only denial + loud note       | unconfined + note |
-| `jail`  | bwrap    | **none**                                    | **hard failure**  |
+| Mode    | Primary  | Fallback                                    | If neither           |
+| ------- | -------- | ------------------------------------------- | -------------------- |
+| `write` | Landlock | bwrap + `GIT_SSH_COMMAND` workaround + note | unconfined + note    |
+| `read`  | bwrap    | Landlock, TCP-only denial + loud note       | unconfined + note    |
+| `jail`  | n/a      | n/a                                         | n/a — works anywhere |
 
 Landlock needs kernel 5.13+; the `write` fallback keeps
 `git_ssh_command_for_userns` and its `SshUserNamespace` denial note alive on
 that path, so neither is deleted.
 
-### The jail hard failure
+### There is no jail hard failure — and that is the better outcome
 
-A jail mode that cannot confine reads is a false promise, so it refuses rather
-than degrading. Two sites, deliberately different:
+An earlier revision of this plan required bwrap for `jail` and exited non-zero
+without it. Removing `grep`'s subprocess makes that unnecessary and, more
+usefully, makes jail **available on macOS and Windows** where bwrap does not
+exist at all. The audit mode goes from Linux-only to universal.
 
-- **Session-level** (`--sandbox jail`, or `sandbox = "jail"` in config): exit
-  non-zero with a clear error **before the TUI starts**. Name bwrap, say it is
-  required for this mode and why, and say which modes do work.
-- **Agent-level** (a profile declaring `sandbox: jail`): fail that one
-  delegation with the same explanation. It must not take the session down — the
-  main agent can report the problem and carry on.
+`detect_backend()` stays lazy everywhere; nothing needs an eager probe.
 
-`detect_backend()` is lazy today, probing on the first confined command so a
-session that never runs one pays nothing. The session-level check has to probe
-**eagerly** when jail is requested. Keep the laziness for every other mode.
+**Stated honestly:** jail has no OS backstop, so a bug in a read tool's path
+handling would be an escape. That is acceptable here, and the reason is who the
+adversary is. With zero execution, their only lever is text in files — read
+confinement guards against _our_ tool bugs, not against the attacker, whose
+actual surface is the injection that the untrusted-content wrapper and the
+persona address. Requiring bwrap for a mode with no child process would be a
+talisman that does nothing.
+
+Same logic retires `--unshare-net` in jail: nothing runs, so nothing can open a
+socket. **Jail's network denial _is_ the tool removal.**
 
 ## Tool sets
 
@@ -128,40 +134,65 @@ child in a laxer mode. `memory` writes outside the sandbox roots by design.
 This belongs to the **mode**, not to one profile: put it in the profile only,
 and the next agent someone writes with `sandbox: jail` silently gets a network.
 
-## Subprocess confinement — must fix before jail is real
+## Grep backends, and why jail ends up subprocess-free
 
-Found while writing this, and it decides whether jail's read confinement is a
-guarantee or a hope.
+`grep` has three backends (`grep.rs:14`): `Rg`, `Grep` (POSIX), and `Builtin` —
+a pure-Rust walker that is already tested and always runnable. Both subprocess
+backends spawn through a bare `tokio::process::Command::new`
+(`grep.rs:218,229`), **not** through `sandboxed_shell_command`, so those
+children are unconfined by the OS. `check_read` runs in-process and validates
+the path the model _named_; it cannot constrain how a helper walks the
+filesystem once started.
 
-`check_read` runs **in-process** and validates the path the model _named_. It
-cannot constrain how a helper process walks the filesystem once started. And
-read-only tools do start helpers: `grep` spawns `rg`, with a POSIX `grep`
-fallback, via a bare `tokio::process::Command::new` (`tools/grep.rs:218,229`) —
-**not** through `sandboxed_shell_command`. So that child is unconfined by the
-OS, and nothing stops it following a symlink out of the tree or reading a file
-the tool never named.
+Resolution, in two parts:
 
-Full enumeration of direct spawns in `hrdr-tools`:
+**Delete the POSIX `grep` backend outright.** It only runs when `rg` is absent,
+so it never runs on a dev machine; it is exercised in CI only, and it has
+already shipped a real bug — the `--exclude-dir=.*` trap its own comment at
+`grep.rs:618` records as having reached a tag. `Builtin` covers that case
+strictly better: it walks with the `ignore` crate (ripgrep's own walker), so it
+is gitignore-aware, honours `hidden`/`no_ignore`, skips secret files via
+`secret_file_reason`, and routes its path through `ctx.resolve_read`.
 
-| Site                    | Reachable in jail?                                                |
-| ----------------------- | ----------------------------------------------------------------- |
-| `tools/grep.rs:218,229` | **yes — `rg` / `grep`. This is the hole.**                        |
-| `lsp.rs:456`            | no (LSP off)                                                      |
-| `mcp/*`                 | no (MCP off)                                                      |
-| `tools/shell.rs:69`     | no (`shell` off; this is the wrapped path)                        |
-| `proc.rs:331,381`       | **verify** — bash at two sites; confirm no jailed tool reaches it |
+**Keep `rg`, but force `Builtin` in jail.** Deleting `rg` everywhere would cost
+two things that need not be paid outside jail:
 
-Fix: **`grep`'s helper must spawn through the confined path** when the policy
-says so, rather than bare. That keeps `grep` (which you want) and makes the
-confinement real.
+- **Lookaround.** Rust's `regex` crate deliberately has none; `rg` gets it via
+  PCRE2 (`ripgrep_args_add_pcre2_only_for_lookaround_patterns`). Builtin-only
+  makes `(?<=foo)bar` a hard error in every mode.
+- **Speed.** `Builtin` is a sequential walk with `read_to_string` per file and
+  no literal prefilter. Fine for an audit; noticeable on every search in a large
+  repo, and `grep` is among the most-used tools.
 
-Two consequences:
+And an unconfined `rg` **violates nothing** in `write`/`read`, because neither
+mode confines reads. The unconfined spawn is only a policy breach in `jail`.
 
-- **bwrap stays required for jail** even though the agent has no `shell`. The
-  read confinement has a subprocess to constrain after all.
-- The rule generalises, so write it down: **any tool that spawns a helper must
-  spawn it through the sandbox, not around it.** A future tool shelling out
-  directly would silently punch the same hole, and no test would notice.
+### The jail tool set, audited
+
+With `grep` on `Builtin`, nothing in jail spawns a subprocess. Verified, not
+assumed:
+
+| Tool          | Read guard                                         | Spawns       |
+| ------------- | -------------------------------------------------- | ------------ |
+| `read`        | `resolve_read`                                     | no           |
+| `tree`        | `resolve_read`                                     | no           |
+| `ls`          | `resolve_read`                                     | no           |
+| `find` (glob) | walks `ctx.cwd`; **takes no path argument at all** | no           |
+| `grep`        | `ctx.resolve_read`                                 | no (Builtin) |
+
+`resolve_read` (`lib.rs:361`) calls `check_read` on the **canonicalised** path,
+which resolves symlinks and lexical `..` — that is what makes the check
+escape-proof for the tools that use it.
+
+### The standing rule this leaves behind
+
+**Any tool that spawns a helper must spawn it through the sandbox, not around
+it.** A future tool shelling out directly would silently punch the same hole and
+no test would notice. Worth a test that asserts the jail tool set spawns
+nothing.
+
+Still to verify: `proc.rs:331,381` spawns bash at two sites — confirm no
+jail-reachable tool reaches it.
 
 ## Prompt surfaces
 
