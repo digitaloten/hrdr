@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-31
+
+### Fixed
+
+- **`!command` tool blocks now show the command being run.** The `!` prefix was
+  passed as a plain string, defeating `tool_display`'s JSON parsing. The block
+  renders now with the command visible under the `shell` header.
+
+- **Cancelling a turn (Esc) no longer leaves tool calls spinning forever.**
+  Tools left mid-execution when a turn was cancelled never received a `ToolEnd`
+  event, keeping `done: false` in the transcript. `cancel_turn()` now settles
+  open tool calls.
+
+### Changed
+
+- **`!command` now uses the same shell-execution path as the model's `shell`
+  tool.** The hand-rolled process spawning, output buffering, and streaming are
+  replaced with `run_streamed_command()` (escaping the sandbox entirely — the
+  user's own shell). Output benefits from the same head/tail ring buffer, ANSI
+  stripping, and secret redaction.
+
+- **After calling `task`, the agent is told to end its turn and wait.** The tool
+  description, its ack message, and the `delegate.md` prompt template previously
+  gave permission to "keep working" or "spawn more", with "end your turn" as a
+  conditional fallback. All four points now say: batch parallel spawns, then end
+  the turn — continue only once the delegated work is done and reviewed.
+
 ## [0.9.0] - 2026-07-30
 
 The sandbox redesign: nine slices in one day, and about 9,000 lines net removed.
