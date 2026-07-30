@@ -286,7 +286,10 @@ impl Harness {
     /// decision table).
     ///
     /// Only for tests *about* the sandbox — see the `sandbox: None` reasoning in
-    /// [`Harness::build`] for why every other test pins it off.
+    /// [`Harness::build`] for why every other test pins it off. `cfg(unix)` because
+    /// its only caller is, and on Windows an uncalled helper is a `-D warnings`
+    /// failure the Linux build cannot see.
+    #[cfg(unix)]
     async fn read_only_sandbox() -> Self {
         Self::build(vec![], 50, hrdr_tools::SandboxMode::Read, true).await
     }

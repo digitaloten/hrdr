@@ -93,19 +93,6 @@ pub(crate) fn bg_handles() -> BgHandles {
 /// a pointer at the transcript for the rest.
 pub(crate) const BACKGROUND_REPORT_MAX_BYTES: usize = 24_000;
 
-/// A sub-agent's prior conversation, restored by `task_revive` into the fresh
-/// agent so a follow-up turn continues rather than restarts.
-///
-/// The persisted `messages` carry the Anthropic signed thinking blocks a Claude
-/// sub-agent that died mid-`tool_use` needs to resume byte-exact (the whole
-/// reason revive loads the `.json` snapshot, not the display transcript), and the
-/// spend/usage seed the run so its cost and gauge count on from where it left off.
-pub(crate) struct RestoredContext {
-    pub(crate) messages: Vec<ChatMessage>,
-    pub(crate) session_cost: f64,
-    pub(crate) usage: AgentUsage,
-}
-
 /// Where a delegated run's state is snapshotted, and everything about the run
 /// that never changes once it is spawned.
 ///
@@ -116,8 +103,16 @@ pub(crate) struct RestoredContext {
 /// same [`crate::SessionState`] the session's own agent persists.
 struct RunSnapshot {
     /// `<stem>.json`, beside the run's transcript. `None` when there is no
-    /// transcript dir to write into (best-effort, the rule the jsonl follows) —
-    /// then nothing is snapshotted and the run is not revivable.
+    /// transcript dir to write into (best-effort, the rule the jsonl follows).
+    ///
+    /// **Nothing loads this today.** It was written for `task_revive`, which is
+    /// gone — a run that went wrong is exactly a run whose context holds the wrong
+    /// reasoning, so re-briefing beats resuming. It is kept because it is the only
+    /// durable copy of a sub-agent's *model-facing* messages (the jsonl holds the
+    /// display fold, and cannot reconstruct signed thinking blocks), which is worth
+    /// having if anything ever needs to reconstruct a run. Whether to keep paying a
+    /// write per committed round for that is an open question in
+    /// `docs/backlog.md`; do not assume a reader exists.
     path: Option<PathBuf>,
     name: String,
     read_only: bool,
@@ -169,9 +164,6 @@ fn spawn_background(
     lsp: Option<Arc<hrdr_tools::LspRegistry>>,
     transcript_dir: ChildDirCell,
     live: AgentRegistry,
-    // A prior conversation to restore before the run (`task_revive`); `None` for a
-    // fresh `task`, which starts from an empty context.
-    restore: Option<RestoredContext>,
 ) -> Result<String> {
     use std::sync::atomic::Ordering;
     let id = BG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
@@ -184,11 +176,10 @@ fn spawn_background(
     let model_for_live = cfg.model.model().to_string();
     let provider_for_live = Some(cfg.model.provider().to_string());
     let base_url_for_live = cfg.base_url.clone();
-    // A revived run seeds the pane with its restored counters (so its gauge and
-    // cost count on from where it left off); a fresh task starts from zero. The
-    // context window is NOT seeded here — the agent publishes its own the moment it
-    // attaches below, exactly as the session's agent does.
-    let usage_for_live = restore.as_ref().map(|r| r.usage).unwrap_or_default();
+    // A task starts from zero. The context window is NOT seeded here — the agent
+    // publishes its own the moment it attaches below, exactly as the session's
+    // agent does.
+    let usage_for_live = AgentUsage::default();
     // Read before `cfg` is moved into `Agent::new`, for the acknowledgement's
     // closing line about where this sub-agent's edits will land.
     let cfg_read_only = cfg.read_only;
@@ -200,9 +191,8 @@ fn spawn_background(
         path: None,
         // The label names the snapshot's session (auto-derived, never user-named).
         name: label.clone(),
-        // Capability belongs in the snapshot: without it a `task_revive` of a
-        // read-only run cannot tell one from a writer, and rebuilds it
-        // write-capable.
+        // Capability belongs in the snapshot: anything rebuilding a run from it
+        // cannot otherwise tell a read-only one from a writer.
         read_only: cfg.read_only,
         model: cfg.model.clone(),
         base_url: cfg.base_url.clone(),
@@ -211,16 +201,6 @@ fn spawn_background(
     // Build and register synchronously so `task_steer` can address the id as soon as
     // `task` returns; registration inside the spawned future races the caller.
     let mut sub = Agent::new(cfg)?;
-    // A revived sub-agent continues its prior conversation: restore the persisted
-    // messages (with the signed thinking blocks a pending tool_use needs) and its
-    // running spend, so the follow-up turn stacks on the original run instead of
-    // starting from an empty context. `set_messages` rebuilds the system prompt on
-    // top of them — the revived run gets today's environment and the current memory
-    // index, and a cache split that matches the text it installed.
-    if let Some(r) = restore {
-        sub.set_messages(r.messages);
-        sub.set_session_cost(r.session_cost);
-    }
     sub.cost_total = cost_total;
     sub.cost_partial = cost_partial;
     sub.ctx.lsp = lsp;
@@ -1375,7 +1355,6 @@ impl hrdr_tools::Tool for SubagentTool {
             self.lsp.clone(),
             self.transcript_dir.clone(),
             self.live.clone(),
-            None,
         )?;
         Ok(ack)
     }
