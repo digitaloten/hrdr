@@ -326,6 +326,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A shell that is present but cannot run anything is no longer detected as
+  one.** `Shell::detect` answered from `which` alone, and on Windows that is
+  wrong: `C:\Windows\System32\bash.exe` is the **WSL launcher**, which exists on
+  a stock install whether or not a distro does. Every command then failed with a
+  UTF-16 error message and a non-zero exit, and the failure named neither WSL
+  nor hrdr — and because the stub **shadows Git Bash on `PATH`**, the machine
+  looked shell-less while a working `sh.exe` sat in the same directory as the
+  `bash.exe` that could not be used. Each candidate is now probed
+  (`<shell> -c "exit 0"` must succeed) and the answer cached for the process.
+
+  Found by reading CI rather than by a report: four `verify` tests had been
+  failing on the Windows runner, and the same break hit any Windows user with
+  the stub and no distro.
+
 - **A `git diff` that touches a credential file no longer prints its contents.**
   The per-line filter added with the tool-surface cut catches search output
   (`path:NN:…` naming a secret file) but not a diff, where `.env` is named

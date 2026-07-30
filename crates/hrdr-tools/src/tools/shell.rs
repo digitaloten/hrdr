@@ -33,16 +33,44 @@ pub enum Shell {
 }
 
 impl Shell {
-    /// Resolve the session's shell from `PATH`: `bash`, then POSIX `sh`. `None`
-    /// when neither exists (on Windows, install WSL or Git Bash).
+    /// Resolve the session's shell: `bash`, then POSIX `sh`, and **only if it
+    /// actually runs**. `None` when neither does (on Windows, install WSL properly
+    /// or Git Bash).
+    ///
+    /// Existence on `PATH` is not enough, and Windows is why. `C:\Windows\System32\
+    /// bash.exe` is the **WSL launcher**, which exists on a stock install whether or
+    /// not a distro does — so `which("bash")` succeeds, every command then fails with
+    /// a UTF-16 error message and a non-zero exit, and the failure names neither WSL
+    /// nor hrdr. It shadows Git Bash on `PATH`, so the machine looks shell-less while
+    /// a working `sh.exe` sits in the same directory as the `bash.exe` that could not
+    /// be used.
+    ///
+    /// So each candidate is *probed* — `<shell> -c "exit 0"` must succeed — and the
+    /// answer is cached for the process, because this costs a subprocess and the
+    /// answer cannot change under a running session.
     pub fn detect() -> Option<Shell> {
-        if which::which("bash").is_ok() {
-            Some(Shell::Bash)
-        } else if which::which("sh").is_ok() {
-            Some(Shell::Posix)
-        } else {
-            None
+        static SHELL: std::sync::OnceLock<Option<Shell>> = std::sync::OnceLock::new();
+        *SHELL.get_or_init(|| [Shell::Bash, Shell::Posix].into_iter().find(|s| s.runs()))
+    }
+
+    /// Whether this shell is on `PATH` **and** can run a trivial command.
+    ///
+    /// `exit 0` rather than `true`: it needs no external binary, so a shell whose
+    /// `PATH` is broken still answers honestly about itself. Stdio is nulled — a
+    /// probe must not print to the terminal a TUI owns — and any spawn error, any
+    /// signal, any non-zero status all read the same: not usable.
+    fn runs(self) -> bool {
+        if which::which(self.program()).is_err() {
+            return false;
         }
+        std::process::Command::new(self.program())
+            .args(self.invoke_args())
+            .arg("exit 0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
     }
 
     /// The interpreter program name.
@@ -875,6 +903,44 @@ pub fn available_shell_tools() -> Vec<std::sync::Arc<dyn Tool>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// **A shell that is present but cannot run anything is not a shell.**
+    ///
+    /// `detect` used to answer from `which` alone, which is wrong on Windows:
+    /// `System32\bash.exe` is the WSL launcher and exists whether or not a distro
+    /// does. Every command then failed with a UTF-16 error and a non-zero exit — and
+    /// it shadows Git Bash on `PATH`, so the machine looked shell-less while a usable
+    /// `sh.exe` sat beside the `bash.exe` that could not be used. Four `verify` tests
+    /// were failing on the Windows runner for exactly this, and the product was
+    /// broken the same way for any user with the stub and no distro.
+    ///
+    /// Asserted as the property, not the mechanism: whatever `detect` returns must
+    /// run a trivial command. On a host with no usable shell it returns `None`, and
+    /// there is nothing to check.
+    #[test]
+    fn a_detected_shell_can_actually_run_a_command() {
+        let Some(shell) = Shell::detect() else {
+            return; // no usable shell here — `None` is the honest answer
+        };
+        assert!(
+            shell.runs(),
+            "{shell:?} was detected but cannot run `exit 0`"
+        );
+        let out = std::process::Command::new(shell.program())
+            .args(shell.invoke_args())
+            .arg("echo probe")
+            .output()
+            .expect("the detected shell spawns");
+        assert!(out.status.success(), "{out:?}");
+        // UTF-8, not the UTF-16 the WSL stub emits — the shape that made the
+        // Windows failure so hard to read.
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "probe");
+        assert!(
+            !out.stdout.contains(&0),
+            "output must not be UTF-16: {:?}",
+            out.stdout
+        );
+    }
     use super::*;
 
     /// Every dialect answers the whole seam, and the answers agree with each
