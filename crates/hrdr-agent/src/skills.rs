@@ -77,12 +77,21 @@ pub struct Skill {
 }
 
 /// The skill directories to scan, in precedence order (highest first).
-fn skill_dirs(cwd: &Path) -> Vec<PathBuf> {
+///
+/// `project` decides whether the working tree's three directories are scanned at
+/// all — see [`ProjectInstructions`](crate::prompt::ProjectInstructions). They are
+/// the worst of the instruction surfaces to load from an untrusted repo: they are
+/// discovered **before** the built-ins and shadow them by name, with
+/// `model_invocable` defaulting true, so a repo shipping `.hrdr/skills/commit.md`
+/// replaces the vetted `:commit` outright.
+fn skill_dirs(cwd: &Path, project: crate::prompt::ProjectInstructions) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     // Project scopes (nearest / most specific) first.
-    dirs.push(cwd.join(".hrdr").join("skills"));
-    dirs.push(cwd.join(".claude").join("commands"));
-    dirs.push(cwd.join(".opencode").join("command"));
+    if project == crate::prompt::ProjectInstructions::Load {
+        dirs.push(cwd.join(".hrdr").join("skills"));
+        dirs.push(cwd.join(".claude").join("commands"));
+        dirs.push(cwd.join(".opencode").join("command"));
+    }
     // User scopes.
     if let Some(d) = crate::config_dir() {
         dirs.push(d.join("skills")); // ~/.config/hrdr/skills
@@ -106,7 +115,7 @@ fn skill_dirs(cwd: &Path) -> Vec<PathBuf> {
 /// built-ins are appended last, so any user or project file of the same name
 /// (e.g. a project's own `.hrdr/skills/commit.md`) is discovered first and
 /// shadows it.
-pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
+pub fn discover_skills(cwd: &Path, project: crate::prompt::ProjectInstructions) -> Vec<Skill> {
     let mut out: Vec<Skill> = Vec::new();
     // Aggregate budget across ALL skill dirs combined. Dirs are scanned in
     // precedence order (project before user), so exhausting the budget drops
@@ -114,7 +123,7 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
     let mut file_count: usize = 0;
     let mut total_bytes: usize = 0;
     let mut truncated = false;
-    for dir in skill_dirs(cwd) {
+    for dir in skill_dirs(cwd, project) {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -789,7 +798,7 @@ mod tests {
         std::fs::write(claude.join("review.md"), "review the diff").unwrap();
         std::fs::write(claude.join("notes.txt"), "not a skill").unwrap();
 
-        let skills = discover_skills(dir.path());
+        let skills = discover_skills(dir.path(), crate::prompt::ProjectInstructions::Load);
         let ship = skills.iter().find(|s| s.name == "ship").unwrap();
         assert_eq!(ship.body, "hrdr wins", "project .hrdr dir outranks .claude");
         assert!(skills.iter().any(|s| s.name == "review"));
@@ -861,7 +870,7 @@ mod tests {
     #[test]
     fn discover_skills_on_empty_cwd_returns_only_builtins() {
         let dir = tempfile::tempdir().unwrap();
-        let skills = discover_skills(dir.path());
+        let skills = discover_skills(dir.path(), crate::prompt::ProjectInstructions::Load);
         let mut names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         names.sort();
         assert_eq!(
@@ -884,7 +893,7 @@ mod tests {
         std::fs::create_dir_all(&hrdr).unwrap();
         std::fs::write(hrdr.join("commit.md"), "project commit wins").unwrap();
 
-        let skills = discover_skills(dir.path());
+        let skills = discover_skills(dir.path(), crate::prompt::ProjectInstructions::Load);
         let commit = skills.iter().find(|s| s.name == "commit").unwrap();
         assert_eq!(commit.body, "project commit wins");
         assert_ne!(commit.source, "built-in");
@@ -1063,7 +1072,7 @@ mod tests {
             )
             .unwrap();
         }
-        let skills = discover_skills(dir.path());
+        let skills = discover_skills(dir.path(), crate::prompt::ProjectInstructions::Load);
         let discovered = skills.iter().filter(|s| s.source != "built-in").count();
         assert_eq!(
             discovered, MAX_SKILLS,

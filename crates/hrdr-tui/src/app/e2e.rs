@@ -5665,7 +5665,10 @@ Run the release checklist for $ARGUMENTS",
     .unwrap();
     // The popup lists the skill (the App cache was built before the file
     // existed — refresh the way /reload and a cwd change do).
-    h.app.skills = hrdr_app::discover_skills(std::path::Path::new(&h.app.current_cwd()));
+    h.app.skills = hrdr_app::discover_skills(
+        std::path::Path::new(&h.app.current_cwd()),
+        hrdr_agent::ProjectInstructions::Load,
+    );
     h.type_str(":sh");
     let screen = h.render();
     assert!(screen.contains(":ship"), "popup lists the skill:\n{screen}");

@@ -6,7 +6,7 @@
 //! both invocation paths expand through the same code. Re-exported here so the
 //! frontends keep referring to `hrdr_app::Skill` / `hrdr_app::discover_skills`.
 
-pub use hrdr_agent::{Skill, builtin_skills, discover_skills, expand_skill};
+pub use hrdr_agent::{ProjectInstructions, Skill, builtin_skills, discover_skills, expand_skill};
 
 /// Case-insensitive fuzzy filter over skills for the `/skills` picker: the
 /// query's characters must appear in order within `"name description source"`.

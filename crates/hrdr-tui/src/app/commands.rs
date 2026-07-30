@@ -185,7 +185,10 @@ impl super::App {
     /// conversation (`/new`).
     fn reload_cmd(&mut self) {
         self.apply_config_reload(true);
-        self.skills = hrdr_app::discover_skills(&std::path::PathBuf::from(self.current_cwd()));
+        self.skills = hrdr_app::discover_skills(
+            &std::path::PathBuf::from(self.current_cwd()),
+            hrdr_agent::ProjectInstructions::Load,
+        );
     }
     /// `/goto <N | 5m | 1h | top | end>` — scroll the transcript to a message
     /// number, to the message nearest a relative time ago, or to top/bottom
@@ -491,7 +494,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.dir = hrdr_app::display_dir(new);
         self.app.branch = hrdr_app::git_branch(new);
         self.app.file_index_cwd = None; // rebuild @-completion for the new dir
-        self.app.skills = hrdr_app::discover_skills(new);
+        self.app.skills = hrdr_app::discover_skills(new, hrdr_agent::ProjectInstructions::Load);
     }
     fn timestamp_style(&self) -> hrdr_app::TimestampStyle {
         self.app.timestamp_style
@@ -539,7 +542,10 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         // `discover_skills` always returns hrdr's built-ins (`:commit`,
         // `:release`, `:review`) even in a cwd with no skill files of its own,
         // so the list is never empty — no "no skills yet" fallback needed here.
-        let skills = hrdr_app::discover_skills(&std::path::PathBuf::from(self.app.current_cwd()));
+        let skills = hrdr_app::discover_skills(
+            &std::path::PathBuf::from(self.app.current_cwd()),
+            hrdr_agent::ProjectInstructions::Load,
+        );
         self.app.skill_selector = Some(super::skill_selector(skills));
     }
     fn begin_model_selector(&mut self) {

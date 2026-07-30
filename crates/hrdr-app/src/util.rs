@@ -175,7 +175,10 @@ pub fn prepare_outgoing_tracked(
     // get the same expansion below.
     let expanded;
     let input = if input.trim_start().starts_with(':') {
-        match crate::expand_skill(input, &crate::discover_skills(cwd)) {
+        match crate::expand_skill(
+            input,
+            &crate::discover_skills(cwd, hrdr_agent::ProjectInstructions::Load),
+        ) {
             Some(prompt) => {
                 expanded = prompt;
                 expanded.as_str()

@@ -2453,17 +2453,11 @@ mod tests {
         SandboxNotices::default()
     }
 
-    /// Everything queued, in order, for the assertions that want the whole set.
-    ///
-    /// Only the Landlock degradation test queues more than one notice, and that
-    /// test is Linux-only — so off Linux this is dead code, and `-D warnings`
-
     /// Landlock really does block a write outside the roots.
     ///
-    /// The backend is forced: this machine picks bwrap whenever it can, so the
-    /// fallback would never run under `detect_backend`. The policy is a struct
-    /// literal for the same reason as slice 3/5 — a `for_agent` policy makes
-    /// `env::temp_dir()` writable and the "outside" tempdir with it.
+    /// The backend is forced rather than detected, so this arm runs on a kernel
+    /// without the LSM too. The policy is a struct literal because a `for_agent`
+    /// policy makes `env::temp_dir()` writable and the "outside" tempdir with it.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn landlock_blocks_writes_outside_roots() {

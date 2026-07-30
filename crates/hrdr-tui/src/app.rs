@@ -664,7 +664,10 @@ impl App {
             next_login_id: 0,
             browser_login_task: None,
             user_shell: None,
-            skills: hrdr_app::discover_skills(&cwd_for_skills),
+            skills: hrdr_app::discover_skills(
+                &cwd_for_skills,
+                hrdr_agent::ProjectInstructions::Load,
+            ),
             pending_goto: None,
             pending_scroll_entry: None,
             find: hrdr_app::FindState::default(),
@@ -1838,7 +1841,7 @@ impl App {
         self.dir = display_dir(&new);
         self.branch = git_branch(&new);
         self.file_index_cwd = None; // force a rebuild for the new directory
-        self.skills = hrdr_app::discover_skills(&new);
+        self.skills = hrdr_app::discover_skills(&new, hrdr_agent::ProjectInstructions::Load);
     }
 
     /// Apply the live-changeable settings from a (config, ui-config) pair. Does

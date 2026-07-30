@@ -1009,8 +1009,12 @@ Mostly-deletion first, so each slice is independently reviewable.
    → `jail` landed here, since the tool set is what makes jail jail. With no
    shell in jail, `STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE`, `DenialKind` (down to
    one arm, then deleted outright) and the GPU note went with it.
-5. **Mode → prompt surfaces.** No working-tree instructions in jail, gated at
-   discovery so `set_cwd` cannot re-seed.
+5. ~~**Mode → prompt surfaces.** No working-tree instructions in jail, gated at
+   discovery so `set_cwd` cannot re-seed.~~ **DONE** — the gate is a
+   `ProjectInstructions::{Load,Skip}` parameter on both discovery functions, so
+   every reader of the working tree has to answer the question. The mode also
+   briefs the model that tool input may be hostile; the fuller persona is
+   slice 7.
 6. **Unified tool-result wrapping.** Policy flag, registry choke point, per-tool
    opt-out, harness notes outside the envelope.
 7. **`sandbox` on agent profiles** + precedence + the `prisoner` agent and its

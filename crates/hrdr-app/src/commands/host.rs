@@ -342,7 +342,7 @@ pub trait CommandHost {
         // `discover_skills` always returns hrdr's built-ins (`:commit`,
         // `:release`, `:review`) even with no skill files on disk, so the list
         // is never empty — no "no skills yet" fallback needed here.
-        let skills = crate::discover_skills(&self.cwd());
+        let skills = crate::discover_skills(&self.cwd(), hrdr_agent::ProjectInstructions::Load);
         let mut s = format!("{} skills (invoke with :name [arguments]):", skills.len());
         for sk in skills {
             s.push_str(&format!("\n  :{}", sk.name));
