@@ -1103,7 +1103,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("a.txt"), "needle here").unwrap();
-        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Strict);
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Jail);
 
         let err = GrepTool::detect()
             .execute(

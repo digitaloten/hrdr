@@ -935,18 +935,21 @@ instructions.
 
 ### Sandbox
 
-Every agent runs confined, by default. hrdr runs arbitrary models and guidance
-only reaches steerable ones: the motivating incident was a delegated write
-sub-agent that `cd`'d out of its worktree and committed to the parent repo's
-`main`. So the boundary is enforced rather than requested.
+**Sandboxing is a cautionary tool, not a requirement.** An agent working in your
+project — main or delegated — is assumed to have authority over that project: it
+commits, it pushes, it installs dependencies. The sandbox stops it reaching
+_outside_ the project, and nothing else. hrdr runs arbitrary models and guidance
+only reaches steerable ones, so that outer boundary is enforced rather than
+requested.
 
 Each agent derives its mode once, at construction, from the session mode and its
 own permissions:
 
-- **`write`** (the default) — reads are unrestricted; writes are allowed only
-  under the agent's working directory, the temp dir, a per-session scratch dir,
-  the tool-output spill dir, the git metadata a linked worktree needs in order
-  to commit, and any `sandbox_writable_roots` you configure.
+- **`write`** (the default) — reads are unrestricted; writes are allowed under
+  the agent's working directory, the temp dir, a per-session scratch dir, the
+  tool-output spill dir, the git metadata a linked worktree needs in order to
+  commit, **the package-manager caches** (see below), and any
+  `sandbox_writable_roots` you configure.
 - **`read`** — what a read-only agent or `--agent` profile gets automatically:
   reads are unrestricted, and **no writes are permitted anywhere** (there is no
   writable root at all). "Read-only" restricts writing, not reading — the same
@@ -954,49 +957,85 @@ own permissions:
   read-only agent has a shell, and the tools it must run (`git`, a linter, a
   formatter) live outside the workspace — under `~/.cargo/bin`, a
   version-managed node, a Homebrew or Nix prefix.
-- **`strict`** — opt-in, the strongest confinement hrdr has: as `read`, plus
-  reads confined to the cwd, scratch and tool-output dirs. Everything else is
-  not merely unwritable but **absent** (ENOENT, not EROFS). The price is that
-  the agent's shell sees only the system toolchain, so anything installed under
-  `$HOME` reports `command not found`. Choose it when confining reads matters
-  more than running the user's tools.
+- **`jail`** — opt-in, the strongest confinement hrdr has, for **auditing code
+  you do not trust**. Writes nothing, reads only its own working directory and
+  its own output dir, and holds **only the read-only tools**: `read`, `grep`,
+  `find`, `ls`, `tree`. No shell, no `verify`, no LSP, no `web_fetch`/
+  `web_search`, no MCP, no `task`, no `memory`. _You read, you do not run._ With
+  nothing that spawns a subprocess, the confinement is entirely in-process, so
+  it needs no OS backend and works identically on every platform.
 - **`none`** (also spelled **`yolo`** or `off`; `--yolo` / `--no-sandbox`) — no
   confinement; exactly the pre-sandbox behavior.
 
-Two layers enforce it. The file tools (`write`, `edit`, `replace`, `move`,
-`copy`, `delete`, `read`, `grep`, `ls`, `tree`, `lsp_nav`) check every path the
-model hands them — symlinks and `..` resolved first — and refuse with
+Two layers enforce it. The file tools check every path the model hands them —
+symlinks and `..` resolved first — and refuse with
 `sandbox: refusing to write <path> — it is outside this agent's writable roots. You may write only under: …`.
-That guard can only see paths a tool is given, so `shell` and `watch` children
-are confined by the OS instead:
+That guard can only see paths a tool is given, so `shell` children are confined
+by the OS instead:
 
-| Platform                       | Backend                            | What a violation looks like                                                                                                                                                                               |
-| ------------------------------ | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Linux**                      | `bwrap` (bubblewrap)               | `write`: the filesystem is read-only except the writable roots → `Read-only file system`. `read`: only `/usr`, `/etc`, a private `/tmp` and the readable roots exist at all → `No such file or directory` |
-| **Linux** without bwrap/userns | Landlock                           | writes outside the roots → `Permission denied`; Landlock has no read axis, so a read-only agent's shell is write-confined only                                                                            |
-| **macOS**                      | `/usr/bin/sandbox-exec` (Seatbelt) | write outside the roots → `Operation not permitted`                                                                                                                                                       |
-| **Windows**                    | none                               | file tools stay guarded; shell commands are **not** OS-confined                                                                                                                                           |
+| Platform    | Backend                            | What a violation looks like                                                           |
+| ----------- | ---------------------------------- | ------------------------------------------------------------------------------------- |
+| **Linux**   | Landlock (kernel 5.13+)            | a write outside the roots → `Permission denied`                                       |
+| **macOS**   | `/usr/bin/sandbox-exec` (Seatbelt) | a write outside the roots → `Operation not permitted`                                 |
+| **Windows** | none                               | file tools stay guarded; shell commands are **not** OS-confined, and a notice says so |
 
-hrdr never pretends to confine more than it does: every degradation surfaces
-once per session as a notice —
-`sandbox: bwrap not found — falling back to Landlock: …`,
+hrdr never pretends to confine more than it does: a machine with no backend
+surfaces a notice —
 `sandbox: no OS-level sandbox is available on this system — shell commands are NOT OS-confined; …`.
-The network is untouched in every mode, and the environment is inherited whole,
-so `PATH`, `HOME`, `CARGO_HOME` and ordinary builds behave as before.
+Landlock has no read axis, so `jail`'s read confinement is the in-process guard
+rather than a mount — which is why it holds no tool that could spawn a shell.
+
+**The network is never confined, in any mode**, and the environment is inherited
+whole, so `PATH`, `HOME`, `CARGO_HOME` and ordinary builds behave as before.
+
+#### Dependency fetches work out of the box
+
+`write` mode grants the package-manager caches, because it has to: a
+`cargo build` on an uncached dependency _downloads the crate successfully_ and
+then dies with `Read-only file system` writing it into
+`$CARGO_HOME/registry/cache`, and `npm i` fails the same way on
+`~/.npm/_cacache`. Granted, resolving every env-var override (`CARGO_HOME`,
+`RUSTUP_HOME`, `GOMODCACHE`, `GRADLE_USER_HOME`, `NUGET_PACKAGES`, `PUB_CACHE`,
+`XDG_CACHE_HOME`, …) rather than hardcoding a home-relative path:
+
+| Ecosystem | Granted                                                                                              |
+| --------- | ---------------------------------------------------------------------------------------------------- |
+| _all_     | `$XDG_CACHE_HOME` (pip, uv, deno, `go-build`, yarn v1, composer, cabal), `~/Library/Caches` on macOS |
+| Rust      | `$CARGO_HOME/{registry,git}`, `$RUSTUP_HOME/{toolchains,downloads,tmp,update-hashes}`                |
+| Node      | `~/.npm`, `~/.node-gyp`, the pnpm store, `~/.yarn/berry/cache`, `~/.bun/install/cache`               |
+| Python    | `$UV_CACHE_DIR`, `$PIP_CACHE_DIR`, poetry venvs, pipx                                                |
+| Go        | `$GOMODCACHE` / `$GOPATH/pkg/mod`, `$GOCACHE`                                                        |
+| JVM       | `~/.m2/repository`, `$GRADLE_USER_HOME/{caches,wrapper}`                                             |
+| .NET      | `$NUGET_PACKAGES` / `~/.nuget/packages`                                                              |
+| Ruby      | `~/.local/share/gem`, `~/.gem/ruby`, `~/.bundle/cache`                                               |
+| Dart      | `$PUB_CACHE` / `~/.pub-cache`                                                                        |
+| Elixir    | `~/.hex/packages`, `~/.mix`                                                                          |
+| Haskell   | `$STACK_ROOT` / `~/.stack`, `~/.cabal/packages`                                                      |
+
+Never the tool's **home** directory, only its cache: `~/.local/share/uv` holds
+`credentials/`, and `~/.m2`, `~/.gradle`, `~/.gem`, `~/.bundle` and
+`~/.composer` are all credential-bearing. Never a directory on **`PATH`**
+(`$CARGO_HOME/bin`, `$GOPATH/bin`, `~/.local/bin`) — a binary there is a
+persistence vector, so `cargo install` and `go install` are refused by default,
+with the denial note naming the flag. A missing cache root is created, but only
+inside a layout that already exists, so hrdr does not scatter empty directories
+through the home of anyone who runs it once.
 
 ```toml
-sandbox = "write"          # write (default) | read | none
+sandbox = "write"          # write (default) | read | jail | none
                            # env HRDR_SANDBOX, flags --sandbox <mode> / --no-sandbox
 sandbox_writable_roots = [ # absolute paths only (a relative entry is a config error)
-  "/home/me/.cargo",       # a cold `cargo build` writes to the registry…
-  "/home/me/.npm",         # …and `npm install` to the npm cache
+  "/opt/shared-cache",     # a bespoke layout the defaults do not cover
 ]
 ```
 
-The narrow escape hatch is `sandbox_writable_roots`: package caches are
-deliberately _not_ writable by default, so a cold `cargo build`/`npm install` in
-a fresh worktree hits a read-only filesystem until you grant them. The blunt one
-is `--no-sandbox` (or `sandbox = "none"`), which restores full access exactly.
+`sandbox_writable_roots` — and `--sandbox-writable-root <PATH>`, repeatable —
+are the escape hatch for a **bespoke** layout, not the mechanism by which
+mainstream tooling becomes usable; both append to the defaults rather than
+replacing them. The blunt hatch is `--no-sandbox` (or `sandbox = "none"`), which
+restores full access exactly. `!<command>` always runs unconfined, as you: a
+command _you_ typed carries your authority, not the agent's.
+
 Broad reads in `write` mode are equally deliberate — builds read all over the
 disk — which means a **shell** command can still read `~/.ssh`; the
 credential-file guard below covers the file tools, not the shell.

@@ -8,6 +8,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- **`sandbox = "strict"` is now `sandbox = "jail"`, and jail holds only the
+  read-only tools.** A jailed agent gets exactly `read`, `grep`, `find`, `ls`,
+  `tree` — no `shell`, no `verify`, no LSP, no `web_fetch`/`web_search`, no MCP,
+  no `task`, no `memory`. _You read, you do not run._
+
+  What is absent is the point. `web_fetch`, `web_search` and MCP tools run **in
+  the hrdr parent process, outside the sandbox**, so an agent holding them had a
+  fully working network egress no filesystem rule touched — the confinement was
+  a fiction. `task` launders work through a child in a laxer mode; `memory`
+  writes outside the roots by design; `shell` and `verify` spawn children the
+  in-process read guard cannot see into.
+
+  The cap belongs to the **mode**, is applied **last**, and can only narrow: a
+  profile's explicit `tools:` list asking for `shell` gets the cap anyway,
+  because otherwise one edit to one agent file silently puts a network inside
+  the jail.
+
+  Two consequences worth stating. Jail's tool set is **not a subset** of the
+  normal one — `grep`/`find`/`tree`/`ls` exist for this mode, since every other
+  mode has `shell` — so a later "cleanup" that reconciles them is wrong in both
+  directions. And with nothing that spawns a subprocess, jail's confinement is
+  **entirely in-process**: it needs no OS backend and behaves identically on
+  every platform, which is what let the last Landlock degradation notice go.
+
+  Per the pre-1.0 rule there is no alias: `sandbox = "strict"` is simply an
+  unrecognised value and fails the existing schema check with the standard
+  unknown-value error.
+
+- **`DenialKind` is gone; `sandbox_denial_note` is the whole API.** It existed
+  so `shell` could decide whether to offer a run outside the sandbox. With
+  escalation gone there is nothing to decide, and every kind but one described a
+  confinement that no longer exists: the network denial, the ssh/user-namespace
+  complaint, and the GPU node hidden by jail's mount set. A refused write is the
+  only thing the sandbox explains now — and a note asserting the sandbox over a
+  genuine local problem (an `~/.ssh/config` that really is group-writable, a
+  machine that really has no GPU) is worse than no note at all.
+
 - **bwrap is deleted. Linux confines with Landlock, macOS with Seatbelt, and
   nothing else needs installing.** bwrap had exactly two capabilities Landlock
   lacks — mount-based read confinement, and a complete network denial via

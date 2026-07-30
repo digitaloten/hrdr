@@ -1753,7 +1753,7 @@ impl AgentConfig {
 pub fn effective_sandbox(session: SandboxMode, read_only: bool) -> SandboxMode {
     match (session, read_only) {
         (SandboxMode::None, _) => SandboxMode::None,
-        (SandboxMode::Strict, true) => SandboxMode::Strict,
+        (SandboxMode::Jail, true) => SandboxMode::Jail,
         (_, true) => SandboxMode::Read,
         (_, false) => SandboxMode::Write,
     }
@@ -2424,11 +2424,11 @@ mod sandbox_tests {
         // still floors write-capable ones at `write` — otherwise a strict
         // session could not run a coder at all.
         assert_eq!(
-            effective_sandbox(SandboxMode::Strict, true),
-            SandboxMode::Strict
+            effective_sandbox(SandboxMode::Jail, true),
+            SandboxMode::Jail
         );
         assert_eq!(
-            effective_sandbox(SandboxMode::Strict, false),
+            effective_sandbox(SandboxMode::Jail, false),
             SandboxMode::Write
         );
         // `none`/`yolo` is the global opt-out and wins for every agent.
@@ -2501,8 +2501,8 @@ mod sandbox_tests {
         assert_eq!(cfg.sandbox, SandboxMode::Read, "trimmed, case-insensitive");
         setter(&mut cfg, "none").unwrap();
         assert_eq!(cfg.sandbox, SandboxMode::None);
-        setter(&mut cfg, "strict").unwrap();
-        assert_eq!(cfg.sandbox, SandboxMode::Strict);
+        setter(&mut cfg, "jail").unwrap();
+        assert_eq!(cfg.sandbox, SandboxMode::Jail);
         // `yolo` and `off` are spellings of `none`, not modes of their own —
         // turning the sandbox off is one behavior, and it renders back as `none`.
         for spelling in ["yolo", "off", "YOLO"] {
@@ -2517,7 +2517,7 @@ mod sandbox_tests {
 
         setter(&mut cfg, "write").unwrap();
         let reason = setter(&mut cfg, "wrote").expect_err("garbage is reported");
-        assert!(reason.contains("write, read, strict, or none"), "{reason}");
+        assert!(reason.contains("write, read, jail, or none"), "{reason}");
         assert_eq!(
             cfg.sandbox,
             SandboxMode::Write,

@@ -46,21 +46,32 @@ pub enum SandboxMode {
     /// over the filesystem (`~/.cargo/bin`, a nvm/fnm node, a Homebrew or Nix
     /// prefix, a mason symlink farm). This mode used to confine reads too, which
     /// left an agent's shell able to see only `/usr` and `/etc` — "command not
-    /// found" for tools that are plainly installed. [`Strict`](Self::Strict) is
-    /// that behavior, kept and made opt-in.
+    /// found" for tools that are plainly installed. [`Jail`](Self::Jail) is that
+    /// behavior, kept and made opt-in.
     Read,
-    /// Read only within the readable roots (cwd + scratch + tool-output), write
-    /// nowhere. The strongest confinement hrdr has, and **opt-in**
-    /// (`sandbox = "strict"`).
+    /// Read only within the readable roots (its working directory and its own
+    /// output dir), write nowhere, and hold **only the read-only tools** — no
+    /// `shell`, no `verify`, no LSP, no `web_fetch`/`web_search`, no MCP, no
+    /// `task`, no `memory`. *You read, you do not run.*
     ///
-    /// Everything else is not merely unwritable but ABSENT — an outside path is
-    /// ENOENT rather than EROFS, so nothing outside the workspace can be read at
-    /// all. The price is that the agent's shell has only the system toolchain
-    /// (`/usr`, `/etc`): anything installed under `$HOME` is invisible, and a
-    /// build that needs a rustup toolchain or a node from a version manager
-    /// cannot run. Choose it when confining reads matters more than running the
-    /// user's tools.
-    Strict,
+    /// The strongest confinement hrdr has, and **opt-in** (`sandbox = "jail"`).
+    /// It exists for one job: inspecting third-party code you are unwilling to
+    /// expose to. The threat is not that the agent is untrustworthy — it is that
+    /// **the code it reads may act through it**, so a project-wide readable root
+    /// would let audited content saying "append `../../.env` to your report" be
+    /// complied with.
+    ///
+    /// Confinement is entirely **in-process**, which is what makes it work on
+    /// every platform with no OS backend at all: with nothing that spawns a
+    /// subprocess, [`check_read`](SandboxPolicy::check_read) on the canonical path
+    /// is the whole boundary. That is also the honest answer to why nothing is
+    /// writable — with no execution there is nothing that needs a writable
+    /// `/tmp`.
+    ///
+    /// The accepted loss is `git log` on the audited repo, real provenance value.
+    /// That argues for a narrow read-only git capability later, not a general
+    /// shell now.
+    Jail,
 }
 
 impl SandboxMode {
@@ -70,7 +81,7 @@ impl SandboxMode {
             SandboxMode::None => "none",
             SandboxMode::Write => "write",
             SandboxMode::Read => "read",
-            SandboxMode::Strict => "strict",
+            SandboxMode::Jail => "jail",
         }
     }
 }
@@ -82,7 +93,7 @@ impl std::str::FromStr for SandboxMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "write" => Ok(SandboxMode::Write),
             "read" => Ok(SandboxMode::Read),
-            "strict" => Ok(SandboxMode::Strict),
+            "jail" => Ok(SandboxMode::Jail),
             // `yolo` is a SPELLING of `none`, not a fourth behavior: turning the
             // sandbox off is already exactly one thing, and two modes that did
             // the same thing under different names would be a bug waiting to be
@@ -91,7 +102,7 @@ impl std::str::FromStr for SandboxMode {
             // `none` stays canonical — it is what `as_str`/`Display` render.
             "none" | "yolo" | "off" => Ok(SandboxMode::None),
             other => Err(format!(
-                "unknown sandbox mode {other:?} — expected write, read, strict, or none \
+                "unknown sandbox mode {other:?} — expected write, read, jail, or none \
                  (aka yolo/off)"
             )),
         }
@@ -156,7 +167,7 @@ impl SandboxPolicy {
     /// and deduped (a root already under an earlier root is dropped).
     ///
     /// Readable roots (`cwd`, scratch, tool-output) are only ever CONSULTED in
-    /// [`SandboxMode::Strict`] — the one mode that confines reads. `Read` and
+    /// [`SandboxMode::Jail`] — the one mode that confines reads. `Read` and
     /// `Write` both read broadly, so they carry the list but never check it.
     ///
     /// Non-existent `extras` are skipped silently — a user config typo is not
@@ -170,26 +181,26 @@ impl SandboxPolicy {
         let output = tool_output_dir();
         let readable_roots =
             canonical_roots(vec![cwd.to_path_buf(), scratch.clone(), output.clone()]);
-        let (writable_roots, cache_roots) =
-            if matches!(mode, SandboxMode::Read | SandboxMode::Strict) {
-                (Vec::new(), Vec::new())
-            } else {
-                let caches = package_cache_roots();
-                let mut roots = vec![cwd.to_path_buf(), std::env::temp_dir(), scratch, output];
-                roots.extend(git_metadata_roots(cwd));
-                roots.extend(caches.iter().cloned());
-                roots.extend(extras.iter().filter(|p| p.exists()).cloned());
-                let roots = canonical_roots(roots);
-                // Labelled *after* canonicalization and intersected with what
-                // survived it, so a cache root that a broader root swallowed (a
-                // session whose cwd is `$HOME`) is not claimed as a separate root
-                // the prompt then omits.
-                let caches = canonical_roots(caches)
-                    .into_iter()
-                    .filter(|c| roots.contains(c))
-                    .collect();
-                (roots, caches)
-            };
+        let (writable_roots, cache_roots) = if matches!(mode, SandboxMode::Read | SandboxMode::Jail)
+        {
+            (Vec::new(), Vec::new())
+        } else {
+            let caches = package_cache_roots();
+            let mut roots = vec![cwd.to_path_buf(), std::env::temp_dir(), scratch, output];
+            roots.extend(git_metadata_roots(cwd));
+            roots.extend(caches.iter().cloned());
+            roots.extend(extras.iter().filter(|p| p.exists()).cloned());
+            let roots = canonical_roots(roots);
+            // Labelled *after* canonicalization and intersected with what
+            // survived it, so a cache root that a broader root swallowed (a
+            // session whose cwd is `$HOME`) is not claimed as a separate root
+            // the prompt then omits.
+            let caches = canonical_roots(caches)
+                .into_iter()
+                .filter(|c| roots.contains(c))
+                .collect();
+            (roots, caches)
+        };
         Self {
             mode,
             writable_roots,
@@ -263,7 +274,7 @@ impl SandboxPolicy {
     /// "writes nowhere", not "reads nowhere", so like `Write` it reads broadly
     /// (builds and review tools read all over the filesystem).
     pub fn check_read(&self, canon: &Path, shown: &Path) -> anyhow::Result<()> {
-        if self.mode != SandboxMode::Strict || is_under_any(canon, &self.readable_roots) {
+        if self.mode != SandboxMode::Jail || is_under_any(canon, &self.readable_roots) {
             return Ok(());
         }
         anyhow::bail!(
@@ -788,19 +799,6 @@ const NO_OS_SANDBOX_NOTICE: &str = "sandbox: no OS-level sandbox is available on
      shell commands are NOT OS-confined; the file tools remain guarded. Use --sandbox none to \
      silence this.";
 
-/// Emitted in addition to the fallback notice when a **strict-mode** agent runs
-/// a shell command on Landlock: the ruleset confines writes only, so this agent
-/// is quietly weaker than its mode claims — say so, loudly.
-///
-/// `Read` is deliberately NOT here. It means "read broadly, write nowhere",
-/// which is precisely what a Landlock ruleset with no writable roots expresses,
-/// so a read-only agent loses nothing on this backend. Only `Strict`, which asks
-/// for reads to be confined, is weakened by it.
-#[cfg(target_os = "linux")]
-const STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE: &str = "sandbox: Landlock cannot confine reads — this \
-     strict-mode agent's shell commands are write-confined only, so paths outside its readable \
-     roots remain readable.";
-
 /// The OS mechanism available to confine *shell children* on this machine.
 ///
 /// The file tools are guarded in-process regardless; this is only about the
@@ -913,83 +911,18 @@ pub(crate) fn gpu_device_nodes() -> Vec<std::path::PathBuf> {
     Vec::new()
 }
 
-/// Which confinement produced a failure — the machine-readable half of
-/// [`sandbox_denial`], so a caller can decide what to *do* about it rather than
-/// only what to say.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DenialKind {
-    /// A GPU node missing under `strict`.
-    GpuStrict,
-    /// An ordinary EROFS: a write outside this agent's roots.
-    WriteOutsideRoots,
-}
-
-/// A recognized sandbox denial: what it was, and the note explaining it.
-#[derive(Debug, Clone)]
-pub struct SandboxDenial {
-    pub kind: DenialKind,
-    /// The text appended to the command's output, leading newlines included.
-    pub note: String,
-}
-
-/// The note alone, for callers that only report.
+/// The note alone — the only thing any caller wants, now that there is exactly one
+/// kind of denial to report.
+///
+/// There used to be a `DenialKind` beside it, so `shell` could decide what to *do*
+/// about a failure: offer to re-run the command outside the sandbox, or not. With
+/// escalation gone there is nothing to decide, and the network and ssh kinds went
+/// with the confinements that caused them. Explaining the failure is the whole job.
 pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<String> {
-    sandbox_denial(policy, output).map(|denial| denial.note)
-}
-
-/// Recognize a failure the sandbox caused, and say both what it was and why.
-///
-/// The confinement is a read-only bind mount, so a blocked write surfaces as
-/// `EROFS` / "Read-only file system" — from deep inside whatever tool was
-/// running, describing a path the model never mentioned. That reads as a broken
-/// or missing tool, and a model acts on it as one.
-///
-/// The case this was written for: `npx prettier --write …` on a machine where
-/// `prettier` is installed and on `PATH`. `npx` ignored it, tried to fetch the
-/// package into `~/.npm/_cacache`, and got `EROFS`. The model concluded
-/// "prettier is not available in this environment" — a false statement about the
-/// machine — and silently skipped formatting the file it had just written.
-///
-/// Every arm is deliberately narrow: only `EROFS`/"read-only file system"
-/// triggers the write case, because those are all but unheard of on a
-/// developer's box outside a sandbox, whereas a bare "Permission denied" is a
-/// normal error this must not editorialize over. `None` when unconfined, or when
-/// nothing in the output matches.
-pub fn sandbox_denial(policy: &SandboxPolicy, output: &str) -> Option<SandboxDenial> {
-    fn denial(kind: DenialKind, note: String) -> Option<SandboxDenial> {
-        Some(SandboxDenial { kind, note })
-    }
     if policy.mode == SandboxMode::None {
         return None;
     }
     let lower = output.to_ascii_lowercase();
-    // A GPU node missing under `strict` — the one mode that deliberately does not
-    // bind them. Checked before the write case because the failure reads nothing
-    // like a write refusal: HIP/CUDA report a missing device or "no agents
-    // found", which is indistinguishable from a machine that genuinely has no
-    // card, and an agent that believes that goes off to work around it.
-    if policy.mode == SandboxMode::Strict
-        && [
-            "/dev/kfd",
-            "/dev/nvidia",
-            "/dev/dri",
-            "hsa_status",
-            "no rocm",
-            "no cuda",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
-    {
-        return denial(
-            DenialKind::GpuStrict,
-            "\n\n[sandbox] `strict` mode does not bind GPU devices (`/dev/kfd`, `/dev/dri`, \
-             `/dev/nvidia*`), so a card that exists on this host is invisible in here. This is \
-             not a machine without a GPU and not a broken driver — it is the confinement this \
-             mode asks for. `write` and `read` mode both pass the devices through; if this work \
-             needs the GPU, say so rather than reporting the hardware as absent."
-                .to_string(),
-        );
-    }
     if !lower.contains("read-only file system") && !lower.contains("erofs") {
         return None;
     }
@@ -1002,19 +935,16 @@ pub fn sandbox_denial(policy: &SandboxPolicy, output: &str) -> Option<SandboxDen
             policy.cache_roots_clause(),
         )
     };
-    denial(
-        DenialKind::WriteOutsideRoots,
-        format!(
-            "\n\n[sandbox] the \"read-only file system\" above is hrdr's sandbox refusing a write \
-         outside this agent's roots — {where_writable}. The program is installed and working; \
-         it tried to write somewhere it may not. If it was a package runner fetching a tool \
-         (`npx`, `uvx`, `pipx`), run the copy already on PATH instead of downloading one. If the \
-         write is genuinely needed, say so and name the directory — the user can allow it with \
+    Some(format!(
+        "\n\n[sandbox] the \"read-only file system\" above is hrdr's sandbox refusing a write \
+         outside this agent's roots — {where_writable}. The program is installed and working; it \
+         tried to write somewhere it may not. If it was a package runner fetching a tool (`npx`, \
+         `uvx`, `pipx`), run the copy already on PATH instead of downloading one. If the write is \
+         genuinely needed, say so and name the directory — the user can allow it with \
          `sandbox_writable_roots` in the config or `--sandbox-writable-root <PATH>` on the \
          command line, and they can run the command themselves with `!<command>` — but do not \
          report the tool as missing or broken."
-        ),
-    )
+    ))
 }
 
 /// The command `shell`/`watch` actually spawn: `cmd_str` run through `shell`,
@@ -1024,11 +954,10 @@ pub fn sandbox_denial(policy: &SandboxPolicy, output: &str) -> Option<SandboxDen
 /// byte-identical to the pre-sandbox behavior.
 ///
 /// The caller still owns cwd, stdio, timeouts and process groups: every backend
-/// left inherits the cwd, passes stdio through untouched, propagates the child's
+/// left inherits the cwd (there is nothing for this to pass down — bwrap needed a
+/// `--chdir` and is gone), passes stdio through untouched, propagates the child's
 /// exit status, and the existing group-kill still reaches every descendant.
 ///
-/// The caller keeps owning cwd — every backend left inherits the process's, so
-/// there is nothing for this to pass down (bwrap needed a `--chdir` and is gone).
 /// `notices` is the **calling agent's** channel
 /// ([`crate::ToolContext::sandbox_notices`]): every degradation this discovers is
 /// owed to that agent and to no other.
@@ -1050,17 +979,12 @@ pub fn sandboxed_shell_command(
 /// it — the Seatbelt arm on Linux, the Landlock arm on a kernel without the LSM —
 /// which is otherwise code no test could execute.
 ///
-/// Every arm that ends up running a command with less confinement than the
-/// mode asks for sets its §5 notice *first* — the one rule this layer may
-/// never break is pretending to sandbox — and it sets it on the **calling
-/// agent's** `notices`, so a sibling that never ran a shell command is not told
-/// its own sandbox degraded, and one that did is not silenced by whoever got
-/// here first.
-///
-/// [`detection`] is still cached process-wide: caching the *probe* is right (it
-/// spawns a process), and it costs no agent its notice, because every arm reads
-/// the cached `degraded` reason again on every call rather than announcing it
-/// once at detection time.
+/// An arm that ends up running a command with no confinement at all sets its
+/// notice *first* — the one rule this layer may never break is pretending to
+/// sandbox — and it sets it on the **calling agent's** `notices`, so a sibling
+/// that never ran a shell command is not told its own sandbox degraded, and one
+/// that did is not silenced by whoever got here first. Backend detection is cached
+/// process-wide; the notice is not, so every command re-earns it.
 fn shell_command_with_backend(
     backend: OsSandboxBackend,
     shell: crate::Shell,
@@ -1070,15 +994,7 @@ fn shell_command_with_backend(
 ) -> tokio::process::Command {
     match backend {
         #[cfg(target_os = "linux")]
-        OsSandboxBackend::Landlock => {
-            // Landlock has no read axis. `Read` does not need one (no writable
-            // roots IS the whole mode), but `Strict` does — so only it gets the
-            // explicit admission of the gap.
-            if policy.mode == SandboxMode::Strict {
-                notices.set(STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE.to_string());
-            }
-            landlock_command(shell, cmd_str, policy)
-        }
+        OsSandboxBackend::Landlock => landlock_command(shell, cmd_str, policy),
         // `Landlock` is unreachable off Linux (detection never returns it),
         // but the variant exists on every platform, so the arm must too.
         #[cfg(not(target_os = "linux"))]
@@ -1297,7 +1213,7 @@ fn seatbelt_profile(mode: SandboxMode, policy: &SandboxPolicy) -> String {
                 profile.push_str(&format!("(allow file-write* {writes})\n"));
             }
         }
-        SandboxMode::Strict => {
+        SandboxMode::Jail => {
             let reads = subpaths(&policy.readable_roots);
             let reads = if reads.is_empty() {
                 String::new()
@@ -1542,41 +1458,35 @@ mod tests {
         }
     }
 
-    /// Which confinement each recognised failure is attributed to. The kinds are
-    /// what a caller switches on, so a note that named the right cause under the
-    /// wrong kind would still mislead anything acting on it.
+    /// **A refused write is the only thing the sandbox explains, and it names the
+    /// remedy.** Everything else that used to get a note — a resolver failure, an
+    /// ssh ownership complaint, a GPU node missing under jail — belonged to a
+    /// confinement that no longer exists, and a note asserting the sandbox over a
+    /// real local problem is worse than no note at all.
     #[test]
-    fn each_denial_is_attributed_to_the_confinement_that_caused_it() {
+    fn only_a_refused_write_is_explained_and_the_remedy_is_named() {
         let dir = tempfile::tempdir().unwrap();
-
         let write = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
-        let erofs = sandbox_denial(&write, "EROFS: read-only file system").expect("recognized");
-        assert_eq!(erofs.kind, DenialKind::WriteOutsideRoots);
-        // The remedy is named, not just the cause: an error that explains itself
-        // and withholds the fix is half an error.
-        assert!(
-            erofs.note.contains("--sandbox-writable-root"),
-            "{}",
-            erofs.note
-        );
 
-        // Not ours any more: the network is never confined, and the ssh
-        // ownership complaint died with the user namespace that caused it.
+        let note = sandbox_denial_note(&write, "EROFS: read-only file system").expect("explained");
+        assert!(note.contains("[sandbox]"), "{note}");
+        // An error that explains the cause and withholds the fix is half an error.
+        assert!(note.contains("--sandbox-writable-root"), "{note}");
+        assert!(note.contains("sandbox_writable_roots"), "{note}");
+        assert!(note.contains("!<command>"), "{note}");
+
         for foreign in [
             "curl: (6) Could not resolve host: example.com",
             "Bad owner or permissions on /etc/ssh/ssh_config",
+            "hipErrorNoDevice: failed to open /dev/kfd",
         ] {
             assert_eq!(sandbox_denial_note(&write, foreign), None, "{foreign}");
         }
-
-        let strict = SandboxPolicy::for_agent(SandboxMode::Strict, dir.path(), &[]);
-        let gpu = sandbox_denial(&strict, "failed to open /dev/kfd").expect("recognized");
-        assert_eq!(gpu.kind, DenialKind::GpuStrict);
-
-        // The note half is unchanged by the split — same text, same callers.
+        // …in every mode, including the one that used to claim the GPU case.
+        let jail = SandboxPolicy::for_agent(SandboxMode::Jail, dir.path(), &[]);
         assert_eq!(
-            sandbox_denial_note(&write, "EROFS: read-only file system").as_deref(),
-            Some(erofs.note.as_str())
+            sandbox_denial_note(&jail, "hipErrorNoDevice: failed to open /dev/kfd"),
+            None
         );
     }
 
@@ -1616,7 +1526,7 @@ mod tests {
     #[test]
     fn a_network_failure_is_never_attributed_to_the_sandbox() {
         let dir = tempfile::tempdir().unwrap();
-        for mode in [SandboxMode::Write, SandboxMode::Read, SandboxMode::Strict] {
+        for mode in [SandboxMode::Write, SandboxMode::Read, SandboxMode::Jail] {
             let policy = SandboxPolicy::for_agent(mode, dir.path(), &[]);
             for failure in [
                 "curl: (6) Could not resolve host: api.example.com",
@@ -1710,7 +1620,7 @@ mod tests {
     #[test]
     fn strict_mode_refuses_reads_outside_roots_and_allows_cwd() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = SandboxPolicy::for_agent(SandboxMode::Strict, dir.path(), &[]);
+        let policy = SandboxPolicy::for_agent(SandboxMode::Jail, dir.path(), &[]);
 
         check_read(&policy, &dir.path().join("notes.md")).unwrap();
         check_read(&policy, &session_scratch_dir().join("probe")).unwrap();
@@ -1945,28 +1855,6 @@ mod tests {
         );
     }
 
-    /// A GPU failure under `strict` reads exactly like a machine with no GPU —
-    /// HIP says the device is missing, not that a sandbox hid it — so the note
-    /// has to name the cause. Under the modes that DO bind the devices there is
-    /// nothing to explain, and saying it anyway would be wrong.
-    #[test]
-    fn a_missing_gpu_under_strict_is_explained_as_the_sandbox() {
-        let dir = tempfile::tempdir().unwrap();
-        let strict = SandboxPolicy::for_agent(SandboxMode::Strict, dir.path(), &[]);
-        let note = sandbox_denial_note(&strict, "hipErrorNoDevice: failed to open /dev/kfd")
-            .expect("strict must explain a hidden GPU");
-        assert!(note.contains("does not bind GPU devices"), "{note}");
-        assert!(note.contains("not a machine without a GPU"), "{note}");
-
-        for mode in [SandboxMode::Write, SandboxMode::Read] {
-            let policy = SandboxPolicy::for_agent(mode, dir.path(), &[]);
-            assert!(
-                sandbox_denial_note(&policy, "failed to open /dev/kfd").is_none(),
-                "{mode:?} binds the devices — a failure there is not the sandbox"
-            );
-        }
-    }
-
     #[test]
     fn seatbelt_profile_lists_every_writable_root() {
         let policy = SandboxPolicy {
@@ -2056,7 +1944,7 @@ mod tests {
                 "(allow network*)\n",
             )
         );
-        for mode in [SandboxMode::Read, SandboxMode::Strict] {
+        for mode in [SandboxMode::Read, SandboxMode::Jail] {
             assert!(
                 seatbelt_profile(mode, &policy).contains("(allow network*)"),
                 "{mode} must not confine the network"
@@ -2069,13 +1957,13 @@ mod tests {
     #[test]
     fn seatbelt_strict_profile_allows_no_writes_and_only_the_read_roots() {
         let policy = SandboxPolicy {
-            mode: SandboxMode::Strict,
+            mode: SandboxMode::Jail,
             writable_roots: Vec::new(),
             readable_roots: vec![PathBuf::from("/work/wt")],
             cache_roots: Vec::new(),
         };
         assert_eq!(
-            seatbelt_profile(SandboxMode::Strict, &policy),
+            seatbelt_profile(SandboxMode::Jail, &policy),
             concat!(
                 "(version 1)\n",
                 "(deny default)\n",
@@ -2341,51 +2229,37 @@ mod tests {
         );
     }
 
-    /// **`strict` no longer confines a shell's reads, and says so out loud.**
+    /// **`jail`'s read confinement is in-process, and that is the whole of it.**
     ///
-    /// It used to: bwrap mounted only `/usr` and `/etc`, so `/home` was ENOENT
-    /// rather than merely unreadable. Landlock has no read axis it can express as
-    /// "everything except…", so with bwrap deleted a strict-mode *shell command*
-    /// is write-confined only. The in-process guard
-    /// ([`SandboxPolicy::check_read`]) still confines the read-only file tools,
-    /// which is where the mode's confinement actually lives — and the notice is the
-    /// point of this test: a boundary quietly narrower than it claims is worse than
-    /// one whose limits are stated.
-    ///
-    /// The gap closes for good when `strict` loses `shell` altogether (it becomes
-    /// `jail`, whose tool set spawns no subprocess at all), at which point this
-    /// test and the notice both go.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn strict_mode_shell_reads_are_only_write_confined_and_it_says_so() {
-        let Some(shell) = confined_shell() else {
-            return;
-        };
-        if detect_backend() != OsSandboxBackend::Landlock {
-            return; // the admission is Landlock's; nothing else to check here
-        }
+    /// It used to be a mount set: bwrap gave a strict agent only `/usr` and `/etc`,
+    /// so an outside path was ENOENT. Landlock has no read axis it can express as
+    /// "everything except…", so that OS-level half is gone — and it does not matter,
+    /// because a jailed agent has no `shell`, no `verify` and no LSP: nothing it can
+    /// call spawns a subprocess for the OS layer to confine. What remains is
+    /// [`SandboxPolicy::check_read`] on the canonical path, which every read-only
+    /// tool routes through, and it works on every platform with no backend at all.
+    #[test]
+    fn jails_read_confinement_is_the_in_process_guard() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("visible.txt"), "x").unwrap();
-        let ctx = confined_ctx(dir.path(), SandboxMode::Strict);
+        let policy = SandboxPolicy::for_agent(SandboxMode::Jail, dir.path(), &[]);
 
-        let out = run_shell(shell, &ctx, "ls").await;
-        assert!(out.contains("visible.txt"), "{out}");
-
-        // The file tools ARE still confined — that is where the mode lives now.
-        let outside = Path::new("/etc/hostname");
+        let inside = dir.path().join("audit-me.rs");
         assert!(
-            ctx.sandbox.check_read(outside, outside).is_err(),
-            "check_read is the strict guard that survives"
+            policy
+                .check_read(&canonicalize_nearest(&inside), &inside)
+                .is_ok(),
+            "its own working directory is readable, or it cannot audit anything"
         );
-
-        // And the shell's weaker boundary is admitted, not hidden.
-        let queued = drain(&ctx.sandbox_notices);
-        assert!(
-            queued
-                .iter()
-                .any(|n| n == STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE),
-            "the lost read confinement must be stated: {queued:?}"
-        );
+        for outside in [Path::new("/etc/hostname"), Path::new("/usr/bin/env")] {
+            let err = policy
+                .check_read(&canonicalize_nearest(outside), outside)
+                .expect_err("outside the roots must be refused")
+                .to_string();
+            assert!(err.contains("strictly confined"), "{err}");
+        }
+        // And nothing is writable — with no execution there is nothing that needs a
+        // writable /tmp.
+        assert!(policy.writable_roots.is_empty());
     }
 
     /// The timeout still reaps the whole tree with a backend in the way.
@@ -2583,11 +2457,6 @@ mod tests {
     ///
     /// Only the Landlock degradation test queues more than one notice, and that
     /// test is Linux-only — so off Linux this is dead code, and `-D warnings`
-    /// says so (it reached a tag that way once already).
-    #[cfg(target_os = "linux")]
-    fn drain(notices: &SandboxNotices) -> Vec<String> {
-        std::iter::from_fn(|| notices.take()).collect()
-    }
 
     /// Landlock really does block a write outside the roots.
     ///
@@ -2648,56 +2517,6 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(std::fs::read_to_string(&inside).unwrap().trim(), "x");
-    }
-
-    /// Landlock has no read axis, so a read-mode agent's shell commands are
-    /// only write-confined — which must never be silent.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn strict_mode_under_landlock_degrades_with_a_notice() {
-        let dir = tempfile::tempdir().unwrap();
-        let policy = SandboxPolicy {
-            mode: SandboxMode::Strict,
-            writable_roots: Vec::new(),
-            readable_roots: vec![canonicalize_nearest(dir.path())],
-            cache_roots: Vec::new(),
-        };
-        let mine = notices();
-
-        let _cmd = shell_command_with_backend(
-            OsSandboxBackend::Landlock,
-            crate::Shell::Bash,
-            "true",
-            &policy,
-            &mine,
-        );
-        // Whatever else this host queued first (the reason bwrap was skipped,
-        // on a machine that actually fell back), the read admission is there.
-        let queued = drain(&mine);
-        assert!(
-            queued
-                .iter()
-                .any(|n| n == STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE),
-            "{queued:?}"
-        );
-
-        // A second agent hears the same thing on its own channel: "at most once"
-        // is per agent, not per process.
-        let sibling = notices();
-        let _cmd = shell_command_with_backend(
-            OsSandboxBackend::Landlock,
-            crate::Shell::Bash,
-            "true",
-            &policy,
-            &sibling,
-        );
-        let theirs = drain(&sibling);
-        assert!(
-            theirs
-                .iter()
-                .any(|n| n == STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE),
-            "a sibling agent must hear its own degradation: {theirs:?}"
-        );
     }
 
     /// With no backend the command runs unconfined — allowed, but only ever
@@ -2763,23 +2582,20 @@ mod tests {
         assert_eq!(sibling.take().as_deref(), Some(msg.as_str()));
     }
 
-    /// The notice texts are pinned bytes: they are what the user reads when the
-    /// boundary quietly got weaker, and they name the fix.
+    /// The one remaining notice is pinned bytes: it is what the user reads when
+    /// there is no OS confinement at all, and it must not soften into something
+    /// that could be mistaken for "confined".
+    ///
+    /// One, now, because every other degradation notice described a fallback that
+    /// no longer exists — bwrap missing, user namespaces disabled, Landlock's
+    /// partial network denial, jail's lost read mounts. A backend is available or
+    /// it is not.
     #[test]
-    fn degradation_notices_say_what_was_lost() {
+    fn the_unconfined_notice_says_exactly_what_is_not_confined() {
         assert_eq!(
             NO_OS_SANDBOX_NOTICE,
             "sandbox: no OS-level sandbox is available on this system — shell commands are NOT \
              OS-confined; the file tools remain guarded. Use --sandbox none to silence this."
         );
-        #[cfg(target_os = "linux")]
-        {
-            assert_eq!(
-                STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE,
-                "sandbox: Landlock cannot confine reads — this strict-mode agent's shell \
-                 commands are write-confined only, so paths outside its readable roots remain \
-                 readable."
-            );
-        }
     }
 }

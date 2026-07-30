@@ -1588,6 +1588,11 @@ impl Agent {
         tools.register(Arc::new(skills::SkillTool {
             skills: Arc::clone(&skills),
         }));
+        // Filesystem confinement, derived once here for every agent — main, sub,
+        // and revived alike all come through this constructor, so there is no
+        // second place a mode could be decided (see `effective_sandbox`). Resolved
+        // before the tool scoping below, because in one mode it decides it.
+        let sandbox_mode = crate::config::effective_sandbox(config.sandbox, config.read_only);
         // Scope the tool set for a restricted sub-agent: an explicit allow-list
         // wins; else, for a read-only agent, the plain read-only set.
         if let Some(allow) = &config.allowed_tools {
@@ -1613,16 +1618,22 @@ impl Agent {
             keep.extend(shell_tool_names(&tools));
             tools.retain_only(&keep);
         }
+        // …and `jail` caps whatever the above produced, LAST, because it is a
+        // boundary rather than a preference: a profile's `tools:` list, a persona,
+        // any future knob can narrow the set but none of them may widen it back.
+        // The tools it removes are the ones that would make the confinement a
+        // fiction — `web_fetch`/`web_search`/MCP run outside the sandbox entirely,
+        // `task` launders work through a laxer child, `shell` spawns children the
+        // in-process read guard cannot see into. See `JAIL_TOOLS`.
+        if sandbox_mode == hrdr_tools::SandboxMode::Jail {
+            tools.cap_to_jail_set();
+        }
         let delegation_enabled = tools.defs().iter().any(|d| d.function.name == "task");
         if let Ok(mut runtime) = delegation_runtime.lock() {
             runtime.public.delegation_enabled = delegation_enabled;
         }
         let mut ctx = ToolContext::new(config.cwd.clone());
         ctx.lsp = lsp;
-        // Filesystem confinement, derived once here for every agent — main, sub,
-        // and revived alike all come through this constructor, so there is no
-        // second place a mode could be decided (see `effective_sandbox`).
-        let sandbox_mode = crate::config::effective_sandbox(config.sandbox, config.read_only);
         let sandbox = hrdr_tools::SandboxPolicy::for_agent(
             sandbox_mode,
             &config.cwd,
@@ -3185,6 +3196,69 @@ mod tests {
         assert!(message.contains("narrow with `query`"), "{message}");
     }
 
+    /// **`jail` caps the tool set to exactly five, and nothing can widen it.**
+    ///
+    /// The cap is the mode's, not a profile's, and it is applied last — because the
+    /// tools it removes are the ones that would make the confinement a fiction.
+    /// `web_fetch`/`web_search`/MCP run in the hrdr parent process, *outside* the
+    /// sandbox, so an agent holding them has a working network egress no filesystem
+    /// rule touches; `task` launders work through a child in a laxer mode; `memory`
+    /// writes outside the roots by design; `shell` spawns children the in-process
+    /// read guard cannot see into.
+    ///
+    /// Asserted through an explicit `tools:` allow-list that *asks* for `shell`,
+    /// because that is the shape of the mistake: a profile is one edit away from
+    /// putting a shell back inside the jail, and it must not be able to.
+    #[tokio::test]
+    async fn jail_caps_the_tool_set_and_a_profile_cannot_widen_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            read_only: true,
+            sandbox: hrdr_tools::SandboxMode::Jail,
+            ..Default::default()
+        };
+
+        let jailed = Agent::new(base.clone()).unwrap();
+        let mut names: Vec<String> = jailed.tools().into_iter().map(|(n, _)| n).collect();
+        names.sort();
+        let mut expected: Vec<String> = hrdr_tools::JAIL_TOOLS
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(names, expected, "jail holds exactly the fixed set");
+
+        // A profile asking for a shell — and for the tools that carry a network —
+        // gets the cap anyway.
+        let widened = Agent::new(AgentConfig {
+            allowed_tools: Some(vec![
+                "shell".to_string(),
+                "read".to_string(),
+                "web_fetch".to_string(),
+                "task".to_string(),
+                "memory".to_string(),
+            ]),
+            ..base
+        })
+        .unwrap();
+        let widened: Vec<String> = widened.tools().into_iter().map(|(n, _)| n).collect();
+        for forbidden in [
+            "shell",
+            "web_fetch",
+            "web_search",
+            "task",
+            "memory",
+            "verify",
+        ] {
+            assert!(
+                !widened.iter().any(|n| n == forbidden),
+                "`{forbidden}` must not be reachable in jail: {widened:?}"
+            );
+        }
+        assert_eq!(widened, vec!["read".to_string()], "narrowing still applies");
+    }
+
     /// The delegation guidance reaches an agent that can actually delegate.
     ///
     /// `task` and `models` are registered by `Agent::new`, so this is the only
@@ -4063,15 +4137,15 @@ mod tests {
             "no writable root at all is what makes it read-only"
         );
 
-        // `strict` is the old behavior, kept and made opt-in: reads confined to
-        // the roots, writes refused everywhere.
+        // `jail` is the old strict behavior, kept and made opt-in: reads confined
+        // to the roots, writes refused everywhere.
         let strict = Agent::new(AgentConfig {
             read_only: true,
-            sandbox: hrdr_tools::SandboxMode::Strict,
+            sandbox: hrdr_tools::SandboxMode::Jail,
             ..cfg2
         })
         .unwrap();
-        assert_eq!(strict.ctx.sandbox.mode, hrdr_tools::SandboxMode::Strict);
+        assert_eq!(strict.ctx.sandbox.mode, hrdr_tools::SandboxMode::Jail);
         strict.ctx.resolve_read("notes.md").unwrap();
         let err = strict
             .ctx

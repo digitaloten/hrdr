@@ -1403,6 +1403,26 @@ pub(crate) fn timeout_floor_note(asked: u64, used: u64) -> String {
     )
 }
 
+/// The tool set a [`SandboxMode::Jail`] agent holds, and the whole of it.
+///
+/// **Deliberately not a subset of the normal set.** `grep`, `find`, `tree` and
+/// `ls` exist *for* this mode — every other mode has `shell`, which does all four
+/// better — so jail holds four tools no other mode gets. Without that written
+/// down, a later cleanup "fixes" the inconsistency by either putting `shell` into
+/// jail or deleting the search tools as dead code, and both are wrong.
+///
+/// What is absent is the point. `web_fetch`, `web_search` and MCP tools run **in
+/// the hrdr parent process, outside the sandbox**, so an agent holding them has a
+/// fully working network egress no filesystem confinement touches. `task`
+/// launders anything through a child in a laxer mode. `memory` writes outside the
+/// roots by design. `shell` and `verify` spawn subprocesses the in-process read
+/// guard cannot see inside of — and their absence is what makes jail's
+/// confinement complete on every platform with no OS backend at all.
+///
+/// This belongs to the **mode**, not to a profile: put it in one profile only,
+/// and the next agent someone writes with `sandbox: jail` silently gets a network.
+pub const JAIL_TOOLS: [&str; 5] = ["read", "grep", "find", "ls", "tree"];
+
 /// Ordered registry of tools, keyed by name.
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
@@ -1499,6 +1519,22 @@ impl ToolRegistry {
     /// `allowed` are simply ignored. Registration order is preserved.
     pub fn retain_only(&mut self, allowed: &[String]) {
         let keep = |n: &str| allowed.iter().any(|a| a == n);
+        self.order.retain(|n| keep(n));
+        self.tools.retain(|n, _| keep(n));
+    }
+
+    /// Cap the registry to the fixed [`JAIL_TOOLS`] set.
+    ///
+    /// A separate method from [`retain_only`] because the two mean different
+    /// things and must not be confused: `retain_only` implements a *profile's*
+    /// request, which is a preference, while this implements a *mode*, which is a
+    /// boundary. It is applied last and can only ever narrow, so nothing a profile
+    /// asks for — an explicit `tools:` list, a persona, a future knob — can widen
+    /// it back.
+    ///
+    /// [`retain_only`]: Self::retain_only
+    pub fn cap_to_jail_set(&mut self) {
+        let keep = |n: &str| JAIL_TOOLS.contains(&n);
         self.order.retain(|n| keep(n));
         self.tools.retain(|n, _| keep(n));
     }

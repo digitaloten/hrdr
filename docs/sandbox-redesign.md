@@ -1004,8 +1004,11 @@ Mostly-deletion first, so each slice is independently reviewable.
    and the notice together. Removes `bwrap_args`, `usr_merge_compat_args`, the
    userns probe, `git_ssh_command_for_userns`, `allow_network`, `deny_network`,
    and the `DenialKind` cascade down to a single arm.
-4. **Mode → tool set.** Pin jail to the fixed five, and make the cap unwidenable
-   by a profile's `tools` list.
+4. ~~**Mode → tool set.** Pin jail to the fixed five, and make the cap
+   unwidenable by a profile's `tools` list.~~ **DONE** — and the rename `strict`
+   → `jail` landed here, since the tool set is what makes jail jail. With no
+   shell in jail, `STRICT_DEGRADES_UNDER_LANDLOCK_NOTICE`, `DenialKind` (down to
+   one arm, then deleted outright) and the GPU note went with it.
 5. **Mode → prompt surfaces.** No working-tree instructions in jail, gated at
    discovery so `set_cwd` cannot re-seed.
 6. **Unified tool-result wrapping.** Policy flag, registry choke point, per-tool

@@ -88,7 +88,7 @@ mod tests {
     async fn ls_outside_roots_is_refused_in_strict_mode() {
         let cwd = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Strict);
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Jail);
 
         let err = LsTool
             .execute(

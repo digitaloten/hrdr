@@ -110,12 +110,13 @@ struct Cli {
     auto_prune: Option<String>,
 
     /// Filesystem confinement for this session: `write` (the default — reads
-    /// unrestricted, writes confined to the working directory, temp/scratch and
-    /// tool output), `read` (what read-only agents get: reads unrestricted,
-    /// writes refused everywhere), `strict` (as `read`, and reads confined to
-    /// the working directory too — tools installed elsewhere become invisible),
-    /// or `none`, also spelled `yolo` (no confinement at all).
-    #[arg(long, global = true, value_name = "write|read|strict|none")]
+    /// unrestricted, writes confined to the working directory, temp/scratch,
+    /// tool output and the package-manager caches), `read` (what read-only
+    /// agents get: reads unrestricted, writes refused everywhere), `jail`
+    /// (read-only tools only — no shell, no network, and reads confined to the
+    /// working directory, for auditing code you do not trust), or `none`, also
+    /// spelled `yolo` (no confinement at all).
+    #[arg(long, global = true, value_name = "write|read|jail|none")]
     sandbox: Option<String>,
 
     /// Extra directory the agent may write to; repeat for more than one.

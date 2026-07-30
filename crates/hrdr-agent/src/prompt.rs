@@ -630,14 +630,15 @@ pub fn sandbox_section(policy: &hrdr_tools::SandboxPolicy) -> String {
              attempt to create, edit or delete a file, and do not try to work around it; \
              report what you found instead.",
         ),
-        hrdr_tools::SandboxMode::Strict => format!(
+        hrdr_tools::SandboxMode::Jail => format!(
             "\n\nSandbox:\n\
-             - Mode: strict — this agent may write nothing, and may read only inside its \
-             roots.\n\
+             - Mode: jail — you read, you do not run. This agent writes nothing, executes \
+             nothing, and may read only inside its roots.\n\
              - You may read ONLY under:\n{}\n\
              - Every read outside those roots is refused, and so is every write, everywhere. \
-             That is the mode, not a broken install or a missing file: do not try to work \
-             around it, and report what you found instead.",
+             There is no shell, no test runner and no network here, and that is the mode \
+             working — not a broken install, a missing file, or something to route around. \
+             Report what you found instead, and say plainly what you could not check.",
             roots(&policy.readable_roots),
         ),
     }
@@ -3029,7 +3030,7 @@ mod tests {
         for mode in [
             hrdr_tools::SandboxMode::Write,
             hrdr_tools::SandboxMode::Read,
-            hrdr_tools::SandboxMode::Strict,
+            hrdr_tools::SandboxMode::Jail,
         ] {
             let s = sandbox_section(&hrdr_tools::SandboxPolicy {
                 mode,
@@ -3037,10 +3038,18 @@ mod tests {
                 readable_roots: roots.clone(),
                 cache_roots: Vec::new(),
             });
+            // `jail` may state that it has no network — it holds no tool that could
+            // open one — but no mode may describe the *sandbox* as confining it.
             assert!(
-                !s.to_lowercase().contains("network"),
+                !s.contains("Your shell commands have NO network"),
                 "{mode} does not confine the network: {s}"
             );
+            if mode != hrdr_tools::SandboxMode::Jail {
+                assert!(
+                    !s.to_lowercase().contains("network"),
+                    "{mode} says nothing about the network at all: {s}"
+                );
+            }
         }
     }
 
@@ -3086,18 +3095,22 @@ mod tests {
         );
         assert!(!s.contains("/work/ro"), "…so it must not list roots: {s}");
 
-        // Strict is the mode that does confine reads, and it names them.
+        // `jail` is the mode that does confine reads, and it names them.
         let strict = hrdr_tools::SandboxPolicy {
-            mode: hrdr_tools::SandboxMode::Strict,
+            mode: hrdr_tools::SandboxMode::Jail,
             writable_roots: Vec::new(),
             readable_roots: vec![std::path::PathBuf::from("/work/ro")],
             cache_roots: Vec::new(),
         };
         let s = sandbox_section(&strict);
-        assert!(s.contains("Mode: strict"));
+        assert!(s.contains("Mode: jail"));
         assert!(s.contains("read ONLY under"));
         assert!(s.contains("- /work/ro"));
         assert!(s.contains("every write, everywhere"));
+        // The tool set is part of the mode, so the prompt states it: an agent that
+        // knows it has no shell reports what it could not check instead of burning
+        // a turn on a call that will not exist.
+        assert!(s.contains("no shell"), "{s}");
         // It pre-empts the misreading: a refused read is the mode, not a missing
         // file. The old wording promised that outside paths were "ABSENT", which
         // was a property of bwrap's mount set and stopped being true with it.

@@ -440,7 +440,7 @@ mod tests {
     #[tokio::test]
     async fn read_and_search_refuse_outside_roots_in_strict_mode() {
         let cwd = tempfile::tempdir().unwrap();
-        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Strict);
+        let ctx = crate::sandbox::confined_ctx(cwd.path(), crate::SandboxMode::Jail);
 
         let outside = tempfile::tempdir().unwrap();
         let outside_file = outside.path().join("hostname");
