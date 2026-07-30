@@ -789,9 +789,22 @@ re-run semantics.
    to allow it_ — naming `sandbox_writable_roots` and the flag. An error that
    explains the cause and withholds the fix is half an error.
 3. **Configurable both ways.** `sandbox_writable_roots` already exists in
-   config; there is **no CLI flag today**, so one is added:
-   `--sandbox-writable-root <PATH>`, repeatable, kebab-case of the config key
-   like every other flag.
+   config; there is **no CLI flag today**, so one is added —
+   `--sandbox-writable-root <PATH>`, **repeatable**, with
+   `--sandbox-writable-roots` as an alias so either spelling works.
+
+   Repeatable rather than one flag taking many values, for two reasons. `hrdr`
+   has a **greedy trailing positional** for the startup command (`main.rs:191`,
+   `trailing_var_arg = true`), so a space-separated multi-value flag is
+   ambiguous: `hrdr --sandbox-writable-roots /a /b /model` would swallow
+   `/model` as a third path instead of running it. And **comma-splitting is
+   lossy for paths** — a directory named `foo,bar` is legal everywhere, so a
+   `value_delimiter` makes some paths unrepresentable. Fine for feature lists,
+   wrong for paths.
+
+   No precedent to follow either way: every existing list-valued config key
+   (`escalate`, `guardrails`, `hooks`, `mcp`, `sandbox_writable_roots`) is
+   config-only with no flag.
 
 **Merge semantics: append, never replace.** Effective roots are the built-in
 defaults, plus config, plus flags — `canonical_roots` already de-nests and
