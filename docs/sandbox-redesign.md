@@ -790,8 +790,14 @@ re-run semantics.
    explains the cause and withholds the fix is half an error.
 3. **Configurable both ways.** `sandbox_writable_roots` already exists in
    config; there is **no CLI flag today**, so one is added —
-   `--sandbox-writable-root <PATH>`, **repeatable**, with
-   `--sandbox-writable-roots` as an alias so either spelling works.
+   `--sandbox-writable-root <PATH>`, **repeatable**. Singular name, no plural
+   alias.
+
+   Because repetition is the only way to pass more than one, the **help text
+   must say so** — it is the only place a user learns the flag repeats, and
+   `--sandbox-writable-root <PATH>` on its own reads as accepting exactly one.
+   Something like _"Extra directory the agent may write to; repeat for more than
+   one."_
 
    Repeatable rather than one flag taking many values, for two reasons. `hrdr`
    has a **greedy trailing positional** for the startup command (`main.rs:191`,
