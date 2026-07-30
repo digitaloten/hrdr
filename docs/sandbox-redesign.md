@@ -1,6 +1,7 @@
 # Sandbox redesign — plan of record
 
-Status: **agreed, not yet built.** Written 2026-07-30. No open decisions.
+Status: **being built.** Written 2026-07-30. No open decisions. Slice 1 shipped;
+slices 2–9 outstanding — the checklist at the end tracks it.
 
 Supersedes the escalation ladder shipped in `97ab735`, `cd4b597`, `e9e753f`, and
 the `.git` lock from `899ecd2`.
@@ -983,8 +984,8 @@ spool.
 
 Mostly-deletion first, so each slice is independently reviewable.
 
-1. **Remove the `.git` lock and all of escalation, and widen `write`'s roots —
-   one slice, in this order.**
+1. ~~**Remove the `.git` lock and all of escalation, and widen `write`'s roots —
+   one slice, in this order.**~~ **DONE.**
    - Widen `write` mode's writable roots to the toolchain caches **first**. The
      post-denial retry offer is currently the only thing that rescues a failed
      `cargo build` (verified reproducible above); remove escalation before

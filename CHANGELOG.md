@@ -8,6 +8,75 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- **The sandbox is a cautionary tool, not a requirement: the `.git` lock and all
+  of escalation are gone.** An agent working in the user's project — main or
+  delegated — is now assumed to have authority over that project. It commits, it
+  pushes, it installs dependencies; the sandbox stops it reaching _outside_ the
+  project and nothing else.
+
+  Removed: the file-tool `.git` guard (`PROTECTED_METADATA_DIRS`), the write
+  sub-agent `.git` mount subtraction (`deny_git_writes`, `readonly_subpaths`,
+  `restored_git_roots`, `protect_git`), and the whole escalation stack —
+  `escalation.rs`, `approval.rs`, the approval gate with its 60s timeout and
+  listener counting, the `escalate` config key, `Widening`,
+  `AgentEvent::ApprovalRequested`/`EscalationDecided`,
+  `Record::EscalationDecided`, `ServerMsg::ApprovalRequested`/`ApprovalClosed`,
+  `ClientMsg::AnswerApproval`, the TUI modal, and the browser dialog.
+
+  The `.git` guard was fake safety: it refused the honest path while `shell`
+  walked around it one `git config` away, and it refused legitimate
+  `.git/info/exclude` edits and hooks the user had asked for. Escalation had
+  nothing left to escalate — its motivating failure was bwrap's user namespace
+  breaking ssh, and its remaining case (a command that must write outside the
+  project) is answered by the wider default roots below plus the user running
+  the command themselves. **A sub-agent can now be briefed to commit its own
+  work**, which is what the prompts say: not committing on your own initiative
+  is a coordination rule, not a permission you lack.
+
+- **`write` mode grants the package-manager caches, so `cargo build` and `npm i`
+  work out of the box.** They did not. Verified under the old roots (cwd +
+  temp + scratch + tool-output): `cargo build` on any uncached dependency
+  _downloads the crate successfully_ and then dies with
+  `Read-only file system (os error 30)` writing it into
+  `$CARGO_HOME/registry/cache` — so a build passes on a warm machine and fails
+  on a cold one, or the first time a dependency is added. `npm i` fails on
+  `~/.npm/_cacache/tmp/…` and cannot even write its own log, which is the
+  founding incident of the sandbox denial note reproduced exactly.
+
+  Granted, resolving every env-var override (`CARGO_HOME`, `RUSTUP_HOME`,
+  `GOMODCACHE`, `GRADLE_USER_HOME`, `NUGET_PACKAGES`, `PUB_CACHE`, `PNPM_HOME`,
+  `XDG_CACHE_HOME`, …) rather than hardcoding a home-relative path: the XDG
+  cache home (plus `~/Library/Caches` on macOS), which alone covers pip, uv,
+  deno, `go-build`, yarn v1 and composer; cargo's `registry`/`git`; rustup's
+  `toolchains`/`downloads`/`tmp`/`update-hashes`; `~/.npm`; the pnpm, yarn-berry
+  and bun stores; `~/.node-gyp`; poetry venvs and pipx; the Go module cache;
+  `~/.m2/repository` and the Gradle caches; NuGet packages; gem/bundler; the pub
+  cache; hex/mix; stack and cabal.
+
+  **Never the tool's home directory, only its cache** — `~/.local/share/uv`
+  holds `credentials/`, `~/.nuget` holds config beside `packages/`, and `~/.m2`,
+  `~/.gradle`, `~/.gem`, `~/.bundle` and `~/.composer` are all
+  credential-bearing. **Never a directory on `PATH`** (`$CARGO_HOME/bin`,
+  `$GOPATH/bin`, `~/.local/bin`, `~/.bun/bin`, `$PNPM_HOME` itself), because a
+  binary there is a persistence vector: the next command the _user_ runs could
+  be the agent's. So `cargo install` and `go install` still fail by default, and
+  the denial note now names the remedy. Toolchain managers (`~/.nvm`,
+  `~/.pyenv`, `~/.asdf`) are out for the same reason; `$RUSTUP_HOME/toolchains`
+  is the deliberate exception, because a pinned `rust-toolchain.toml` makes
+  `cargo build` itself fail on a fresh checkout.
+
+  A missing cache root is **created**, but only inside a layout that already
+  exists (`~/.cargo/registry` when `~/.cargo` does, a `PATH` probe for the
+  caches that _are_ a tool's home like `~/.npm`) — the OS layer can only confine
+  a path that exists, so an absent root is silently dropped and the package
+  manager cannot create it either. Without the rule hrdr would scatter two dozen
+  empty directories through the home of anyone who ran it once.
+
+  The caches are enforced but not narrated: they are writable roots, and the
+  system prompt and refusal messages name the project roots one per line and the
+  caches as a group, because two dozen cache paths re-read every turn is noise
+  and the model never chooses to write there — `cargo` does.
+
 - **A sub-agent's shell has no network.** Its real network needs never went
   through a shell — `web_fetch` and `web_search` run in the hrdr process, on
   this side of the sandbox, and keep working — so what is removed is raw network
@@ -47,6 +116,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   write cap at 1, the defaults are now 1 writer / 2 readers.
 
 ### Fixed
+
+- **`!command` is pinned as unsandboxed by a test.** It always was — a command
+  the _user_ typed carries the user's authority, not the agent's — but nothing
+  asserted it, and with escalation gone this is the only way to run something
+  the sandbox would refuse. A refactor routing the bang path through
+  `sandboxed_shell_command` "for consistency" would have deleted the last relief
+  valve silently. The test proves it against the real backend: the session runs
+  with nothing writable to the agent at all, and the probe is a write that has
+  to land.
 
 - **`git push`/`fetch`/`clone` over ssh works inside the sandbox again.**
   Unprivileged bwrap must create a user namespace, and one maps only the
@@ -88,27 +166,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `--max-readonly-subagents` and `--max-write-subagents` `--help` text, and
   README's example config, stated the old defaults (5 and 2).
 
-- **`.git` is read-only for write sub-agents, enforced by the OS.** The prompt
-  told a sub-agent not to commit; now it cannot. A delegated writer's sandbox
-  subtracts the repository's git metadata from its writable set — a `--ro-bind`
-  layered after the writable binds under bwrap, a nested read-only rule under
-  Landlock (which resolves to the most specific matching hierarchy), a trailing
-  `deny file-write*` under Seatbelt. Reads stay wide open, deliberately:
-  `git log`, `diff`, `show` and `status` all still work, because a sub-agent
-  reviewing its own change needs them and none of them writes. What fails is
-  committing, staging, moving a ref, and installing a hook. This closes the
-  widening introduced when sub-agents moved into the parent's working directory:
-  they inherited the parent's sandbox roots, which put `.git` inside a writable
-  root for the first time. Since sub-agents share one tree, a commit from one
-  would sweep the parent's work in progress and any sibling's half-finished edit
-  into a single commit under its own message — and nothing in the harness would
-  have noticed a sub-agent moving `refs/heads/main`. Modelled on Codex, which
-  protects `.git` under every writable root; hrdr denies writes only, where
-  Codex masks the directory entirely and loses read-only git with it. The
-  sub-agent's Sandbox prompt block states the boundary up front, and an EROFS
-  from git now gets a specific note rather than the generic "outside your
-  writable roots" one.
-
 - **Sub-agent worktrees are gone; every sub-agent shares your working
   directory.** A write-capable `task` used to run in a private git worktree on
   its own branch, and its work reached you through a review-merge-clean sequence
@@ -137,61 +194,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **The web frontend can approve an escalation too.**
-  `ServerMsg::ApprovalRequested` / `ApprovalClosed` and
-  `ClientMsg::AnswerApproval` carry the question and the answer, and the Dioxus
-  UI grows the same modal the TUI has — command verbatim and wrapped rather than
-  truncated, plain words for what is granted (outside the sandbox, unconfined,
-  as you), and deny as the safe default. Registration with the gate is an RAII
-  guard taken as the socket's first act _after_ the auth check, so a client can
-  only answer once authenticated and the registration cannot outlive the
-  connection down any exit path. Unlike the TUI there can be several clients or
-  none: the gate refcounts listeners, every connected client sees the request,
-  the first answer wins, and the losers are told the question closed rather than
-  left holding a live dialog. The browser's version of the reflexive-keypress
-  hazard gets its own answer — deny is first in tab order and autofocused, and
-  the approve buttons hold `pointer-events: none` for 600ms after mount so a
-  click already in flight passes through to the backdrop, which denies.
-
-- **The TUI can now approve an escalation.** The seam from the previous entry
-  gets its answerer: an eligible command opens a modal naming the exact command
-  and what approving it means — it runs **outside** the sandbox, unconfined, as
-  you — with three outcomes (once / for the session / deny). The command is
-  shown verbatim and wrapped, never truncated, because a consent dialog that
-  elides the tail of `git push … ; rm -rf ~` is one that lies; a command taller
-  than the terminal scrolls instead. The highlight starts on **Deny**: the modal
-  opens unannounced over an input box, so a reflexive Enter is a real key press
-  to plan for, and there are no single-letter shortcuts for the same reason. It
-  captures every key while open and outranks the other pickers, so a blocked
-  tool call cannot sit behind a `/model` list. Concurrent requests queue; an
-  unanswered one expires on the gate's own 60s clock, closes itself, and says
-  the command ran confined; answering after that grants nothing, since decisions
-  are keyed by request id. Registration is handed back in `Drop`, which is the
-  one path every exit takes — a registered frontend that goes away is worse than
-  one that never registered, because requests would then wait out the full
-  minute rather than being denied on the spot.
-
-- **Escalation: the groundwork for running a command outside the sandbox
-  (plumbing only — every request is denied today).** hrdr confines every shell
-  command, and unprivileged bwrap's user namespace is what makes `git push` over
-  ssh fail. Codex answers this by running approved commands with no sandbox at
-  all; this slice builds the same seam. A new escalation policy decides which
-  commands are even _eligible_ — `git push`/`pull`/`fetch`/`clone`/`ls-remote`/
-  `remote` by default, extensible with `escalate = [...]` in config — and an
-  `ApprovalGate` on the tool context carries the request out and a decision
-  back. Nothing can answer yet, so every request is refused immediately (never a
-  hang), which is permanently the right behaviour for headless runs and is what
-  the TUI and web slices will change. Eligibility is deliberately strict:
-  matching is on the program word and leading positionals rather than a regex,
-  **every** segment of a compound command must be eligible
-  (`git push && curl … | sh` is not), and any segment carrying command
-  substitution, backticks, a redirection, or a privilege wrapper is refused
-  outright — the allowlist has to bound the whole line, not just its first word.
-  Guardrails still win: `git push --force` stays refused whether or not it is
-  eligible. Sub-agents have no gate at all, so they cannot escalate. A bypass is
-  also refused when the policy denies reads, denies the network, or carves a
-  read-only subpath out of a writable root — widening writes must not silently
-  widen an axis nobody was asked about.
+- **`--sandbox-writable-root <PATH>`, repeatable.** `sandbox_writable_roots`
+  existed in config with no CLI equivalent. Repeatable rather than multi-valued
+  because `hrdr` has a greedy trailing positional for the startup command (a
+  space-separated list would swallow it) and because comma-splitting makes a
+  directory named `foo,bar` unrepresentable; the help text says it repeats,
+  since that is the only place a user could learn it. Flags and config both
+  **append** to the built-in defaults — a flag that replaced them would mean
+  "allow one extra path, and take away every dependency cache".
 
 - **A `verify` tool that runs the gate and answers one question.** Everything
   else in this story only describes: the prompt names the gate, the ledger

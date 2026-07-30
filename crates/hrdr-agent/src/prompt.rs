@@ -563,24 +563,23 @@ pub fn gate_section(gate: &hrdr_tools::Gate, tools: &ToolRegistry) -> String {
     )
 }
 
-/// The `.git`-is-read-only line, for a policy that has the denial installed
-/// (a write sub-agent). Empty otherwise, so the main agent's Sandbox block is
-/// byte-identical to what it always was.
+/// The one line covering the package-manager caches
+/// ([`hrdr_tools::SandboxPolicy::cache_roots`]), which the root list above
+/// deliberately omits. Empty when none were granted.
 ///
-/// Stated as a capability boundary rather than a warning: a model that knows
-/// `git commit` cannot work here reports its files and stops, where one that
-/// discovers it through an EROFS spends a turn deciding whether the repository
-/// is broken.
-fn git_lockdown_line(policy: &hrdr_tools::SandboxPolicy) -> String {
-    if policy.readonly_subpaths.is_empty() {
+/// Named as a group rather than listed: two dozen cache paths would be the
+/// longest thing in the prompt, re-read every turn, and the model never chooses
+/// to write there — `cargo` and `npm` do. What it does need to know is that a
+/// dependency fetch is expected to work, so it does not pre-emptively report the
+/// build as impossible.
+fn cache_roots_line(policy: &hrdr_tools::SandboxPolicy) -> String {
+    if policy.cache_roots.is_empty() {
         return String::new();
     }
-    "\n- Git metadata (`.git`) is READ-ONLY for you. Read history freely — `git log`, `git \
-     diff`, `git show`, `git status` all work — but you cannot commit, stage, move a ref, or \
-     install a hook, and attempting it fails with a read-only filesystem error rather than \
-     doing anything. This is deliberate: you share this working directory with the agent that \
-     delegated to you, so a commit from you would sweep up its work and any sibling's. Leave \
-     your changes in the tree and name the files you changed in your report."
+    "\n- The usual package-manager caches on this machine are writable too (cargo, npm, pip, \
+     go, and friends), so `cargo build`, `npm i` and the like fetch dependencies normally. \
+     Installing a *binary* onto PATH — `cargo install`, `go install` — is not: that is machine \
+     setup, and it is refused."
         .to_string()
 }
 
@@ -628,6 +627,13 @@ pub fn sandbox_section(policy: &hrdr_tools::SandboxPolicy) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let paths = |paths: &[&std::path::Path]| {
+        paths
+            .iter()
+            .map(|r| format!("- {}", r.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     match policy.mode {
         hrdr_tools::SandboxMode::None => String::new(),
         hrdr_tools::SandboxMode::Write => format!(
@@ -636,8 +642,8 @@ pub fn sandbox_section(policy: &hrdr_tools::SandboxPolicy) -> String {
              - You may write ONLY under:\n{}\n\
              - Writing anywhere else is refused. If a task appears to require writing outside \
              these roots, stop and say so instead of attempting it.{}{}",
-            roots(&policy.writable_roots),
-            git_lockdown_line(policy),
+            paths(&policy.project_writable_roots()),
+            cache_roots_line(policy),
             network_lockdown_line(policy),
         ),
         hrdr_tools::SandboxMode::Read => format!(
@@ -2680,12 +2686,16 @@ mod tests {
             "shared commit discipline reaches the main agent: {main}"
         );
 
-        // The don't-commit + own-work-only discipline is sub-agent-only: it shares
-        // the parent's tree, so a commit or a stage from it would sweep up work
-        // that is not its own.
+        // The default-don't-commit + own-work-only discipline is sub-agent-only: it
+        // shares the parent's tree, so a commit it made on its own initiative would
+        // sweep up work that is not its own. Phrased as coordination rather than as
+        // a permission it lacks, because the `.git` lock that used to make it the
+        // latter is gone — a task CAN now be briefed to commit its own work, and a
+        // prompt claiming otherwise would refuse work the kernel allows.
         assert!(
-            sub.contains("Do NOT commit")
-                && sub.contains("Do not stage either")
+            sub.contains("Do NOT commit unless your task explicitly tells you to")
+                && sub.contains("this is a rule about coordination, not")
+                && sub.contains("If you ARE told to commit, stage explicit paths")
                 && sub.contains("is authoritative and already active")
                 && sub.contains("never need to `cd` into it")
                 && sub.contains("project-relative paths")
@@ -2984,43 +2994,55 @@ mod tests {
         );
     }
 
-    /// A write sub-agent is told `.git` is read-only BEFORE it tries to commit.
-    /// Discovering it through an EROFS costs a turn spent deciding whether the
-    /// repository is broken — the failure the sandbox notice exists to catch,
-    /// and cheaper to prevent than to explain.
+    /// No agent is told `.git` is read-only, because for no agent is it. The
+    /// prompt used to carry a "git metadata is READ-ONLY for you" paragraph for
+    /// write sub-agents; the lock is gone, so the paragraph must be too — a prompt
+    /// that describes a boundary the kernel does not enforce teaches the model to
+    /// refuse work it can actually do.
+    ///
+    /// The package caches are the other half: named as a group, never enumerated,
+    /// because two dozen cache paths re-read every turn is the longest thing in
+    /// the prompt and the model never chooses to write there.
     #[test]
-    fn the_sandbox_section_names_the_git_lockdown_only_when_it_applies() {
+    fn the_sandbox_section_names_no_git_lockdown_and_groups_the_caches() {
         let roots = vec![std::path::PathBuf::from("/tmp/proj")];
+        let cache = std::path::PathBuf::from("/home/u/.cargo/registry");
         let plain = hrdr_tools::SandboxPolicy {
             mode: hrdr_tools::SandboxMode::Write,
             writable_roots: roots.clone(),
             readable_roots: roots.clone(),
-            readonly_subpaths: Vec::new(),
             allow_network: true,
-            delegated: false,
-            restored_git_roots: Vec::new(),
+            cache_roots: Vec::new(),
         };
+        let s = sandbox_section(&plain);
         assert!(
-            !sandbox_section(&plain).contains("READ-ONLY"),
-            "the parent commits, and its block must not say otherwise"
+            !s.contains("READ-ONLY") && !s.to_lowercase().contains("cannot commit"),
+            "no agent is locked out of git: {s}"
+        );
+        assert!(
+            !s.contains("package-manager"),
+            "with no caches granted there is nothing to mention: {s}"
         );
 
-        let sub = hrdr_tools::SandboxPolicy {
-            readonly_subpaths: vec![std::path::PathBuf::from("/tmp/proj/.git")],
-            ..plain
-        };
-        let s = sandbox_section(&sub);
+        let mut with_caches = plain.clone();
+        with_caches.writable_roots.push(cache.clone());
+        with_caches.cache_roots = vec![cache.clone()];
+        let s = sandbox_section(&with_caches);
         assert!(
-            s.contains("Git metadata (`.git`) is READ-ONLY for you"),
-            "{s}"
+            !s.contains(&cache.display().to_string()),
+            "a cache path must not be listed one per line: {s}"
         );
         assert!(
-            s.contains("`git log`") && s.contains("cannot commit"),
-            "it separates what still works from what does not: {s}"
+            s.contains("package-manager caches") && s.contains("cargo build"),
+            "the group is named, so the model does not report a build as impossible: {s}"
         );
         assert!(
-            s.contains("name the files you changed"),
-            "and says what to do instead: {s}"
+            s.contains("cargo install"),
+            "…and the exclusion is named too, so a refused install is not a mystery: {s}"
+        );
+        assert!(
+            s.contains("/tmp/proj"),
+            "the project root is still listed: {s}"
         );
     }
 
@@ -3036,10 +3058,8 @@ mod tests {
                 mode,
                 writable_roots: roots.clone(),
                 readable_roots: roots,
-                readonly_subpaths: Vec::new(),
                 allow_network: true,
-                delegated: false,
-                restored_git_roots: Vec::new(),
+                cache_roots: Vec::new(),
             };
             if !allow_network {
                 policy.deny_network();
@@ -3083,10 +3103,8 @@ mod tests {
                 std::path::PathBuf::from("/scratch/hrdr"),
             ],
             readable_roots: vec![std::path::PathBuf::from("/work/wt-1")],
-            readonly_subpaths: Vec::new(),
             allow_network: true,
-            delegated: false,
-            restored_git_roots: Vec::new(),
+            cache_roots: Vec::new(),
         };
         let s = sandbox_section(&policy);
         assert!(
@@ -3105,10 +3123,8 @@ mod tests {
             mode: hrdr_tools::SandboxMode::Read,
             writable_roots: Vec::new(),
             readable_roots: vec![std::path::PathBuf::from("/work/ro")],
-            readonly_subpaths: Vec::new(),
             allow_network: true,
-            delegated: false,
-            restored_git_roots: Vec::new(),
+            cache_roots: Vec::new(),
         };
         let s = sandbox_section(&ro);
         assert!(s.contains("Mode: read"));
@@ -3125,10 +3141,8 @@ mod tests {
             mode: hrdr_tools::SandboxMode::Strict,
             writable_roots: Vec::new(),
             readable_roots: vec![std::path::PathBuf::from("/work/ro")],
-            readonly_subpaths: Vec::new(),
             allow_network: true,
-            delegated: false,
-            restored_git_roots: Vec::new(),
+            cache_roots: Vec::new(),
         };
         let s = sandbox_section(&strict);
         assert!(s.contains("Mode: strict"));

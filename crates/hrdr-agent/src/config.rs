@@ -343,42 +343,6 @@ pub struct AgentConfig {
     /// Extra shell guardrails from `[[guardrails]]` in config, applied on top
     /// of the built-in rules.
     pub guardrails: Vec<GuardrailConfig>,
-    /// Extra commands that may be *offered* to run outside the OS sandbox
-    /// (`escalate = ["gh pr create", …]`), on top of the built-in git set —
-    /// see [`hrdr_tools::EscalationPolicy`].
-    ///
-    /// Each entry is a program word plus the leading subcommands that must
-    /// follow it, matched on what the segment actually runs; it is NOT a
-    /// pattern over the command line. Eligibility only decides what may be
-    /// *asked about*: the user still answers, guardrails still block first, and
-    /// a delegated sub-agent has no gate to ask through at all.
-    ///
-    /// Config-only, like `[[guardrails]]`: widening what may leave the sandbox
-    /// is a project decision worth writing down, not one to slip in through an
-    /// environment variable a script inherited.
-    pub escalate: Vec<String>,
-    /// Keep the repository's git metadata read-only for the **main** agent too,
-    /// so a commit needs the user's approval (`protect_git = true`). Default
-    /// `false`. Config-only, for the same reason as [`escalate`](Self::escalate).
-    ///
-    /// A write sub-agent is confined this way unconditionally and always has
-    /// been — it shares the parent's working directory, so a commit from one
-    /// would sweep up everybody's work in progress. This extends the same lock to
-    /// the agent the user is talking to, where the argument is different: not
-    /// that it must never commit, but that the user should see it happen. Codex
-    /// denies `.git` to every agent for exactly this reason and routes commits
-    /// through an approval; with
-    /// [`Widening::GitMetadata`](hrdr_tools::Widening::GitMetadata) hrdr can do
-    /// the same.
-    ///
-    /// **Off by default, deliberately.** The threat it answers is the weakest of
-    /// the set: this is the agent whose arbitrary shell commands the user is
-    /// already trusting, so the lock buys a checkpoint rather than a boundary.
-    /// What it costs is a prompt on every commit — genuinely worth it for someone
-    /// running long unattended sessions on a repo they care about, and pure
-    /// friction for someone who commits twenty times an hour. That is a judgement
-    /// about how a particular person works, so it is theirs to make.
-    pub protect_git: bool,
     /// Post-edit hooks from `[[hooks]]` in config (formatters, mostly).
     pub hooks: Vec<HookConfig>,
     /// Post-edit LSP diagnostics (default `true`): after a mutating tool
@@ -811,13 +775,6 @@ pub(crate) struct FileConfig {
     pub(crate) providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
     pub(crate) guardrails: Vec<GuardrailConfig>,
-    /// `escalate = ["gh pr create"]` — extra commands eligible for a
-    /// run-outside-the-sandbox prompt.
-    #[serde(default)]
-    pub(crate) escalate: Vec<String>,
-    /// `protect_git = true` — keep git metadata read-only for the main agent too,
-    /// so commits go through an approval.
-    pub(crate) protect_git: Option<bool>,
     #[serde(default)]
     pub(crate) hooks: Vec<HookConfig>,
     pub(crate) tool_output: Option<ToolOutputConfig>,
@@ -1030,8 +987,6 @@ impl Default for AgentConfig {
             auto_prune: true,
             providers: HashMap::new(),
             guardrails: Vec::new(),
-            escalate: Vec::new(),
-            protect_git: false,
             hooks: Vec::new(),
             tool_max_bytes: DEFAULT_MAX_OUTPUT,
             tool_max_lines: DEFAULT_MAX_OUTPUT_LINES,
@@ -1704,12 +1659,6 @@ impl AgentConfig {
         }
         if !fc.guardrails.is_empty() {
             self.guardrails = fc.guardrails;
-        }
-        if let Some(protect_git) = fc.protect_git {
-            self.protect_git = protect_git;
-        }
-        if !fc.escalate.is_empty() {
-            self.escalate = fc.escalate;
         }
         if !fc.hooks.is_empty() {
             self.hooks = fc.hooks;
@@ -2532,24 +2481,6 @@ mod sandbox_tests {
         assert_eq!(
             cfg.sandbox_writable_roots,
             vec![PathBuf::from("/home/me/.cargo")]
-        );
-    }
-
-    /// `escalate = [...]` parses and layers on, and is absent by default — the
-    /// built-in git rules are the whole shipped list.
-    #[test]
-    fn escalate_config_key_parses_and_layers_on() {
-        let fc: FileConfig =
-            toml::from_str("escalate = [\"gh pr create\", \"docker push\"]").unwrap();
-        let mut cfg = AgentConfig::default();
-        cfg.apply_file(fc);
-        assert_eq!(cfg.escalate, vec!["gh pr create", "docker push"]);
-
-        let mut cfg = AgentConfig::default();
-        cfg.apply_file(toml::from_str("").unwrap());
-        assert!(
-            cfg.escalate.is_empty(),
-            "nothing beyond the built-in git rules ships enabled"
         );
     }
 

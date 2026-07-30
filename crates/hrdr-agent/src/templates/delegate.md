@@ -99,10 +99,15 @@ Delegating with `task`:
     sibling task's are in there too, separate them at COMMIT time — stage the
     paths that belong together (`git add <file>` per file) and commit them with
     their own message, rather than sweeping the tree into one commit.
-  - COMMIT IT YOURSELF, promptly. The sub-agent is told not to commit and not to
-    stage, precisely so that you decide what lands and under what message. Work
-    left uncommitted while the next task runs is work the next task can walk
+  - COMMIT IT YOURSELF, promptly. A sub-agent is told not to commit on its own
+    initiative, precisely so that you decide what lands and under what message.
+    Work left uncommitted while the next task runs is work the next task can walk
     over.
+  - You CAN hand that job over when it makes sense: tell the task to commit its
+    own work in the brief, and it will (nothing in the sandbox stops it). Worth
+    doing for a self-contained task whose diff you do not need to gate — a
+    mechanical rename, a changelog entry, a dependency bump. Do not do it for two
+    tasks running at once in the same tree: their commits would interleave.
   - Act on what your review finds: fix small issues yourself — faster than a
     round-trip. A misunderstood spec means re-brief, not patch-over: `task_steer`
     the task if it is still running, or spawn a fresh one that says exactly what

@@ -11,9 +11,9 @@ use hrdr_app::{
     CtxGauge, CtxLevel, StatusInputs, StatusRole, StatusRun, StatusSeg, classify_diff_line,
 };
 use hrdr_protocol::{
-    InputSetMode, PaneTranscript, ServerFrame, ServerMsg, WireApprovalDecision, WireCtxLevel,
-    WireDiffLine, WireDiffLineKind, WireEntry, WireEntryKind, WireEntryView, WireGauge, WirePane,
-    WirePaneId, WirePaneStatus, WireStatus, WireStatusRole, WireStatusRun, WireStatusSeg, WireTodo,
+    InputSetMode, PaneTranscript, ServerFrame, ServerMsg, WireCtxLevel, WireDiffLine,
+    WireDiffLineKind, WireEntry, WireEntryKind, WireEntryView, WireGauge, WirePane, WirePaneId,
+    WirePaneStatus, WireStatus, WireStatusRole, WireStatusRun, WireStatusSeg, WireTodo,
     WireToolBody, WireToolDisplay, WireTurn,
 };
 
@@ -354,49 +354,5 @@ pub fn build_set_input(seq: u64, mode: InputSetMode, text: String) -> ServerFram
     ServerFrame {
         seq,
         msg: ServerMsg::SetInput { mode, text },
-    }
-}
-
-// ── escalation approvals ───────────────────────────────────────────────────
-
-/// Build a `ServerMsg::ApprovalRequested` frame.
-///
-/// The command is moved through untouched — no truncation, no normalization,
-/// no eliding for the wire. What the user is asked to allow has to be what
-/// runs, and this is the only place the two could drift apart.
-pub fn build_approval_requested(
-    seq: u64,
-    id: String,
-    command: String,
-    reason: String,
-    rules: Vec<String>,
-    allow_session: bool,
-) -> ServerFrame {
-    ServerFrame {
-        seq,
-        msg: ServerMsg::ApprovalRequested {
-            id,
-            command,
-            reason,
-            rules,
-            allow_session,
-        },
-    }
-}
-
-/// Build a `ServerMsg::ApprovalClosed` frame.
-pub fn build_approval_closed(seq: u64, id: String) -> ServerFrame {
-    ServerFrame {
-        seq,
-        msg: ServerMsg::ApprovalClosed { id },
-    }
-}
-
-/// Wire decision → the gate's own enum.
-pub fn core_approval_decision(d: WireApprovalDecision) -> hrdr_tools::ApprovalDecision {
-    match d {
-        WireApprovalDecision::Once => hrdr_tools::ApprovalDecision::Once,
-        WireApprovalDecision::Session => hrdr_tools::ApprovalDecision::Session,
-        WireApprovalDecision::Deny => hrdr_tools::ApprovalDecision::Deny,
     }
 }

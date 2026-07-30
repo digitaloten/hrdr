@@ -203,12 +203,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // The `/model` selector and `/resume` picker are full modals; when one is
     // open it owns the screen (and every key), so the completion popup stands
     // down.
-    if let Some(modal) = &app.approval_modal {
-        // First in the chain for the same reason it is first in `on_key`: a tool
-        // call is blocked behind it and it expires in a minute, so it must never
-        // be hidden under a picker the user left open.
-        draw_approval_modal(f, &app.theme, modal, app.approval_queue.len());
-    } else if let Some(sel) = &app.model_selector {
+    if let Some(sel) = &app.model_selector {
         draw_model_selector(f, &app.theme, sel, app.model_loading, app.model_source);
     } else if let Some(sel) = &app.session_selector {
         draw_session_selector(f, &app.theme, sel);
@@ -536,120 +531,6 @@ fn draw_login_modal(f: &mut Frame, theme: &Theme, modal: &crate::app::LoginModal
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
     }
-}
-
-/// The escalation-approval modal: what is being asked, the command **verbatim**,
-/// what approving actually grants, the rule that matched, and the three answers.
-///
-/// The command is wrapped, never truncated, and the modal grows to fit it (and
-/// scrolls with PgUp/PgDn when the terminal is too short). This is the one piece
-/// of chrome in the TUI that must not elide: the user is consenting to *this*
-/// command running with no sandbox, and `git push … ; rm -rf ~` with the tail cut
-/// off is a consent dialog that lies about what it is asking for. Every other
-/// picker here right-truncates its rows; this one may not.
-fn draw_approval_modal(
-    f: &mut Frame,
-    theme: &Theme,
-    modal: &crate::app::ApprovalModal,
-    queued: usize,
-) {
-    let req = &modal.req;
-    let width = f.area().width.saturating_sub(4).clamp(1, 78);
-    let inner_w = (width as usize).saturating_sub(BLOCK_PAD_X * 2).max(1);
-
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "⚠  Run this command with less confinement?",
-            Style::default()
-                .fg(theme.error)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled("Command", Style::default().fg(theme.dim))),
-        Line::from(Span::styled(
-            req.command.clone(),
-            Style::default().fg(theme.user).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        // The severity of the grant, in the warn colour, because `reason` is now
-        // where it lives. There is deliberately no hard-coded "runs with NO
-        // sandbox at all" above: that was true of the only rung that existed when
-        // it was written and false of the two narrower ones added since, so a
-        // dialog carrying it would have promised the user's whole filesystem away
-        // while the command actually ran fully confined. `Widening::describes` is
-        // the single source of that sentence.
-        Line::from(Span::styled(
-            req.reason.clone(),
-            Style::default().fg(theme.warn),
-        )),
-        Line::from(""),
-    ];
-    // Named so "approve for the session" has a visible meaning: this is what else
-    // that answer waves through later, without asking again. Omitted with the
-    // choice itself — see `approval_choices`.
-    if req.allow_session {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "Matched {}: {} — this is what \"for the session\" would remember, \
-                 and every later command matching it would then run the same way \
-                 without asking.",
-                if req.rules.len() == 1 {
-                    "rule"
-                } else {
-                    "rules"
-                },
-                req.rules
-                    .iter()
-                    .map(|r| format!("`{r}`"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ),
-            Style::default().fg(theme.dim),
-        )));
-        lines.push(Line::from(""));
-    }
-    for (i, (_, label, detail)) in modal.choices().iter().enumerate() {
-        let selected = i == modal.selected;
-        let mark = if selected { "❯ " } else { "  " };
-        let style = if selected {
-            Style::default().fg(theme.user).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.dim)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{mark}{label}"), style),
-            Span::styled(format!("  — {detail}"), Style::default().fg(theme.dim)),
-        ]));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "↑↓ choose · Enter answer · Esc deny · PgUp/PgDn scroll",
-        Style::default().fg(theme.dim),
-    )));
-    // On its own line, not appended to the hint: a wrapped hint would break the
-    // count across rows, and how many more of these are coming is worth seeing.
-    if queued > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("{queued} more waiting — each blocks its own command until answered"),
-            Style::default().fg(theme.warn),
-        )));
-    }
-
-    // How tall the body actually is once wrapped, so the modal is sized to the
-    // command rather than the command to the modal.
-    let rows: usize = lines
-        .iter()
-        .map(|l| l.width().div_ceil(inner_w).max(1))
-        .sum();
-    let Some(inner) = modal_frame(f, theme, width, (rows as u16).saturating_add(2), 4) else {
-        return;
-    };
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((modal.scroll, 0)),
-        inner,
-    );
 }
 
 /// The `/effort` picker modal: a search line, a hint, and a two-column list

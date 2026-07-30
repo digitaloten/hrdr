@@ -88,11 +88,6 @@ pub(crate) async fn run_loop(
         // A detached sub-agent that finished while the agent was idle wakes it,
         // so its result reaches the model without waiting for the user to type.
         app.maybe_deliver_background();
-        // An escalation request the user never answered denies itself inside the
-        // blocked tool call, which has no way to say so. Checked here — the loop
-        // wakes at least every 120ms on the spinner tick — so the dialog closes
-        // instead of soliciting consent for a decision already made without it.
-        app.prune_expired_approvals();
         // A turn that caught a tool panic ran through the process-global panic
         // hook, which left the alt screen and dropped raw mode before
         // `catch_unwind` recovered. Re-enter before drawing, or every frame from

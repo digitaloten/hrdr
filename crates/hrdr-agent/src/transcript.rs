@@ -675,26 +675,7 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
         AgentEvent::Notice(text) => transcript.push(Entry::system(text.clone())),
         // A steered message is a real user turn in this conversation.
         AgentEvent::Steered(sent) => transcript.push(Entry::user(sent.clone())),
-        // A pending approval is UI state — a question waiting on the user, which
-        // the frontend owns until it is answered. Folding it into the transcript
-        // would leave a permanent "may I?" in a conversation whose next entry is
-        // the answer in the form of the command's result.
-        // A decision the user made is part of the run, and the transcript is
-        // where a person looks to see what happened in it — so it folds to a
-        // notice, live and on replay alike. (The *question* stays out: it is UI
-        // state, and by the time anyone reads this it has been answered.)
-        AgentEvent::EscalationDecided {
-            command, decision, ..
-        } => transcript.push(Entry::notice(format!(
-            "escalation: `{command}` — {}",
-            match decision {
-                hrdr_tools::ApprovalDecision::Once => "approved for this run",
-                hrdr_tools::ApprovalDecision::Session => "approved for the session",
-                hrdr_tools::ApprovalDecision::Deny => "refused, so it ran confined",
-            }
-        ))),
-        AgentEvent::ApprovalRequested { .. }
-        | AgentEvent::Usage { .. }
+        AgentEvent::Usage { .. }
         | AgentEvent::History(_)
         | AgentEvent::TurnDone
         | AgentEvent::TodoUpdated(_) => {}
@@ -1072,71 +1053,5 @@ mod apply_event_tests {
         assert!(matches!(kinds[0], EntryKind::Assistant(s) if s == "before"));
         assert!(matches!(kinds[1], EntryKind::Reasoning { text, .. } if text == "thinking"));
         assert!(matches!(kinds[2], EntryKind::Assistant(s) if s == "after"));
-    }
-
-    /// A consent decision folds to a notice, and it does so HERE — in the shared
-    /// reducer — so every frontend shows it without each one handling the event.
-    /// The `EntryKind::Notice` this produces is also what crosses the web wire
-    /// unchanged, so the browser gets it for free.
-    ///
-    /// Both outcomes, because a transcript that showed only the grants would read
-    /// as though nothing had ever been declined.
-    #[test]
-    fn a_consent_decision_folds_to_a_notice() {
-        for (decision, expect) in [
-            (hrdr_tools::ApprovalDecision::Once, "approved for this run"),
-            (
-                hrdr_tools::ApprovalDecision::Session,
-                "approved for the session",
-            ),
-            (
-                hrdr_tools::ApprovalDecision::Deny,
-                "refused, so it ran confined",
-            ),
-        ] {
-            let mut transcript = Vec::new();
-            apply_event(
-                &mut transcript,
-                &AgentEvent::EscalationDecided {
-                    command: "git push origin main".to_string(),
-                    reason: "runs outside the OS sandbox".to_string(),
-                    rules: vec!["git push".to_string()],
-                    decision,
-                },
-            );
-            let [entry] = &transcript[..] else {
-                panic!("expected exactly one entry: {transcript:?}");
-            };
-            let EntryKind::Notice(text) = &entry.kind else {
-                panic!("expected a notice, got {:?}", entry.kind);
-            };
-            assert!(text.contains("git push origin main"), "{text}");
-            assert!(text.contains(expect), "{text}");
-        }
-    }
-
-    /// The durable record replays to the same entry the live event produced, so a
-    /// resumed transcript documents the decision exactly where the original did.
-    #[test]
-    fn a_recorded_decision_replays_to_the_same_notice() {
-        let live = AgentEvent::EscalationDecided {
-            command: "cargo test --workspace".to_string(),
-            reason: "the OS sandbox refused this command".to_string(),
-            rules: vec!["cargo test".to_string()],
-            decision: hrdr_tools::ApprovalDecision::Once,
-        };
-        let record = crate::transcript_log::Record::from_event(&live).expect("it is persisted");
-        let replayed = record.as_event().expect("it comes back");
-
-        let mut from_live = Vec::new();
-        apply_event(&mut from_live, &live);
-        let mut from_disk = Vec::new();
-        apply_event(&mut from_disk, &replayed);
-
-        let kind_of = |t: &Vec<Entry>| match &t[0].kind {
-            EntryKind::Notice(text) => text.clone(),
-            other => panic!("expected a notice, got {other:?}"),
-        };
-        assert_eq!(kind_of(&from_live), kind_of(&from_disk));
     }
 }

@@ -373,18 +373,6 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSession) {
     let (mut sender, mut receiver) = socket.split();
 
-    // This connection can answer escalation approvals, and says so for exactly as
-    // long as it is here. Taken first and dropped last: the guard registers on
-    // construction and unregisters on drop, so no path out of this function —
-    // including the early `return` below and an aborted task — can leave the gate
-    // counting a listener that is gone. Reaching this line at all means the socket
-    // authenticated: `ws_handler` refuses the upgrade otherwise, so an approval can
-    // never be answered by a client the server did not let in.
-    let _approval_listener = {
-        let s = session.lock().await;
-        crate::session::ApprovalListener::register(s.approval_gate())
-    };
-
     // Line channel: WebHost posts system/diff lines here.
     let (line_tx, mut line_rx) =
         tokio::sync::mpsc::unbounded_channel::<(hrdr_app::LineKind, String)>();
@@ -546,14 +534,6 @@ async fn handle_client_msg(
         }
         hrdr_protocol::ClientMsg::SwitchPane { pane } => {
             session.lock().await.switch_pane(pane);
-        }
-        hrdr_protocol::ClientMsg::AnswerApproval { id, decision } => {
-            // Through the session's gate `Arc`, never `Agent::answer_approval`:
-            // the turn task holds the agent lock for the whole turn, and the tool
-            // call waiting on this answer is inside that turn — an answer that had
-            // to take the lock would wait for the very turn it is unblocking.
-            let mut s = session.lock().await;
-            s.answer_approval(&id, crate::convert::core_approval_decision(decision));
         }
         hrdr_protocol::ClientMsg::Resume { seq } => {
             let mut s = session.lock().await;

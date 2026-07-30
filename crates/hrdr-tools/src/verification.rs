@@ -368,7 +368,7 @@ pub(crate) fn segments(command: &str) -> impl Iterator<Item = String> + '_ {
 /// leading environment assignments, wrapper programs, and everything from the
 /// first redirection on (`> out.log`, `2>` left over from `2>&1`).
 ///
-/// Shared with [`escalation`](crate::escalation), which decides eligibility on
+/// Shared with the sandbox denial notes, which classify a failure on
 /// the program a segment really runs. One normalization, so a wrapper this list
 /// learns about cannot be known to one caller and not the other — `rtk git push`
 /// has to read as `git push` in both.

@@ -122,55 +122,6 @@ impl ShellTool {
     pub fn new(shell: Shell) -> Self {
         Self { shell }
     }
-
-    /// The command to spawn, given how far the boundary has been moved for it.
-    ///
-    /// One place decides this, because it is called twice — once for the first
-    /// attempt and once for an approved retry — and the two must not be able to
-    /// disagree about what a given [`Widening`](crate::escalation::Widening)
-    /// means.
-    fn command_for(
-        &self,
-        command: &str,
-        escalation: &crate::escalation::Escalation,
-        ctx: &ToolContext,
-    ) -> tokio::process::Command {
-        use crate::escalation::{Escalation, Widening};
-        match escalation {
-            // No OS wrapper at all, so the user namespace that makes ssh refuse
-            // `/etc/ssh/ssh_config` is never created. Byte-identical to how every
-            // command ran before the sandbox existed.
-            Escalation::Approved(Widening::Full) => self.shell.command(command),
-            // Still confined — same roots, same read-only subpaths, same network
-            // rule — just by a mechanism that needs no namespace.
-            Escalation::Approved(Widening::NoUserNamespace) => {
-                crate::sandbox::shell_command_without_userns(
-                    self.shell,
-                    command,
-                    &ctx.sandbox,
-                    &ctx.cwd,
-                    &ctx.sandbox_notices,
-                )
-            }
-            // Same backend, same roots, same network — one lock lifted.
-            Escalation::Approved(Widening::GitMetadata) => crate::sandbox::sandboxed_shell_command(
-                self.shell,
-                command,
-                &ctx.sandbox.allow_git_writes(),
-                &ctx.cwd,
-                &ctx.sandbox_notices,
-            ),
-            Escalation::NotEligible | Escalation::Denied(_) => {
-                crate::sandbox::sandboxed_shell_command(
-                    self.shell,
-                    command,
-                    &ctx.sandbox,
-                    &ctx.cwd,
-                    &ctx.sandbox_notices,
-                )
-            }
-        }
-    }
 }
 
 const BASH_DESC: &str = "Run a shell command via `bash -c` in the working directory. Use for build, test, \
@@ -361,12 +312,14 @@ impl Tool for ShellTool {
             bail!("command blocked: {msg}");
         }
         // Guardrails first, confinement second: a blocked command never runs,
-        // sandboxed or not — and it is never offered for escalation either.
-        // `git push --force` is refused whether or not `git push` is eligible to
-        // leave the sandbox; escalation widens the boundary, it does not repeal
-        // the rules.
-        let escalation = crate::escalation::consider(&a.command, ctx).await;
-        let mut cmd = self.command_for(&a.command, &escalation, ctx);
+        // sandboxed or not.
+        let mut cmd = crate::sandbox::sandboxed_shell_command(
+            self.shell,
+            &a.command,
+            &ctx.sandbox,
+            &ctx.cwd,
+            &ctx.sandbox_notices,
+        );
         cmd.current_dir(&ctx.cwd);
         // `shell` opts out of the registry's deadline (see `timeout_secs`), so it
         // applies the same floor itself rather than inheriting it.
@@ -389,100 +342,20 @@ impl Tool for ShellTool {
         // the run's `passed` flag is dropped here — `verify` is the caller that
         // needs it (see [`CommandRun`]).
         let run = run_streamed_command(cmd, &a.command, timeout, a.keep_ansi, ctx).await;
-        // Kept before the text is unwrapped: whether the command *succeeded* is
-        // a separate fact from what it printed (see [`CommandRun`]), and the
-        // escalation note below is owed only to a failure.
-        let failed = run.as_ref().is_ok_and(|r| !r.passed);
         let mut out = run.map(|run| run.output);
         // Also on failure: a command that exited non-zero (or timed out) may
         // still have rewritten files before it died.
         ctx.note_modifying_command(&before, &a.command);
         // Name the sandbox when it is what actually failed. An `EROFS` raised
         // deep inside a tool, about a path the model never named, otherwise
-        // reads as that tool being broken or absent — see `sandbox_denial`.
-        //
-        // …and when the sandbox is what failed, that is also the moment to offer
-        // a way past it. Ahead of the run only an allowlisted command could ask;
-        // here the refusal itself is the evidence that asking is warranted, which
-        // is what lets an unanticipated command be escalated at all instead of
-        // dead-ending in an explanation. Only when this attempt was confined
-        // (`NotEligible` — an already-approved run has nothing left to escalate,
-        // and a refused one was just answered).
-        let mut retry_with: Option<crate::escalation::Widening> = None;
+        // reads as that tool being broken or absent — see `sandbox_denial`,
+        // which is now the whole response to a refused write: it says what the
+        // sandbox did, that the tool is not broken, and how the user can widen
+        // the boundary if the write is genuinely wanted.
         if let Ok(text) = &mut out
-            && let Some(denial) = crate::sandbox::sandbox_denial(&ctx.sandbox, text)
+            && let Some(note) = crate::sandbox::sandbox_denial_note(&ctx.sandbox, text)
         {
-            text.push_str(&denial.note);
-            // Which rung of the ladder is left. An attempt that was already
-            // confined starts at the narrowest one that could fix this denial; an
-            // attempt that ALREADY took the narrow rung and still failed has
-            // learned something — the mechanism was not the problem — so the only
-            // thing left to offer is the full bypass. After a full bypass there is
-            // nothing left at all.
-            let next = match &escalation {
-                crate::escalation::Escalation::NotEligible => {
-                    crate::escalation::widening_for(denial.kind, &ctx.sandbox)
-                }
-                crate::escalation::Escalation::Approved(
-                    crate::escalation::Widening::NoUserNamespace,
-                ) => crate::escalation::widening_allowed(
-                    crate::escalation::Widening::Full,
-                    &ctx.sandbox,
-                )
-                .then_some(crate::escalation::Widening::Full),
-                _ => None,
-            };
-            if failed
-                && denial.kind.escalatable()
-                && let Some(widening) = next
-                && crate::escalation::consider_retry(&a.command, ctx, widening).await
-                    == crate::escalation::Escalation::Approved(widening)
-            {
-                retry_with = Some(widening);
-            }
-        }
-        if let Some(widening) = retry_with {
-            let mut cmd = self.command_for(
-                &a.command,
-                &crate::escalation::Escalation::Approved(widening),
-                ctx,
-            );
-            cmd.current_dir(&ctx.cwd);
-            let before = ctx.tracked_sigs();
-            let rerun = run_streamed_command(cmd, &a.command, timeout, a.keep_ansi, ctx).await;
-            ctx.note_modifying_command(&before, &a.command);
-            // The confined attempt's output is replaced rather than appended to.
-            // It is a failure the user has just been told to disregard, and
-            // keeping both would leave the model reading two exit statuses for
-            // one command and guessing which one counts. The note says what
-            // happened so the transcript is not silently missing a run.
-            let how = match widening {
-                crate::escalation::Widening::NoUserNamespace => {
-                    "with the same confinement but no user namespace"
-                }
-                crate::escalation::Widening::Full => "with no OS confinement",
-                crate::escalation::Widening::GitMetadata => {
-                    "with the same confinement but git metadata writable"
-                }
-            };
-            out = rerun.map(|run| {
-                format!(
-                    "{}\n\n[sandbox] the first attempt was refused by the OS sandbox; you \
-                     approved re-running this command {how}, and the output above is that \
-                     second run.",
-                    run.output
-                )
-            });
-        }
-        // Say that the sandbox was not left, but only when it might explain the
-        // failure. A refused escalation whose command then worked confined has
-        // nothing to report, and a note on every successful `git push` would be
-        // noise the model learns to skip.
-        if let crate::escalation::Escalation::Denied(rules) = &escalation
-            && failed
-            && let Ok(text) = &mut out
-        {
-            text.push_str(&crate::escalation::escalation_denied_note(rules));
+            text.push_str(&note);
         }
         // The deadline the call asked for was not the one it got. Said even when
         // the command finished comfortably — the point is that the next call

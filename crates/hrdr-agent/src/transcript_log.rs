@@ -93,18 +93,6 @@ pub enum Record {
     Error {
         msg: String,
     },
-    /// A human agreed (or refused) to move this agent's sandbox boundary for one
-    /// command. The audit half of escalation: without it nothing on disk says a
-    /// command ran with less confinement than the session's policy describes.
-    EscalationDecided {
-        command: String,
-        reason: String,
-        rules: Vec<String>,
-        /// `"once"`, `"session"` or `"deny"` — the wire spelling of
-        /// `ApprovalDecision`, kept as a string so the record format does not
-        /// depend on that enum's layout.
-        decision: String,
-    },
     End {
         status: EndStatus,
         /// Byte length of the sub-agent's trimmed text output at the terminal
@@ -146,32 +134,8 @@ impl Record {
                 ok: *ok,
             }),
             AgentEvent::Notice(n) => Some(Record::Notice { msg: n.clone() }),
-            // The one approval signal that IS persisted: a decision, not a
-            // question. See `Record::EscalationDecided`.
-            AgentEvent::EscalationDecided {
-                command,
-                reason,
-                rules,
-                decision,
-            } => Some(Record::EscalationDecided {
-                command: command.clone(),
-                reason: reason.clone(),
-                rules: rules.clone(),
-                decision: match decision {
-                    hrdr_tools::ApprovalDecision::Once => "once",
-                    hrdr_tools::ApprovalDecision::Session => "session",
-                    hrdr_tools::ApprovalDecision::Deny => "deny",
-                }
-                .to_string(),
-            }),
             AgentEvent::Steered(s) => Some(Record::Steered { text: s.clone() }),
-            // An approval request is a question in flight, not a record of what
-            // happened: by the time anyone replays this transcript it has been
-            // answered one way or the other, and the answer shows up as the
-            // command's own result. Nothing to persist. (A sub-agent never files
-            // one at all — it has no gate.)
-            AgentEvent::ApprovalRequested { .. }
-            | AgentEvent::Usage { .. }
+            AgentEvent::Usage { .. }
             | AgentEvent::History(_)
             | AgentEvent::TodoUpdated(_)
             | AgentEvent::TurnDone => None,
@@ -214,25 +178,6 @@ impl Record {
             Record::Notice { msg } => Some(AgentEvent::Notice(msg.clone())),
             Record::Steered { text } => Some(AgentEvent::Steered(text.clone())),
             Record::Error { msg } => Some(AgentEvent::Notice(msg.clone())),
-            // Round-tripped, because `apply_event` renders this event: a replayed
-            // transcript shows the decision exactly where the live one did. An
-            // unrecognised spelling reads as a refusal — the conservative way to
-            // be wrong about a consent record.
-            Record::EscalationDecided {
-                command,
-                reason,
-                rules,
-                decision,
-            } => Some(AgentEvent::EscalationDecided {
-                command: command.clone(),
-                reason: reason.clone(),
-                rules: rules.clone(),
-                decision: match decision.as_str() {
-                    "once" => hrdr_tools::ApprovalDecision::Once,
-                    "session" => hrdr_tools::ApprovalDecision::Session,
-                    _ => hrdr_tools::ApprovalDecision::Deny,
-                },
-            }),
             Record::End { .. } => None,
         }
     }

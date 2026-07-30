@@ -118,6 +118,27 @@ struct Cli {
     #[arg(long, global = true, value_name = "write|read|strict|none")]
     sandbox: Option<String>,
 
+    /// Extra directory the agent may write to; repeat for more than one.
+    ///
+    /// The "repeat" is load-bearing documentation, not a stylistic note: this is
+    /// the only place a user learns the flag can be given twice, and
+    /// `--sandbox-writable-root <PATH>` on its own reads as accepting exactly one.
+    /// It is repeatable rather than multi-valued because `hrdr` has a greedy
+    /// trailing positional for the startup command — a space-separated list would
+    /// swallow it — and because comma-splitting makes a directory named `foo,bar`
+    /// unrepresentable.
+    ///
+    /// Appends to the built-in package-manager caches and to
+    /// `sandbox_writable_roots` in config; it never replaces them, or using it to
+    /// add one path would silently break `cargo build`.
+    #[arg(
+        long = "sandbox-writable-root",
+        global = true,
+        value_name = "PATH",
+        action = clap::ArgAction::Append
+    )]
+    sandbox_writable_root: Vec<std::path::PathBuf>,
+
     /// Run without filesystem confinement (alias for `--sandbox none`).
     #[arg(long = "no-sandbox", global = true, conflicts_with = "sandbox")]
     no_sandbox: bool,
@@ -586,6 +607,13 @@ async fn main() -> Result<()> {
     if cli.no_sandbox || cli.yolo {
         config.sandbox = hrdr_tools::SandboxMode::None;
     }
+    // Appended, never assigned: config's own list stays, and both sit on top of
+    // the built-in package-manager caches (`package_cache_roots`). A flag that
+    // replaced them would make "allow one extra path" silently mean "and take
+    // away every dependency cache".
+    config
+        .sandbox_writable_roots
+        .extend(cli.sandbox_writable_root);
     if cli.no_auto_resume {
         ui.auto_resume = false;
     }
@@ -984,39 +1012,6 @@ fn event_json(ev: &AgentEvent) -> String {
                 "cost_usd": cost_usd,
                 "session_cost_usd": session_cost_usd,
                 "cost_partial": cost_partial,
-            })
-        }
-        // Unreachable from `hrdr run`: a request is only published once a
-        // frontend has registered as able to answer, and this one cannot — a
-        // headless run has no user to ask, so escalation is refused before
-        // anything is emitted. Serialized rather than dropped so a `--json`
-        // consumer that DOES drive approvals (over the same stream, one day)
-        // sees the same shape every other event has.
-        AgentEvent::ApprovalRequested {
-            id,
-            command,
-            reason,
-            rules,
-            allow_session,
-        } => {
-            json!({"type": "approval_requested", "id": id, "command": command, "reason": reason, "rules": rules, "allow_session": allow_session})
-        }
-        AgentEvent::EscalationDecided {
-            command,
-            reason,
-            rules,
-            decision,
-        } => {
-            json!({
-                "type": "escalation_decided",
-                "command": command,
-                "reason": reason,
-                "rules": rules,
-                "decision": match decision {
-                    hrdr_tools::ApprovalDecision::Once => "once",
-                    hrdr_tools::ApprovalDecision::Session => "session",
-                    hrdr_tools::ApprovalDecision::Deny => "deny",
-                },
             })
         }
         AgentEvent::TurnDone => json!({"type": "done"}),

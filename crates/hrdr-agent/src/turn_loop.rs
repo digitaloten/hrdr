@@ -533,18 +533,6 @@ impl Agent {
             if let Some(warning) = self.ctx.sandbox_notices.take() {
                 on_event(AgentEvent::Notice(warning));
             }
-            // Consent decisions, on the same channel and for the same reason: a
-            // tool call several crates down has something the run's durable
-            // record must carry, and no way to emit an event itself. Drained
-            // rather than read — a decision is persisted exactly once.
-            for decided in self.ctx.escalations.take() {
-                on_event(AgentEvent::EscalationDecided {
-                    command: decided.command,
-                    reason: decided.reason,
-                    rules: decided.rules,
-                    decision: decided.decision,
-                });
-            }
 
             // Emit usage for the status bar + auto-compaction. Prefer the
             // server's reported counts; when it doesn't send any (e.g. a server
@@ -976,19 +964,6 @@ impl Agent {
     /// `ToolOutput` events (attributed by call id) while they run. A read-only
     /// run executes concurrently; a lone mutating call is a one-element batch.
     /// Results are emitted and recorded in call order.
-    /// The next approval request, or a future that never resolves when this
-    /// agent has no gate (a sub-agent). `select!` needs a branch either way, and
-    /// `Option::recv` is not a thing; `recv` is cancel-safe, so re-creating this
-    /// on each loop pass loses nothing.
-    async fn next_approval(
-        rx: Option<&mut tokio::sync::mpsc::UnboundedReceiver<hrdr_tools::ApprovalRequest>>,
-    ) -> Option<hrdr_tools::ApprovalRequest> {
-        match rx {
-            Some(rx) => rx.recv().await,
-            None => std::future::pending().await,
-        }
-    }
-
     async fn run_tool_batch<F: FnMut(AgentEvent)>(
         &mut self,
         batch: &[hrdr_llm::ToolCall],
@@ -1143,19 +1118,6 @@ impl Agent {
                 r = &mut joined => break r,
                 Some((id, chunk)) = shared_rx.recv() => {
                     on_event(AgentEvent::ToolOutput { id, chunk });
-                }
-                // An approval request has to reach the frontend from *inside* the
-                // running batch: the tool call that filed it is one of the futures
-                // above and is blocked until it is answered, so publishing it after
-                // the join would deadlock until the gate's own timeout fired.
-                Some(req) = Self::next_approval(self.approval_rx.as_mut()) => {
-                    on_event(AgentEvent::ApprovalRequested {
-                        id: req.id,
-                        command: req.command,
-                        reason: req.reason,
-                        rules: req.rules,
-                        allow_session: req.allow_session,
-                    });
                 }
             }
         };
