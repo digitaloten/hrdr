@@ -1,6 +1,6 @@
 # Sandbox redesign — plan of record
 
-Status: **plan, not yet built.** Written 2026-07-30.
+Status: **agreed, not yet built.** Written 2026-07-30. No open decisions.
 
 Supersedes the escalation ladder shipped in `97ab735`, `cd4b597`, `e9e753f`, and
 the `.git` lock from `899ecd2`.
@@ -793,8 +793,11 @@ the plan assumes the stated recommendation for the rest.
   the POSIX backend are both deleted, and lookaround goes with them.
 - **`task` gains a `cwd`** — optional in general, **required for a jailed
   agent**, validated to sit inside the caller's own cwd.
-- **The jail agent is `prisoner`** — containment is its defining property, so
-  naming it after the containment is correct here.
+- **The jail agent is `prisoner`, and it is the only agent added.** Containment
+  is its defining property, so naming it after the containment is correct here.
+  **No `audit` agent**: security review of our own code is already served by the
+  `:audit` skill and the `review` agent, and a third would be the redundancy
+  this document otherwise removes.
 - **No network confinement in any mode**, and **bwrap is deleted** — Landlock on
   Linux, Seatbelt on macOS, nothing elsewhere. The ssh / user-namespace failure
   class disappears with it.
