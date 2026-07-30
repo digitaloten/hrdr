@@ -33,19 +33,18 @@ exists to inspect third-party code you are unwilling to expose to.
 
 ## Mode matrix
 
-| Axis                         | `none` (yolo) | `write`                        | `read`          | `jail`                   |
-| ---------------------------- | ------------- | ------------------------------ | --------------- | ------------------------ |
-| Writes                       | everywhere    | cwd, temp, scratch, output dir | **none**        | **none**                 |
-| Reads                        | everywhere    | everywhere                     | everywhere      | **cwd + own output dir** |
-| `web_fetch` / `web_search`   | yes           | yes                            | yes             | **no**                   |
-| MCP tools                    | yes           | yes                            | yes             | **no**                   |
-| `shell` / `verify` / LSP     | yes           | yes                            | yes             | **no**                   |
-| `task`                       | yes           | yes                            | yes             | **no**                   |
-| `memory`                     | main only     | main only                      | main only       | **no**                   |
-| Project `AGENTS.md` / skills | yes           | yes                            | yes             | **no**                   |
-| Tool results wrapped         | no            | opt-in (config)                | opt-in (config) | **always**               |
-| Escalation eligible          | n/a           | yes                            | yes             | **never**                |
-| Backend                      | none          | Landlock                       | Landlock        | **none needed**          |
+| Axis                         | `none` (yolo) | `write`                                      | `read`          | `jail`                   |
+| ---------------------------- | ------------- | -------------------------------------------- | --------------- | ------------------------ |
+| Writes                       | everywhere    | cwd, temp, scratch, output, toolchain caches | **none**        | **none**                 |
+| Reads                        | everywhere    | everywhere                                   | everywhere      | **cwd + own output dir** |
+| `web_fetch` / `web_search`   | yes           | yes                                          | yes             | **no**                   |
+| MCP tools                    | yes           | yes                                          | yes             | **no**                   |
+| `shell` / `verify` / LSP     | yes           | yes                                          | yes             | **no**                   |
+| `task`                       | yes           | yes                                          | yes             | **no**                   |
+| `memory`                     | main only     | main only                                    | main only       | **no**                   |
+| Project `AGENTS.md` / skills | yes           | yes                                          | yes             | **no**                   |
+| Tool results wrapped         | no            | opt-in (config)                              | opt-in (config) | **always**               |
+| Backend                      | none          | Landlock                                     | Landlock        | **none needed**          |
 
 **There is no network axis.** The sandbox does not confine the network in any
 mode — see "Network confinement is removed" below.
