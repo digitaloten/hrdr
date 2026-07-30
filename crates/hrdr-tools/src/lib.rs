@@ -15,7 +15,7 @@ extern crate hrdr_test_support;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -1761,29 +1761,54 @@ pub enum TruncateSide {
     Middle,
 }
 
-/// Directory holding full copies of truncated tool output. Overflow files can
-/// contain anything a command touched — full shell output, grep hits across
-/// the tree — so this must not be a single world-readable path shared by
-/// every local user under the default umask.
+/// Directory holding full copies of truncated tool output, **for this session
+/// alone**.
 ///
-/// Prefers `$XDG_RUNTIME_DIR` when set: on Linux that's already a per-user
-/// directory (typically `/run/user/<uid>`, mode `0700`) provisioned by the
-/// login session, so nesting under it inherits that isolation for free.
-/// Otherwise falls back to a login-name-suffixed subdirectory of the system
-/// temp dir, created with `0700` permissions on unix (belt-and-suspenders:
-/// even if two users' names somehow collided, the directory the first one
-/// created is unreadable to the second by mode alone).
+/// Overflow files can contain anything a command touched — full shell output,
+/// grep hits across the whole tree — so the path is private twice over:
 ///
-/// Still under a well-known temp root on purpose: it's within the
-/// cwd-confinement escape hatch `read`/`grep` already grant for scratch
-/// space, so the model can retrieve the overflow.
+/// 1. **Per user.** `$XDG_RUNTIME_DIR` when set (on Linux that is already a
+///    per-user `0700` directory the login session provisions, so nesting under it
+///    inherits the isolation for free); otherwise a login-name-suffixed
+///    subdirectory of the system temp dir, created `0700` on unix. Belt and
+///    braces: even if two users' names somehow collided, the directory the first
+///    created is unreadable to the second by mode alone.
+/// 2. **Per session** — `<per-user base>/s-<pid>-<8 hex rand>`, one per process,
+///    which is what the previous single shared path got wrong. It is a *readable
+///    root*, so a strictly-confined agent whose readable set is "its own working
+///    directory and its own output dir" could otherwise read spooled output from
+///    other sessions on other projects. Confinement that leaks every concurrent
+///    session's shell output is not confinement.
+///
+/// Still under a well-known temp root on purpose: it is inside the confinement
+/// every mode grants for scratch space, so the model can retrieve its own
+/// overflow with `read` or `grep`.
+///
+/// Resolved once per process and cached: a session dir that changed mid-run would
+/// strand the overflow pointers already in the model's context.
 pub fn tool_output_dir() -> PathBuf {
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let base = tool_output_base();
+        ensure_private_dir(&base);
+        let dir = base.join(format!(
+            "s-{}-{}",
+            std::process::id(),
+            crate::sandbox::rand_hex8()
+        ));
+        crate::sandbox::sweep_stale_session_dirs(&base, "s-", &dir);
+        ensure_private_dir(&dir);
+        dir
+    })
+    .clone()
+}
+
+/// The per-user parent [`tool_output_dir`] puts its session directory inside.
+fn tool_output_base() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
         Some(runtime) => PathBuf::from(runtime).join("hrdr-tool-output"),
         None => std::env::temp_dir().join(format!("hrdr-tool-output-{}", user_scope())),
-    };
-    ensure_private_dir(&dir);
-    dir
+    }
 }
 
 /// A best-effort per-user scope string for the temp-dir fallback path: the
@@ -2400,6 +2425,73 @@ mod tests {
         ensure_private_dir(&target);
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    /// The overflow dir is **per session**, not per user: it is a readable root,
+    /// so one shared path let a strictly-confined agent read spooled shell output
+    /// from every other session on the machine, including other projects.
+    ///
+    /// Asserted three ways, because each is a distinct way to get it wrong: the
+    /// path is nested under the per-user base (so the mode-`0700` isolation still
+    /// applies), it names this process, and it is stable within the process — a
+    /// path that changed mid-run would strand every overflow pointer already in
+    /// the model's context.
+    #[test]
+    fn the_overflow_dir_is_private_to_this_session() {
+        let dir = tool_output_dir();
+        let base = tool_output_base();
+        assert!(
+            dir.starts_with(&base),
+            "{} must nest under the per-user base {}",
+            dir.display(),
+            base.display()
+        );
+        assert_ne!(dir, base, "the session dir must not BE the shared base");
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with(&format!("s-{}-", std::process::id())),
+            "the session dir names this process: {name}"
+        );
+        assert_eq!(dir, tool_output_dir(), "and is stable within the process");
+        assert!(dir.is_dir(), "created eagerly, so a spool can land in it");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [base.as_path(), dir.as_path()] {
+                let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700, "{} must be owner-only", path.display());
+            }
+        }
+    }
+
+    /// A dead session's spool is reaped, but not for a day — a resumed session is
+    /// by definition one whose process is dead, and its restored context still
+    /// points at "full output saved to <path>" inside that directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_sessions_spool_survives_long_enough_to_resume() {
+        let base = tempfile::tempdir().unwrap();
+        let keep = base.path().join("s-1-keepme");
+        // pid 1 is always alive, so this stands in for a live sibling session.
+        std::fs::create_dir_all(&keep).unwrap();
+        // A pid nothing can be using, whose directory was touched just now.
+        let recent = base.path().join(format!("s-{}-recent", i32::MAX));
+        std::fs::create_dir_all(&recent).unwrap();
+        let mine = base.path().join("s-999999-mine");
+
+        crate::sandbox::sweep_stale_session_dirs(base.path(), "s-", &mine);
+        assert!(keep.is_dir(), "a live session's spool is not ours to reap");
+        assert!(
+            recent.is_dir(),
+            "a dead session's spool survives the resume window"
+        );
+
+        // Backdate it past the window and it goes.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 60 * 60);
+        filetime::set_file_mtime(&recent, filetime::FileTime::from_system_time(old)).unwrap();
+        crate::sandbox::sweep_stale_session_dirs(base.path(), "s-", &mine);
+        assert!(!recent.exists(), "an old dead session's spool is reaped");
     }
 
     // ---- grep secret-line filter ----

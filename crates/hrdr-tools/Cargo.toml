@@ -57,5 +57,7 @@ windows-sys = { version = "0.52", features = [
 [dev-dependencies]
 # Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).
 hrdr-test-support.workspace = true
+# Backdating an mtime is the only way to test an age-based sweep without sleeping.
+filetime.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

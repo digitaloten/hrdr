@@ -1,7 +1,7 @@
 # Sandbox redesign — plan of record
 
-Status: **being built.** Written 2026-07-30. No open decisions. Slice 1 shipped;
-slices 2–9 outstanding — the checklist at the end tracks it.
+Status: **being built.** Written 2026-07-30. No open decisions. Slices 1–2
+shipped; slices 3–9 outstanding — the checklist at the end tracks it.
 
 Supersedes the escalation ladder shipped in `97ab735`, `cd4b597`, `e9e753f`, and
 the `.git` lock from `899ecd2`.
@@ -996,7 +996,7 @@ Mostly-deletion first, so each slice is independently reviewable.
      trail.
    - Add the `!command`-is-unsandboxed test here too: it becomes the only
      remaining relief valve and is untested today.
-2. **`tool_output_dir` per session.**
+2. ~~**`tool_output_dir` per session.**~~ **DONE.**
 3. **Delete bwrap and the network axis.** Write/Read→Landlock (Seatbelt on
    macOS), jail→no backend. Removes `bwrap_args`, `usr_merge_compat_args`, the
    userns probe, `git_ssh_command_for_userns`, `allow_network`, `deny_network`,

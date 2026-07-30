@@ -375,9 +375,9 @@ pub fn session_scratch_dir() -> &'static Path {
     .as_path()
 }
 
-/// Eight hex characters of randomness for the scratch-dir name, so a recycled
-/// pid cannot land on a directory somebody else created first.
-fn rand_hex8() -> String {
+/// Eight hex characters of randomness for a per-session directory name, so a
+/// recycled pid cannot land on a directory somebody else created first.
+pub(crate) fn rand_hex8() -> String {
     use rand::RngExt as _;
     let mut bytes = [0u8; 4];
     rand::rng().fill(&mut bytes);
@@ -389,9 +389,53 @@ fn rand_hex8() -> String {
 /// error is ignored.
 #[cfg(unix)]
 fn sweep_stale_scratch(temp: &Path, keep: &Path) {
-    let Ok(entries) = std::fs::read_dir(temp) else {
-        return;
+    for path in dead_pid_dirs(temp, "hrdr-scratch-", keep) {
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
+/// Remove `<prefix><pid>-*` session directories in `parent` whose pid is gone
+/// **and** which have not been touched for a day, skipping `keep`.
+///
+/// The age condition is the difference from [`sweep_stale_scratch`], and it is
+/// there for **resume**: a resumed session is by definition one whose process is
+/// dead, and its restored context still carries "full output saved to <path>"
+/// pointers into that session's output dir. Reaping on a dead pid alone would
+/// delete exactly the files a resume is about to want. Scratch has no equivalent
+/// problem — nothing points into it across a restart.
+///
+/// Best-effort: every error is ignored, and an unreadable mtime counts as recent
+/// (keeping a directory is cheaper than deleting one somebody needs).
+#[cfg(unix)]
+pub(crate) fn sweep_stale_session_dirs(parent: &Path, prefix: &str, keep: &Path) {
+    const KEEP_FOR: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    for path in dead_pid_dirs(parent, prefix, keep) {
+        let stale = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+            .is_ok_and(|age| age > KEEP_FOR);
+        if stale {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Non-unix: no portable liveness probe, so leave stale dirs to the OS.
+#[cfg(not(unix))]
+pub(crate) fn sweep_stale_session_dirs(_parent: &Path, _prefix: &str, _keep: &Path) {}
+
+/// Directories in `parent` named `<prefix><pid>-…` whose pid is no longer alive,
+/// excluding `keep`.
+///
+/// Signal 0 probes for existence without delivering anything. Only `ESRCH` proves
+/// the process is gone — `EPERM` means it is alive and owned by somebody else, and
+/// that directory is not ours to reap.
+#[cfg(unix)]
+fn dead_pid_dirs(parent: &Path, prefix: &str, keep: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
     };
+    let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path == keep {
@@ -400,21 +444,18 @@ fn sweep_stale_scratch(temp: &Path, keep: &Path) {
         let name = entry.file_name();
         let Some(pid) = name
             .to_str()
-            .and_then(|n| n.strip_prefix("hrdr-scratch-"))
+            .and_then(|n| n.strip_prefix(prefix))
             .and_then(|rest| rest.split('-').next())
             .and_then(|pid| pid.parse::<i32>().ok())
         else {
             continue;
         };
-        // Signal 0 probes for existence without delivering anything. Only
-        // ESRCH proves the process is gone — EPERM means it is alive and
-        // owned by somebody else, and that directory is not ours to reap.
         let rc = unsafe { libc::kill(pid, 0) };
-        let gone = rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if gone {
-            let _ = std::fs::remove_dir_all(&path);
+        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            out.push(path);
         }
     }
+    out
 }
 
 /// Non-unix: no portable liveness probe, so leave stale dirs to the OS.

@@ -8,6 +8,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- **The tool-output spool is per session, not per user.** Truncated tool output
+  spills its full copy to a file under `$XDG_RUNTIME_DIR` (or a
+  login-name-scoped temp subdirectory) so the model can `read` or `grep` it
+  instead of re-running the command. That directory was one shared path per user
+  — and it is a _readable root_, so an agent whose readable set is meant to be
+  "its own working directory and its own output dir" could read spooled shell
+  output from every other session on the machine, including other projects. It
+  is now `<per-user base>/s-<pid>-<rand>`, resolved once per process (a path
+  that changed mid-run would strand the overflow pointers already in the model's
+  context).
+
+  A dead session's spool is reaped, but only after a day. A resumed session is
+  by definition one whose process is dead, and its restored context still points
+  at "full output saved to <path>" inside that directory — reaping on a dead pid
+  alone, the way the scratch dir does, would delete exactly the files a resume
+  wants.
+
 - **The sandbox is a cautionary tool, not a requirement: the `.git` lock and all
   of escalation are gone.** An agent working in the user's project — main or
   delegated — is now assumed to have authority over that project. It commits, it
