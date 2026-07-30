@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-30
+
+The sandbox redesign: nine slices in one day, and about 9,000 lines net removed.
+Most of what follows closed **by deletion** — the `.git` lock, all of
+escalation, the network axis, bwrap, ten tools — because each was answering a
+problem better solved by not having the mechanism. `docs/sandbox-redesign.md` is
+the decision record.
+
 ### Breaking
 
 - **Ten tools removed: `move`, `copy`, `delete`, `watch`, `definition`,
@@ -5227,7 +5235,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.8.5...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/kryptic-sh/hrdr/compare/v0.8.5...v0.9.0
 [0.8.5]: https://github.com/kryptic-sh/hrdr/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/kryptic-sh/hrdr/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/kryptic-sh/hrdr/compare/v0.8.2...v0.8.3
