@@ -1469,10 +1469,10 @@ async fn a_queued_message_rides_in_with_the_tool_results() {
     assert!(!h.app.running(), "no follow-up turn was spawned");
 }
 
-/// Esc cancels only the turn in flight — pending messages survive and launch
-/// the next turn.
+/// Esc cancels the turn in flight and hands anything queued behind it back to
+/// the composer — neither sent nor lost.
 #[tokio::test]
-async fn cancelling_preserves_pending_steering() {
+async fn cancelling_returns_pending_steering_to_the_composer() {
     let mut h = Harness::new(vec![]).await;
     h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     h.type_str("never mind");
@@ -1480,16 +1480,33 @@ async fn cancelling_preserves_pending_steering() {
     assert_eq!(h.app.steering_len_for_test(), 1);
 
     h.app.cancel_turn();
-    // The message stays in the queue — Esc cancels only the current turn, not
-    // what was waiting for it.
-    assert!(!h.app.pending().is_empty());
-    assert_eq!(h.app.steering_len_for_test(), 1, "the message survives");
+    // Off the queue...
+    assert!(h.app.pending().is_empty(), "nothing is left queued to fire");
+    assert_eq!(h.app.steering_len_for_test(), 0, "the agent's copy too");
+    // ...and in front of the user, where they can edit, resend or clear it.
+    assert_eq!(h.app.editor.content(), "never mind");
+    // Cancel means stop: it must not have started anything.
+    assert!(!h.app.running(), "cancel does not launch the next turn");
+}
+
+/// Whatever the user is part-way through typing is newer than what was queued,
+/// so it stays last — and the restore must not clobber it.
+#[tokio::test]
+async fn a_restored_steer_lands_above_what_is_being_typed() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    h.type_str("queued thought");
+    h.press(KeyCode::Enter);
+    h.type_str("half-typed");
+
+    h.app.cancel_turn();
+    assert_eq!(h.app.editor.content(), "queued thought\nhalf-typed");
 }
 
 /// Several mid-turn submits queue up and are merged into a single message —
 /// each line the user types while waiting is one thought, not separate turns.
 #[tokio::test]
-async fn queued_messages_merge_and_survive_cancel() {
+async fn queued_messages_merge_and_come_back_together() {
     let mut h = Harness::new(vec![]).await;
     h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     for msg in ["one", "two"] {
@@ -1506,12 +1523,10 @@ async fn queued_messages_merge_and_survive_cancel() {
         "a fresh turn was spawned to drain the queue"
     );
 
-    // Cancelling preserves the queued messages — Esc only kills the in-flight turn.
+    // Cancelling hands the merged message back, both lines intact.
     h.app.cancel_turn();
-    assert!(
-        !h.app.pending().is_empty(),
-        "queued messages survive cancel"
-    );
+    assert!(h.app.pending().is_empty(), "nothing left on the queue");
+    assert_eq!(h.app.editor.content(), "one\ntwo");
 }
 
 /// Regression: meta lines, the thinking spinner, stats lines, and queued-message

@@ -1864,7 +1864,8 @@ impl App {
         }
     }
 
-    /// Abort the in-flight agent task and discard any queued messages.
+    /// Abort the in-flight agent task, returning anything queued behind it to
+    /// the composer. Cancel stops: it never starts the next turn.
     fn cancel_turn(&mut self) {
         if let Some(handle) = self.turn_handle.take() {
             handle.abort();
@@ -1887,22 +1888,34 @@ impl App {
         self.sync_panes();
         hrdr_agent::settle_restored_tools(&mut self.panes.main_mut().state.transcript);
         // If the user typed while the turn was running, those messages are still
-        // in the steering queue. Run them now rather than dropping them — Esc
-        // cancels only the turn that was in flight, not what was waiting for it.
+        // in the steering queue. They are neither dropped nor sent: they go back
+        // into the composer, where the user can edit, resend or clear them.
+        //
+        // Cancel must *stop*. Sending them straight into a fresh turn made Esc
+        // start work instead of ending it — a runaway agent took two presses to
+        // stop, and the second only worked if the queue happened to be empty.
+        // Leaving them on the queue instead would have them ride out silently on
+        // whatever turn came next, minutes later. The composer is the one place
+        // they are visible and under the user's control.
         let pending = self.registry.pending(hrdr_agent::MAIN_KEY);
-        if !pending.is_empty() {
-            // Sync the pending display into the transcript so the UI shows what
-            // was typed, then launch a new turn.
-            self.push_entry(Entry::notice(format!(
-                "cancelled — {} pending message(s) queued for the next turn",
-                pending.len()
-            )));
-            // Don't enqueue anything — the messages are already there. Just
-            // launch the turn; `run` will drain them.
-            self.launch_turn();
-        } else {
+        self.registry.clear_pending(hrdr_agent::MAIN_KEY);
+        if pending.is_empty() {
             self.push_entry(Entry::system(hrdr_app::cancel_message(0)));
+            return;
         }
+        let restored = pending.join("\n");
+        let restored_lines = restored.lines().count();
+        let typed = self.editor.content();
+        let content = if typed.trim().is_empty() {
+            restored
+        } else {
+            // Whatever they are typing now is the newer thought — it stays last.
+            format!("{restored}\n{typed}")
+        };
+        self.editor.set_content(&content);
+        self.push_entry(Entry::system(hrdr_app::cancel_message_restored(
+            restored_lines,
+        )));
     }
 
     /// Quit the session. If a turn is running, cancel it first — which

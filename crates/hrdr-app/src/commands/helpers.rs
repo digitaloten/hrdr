@@ -135,6 +135,17 @@ pub fn cancel_message(dropped: usize) -> String {
     }
 }
 
+/// The cancel notice when messages the user typed mid-turn were put back into
+/// the composer rather than sent or dropped.
+///
+/// `lines` counts what came *off the queue*, not what the composer now holds —
+/// anything half-typed at the moment of the cancel is still theirs and is not
+/// news.
+pub fn cancel_message_restored(lines: usize) -> String {
+    let plural = if lines == 1 { "line" } else { "lines" };
+    format!("[cancelled · {lines} queued {plural} put back in the input]")
+}
+
 /// The one-time notice when a session file is first created.
 pub fn session_saved_notice(id: &str) -> String {
     format!("session saved as '{id}' — /resume {id}")

@@ -323,9 +323,9 @@ fn spawn_background(
                 // the very queue `run` drains. `run` pops it, emits `Steered`, and
                 // pushes it into history — so its record opens with the question and
                 // not just the answer, exactly as a steered follow-up turn does.
-                live.begin_turn(live_key);
+                let generation = live.begin_turn(live_key);
                 live.enqueue(live_key, crate::Steer::plain(prompt));
-                let _run_guard = RunGuard::new(live.clone(), live_key);
+                let _run_guard = RunGuard::new(live.clone(), live_key, generation);
                 let usage_live = live.clone();
                 let mut sub = sub.lock().await;
                 loop {

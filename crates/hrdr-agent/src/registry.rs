@@ -261,7 +261,20 @@ impl AgentEntry {
 
 /// Every agent in the session, shared between the agents and their frontend.
 #[derive(Clone, Default)]
-pub struct AgentRegistry(Arc<Mutex<Vec<AgentEntry>>>);
+pub struct AgentRegistry {
+    entries: Arc<Mutex<Vec<AgentEntry>>>,
+    /// Which turn currently owns each agent, as a monotonic counter bumped by
+    /// [`Self::begin_turn`].
+    ///
+    /// A cancelled turn's [`RunGuard`] does not run at `abort()` — it runs
+    /// whenever the runtime next polls the aborted task, which can be *after*
+    /// its replacement has already started. Without this, the dying turn's
+    /// guard marks the agent idle while the live one is mid-flight: the loader
+    /// stops, the status bar lies, and `send_prompt` takes its idle branch and
+    /// starts a second concurrent turn on the one agent. The guard carries the
+    /// generation it was born with and stands down when it no longer matches.
+    turns: Arc<Mutex<std::collections::HashMap<u64, u64>>>,
+}
 
 impl AgentRegistry {
     pub fn new() -> Self {
@@ -276,8 +289,14 @@ impl AgentRegistry {
     /// Run `f` over the entries under the lock. A poisoned lock is recovered
     /// rather than propagated: losing the pane list must never fail a turn.
     pub fn with<R>(&self, f: impl FnOnce(&mut Vec<AgentEntry>) -> R) -> R {
-        let mut v = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut v = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         f(&mut v)
+    }
+
+    /// The generation of the turn that currently owns agent `key`.
+    fn turn_gen(&self, key: u64) -> u64 {
+        let g = self.turns.lock().unwrap_or_else(|p| p.into_inner());
+        g.get(&key).copied().unwrap_or(0)
     }
 
     /// Register an agent.
@@ -429,11 +448,20 @@ impl AgentRegistry {
     }
 
     /// A turn is starting on agent `key`: start its clock.
-    pub fn begin_turn(&self, key: u64) {
+    /// Returns the generation this turn owns — see [`Self::turns`]. Callers that
+    /// only want the state change (a frontend faking a turn, a test) can drop it.
+    pub fn begin_turn(&self, key: u64) -> u64 {
+        let generation = {
+            let mut g = self.turns.lock().unwrap_or_else(|p| p.into_inner());
+            let slot = g.entry(key).or_insert(0);
+            *slot += 1;
+            *slot
+        };
         self.update(key, |e| {
             e.running = true;
             e.turn.begin();
         });
+        generation
     }
 
     /// Agent `key`'s turn is over: stop its clock and mark it idle.
@@ -726,12 +754,15 @@ impl AgentRegistry {
     {
         // The turn clock belongs to the agent whose turn it is, so a frontend
         // showing that agent shows its loader.
-        self.begin_turn(key);
+        let generation = self.begin_turn(key);
         let live = self.clone();
         tokio::spawn(async move {
             // The guard marks the agent idle again on every exit — including
-            // cancellation, where nothing after the await below would run.
-            let _guard = RunGuard::new(live.clone(), key);
+            // cancellation, where nothing after the await below would run. It
+            // carries this turn's generation so an aborted predecessor, whose
+            // guard may not run until after this turn started, cannot mark the
+            // agent idle out from under it.
+            let _guard = RunGuard::new(live.clone(), key, generation);
             let mut on_event = on_event;
             // Recorded on the agent's own entry rather than by whoever is watching:
             // what a turn did and what it spent are facts about the agent, not
@@ -830,16 +861,28 @@ pub fn age_completed_todos(
 pub struct RunGuard {
     live: AgentRegistry,
     key: u64,
+    /// The generation this guard's turn owns. See [`AgentRegistry::turns`].
+    generation: u64,
 }
 
 impl RunGuard {
-    pub fn new(live: AgentRegistry, key: u64) -> Self {
-        Self { live, key }
+    pub fn new(live: AgentRegistry, key: u64, generation: u64) -> Self {
+        Self {
+            live,
+            key,
+            generation,
+        }
     }
 }
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
+        // A cancelled turn's guard can run long after `abort()`, by which point
+        // a replacement turn may already own the agent. Only the turn that still
+        // owns it may declare it finished.
+        if self.live.turn_gen(self.key) != self.generation {
+            return;
+        }
         self.live.update(self.key, |e| {
             e.running = false;
             e.done = true;
@@ -1102,7 +1145,7 @@ mod tests {
         let live = AgentRegistry::new();
         live.register(entry(1));
         {
-            let _guard = RunGuard::new(live.clone(), 1);
+            let _guard = RunGuard::new(live.clone(), 1, live.begin_turn(1));
             // ...task is aborted here: nothing after this point would have run.
         }
         let (running, done) = live.with(|v| (v[0].running, v[0].done));
@@ -1116,6 +1159,41 @@ mod tests {
         live.update(1, |e| e.delivered = true);
         live.prune();
         assert!(live.is_empty(), "and then it is released, not leaked");
+    }
+
+    /// A cancelled turn's guard does not run at `abort()` — it runs whenever the
+    /// runtime next polls the aborted task, which can be after its replacement
+    /// has already begun. The late guard must not mark the agent idle while the
+    /// live turn is still working.
+    ///
+    /// Regression: `cancel_turn` aborts, then immediately starts the next turn.
+    /// Without the generation check the dying turn's guard flipped `running` to
+    /// false under the new turn — stopping the loader, lying in the status bar,
+    /// and letting `send_prompt` take its idle branch and start a *second*
+    /// concurrent turn on the one agent.
+    #[test]
+    fn a_late_guard_from_a_cancelled_turn_does_not_end_its_successor() {
+        let live = AgentRegistry::new();
+        live.register(entry(1));
+
+        // Turn A starts, then is cancelled: its guard is still alive, unpolled.
+        let guard_a = RunGuard::new(live.clone(), 1, live.begin_turn(1));
+        live.end_turn(1);
+
+        // Turn B takes the agent over before A's task was ever polled again.
+        let _guard_b = RunGuard::new(live.clone(), 1, live.begin_turn(1));
+        assert!(live.with(|v| v[0].running), "turn B owns the agent");
+
+        // Now A's aborted task finally unwinds.
+        drop(guard_a);
+        assert!(
+            live.with(|v| v[0].running),
+            "the superseded turn's guard must not end the turn that replaced it"
+        );
+
+        // B still ends its own turn normally.
+        drop(_guard_b);
+        assert!(!live.with(|v| v[0].running), "turn B ends its own turn");
     }
 
     /// A sub-agent records everything it emits on its own entry, and a frontend
