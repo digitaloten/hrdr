@@ -316,8 +316,8 @@ impl Harness {
             // A TUI e2e test asserts on what the terminal shows, so its
             // transcript must not depend on what the *host* can confine with.
             // Under the shipped default (`Write`) the first shell command an
-            // agent runs on a machine with no bwrap — CI's Windows and macOS
-            // runners, any Linux without bubblewrap — queues a degradation
+            // agent runs on a machine with no OS sandbox — CI's Windows and
+            // macOS runners, any Linux without Landlock — queues a degradation
             // notice, which folds into the transcript as an extra entry and
             // scrolls the rows these tests assert on out of the viewport. Worse,
             // that queue is process-global and first-come-first-served, so under
@@ -5128,7 +5128,7 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
 /// Proved as a property of the real backend rather than by inspecting a flag: the
 /// session runs in `read` mode, where an *agent's* shell may write nowhere at all,
 /// and the probe is a write into the working directory. Unconfined, it lands.
-/// Confined — under bwrap, Landlock or Seatbelt alike, since `read` grants no
+/// Confined — under Landlock or Seatbelt alike, since `read` grants no
 /// writable root on any of them — it would die on EROFS. Read mode rather than a
 /// path outside the roots on purpose: in `write` mode `env::temp_dir()` is
 /// writable, and every path a test can write to lives under it.

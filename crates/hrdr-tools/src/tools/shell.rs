@@ -83,8 +83,8 @@ impl Shell {
 
     /// The arguments that precede the command string. Separate from
     /// [`Shell::program`] because it is not universally `-c` — PowerShell would
-    /// want `-NoProfile -Command`. Visible to the crate so the sandbox wrapper
-    /// can rebuild the same invocation behind `bwrap` without hardcoding `-c`.
+    /// want `-NoProfile -Command`. Visible to the crate so the sandbox backends
+    /// can build a shell invocation from its parts.
     pub(crate) fn invoke_args(self) -> &'static [&'static str] {
         match self {
             Shell::Bash | Shell::Posix => &["-c"],

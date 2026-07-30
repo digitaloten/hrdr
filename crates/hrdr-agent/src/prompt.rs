@@ -3180,7 +3180,8 @@ mod tests {
         assert!(s.contains("no shell"), "{s}");
         // It pre-empts the misreading: a refused read is the mode, not a missing
         // file. The old wording promised that outside paths were "ABSENT", which
-        // was a property of bwrap's mount set and stopped being true with it.
+        // was a property of the old mount-based sandbox and stopped being true once
+        // read confinement moved in-process.
         assert!(s.contains("not a broken install"), "{s}");
         assert!(!s.contains("ABSENT"), "{s}");
     }

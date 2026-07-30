@@ -856,15 +856,9 @@ const NO_OS_SANDBOX_NOTICE: &str = "sandbox: no OS-level sandbox is available on
 /// One mechanism per platform: Landlock on Linux, Seatbelt on macOS, nothing
 /// anywhere else.
 ///
-/// **bwrap used to be primary on Linux and is deleted.** It had exactly two
-/// capabilities Landlock lacks — mount-based read confinement, and a complete
-/// network denial via `--unshare-net` — and both are gone: no mode confines the
-/// network any more, and read confinement is enforced in-process by
-/// [`SandboxPolicy::check_read`] for the one mode that wants it. What bwrap
-/// brought in exchange was a mandatory user namespace, and that namespace *was*
-/// the ssh failure class this module spent an escalation ladder working around
-/// (`/etc/ssh/ssh_config` reading as uid 65534, so every `git push` over ssh
-/// died). Deleting the mechanism deleted the bug.
+/// Read confinement is enforced in-process by [`SandboxPolicy::check_read`] in
+/// `jail` mode; the OS backends confine writes only. No mode confines the
+/// network — that is enforced at the tool level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OsSandboxBackend {
     /// Landlock LSM rules the child applies to itself. Writes only.
@@ -885,8 +879,7 @@ pub fn detect_backend() -> OsSandboxBackend {
 ///
 /// Kernel 5.13+ (July 2021). Below that the shell runs unconfined with a notice,
 /// the same posture Windows has — Debian 12 ships 6.1 and RHEL 9 ships 5.14, so
-/// the band is narrow, but it is a real regression for anyone on an older kernel
-/// who used to have bwrap and the notice must say so plainly.
+/// the band is narrow, but the notice must say so plainly.
 #[cfg(target_os = "linux")]
 fn detect_backend_uncached() -> OsSandboxBackend {
     if landlock_available() {
@@ -998,9 +991,8 @@ pub fn sandbox_denial_note(policy: &SandboxPolicy, output: &str) -> Option<Strin
 /// byte-identical to the pre-sandbox behavior.
 ///
 /// The caller still owns cwd, stdio, timeouts and process groups: every backend
-/// left inherits the cwd (there is nothing for this to pass down — bwrap needed a
-/// `--chdir` and is gone), passes stdio through untouched, propagates the child's
-/// exit status, and the existing group-kill still reaches every descendant.
+/// passes them through untouched — no intermediate process mediates the
+/// execution — and the existing group-kill still reaches every descendant.
 ///
 /// `notices` is the **calling agent's** channel
 /// ([`crate::ToolContext::sandbox_notices`]): every degradation this discovers is
@@ -2230,10 +2222,9 @@ mod tests {
         // second tempdir with it; confine to the cwd alone.
         let ctx = confined_ctx(dir.path(), SandboxMode::Write);
 
-        // The wording is the backend's, not ours: Landlock refuses the open with
-        // EACCES, where bwrap's read-only mount said EROFS. Both are asserted
-        // because the *property* is what matters — the write does not land — and a
-        // test pinned to one backend's errno would fail on the other for no reason.
+        // The wording is the backend's, not ours: both EACCES (Landlock) and
+        // EROFS (a read-only filesystem) are asserted because the *property* is
+        // what matters — the write does not land.
         let refused =
             |out: &str| out.contains("Read-only file system") || out.contains("Permission denied");
 
@@ -2371,13 +2362,12 @@ mod tests {
 
     /// **`jail`'s read confinement is in-process, and that is the whole of it.**
     ///
-    /// It used to be a mount set: bwrap gave a strict agent only `/usr` and `/etc`,
-    /// so an outside path was ENOENT. Landlock has no read axis it can express as
-    /// "everything except…", so that OS-level half is gone — and it does not matter,
-    /// because a jailed agent has no `shell`, no `verify` and no LSP: nothing it can
-    /// call spawns a subprocess for the OS layer to confine. What remains is
-    /// [`SandboxPolicy::check_read`] on the canonical path, which every read-only
-    /// tool routes through, and it works on every platform with no backend at all.
+    /// Read confinement in `jail` mode is entirely in-process via
+    /// [`SandboxPolicy::check_read`], applied on every tool call. There is no OS
+    /// mount to confine — and a jailed agent has no `shell`, no `verify`, and no
+    /// LSP, so nothing it calls ever spawns a subprocess for an OS layer to
+    /// confine anyway. The in-process check works on every platform with no
+    /// backend at all.
     #[test]
     fn jails_read_confinement_is_the_in_process_guard() {
         let dir = tempfile::tempdir().unwrap();
@@ -2444,12 +2434,10 @@ mod tests {
     /// **The ssh / user-namespace failure class is gone, and a bare
     /// "bad owner or permissions" must not be blamed on the sandbox any more.**
     ///
-    /// It was bwrap's doing: an unprivileged user namespace maps only the invoking
-    /// uid, so every root-owned file inside read as `nobody`, and OpenSSH refuses
-    /// any config file it cannot vouch for — killing every `git push` over ssh with
-    /// an error that pointed at `/etc/ssh/ssh_config` and invited a `chmod` of a
-    /// system file. That was the founding case for the whole escalation ladder.
-    /// Deleting bwrap deleted it: no namespace, no misread ownership.
+    /// The old sandbox used an unprivileged user namespace that remapped the
+    /// invoking uid — every root-owned file read as `nobody`, and OpenSSH refused
+    /// any config file it couldn't vouch for, killing every `git push` over ssh.
+    /// No namespace means no misread ownership.
     ///
     /// So the denial note for it is deleted too. On a machine with no namespace
     /// involved, that message means the user's own `~/.ssh/config` really is
@@ -2544,9 +2532,9 @@ mod tests {
     }
 
     /// **A confined shell still reaches the network, in every mode.** Proved
-    /// against the real backend, because the denial it replaces was also real:
-    /// bwrap handed the child a private network namespace, so a `/dev/tcp` connect
-    /// to a listener on the host's own loopback found nothing there.
+    /// against the real backend — the old sandbox used a private network namespace,
+    /// so a `/dev/tcp` connect to a listener on the host's own loopback found
+    /// nothing. No namespace means a bare connect reaches what is actually there.
     ///
     /// The listener is one this test bound itself, so nothing external is needed
     /// and a CI runner with no egress cannot fail it for the wrong reason. Never
@@ -2722,9 +2710,8 @@ mod tests {
     /// that could be mistaken for "confined".
     ///
     /// One, now, because every other degradation notice described a fallback that
-    /// no longer exists — bwrap missing, user namespaces disabled, Landlock's
-    /// partial network denial, jail's lost read mounts. A backend is available or
-    /// it is not.
+    /// no longer exists — Landlock absent, jail's read mounts gone. A backend is
+    /// available or it is not.
     #[test]
     fn the_unconfined_notice_says_exactly_what_is_not_confined() {
         assert_eq!(
