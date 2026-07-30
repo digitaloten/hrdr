@@ -5418,29 +5418,40 @@ mod tests {
         );
         let p = sections(&confined);
 
+        // The capability group is shell-dependent: a POSIX `sh` host gets the
+        // avoid-bashisms caveat as its own section. Built rather than hardcoded, so
+        // this test asserts the ORDER (which is the cache strategy) on every host
+        // instead of only on one with bash — it failed on the Windows runner for
+        // exactly that reason.
+        let mut expected: Vec<&str> = vec![
+            SECTION_BASE,
+            SECTION_GLOBAL_AGENTS_MD,
+            SECTION_GLOBAL_MEMORY,
+            SECTION_PROJECT_AGENTS_MD,
+            SECTION_PROJECT_MEMORY,
+            // the capability group: differs by tool set / main-vs-sub
+            "write",
+            "shell",
+        ];
+        if tools.shell().is_some_and(|s| s.needs_posix_caveat()) {
+            expected.push("shell_posix");
+        }
+        expected.extend([
+            "committing",
+            "committing_main",
+            // names + one-liners of what `skill` can load: project-scoped, so
+            // above the persona and out of the volatile tail
+            SECTION_SKILLS,
+            SECTION_PERSONA,
+            SECTION_ENVIRONMENT,
+            // what "done" means here, in commands — a requirement, so it gets
+            // its own section rather than another environment bullet
+            SECTION_GATE,
+            SECTION_SANDBOX,
+        ]);
         assert_eq!(
             p.names(),
-            [
-                SECTION_BASE,
-                SECTION_GLOBAL_AGENTS_MD,
-                SECTION_GLOBAL_MEMORY,
-                SECTION_PROJECT_AGENTS_MD,
-                SECTION_PROJECT_MEMORY,
-                // the capability group: differs by tool set / main-vs-sub
-                "write",
-                "shell",
-                "committing",
-                "committing_main",
-                // names + one-liners of what `skill` can load: project-scoped, so
-                // above the persona and out of the volatile tail
-                SECTION_SKILLS,
-                SECTION_PERSONA,
-                SECTION_ENVIRONMENT,
-                // what "done" means here, in commands — a requirement, so it gets
-                // its own section rather than another environment bullet
-                SECTION_GATE,
-                SECTION_SANDBOX,
-            ],
+            expected.as_slice(),
             "assembly order is the cache strategy: least-volatile first, so a new session \
              in an unchanged project reuses every byte up to the environment block"
         );

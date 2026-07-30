@@ -326,6 +326,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A failing command's exit code is reported as a number, on every platform.**
+  The note interpolated `ExitStatus`'s `Display`, which Unix renders as "exit
+  status: 3" and Windows as "exit code: 3" — so on Windows the model read
+  `[exit status: exit code: 3]` on every failure. It now prints the code itself,
+  and says `[killed by signal: …]` for a signal, which has no code.
+
 - **A shell that is present but cannot run anything is no longer detected as
   one.** `Shell::detect` answered from `which` alone, and on Windows that is
   wrong: `C:\Windows\System32\bash.exe` is the **WSL launcher**, which exists on

@@ -720,7 +720,14 @@ pub(crate) async fn run_streamed_command(
     if let Some(s) = status
         && !s.success()
     {
-        let msg = format!("[exit status: {s}]");
+        // The NUMBER, not the platform's `Display`. Unix renders `ExitStatus` as
+        // "exit status: 3" and Windows as "exit code: 3", so interpolating it gave
+        // the model "[exit status: exit code: 3]" on Windows — noise in a line it
+        // reads on every failure. A signal has no code, so it says so instead.
+        let msg = match s.code() {
+            Some(code) => format!("[exit status: {code}]"),
+            None => format!("[killed by signal: {s}]"),
+        };
         ingest_line!(&msg);
     }
 
