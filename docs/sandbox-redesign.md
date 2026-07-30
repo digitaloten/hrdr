@@ -24,9 +24,9 @@ Two consequences, stated up front because they reverse shipped behaviour:
 - **The `.git` lock goes.** A sub-agent told to commit its own work should be
   able to. Coordination between concurrent writers is a prompt rule, not a
   mount.
-- **Escalation shrinks to one grant.** Its motivating failure — bwrap's user
-  namespace breaking ssh — is not worked around but _deleted_: bwrap goes
-  entirely, so the namespace that caused it never exists.
+- **Escalation is removed entirely.** Its motivating failure — bwrap's user
+  namespace breaking ssh — is not worked around but _deleted_: bwrap goes, so
+  the namespace that caused it never exists. Nothing is left to escalate.
 
 One mode is the exception, and it is the reason the read axis survives: `jail`
 exists to inspect third-party code you are unwilling to expose to.
@@ -645,25 +645,75 @@ persona helps, by treating the brief as _what to examine_ rather than as
 instructions about how to report. Jail mode is a strong boundary, not an
 airtight one.
 
-## Escalation after the change
+## Escalation is removed entirely
 
-What survives, because it is about oversight rather than confinement:
+There is nothing left to escalate. Its two drivers are both gone:
 
-- the `ApprovalGate`, its 60s timeout, and deny-when-nobody-can-answer
-- the **post-denial retry offer** — now the only trigger, and the right one:
-  "this command needs to write outside the project"
-- the consent audit trail (`Record::EscalationDecided`) and its transcript fold
-- `allow_session` and the frontend work — a derived rule is still never
-  remembered
-- the `escalate` config list for user-declared commands
+**The ssh / user-namespace failure** was the motivating case, and bwrap's
+deletion removes the namespace that caused it. `git push` works because nothing
+breaks it.
 
-What goes: `Widening` collapses back to a single grant (both rungs deleted),
-`DEFAULT_RULES` deletes with them (git network verbs need no escalation once
-Write runs on Landlock), and the severity text moves from `Widening::describes`
-to one constant.
+**"This command must write outside the project"** was the remaining case, and it
+turns out to be mostly a symptom of `write` mode being too tight — see the next
+section. Fix that and what is left is rare, one-off, unpredictable writes
+outside the project, for which the answer is that the **user runs the command**.
+Escalation only ever helped when a human was present to answer (with no listener
+it denies immediately), and a human who is present can act directly.
 
-Escalation stays **refused in jail** — `unsandboxed_execution_allowed` already
-does this. Stated here so nobody later "fixes" it.
+So all of it goes: `escalation.rs`, `approval.rs`, the `ApprovalGate` and its
+timeout and listener counting, `EscalationPolicy`/`EscalationRule`,
+`segment_is_safe`, `retry_rules`, `consider`/`consider_retry`,
+`unsandboxed_execution_allowed`, the `escalate` config list, `AgentEvent::`
+`ApprovalRequested` and `EscalationDecided`, `Record::EscalationDecided` and its
+transcript fold, `ServerMsg::ApprovalRequested`/`ApprovalClosed`,
+`ClientMsg::AnswerApproval`, `allow_session`, the TUI `ApprovalModal` with its
+arming and default-Deny logic, the wasm modal, and hrdr-web's approval inbox and
+pump.
+
+That deletes most of what shipped earlier today (`c2e472f` … `b7f82ed`),
+including the consent audit trail and the frontend work. Correctly: the audit
+trail existed to record escalation decisions, so with no decisions there is
+nothing to record. The machinery was answering a problem this redesign removes
+rather than routes around.
+
+**What survives and matters more.** `sandbox_denial_note` is now the whole
+response to a refused write: it explains what the sandbox did, why, and that the
+tool is not broken. It is the only thing standing between an EROFS deep inside a
+package manager and a model that reports the toolchain as missing. Also
+`sandbox_writable_roots` in config, which is the static answer to anything the
+default roots do not cover.
+
+## `write` mode must be able to fetch dependencies
+
+A gap escalation was band-aiding, and it has to be fixed in the same pass or
+removing escalation makes `write` mode worse than it is today.
+
+Writable roots are `cwd`, `temp_dir`, scratch and tool-output
+(`sandbox.rs:199`). That excludes every package-manager cache:
+
+| Command                 | Writes to                           |
+| ----------------------- | ----------------------------------- |
+| `cargo build` (new dep) | `~/.cargo/registry`, `~/.cargo/git` |
+| `npm install`           | `~/.npm/_cacache`                   |
+| `pip install`           | `~/.cache/pip`                      |
+| `go build`              | `~/go/pkg/mod`                      |
+
+This is the **documented founding incident** of the EROFS note:
+`npx prettier --write` tried to fetch into `~/.npm/_cacache`, got EROFS, and the
+model concluded _"prettier is not available in this environment"_ and silently
+skipped formatting. The note's own advice — "run the copy already on PATH
+instead of downloading one" — is a workaround for a mode that cannot build a
+project with an uncached dependency.
+
+**So `write` mode's writable roots gain the toolchain caches.** Fetching your
+own dependencies is part of working on your own project, which is what "full
+authority over the project" has to mean if the mode is to be usable.
+
+**One precision:** grant `~/.cargo/registry` and `~/.cargo/git`, **not
+`~/.cargo`**. The parent holds `config.toml`, which cargo reads back as build
+configuration, including directives that execute code. Same for
+`~/.npm/_cacache` over `~/.npm`. The caches are data; the parents are
+configuration. Anything else a project needs goes in `sandbox_writable_roots`.
 
 ## Deletions
 
@@ -726,8 +776,11 @@ spool.
 
 Mostly-deletion first, so each slice is independently reviewable.
 
-1. **Remove the `.git` lock.** `protect_git`, `deny_git_writes` and friends;
-   collapse `Widening` to one grant; delete `DEFAULT_RULES`.
+1. **Remove the `.git` lock and all of escalation.** `protect_git`,
+   `deny_git_writes` and friends; `escalation.rs`, `approval.rs`, the protocol
+   frames, both frontend modals, the consent audit trail. 1b. **Widen `write`
+   mode's roots** to the toolchain caches, so the mode can build a project with
+   an uncached dependency.
 2. **`tool_output_dir` per session.**
 3. **Delete bwrap and the network axis.** Write/Read→Landlock (Seatbelt on
    macOS), jail→no backend. Removes `bwrap_args`, `usr_merge_compat_args`, the
