@@ -33,18 +33,18 @@ exists to inspect third-party code you are unwilling to expose to.
 
 ## Mode matrix
 
-| Axis                         | `none` (yolo) | `write`                                      | `read`          | `jail`                   |
-| ---------------------------- | ------------- | -------------------------------------------- | --------------- | ------------------------ |
-| Writes                       | everywhere    | cwd, temp, scratch, output, toolchain caches | **none**        | **none**                 |
-| Reads                        | everywhere    | everywhere                                   | everywhere      | **cwd + own output dir** |
-| `web_fetch` / `web_search`   | yes           | yes                                          | yes             | **no**                   |
-| MCP tools                    | yes           | yes                                          | yes             | **no**                   |
-| `shell` / `verify` / LSP     | yes           | yes                                          | yes             | **no**                   |
-| `task`                       | yes           | yes                                          | yes             | **no**                   |
-| `memory`                     | main only     | main only                                    | main only       | **no**                   |
-| Project `AGENTS.md` / skills | yes           | yes                                          | yes             | **no**                   |
-| Tool results wrapped         | no            | opt-in (config)                              | opt-in (config) | **always**               |
-| Backend                      | none          | Landlock                                     | Landlock        | **none needed**          |
+| Axis                         | `none` (yolo) | `write`                                    | `read`          | `jail`                   |
+| ---------------------------- | ------------- | ------------------------------------------ | --------------- | ------------------------ |
+| Writes                       | everywhere    | cwd, temp, scratch, output, package caches | **none**        | **none**                 |
+| Reads                        | everywhere    | everywhere                                 | everywhere      | **cwd + own output dir** |
+| `web_fetch` / `web_search`   | yes           | yes                                        | yes             | **no**                   |
+| MCP tools                    | yes           | yes                                        | yes             | **no**                   |
+| `shell` / `verify` / LSP     | yes           | yes                                        | yes             | **no**                   |
+| `task`                       | yes           | yes                                        | yes             | **no**                   |
+| `memory`                     | main only     | main only                                  | main only       | **no**                   |
+| Project `AGENTS.md` / skills | yes           | yes                                        | yes             | **no**                   |
+| Tool results wrapped         | no            | opt-in (config)                            | opt-in (config) | **always**               |
+| Backend                      | none          | Landlock                                   | Landlock        | **none needed**          |
 
 **There is no network axis.** The sandbox does not confine the network in any
 mode — see "Network confinement is removed" below.
@@ -756,27 +756,73 @@ and skip formatting.
 in the same failure. Fix verified: binding `~/.npm` writable makes `npm i`
 succeed.
 
-### The list, and why the shape differs per tool
+### The default writable set
 
-| Grant                                   | Why not the parent                                          |
-| --------------------------------------- | ----------------------------------------------------------- |
-| `~/.cargo/registry`, `~/.cargo/git`     | **narrow, deliberately** — see below                        |
-| `~/.npm` (whole)                        | holds only caches and logs; config is `~/.npmrc`, elsewhere |
-| `~/.cache` (pip, uv, yarn, go-build, …) | it is the XDG cache root; that is what it is for            |
-| `~/go/pkg/mod`                          | the module cache                                            |
+**The common case must work out of the box.** Config and
+`--sandbox-writable-root` are an escape hatch for bespoke layouts, not the
+mechanism by which mainstream package managers become usable. So the defaults
+aim to be comprehensive across the ecosystems people actually build in.
 
-**`~/.cargo` must not be granted wholesale.** On this machine it holds `bin/`
-(the toolchain — writable means the agent can replace `cargo` itself),
-`config.toml` (build configuration, including directives that execute code),
-`.crates.toml`, and `credentials.toml` — which is a **symlink into
-`~/.secrets/`**. That last one also confirms why the roots check must
-canonicalise first: a write to `~/.cargo/credentials.toml` resolves into a
-secrets directory that no root mentions.
+**One cross-cutting entry does most of the work:** `$XDG_CACHE_HOME` (default
+`~/.cache`), plus `~/Library/Caches` on macOS where XDG is not the convention.
+That alone covers pip, uv, deno, `go-build`, yarn v1, pnpm, composer, node-gyp,
+cabal and swiftpm. What follows is the non-XDG holdouts.
 
-`~/.npm` is the opposite case and it is worth stating so nobody "tidies" it into
-symmetry: it contains `_cacache`, `_logs`, `_npx`, `_prebuilds` and a timestamp
-file — no configuration at all. Granting it whole is safe; granting `~/.cargo`
-whole is not.
+| Ecosystem | Granted                                                                                                                                         |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Rust      | `$CARGO_HOME/registry`, `$CARGO_HOME/git`; `$RUSTUP_HOME/{toolchains,downloads,tmp,update-hashes}`                                              |
+| Node      | `~/.npm`; pnpm store (`$PNPM_HOME`, `~/.local/share/pnpm/store`, `~/.pnpm-store`); `~/.yarn/berry/cache`; `~/.bun/install/cache`; `~/.node-gyp` |
+| Python    | `~/.local/share/pypoetry/venvs`, `~/.local/share/pipx`                                                                                          |
+| Go        | `$GOMODCACHE` / `$GOPATH/pkg/mod` / `~/go/pkg/mod`                                                                                              |
+| Java/JVM  | `~/.m2/repository`; `$GRADLE_USER_HOME/{caches,wrapper}`                                                                                        |
+| .NET      | `$NUGET_PACKAGES` / `~/.nuget/packages`                                                                                                         |
+| Ruby      | `~/.local/share/gem`, `~/.gem/ruby`, `~/.bundle/cache`                                                                                          |
+| PHP       | covered by XDG (`~/.cache/composer`)                                                                                                            |
+| Dart      | `$PUB_CACHE` / `~/.pub-cache`                                                                                                                   |
+| Elixir    | `~/.hex/packages`, `~/.mix`                                                                                                                     |
+| Haskell   | `~/.stack`, `~/.cabal/packages`                                                                                                                 |
+
+### Two invariants this list depends on
+
+**Resolve the env-var override, never hardcode the home-relative path.**
+`CARGO_HOME`, `RUSTUP_HOME`, `GOMODCACHE`, `GOPATH`, `GOCACHE`,
+`XDG_CACHE_HOME`, `PNPM_HOME`, `DENO_DIR`, `GRADLE_USER_HOME`, `NUGET_PACKAGES`,
+`PUB_CACHE`, `COMPOSER_HOME`, `UV_CACHE_DIR`, `PIP_CACHE_DIR`, `STACK_ROOT` are
+all real and all used. A hardcoded `~/.cargo/registry` on a machine with
+`CARGO_HOME=/opt/cargo` grants nothing and produces exactly the confusing EROFS
+this section exists to prevent.
+
+**Never grant the parent — package managers keep credentials beside caches.**
+Verified on this machine, not assumed:
+
+- `~/.nuget/` holds `NuGet/` (config) beside `packages/`
+- `~/.local/share/uv/` holds **`credentials/`** beside `python/` and `tools/`
+- `~/.cargo/credentials.toml` is a **symlink into `~/.secrets/`**
+- `~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.gem/credentials`,
+  `~/.composer/auth.json`, `~/.bundle/config` are all credential-bearing
+- `~/.bun/install/` holds `global` (binaries) beside `cache`
+
+`~/.npm` is the one safe whole grant: `_cacache`, `_logs`, `_npx`, `_prebuilds`
+and a timestamp, with config at `~/.npmrc` outside it. Worth stating so nobody
+"tidies" the list into symmetry.
+
+### Deliberately excluded
+
+**Binary directories** — `$CARGO_HOME/bin`, `$GOPATH/bin`, `~/.local/bin`,
+`~/.bun/bin`. A binary on `PATH` is a persistence vector: the next command _the
+user_ runs could be the agent's. So `cargo install` and `go install` fail by
+default, with the note naming the flag. Installing a tool is machine setup, not
+project work.
+
+**Language toolchain managers** — `~/.nvm`, `~/.pyenv`, `~/.rbenv`, `~/.asdf`,
+`~/.local/share/uv/python`. Same reasoning.
+
+`$RUSTUP_HOME/toolchains` is the deliberate exception, because a
+`rust-toolchain.toml` pinning an uninstalled version makes `cargo build` itself
+fail on a fresh checkout — that is project work, the download is
+checksum-verified, and those binaries are not on `PATH` (the rustup shims in
+`$CARGO_HOME/bin` are, and stay excluded). `settings.toml` stays out so the
+selected default toolchain cannot be changed.
 
 ### Decided: defaults, a good error, and config + CLI
 
