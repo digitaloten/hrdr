@@ -683,6 +683,36 @@ package manager and a model that reports the toolchain as missing. Also
 `sandbox_writable_roots` in config, which is the static answer to anything the
 default roots do not cover.
 
+## `!command` stays unsandboxed — and is now load-bearing
+
+**Already true.** `user_shell_command` spawns through
+`hrdr_tools::Shell::command` (`app.rs:1526`), not `sandboxed_shell_command`.
+That is right and must stay right: a command the _user_ typed is the user
+acting, and it carries the user's authority, not the agent's. The sandbox
+confines what the **model** decides to run.
+
+**What changes is its importance.** With escalation removed this is the only way
+to run something outside the sandbox — the human relief valve the design now
+depends on. It is also the answer to the rare case escalation used to cover: a
+one-off write outside the project that nobody wants to grant permanently.
+
+**And nothing tests it.** No test asserts that the bang path bypasses
+confinement. That is precisely the invariant a later refactor removes by
+accident, routing `!command` through `sandboxed_shell_command` "for consistency"
+and silently deleting the last relief valve.
+
+So: **add a test that pins it against the real backend**, not against a flag —
+the same shape the escalation test used, writing to a path outside the writable
+roots and asserting it lands. A property this load-bearing should fail loudly
+when someone changes it.
+
+**One parity gap, recorded as a decision rather than left as an accident.** The
+passthrough is TUI-only: neither hrdr-web nor the wasm UI has `!` handling or a
+protocol frame for it, so a browser session has no user shell escape. That may
+well be correct — a remote frontend running arbitrary local commands is a
+different security question from a local terminal doing it — but it means the
+relief valve does not exist for web users, and they have no escalation either.
+
 ## `write` mode must be able to fetch dependencies
 
 A gap escalation was band-aiding, and it has to be fixed in the same pass or
