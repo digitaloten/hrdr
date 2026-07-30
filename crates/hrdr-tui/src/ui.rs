@@ -1638,9 +1638,11 @@ fn highlight_lines(lang: &str, content: &str, bg: Color) -> Vec<Line<'static>> {
                     if piece.is_empty() {
                         return None;
                     }
+                    // Tab-indented source is the common case here, and a raw
+                    // `\t` renders as nothing — see `expand_tabs`.
                     let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
                     Some(Span::styled(
-                        piece.to_string(),
+                        expand_tabs(piece),
                         Style::default().fg(fg).bg(bg),
                     ))
                 })
@@ -2608,11 +2610,30 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
     (chunks, msg_at)
 }
 
+/// How wide a tab renders. Ratatui measures a `\t` as one cell and draws it as
+/// nothing, so a tab-indented line collapses on itself — the fix is to expand
+/// before the text ever becomes a `Span`.
+const TAB_WIDTH: usize = 4;
+
+/// Tabs expanded, for any raw text on its way into a [`Span`].
+///
+/// Every path that turns bytes we did not write into block-body lines goes
+/// through here: tool results, shell command bodies, code previews, plain text.
+/// Miss one and that pane alone renders `\t`-indented output clumped against
+/// the margin — which is exactly how this was found, in `read` and `!command`
+/// output, after only [`text_lines`] had been fixed.
+pub(crate) fn expand_tabs(raw: &str) -> String {
+    if !raw.contains('\t') {
+        return raw.to_string();
+    }
+    raw.replace('\t', &" ".repeat(TAB_WIDTH))
+}
+
 /// Split plain text into styled block-body lines (no padding — [`render_block`]
 /// adds that).
 fn text_lines(text: &str, style: Style) -> Vec<Line<'static>> {
     text.split('\n')
-        .map(|raw| Line::from(Span::styled(raw.replace('\t', "    "), style)))
+        .map(|raw| Line::from(Span::styled(expand_tabs(raw), style)))
         .collect()
 }
 
@@ -2706,7 +2727,7 @@ fn tool_lines(
     if let hrdr_app::ToolBody::Shell { command } = &disp.body {
         for line in command.lines() {
             out.push(Line::from(Span::styled(
-                line.to_string(),
+                expand_tabs(line),
                 Style::default().fg(theme.assistant).bg(bg),
             )));
         }
@@ -2774,7 +2795,7 @@ fn tool_lines(
                 theme.dim
             };
             out.push(Line::from(Span::styled(
-                line.to_string(),
+                expand_tabs(line),
                 Style::default().fg(color).bg(bg),
             )));
         }
@@ -2791,7 +2812,7 @@ fn tool_lines(
             )));
         }
         for line in &lines[start..] {
-            out.push(Line::from(Span::styled(line.to_string(), dim_bg)));
+            out.push(Line::from(Span::styled(expand_tabs(line), dim_bg)));
         }
     }
     out
@@ -3652,6 +3673,68 @@ mod block_tests {
         assert!(head(false, true).starts_with('✗'), "failed");
         // The headline follows the tool name on the same row.
         assert!(head(true, true).contains("ls src"));
+    }
+
+    /// Ratatui measures a `\t` as one cell and draws nothing, so tab-indented
+    /// text clumps against the margin. Every path that turns raw bytes into a
+    /// block-body span must expand tabs first.
+    ///
+    /// Regression: only `text_lines` did, so a `read` of a tab-indented file,
+    /// a `!command`'s output, and a diff all still clumped — the paths that
+    /// carry the most tab-indented text of any in the app.
+    #[test]
+    fn every_body_path_expands_tabs() {
+        let t = Theme::default();
+        let indented = "fn main() {\n\tlet x = 1;\n}";
+
+        // A finished tool result (a `read`, a shell run, a diff).
+        let result = tool_lines(
+            &t,
+            "read",
+            r#"{"path":"a.rs"}"#,
+            indented,
+            true,
+            true,
+            true,
+            "⠋",
+        );
+        let body = result.iter().map(text).collect::<Vec<_>>().join("\n");
+        assert!(body.contains("    let x = 1;"), "result lines: {body}");
+        assert!(!body.contains('\t'), "no raw tab survives: {body}");
+
+        // A shell block's command rows.
+        let shell = tool_lines(
+            &t,
+            "shell",
+            "{\"command\":\"if true; then\\n\\techo hi\\nfi\"}",
+            "",
+            true,
+            true,
+            true,
+            "⠋",
+        );
+        let body = shell.iter().map(text).collect::<Vec<_>>().join("\n");
+        assert!(body.contains("    echo hi"), "shell command rows: {body}");
+
+        // A still-running call, whose live tail is a different loop.
+        let live = tool_lines(
+            &t,
+            "shell",
+            r#"{"command":"x"}"#,
+            indented,
+            false,
+            false,
+            true,
+            "⠋",
+        );
+        let body = live.iter().map(text).collect::<Vec<_>>().join("\n");
+        assert!(body.contains("    let x = 1;"), "live tail: {body}");
+
+        // A `write` body, which is syntax-highlighted rather than plain.
+        let code = highlight_lines("rs", indented, Color::Reset);
+        let body = code.iter().map(text).collect::<Vec<_>>().join("\n");
+        assert!(body.contains("    let x = 1;"), "highlighted code: {body}");
+        assert!(!body.contains('\t'), "no raw tab survives: {body}");
     }
 
     /// Shell calls render the command verbatim on its own rows, with the

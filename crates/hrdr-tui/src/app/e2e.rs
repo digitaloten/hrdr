@@ -5248,6 +5248,78 @@ async fn bang_command_output_is_capped_while_streaming_not_just_at_the_end() {
     assert!(done, "the command finished cleanly with a bounded result");
 }
 
+/// A `!command`'s output settles *inside* its block, and a person's own shell
+/// output is not cut to the model's line budget.
+///
+/// Two regressions from routing `!` through the model's shell path. The live
+/// stream is forwarded by a second task pushing onto the same channel as the
+/// settle, so `ToolEnd` could overtake output still in flight and leave it
+/// landing in a closed block. And `max_output` was raised to 50_000 bytes while
+/// `max_output_lines` kept its default of 50, so `!seq 1 500` — or any `!git
+/// log` — settled to 50 lines and a spool pointer.
+#[cfg(unix)]
+#[tokio::test]
+async fn bang_command_output_lands_before_the_block_closes_and_is_not_line_capped() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.type_str("!seq 1 500");
+    h.press(KeyCode::Enter);
+
+    let mut ended = false;
+    let mut output_after_end = 0usize;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !h
+        .app
+        .transcript()
+        .iter()
+        .any(|e| matches!(&e.kind, EntryKind::Tool { done: true, .. }))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "shell events never arrived"
+        );
+        match tokio::time::timeout(std::time::Duration::from_secs(10), h.rx.recv()).await {
+            Ok(Some(msg)) => {
+                match &msg {
+                    TurnMsg::UserShell(hrdr_agent::AgentEvent::ToolOutput { .. }, _) if ended => {
+                        output_after_end += 1;
+                    }
+                    TurnMsg::UserShell(hrdr_agent::AgentEvent::ToolEnd { .. }, _) => ended = true,
+                    _ => {}
+                }
+                h.app.on_turn_msg(msg);
+            }
+            Ok(None) => panic!("channel closed before the shell finished"),
+            Err(_) => panic!("timed out waiting for shell events"),
+        }
+    }
+
+    assert_eq!(
+        output_after_end, 0,
+        "output arrived after the block had already settled"
+    );
+    let result = h
+        .app
+        .transcript()
+        .iter()
+        .find_map(|e| match &e.kind {
+            EntryKind::Tool {
+                done: true, result, ..
+            } => Some(result.clone()),
+            _ => None,
+        })
+        .expect("a settled tool block");
+    // Not `contains("500")`: over the cap the head/tail view keeps the *last*
+    // lines, so the final line is present either way. The count is what tells
+    // truncation from the whole thing.
+    assert!(
+        result.lines().count() >= 500,
+        "all 500 lines survived, not just the model's default 50 plus a spool \
+         pointer — got {} lines:\n{result}",
+        result.lines().count()
+    );
+}
+
 /// Esc cancels a running `!command`: the child is killed, the tool block
 /// closes as "(cancelled)", the cancellation note commits to history + disk
 /// like any other transcript entry, and the slot frees for the next command.

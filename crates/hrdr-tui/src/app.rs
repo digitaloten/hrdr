@@ -18,6 +18,15 @@ use tokio::task::JoinHandle;
 /// Rows scrolled per mouse-wheel notch.
 const MOUSE_SCROLL_LINES: usize = 3;
 
+/// How long a `!command` may run: a day, which is to say "until the user stops
+/// it".
+///
+/// The model's tools take `DEFAULT_TOOL_TIMEOUT_SECS` because a stuck tool call
+/// hangs a turn. This is the user's own shell — the one thing in the app that
+/// answers to nobody — so the only bound here is the one that stops a forgotten
+/// process outliving the session.
+const USER_SHELL_TIMEOUT_SECS: u64 = 60 * 60 * 24;
+
 use crate::theme::Theme;
 
 mod commands;
@@ -1207,15 +1216,23 @@ impl App {
         let mut ctx = hrdr_tools::ToolContext::new(&cwd);
         ctx.stream = Some(stream_tx);
         ctx.max_output = 50_000;
+        // Raised in step with `max_output`. The default is 50 lines, which is a
+        // sensible read for the *model* and absurd for a person who just typed
+        // `!git log`: the block would settle to 50 lines and a spool pointer.
+        ctx.max_output_lines = 5_000;
         ctx.guardrails = Arc::new(Vec::new()); // user's own shell — no guardrails
         let tx = self.tx.clone();
         let task_command = command.clone();
-        let timeout = std::time::Duration::from_secs(hrdr_tools::DEFAULT_TOOL_TIMEOUT_SECS);
+        // The user's own shell is not on a leash. The model's tools time out
+        // because a stuck tool call hangs a turn; `!command` is the user sitting
+        // at their own prompt, and `!tail -f` or `!npm run dev` must not be
+        // killed at five minutes. Ctrl+C is how this one ends.
+        let timeout = std::time::Duration::from_secs(USER_SHELL_TIMEOUT_SECS);
         let handle = tokio::spawn(async move {
             // Forward live output to the TUI as ToolOutput events.
             let fwd_tx = tx.clone();
             let fwd_id = task_id.clone();
-            tokio::spawn(async move {
+            let forwarder = tokio::spawn(async move {
                 while let Some(chunk) = stream_rx.recv().await {
                     let _ = fwd_tx
                         .send(TurnMsg::UserShell(
@@ -1228,14 +1245,27 @@ impl App {
                         .await;
                 }
             });
-            match hrdr_tools::run_user_command(shell, &task_command, timeout, true, &ctx).await {
+            let finished =
+                hrdr_tools::run_user_command(shell, &task_command, timeout, true, &ctx).await;
+            // Close the stream and let the forwarder drain before `ToolEnd`.
+            // Both tasks push onto the same channel, so without this the settle
+            // can overtake output still in flight and land in a closed block.
+            drop(ctx);
+            let _ = forwarder.await;
+            match finished {
                 Ok(run) => {
                     let exit = run
                         .exit_code
                         .map_or_else(|| "?".to_string(), |c| c.to_string());
                     // Bound what lands in the transcript result + history (the
                     // live stream already showed everything).
-                    let bounded = hrdr_tools::truncate_inline(&run.output, 50_000);
+                    //
+                    // `truncate`, not `truncate_inline`: the latter is for
+                    // one-line previews and replaces every newline with a
+                    // space, which turned a `!git log` or `!seq 1 500` into a
+                    // single wrapped line in the settled block — and handed the
+                    // model the same flattened blob inside a fence.
+                    let bounded = hrdr_tools::truncate(&run.output, 50_000);
                     let result = if bounded.trim().is_empty() {
                         format!("(no output — exit {exit})")
                     } else {
