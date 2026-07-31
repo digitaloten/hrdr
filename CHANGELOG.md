@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`Ctrl+S` stashes the input.** A non-empty input box is pushed onto a stash
+  stack and cleared; pressing `Ctrl+S` on an empty box pops the newest one back.
+  The stash is a stack, so several drafts can wait at once (last stashed, first
+  back) — it lives for the session, like the input buffer itself.
+
+### Changed
+
+- **`Ctrl+C` now reads most-local-first.** A non-empty input box is cleared; on
+  an empty box it interrupts the running turn or `!command`; with nothing in
+  flight it arms, and a second consecutive press quits — the double-press quit
+  is unchanged.
+
+- **`Esc` interrupts on a second consecutive press.** A single `Esc` now only
+  arms the interrupt (with a "Press Esc again to interrupt" banner, mirroring
+  the quit confirmation); any other key disarms it, so a stray `Esc` can no
+  longer kill a long turn or a running `!command`.
+
 ## [0.9.3] - 2026-07-31
 
 ### Fixed

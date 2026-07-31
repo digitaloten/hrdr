@@ -507,6 +507,14 @@ pub(crate) struct App {
     /// Set after one idle Ctrl+C; a second consecutive Ctrl+C quits. Any other
     /// key (or a mouse action) disarms it.
     pub(crate) quit_armed: bool,
+    /// Drafts put aside with Ctrl+S, newest last — an empty-box Ctrl+S pops the
+    /// last one back into the editor. Session-lifetime only, like the editor
+    /// buffer itself.
+    pub(crate) stash: Vec<String>,
+    /// Set after one Esc pressed against something in flight; a second
+    /// consecutive Esc interrupts it. Any other key (or a mouse action) disarms
+    /// it, so a stray Esc can't kill a long turn.
+    pub(crate) cancel_armed: bool,
     /// A `/resume` that hit a session held open by another live instance armed an
     /// offer to open a forked copy instead; carries the busy session's `(id,
     /// path)`. The next key answers: `f`/`y` forks, any other key cancels. Like
@@ -698,6 +706,8 @@ impl App {
             background_tasks,
             subagent_hits: Vec::new(),
             quit_armed: false,
+            cancel_armed: false,
+            stash: Vec::new(),
             pending_fork: None,
             tx,
             rx: Some(rx),
@@ -842,11 +852,15 @@ impl App {
             return Action::None;
         }
 
-        // Any key other than a Ctrl+C disarms the quit confirmation.
+        // Each double-press confirmation survives only its own key: any other
+        // key breaks the sequence and disarms it.
         let is_ctrl_c =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         if !is_ctrl_c {
             self.quit_armed = false;
+        }
+        if key.code != KeyCode::Esc {
+            self.cancel_armed = false;
         }
 
         // A `/resume` refused a session held open elsewhere and armed an offer to
@@ -941,15 +955,16 @@ impl App {
         // Ctrl+C / Ctrl+Q / Ctrl+G, plus vim-mode scroll.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                // Ctrl+C interrupts a running turn (doesn't arm quit).
-                KeyCode::Char('c') if self.running() => {
-                    self.cancel_turn();
-                    self.quit_armed = false;
-                    return Action::None;
-                }
-                // First idle Ctrl+C arms; a second consecutive one quits.
+                // Ctrl+C, most-local-first: clear a non-empty input box, else
+                // interrupt what is in flight, else arm quit — and a second
+                // consecutive Ctrl+C on that armed, idle, empty state quits.
                 KeyCode::Char('c') => {
-                    if self.quit_armed {
+                    if !self.editor.content().trim().is_empty() {
+                        self.editor.set_content("");
+                        self.quit_armed = false;
+                    } else if self.cancel_in_flight() {
+                        self.quit_armed = false;
+                    } else if self.quit_armed {
                         self.request_quit();
                     } else {
                         self.quit_armed = true;
@@ -963,6 +978,23 @@ impl App {
                 }
                 // Ctrl+L clears + repaints the screen (fix terminal corruption).
                 KeyCode::Char('l') => return Action::Redraw,
+                // Ctrl+S puts the draft aside and takes it back: a non-empty box
+                // is pushed onto the stash and cleared, an empty one pops the
+                // newest stash back. A stack, so several drafts can wait at once
+                // (last stashed is first back). Same `trim()` reasoning as the
+                // Ctrl+D arm below.
+                KeyCode::Char('s') => {
+                    let draft = self.editor.content();
+                    if draft.trim().is_empty() {
+                        if let Some(stashed) = self.stash.pop() {
+                            self.editor.set_content(&stashed);
+                        }
+                    } else {
+                        self.stash.push(draft);
+                        self.editor.set_content("");
+                    }
+                    return Action::None;
+                }
                 // Ctrl+G: hand the buffer off to $EDITOR (only when idle).
                 KeyCode::Char('g') if !self.running() => return Action::OpenEditor,
                 // Ctrl+D on an empty input quits (shell-style EOF) — checked
@@ -992,24 +1024,20 @@ impl App {
             }
         }
 
-        // Esc while running cancels the in-flight turn (vim: only in Normal, so
-        // Esc still exits Insert; plain: always, since Esc is otherwise unused).
-        if self.running()
-            && key.code == KeyCode::Esc
+        // Esc interrupts what is in flight — a turn or a user `!command` — but
+        // only on a second consecutive press, so a stray Esc can't kill a long
+        // turn (vim: only in Normal, so Esc still exits Insert; plain: always,
+        // since Esc is otherwise unused).
+        if key.code == KeyCode::Esc
             && key.modifiers.is_empty()
             && self.editor.mode_label() != "INSERT"
+            && self.in_flight()
         {
-            self.cancel_turn();
-            return Action::None;
-        }
-        // Likewise Esc cancels a running user `!command` (never concurrent
-        // with a turn — `!` is rejected while one runs).
-        if self.user_shell.is_some()
-            && key.code == KeyCode::Esc
-            && key.modifiers.is_empty()
-            && self.editor.mode_label() != "INSERT"
-        {
-            self.cancel_user_shell();
+            if std::mem::take(&mut self.cancel_armed) {
+                self.cancel_in_flight();
+            } else {
+                self.cancel_armed = true;
+            }
             return Action::None;
         }
 
@@ -1167,7 +1195,7 @@ impl App {
     pub(crate) fn user_shell_command(&mut self, command: String) {
         if self.running() {
             self.system(
-                "a turn is running — wait for it (or interrupt with Esc) before running                  !commands"
+                "a turn is running — wait for it (or interrupt with Esc Esc) before running                  !commands"
                     .to_string(),
             );
             return;
@@ -1207,7 +1235,7 @@ impl App {
             .is_some_and(|u| !u.handle.is_finished())
         {
             self.system(
-                "a !command is already running — wait for it (or cancel with Esc)".to_string(),
+                "a !command is already running — wait for it (or cancel with Esc Esc)".to_string(),
             );
             return;
         }
@@ -1369,7 +1397,7 @@ impl App {
     /// paste must not leak into the editor/history); otherwise it goes to the
     /// input editor.
     pub(crate) fn on_paste(&mut self, text: &str) {
-        self.quit_armed = false;
+        self.disarm();
         if let Some(LoginModal::Key { input, .. }) = &mut self.login_modal {
             input.push_str(text.trim());
             return;
@@ -1380,7 +1408,7 @@ impl App {
     /// Mouse: wheel scrolls the transcript; a left click on the follow button
     /// resumes following the newest output.
     pub(crate) fn on_mouse(&mut self, m: MouseEvent) {
-        self.quit_armed = false;
+        self.disarm();
         // The `/model` selector owns the mouse while open: the wheel scrolls its
         // list (moving the highlight, which the view follows); other events are
         // swallowed so they don't reach the transcript beneath the modal.
@@ -1546,6 +1574,32 @@ impl App {
     /// the frontend is a copy that can be wrong.
     pub(crate) fn running(&self) -> bool {
         self.registry.is_running(hrdr_agent::MAIN_KEY)
+    }
+
+    /// Drop both double-press arms (quit, interrupt): any input that isn't the
+    /// armed key itself breaks the sequence.
+    fn disarm(&mut self) {
+        self.quit_armed = false;
+        self.cancel_armed = false;
+    }
+
+    /// Whether anything the user can interrupt is in flight: a turn, or a user
+    /// `!command` (never both — `!` is rejected while a turn runs).
+    pub(crate) fn in_flight(&self) -> bool {
+        self.running() || self.user_shell.is_some()
+    }
+
+    /// Interrupt whatever [`Self::in_flight`] reports, and say whether there was
+    /// anything to interrupt. The one cancel path behind both Esc and Ctrl+C.
+    fn cancel_in_flight(&mut self) -> bool {
+        if self.running() {
+            self.cancel_turn();
+        } else if self.user_shell.is_some() {
+            self.cancel_user_shell();
+        } else {
+            return false;
+        }
+        true
     }
 
     /// Whether the session's agent is summarizing its own context.
@@ -1997,6 +2051,9 @@ impl App {
     /// `Steered` event `run` emits — not by pushing an entry here — so a normal
     /// message and a steering message reach the transcript the same way.
     fn launch_turn(&mut self) {
+        // An Esc armed against the *previous* turn must not carry over and kill
+        // this one on a single press.
+        self.cancel_armed = false;
         // Keep last_usage so the status-bar context size persists between turns;
         // it's refreshed when this turn's Usage event arrives.
         let tx = self.tx.clone();

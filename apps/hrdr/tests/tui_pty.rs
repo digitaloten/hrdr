@@ -618,9 +618,9 @@ fn a_submitted_prompt_streams_its_reply() -> Result<(), String> {
     Ok(())
 }
 
-/// 8. Esc cancels an in-flight turn (the mock holds the stream open) without
-///    killing the app — a `[cancelled]` note appears, and `quit` then exits
-///    cleanly.
+/// 8. A double Esc cancels an in-flight turn (the mock holds the stream open)
+///    without killing the app — the first press only arms, a `[cancelled]` note
+///    appears on the second, and `quit` then exits cleanly.
 #[test]
 fn escape_cancels_a_turn_without_killing_the_app() -> Result<(), String> {
     if skip_for_want_of_a_pty() {
@@ -634,7 +634,9 @@ fn escape_cancels_a_turn_without_killing_the_app() -> Result<(), String> {
     s.send("do something\r");
     // The turn is streaming (the partial chunk rendered) — it is in-flight.
     s.wait_for("PARTIAL_TOKEN", EXIT);
-    // Esc cancels it.
+    // Esc arms, and the second Esc cancels.
+    s.send("\x1b");
+    s.wait_for("Press Esc again to interrupt", EXIT);
     s.send("\x1b");
     // The app records the cancellation and stays up.
     s.wait_for("cancelled", EXIT);

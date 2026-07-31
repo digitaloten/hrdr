@@ -349,6 +349,11 @@ impl Harness {
         self.app.on_key(KeyEvent::new(code, KeyModifiers::empty()));
     }
 
+    fn ctrl(&mut self, c: char) {
+        self.app
+            .on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
     fn type_str(&mut self, s: &str) {
         for c in s.chars() {
             self.press(KeyCode::Char(c));
@@ -1487,6 +1492,90 @@ async fn cancelling_returns_pending_steering_to_the_composer() {
     assert_eq!(h.app.editor.content(), "never mind");
     // Cancel means stop: it must not have started anything.
     assert!(!h.app.running(), "cancel does not launch the next turn");
+}
+
+/// Esc interrupts only on a second *consecutive* press: the first arms, and any
+/// other key in between disarms — a stray Esc must not kill a long turn.
+#[tokio::test]
+async fn esc_takes_two_presses_to_interrupt_a_turn() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+
+    h.press(KeyCode::Esc);
+    assert!(h.app.cancel_armed, "the first press only arms");
+    assert!(h.app.running(), "the turn is untouched");
+
+    h.type_str("x");
+    assert!(!h.app.cancel_armed, "any other key disarms");
+    h.press(KeyCode::Esc);
+    assert!(
+        h.app.running(),
+        "so the next Esc arms again, it doesn't cancel"
+    );
+    h.press(KeyCode::Esc);
+    assert!(!h.app.running(), "two consecutive presses interrupt");
+}
+
+/// Ctrl+C reads most-local-first: a non-empty box is a draft to clear; an empty
+/// one with something in flight is an interrupt; an empty one with nothing
+/// running arms, then confirms, the quit.
+#[tokio::test]
+async fn ctrl_c_clears_the_draft_then_interrupts_then_quits() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    h.type_str("half-typed");
+
+    h.ctrl('c');
+    assert_eq!(h.app.editor.content().trim(), "", "the draft is cleared");
+    assert!(h.app.running(), "clearing a draft leaves the turn alone");
+    assert!(!h.app.quit_armed, "and doesn't arm the quit");
+
+    h.ctrl('c');
+    assert!(!h.app.running(), "an empty box makes Ctrl+C an interrupt");
+    assert!(
+        !h.app.quit_armed,
+        "interrupting doesn't arm the quit either"
+    );
+
+    h.ctrl('c');
+    assert!(h.app.quit_armed, "idle and empty: the first press arms");
+    assert!(!h.app.should_quit);
+    h.ctrl('c');
+    assert!(h.app.should_quit, "the second consecutive press quits");
+}
+
+/// Ctrl+S is a draft stack: it puts a non-empty box aside and hands the newest
+/// one back when the box is empty, so several drafts can wait at once.
+#[tokio::test]
+async fn ctrl_s_stashes_and_pops_drafts() {
+    let mut h = Harness::new(vec![]).await;
+
+    h.type_str("first thought");
+    h.ctrl('s');
+    assert_eq!(h.app.editor.content().trim(), "", "the box is cleared");
+
+    h.type_str("second thought");
+    h.ctrl('s');
+    assert_eq!(h.app.stash.len(), 2, "the stash stacks up");
+
+    // Empty box: newest first.
+    h.ctrl('s');
+    assert_eq!(h.app.editor.content().trim(), "second thought");
+    // ...and a non-empty box stashes again rather than popping.
+    h.ctrl('s');
+    assert_eq!(h.app.editor.content().trim(), "");
+    h.ctrl('s');
+    assert_eq!(h.app.editor.content().trim(), "second thought");
+
+    h.app.editor.set_content("");
+    h.ctrl('s');
+    assert_eq!(h.app.editor.content().trim(), "first thought");
+
+    // Nothing left to pop: the empty box stays empty.
+    h.app.editor.set_content("");
+    h.ctrl('s');
+    assert_eq!(h.app.editor.content().trim(), "");
+    assert!(h.app.stash.is_empty());
 }
 
 /// Whatever the user is part-way through typing is newer than what was queued,
@@ -5320,9 +5409,10 @@ async fn bang_command_output_lands_before_the_block_closes_and_is_not_line_cappe
     );
 }
 
-/// Esc cancels a running `!command`: the child is killed, the tool block
-/// closes as "(cancelled)", the cancellation note commits to history + disk
-/// like any other transcript entry, and the slot frees for the next command.
+/// A double Esc cancels a running `!command`: the child is killed, the tool
+/// block closes as "(cancelled)", the cancellation note commits to history +
+/// disk like any other transcript entry, and the slot frees for the next
+/// command.
 #[cfg(unix)]
 #[tokio::test]
 async fn esc_cancels_a_running_user_shell_command() {
@@ -5333,7 +5423,12 @@ async fn esc_cancels_a_running_user_shell_command() {
     assert!(h.app.user_shell.is_some(), "the shell task is tracked");
 
     h.press(KeyCode::Esc);
-    assert!(h.app.user_shell.is_none(), "Esc cleared the slot");
+    assert!(h.app.user_shell.is_some(), "the first Esc only arms");
+    h.press(KeyCode::Esc);
+    assert!(
+        h.app.user_shell.is_none(),
+        "the second Esc cleared the slot"
+    );
     let noted = h.app.agent.try_lock().is_ok_and(|a| {
         a.messages_owned().iter().any(|m| {
             m.content

@@ -1207,20 +1207,15 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = draw_pane(f, &app.theme, area, app.theme.prompt_border);
     app.editor.render(f, inner);
 
-    // Both banners float on the same row above the pane; the quit confirmation
-    // takes the spot when both would apply. Only the follow banner is clickable.
-    if app.quit_armed {
-        // `●` (U+25CF) is neutral-width and lives in the same geometric-shapes
-        // block as the bars and blocks the TUI already draws, so it can't be
-        // emoji-substituted or rendered double-wide the way `⚠` was.
-        banner(
-            f,
-            area,
-            "●",
-            "Press Ctrl+C again to quit",
-            Color::White,
-            app.theme.error,
-        );
+    // The banners all float on the same row above the pane; a pending
+    // confirmation takes the spot when more than one would apply. Only the
+    // follow banner is clickable.
+    //
+    // `●` (U+25CF) is neutral-width and lives in the same geometric-shapes block
+    // as the bars and blocks the TUI already draws, so it can't be
+    // emoji-substituted or rendered double-wide the way `⚠` was.
+    if let Some(label) = confirmation_label(app) {
+        banner(f, area, "●", label, Color::White, app.theme.error);
         app.end_button = None;
         app.home_button = None;
     } else if app.scroll_offset > 0 {
@@ -1239,6 +1234,20 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         app.end_button = None;
         app.home_button = None;
+    }
+}
+
+/// What a pending double-press confirmation should tell the user, if one is
+/// armed. Quit wins when both are — it is the one that ends the session. The
+/// interrupt offer is only shown while there is still something to interrupt: a
+/// turn that ended on its own leaves the arm behind, but nothing to say about it.
+fn confirmation_label(app: &App) -> Option<&'static str> {
+    if app.quit_armed {
+        Some("Press Ctrl+C again to quit")
+    } else if app.cancel_armed && app.in_flight() {
+        Some("Press Esc again to interrupt")
+    } else {
+        None
     }
 }
 

@@ -310,8 +310,10 @@ Review the working-tree diff. Focus on: $ARGUMENTS
 | `Ctrl+G`                  | Edit the input in `$EDITOR` / `$VISUAL`                                                                  |
 | `PageUp/Down`, mouse      | Scroll the transcript; `End` follows the newest output                                                   |
 | `Ctrl+L`                  | Clear + repaint the screen                                                                               |
-| `Esc` / `Ctrl+C`          | Interrupt the running turn; Esc also cancels a running `!command`                                        |
-| `Ctrl+C` twice / `Ctrl+D` | Quit (`Ctrl+D` on an empty input); `Ctrl+Q` quits at once                                                |
+| `Ctrl+S`                  | Stash the input (a stack); on an empty input, pop the newest stash back                                  |
+| `Ctrl+C`                  | Clear a non-empty input; on an empty one, interrupt the running turn or `!command`                       |
+| `Esc` twice               | Interrupt the running turn or `!command`                                                                 |
+| `Ctrl+C` twice / `Ctrl+D` | Quit when idle with an empty input (`Ctrl+D` on an empty input); `Ctrl+Q` quits at once                  |
 
 Pass `--vim` for a full [hjkl](https://github.com/kryptic-sh/hjkl) vim editor in
 the input pane instead of the default plain input.
