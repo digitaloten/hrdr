@@ -200,7 +200,18 @@ impl ToolDef {
 /// Request body for `POST /v1/chat/completions`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
-    pub model: String,
+    /// The model id, omitted entirely when the caller has none to name.
+    ///
+    /// Optional because of one endpoint shape hrdr has to work on out of the
+    /// box: a local server that serves exactly ONE model, where the id is a
+    /// detail of how the server was launched (llama.cpp reports its `id` as the
+    /// gguf's file path) and the user has named nothing. llama.cpp ignores the
+    /// field; vLLM validates it against its served names and answers a 404 for
+    /// anything else, so a placeholder id is strictly worse than no id at all —
+    /// vLLM's own `model` is nullable and falls back to the served model.
+    /// See [`crate::UNNAMED_MODEL`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDef>,
@@ -1541,7 +1552,7 @@ mod tests {
     #[test]
     fn chat_request_tools_omitted_when_empty() {
         let req = ChatRequest {
-            model: "m".to_string(),
+            model: Some("m".to_string()),
             messages: vec![],
             tools: vec![],
             temperature: Some(0.5),
@@ -1564,7 +1575,7 @@ mod tests {
     #[test]
     fn chat_request_temperature_omitted_when_none() {
         let req = ChatRequest {
-            model: "m".to_string(),
+            model: Some("m".to_string()),
             messages: vec![],
             tools: vec![],
             temperature: None,
@@ -1598,7 +1609,7 @@ mod tests {
     fn opt_in_params_omitted_by_default_and_sent_when_set() {
         // Defaults: none of the opt-in params appear on the wire.
         let base = ChatRequest {
-            model: "m".to_string(),
+            model: Some("m".to_string()),
             messages: vec![],
             tools: vec![],
             temperature: None,
@@ -1728,7 +1739,7 @@ mod tests {
 
         // Nor via a whole `ChatRequest`, which is how they actually reach the wire.
         let req = ChatRequest {
-            model: "m".to_string(),
+            model: Some("m".to_string()),
             messages: vec![msg],
             tools: vec![],
             temperature: None,
@@ -1776,7 +1787,7 @@ mod tests {
     #[test]
     fn chat_request_reasoning_effort_serialized_when_set() {
         let req = ChatRequest {
-            model: "m".to_string(),
+            model: Some("m".to_string()),
             messages: vec![],
             tools: vec![],
             temperature: None,

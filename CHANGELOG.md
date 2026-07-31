@@ -8,6 +8,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **hrdr's own default identity 404'd on vLLM.** `local://default` put the
+  literal model id `default` on the wire. llama.cpp ignores the field, but vLLM
+  validates it against its served names and answers `404` for anything else, and
+  llama.cpp's router (`--models-dir`) selects by the same field. The sentinel
+  now resolves against the endpoint: `GET /v1/models` is asked once per endpoint
+  and, when the server lists exactly one model, that id is adopted — llama.cpp
+  names the gguf path, vLLM its `--served-model-name`. When the endpoint can't
+  be reached or serves several models, `model` is omitted entirely rather than
+  guessed at; vLLM's own `model` is nullable and falls back to its served model.
+
+- **A server that isn't parsing tool calls now says so.** Started without
+  `--enable-auto-tool-choice --tool-call-parser`, vLLM does not error — it
+  returns the template's raw tool-call markup as ordinary assistant text with a
+  `200`, so the model appears to narrate tool use and never call a tool, with no
+  error to retry and nothing in the response to notice. hrdr now recognises the
+  leaked markers (`<tool_call>`, `<|python_tag|>`, `[TOOL_CALLS]`, harmony
+  commentary channels, …) and says once what flags the server is missing.
+
+- **`prompt_cache_key` is no longer sent to servers that don't read it.** It now
+  goes only to OpenAI, Azure OpenAI and the Codex backend. The gate is an
+  allowlist rather than "not localhost" because a self-hosted vLLM, llama.cpp or
+  Ollama is as likely to sit behind private DNS on another machine as on
+  `localhost`, and none of them consume the field.
+
+- **Two local-endpoint traps documented in the probe.** llama.cpp's `/v1/models`
+  publishes `meta.n_ctx_train` — the model's _training_ context, not the `-c`
+  the server was started with — so adopting it would tell hrdr it has 131072
+  tokens on a server running 8192. The loaded figure comes from `/props`
+  instead, whose `n_ctx` is _per slot_: `--parallel 4` divides the context four
+  ways, which is why raising it shrinks the gauge.
+
 - **Reasoning worked on no current Claude model.** Setting any effort level on
   the Anthropic backend sent `thinking: {type: "enabled", budget_tokens}`, which
   Claude Opus 4.7 and later — Opus 4.8, Opus 5, Sonnet 5, Fable 5, Mythos 5 —

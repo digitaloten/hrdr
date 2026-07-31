@@ -2066,11 +2066,12 @@ pub(crate) fn is_anthropic_native(base_url: &str) -> bool {
 ///
 /// A *remote* endpoint with no credential is the opposite: the request is
 /// guaranteed to 401, and the 401 says nothing about whether the endpoint is up.
+///
+/// The host-matching itself belongs to hrdr-llm, which also uses it to decide
+/// request shape (an OpenAI routing hint means nothing to a local server); this
+/// only names what that decision means for credentials.
 pub fn is_local_endpoint(base_url: &str) -> bool {
-    let host = url_host(base_url);
-    matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1")
-        || host.ends_with(".local")
-        || host.is_empty()
+    hrdr_llm::is_local_host(base_url)
 }
 
 /// Whether `base_url` points at OpenRouter — the one endpoint hrdr enables

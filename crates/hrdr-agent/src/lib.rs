@@ -1063,6 +1063,12 @@ pub struct Agent {
     /// that fails for a non-transient reason (a 401, a model that refuses the
     /// request) is not retried on every subsequent round of the turn.
     self_compact_failed: bool,
+    /// This agent has already said that its endpoint looks like it isn't parsing
+    /// tool calls (see `turn_loop`'s `looks_like_unparsed_tool_call`). Latched:
+    /// the condition persists for the whole session — the server would have to be
+    /// restarted with different flags — so repeating it every round would be
+    /// noise on top of an already-degraded run.
+    tool_syntax_warned: bool,
     /// Recent turns kept verbatim through compaction ([`AgentConfig::compaction_tail_turns`]).
     compaction_tail_turns: usize,
     /// Token budget for the kept-verbatim compaction tail
@@ -1930,6 +1936,7 @@ impl Agent {
             // case a later `ensure_context_window` may still find something.
             context_window_probed: context_window.is_some(),
             self_compact_failed: false,
+            tool_syntax_warned: false,
             todo_turn: 0,
             todo_completed_at: HashMap::new(),
             todo_ttl: config.todo_ttl,

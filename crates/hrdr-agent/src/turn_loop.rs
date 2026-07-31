@@ -276,6 +276,47 @@ fn chunk_has_payload(chunk: &hrdr_llm::ChatChunk) -> bool {
 /// earlier in the messages (e.g. two interrupted turns before a save), and
 /// leaving it unrepaired would keep the session permanently invalid even after
 /// the newest turn is fixed.
+/// What hrdr says when its endpoint hands back a tool call as prose.
+///
+/// The failure it describes is silent by construction. An OpenAI-compatible
+/// server that has not been told how to *parse* its model's tool-call syntax
+/// still answers 200 with a perfectly well-formed completion — the tool call is
+/// just sitting in `content` as text, and `tool_calls` is empty. vLLM does
+/// exactly this when started without `--enable-auto-tool-choice
+/// --tool-call-parser <parser>`: it returns the raw text rather than erroring,
+/// so nothing in the response says anything is wrong. hrdr sees a model that
+/// narrates tool use and never calls a tool, forever, with no error to retry.
+pub(crate) const UNPARSED_TOOL_CALL_NOTICE: &str = "⚠ this endpoint returned a tool call as plain text — it looks like the server isn't \
+     parsing tool calls. vLLM needs `--enable-auto-tool-choice --tool-call-parser <parser>`; \
+     llama.cpp needs `--jinja` (and a template that supports tools).";
+
+/// Whether `text` looks like a tool call the server failed to parse.
+///
+/// Keyed on the wrappers the chat templates emit, not on JSON: a model
+/// *discussing* a tool call writes its name and arguments, but it does not
+/// reproduce the template's control markers. Deliberately narrow — this drives a
+/// warning about the operator's setup, and crying wolf about it is worse than
+/// staying quiet.
+///
+/// Host is not part of the test. The symptom only occurs on a self-hosted
+/// server (a hosted API parses its own models' output), and "self-hosted" is not
+/// something an endpoint's hostname tells you — a vLLM box behind private DNS on
+/// another machine is the common case, not the exception.
+pub(crate) fn looks_like_unparsed_tool_call(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "<tool_call>",           // Qwen, Hermes, many others
+        "<|tool_call",           // Granite / assorted pipe-delimited templates
+        "<|python_tag|>",        // Llama 3.x
+        "<function=",            // Llama 3.1 built-in / functionary
+        "<tool▁call▁begin｜>",   // DeepSeek (its own unicode delimiters)
+        "<|tool▁calls▁begin|>",  // DeepSeek R1
+        "[TOOL_CALLS]",          // Mistral
+        "<|channel|>commentary", // gpt-oss / harmony
+        "functools[",            // assorted fine-tunes
+    ];
+    MARKERS.iter().any(|m| text.contains(m))
+}
+
 pub(crate) fn repair_dangling_tool_calls(messages: &mut Vec<ChatMessage>) {
     let mut idx = 0;
     while idx < messages.len() {
@@ -582,6 +623,19 @@ impl Agent {
             let mut assistant = acc.into_message();
             ensure_assistant_has_content(&mut assistant);
             let tool_calls = assistant.tool_calls.clone().unwrap_or_default();
+            // A server that isn't parsing tool calls hands the template's raw
+            // markup back as ordinary text instead, with a 200 and no error to
+            // catch. Say so once, with the flags that fix it — see
+            // [`UNPARSED_TOOL_CALL_NOTICE`].
+            if !self.tool_syntax_warned
+                && tool_calls.is_empty()
+                && !defs.is_empty()
+                && let Some(text) = assistant.content.as_deref()
+                && looks_like_unparsed_tool_call(text)
+            {
+                self.tool_syntax_warned = true;
+                on_event(AgentEvent::Notice(UNPARSED_TOOL_CALL_NOTICE.to_string()));
+            }
             self.messages.push(assistant);
 
             if tool_calls.is_empty() {
@@ -1323,6 +1377,38 @@ impl Agent {
 mod tests {
     use super::*;
     use hrdr_llm::{ChatChunk, ChunkChoice, Delta};
+
+    /// The unparsed-tool-call detector fires on the template markers a server
+    /// leaks when it isn't parsing tool calls, and stays quiet for a model that
+    /// is merely *talking* about tools — the false positive that would matter,
+    /// since this drives a warning about the operator's setup.
+    #[test]
+    fn unparsed_tool_call_detection_keys_on_template_markers() {
+        for leaked in [
+            "<tool_call>\n{\"name\": \"read\", \"arguments\": {}}\n</tool_call>",
+            "let me look: <|python_tag|>read(path=\"a.rs\")",
+            "<function=read>{\"path\": \"a.rs\"}</function>",
+            "[TOOL_CALLS] [{\"name\": \"read\"}]",
+            "<|channel|>commentary to=functions.read",
+            "functools[{\"name\": \"read\"}]",
+        ] {
+            assert!(
+                looks_like_unparsed_tool_call(leaked),
+                "must detect leaked markup: {leaked}"
+            );
+        }
+        for innocent in [
+            "I'll call the `read` tool with {\"path\": \"a.rs\"} next.",
+            "The tool_call field was empty, so nothing ran.",
+            "Use tools like read and grep to explore.",
+            "",
+        ] {
+            assert!(
+                !looks_like_unparsed_tool_call(innocent),
+                "must not fire on ordinary prose: {innocent}"
+            );
+        }
+    }
 
     fn chunk(content: Option<&str>, reasoning: Option<&str>) -> ChatChunk {
         ChatChunk {

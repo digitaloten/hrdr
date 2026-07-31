@@ -435,6 +435,39 @@ enum Backend {
 /// 32k on Opus 4.1), so relying on it truncates real work.
 const ANTHROPIC_MAX_TOKENS: u32 = 8192;
 
+/// The model id that means **"whatever this endpoint serves"** rather than a
+/// real model — hrdr's default identity, for a user who has pointed it at a
+/// local server and named nothing.
+///
+/// It is not a name any provider knows, so putting it on the wire is a request
+/// that cannot succeed anywhere it is actually read: vLLM validates `model`
+/// against its served names and answers `404 The model 'default' does not
+/// exist`, and llama.cpp's router (`--models-dir`) selects by the same field.
+/// The one server that tolerates it is single-model llama.cpp, which ignores
+/// `model` entirely. So the OpenAI-shaped request builder omits the field
+/// instead — vLLM's own `model` is nullable and falls back to the served model,
+/// which is the same thing the sentinel was trying to say.
+///
+/// Defined here rather than in hrdr-agent (whose `DEFAULT_MODEL` is the same
+/// string) because this crate is what decides whether the field goes on the
+/// wire; hrdr-agent's constant is checked against this one in its own tests.
+pub const UNNAMED_MODEL: &str = "default";
+
+/// Whether `base_url` points at a server on this machine.
+///
+/// Local servers differ from hosted ones in ways the request builder cares
+/// about — they need no credential, they serve one model whose id is an
+/// accident of how they were launched, and OpenAI-specific routing hints mean
+/// nothing to them — so the predicate lives next to the code that decides the
+/// request shape. `hrdr_agent::is_local_endpoint` delegates here so the two
+/// cannot disagree about what "local" is.
+pub fn is_local_host(base_url: &str) -> bool {
+    let host = url_host(base_url);
+    matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1")
+        || host.ends_with(".local")
+        || host.is_empty()
+}
+
 /// A configured chat-completions client.
 #[derive(Clone)]
 pub struct Client {
@@ -469,6 +502,13 @@ pub struct Client {
     api_version: Option<String>,
     /// Wire protocol, derived from `base_url`.
     backend: Backend,
+    /// What [`UNNAMED_MODEL`] resolved to at this endpoint, once asked.
+    ///
+    /// `None` = not asked yet; `Some(None)` = asked, and the endpoint named
+    /// nothing usable (unreachable, or serving more than one model, where
+    /// picking one would be a guess). Shared across clones and reset by
+    /// [`Client::set_base_url`], since the answer is a property of the endpoint.
+    resolved_model: std::sync::Arc<std::sync::Mutex<Option<Option<String>>>>,
 }
 
 /// Whether `model` is an OpenAI reasoning model that wants `max_completion_tokens`
@@ -637,6 +677,7 @@ impl Client {
             system_cache_split: None,
             api_version: None,
             backend,
+            resolved_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -805,6 +846,70 @@ impl Client {
     pub fn set_base_url(&mut self, base_url: impl Into<String>) {
         self.base_url = base_url.into().trim_end_matches('/').to_string();
         self.backend = detect_backend(&self.base_url);
+        // "Whatever this endpoint serves" is a different answer at a different
+        // endpoint. A stale one would send the previous server's model id to
+        // the new one — the exact 404 this resolution exists to avoid.
+        *self
+            .resolved_model
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Whether this endpoint is one that reads OpenAI's `prompt_cache_key`:
+    /// OpenAI itself, an Azure OpenAI deployment, or the ChatGPT/Codex backend.
+    ///
+    /// An allowlist, deliberately. Anything else is either an
+    /// OpenAI-*compatible* server that self-hosts its own prefix cache — which
+    /// may perfectly well be a vLLM box behind private DNS rather than on
+    /// `localhost` — or a gateway that has no reason to understand the field.
+    fn consumes_prompt_cache_key(&self) -> bool {
+        if self.backend == Backend::Codex || self.api_version.is_some() {
+            return true;
+        }
+        let host = url_host(&self.base_url);
+        host == "api.openai.com" || host.ends_with(".openai.com")
+    }
+
+    /// The model id to put on the wire, resolving [`UNNAMED_MODEL`] against the
+    /// endpoint the first time it is needed.
+    ///
+    /// The sentinel means "whatever this server serves", and `/v1/models` is
+    /// where a server says what that is — llama.cpp returns exactly one entry
+    /// (its `id` the gguf path, which its own router then accepts), vLLM returns
+    /// its `--served-model-name`. Asking is what makes hrdr work against a stock
+    /// vLLM, which validates `model` and 404s anything it doesn't serve.
+    ///
+    /// Only a **single-model** listing is adopted. A server offering several has
+    /// no "the" model, and picking the first would be the same guess that made
+    /// the context-window probe adopt a stranger's window (see
+    /// [`Client::context_from_models`]). Then, and whenever the endpoint can't be
+    /// reached, the field is omitted entirely instead: vLLM's `model` is nullable
+    /// and falls back to its served model, and llama.cpp ignores it — both
+    /// strictly better than a placeholder no one knows.
+    ///
+    /// One request per endpoint, cached; a named model never asks at all.
+    async fn wire_model(&self) -> Option<String> {
+        if self.model != UNNAMED_MODEL {
+            return Some(self.model.clone());
+        }
+        if let Some(cached) = self
+            .resolved_model
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            return cached;
+        }
+        let ids = self.list_models().await.unwrap_or_default();
+        let resolved = match ids.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        };
+        *self
+            .resolved_model
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(resolved.clone());
+        resolved
     }
 
     /// Replace the API key (or clear it with `None`).
@@ -812,14 +917,22 @@ impl Client {
         self.api_key = api_key;
     }
 
-    fn request(&self, messages: &[ChatMessage], tools: &[ToolDef], stream: bool) -> ChatRequest {
+    fn request(
+        &self,
+        model: Option<String>,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+        stream: bool,
+    ) -> ChatRequest {
         // OpenAI reasoning models want `max_completion_tokens`, not `max_tokens`.
         let (max_tokens, max_completion_tokens) = match self.params.max_tokens {
             Some(n) if uses_max_completion_tokens(&self.model) => (None, Some(n)),
             other => (other, None),
         };
         ChatRequest {
-            model: self.model.clone(),
+            // Already resolved by `wire_model`: the configured id, the one the
+            // endpoint named for the sentinel, or nothing at all.
+            model,
             messages: messages.to_vec(),
             tools: tools.to_vec(),
             temperature: self.temperature,
@@ -902,7 +1015,16 @@ impl Client {
         // Skipped entirely when unset, so an OpenAI-compatible server that has
         // never heard of the field sees no change. See
         // [`Client::set_prompt_cache_key`] for why it is set at all.
+        //
+        // Sent only to the endpoints that actually READ it — an allowlist, not
+        // "everything that isn't localhost". A self-hosted llama.cpp, vLLM or
+        // Ollama is just as likely to sit behind real DNS on another machine as
+        // on `localhost`, and none of them consume this field: they cache by
+        // prompt prefix inside the one server already (llama.cpp ignores unknown
+        // keys, vLLM logs them as ignored). Keying on the host would have sent
+        // it to exactly those servers whenever they weren't local.
         if let Some(key) = &self.prompt_cache_key
+            && self.consumes_prompt_cache_key()
             && let Some(obj) = json.as_object_mut()
         {
             obj.insert("prompt_cache_key".to_string(), serde_json::json!(key));
@@ -976,7 +1098,11 @@ impl Client {
             )
             .await;
         }
-        let body = self.body_json(&self.request(messages, tools, true));
+        // Resolve the model before serializing: on the "whatever you serve"
+        // sentinel this asks the endpoint once, so vLLM gets the name it
+        // validates against instead of a placeholder it 404s.
+        let model = self.wire_model().await;
+        let body = self.body_json(&self.request(model, messages, tools, true));
         log_wire(
             "request",
             serde_json::json!({
@@ -1195,6 +1321,15 @@ impl Client {
 
     /// llama.cpp exposes the loaded context via `GET /props` (served at the root,
     /// not under `/v1`), either top-level or under `default_generation_settings`.
+    ///
+    /// `GET /props` is available by default — the `--props` flag only unlocks the
+    /// POST form — so this works against a stock `llama-server`.
+    ///
+    /// The number it reports is the **per-slot** context: a server started
+    /// `--parallel 4 -c 32768` gives each concurrent request 8192, and 8192 is
+    /// what lands here. That is the right figure for hrdr (one request occupies
+    /// one slot), and it is why a user who raises `--parallel` sees the context
+    /// gauge shrink by the same factor.
     async fn context_from_props(&self) -> Option<u32> {
         let root = self.base_url.strip_suffix("/v1").unwrap_or(&self.base_url);
         let v = self.get_json(&format!("{root}/props")).await?;
@@ -1229,11 +1364,19 @@ struct ModelEntry {
 /// various OpenAI-compatible servers use. Accepts a number or a numeric string;
 /// ignores non-positive values.
 ///
-/// Note what is *not* here: Anthropic's `/v1/models` publishes both
-/// `max_input_tokens` (the window, listed below) and `max_tokens` (the largest
-/// value the `max_tokens` request param may take). Reading the latter as a
-/// window would understate it by an order of magnitude, so only the former is
-/// a key.
+/// Note what is *not* here, in both directions:
+///
+/// * Anthropic's `/v1/models` publishes both `max_input_tokens` (the window,
+///   listed below) and `max_tokens` (the largest value the `max_tokens` request
+///   param may take). Reading the latter as a window would understate it by an
+///   order of magnitude, so only the former is a key.
+/// * llama.cpp's `/v1/models` publishes `meta.n_ctx_train` — the context the
+///   model was **trained** at, not the one the server was started with. It is
+///   deliberately not read (nor is `meta` descended into): a server run with
+///   `-c 8192` on a 131072-train model would otherwise advertise 131072, and the
+///   agent would fill a window four times larger than the one that exists. The
+///   loaded figure comes from `/props` instead — see
+///   [`Client::context_from_props`]. Do not "fix" this omission.
 fn context_field(v: &serde_json::Value) -> Option<u32> {
     const KEYS: &[&str] = &[
         "max_model_len",      // vLLM
@@ -1285,17 +1428,17 @@ mod tests {
 
         client.set_effort(Some("off".to_string()));
         assert_eq!(client.effort(), Some("off"));
-        let off = client.request(&[], &[], false);
+        let off = client.request(Some(client.model.clone()), &[], &[], false);
         assert!(off.reasoning_effort.is_none());
 
         client.set_effort(Some("high".to_string()));
         assert_eq!(client.effort(), Some("high"));
-        let high = client.request(&[], &[], false);
+        let high = client.request(Some(client.model.clone()), &[], &[], false);
         assert_eq!(high.reasoning_effort.as_deref(), Some("high"));
 
         client.set_effort(None);
         assert_eq!(client.effort(), None);
-        let none = client.request(&[], &[], false);
+        let none = client.request(Some(client.model.clone()), &[], &[], false);
         assert!(none.reasoning_effort.is_none());
     }
 
@@ -1307,7 +1450,7 @@ mod tests {
         let mut client = Client::new("https://api.openai.com/v1", None, "gpt-5.6");
         assert_eq!(client.prompt_cache_key(), None);
 
-        let unset = client.body_json(&client.request(&[], &[], true));
+        let unset = client.body_json(&client.request(Some(client.model.clone()), &[], &[], true));
         assert!(
             unset.get("prompt_cache_key").is_none(),
             "an unset key must not put an empty/null field on the wire: {unset}"
@@ -1315,7 +1458,7 @@ mod tests {
 
         client.set_prompt_cache_key(Some("hrdr-agent-0f1e2d3c".to_string()));
         assert_eq!(client.prompt_cache_key(), Some("hrdr-agent-0f1e2d3c"));
-        let set = client.body_json(&client.request(&[], &[], true));
+        let set = client.body_json(&client.request(Some(client.model.clone()), &[], &[], true));
         assert_eq!(set["prompt_cache_key"], "hrdr-agent-0f1e2d3c");
         // Additive only — the request the struct serialized is otherwise intact.
         assert_eq!(set["model"], "gpt-5.6");
@@ -1324,7 +1467,7 @@ mod tests {
         // Clearing it removes the field again (a provider switch that drops the
         // key must be visible as an absent field, not a stale one).
         client.set_prompt_cache_key(None);
-        let cleared = client.body_json(&client.request(&[], &[], true));
+        let cleared = client.body_json(&client.request(Some(client.model.clone()), &[], &[], true));
         assert!(cleared.get("prompt_cache_key").is_none());
     }
 
@@ -1338,8 +1481,14 @@ mod tests {
         let mut client = Client::new("https://api.openai.com/v1", None, "gpt-5.6");
         client.set_prompt_cache_key(Some("hrdr-agent-0f1e2d3c".to_string()));
 
-        let first = client.body_json(&client.request(&[ChatMessage::user("one")], &[], true));
+        let first = client.body_json(&client.request(
+            Some(client.model.clone()),
+            &[ChatMessage::user("one")],
+            &[],
+            true,
+        ));
         let second = client.body_json(&client.request(
+            Some(client.model.clone()),
             &[ChatMessage::user("one"), ChatMessage::user("two")],
             &[],
             true,
@@ -1387,7 +1536,8 @@ mod tests {
         // carry it — so the absence above is backend-specific, not a no-op.
         let mut openai = Client::new("https://api.openai.com/v1", None, "gpt-5.6");
         openai.set_prompt_cache_key(Some("hrdr-agent-0f1e2d3c".to_string()));
-        let openai_body = openai.body_json(&openai.request(&[], &[], true));
+        let openai_body =
+            openai.body_json(&openai.request(Some(openai.model.clone()), &[], &[], true));
         assert_eq!(openai_body["prompt_cache_key"], "hrdr-agent-0f1e2d3c");
     }
 
@@ -1405,7 +1555,7 @@ mod tests {
             max_tokens: Some(1000),
             ..Default::default()
         });
-        let r = c.request(&[], &[], false);
+        let r = c.request(Some(c.model.clone()), &[], &[], false);
         assert_eq!(r.max_tokens, None);
         assert_eq!(r.max_completion_tokens, Some(1000));
 
@@ -1415,9 +1565,62 @@ mod tests {
             max_tokens: Some(1000),
             ..Default::default()
         });
-        let r = c.request(&[], &[], false);
+        let r = c.request(Some(c.model.clone()), &[], &[], false);
         assert_eq!(r.max_tokens, Some(1000));
         assert_eq!(r.max_completion_tokens, None);
+    }
+
+    /// The "whatever you serve" sentinel never reaches the wire as a model id.
+    /// It is not a name any server knows: vLLM validates `model` and 404s it,
+    /// and llama.cpp's router selects by the same field. Omitting it is what
+    /// vLLM's own nullable `model` is for.
+    #[test]
+    fn the_unnamed_model_sentinel_is_omitted_rather_than_sent() {
+        let client = Client::new("http://gpu-box.lan:8000/v1", None, UNNAMED_MODEL);
+        // `wire_model` resolves it against the endpoint; with none reachable it
+        // yields `None`, and the field must then be absent (not `"default"`,
+        // not `null`).
+        let body = client.body_json(&client.request(None, &[], &[], true));
+        assert!(
+            body.get("model").is_none(),
+            "an unresolvable sentinel must send no `model` at all: {body}"
+        );
+        // A real id is always sent, sentinel logic or not.
+        let named = Client::new("http://gpu-box.lan:8000/v1", None, "qwen3-coder");
+        let body = named.body_json(&named.request(Some("qwen3-coder".to_string()), &[], &[], true));
+        assert_eq!(body["model"], "qwen3-coder");
+    }
+
+    /// `prompt_cache_key` goes only to the endpoints that read it. The gate is
+    /// an allowlist rather than "not localhost" on purpose: a self-hosted vLLM,
+    /// llama.cpp or Ollama is as likely to sit behind private DNS on another
+    /// machine as on `localhost`, and none of them consume the field.
+    #[test]
+    fn prompt_cache_key_goes_only_to_endpoints_that_read_it() {
+        let with_key = |url: &str, api_version: Option<&str>| {
+            let mut c = Client::new(url, None, "m");
+            c.set_api_version(api_version.map(str::to_string));
+            c.set_prompt_cache_key(Some("hrdr-agent-0f1e2d3c".to_string()));
+            let body = c.body_json(&c.request(Some("m".to_string()), &[], &[], true));
+            body.get("prompt_cache_key").is_some()
+        };
+        // Reads it: OpenAI, an Azure OpenAI deployment, the Codex backend.
+        assert!(with_key("https://api.openai.com/v1", None));
+        assert!(with_key(
+            "https://my-org.openai.azure.com/openai/deployments/gpt-5",
+            Some("2024-10-21")
+        ));
+        assert!(with_key("https://chatgpt.com/backend-api/codex", None));
+        // Does not: self-hosted servers, wherever they live, and gateways.
+        for url in [
+            "http://localhost:8080/v1",
+            "http://gpu-box.lan:8000/v1",
+            "https://vllm.internal.example.com/v1",
+            "http://10.0.0.5:11434/v1",
+            "https://openrouter.ai/api/v1",
+        ] {
+            assert!(!with_key(url, None), "{url} must not receive the key");
+        }
     }
 
     #[test]
