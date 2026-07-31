@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::FutureExt;
 use hrdr_agent::{Agent, AgentConfig, AgentRegistry, Entry, MAIN_KEY, PaneId, PaneSet, Steer};
 use hrdr_app::{self, StatusInputs};
 use hrdr_protocol::{PaneTranscript, ServerFrame, WirePane, WirePaneId};
@@ -66,8 +67,22 @@ impl SharedSession {
                 let turn_done = s.main_turn_handle.as_ref().is_some_and(|h| h.is_finished());
                 if turn_done {
                     let handle = s.main_turn_handle.take().unwrap();
-                    // join to avoid leaking
-                    drop(handle);
+                    // The handle is already finished, so `now_or_never` resolves
+                    // on the spot and cannot stall this loop. Observing the
+                    // result rather than dropping the handle is the only thing
+                    // that makes a panic inside the turn task visible: dropping
+                    // it detaches the task and discards its payload, leaving the
+                    // session to go quiet — which reads to the user as the model
+                    // simply having stopped answering. (`cancel` takes the
+                    // handle out of the slot before aborting it, so an aborted
+                    // turn never reaches here; only a panic does.)
+                    if let Some(Err(e)) = handle.now_or_never()
+                        && e.is_panic()
+                    {
+                        let seq = s.next_seq();
+                        let frame = build_notice(seq, format!("turn task panicked: {e}"));
+                        s.emit_raw(frame);
+                    }
                     s.persist();
                     // Check for pending steers to relaunch.
                     if !s.live.pending(MAIN_KEY).is_empty() {
@@ -641,7 +656,6 @@ impl WebSession {
         }
     }
 
-    #[allow(dead_code)]
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.seq

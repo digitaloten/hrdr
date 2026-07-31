@@ -67,14 +67,28 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     crate::auth::verify_basic_password(password, hash)
 }
 
+/// Decide whether `password` matches `hash_opt` — the stored hash of a username
+/// that may not exist. The absent case still runs a full argon2 verify against
+/// [`DUMMY_HASH`] so a nonexistent username costs the same time as a wrong
+/// password.
+///
+/// This is the single place that decision is made. `login_handler` cannot go
+/// through [`verify`] because it has to drop the users-db mutex before the
+/// argon2 work, so it fetches the hash itself and calls in here — keeping the
+/// enumeration-oracle behaviour in one function instead of two that drift.
+pub fn password_matches(hash_opt: Option<String>, password: &str) -> bool {
+    match hash_opt {
+        Some(hash) => verify_password(password, &hash),
+        None => {
+            let _ = verify_password(password, DUMMY_HASH);
+            false
+        }
+    }
+}
+
 /// Verify a username + password against the database.
 pub fn verify(db: &Connection, username: &str, password: &str) -> anyhow::Result<bool> {
-    let Some(hash) = get_password_hash(db, username)? else {
-        // Burn the same argon2 work as a real verify, then fail.
-        let _ = verify_password(password, DUMMY_HASH);
-        return Ok(false);
-    };
-    Ok(verify_password(password, &hash))
+    Ok(password_matches(get_password_hash(db, username)?, password))
 }
 
 // Allow `optional()` on rusqlite rows.

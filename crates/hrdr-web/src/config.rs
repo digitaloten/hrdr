@@ -112,9 +112,9 @@ impl WebConfig {
         let tls_key = env_override_opt("HRDR_WEB_TLS_KEY", web.tls_key_path);
 
         // 3. CLI overrides (highest precedence).
-        let bind_str = cli.bind.as_deref().unwrap_or(bind_str).to_string();
+        let bind_str = cli.bind.clone().unwrap_or(bind_str);
         let port = cli.port.unwrap_or(port);
-        let auth_str = cli.auth.as_deref().unwrap_or(auth_str).to_string();
+        let auth_str = cli.auth.clone().unwrap_or(auth_str);
         let allow_remote = cli.allow_remote || allow_remote;
         let users_db_cli = cli.users_db.clone();
         let users_db = users_db_cli
@@ -184,20 +184,13 @@ impl WebConfig {
     }
 }
 
-fn env_override<'a>(key: &str, default: &'a str, warnings: &mut Vec<String>) -> &'a str {
+fn env_override(key: &str, default: &str, warnings: &mut Vec<String>) -> String {
     match std::env::var(key) {
-        Ok(v) => {
-            // Return a leaked string — fine for startup-only config.
-            // Actually just use the default env var String.
-            let s = v;
-            // We need to return a reference that lives long enough.
-            // This is a startup-only config load; leak is acceptable.
-            Box::leak(s.into_boxed_str())
-        }
-        Err(std::env::VarError::NotPresent) => default,
+        Ok(v) => v,
+        Err(std::env::VarError::NotPresent) => default.to_string(),
         Err(e) => {
             warnings.push(format!("{key}: {e}"));
-            default
+            default.to_string()
         }
     }
 }

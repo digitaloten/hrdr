@@ -240,14 +240,7 @@ async fn login_handler(
     };
     drop(db);
 
-    let ok = match hash_opt {
-        Some(hash) => crate::users::verify_password(&body.password, &hash),
-        None => {
-            // Burn same argon2 work so timing can't leak "user exists".
-            let _ = crate::users::verify_password(&body.password, crate::users::DUMMY_HASH);
-            false
-        }
-    };
+    let ok = crate::users::password_matches(hash_opt, &body.password);
 
     if !ok {
         auth::rate_limit_record(&state.auth, client_ip);
@@ -297,6 +290,12 @@ async fn logout_handler(State(state): State<AppState>, headers: HeaderMap) -> Re
 
 // ── auth helper ────────────────────────────────────────────────────────────
 
+/// The Basic-auth challenge sent with a 401 in `AuthMode::Basic`. `charset` is
+/// the only parameter RFC 7617 defines, and `UTF-8` is its only legal value —
+/// it tells the browser to send non-ASCII credentials as UTF-8 rather than
+/// whatever the page's encoding happens to be.
+const BASIC_CHALLENGE: &str = r#"Basic realm="hrdr", charset="UTF-8""#;
+
 #[allow(clippy::result_large_err)]
 fn check_auth(
     state: &AppState,
@@ -331,6 +330,21 @@ fn check_auth(
 
     if !authed {
         auth::rate_limit_record(&state.auth, client_ip);
+        // RFC 9110 §11.6.1 makes `WWW-Authenticate` mandatory on a 401, and a
+        // browser uses it to decide whether to offer the credential prompt at
+        // all. Without the challenge, `--auth basic` renders the bare
+        // "unauthorized" body with no way to supply credentials — which is the
+        // one mode `serve()` allows for remote access. Token and users mode
+        // have no challenge to offer (a pasted token, and a cookie minted by
+        // POST /login), so they answer with a plain 401.
+        if state.auth.mode == AuthMode::Basic {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, BASIC_CHALLENGE)],
+                "unauthorized",
+            )
+                .into_response());
+        }
         return Err((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
     }
 
@@ -370,6 +384,27 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
 // ── WS handler ─────────────────────────────────────────────────────────────
 
+/// Serialize `value` and send it down the socket. Returns `false` once the
+/// socket is gone, which is the caller's signal to stop.
+///
+/// A value that will not serialize is dropped rather than fatal. The wire types
+/// are all serde-derived so that is unreachable today, but every send here runs
+/// inside a detached `tokio::spawn` where a panic kills the connection with no
+/// diagnostic at all — losing one frame and staying up is the better failure.
+async fn send_json<T: serde::Serialize>(
+    sender: &mut futures_util::stream::SplitSink<axum::extract::ws::WebSocket, Message>,
+    value: &T,
+) -> bool {
+    let json = match serde_json::to_string(value) {
+        Ok(json) => json,
+        Err(e) => {
+            eprintln!("hrdr web: dropping unserializable frame: {e}");
+            return true;
+        }
+    };
+    sender.send(Message::Text(json.into())).await.is_ok()
+}
+
 async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSession) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -388,8 +423,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSess
         let mut s = session.lock().await;
         s.subscribe()
     };
-    let snap_json = serde_json::to_string(&snapshot).unwrap();
-    if sender.send(Message::Text(snap_json.into())).await.is_err() {
+    if !send_json(&mut sender, &snapshot).await {
         return;
     }
 
@@ -401,8 +435,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSess
                 frame = broadcast_rx.recv() => {
                     match frame {
                         Ok(frame) => {
-                            let json = serde_json::to_string(&frame).unwrap();
-                            if sender.send(Message::Text(json.into())).await.is_err() {
+                            if !send_json(&mut sender, &frame).await {
                                 break;
                             }
                         }
@@ -417,8 +450,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSess
                                 let mut s = forward_session.lock().await;
                                 s.build_snapshot()
                             };
-                            let json = serde_json::to_string(&snap).unwrap();
-                            if sender.send(Message::Text(json.into())).await.is_err() {
+                            if !send_json(&mut sender, &snap).await {
                                 break;
                             }
                         }
@@ -428,8 +460,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: SharedSess
                 direct = direct_rx.recv() => {
                     match direct {
                         Some(frame) => {
-                            let json = serde_json::to_string(&frame).unwrap();
-                            if sender.send(Message::Text(json.into())).await.is_err() {
+                            if !send_json(&mut sender, &frame).await {
                                 break;
                             }
                         }

@@ -244,6 +244,26 @@ async fn good_session_cookie_is_not_rate_limited() {
     drop(server);
 }
 
+/// In `basic` mode the 401 carries the `WWW-Authenticate` challenge — without
+/// it a browser renders the bare body and never offers the credential prompt,
+/// which makes the mode unusable from the deployment it exists for.
+#[tokio::test]
+async fn basic_mode_401_carries_the_challenge() {
+    let (server, _session) = start_test_server_basic_mode().await;
+
+    let response = raw_get(server.addr, "/", &[]).await;
+    assert!(
+        response.contains("401 Unauthorized"),
+        "expected 401, got: {response}"
+    );
+    assert!(
+        response.contains(r#"www-authenticate: Basic realm="hrdr", charset="UTF-8""#),
+        "401 must carry the Basic challenge, got: {response}"
+    );
+
+    drop(server);
+}
+
 /// A WS upgrade from a foreign Origin is 403 even with a valid token.
 #[tokio::test]
 async fn ws_origin_foreign_is_rejected() {
@@ -427,6 +447,34 @@ async fn start_test_server_with_token() -> (server::RunningServer, SharedSession
         .expect("serve");
 
     (running, shared, token)
+}
+
+/// A server in `basic` auth mode with credentials configured, so the 401 path
+/// under test is the one a real Basic deployment takes.
+async fn start_test_server_basic_mode() -> (server::RunningServer, SharedSession) {
+    let config = AgentConfig {
+        cwd: std::path::PathBuf::from("/tmp"),
+        api_key: Some("test-key".into()),
+        ..Default::default()
+    };
+
+    let shared = SharedSession::start(config).await.expect("session");
+
+    let mut web_cfg = WebConfig::load(&Default::default()).0;
+    web_cfg.auth = hrdr_web::config::AuthMode::Basic;
+    web_cfg.basic_user = Some("alice".into());
+    web_cfg.basic_password_hash = Some(hrdr_web::auth::hash_password("s3cret").expect("hash"));
+    let auth_state = AuthState::from_config(&web_cfg);
+
+    let cfg = ServeConfig {
+        bind: std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        port: 0,
+    };
+    let running = server::serve(shared.clone(), cfg, &web_cfg, auth_state)
+        .await
+        .expect("serve");
+
+    (running, shared)
 }
 
 /// A server in `users` auth mode, plus the cookie secret so a test can mint a
