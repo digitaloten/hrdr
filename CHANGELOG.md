@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-07-31
+
 ### Fixed
 
 - **Flattening the tool protocol no longer leaves the provider's reasoning state
@@ -5468,7 +5470,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/kryptic-sh/hrdr/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/kryptic-sh/hrdr/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/kryptic-sh/hrdr/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/kryptic-sh/hrdr/compare/v0.8.5...v0.9.0
