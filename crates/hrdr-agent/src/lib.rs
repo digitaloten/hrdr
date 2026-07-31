@@ -9162,6 +9162,142 @@ mod tests {
             );
         }
 
+        /// A tool that panics takes the whole turn down with it — and used to
+        /// take its own transcript entry with it too: the `ToolStart` had landed,
+        /// the `ToolEnd` never did, so every frontend went on painting a call
+        /// that was already dead, spinner and all, for the rest of the session.
+        ///
+        /// The turn's guard closes what the crash left open before it reports the
+        /// failure, so the entry settles as a failed call. Driven through the
+        /// registry rather than around it, because that guard is what is under
+        /// test: the mock model asks for two concurrent calls, so this also pins
+        /// that *every* call in flight is closed and not just the last one.
+        #[tokio::test]
+        async fn a_panicking_tool_closes_its_transcript_entry() {
+            /// Read-only so a batch of these runs concurrently, which is what
+            /// puts two calls in flight at once.
+            struct BoomTool;
+            #[async_trait::async_trait]
+            impl hrdr_tools::Tool for BoomTool {
+                fn name(&self) -> &'static str {
+                    "boom"
+                }
+                fn description(&self) -> &'static str {
+                    "explodes"
+                }
+                fn parameters(&self) -> serde_json::Value {
+                    json!({"type": "object", "properties": {}})
+                }
+                fn read_only(&self) -> bool {
+                    true
+                }
+                async fn execute(
+                    &self,
+                    _args: serde_json::Value,
+                    _ctx: &hrdr_tools::ToolContext,
+                ) -> anyhow::Result<String> {
+                    panic!("the tool exploded");
+                }
+            }
+
+            // Two calls in one assistant message: both `ToolStart`s are emitted
+            // before either runs, so both are open when the first one panics.
+            let two_calls = serde_json::to_string(&json!({
+                "id": "c1",
+                "choices": [{"index": 0, "delta": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {"index": 0, "id": "call_a", "type": "function",
+                         "function": {"name": "boom", "arguments": "{\"n\":1}"}},
+                        {"index": 1, "id": "call_b", "type": "function",
+                         "function": {"name": "boom", "arguments": "{\"n\":2}"}}
+                    ]
+                }, "finish_reason": null}]
+            }))
+            .unwrap();
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                two_calls,
+                tool_calls_stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            agent.tools.register(Arc::new(BoomTool));
+
+            let live = crate::AgentRegistry::new();
+            live.register_session(
+                Arc::new(tokio::sync::Mutex::new(agent)),
+                steering_queue(),
+                "m".to_string(),
+                None,
+                server.base_url(),
+                crate::AgentUsage::default(),
+            );
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let outcome = Arc::new(std::sync::Mutex::new(None));
+            let handle = live
+                .start_turn(
+                    crate::MAIN_KEY,
+                    {
+                        let seen = Arc::clone(&seen);
+                        move |ev| seen.lock().unwrap().push(ev)
+                    },
+                    {
+                        let outcome = Arc::clone(&outcome);
+                        move |o| async move {
+                            *outcome.lock().unwrap() = Some(o);
+                        }
+                    },
+                )
+                .expect("the session agent can be driven");
+            handle.await.unwrap();
+
+            let outcome = outcome.lock().unwrap().take().expect("on_done ran");
+            assert!(outcome.panicked, "the turn crashed: {outcome:?}");
+
+            let seen = seen.lock().unwrap();
+            // The transcript every frontend builds is this fold, so asserting on
+            // it asserts on what the TUI and the web UI both show.
+            let mut entries: Vec<crate::Entry> = Vec::new();
+            for ev in seen.iter() {
+                crate::transcript::apply_event(&mut entries, ev);
+            }
+            let tools: Vec<_> = entries
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    crate::EntryKind::Tool { id, ok, done, .. } => Some((id.as_str(), *ok, *done)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                tools,
+                vec![("call_a", false, true), ("call_b", false, true)],
+                "both calls in flight settle as failed, not as live spinners: {tools:?}"
+            );
+            assert!(
+                seen.iter().any(|e| matches!(
+                    e,
+                    AgentEvent::ToolEnd { result, .. } if result.contains("never returned")
+                )),
+                "and the result says why: {seen:?}"
+            );
+
+            // The turn's own terminal events are unchanged — the crash is still
+            // reported, and the watcher is still told the turn is over last.
+            assert!(
+                seen.iter()
+                    .any(|e| matches!(e, AgentEvent::Notice(n) if n.starts_with("[error]"))),
+                "the crash is still reported: {seen:?}"
+            );
+            assert!(
+                matches!(seen.last(), Some(AgentEvent::TurnDone)),
+                "and `TurnDone` is still last: {seen:?}"
+            );
+        }
+
         // ── (c) turn-end nudge for unfinished TODOs ─────────────────────────────
 
         /// A degraded model ends its turn with no tool calls while the TODO list

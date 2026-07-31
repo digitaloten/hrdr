@@ -462,6 +462,17 @@ fn spawn_background(
                     .copied()
                     .or_else(|| panic_err.downcast_ref::<String>().map(|s| s.as_str()))
                     .unwrap_or("(unknown panic)");
+                // The crash unwound this agent's run wherever it was, which
+                // includes between a tool call's `ToolStart` and its `ToolEnd` —
+                // leaving that call open in its pane and in its jsonl, spinning
+                // for a tool that is never coming back. A steered turn on this
+                // same agent settles that in `start_turn_on`; a delegated run
+                // has its own guard, so it settles it here, through the same
+                // `record` its events travelled, and before the terminal `End`
+                // record below so the transcript closes in order.
+                for ev in live_done.open_tool_ends(live_key, &format!("turn crashed: {msg}")) {
+                    live_done.record(live_key, &ev);
+                }
                 if let Some(ts) = &ts_outer
                     && let Ok(mut t) = ts.lock()
                 {

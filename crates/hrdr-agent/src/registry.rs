@@ -57,11 +57,42 @@ pub struct Events {
     /// Absolute index of `events[0]` — cursors are absolute, so compaction is
     /// invisible to a reader.
     base: usize,
+    /// The tool calls started here and not yet ended, `(id, name)`, in start
+    /// order.
+    ///
+    /// Kept beside the log rather than derived from it, because the log is not a
+    /// durable record: a frontend that keeps up compacts each event away as it
+    /// folds it ([`Events::compact`]), so by the time a turn crashes the
+    /// `ToolStart` whose entry is still spinning has usually already been
+    /// dropped. This index survives that, which is what lets a crashed turn
+    /// close the calls it left open (see [`AgentRegistry::open_tool_ends`]).
+    open_tools: Vec<(String, String)>,
 }
 
 impl Events {
     pub fn push(&mut self, ev: crate::AgentEvent) {
+        match &ev {
+            crate::AgentEvent::ToolStart { id, name, .. } => {
+                self.open_tools.push((id.clone(), name.clone()));
+            }
+            crate::AgentEvent::ToolEnd { id, .. } => self.open_tools.retain(|(i, _)| i != id),
+            _ => {}
+        }
         self.events.push_back(ev);
+    }
+
+    /// The tool calls still running, in start order. A round can put several in
+    /// flight at once — a batch of read-only calls runs concurrently — so this
+    /// is a list, not a single call.
+    pub fn open_tools(&self) -> &[(String, String)] {
+        &self.open_tools
+    }
+
+    /// Forget what was in flight — a fresh turn is starting on this agent, and
+    /// nothing from the last one is still running (see
+    /// [`AgentRegistry::begin_turn`]).
+    pub fn clear_open_tools(&mut self) {
+        self.open_tools.clear();
     }
 
     /// Everything from absolute index `from`, and the cursor to resume at. A
@@ -406,6 +437,45 @@ impl AgentRegistry {
         });
     }
 
+    /// The failed `ToolEnd` every tool call still open on agent `key` never got,
+    /// explained by `reason` — empty when the agent has nothing in flight.
+    ///
+    /// A turn that crashes unwinds between a call's `ToolStart` and the
+    /// `ToolEnd` its completion would have emitted, so every view of that agent
+    /// is left painting the call as still running: a spinner that never stops.
+    /// That is the same shape [`crate::transcript::settle_restored_tools`]
+    /// repairs for a session read back from disk, but it cannot be the same
+    /// repair: that one edits already-folded [`crate::Entry`]s, and a *live*
+    /// crash has to settle the thing the entries are folded FROM. So this hands
+    /// back events. Emitted the way the turn's own events are emitted, they
+    /// reach the TUI, the web frontend and the durable jsonl through the one
+    /// fold ([`crate::transcript::apply_event`]) all three already share, rather
+    /// than being patched into one renderer and missing in the others.
+    ///
+    /// The caller emits them rather than this recording them itself, because the
+    /// two crash paths hand their events on differently — a driven turn wraps
+    /// [`Self::record`] in the watcher's callback, a delegated run calls it
+    /// directly — and only the caller knows which.
+    pub fn open_tool_ends(&self, key: u64, reason: &str) -> Vec<crate::AgentEvent> {
+        self.with(|v| {
+            let Some(e) = v.iter().find(|e| e.key == key) else {
+                return Vec::new();
+            };
+            let Ok(log) = e.events.lock() else {
+                return Vec::new();
+            };
+            log.open_tools()
+                .iter()
+                .map(|(id, name)| crate::AgentEvent::ToolEnd {
+                    id: id.clone(),
+                    name: name.clone(),
+                    result: format!("(this call never returned — {reason})"),
+                    ok: false,
+                })
+                .collect()
+        })
+    }
+
     /// Attach a durable transcript writer to agent `key` at `path`, if it does not
     /// already have one. Opens the file in **append** mode
     /// ([`crate::transcript_log::TranscriptLog::append`]): the main
@@ -460,6 +530,15 @@ impl AgentRegistry {
         self.update(key, |e| {
             e.running = true;
             e.turn.begin();
+            // Nothing is in flight at the start of a turn. Said here because the
+            // one path that can leave a call open — a turn aborted mid-tool, where
+            // the future is simply dropped and no `ToolEnd` is ever emitted — has
+            // no handler to clear it, so without this the ids accumulate and the
+            // NEXT crash would close a call from a turn that is long over,
+            // stamping it with the wrong turn's reason.
+            if let Ok(mut log) = e.events.lock() {
+                log.clear_open_tools();
+            }
         });
         generation
     }
@@ -763,6 +842,10 @@ impl AgentRegistry {
             // guard may not run until after this turn started, cannot mark the
             // agent idle out from under it.
             let _guard = RunGuard::new(live.clone(), key, generation);
+            // A handle kept out of the event closure below, which takes `live` by
+            // value: the failure path still needs the registry once the turn is
+            // over.
+            let crashed = live.clone();
             let mut on_event = on_event;
             // Recorded on the agent's own entry rather than by whoever is watching:
             // what a turn did and what it spent are facts about the agent, not
@@ -792,6 +875,18 @@ impl AgentRegistry {
                 },
             };
             if let Some(error) = &outcome.error {
+                // A panicking tool unwinds the turn between its `ToolStart` and the
+                // `ToolEnd` that finishing it would have emitted, so the call is
+                // left open on every frontend — a spinner that runs forever, on a
+                // tool that died with the turn. Close what is open before saying
+                // the turn is over, so the crash lands on the call that caused it
+                // rather than beside it. Run for a clean error too: nothing on that
+                // path leaves a call open today, and if something ever does the
+                // repair is the same one — it costs a lock and an empty vector
+                // when there is nothing in flight.
+                for ev in crashed.open_tool_ends(key, error) {
+                    on_event(ev);
+                }
                 on_event(crate::AgentEvent::Notice(format!("[error] {error}")));
                 // `run` only emits `TurnDone` on success; whoever is watching still
                 // needs to know the turn is over.
@@ -1269,6 +1364,53 @@ mod tests {
             "the tail after a compaction is still the tail"
         );
         assert_eq!(cursor, 3, "cursors stay absolute across compaction");
+    }
+
+    /// Which calls are in flight is tracked beside the record rather than read
+    /// out of it, and this is why: a frontend that keeps up compacts the
+    /// `ToolStart` away the moment it has folded it, so a crashed turn looking
+    /// for what it left open would find an empty log and settle nothing. The
+    /// ends it hands back are what close those entries (see
+    /// [`AgentRegistry::open_tool_ends`]); a call that already ended is not
+    /// among them.
+    #[test]
+    fn the_calls_in_flight_survive_the_record_being_compacted_away() {
+        let live = AgentRegistry::new();
+        live.register(entry(1));
+        let start = |id: &str| crate::AgentEvent::ToolStart {
+            id: id.to_string(),
+            name: "shell".to_string(),
+            args: "{}".to_string(),
+        };
+        live.record(1, &start("a"));
+        live.record(1, &start("b"));
+        live.record(
+            1,
+            &crate::AgentEvent::ToolEnd {
+                id: "a".to_string(),
+                name: "shell".to_string(),
+                result: "done".to_string(),
+                ok: true,
+            },
+        );
+
+        // A frontend drains and releases the whole record, exactly as `pane` does.
+        let (_, cursor) = live.events_since(1, 0).unwrap();
+        live.compact(1, cursor);
+
+        let ends = live.open_tool_ends(1, "turn crashed: boom");
+        assert!(
+            matches!(
+                &ends[..],
+                [crate::AgentEvent::ToolEnd { id, ok: false, result, .. }]
+                    if id == "b" && result.contains("turn crashed: boom")
+            ),
+            "only the call still running is closed, and it is closed as failed: {ends:?}"
+        );
+        assert!(
+            live.open_tool_ends(99, "gone").is_empty(),
+            "an unknown key has nothing in flight"
+        );
     }
 
     /// A sub-agent's tokens are a fact about *that agent*, so they are counted on
