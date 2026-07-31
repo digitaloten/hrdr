@@ -321,60 +321,119 @@ pub enum ClientMsg {
 mod tests {
     use super::*;
 
-    /// Every JSON example from §4 of the web-ui-plan must parse and
-    /// re-serialize to the same value.
+    /// Which concrete wire type a fixture is supposed to be. The examples run
+    /// in both directions, so a fixture has to say which one it is rather than
+    /// leaving the test to guess from the `type` tag.
+    enum Wire {
+        /// Server → client: a `ServerFrame` (`seq` + flattened `ServerMsg`).
+        Frame,
+        /// Client → server: a `ClientMsg`.
+        Client,
+        /// Not a whole frame — one element of an `entries`/`transcripts` list.
+        EntryView,
+    }
+
+    /// Parse `json` into `T`, serialize it back, and require the two JSON
+    /// values to be equal.
+    ///
+    /// Both halves matter. Parsing into the concrete type is what proves the
+    /// protocol can actually speak the message — a variant that doesn't exist
+    /// fails here. Comparing the re-serialized value against the original is
+    /// what catches a field that serde silently drops: an unknown key parses
+    /// fine into a struct that ignores it, and then vanishes on the way back
+    /// out, so only the round-trip comparison notices it was ever there.
+    fn assert_round_trips<T>(name: &str, json: &str)
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let before: serde_json::Value =
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("{name}: not valid JSON: {e}"));
+        let typed: T = serde_json::from_str(json).unwrap_or_else(|e| {
+            panic!(
+                "{name}: does not parse as {}: {e}",
+                std::any::type_name::<T>()
+            )
+        });
+        let after = serde_json::to_value(&typed).unwrap();
+        assert_eq!(before, after, "{name}: round-trip through the wire type");
+    }
+
+    /// Every example below is a message hrdr's web protocol claims to speak.
+    /// Each one must parse into the concrete type it is tagged with and
+    /// re-serialize to exactly the same JSON — see `assert_round_trips` for
+    /// what each half of that catches.
     #[test]
     fn wire_examples_round_trip() {
-        let examples: Vec<(&str, &str)> = vec![
+        let examples: Vec<(Wire, &str, &str)> = vec![
             // Snapshot (abridged).
             (
+                Wire::Frame,
                 "snapshot",
                 r#"{"seq":1,"type":"snapshot","session_id":"fix-parser","session_name":"fix parser","cwd":"/home/me/proj","panes":[{"id":"main","title":"main","status":"idle","model":"gpt-5.5","provider":"openai","effort":null,"pending":[],"compacting":false,"turn":{"running":false,"inferring":false,"elapsed_ms":0,"ttft_secs":null,"tok_per_sec":0.0,"out_tokens":0,"started_unix":null},"todos":[]}],"active":"main","status":{"left":[],"right":[]},"transcripts":[{"pane":"main","entries":[{"entry":{"kind":"user","data":"hi","time":1753500000}}]}],"show_thinking":true}"#,
             ),
             // Entries delta.
             (
+                Wire::Frame,
                 "entries",
                 r#"{"seq":42,"type":"entries","pane":"main","from":3,"entries":[{"entry":{"kind":"assistant","data":"Done — it was an off-by-one.","time":1753500100}}]}"#,
             ),
+            // Notice, and the input the server pushes back at the client.
+            (
+                Wire::Frame,
+                "notice",
+                r#"{"seq":43,"type":"notice","text":"background task finished"}"#,
+            ),
+            (
+                Wire::Frame,
+                "set_input",
+                r#"{"seq":44,"type":"set_input","mode":"insert_at_cursor","text":"@src/lib.rs"}"#,
+            ),
+            // The two frames that end a connection's handshake, happily or not.
+            (Wire::Frame, "resumed", r#"{"seq":45,"type":"resumed"}"#),
+            (
+                Wire::Frame,
+                "error",
+                r#"{"seq":0,"type":"error","message":"bad token"}"#,
+            ),
             // Tool entry with display model.
             (
+                Wire::EntryView,
                 "tool_entry",
                 r#"{"entry":{"kind":"tool","data":{"id":"c1","name":"shell","args":"{\"command\":\"ls\"}","result":"src\n","ok":true,"done":true},"time":1753500050},"tool":{"headline":"","body":{"type":"shell","command":"ls"}}}"#,
             ),
             // Sub-agent pane id.
             (
+                Wire::Client,
                 "sub_pane",
                 r#"{"type":"submit","pane":{"sub":7},"text":"fix the bug"}"#,
             ),
             // Command.
             (
+                Wire::Client,
                 "command",
                 r#"{"type":"command","pane":{"sub":7},"line":"/status"}"#,
             ),
+            // Cancel and pane switch.
+            (
+                Wire::Client,
+                "cancel",
+                r#"{"type":"cancel","pane":{"sub":7}}"#,
+            ),
+            (
+                Wire::Client,
+                "switch_pane",
+                r#"{"type":"switch_pane","pane":"main"}"#,
+            ),
             // Resume.
-            ("resume", r#"{"type":"resume","seq":41}"#),
-            // Escalation approval, both directions.
-            (
-                "approval_requested",
-                r#"{"seq":77,"type":"approval_requested","id":"esc-1","command":"git push origin main","reason":"runs outside the OS sandbox","rules":["git push"]}"#,
-            ),
-            (
-                "approval_closed",
-                r#"{"seq":78,"type":"approval_closed","id":"esc-1"}"#,
-            ),
-            (
-                "answer_approval",
-                r#"{"type":"answer_approval","id":"esc-1","decision":"session"}"#,
-            ),
+            (Wire::Client, "resume", r#"{"type":"resume","seq":41}"#),
         ];
 
-        for (name, json) in examples {
-            // Parse as generic Value, then re-serialize, then compare.
-            let v: serde_json::Value =
-                serde_json::from_str(json).unwrap_or_else(|_| panic!("{name}: parse failed"));
-            let round = serde_json::to_string(&v).unwrap();
-            let v2: serde_json::Value = serde_json::from_str(&round).unwrap();
-            assert_eq!(v, v2, "{name}: round-trip mismatch");
+        for (wire, name, json) in examples {
+            match wire {
+                Wire::Frame => assert_round_trips::<ServerFrame>(name, json),
+                Wire::Client => assert_round_trips::<ClientMsg>(name, json),
+                Wire::EntryView => assert_round_trips::<WireEntryView>(name, json),
+            }
         }
     }
 
