@@ -714,10 +714,10 @@ large report is instead **saved to a file** and the parent gets a preview + a
 pointer to `read` it — so it doesn't flood the main context. Issuing several
 `task` calls in one turn runs the sub-agents **in parallel** — e.g. explore
 several areas of the codebase at once. While they run, the TUI shows a **live
-sub-agent panel**: one row per running sub-agent. Each row is a link — **click a
-sub-agent to jump to its `task` call** in the transcript, where its output
-streams. Finished sub-agents drop from the panel and their result lands in the
-transcript.
+sub-agent panel** at the foot of the transcript: one row per running sub-agent.
+Each row is a link — **click a sub-agent to jump to its `task` call** in the
+transcript, where its output streams. Finished sub-agents drop from the panel
+and their result lands in the transcript.
 
 Every sub-agent runs **detached**: the `task` call returns immediately with a
 task id, so a sub-agent never blocks the main conversation — the model keeps

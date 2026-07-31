@@ -530,10 +530,11 @@ pub(crate) struct App {
     /// Shared registry of *detached background* sub-agents (a clone of the
     /// agent's `ctx.background_tasks`), read live for the panel.
     pub(crate) background_tasks: Arc<Mutex<Vec<hrdr_tools::BackgroundTask>>>,
-    /// Clickable screen rect for each sub-agent panel row → the id of the `task`
-    /// call that spawned it; a left click jumps to that transcript entry. `None`
-    /// for a row with no call context, whose click is a no-op.
-    pub(crate) subagent_hits: Vec<(HitRect, hrdr_app::PaneId)>,
+    /// Clickable screen rects for the live panels that close the transcript (the
+    /// agent switcher's rows, the TODO list's "finished" row) → what a click on
+    /// each one does. They scroll with the transcript, so the frame recomputes
+    /// them every draw, exactly like [`Self::tool_hits`].
+    pub(crate) row_hits: Vec<(HitRect, crate::ui::RowHit)>,
     /// Screen rect of the transcript, set during draw: the region a drag may
     /// select from, and the frame the selected text is read back out of.
     pub(crate) transcript_rect: HitRect,
@@ -545,6 +546,10 @@ pub(crate) struct App {
     /// Toast notifications (copy/paste feedback), drawn over the top-right of
     /// the screen and dismissed by their own TTLs.
     pub(crate) toasts: HollerBus,
+    /// Whether the TODO panel is showing the tasks that are over (completed,
+    /// cancelled) as well as the ones still to do. Off by default — the panel is
+    /// about what is left — and toggled by clicking its "finished" row.
+    pub(crate) show_done_todos: bool,
     /// Set after one idle Ctrl+C; a second consecutive Ctrl+C quits. Any other
     /// key (or a mouse action) disarms it.
     pub(crate) quit_armed: bool,
@@ -754,7 +759,8 @@ impl App {
             pending_copy: false,
             toasts: HollerBus::new(),
             background_tasks,
-            subagent_hits: Vec::new(),
+            row_hits: Vec::new(),
+            show_done_todos: false,
             quit_armed: false,
             cancel_armed: false,
             stash: Vec::new(),
@@ -1559,18 +1565,6 @@ impl App {
                     self.scroll_offset = self.max_scroll; // jump to the top
                     return;
                 }
-                // Click a row in the agent list to *switch to that agent*: the
-                // transcript, the scroll position and the input all follow it.
-                // Main is the first row, so it is always the way back.
-                if let Some(id) = self
-                    .subagent_hits
-                    .iter()
-                    .find(|(r, _)| r.contains(m.column, m.row))
-                    .map(|(_, id)| *id)
-                {
-                    self.focus_pane(id);
-                    return;
-                }
                 // Inside the transcript the button going down is the start of a
                 // drag, not yet a click: what it turns out to be is settled on
                 // the way up, once we know whether the pointer moved.
@@ -1604,11 +1598,35 @@ impl App {
                 } else {
                     // A click after all — the transcript's own hit targets get it.
                     self.selection = None;
-                    self.toggle_tool_at(m.column, m.row);
+                    self.click_transcript(m.column, m.row);
                 }
             }
             _ => {}
         }
+    }
+
+    /// Answer a click inside the transcript. The live panels ride at its bottom,
+    /// so their rows are hit-tested first — they are the specific targets; a tool
+    /// block is the general one.
+    fn click_transcript(&mut self, col: u16, row: u16) {
+        if let Some(hit) = self
+            .row_hits
+            .iter()
+            .find(|(r, _)| r.contains(col, row))
+            .map(|(_, hit)| *hit)
+        {
+            match hit {
+                // Switch the view to that agent: the transcript, the scroll
+                // position and the input all follow it. Main is the first row,
+                // so it is always the way back.
+                crate::ui::RowHit::Agent(id) => self.focus_pane(id),
+                crate::ui::RowHit::ToggleDoneTodos => {
+                    self.show_done_todos = !self.show_done_todos;
+                }
+            }
+            return;
+        }
+        self.toggle_tool_at(col, row);
     }
 
     /// Toggle the full output of the tool block under `(col, row)`, if a click

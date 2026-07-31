@@ -30,6 +30,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The TODO list, the agent switcher and the inference loader moved into the
+  scrollback.** They were fixed sections between the transcript and the input,
+  charging the reader those rows on every frame; they now close the transcript
+  as trailing blocks, so they cost only what they show and scroll away with
+  everything else. The reader's viewport is the whole window minus the input.
+  Their click targets (an agent row, and the TODO panel's new "finished" row)
+  scroll with them, like a tool block's.
+
+- **Finished TODO items are folded away.** The panel lists what is left; the
+  completed and cancelled tasks sit behind a `▸ N finished — click to show` row
+  until they age out of the list (`todo_ttl`).
+
 - **`Ctrl+C` now reads most-local-first.** A non-empty input box is cleared; on
   an empty box it interrupts the running turn or `!command`; with nothing in
   flight it arms, and a second consecutive press quits — the double-press quit

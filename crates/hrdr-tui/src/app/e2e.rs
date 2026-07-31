@@ -432,6 +432,23 @@ impl Harness {
     }
 }
 
+/// Click a cell: press *and* release, which is what the transcript's own hit
+/// targets answer to (a release after movement is a select-to-copy drag).
+fn click_at(app: &mut App, column: u16, row: u16) {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        app.on_mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        });
+    }
+}
+
 fn buffer_to_string(buf: &Buffer) -> String {
     let area = buf.area;
     let mut out = String::new();
@@ -2716,8 +2733,6 @@ async fn goto_finds_a_text_less_assistant_turn() {
 /// keep accurate.
 #[tokio::test]
 async fn clicking_a_tool_block_toggles_its_expansion() {
-    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-
     let long_output: String = (0..30).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(vec![]).await;
     h.app
@@ -2758,32 +2773,17 @@ async fn clicking_a_tool_block_toggles_its_expansion() {
         "the tool hit rect misses the tool header at row {header_y}"
     );
 
-    // Clicking it expands the block; clicking again collapses it. A click is
-    // press *and* release on the same cell — the transcript only knows a click
-    // from the start of a select-to-copy drag once the button comes back up.
-    let click = |app: &mut App, y: u16| {
-        for kind in [
-            MouseEventKind::Down(MouseButton::Left),
-            MouseEventKind::Up(MouseButton::Left),
-        ] {
-            app.on_mouse(MouseEvent {
-                kind,
-                column: 2,
-                row: y,
-                modifiers: crossterm::event::KeyModifiers::empty(),
-            });
-        }
-    };
+    // Clicking it expands the block; clicking again collapses it.
     let expanded = |app: &App| {
         app.transcript()
             .iter()
             .any(|e| matches!(&e.kind, EntryKind::Tool { expanded, .. } if *expanded))
     };
     assert!(!expanded(&h.app), "starts collapsed");
-    click(&mut h.app, header_y);
+    click_at(&mut h.app, 2, header_y);
     assert!(expanded(&h.app), "the click expanded it");
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    click(&mut h.app, header_y);
+    click_at(&mut h.app, 2, header_y);
     assert!(!expanded(&h.app), "the second click collapsed it");
 }
 
@@ -3207,8 +3207,6 @@ async fn a_thought_and_the_output_after_it_share_one_blank_row() {
 /// was reading jumped up by however many rows it lost.
 #[tokio::test]
 async fn collapsing_a_tool_block_keeps_it_at_the_top_of_the_view() {
-    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-
     let long: String = (0..40).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(vec![]).await;
     h.app
@@ -3250,17 +3248,7 @@ async fn collapsing_a_tool_block_keeps_it_at_the_top_of_the_view() {
     // Click it: the block collapses, and its top comes to the viewport's top.
     let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
     assert!(rect.contains(2, before));
-    for kind in [
-        MouseEventKind::Down(MouseButton::Left),
-        MouseEventKind::Up(MouseButton::Left),
-    ] {
-        h.app.on_mouse(MouseEvent {
-            kind,
-            column: 2,
-            row: before,
-            modifiers: crossterm::event::KeyModifiers::empty(),
-        });
-    }
+    click_at(&mut h.app, 2, before);
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
 
     let after = header_row(&term).expect("tool header still on screen");
@@ -3276,8 +3264,6 @@ async fn collapsing_a_tool_block_keeps_it_at_the_top_of_the_view() {
 /// place.
 #[tokio::test]
 async fn collapsing_while_following_stays_at_the_bottom() {
-    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-
     let long: String = (0..40).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(vec![]).await;
     h.app
@@ -3299,17 +3285,7 @@ async fn collapsing_while_following_stays_at_the_bottom() {
 
     // The header is off the top of a long expanded block; click its last row.
     let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
-    for kind in [
-        MouseEventKind::Down(MouseButton::Left),
-        MouseEventKind::Up(MouseButton::Left),
-    ] {
-        h.app.on_mouse(MouseEvent {
-            kind,
-            column: 2,
-            row: rect.y,
-            modifiers: crossterm::event::KeyModifiers::empty(),
-        });
-    }
+    click_at(&mut h.app, 2, rect.y);
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
 
     assert_eq!(h.app.scroll_offset, 0, "still following the newest output");
@@ -3594,8 +3570,6 @@ async fn the_input_box_routes_to_the_focused_agent() {
 /// records *what was delegated* rather than replaying the work.
 #[tokio::test]
 async fn the_agent_list_switches_the_focused_agent() {
-    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-
     let mut h = Harness::new(vec![]).await;
     h.app.state_mut().name = "my session".to_string();
 
@@ -3676,13 +3650,9 @@ async fn the_agent_list_switches_the_focused_agent() {
     );
 
     // Click the sub-agent's row: the view switches to it, and now its transcript
-    // is what renders.
-    h.app.on_mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: 3,
-        row: sub_y,
-        modifiers: crossterm::event::KeyModifiers::empty(),
-    });
+    // is what renders. The list rides in the transcript, so its rows answer to a
+    // click — press and release — not to the press alone.
+    click_at(&mut h.app, 3, sub_y);
     assert_eq!(h.app.panes.active(), hrdr_app::PaneId(1));
 
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -3706,12 +3676,7 @@ async fn the_agent_list_switches_the_focused_agent() {
 
     // Click main's row to come back.
     let main_y = row_of(&screen, "· main").expect("main is still listed");
-    h.app.on_mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: 3,
-        row: main_y,
-        modifiers: crossterm::event::KeyModifiers::empty(),
-    });
+    click_at(&mut h.app, 3, main_y);
     assert!(h.app.panes.active().is_main(), "main is always reachable");
 }
 
@@ -4024,26 +3989,35 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
         .find(|&y| row(y).contains("ship it"))
         .expect("the todo renders");
 
-    // No border glyphs, and no title, anywhere on the panel.
+    // No border glyphs, and no title, anywhere on the panel. (The last column
+    // is the transcript's scrollbar, which is not the panel's chrome.)
     for y in text_y - 1..=text_y + 1 {
-        let r = row(y);
+        let r: String = row(y).chars().take(49).collect();
         for ch in ['┌', '┐', '└', '┘', '│', '─'] {
             assert!(!r.contains(ch), "border glyph {ch:?} on row {y}:\n{screen}");
         }
     }
     assert!(!screen.contains("todos"), "no title:\n{screen}");
 
-    // The prompt's background across the full width, on the padding rows too.
-    for x in [0, 2, 49] {
+    // The prompt's background across the block's width, on the padding rows too.
+    // The last column is the transcript's scrollbar gutter — the panel is a
+    // block in the scrollback now, so it stops where every other block does.
+    for x in [0, 2, 48] {
         for y in [text_y - 1, text_y, text_y + 1] {
             assert_eq!(cell(x, y).bg, h.app.theme.user_bg, "({x},{y}):\n{screen}");
         }
     }
-    // One blank row above and below the panel content.
-    let last_text_y = text_y + 3;
-    assert_eq!(without_bar(&row(text_y - 1)), "", "top padding:\n{screen}");
+    // One blank row above and below the panel content. (Dropping the last
+    // column drops the transcript's scrollbar, which paints over every row.)
+    let panel_row = |y: u16| -> String { row(y).chars().take(49).collect() };
+    let last_text_y = text_y + 2;
     assert_eq!(
-        without_bar(&row(last_text_y + 1)),
+        without_bar(&panel_row(text_y - 1)),
+        "",
+        "top padding:\n{screen}"
+    );
+    assert_eq!(
+        without_bar(&panel_row(last_text_y + 1)),
         "",
         "bottom padding:\n{screen}"
     );
@@ -4056,8 +4030,16 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
         "{screen}"
     );
     assert!(screen.contains("  wait here"), "pending marker: {screen}");
-    assert!(screen.contains("✓ landed"), "completed marker: {screen}");
-    assert!(screen.contains("✗ skip it"), "cancelled marker: {screen}");
+    // The two finished tasks are folded away behind one row.
+    assert!(
+        !screen.contains("landed"),
+        "completed tasks are hidden: {screen}"
+    );
+    assert!(!screen.contains("skip it"), "cancelled ones too: {screen}");
+    assert!(
+        screen.contains("▸ 2 finished — click to show"),
+        "the panel offers them: {screen}"
+    );
     // Green, where the input pane's is the prompt's mauve.
     for y in text_y - 1..=text_y + 1 {
         assert_eq!(cell(0, y).symbol(), crate::ui::BORDER_BAR, "{screen}");
@@ -4069,11 +4051,64 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
     );
 }
 
-/// Every panel above the input carries a blank row above itself, so it never
-/// butts up against the scrollback (whose last block no longer trails one) — and
-/// that row costs nothing when the panel isn't rendered.
+/// Every live panel carries a blank row above itself, so it never butts up
+/// Finished tasks are folded away behind the panel's last row, and clicking
+/// that row unfolds them — the panel is about what is left, but what was done is
+/// still in the list until it ages out.
 #[tokio::test]
-async fn each_panel_above_the_input_owns_a_blank_row_above_it() {
+async fn clicking_the_finished_row_unfolds_the_done_todos() {
+    let mut h = Harness::new(vec![]).await;
+    *h.app.todos.lock().unwrap() = vec![
+        hrdr_agent::Todo {
+            content: "ship it".to_string(),
+            status: "in_progress".to_string(),
+            evidence: None,
+        },
+        hrdr_agent::Todo {
+            content: "landed".to_string(),
+            status: "completed".to_string(),
+            evidence: None,
+        },
+    ];
+
+    let mut term = Terminal::new(TestBackend::new(50, 24)).unwrap();
+    let draw = |h: &mut Harness, term: &mut Terminal<TestBackend>| -> String {
+        term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+        buffer_to_string(term.backend().buffer())
+    };
+
+    let screen = draw(&mut h, &mut term);
+    assert!(!screen.contains("landed"), "folded away:\n{screen}");
+    let toggle_y = (0..24)
+        .find(|&y| {
+            screen
+                .lines()
+                .nth(y as usize)
+                .is_some_and(|l| l.contains("1 finished"))
+        })
+        .expect("the panel offers the finished task");
+
+    // The row is a click target that rides in the transcript, like a tool block.
+    click_at(&mut h.app, 4, toggle_y);
+    assert!(h.app.show_done_todos, "the click unfolded them");
+    let screen = draw(&mut h, &mut term);
+    assert!(screen.contains("✓ landed"), "now shown:\n{screen}");
+    assert!(
+        screen.contains("▾ 1 finished — click to hide"),
+        "and the row folds them back:\n{screen}"
+    );
+
+    click_at(&mut h.app, 4, toggle_y);
+    let screen = draw(&mut h, &mut term);
+    assert!(!h.app.show_done_todos, "clicking again folds them");
+    assert!(!screen.contains("landed"), "hidden again:\n{screen}");
+}
+
+/// Every live panel carries a blank row above itself, so it never butts up
+/// against the block before it (the scrollback's last block no longer trails
+/// one) — and that row costs nothing when the panel isn't rendered.
+#[tokio::test]
+async fn each_panel_owns_a_blank_row_above_it() {
     let mut h = Harness::new(vec![]).await;
     // Overflow the transcript so its last block runs up to whatever is below.
     for i in 0..40 {
@@ -4086,7 +4121,9 @@ async fn each_panel_above_the_input_owns_a_blank_row_above_it() {
         let buf = term.backend().buffer();
         (0..24)
             .map(|y| {
-                (0..50)
+                // Without the last column: the transcript's scrollbar paints
+                // there, and it is not part of any block.
+                (0..49)
                     .filter_map(|x| {
                         buf.cell(Position::new(x, y))
                             .map(|c| c.symbol().to_string())
@@ -4451,11 +4488,12 @@ async fn the_loader_belongs_to_the_agent_on_screen() {
     );
 }
 
-/// The loader heads the input area while a turn runs: above every panel, with a
-/// blank row on each side. Those blanks are the shared per-section spacer — the
-/// loader's own above it, the next section's below it.
+/// The loader closes the transcript while a turn runs: it is the last thing in
+/// the scrollback — below the todo panel, above the input — with a blank row
+/// above it, and it scrolls with everything else instead of holding a row of
+/// every frame for itself.
 #[tokio::test]
-async fn the_generating_line_heads_the_input_area_with_a_blank_row_each_side() {
+async fn the_generating_line_closes_the_transcript() {
     let mut h = Harness::new(vec![]).await;
     h.type_str("draft");
     // A panel between the loader and the input, so "top-most" is a real claim.
@@ -4488,20 +4526,37 @@ async fn the_generating_line_heads_the_input_area_with_a_blank_row_each_side() {
     };
 
     let loader_y = find("inferring");
-    // Top-most: the todo panel and the input pane both sit below it.
-    assert!(loader_y < find("ship it"), "above the todos:\n{screen}");
+    // Last in the scrollback: below the todo panel, above the input pane.
+    assert!(loader_y > find("ship it"), "below the todos:\n{screen}");
     assert!(loader_y < find("draft"), "above the input:\n{screen}");
 
-    // A blank, untinted row on each side of it.
-    for y in [loader_y - 1, loader_y + 1] {
-        assert_eq!(row(y).trim(), "", "blank row at {y}:\n{screen}");
-        assert_eq!(cell(y).bg, Color::Reset, "untinted row at {y}:\n{screen}");
-    }
-    // And exactly one below: the todo panel's tinted top pad follows it.
+    // A blank, untinted row above it (the panel before it ends with its own
+    // tinted pad, so this one is the spacer), and the loader row itself is
+    // untinted — it is a status line, not a block.
     assert_eq!(
-        cell(loader_y + 2).bg,
-        h.app.theme.user_bg,
-        "the next section starts one row below:\n{screen}"
+        without_bar(&row(loader_y - 1).chars().take(55).collect::<String>()),
+        "",
+        "blank row above the loader:\n{screen}"
+    );
+    assert_eq!(
+        cell(loader_y - 1).bg,
+        Color::Reset,
+        "untinted spacer:\n{screen}"
+    );
+    assert_eq!(
+        cell(loader_y).bg,
+        Color::Reset,
+        "untinted loader:\n{screen}"
+    );
+
+    // Scrolling up takes it away with the rest of the scrollback — that is the
+    // point of moving it in: nothing outside the transcript owns a row.
+    h.app.scroll_offset = h.app.max_scroll;
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let scrolled = buffer_to_string(term.backend().buffer());
+    assert!(
+        !scrolled.contains("inferring"),
+        "the loader scrolls with the transcript:\n{scrolled}"
     );
 }
 

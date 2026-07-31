@@ -28,26 +28,22 @@ const TODO_PANEL_MAX_ITEMS: u16 = 6;
 /// scrolls its rows off the top (newest at the bottom).
 const SUBAGENT_PANEL_MAX_ROWS: u16 = 18;
 
-/// Outer height (with padding) of the sub-agent panel; 0 when nothing is shown.
-fn subagent_panel_height(items: &[hrdr_app::PaneRow]) -> u16 {
-    if items.is_empty() {
-        return 0;
-    }
-    (items.len() as u16).min(SUBAGENT_PANEL_MAX_ROWS) + 2
-}
-
 /// Rows clipped from the top so the newest agent sits at the bottom of a panel
 /// `height` rows tall. Pure, so the scroll math is testable without rendering.
 fn subagent_scroll(items: usize, height: u16) -> u16 {
     (items as u16).saturating_sub(height)
 }
 
+/// Sort key of a task that is over — completed or cancelled. The panel folds
+/// these away behind one row (see [`todo_lines`]).
+const TODO_DONE: u8 = 2;
+
 /// TODO-panel sort order by status: the one in progress on top, the not-yet-
 /// started (pending) ones in the middle, the finished/cancelled ones at the bottom.
 fn todo_sort_key(status: &str) -> u8 {
     match status {
         "in_progress" => 0,
-        "completed" | "cancelled" => 2,
+        "completed" | "cancelled" => TODO_DONE,
         _ => 1,
     }
 }
@@ -73,47 +69,6 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // release it out from under the reader.)
     app.sync_panes();
 
-    // Snapshot the TODO list while briefly holding the lock; the height and
-    // the renderer both use the same snapshot.
-    // The TODO list belongs to the agent on screen — every agent has its own, and
-    // the `todo` tool a sub-agent calls writes to *its* list, not the main one's.
-    let mut todos = app
-        .panes
-        .active_pane()
-        .todos
-        .lock()
-        .map(|t| t.clone())
-        .unwrap_or_default();
-    // Sort for the panel: the one being worked on (in_progress) at the top, then
-    // the not-yet-started (pending) ones, then the completed ones at the bottom.
-    // Stable, so items keep their relative order within each group.
-    todos.sort_by_key(|t| todo_sort_key(&t.status));
-    let todo_height = if todos.is_empty() {
-        0
-    } else {
-        (todos.len() as u16).min(TODO_PANEL_MAX_ITEMS) + 2
-    };
-    // Hide the TODO panel while a sub-agent is running: the TODO panel belongs
-    // to the active pane, but when a sub-agent is mid-turn the viewer is watching
-    // that sub-agent's own thinking, not its task list — suppress it so it does
-    // not occupy scarce vertical space. A running main agent does not suppress it.
-    let any_sub_running = app
-        .panes
-        .subs()
-        .iter()
-        .any(|p| p.status == hrdr_app::PaneStatus::Running);
-    let todo_height = if any_sub_running { 0 } else { todo_height };
-
-    // The loader heads the input section while **the agent on screen** works. It
-    // hides while that agent's tool calls run: the model is idle then, and a spinner
-    // would claim otherwise (the running tool's own block carries the `…` mark), and
-    // it hides entirely when the agent you are looking at is not working — even if
-    // another one is.
-    // Compaction is the agent's, like the turn clock: a sub-agent summarizing itself
-    // says so on its own pane rather than looking hung.
-    let working = app.panes.active_pane().turn.inferring() || app.panes.active_pane().compacting;
-    let loader_height: u16 = if working { 1 } else { 0 };
-
     // Input pane auto-grows 1..=INPUT_MAX_ROWS text rows with the content.
     // Inner width = full width minus the horizontal padding on both sides; the
     // extra two rows are the blank padding above and below.
@@ -123,26 +78,15 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         .desired_rows(input_inner_w, hrdr_app::INPUT_MAX_ROWS)
         + 2;
 
-    // Built once per frame; both the layout height and the renderer use it.
-    // The switcher lists every agent — main first, so there is always a way back.
-    // It stays hidden while the main agent is the only one: a one-row list of the
-    // thing you are already looking at is noise.
-    let mut subagent_items: Vec<hrdr_app::PaneRow> = if app.panes.show_switcher() {
-        hrdr_app::pane_rows(&app.panes)
-    } else {
-        Vec::new()
-    };
-    // Sort the agent list: the main agent on top (always the way back), then the
-    // still-running sub-agents, then the finished (Done) ones at the bottom.
-    // Stable, so agents keep their spawn order within each group.
-    subagent_items.sort_by_key(agent_sort_key);
-    let subagent_height = subagent_panel_height(&subagent_items);
-
     // Build the row stack dynamically, remembering each section's index. Every
     // section of the input area carries a blank row above itself, so none butts
     // up against the one above it (the scrollback's last block no longer trails
     // a separator of its own) — and that row costs nothing when the section
     // isn't rendered. Each section's own blank is the previous one's blank below.
+    //
+    // The loader, the TODO list and the agent switcher are *not* sections here:
+    // they close the transcript instead (see [`live_panel_chunks`]), so the rows
+    // they would have reserved from every frame belong to the scrollback.
     let mut constraints = vec![Constraint::Min(3)];
     let section = |constraints: &mut Vec<Constraint>, height: u16| {
         (height > 0).then(|| {
@@ -151,10 +95,6 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
             constraints.len() - 1
         })
     };
-    let loader_idx = section(&mut constraints, loader_height);
-    // TODO list first, then the agent list below it.
-    let todo_idx = section(&mut constraints, todo_height);
-    let subagent_idx = section(&mut constraints, subagent_height);
     let input_idx = section(&mut constraints, input_height).expect("the input pane always renders");
     // Status bar: hidden (0 rows), one row (truncate), or wrapped (≤4 rows). It
     // renders as a block, so it carries the same padding as the transcript's —
@@ -185,17 +125,6 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical(constraints).split(area);
 
     draw_transcript(f, app, chunks[0]);
-    if let Some(i) = subagent_idx {
-        draw_subagents(f, app, chunks[i], &subagent_items);
-    } else {
-        app.subagent_hits.clear();
-    }
-    if let Some(i) = todo_idx {
-        draw_todos(f, app, chunks[i], &todos);
-    }
-    if let Some(i) = loader_idx {
-        draw_loader(f, app, chunks[i]);
-    }
     draw_input(f, app, chunks[input_idx]);
     if let Some(i) = statusbar_idx {
         draw_statusbar(f, app, chunks[i], &sb_left, &sb_right);
@@ -911,22 +840,32 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     // the chunks borrow the app until they are painted.
     let pending_goto = app.pending_goto.take();
     let pending_entry = app.pending_scroll_entry.take();
-    let (scroll_offset, max_scroll, tool_hits) =
-        draw_chunks(f, app, area, text_area, pending_goto, pending_entry);
+    let frame = draw_chunks(f, app, area, text_area, pending_goto, pending_entry);
 
     // scroll_offset is rows scrolled UP from the bottom; 0 == follow newest. Write
     // it back so "scrolled up" state (and the follow button) is accurate even after
     // the content shrinks.
-    app.scroll_offset = scroll_offset;
-    app.max_scroll = max_scroll;
-    app.tool_hits = tool_hits;
+    app.scroll_offset = frame.scroll_offset;
+    app.max_scroll = frame.max_scroll;
+    app.tool_hits = frame.tool_hits;
+    app.row_hits = frame.row_hits;
 
-    draw_scrollbar(f, app, area, max_scroll, scroll_offset);
+    draw_scrollbar(f, app, area, frame.max_scroll, frame.scroll_offset);
+}
+
+/// What laying the transcript out told the frame: where the reader ended up, how
+/// far there is to scroll, and where a click would land on something.
+struct TranscriptFrame {
+    scroll_offset: usize,
+    max_scroll: usize,
+    /// Visible tool blocks → the transcript index each one expands.
+    tool_hits: Vec<(HitRect, usize)>,
+    /// Visible live-panel rows → what clicking one does.
+    row_hits: Vec<(HitRect, RowHit)>,
 }
 
 /// Lay the transcript out, place the viewport in it, and paint the rows it lands
-/// on. Returns what the frame learned: where the reader ended up, how far there is
-/// to scroll, and which screen rows a click would land on a tool block in.
+/// on.
 fn draw_chunks(
     f: &mut Frame,
     app: &App,
@@ -934,8 +873,11 @@ fn draw_chunks(
     text_area: Rect,
     pending_goto: Option<usize>,
     pending_entry: Option<usize>,
-) -> (usize, usize, Vec<(crate::app::HitRect, usize)>) {
-    let (chunks, msg_at) = transcript_chunks(app, text_area.width);
+) -> TranscriptFrame {
+    let (mut chunks, msg_at) = transcript_chunks(app, text_area.width);
+    // The live panels close the transcript, below the last block: they scroll
+    // with it instead of holding rows of every frame for themselves.
+    chunks.extend(live_panel_chunks(app, text_area.width));
     // The screen row each block starts at. A block's rows come out of
     // `render_block` already wrapped and padded to the render width, so a row is a
     // row: no measuring, no re-wrapping, just a running total.
@@ -997,13 +939,30 @@ fn draw_chunks(
     // usize (cum values) to avoid overflow; only the final HitRect fields are cast
     // back to u16.
     let mut tool_hits = Vec::new();
+    let mut row_hits = Vec::new();
     for (i, c) in chunks.iter().enumerate() {
+        // A live panel's rows: each one is a single screen row, one below the
+        // block's top padding row.
+        for (row, hit) in &c.row_hits {
+            let at = cum[i] + 1 + row;
+            if (scroll_us..view_end).contains(&at) {
+                row_hits.push((
+                    HitRect {
+                        x: text_area.x,
+                        y: text_area.y + (at - scroll_us) as u16,
+                        w: text_area.width,
+                        h: 1,
+                    },
+                    *hit,
+                ));
+            }
+        }
         let Some(idx) = c.tool_idx else { continue };
         let vis_start = cum[i].max(scroll_us);
         let vis_end = cum[i + 1].min(view_end);
         if vis_end > vis_start {
             tool_hits.push((
-                crate::app::HitRect {
+                HitRect {
                     x: text_area.x,
                     y: text_area.y + (vis_start - scroll_us) as u16,
                     w: text_area.width,
@@ -1057,7 +1016,12 @@ fn draw_chunks(
     let para = Paragraph::new(visible).wrap(Wrap { trim: false });
     f.render_widget(para.scroll((inner_scroll, 0)), text_area);
 
-    (offset as usize, max_scroll as usize, tool_hits)
+    TranscriptFrame {
+        scroll_offset: offset as usize,
+        max_scroll: max_scroll as usize,
+        tool_hits,
+        row_hits,
+    }
 }
 
 /// The scrollbar: total session length, and where the reader is within it.
@@ -1086,19 +1050,56 @@ fn draw_scrollbar(f: &mut Frame, app: &App, area: Rect, max_scroll: usize, offse
     f.render_stateful_widget(scrollbar, sb_area, &mut sb_state);
 }
 
-fn draw_todos(f: &mut Frame, app: &App, area: Rect, todos: &[hrdr_agent::Todo]) {
+/// The TODO panel's rows — one per task still to do, marked by status — and the
+/// index of the "finished" row, when there is one. `None` when the panel has
+/// nothing to show at all.
+///
+/// Finished tasks (completed, cancelled) are folded away behind that last row:
+/// the panel is about what is left, and a list that keeps everything ever done
+/// pushes the live work off the bottom. Clicking the row unfolds them, until
+/// they age out of the list entirely (`todo_ttl`).
+///
+/// The list belongs to the agent on screen — every agent has its own, and the
+/// `todo` tool a sub-agent calls writes to *its* list, not the main one's.
+fn todo_lines(app: &App) -> Option<(Vec<Line<'static>>, Option<usize>)> {
+    // Hide the list while a sub-agent is running: when one is mid-turn the
+    // viewer is watching that sub-agent's own thinking, not its task list. A
+    // running main agent does not suppress it.
+    if app
+        .panes
+        .subs()
+        .iter()
+        .any(|p| p.status == hrdr_app::PaneStatus::Running)
+    {
+        return None;
+    }
+    let mut todos = app
+        .panes
+        .active_pane()
+        .todos
+        .lock()
+        .map(|t| t.clone())
+        .unwrap_or_default();
     if todos.is_empty() {
-        return;
+        return None;
+    }
+    // The one being worked on (in_progress) at the top, then the not-yet-started
+    // (pending) ones, then the finished ones at the bottom. Stable, so items
+    // keep their relative order within each group.
+    todos.sort_by_key(|t| todo_sort_key(&t.status));
+    let done = todos
+        .iter()
+        .filter(|t| todo_sort_key(&t.status) == TODO_DONE)
+        .count();
+    if !app.show_done_todos {
+        todos.retain(|t| todo_sort_key(&t.status) != TODO_DONE);
     }
 
-    // The input pane's chrome, with a green rule instead of the prompt's.
     let bg = app.theme.user_bg;
-    let inner = draw_pane(f, &app.theme, area, app.theme.success);
-
     let frame = SPINNER[(app.header_anchor.elapsed().as_millis() / 120) as usize % SPINNER.len()];
-
-    let lines: Vec<Line<'static>> = todos
+    let mut lines: Vec<Line<'static>> = todos
         .iter()
+        .take(TODO_PANEL_MAX_ITEMS as usize)
         .map(|t| {
             let (mark, color) = match t.status.as_str() {
                 "completed" => ("✓", app.theme.success),
@@ -1113,30 +1114,54 @@ fn draw_todos(f: &mut Frame, app: &App, area: Rect, todos: &[hrdr_agent::Todo]) 
         })
         .collect();
 
-    f.render_widget(Paragraph::new(lines), inner);
+    // The finished ones are still in the list (they age out after `todo_ttl`),
+    // so the panel offers them rather than pretending they never happened.
+    let toggle = (done > 0).then(|| {
+        let label = if app.show_done_todos {
+            format!("▾ {done} finished — click to hide")
+        } else {
+            format!("▸ {done} finished — click to show")
+        };
+        lines.push(Line::from(Span::styled(
+            label,
+            Style::default().fg(app.theme.dim).bg(bg),
+        )));
+        lines.len() - 1
+    });
+    if lines.is_empty() {
+        return None;
+    }
+    Some((lines, toggle))
 }
 
-/// The live sub-agent panel: one block per running `task`, each showing a header
-/// (its `↳ task …` line) plus the tail of its output (collapsed) or the whole
-/// log (expanded). A left click on a row toggles that agent's expansion; the
-/// clickable rects are recorded in `app.subagent_hits`.
+/// The agent switcher's rows — one per agent, and the id each row switches to
+/// when clicked. `None` while the main agent is the only one: a one-row list of
+/// the thing you are already looking at is noise.
 ///
-/// When the total content rows exceed `SUBAGENT_PANEL_MAX_ROWS`, the panel
-/// scrolls so the newest agents/logs stay visible at the bottom.
-fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect, items: &[hrdr_app::PaneRow]) {
-    let (accent, success) = (app.theme.accent, app.theme.success);
-    // The input pane's chrome, with the accent rule a running agent wears — the
-    // todo panel's is green.
-    let bg = app.theme.user_bg;
-    let inner = draw_pane(f, &app.theme, area, accent);
+/// Beyond `SUBAGENT_PANEL_MAX_ROWS` agents the oldest rows drop off the top, so
+/// the newest stay visible.
+fn subagent_lines(app: &App, width: usize) -> Option<(Vec<Line<'static>>, Vec<hrdr_app::PaneId>)> {
+    if !app.panes.show_switcher() {
+        return None;
+    }
+    let mut items = hrdr_app::pane_rows(&app.panes);
+    if items.is_empty() {
+        return None;
+    }
+    // The main agent on top (always the way back), then the still-running
+    // sub-agents, then the finished (Done) ones at the bottom. Stable, so agents
+    // keep their spawn order within each group.
+    items.sort_by_key(agent_sort_key);
+    let scroll = subagent_scroll(items.len(), SUBAGENT_PANEL_MAX_ROWS) as usize;
 
-    // One row per agent, newest pinned to the bottom when they overflow. A
-    // running row leads with the same animated spinner as the inference loader
+    let (accent, success, bg) = (app.theme.accent, app.theme.success, app.theme.user_bg);
+    // A running row leads with the same animated spinner as the inference loader
     // (driven off the free-running header clock so it ticks even while idle).
-    let scroll = subagent_scroll(items.len(), inner.height);
     let frame = SPINNER[(app.header_anchor.elapsed().as_millis() / 120) as usize % SPINNER.len()];
-    let lines: Vec<Line<'static>> = items
+    let inner = inner_width(width) as usize;
+    let (lines, ids) = items
         .iter()
+        .skip(scroll)
         .map(|item| {
             let fg = match item.status {
                 hrdr_app::PaneStatus::Done => success,
@@ -1150,40 +1175,30 @@ fn draw_subagents(f: &mut Frame, app: &mut App, area: Rect, items: &[hrdr_app::P
             if item.active {
                 style = style.add_modifier(Modifier::REVERSED);
             }
-            Line::from(Span::styled(
-                format!("{marker} {}", item.title.trim()),
-                style,
-            ))
+            // Truncated, not wrapped: one agent is one row, which is what lets a
+            // click on row N mean agent N.
+            let title = truncate_chars(&format!("{marker} {}", item.title.trim()), inner);
+            (Line::from(Span::styled(title, style)), item.id)
         })
-        .collect();
-
-    // A click on a visible row switches the view to that agent.
-    app.subagent_hits = items
-        .iter()
-        .enumerate()
-        .skip(scroll as usize)
-        .take(inner.height as usize)
-        .map(|(i, item)| {
-            (
-                crate::app::HitRect {
-                    x: inner.x,
-                    y: inner.y + (i as u16 - scroll),
-                    w: inner.width,
-                    h: 1,
-                },
-                item.id,
-            )
-        })
-        .collect();
-
-    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+        .unzip();
+    Some((lines, ids))
 }
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// The inference loader: spinner + live stats (context size, in/out ratio,
-/// token throughput) shown above the input while a turn runs.
-fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
+/// token throughput), closing the transcript while a turn runs. `None` when the
+/// agent on screen isn't working.
+fn loader_line(app: &App) -> Option<Line<'static>> {
+    // It hides while that agent's tool calls run: the model is idle then, and a
+    // spinner would claim otherwise (the running tool's own block carries the
+    // `…` mark), and it hides entirely when the agent you are looking at is not
+    // working — even if another one is. Compaction is the agent's, like the turn
+    // clock: a sub-agent summarizing itself says so on its own pane rather than
+    // looking hung.
+    if !(app.panes.active_pane().turn.inferring() || app.panes.active_pane().compacting) {
+        return None;
+    }
     // The loader describes **the agent you are looking at**, and the clock it reads
     // is that agent's own. Watching a sub-agent work used to show the *main* agent's
     // spinner, throughput and elapsed time — and a sub-agent grinding away under an
@@ -1239,14 +1254,65 @@ fn draw_loader(f: &mut Frame, app: &App, area: Rect) {
             elapsed.as_secs_f64(),
         )
     };
-    f.render_widget(
-        Paragraph::new(text).style(
-            Style::default()
-                .fg(app.theme.warn)
-                .add_modifier(Modifier::BOLD),
-        ),
-        area,
-    );
+    Some(Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(app.theme.warn)
+            .add_modifier(Modifier::BOLD),
+    )))
+}
+
+/// The live panels that close the transcript: the inference loader, the TODO
+/// list, and the agent switcher, in that order, below the last block.
+///
+/// They used to be fixed sections between the transcript and the input, which
+/// charged the reader those rows on every frame whether or not anything was in
+/// them. As trailing chunks they cost only what they show, and they scroll away
+/// with the rest of the scrollback — so the reader's viewport is the whole
+/// window minus the input.
+fn live_panel_chunks(app: &App, width: u16) -> Vec<Chunk<'static>> {
+    let w = width as usize;
+    let bg = app.theme.user_bg;
+    let mut out = Vec::new();
+
+    // A block, its left rule, and what a click on each of its body rows does.
+    // Each panel carries the blank row above it that used to come from its
+    // layout section, so it never butts against the block before it.
+    let mut panel = |body: Vec<Line<'static>>, rule: Color, hits: Vec<(usize, RowHit)>| {
+        out.push(separator());
+        out.push(Chunk {
+            rows: ChunkRows::Ready(Rc::new(render_block(body, w, bg, Some(rule)))),
+            tool_idx: None,
+            row_hits: hits,
+        });
+    };
+
+    if let Some((body, toggle)) = todo_lines(app) {
+        panel(
+            body,
+            app.theme.success,
+            toggle
+                .map(|i| (i, RowHit::ToggleDoneTodos))
+                .into_iter()
+                .collect(),
+        );
+    }
+    if let Some((body, ids)) = subagent_lines(app, w) {
+        let hits = ids
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| (i, RowHit::Agent(id)))
+            .collect();
+        panel(body, app.theme.accent, hits);
+    }
+    if let Some(line) = loader_line(app) {
+        // No block chrome: the loader is a single status row on the terminal's
+        // own background, as it was when it sat above the input — and it goes
+        // last, closest to the input, because it is the live one.
+        out.push(separator());
+        out.push(Chunk::plain(ChunkRows::Ready(Rc::new(vec![line])), None));
+    }
+    out
 }
 
 /// Paint a pane wearing the chrome of the user's own surfaces: the prompt's
@@ -2191,6 +2257,31 @@ struct Chunk<'a> {
     rows: ChunkRows<'a>,
     /// Transcript index, when this chunk is a tool call (for click-to-expand).
     tool_idx: Option<usize>,
+    /// What a click on one of this chunk's *body* rows does, by row index
+    /// (0 = the first row inside the block's padding). Only the live panels use
+    /// this — they ride in the transcript, so their click targets scroll like
+    /// everything else.
+    row_hits: Vec<(usize, RowHit)>,
+}
+
+impl<'a> Chunk<'a> {
+    /// A chunk with nothing clickable in it — every block but the live panels.
+    fn plain(rows: ChunkRows<'a>, tool_idx: Option<usize>) -> Self {
+        Self {
+            rows,
+            tool_idx,
+            row_hits: Vec::new(),
+        }
+    }
+}
+
+/// What clicking a live panel's row does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowHit {
+    /// Switch the view to this agent.
+    Agent(hrdr_app::PaneId),
+    /// Unfold (or fold) the finished TODO items.
+    ToggleDoneTodos,
 }
 
 /// A chunk's rows — laid out already, or laid out only if they are looked at.
@@ -2412,7 +2503,7 @@ fn flush<'a>(
     for _ in 0..msgs {
         msg_at.push(chunks.len());
     }
-    chunks.push(Chunk { rows, tool_idx });
+    chunks.push(Chunk::plain(rows, tool_idx));
     if separate {
         chunks.push(separator());
     }
@@ -2424,10 +2515,7 @@ fn separator<'a>() -> Chunk<'a> {
     thread_local! {
         static SEP: Rc<Vec<Line<'static>>> = Rc::new(vec![Line::raw("")]);
     }
-    Chunk {
-        rows: ChunkRows::Ready(SEP.with(Rc::clone)),
-        tool_idx: None,
-    }
+    Chunk::plain(ChunkRows::Ready(SEP.with(Rc::clone)), None)
 }
 
 /// Returns the transcript as a list of rendered blocks, plus the chunk each
@@ -2669,15 +2757,15 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
             // against the message text above it.
             body.push(Line::raw(""));
             body.push(Line::from(Span::styled(" Queued ", badge)));
-            chunks.push(Chunk {
-                rows: ChunkRows::Ready(Rc::new(render_block(
+            chunks.push(Chunk::plain(
+                ChunkRows::Ready(Rc::new(render_block(
                     body,
                     w,
                     bg,
                     BlockKind::Queued.border(theme),
                 ))),
-                tool_idx: None,
-            });
+                None,
+            ));
             // Queued blocks are tinted: a blank row separates them from each
             // other, and the last one from the input pane below.
             chunks.push(separator());
@@ -3016,10 +3104,7 @@ mod selection_tests {
 
 #[cfg(test)]
 mod subagent_tests {
-    use super::{
-        SUBAGENT_PANEL_MAX_ROWS, agent_sort_key, subagent_panel_height, subagent_scroll,
-        todo_sort_key,
-    };
+    use super::{agent_sort_key, subagent_scroll, todo_sort_key};
     use hrdr_app::{PaneId, PaneRow, PaneStatus};
 
     /// The TODO panel groups by status: in-progress on top, pending in the
@@ -3077,35 +3162,6 @@ mod subagent_tests {
                 PaneId(1), // done
                 PaneId(4),
             ]
-        );
-    }
-
-    fn items(n: usize) -> Vec<PaneRow> {
-        (0..n)
-            .map(|i| PaneRow {
-                id: if i == 0 {
-                    PaneId::MAIN
-                } else {
-                    PaneId(i as u64)
-                },
-                title: format!("agent {i}"),
-                status: PaneStatus::Idle,
-                active: i == 0,
-            })
-            .collect()
-    }
-
-    /// One row per agent plus the pane's two padding rows, capped — the panel is
-    /// a list now, so an agent's log length can't grow it.
-    #[test]
-    fn the_panel_is_one_row_per_agent_plus_padding() {
-        assert_eq!(subagent_panel_height(&items(0)), 0, "hidden when empty");
-        assert_eq!(subagent_panel_height(&items(1)), 3);
-        assert_eq!(subagent_panel_height(&items(4)), 6);
-        assert_eq!(
-            subagent_panel_height(&items(SUBAGENT_PANEL_MAX_ROWS as usize + 5)),
-            SUBAGENT_PANEL_MAX_ROWS + 2,
-            "capped"
         );
     }
 
