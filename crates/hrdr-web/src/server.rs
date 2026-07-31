@@ -173,7 +173,37 @@ async fn index(
     headers: HeaderMap,
     query: Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    if let Err(resp) = check_auth(&state, peer.ip(), &headers, &query) {
+    // Users mode is the one mode where a browser cannot supply a credential on
+    // this request: the only thing `check_auth` accepts is the `hrdr_session`
+    // cookie, and that cookie is minted by `POST /login`. A 401 here is
+    // therefore a dead end — no unauthenticated route serves a form, so the
+    // mode has no browser entry point at all. Answer the navigation with the
+    // login page instead, and let the SPA (or the placeholder index) wait until
+    // the request is authenticated: serving the app to a logged-out user is the
+    // same dead end wearing a nicer page.
+    //
+    // A *missing or unusable* cookie is deliberately not recorded as a failed
+    // auth attempt. The rate limiter still gates the route — a bucket already
+    // locked by real failures gets its 429 below, before anything is served —
+    // but merely fetching the login form must not consume the budget the user
+    // needs to submit it. This is not the paranoid choice it looks like: the
+    // cookie secret is regenerated on every start (`AuthState::from_config`),
+    // so after a restart every browser in the fleet presents a cookie that no
+    // longer verifies, and counting those would lock each of them out of the
+    // page that fixes it. The credential check that can actually be
+    // brute-forced is `POST /login`, and that one does record.
+    if state.auth.mode == AuthMode::Users {
+        let client_ip = auth::extract_client_ip(peer.ip(), &headers);
+        if !auth::check_rate_limit(&state.auth, client_ip) {
+            return rate_limited();
+        }
+        let authed = session_cookie(&headers)
+            .map(|val| auth::verify_session_cookie(val, &state.auth.cookie_secret[..]).is_some())
+            .unwrap_or(false);
+        if !authed {
+            return axum::response::Html(LOGIN_HTML).into_response();
+        }
+    } else if let Err(resp) = check_auth(&state, peer.ip(), &headers, &query) {
         return resp;
     }
     if let Some(spa) = crate::spa_index_html() {
@@ -219,12 +249,7 @@ async fn login_handler(
 ) -> Response {
     let client_ip = auth::extract_client_ip(peer.ip(), &headers);
     if !auth::check_rate_limit(&state.auth, client_ip) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, "60")],
-            "rate limit exceeded",
-        )
-            .into_response();
+        return rate_limited();
     }
 
     if state.auth.mode != AuthMode::Users {
@@ -296,6 +321,19 @@ async fn logout_handler(State(state): State<AppState>, headers: HeaderMap) -> Re
 /// whatever the page's encoding happens to be.
 const BASIC_CHALLENGE: &str = r#"Basic realm="hrdr", charset="UTF-8""#;
 
+/// The answer to a request from a locked-out bucket. Every route that consults
+/// the limiter — `check_auth`, `login_handler`, and the users-mode arm of `/`
+/// that serves the login page without going through `check_auth` — replies with
+/// this same 429, so the three cannot drift apart.
+fn rate_limited() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, "60")],
+        "rate limit exceeded",
+    )
+        .into_response()
+}
+
 #[allow(clippy::result_large_err)]
 fn check_auth(
     state: &AppState,
@@ -305,12 +343,7 @@ fn check_auth(
 ) -> Result<(), Response> {
     let client_ip = auth::extract_client_ip(peer, headers);
     if !auth::check_rate_limit(&state.auth, client_ip) {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, "60")],
-            "rate limit exceeded",
-        )
-            .into_response());
+        return Err(rate_limited());
     }
 
     let authed = match state.auth.mode {
@@ -336,7 +369,11 @@ fn check_auth(
         // "unauthorized" body with no way to supply credentials — which is the
         // one mode `serve()` allows for remote access. Token and users mode
         // have no challenge to offer (a pasted token, and a cookie minted by
-        // POST /login), so they answer with a plain 401.
+        // POST /login), so they answer with a plain 401. Users mode reaching
+        // here at all means the request was for `/ws`: `/` serves the login
+        // page instead of a 401 in that mode, but `/ws` is an API endpoint a
+        // browser never navigates to, so it stays a hard 401 — an HTML login
+        // page is not a WebSocket handshake response.
         if state.auth.mode == AuthMode::Basic {
             return Err((
                 StatusCode::UNAUTHORIZED,
@@ -378,6 +415,83 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     <h1>hrdr web</h1>
     <p>Connect a WebSocket client to <code>/ws</code>.</p>
     <p>Example: <code>websocat ws://127.0.0.1:9911/ws</code></p>
+</body>
+</html>
+"#;
+
+// ── login page (users mode) ────────────────────────────────────────────────
+
+/// The unauthenticated `/` in `AuthMode::Users`. Deliberately minimal: this is
+/// the server's own fallback entry point, not a UI — enough to get a cookie
+/// minted so the real client can load.
+///
+/// Wholly static, and that is a requirement rather than an accident: not one
+/// byte of it comes from the request, so there is nothing to escape and no way
+/// for a username, a query parameter, or a header to reach the markup. Anything
+/// dynamic that appeared here later would need escaping, which is the moment to
+/// stop and reconsider instead.
+///
+/// The `fetch()` exists because `login_handler` takes `axum::Json<LoginBody>`:
+/// a native form submit sends `application/x-www-form-urlencoded`, which that
+/// extractor rejects with a 415 before ever seeing the credentials.
+const LOGIN_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>hrdr web — sign in</title>
+    <style>
+        body { font-family: system-ui, sans-serif; max-width: 22rem; margin: 4rem auto; padding: 0 1rem; }
+        label { display: block; margin: 1rem 0 0.25rem; }
+        input { width: 100%; padding: 0.4em; box-sizing: border-box; font: inherit; }
+        button { margin-top: 1.25rem; padding: 0.5em 1.2em; font: inherit; }
+        #error { color: #a00; min-height: 1.3em; margin-top: 1rem; }
+    </style>
+</head>
+<body>
+    <h1>hrdr web</h1>
+    <form id="login-form">
+        <label for="username">Username</label>
+        <input id="username" name="username" autocomplete="username" autocapitalize="none" autofocus required>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <button type="submit">Sign in</button>
+    </form>
+    <p id="error" role="alert"></p>
+    <script>
+        const form = document.getElementById('login-form');
+        const error = document.getElementById('error');
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            error.textContent = '';
+            let response;
+            try {
+                response = await fetch('/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        username: document.getElementById('username').value,
+                        password: document.getElementById('password').value,
+                    }),
+                });
+            } catch (e) {
+                error.textContent = 'could not reach the server';
+                return;
+            }
+            if (response.ok) {
+                // The Set-Cookie has landed, so the same URL now serves the app.
+                window.location.reload();
+                return;
+            }
+            // Failures come back as a plain-text reason (401 "bad credentials",
+            // 429 "rate limit exceeded", 404 when users mode is off). Show it —
+            // a form that does nothing on a bad password looks broken. Assigned
+            // through textContent, never innerHTML: the body is server-authored
+            // today, but a login form is the wrong place to trust that forever.
+            const reason = await response.text().catch(() => '');
+            error.textContent = reason || ('sign-in failed (' + response.status + ')');
+        });
+    </script>
 </body>
 </html>
 "#;

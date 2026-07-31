@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--auth users` has a way in.** The mode was wired end to end on the server —
+  SQLite user store, argon2, cookie HMAC, CSRF-safe logout, `--add-user` — with
+  no client half: `/` was gated on a cookie that only `POST /login` mints, and
+  nothing served a form, so a browser got a 401 and no way past it. An
+  unauthenticated `/` now answers with a minimal sign-in page. `/ws` stays a
+  hard 401 — it is an API endpoint, not something a browser navigates to.
+
 - **Select to copy.** Dragging the mouse across the transcript highlights the
   cells under the pointer and, on release, copies what they say to the clipboard
   — the app captures the mouse, so the terminal's own selection never reached
@@ -65,6 +72,58 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   longer kill a long turn or a running `!command`.
 
 ### Fixed
+
+- **A tool that panics stops spinning.** The turn's panic guard emitted its
+  notice and `TurnDone` but never a `ToolEnd`, so the call that killed the turn
+  was left painted as still running — forever, on every frontend. A crashed turn
+  now closes every call it left open (a round can have several in flight) as
+  failed, through the same event fold the TUI, the web UI and the durable
+  transcript already share. Delegated runs settle theirs the same way.
+
+- **A hook that times out reports the right unit.** Both the file-hook and the
+  lifecycle-hook notes read `timed out after 30ms` for a thirty-_second_ timeout
+  — the two format strings still said `ms` after the field was renamed
+  `timeout_ms` → `timeout_secs`. A formatter that needed a moment longer read as
+  one that died instantly, which points at the wrong fix.
+
+- **A CI directory past sixteen files no longer hides `.gitlab-ci.yml`.** The
+  cap on how many CI configs the verification gate reads was applied to the
+  workflow scan and the single-file configs _together_, so a monorepo with
+  enough `.github/workflows` entries dropped every other provider — possibly the
+  only one carrying the gate. The cap now bounds the directory scan alone.
+
+- **`fetch` refuses the RFC 6598 shared address space** (`100.64.0.0/10`), which
+  hosting providers hand to internal service meshes and ingress ranges. Reaching
+  one was the same class of mistake as reaching `10/8`, which was already
+  blocked.
+
+- **A malformed DuckDuckGo result no longer borrows the next result's snippet**,
+  and an attribute whose name merely _ends_ with the one being read (`data-href`
+  for `href`) no longer answers for it.
+
+- **`--auth basic` is usable from a browser again.** The 401 carried no
+  `WWW-Authenticate` header, so no browser ever offered the credential prompt —
+  it rendered the bare "unauthorized" body instead, with no way in. That is the
+  one mode `serve()` allows for remote access alongside `users`. Token and users
+  mode still answer with a plain 401: neither has a challenge to offer.
+
+- **A truncated SSE event no longer escapes as a success.** `SseDecoder::finish`
+  checked its overflow flag on entry but not after flushing the trailing line —
+  and that flush parses an unterminated final `data:` line, which can trip the
+  cap for the first time. Every backend reads `Ok` as "the events are intact",
+  so the truncated payload went into JSON parsing and surfaced as a misleading
+  parse error instead of a clean overflow. The flag is now rechecked after the
+  flush, and the buffers are cleared so no later call can leak the fragment.
+
+- **A Codex error carrying its code at the top level and its message in a nested
+  object is classified correctly.** The nested object won outright, so its
+  missing `code` read as "unknown" — which is terminal — and a retryable
+  `server_error` ended the turn. Both fields now fall back to the outer event.
+
+- **A panicking turn no longer leaves the web session silently idle.** The tick
+  loop dropped the finished turn's `JoinHandle` (detaching the task and
+  discarding its payload) where the comment claimed it joined. A panic now
+  surfaces as a notice instead of reading like a model that stopped answering.
 
 - **The live `tok/s` figure no longer measures the provider's chunk size.** The
   round in flight was estimated by counting streamed _deltas_ as tokens, so the

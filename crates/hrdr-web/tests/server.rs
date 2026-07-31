@@ -198,16 +198,19 @@ async fn wrong_token_is_401_and_rate_limited() {
 /// A bad `hrdr_session` cookie is counted by the rate limiter like any other
 /// auth failure: ten of them lock the bucket, so the eleventh request is 429
 /// even though it carries a *valid* cookie.
+///
+/// The ten failures go through `/ws`, the surface where a bad cookie is still
+/// an auth failure. `GET /` answers an unusable cookie with the login page and
+/// records nothing (see `users_mode_index_does_not_lock_out_a_stale_cookie`),
+/// but it does still consult the limiter — which is exactly what the final
+/// assertion proves, on a request whose cookie is perfectly good.
 #[tokio::test]
 async fn bad_session_cookie_is_rate_limited() {
     let (server, _session, secret) = start_test_server_users_mode().await;
 
     for i in 0..10 {
-        let response = raw_get(server.addr, "/", &["Cookie: hrdr_session=not-a-cookie"]).await;
-        assert!(
-            response.contains("401 Unauthorized"),
-            "attempt {i} should be 401, got: {response}"
-        );
+        let status = ws_upgrade_status(server.addr, Some("hrdr_session=not-a-cookie")).await;
+        assert_eq!(status, 401, "ws attempt {i} should be 401");
     }
 
     let cookie = format!(
@@ -218,6 +221,113 @@ async fn bad_session_cookie_is_rate_limited() {
     assert!(
         response.contains("429 Too Many Requests"),
         "11th request should be rate limited even with a good cookie, got: {response}"
+    );
+
+    drop(server);
+}
+
+/// In `users` mode an unauthenticated `GET /` serves the login form, not a 401.
+/// The only credential `check_auth` accepts in that mode is a cookie minted by
+/// `POST /login`, so a 401 here leaves a browser with no way in at all.
+#[tokio::test]
+async fn users_mode_index_serves_the_login_page_without_a_cookie() {
+    let (server, _session, _secret) = start_test_server_users_mode().await;
+
+    let response = raw_get(server.addr, "/", &[]).await;
+    assert!(
+        response.contains("200 OK"),
+        "unauthenticated / should serve the login page, got: {response}"
+    );
+    assert!(
+        response.contains(r#"id="login-form""#)
+            && response.contains(r#"id="username""#)
+            && response.contains(r#"id="password""#),
+        "login page must carry the credential form, got: {response}"
+    );
+    assert!(
+        response.contains("fetch('/login'"),
+        "the form must post to /login, got: {response}"
+    );
+
+    drop(server);
+}
+
+/// A *valid* cookie still gets the app page — the login page must not have
+/// displaced it for users who are already signed in.
+#[tokio::test]
+async fn users_mode_index_with_a_valid_cookie_serves_the_app() {
+    let (server, _session, secret) = start_test_server_users_mode().await;
+
+    let cookie = format!(
+        "Cookie: hrdr_session={}",
+        hrdr_web::auth::mint_session_cookie("alice", &secret[..])
+    );
+    let response = raw_get(server.addr, "/", &[&cookie]).await;
+    assert!(response.contains("200 OK"), "expected 200, got: {response}");
+    assert!(
+        !response.contains(r#"id="login-form""#),
+        "an authenticated / must not serve the login page, got: {response}"
+    );
+
+    drop(server);
+}
+
+/// A cookie the server cannot verify — a stale one from a previous run, since
+/// the cookie secret is regenerated on every start — also gets the login page,
+/// and burns none of the rate-limit budget. Otherwise every browser in the
+/// fleet would lock itself out of the very form that fixes its cookie.
+#[tokio::test]
+async fn users_mode_index_does_not_lock_out_a_stale_cookie() {
+    let (server, _session, secret) = start_test_server_users_mode().await;
+
+    for i in 0..11 {
+        let response = raw_get(
+            server.addr,
+            "/",
+            &["Cookie: hrdr_session=stale-from-last-run"],
+        )
+        .await;
+        assert!(
+            response.contains("200 OK") && response.contains(r#"id="login-form""#),
+            "request {i} should serve the login page, got: {response}"
+        );
+    }
+
+    // The bucket is untouched, so logging in still works.
+    let cookie = format!(
+        "Cookie: hrdr_session={}",
+        hrdr_web::auth::mint_session_cookie("alice", &secret[..])
+    );
+    let response = raw_get(server.addr, "/", &[&cookie]).await;
+    assert!(
+        response.contains("200 OK"),
+        "a good cookie after 11 login-page loads should still be 200, got: {response}"
+    );
+
+    drop(server);
+}
+
+/// `/ws` in `users` mode is unchanged: a hard 401 without a cookie, an upgrade
+/// with one. The login page is a page, not a widening of the API surface — a
+/// browser never navigates to `/ws`, and an HTML body is not a handshake.
+#[tokio::test]
+async fn users_mode_ws_still_rejects_without_a_cookie() {
+    let (server, _session, secret) = start_test_server_users_mode().await;
+
+    assert_eq!(
+        ws_upgrade_status(server.addr, None).await,
+        401,
+        "ws without a cookie must stay 401"
+    );
+
+    let cookie = format!(
+        "hrdr_session={}",
+        hrdr_web::auth::mint_session_cookie("alice", &secret[..])
+    );
+    assert_eq!(
+        ws_upgrade_status(server.addr, Some(&cookie)).await,
+        101,
+        "ws with a valid cookie should upgrade"
     );
 
     drop(server);
@@ -401,6 +511,30 @@ where
     while let Ok(Some(Ok(_))) =
         tokio::time::timeout(std::time::Duration::from_millis(300), read.next()).await
     {}
+}
+
+/// Attempt a WS upgrade, optionally carrying a `Cookie`, and return the HTTP
+/// status the server answered the handshake with (101 once it succeeded). A
+/// plain `GET /ws` is not usable for this: the `WebSocketUpgrade` extractor runs
+/// before the handler's auth check and rejects a non-handshake request outright,
+/// so the status under test would never be reached.
+async fn ws_upgrade_status(addr: std::net::SocketAddr, cookie: Option<&str>) -> u16 {
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut request = format!("ws://{addr}/ws")
+        .into_client_request()
+        .expect("build ws request");
+    if let Some(cookie) = cookie {
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+    }
+    match connect_async(request).await {
+        Ok((_ws, resp)) => resp.status().as_u16(),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status().as_u16(),
+        Err(e) => panic!("unexpected ws error: {e}"),
+    }
 }
 
 /// Issue a single `GET` over a fresh connection and return the raw response.
