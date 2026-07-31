@@ -428,8 +428,11 @@ enum Backend {
     Codex,
 }
 
-/// Default `max_tokens` for the native Anthropic backend (required by the API;
-/// well under every current Claude model's output cap).
+/// Last-resort `max_tokens` for the native Anthropic backend (the API requires
+/// the field). Only used when the models.dev catalog can't name the model's real
+/// cap — see [`Client::anthropic_max_tokens`]. It is *far* below every current
+/// model's cap (128k on Opus 5 / Sonnet 5 / Opus 4.6-4.8, 64k on the 4.5 family,
+/// 32k on Opus 4.1), so relying on it truncates real work.
 const ANTHROPIC_MAX_TOKENS: u32 = 8192;
 
 /// A configured chat-completions client.
@@ -453,6 +456,12 @@ pub struct Client {
     params: crate::RequestParams,
     /// Extra HTTP headers (provider-configured) sent with every request.
     extra_headers: Vec<(String, String)>,
+    /// OpenAI's `prompt_cache_key`: a caller-chosen routing hint combined with
+    /// the prompt-prefix hash when OpenAI looks for a cache entry. Sent on the
+    /// two OpenAI-shaped backends only ([`Backend::OpenAi`], [`Backend::Codex`]);
+    /// the native Anthropic Messages API has no such field and would 400 on it.
+    /// See [`Client::set_prompt_cache_key`] for why it must be set.
+    prompt_cache_key: Option<String>,
     system_cache_split: Option<usize>,
     /// Azure OpenAI API version. When set, requests append `?api-version=<v>` and
     /// authenticate with an `api-key` header instead of `Bearer` (Azure is still
@@ -624,6 +633,7 @@ impl Client {
             effort: None,
             params: crate::RequestParams::default(),
             extra_headers: Vec::new(),
+            prompt_cache_key: None,
             system_cache_split: None,
             api_version: None,
             backend,
@@ -650,6 +660,56 @@ impl Client {
     /// ephemeral (`false`).
     pub fn set_cache_ttl_1h(&mut self, one_hour: bool) {
         self.cache_1h = one_hour;
+    }
+
+    /// Whether the extended 1-hour cache TTL is in force.
+    ///
+    /// Exposed for **pricing**, not for request building: a cache *write* is
+    /// billed at 1.25x the input rate on the 5-minute TTL and 2x on the 1-hour
+    /// one, so a caller estimating the cost of a call has to know which one this
+    /// client asked for. The client is the only thing that does — the TTL is set
+    /// per identity, alongside the cache mode, and can change on a `/model`
+    /// switch — so reading it back from here is what keeps the estimate and the
+    /// request describing the same call.
+    pub fn cache_ttl_1h(&self) -> bool {
+        self.cache_1h
+    }
+
+    /// Set OpenAI's `prompt_cache_key` — the routing hint that decides whether
+    /// hrdr's long, highly repetitive prompt prefix actually *hits* OpenAI's
+    /// prompt cache. `None` omits the field.
+    ///
+    /// Why this is not optional in practice: OpenAI combines this value with the
+    /// prompt-prefix hash when picking a cache entry, and **on GPT-5.6 models
+    /// setting it is mandatory for reliable cache matching**. Without it hrdr
+    /// sends a prompt that is *eligible* for caching (the system prompt alone
+    /// clears the 1024-token floor caching requires) and still misses, paying
+    /// full uncached input price on every round of every turn.
+    ///
+    /// Why the value must be per-conversation — neither per-process nor
+    /// per-request. OpenAI's guidance is to use the key *consistently across
+    /// requests that share a long common prefix*, and to keep each key's traffic
+    /// to roughly **15 requests per minute**. One key per agent lands exactly on
+    /// that: every request in a conversation shares the same system prompt and a
+    /// growing history, so they share a prefix and belong on one key; a
+    /// process-wide constant would pool unrelated conversations (different
+    /// prefixes, and busy sessions blow past the rpm guidance), while a
+    /// per-request value shares a prefix with nothing and defeats the parameter
+    /// entirely.
+    ///
+    /// Applied to the OpenAI chat-completions body (in [`Client::body_json`]) and
+    /// the Responses body (in [`crate::codex::build_body`]). The native Anthropic
+    /// backend never sees it: the Messages API has no such field, and Anthropic
+    /// rejects unknown top-level parameters.
+    pub fn set_prompt_cache_key(&mut self, key: Option<String>) {
+        self.prompt_cache_key = key;
+    }
+
+    /// The `prompt_cache_key` currently in force — so a caller that reconfigures
+    /// the client for a new identity can assert the key survived the switch
+    /// (a dropped key is a silent, invisible cache miss, not an error).
+    pub fn prompt_cache_key(&self) -> Option<&str> {
+        self.prompt_cache_key.as_deref()
     }
 
     /// Set the reasoning-effort label; only recognized levels
@@ -807,6 +867,24 @@ impl Client {
         req
     }
 
+    /// The `max_tokens` to send on the native Anthropic backend when the user
+    /// configured none. The Messages API makes the field mandatory, so this is
+    /// the model's real output cap or nothing — a fixed default either truncates
+    /// long answers (and, on the manual-thinking path, starves the answer of the
+    /// room the budget scales out of) or 400s for exceeding the model's cap.
+    ///
+    /// Asked with `provider: None` on purpose: `Client` only knows a base URL
+    /// and a model id, never hrdr's provider name — and even that name would be
+    /// the wrong key, since models.dev's provider namespace is a different one
+    /// (hrdr's `zen` is models.dev's `opencode`). `None` selects the catalog's
+    /// cross-provider scan, which takes the *smallest* cap on offer; overstating
+    /// `max_tokens` past a model's real cap is a 400, so low is the safe miss.
+    /// Cache-only: this runs while building a request inside a live turn, where
+    /// an out-of-band fetch would interleave with the stream about to open.
+    fn anthropic_max_tokens(&self) -> u32 {
+        crate::catalog::max_output_cached(None, &self.model).unwrap_or(ANTHROPIC_MAX_TOKENS)
+    }
+
     /// Serialize a request and apply cache breakpoints per the active [`CacheMode`].
     fn body_json(&self, body: &ChatRequest) -> serde_json::Value {
         let mut json = serde_json::to_value(body).unwrap_or_default();
@@ -816,6 +894,18 @@ impl Client {
                 self.cache_1h,
                 self.system_cache_split,
             );
+        }
+        // `prompt_cache_key` is grafted onto the serialized body rather than
+        // carried as a `ChatRequest` field, for the same reason the cache
+        // breakpoints above are: it is an OpenAI-shape-only parameter, and
+        // `ChatRequest` is the shared struct every backend serializes from.
+        // Skipped entirely when unset, so an OpenAI-compatible server that has
+        // never heard of the field sees no change. See
+        // [`Client::set_prompt_cache_key`] for why it is set at all.
+        if let Some(key) = &self.prompt_cache_key
+            && let Some(obj) = json.as_object_mut()
+        {
+            obj.insert("prompt_cache_key".to_string(), serde_json::json!(key));
         }
         json
     }
@@ -841,7 +931,9 @@ impl Client {
                 &self.base_url,
                 self.api_key.as_deref(),
                 &self.model,
-                self.params.max_tokens.unwrap_or(ANTHROPIC_MAX_TOKENS),
+                self.params
+                    .max_tokens
+                    .unwrap_or_else(|| self.anthropic_max_tokens()),
                 self.effort.as_deref(),
                 self.temperature,
                 self.params.top_p,
@@ -851,6 +943,11 @@ impl Client {
                 self.cache,
                 self.cache_1h,
                 &self.extra_headers,
+                // `self.prompt_cache_key` is intentionally not passed: it is an
+                // OpenAI parameter. The Messages API has no equivalent (its
+                // caching is explicit, via the `cache_control` breakpoints the
+                // `cache` argument above drives) and rejects unknown top-level
+                // fields, so sending it here would be a 400.
                 self.system_cache_split,
                 messages,
                 tools,
@@ -867,6 +964,10 @@ impl Client {
                 self.temperature,
                 self.params.top_p,
                 self.params.max_tokens,
+                // The Responses API takes the same `prompt_cache_key` as
+                // chat-completions, at the top level — see
+                // `Client::set_prompt_cache_key`.
+                self.prompt_cache_key.as_deref(),
                 // `ChatGPT-Account-Id` rides here (set via `set_headers`);
                 // `originator: hrdr` + `Authorization: Bearer` are added inside.
                 &self.extra_headers,
@@ -1067,15 +1168,28 @@ impl Client {
         self.context_from_props().await
     }
 
-    /// Look for a context-length field on this client's model in `/v1/models`
-    /// (falling back to the first entry if the id doesn't match).
+    /// Look for a context-length field on this client's model in `/v1/models`.
+    ///
+    /// The no-match fallback applies **only when the server lists exactly one
+    /// model** — the local-server case it was written for (llama.cpp / vLLM
+    /// serving a single model under a name the user's config may not spell the
+    /// same way). On a multi-model list it is actively harmful: OpenRouter's
+    /// `/v1/models` returns hundreds of entries whose first is an unrelated
+    /// 1M-context model, so any id typo, alias, or variant suffix would silently
+    /// adopt a 1M window — and because this probe outranks the models.dev
+    /// catalog, the agent would then never compact and overflow instead. Return
+    /// `None` there and let the catalog answer.
     async fn context_from_models(&self) -> Option<u32> {
         let v = self.get_json(&self.url("models")).await?;
         let data = v.get("data")?.as_array()?;
-        let entry = data
+        let entry = match data
             .iter()
             .find(|e| e.get("id").and_then(|i| i.as_str()) == Some(self.model.as_str()))
-            .or_else(|| data.first())?;
+        {
+            Some(e) => e,
+            None if data.len() == 1 => data.first()?,
+            None => return None,
+        };
         context_field(entry)
     }
 
@@ -1114,18 +1228,31 @@ struct ModelEntry {
 /// Pull a context-window value from a JSON object, trying the field names the
 /// various OpenAI-compatible servers use. Accepts a number or a numeric string;
 /// ignores non-positive values.
+///
+/// Note what is *not* here: Anthropic's `/v1/models` publishes both
+/// `max_input_tokens` (the window, listed below) and `max_tokens` (the largest
+/// value the `max_tokens` request param may take). Reading the latter as a
+/// window would understate it by an order of magnitude, so only the former is
+/// a key.
 fn context_field(v: &serde_json::Value) -> Option<u32> {
     const KEYS: &[&str] = &[
         "max_model_len",      // vLLM
         "max_context_length", // LM Studio et al.
-        "context_length",     // Ollama-style model_info
+        "context_length",     // Ollama-style model_info; OpenRouter
+        "max_input_tokens",   // Anthropic's own /v1/models
         "context_window",     // generic
         "n_ctx",              // llama.cpp
         "context_size",
         "max_context",
     ];
-    KEYS.iter()
-        .find_map(|k| v.get(k).and_then(json_u32).filter(|n| *n > 0))
+    let find = |obj: &serde_json::Value| {
+        KEYS.iter()
+            .find_map(|k| obj.get(k).and_then(json_u32).filter(|n| *n > 0))
+    };
+    // OpenRouter nests a second copy of the window under `top_provider`
+    // (`top_provider.context_length`), which is the one that survives when the
+    // top-level field is absent for a given entry.
+    find(v).or_else(|| v.get("top_provider").and_then(find))
 }
 
 /// Read a `u32` from a JSON number or numeric string.
@@ -1170,6 +1297,98 @@ mod tests {
         assert_eq!(client.effort(), None);
         let none = client.request(&[], &[], false);
         assert!(none.reasoning_effort.is_none());
+    }
+
+    /// The chat-completions body grows a top-level `prompt_cache_key` when one
+    /// is set, and carries no such field when it is not — an OpenAI-compatible
+    /// server that has never heard of the parameter must see an unchanged body.
+    #[test]
+    fn prompt_cache_key_appears_on_the_chat_completions_body_only_when_set() {
+        let mut client = Client::new("https://api.openai.com/v1", None, "gpt-5.6");
+        assert_eq!(client.prompt_cache_key(), None);
+
+        let unset = client.body_json(&client.request(&[], &[], true));
+        assert!(
+            unset.get("prompt_cache_key").is_none(),
+            "an unset key must not put an empty/null field on the wire: {unset}"
+        );
+
+        client.set_prompt_cache_key(Some("hrdr-agent-0f1e2d3c".to_string()));
+        assert_eq!(client.prompt_cache_key(), Some("hrdr-agent-0f1e2d3c"));
+        let set = client.body_json(&client.request(&[], &[], true));
+        assert_eq!(set["prompt_cache_key"], "hrdr-agent-0f1e2d3c");
+        // Additive only — the request the struct serialized is otherwise intact.
+        assert_eq!(set["model"], "gpt-5.6");
+        assert_eq!(set["stream"], true);
+
+        // Clearing it removes the field again (a provider switch that drops the
+        // key must be visible as an absent field, not a stale one).
+        client.set_prompt_cache_key(None);
+        let cleared = client.body_json(&client.request(&[], &[], true));
+        assert!(cleared.get("prompt_cache_key").is_none());
+    }
+
+    /// Two consecutive requests from one client send the *same* key. That is the
+    /// whole point: OpenAI combines the key with the prompt-prefix hash, so a
+    /// value that changed per request would share a prefix with nothing. (It is
+    /// also why the key is per-conversation rather than per-process — OpenAI's
+    /// guidance caps a single key at roughly 15 requests per minute.)
+    #[test]
+    fn prompt_cache_key_is_stable_across_consecutive_requests() {
+        let mut client = Client::new("https://api.openai.com/v1", None, "gpt-5.6");
+        client.set_prompt_cache_key(Some("hrdr-agent-0f1e2d3c".to_string()));
+
+        let first = client.body_json(&client.request(&[ChatMessage::user("one")], &[], true));
+        let second = client.body_json(&client.request(
+            &[ChatMessage::user("one"), ChatMessage::user("two")],
+            &[],
+            true,
+        ));
+        assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+        assert_eq!(first["prompt_cache_key"], "hrdr-agent-0f1e2d3c");
+    }
+
+    /// The native Anthropic backend must never carry `prompt_cache_key`: the
+    /// Messages API has no such parameter (its caching is the explicit
+    /// `cache_control` breakpoints) and rejects unknown top-level fields, so
+    /// sending it would turn every request into a 400.
+    ///
+    /// The guarantee is structural — `crate::anthropic::chat_stream` has no
+    /// `prompt_cache_key` parameter for `Client::chat_stream` to pass, so the
+    /// key cannot reach the Anthropic body. This drives the body builder that
+    /// dispatch calls, as the tripwire for anyone who later adds one.
+    #[test]
+    fn anthropic_body_never_carries_prompt_cache_key() {
+        let client = Client::new("https://api.anthropic.com/v1", None, "claude-opus-4-8");
+        assert_eq!(
+            detect_backend(client.base_url()),
+            Backend::Anthropic,
+            "this test is meaningless unless the endpoint really is the native backend"
+        );
+        let body = crate::anthropic::build_body(
+            "claude-opus-4-8",
+            8192,
+            Some("high"),
+            None,
+            None,
+            &[],
+            CacheMode::Ephemeral,
+            false,
+            None,
+            &[ChatMessage::system("you are hrdr"), ChatMessage::user("hi")],
+            &[],
+        );
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "the Messages API would 400 on an unknown top-level field: {body}"
+        );
+
+        // And the OpenAI shape, from a client configured the same way, does
+        // carry it — so the absence above is backend-specific, not a no-op.
+        let mut openai = Client::new("https://api.openai.com/v1", None, "gpt-5.6");
+        openai.set_prompt_cache_key(Some("hrdr-agent-0f1e2d3c".to_string()));
+        let openai_body = openai.body_json(&openai.request(&[], &[], true));
+        assert_eq!(openai_body["prompt_cache_key"], "hrdr-agent-0f1e2d3c");
     }
 
     #[test]
@@ -1471,6 +1690,73 @@ mod tests {
         assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
     }
 
+    /// Serve one canned JSON body (with `Connection: close`, so the client reads
+    /// to EOF) — enough to drive the `/v1/models` context probe.
+    async fn serve_json_once(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut tmp = [0u8; 4096];
+            let _ = stream.read(&mut tmp).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+        });
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    /// A multi-entry `/v1/models` with no id match must yield `None`, not the
+    /// first entry's window. Verified live: OpenRouter returns 364 entries whose
+    /// first is an unrelated 1M-context model, so the old `data.first()` fallback
+    /// gave any typo or alias a 1M window — and since this probe outranks the
+    /// models.dev catalog, the agent would never compact.
+    #[tokio::test]
+    async fn multi_entry_models_list_without_a_match_yields_none() {
+        let body = r#"{"data":[
+            {"id":"qwen/qwen3.7-flash","context_length":1000000},
+            {"id":"anthropic/claude-opus-5","context_length":1000000}
+        ]}"#;
+        let base_url = serve_json_once(body).await;
+        let client = Client::new(base_url, None, "anthropic/claude-opus-5-typo");
+        assert_eq!(client.context_from_models().await, None);
+    }
+
+    /// The same list *with* a match still answers from the matching entry.
+    #[tokio::test]
+    async fn multi_entry_models_list_reads_the_matching_entry() {
+        let body = r#"{"data":[
+            {"id":"qwen/qwen3.7-flash","context_length":1000000},
+            {"id":"anthropic/claude-haiku-4-5","context_length":200000}
+        ]}"#;
+        let base_url = serve_json_once(body).await;
+        let client = Client::new(base_url, None, "anthropic/claude-haiku-4-5");
+        assert_eq!(client.context_from_models().await, Some(200_000));
+    }
+
+    /// The single-entry fallback the rule was written for still works: a local
+    /// server (llama.cpp / vLLM) advertising one model under a name the config
+    /// may not spell the same way.
+    #[tokio::test]
+    async fn single_entry_models_list_still_falls_back() {
+        let body = r#"{"data":[{"id":"/models/qwen3-30b.gguf","max_model_len":32768}]}"#;
+        let base_url = serve_json_once(body).await;
+        let client = Client::new(base_url, None, "qwen3-30b");
+        assert_eq!(client.context_from_models().await, Some(32_768));
+    }
+
     #[test]
     fn url_appends_azure_api_version_when_set() {
         let mut c = Client::new(
@@ -1511,6 +1797,42 @@ mod tests {
         assert_eq!(context_field(&json!({"id": "m", "object": "model"})), None);
         // non-positive is ignored
         assert_eq!(context_field(&json!({"n_ctx": 0})), None);
+    }
+
+    /// Anthropic's own `/v1/models` publishes the window as `max_input_tokens`,
+    /// alongside a `max_tokens` that is the *output* cap — reading that as the
+    /// window would understate it ~8×, so only the former counts.
+    #[test]
+    fn reads_anthropic_max_input_tokens_not_max_tokens() {
+        let entry = json!({
+            "id": "claude-opus-5",
+            "max_input_tokens": 1_000_000,
+            "max_tokens": 128_000,
+            "capabilities": { "image_input": { "supported": true } },
+        });
+        assert_eq!(context_field(&entry), Some(1_000_000));
+        assert_eq!(context_field(&json!({"max_tokens": 128_000})), None);
+    }
+
+    /// OpenRouter nests a second copy of the window under `top_provider`; it is
+    /// the fallback when the top-level keys miss.
+    #[test]
+    fn reads_openrouter_top_provider_context_length() {
+        assert_eq!(
+            context_field(&json!({
+                "id": "anthropic/claude-opus-5",
+                "top_provider": { "context_length": 1_000_000, "max_completion_tokens": 128_000 },
+            })),
+            Some(1_000_000)
+        );
+        // A top-level value still wins over the nested copy.
+        assert_eq!(
+            context_field(&json!({
+                "context_length": 200_000,
+                "top_provider": { "context_length": 1_000_000 },
+            })),
+            Some(200_000)
+        );
     }
 
     #[test]

@@ -12,10 +12,10 @@
 //! **silently drops** `cache_control` and doesn't expose thinking, so prompt
 //! caching and extended thinking are only reachable here. Covers: system +
 //! messages + tools + streaming, prompt caching (`cache_control` on system, the
-//! last tool, and the last message), and **extended thinking** (a reasoning
-//! `effort` level turns on a `thinking` budget that scales with `max_tokens`;
-//! interleaved-thinking is enabled alongside tools; `thinking_delta`s stream to
-//! hrdr's reasoning channel).
+//! last tool, and the last message), and **thinking** (a reasoning `effort`
+//! level selects one of the two thinking dialects Anthropic speaks — see
+//! [`thinking_config`] — and `thinking_delta`s stream to hrdr's reasoning
+//! channel).
 //!
 //! [`Accumulator`]: crate::Accumulator
 
@@ -26,8 +26,8 @@ use serde_json::{Value, json};
 use crate::sse::SseDecoder;
 
 use crate::types::{
-    CacheMode, ChatChunk, ChatMessage, ChunkChoice, Delta, Role, ToolDef, Usage, reasoning_chunk,
-    text_chunk, tool_call_chunk,
+    CacheMode, ChatChunk, ChatMessage, ChunkChoice, Delta, Role, TokenDetails, ToolDef, Usage,
+    reasoning_chunk, text_chunk, tool_call_chunk,
 };
 
 /// Anthropic API version pinned in the `anthropic-version` header.
@@ -67,15 +67,31 @@ pub(crate) fn build_body(
         "stream": true,
     });
 
-    // Extended thinking: an effort level turns on a thinking budget (which fits
-    // inside `max_tokens`). Anthropic requires the temperature to default to 1
-    // and forbids `top_p` while thinking, so both are only sent when thinking
-    // is off.
-    match thinking_budget(effort, max_tokens) {
-        Some(budget) => {
-            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+    // Thinking. `display: "summarized"` is explicit on the *adaptive* dialect
+    // only: there it defaults to `"omitted"`, so thinking blocks come back
+    // signed but with an empty `thinking` field and hrdr's reasoning pane stays
+    // blank for the whole turn. On the manual dialect — Opus/Sonnet 4.6 and
+    // earlier — `"summarized"` is already the default, so sending it buys
+    // nothing on models old enough that the field may predate them.
+    //
+    // Sampling params ride only on the no-thinking path, and only on models that
+    // still accept them at all (see `sampling_locked`): Anthropic forbids
+    // `temperature`/`top_k` alongside manual thinking, and the current
+    // generation rejects them outright.
+    match thinking_config(model, effort, max_tokens) {
+        ThinkingShape::Adaptive { effort } => {
+            body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
+            if let Some(e) = effort {
+                body["output_config"] = json!({ "effort": e.as_str() });
+            }
         }
-        None => {
+        ThinkingShape::Manual { budget, effort } => {
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+            if let Some(e) = effort {
+                body["output_config"] = json!({ "effort": e.as_str() });
+            }
+        }
+        ThinkingShape::Off if !sampling_locked(model) => {
             if let Some(t) = temperature {
                 body["temperature"] = json!(t);
             }
@@ -83,6 +99,7 @@ pub(crate) fn build_body(
                 body["top_p"] = json!(p);
             }
         }
+        ThinkingShape::Off => {}
     }
 
     if !stop.is_empty() {
@@ -134,26 +151,269 @@ pub(crate) fn build_body(
     body
 }
 
-/// Extended-thinking budget (tokens) for a reasoning `effort` level, or `None`
-/// to leave thinking off (no effort set, an unrecognized label, or a
-/// `max_tokens` window too small to fit a budget plus room for the answer).
+/// Upper bound on a manual thinking budget. The docs warn that budgets above
+/// 32k should move to batch processing because the request otherwise runs long
+/// enough to hit timeouts — and with `max_tokens` now sized from the model's
+/// real output cap (64k–128k), the old `0.75 × max_tokens` alone would ask for
+/// a ~96k-token budget on a single streamed turn.
+const MAX_THINKING_BUDGET: u32 = 32_768;
+
+/// One of Anthropic's `output_config.effort` levels. Ordered so a model's
+/// ceiling can be applied with a comparison; note `Xhigh` is *not* simply below
+/// `Max` in support terms — Opus/Sonnet 4.6 took `max` a release before `xhigh`
+/// existed, which is why [`EffortSupport`] is an enum rather than a bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Xhigh => "xhigh",
+            Effort::Max => "max",
+        }
+    }
+}
+
+/// Which `output_config.effort` values a model accepts. Sending one it doesn't
+/// know is a 400, so an unsupported level is clamped down rather than dropped —
+/// the user asked for *more* thinking, and the nearest supported level honours
+/// that better than silently reverting to the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffortSupport {
+    /// No `output_config.effort` at all (Sonnet/Haiku 4.5, Opus 4.1, Claude 3).
+    None,
+    /// `low`/`medium`/`high` only — Opus 4.5, which takes effort *and*
+    /// `budget_tokens` but predates the two top levels.
+    UpToHigh,
+    /// Everything except `xhigh`, which arrived after these shipped
+    /// (Opus 4.6, Sonnet 4.6).
+    NoXhigh,
+    /// The full ladder (Opus 4.7 and later, Sonnet 5, Fable 5, Mythos 5, …).
+    All,
+}
+
+impl EffortSupport {
+    /// `want` clamped to what this model accepts, or `None` when it has no
+    /// effort knob at all.
+    fn clamp(self, want: Effort) -> Option<Effort> {
+        match self {
+            EffortSupport::None => None,
+            EffortSupport::UpToHigh => Some(want.min(Effort::High)),
+            // `max` survives; only `xhigh` has no landing spot here.
+            EffortSupport::NoXhigh if want == Effort::Xhigh => Some(Effort::High),
+            EffortSupport::NoXhigh | EffortSupport::All => Some(want),
+        }
+    }
+}
+
+/// The thinking configuration a (model, effort, max_tokens) triple calls for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThinkingShape {
+    /// `thinking:{type:"adaptive",display:"summarized"}` plus a separate
+    /// top-level `output_config:{effort}` when the level maps to something.
+    Adaptive { effort: Option<Effort> },
+    /// The pre-4.6 dialect: `thinking:{type:"enabled",budget_tokens}`.
+    Manual { budget: u32, effort: Option<Effort> },
+    /// No thinking config on the request at all.
+    Off,
+}
+
+/// Decide how to ask `model` to think.
+///
+/// Anthropic has two mutually incompatible thinking dialects and the split is by
+/// model generation, not by preference:
+///
+/// * **adaptive** — `thinking:{type:"adaptive"}` with depth steered by a
+///   separate top-level `output_config:{effort}`. The only dialect Opus 4.7 and
+///   later accept; `type:"enabled"` is a **400** there. On Opus 4.6/4.7/4.8 and
+///   Sonnet 4.6 thinking is off until this is sent, so hrdr sends the adaptive
+///   object even when no effort level is configured.
+/// * **manual** — `thinking:{type:"enabled",budget_tokens}`, the only dialect
+///   Sonnet/Opus/Haiku 4.5, Opus 4.1 and the Claude 3 family understand. Opus
+///   4.5 alone takes an `output_config.effort` alongside the budget.
+///
+/// Unknown ids — including provider-prefixed (`anthropic/claude-opus-5`) and
+/// not-yet-released ones — default to **adaptive**: the manual-only set is a
+/// closed, shrinking list of shipped models, while every new model rejects
+/// `enabled`, so guessing adaptive is the forward-compatible guess.
+///
+/// `effort` is hrdr's own ladder; `none`/an unrecognized label means "no
+/// thinking" and yields [`ThinkingShape::Off`] on every model, which is also
+/// what a manual-only model gets when no effort is configured (there is no
+/// budget to compute).
+pub(crate) fn thinking_config(model: &str, effort: Option<&str>, max_tokens: u32) -> ThinkingShape {
+    let ModelCaps {
+        adaptive, support, ..
+    } = classify(model);
+    // `None` = the caller configured no effort at all (adaptive stays on, at the
+    // model's default depth); `Some(None)` = an explicit "none"/unknown label,
+    // which turns thinking off entirely.
+    let want: Option<Option<Effort>> = effort.map(map_effort);
+    match (adaptive, want) {
+        (_, Some(None)) => ThinkingShape::Off,
+        (true, None) => ThinkingShape::Adaptive { effort: None },
+        (true, Some(Some(want))) => ThinkingShape::Adaptive {
+            effort: support.clamp(want),
+        },
+        (false, None) => ThinkingShape::Off,
+        (false, Some(Some(want))) => match thinking_budget(want, max_tokens) {
+            Some(budget) => ThinkingShape::Manual {
+                budget,
+                effort: support.clamp(want),
+            },
+            // A `max_tokens` window too small to fit a budget plus room for the
+            // answer: thinking off rather than a rejected request.
+            None => ThinkingShape::Off,
+        },
+    }
+}
+
+/// hrdr's effort ladder → Anthropic's. `minimal` has no Anthropic equivalent and
+/// folds into `low`; `high` is Anthropic's own default. `none` (and any label
+/// [`crate::normalize_effort`] doesn't know) means no thinking at all.
+fn map_effort(label: &str) -> Option<Effort> {
+    match crate::normalize_effort(label)?.as_str() {
+        "minimal" | "low" => Some(Effort::Low),
+        "medium" => Some(Effort::Medium),
+        "high" => Some(Effort::High),
+        "xhigh" => Some(Effort::Xhigh),
+        "max" => Some(Effort::Max),
+        // "none" — and nothing else reaches here.
+        _ => None,
+    }
+}
+
+/// What one model id supports, as far as this module cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelCaps {
+    /// Speaks the adaptive thinking dialect rather than `budget_tokens`.
+    adaptive: bool,
+    /// Which `output_config.effort` levels it accepts.
+    support: EffortSupport,
+    /// Rejects any non-default `temperature`/`top_p`/`top_k` outright — see
+    /// [`sampling_locked`].
+    sampling_locked: bool,
+}
+
+/// Whether `model` refuses non-default sampling parameters **unconditionally**.
+///
+/// Two different rules are in play. On Fable 5, Mythos 5/Preview, Opus 5, Opus
+/// 4.8, Opus 4.7 and Sonnet 5 a non-default `temperature`, `top_p` or `top_k` is
+/// a **400 on every request**, thinking or not — so those parameters can never
+/// go out, and hrdr drops them rather than failing the turn. On everything older
+/// (Opus 4.6 and Sonnet 4.6 included) the restriction is only "while thinking is
+/// on", which [`build_body`]'s existing rule — sampling params only when no
+/// thinking config is sent — already covers.
+///
+/// Unknown and future ids count as **locked**, for the same reason unknown ids
+/// default to adaptive: the locked set only grows, and a silently dropped
+/// sampling parameter is a quality nudge while a 400 is a dead turn.
+fn sampling_locked(model: &str) -> bool {
+    classify(model).sampling_locked
+}
+
+/// Classify a model id.
+///
+/// Matching is on the id's own shape — `claude-<family>-<major>[-<minor>]` —
+/// after stripping any `provider/` prefix and lowercasing, so both
+/// `claude-opus-4-5` and `anthropic/claude-opus-4-5-20251101` land in the same
+/// bucket. A trailing date (`claude-opus-4-20250514`) is not a minor version:
+/// numeric segments of three digits or more are treated as snapshot dates, which
+/// is what keeps Claude 4.0 out of the "4.6 or later" branch.
+fn classify(model: &str) -> ModelCaps {
+    let id = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+
+    // Claude 3 is versioned `claude-3[-<minor>]-<family>`, the other way round,
+    // and is uniformly manual-only with no effort knob and no sampling lock.
+    if id.starts_with("claude-3") {
+        return ModelCaps {
+            adaptive: false,
+            support: EffortSupport::None,
+            sampling_locked: false,
+        };
+    }
+
+    let Some((major, minor)) = model_version(&id) else {
+        // Not a shape we recognize (an alias, a gateway's renaming, a model that
+        // does not exist yet — `claude-mythos-preview` lands here too): assume
+        // the current generation's rules on both axes.
+        return ModelCaps {
+            adaptive: true,
+            support: EffortSupport::All,
+            sampling_locked: true,
+        };
+    };
+
+    let (adaptive, support) = match (major, minor) {
+        // Claude 4.6: adaptive, and the first with `output_config.effort` up to
+        // `max` — but `xhigh` only landed with 4.7.
+        (4, 6) => (true, EffortSupport::NoXhigh),
+        // Opus 4.5 takes effort (low/medium/high) but only manual thinking.
+        (4, 5) if id.contains("opus") => (false, EffortSupport::UpToHigh),
+        // The rest of Claude 4 below 4.6 — Sonnet/Haiku 4.5, 4.1, 4.0, and any
+        // other 4.x snapshot — is manual-only with no effort control.
+        (4, m) if m < 6 => (false, EffortSupport::None),
+        // 4.7+ and everything from Claude 5 on.
+        _ => (true, EffortSupport::All),
+    };
+    ModelCaps {
+        adaptive,
+        support,
+        // The sampling lock arrived one release *after* adaptive thinking did:
+        // 4.6 still takes sampling params when thinking is off, 4.7 and later
+        // never do.
+        sampling_locked: major > 4 || (major == 4 && minor >= 7),
+    }
+}
+
+/// `(major, minor)` from a `claude-<family>-<major>[-<minor>]` id, with an
+/// absent minor reading as `0` (`claude-opus-5` is 5.0). `None` when the id
+/// doesn't carry a recognizable family + version pair.
+fn model_version(id: &str) -> Option<(u32, u32)> {
+    let parts: Vec<&str> = id.split('-').collect();
+    let family = parts
+        .iter()
+        .position(|p| matches!(*p, "opus" | "sonnet" | "haiku" | "fable" | "mythos"))?;
+    // A version segment is one or two digits; three or more is a snapshot date
+    // (`20250514`), which must not be mistaken for a minor version.
+    let version = |i: usize| -> Option<u32> {
+        let s = *parts.get(i)?;
+        (s.len() <= 2).then(|| s.parse().ok()).flatten()
+    };
+    Some((version(family + 1)?, version(family + 2).unwrap_or(0)))
+}
+
+/// Manual-mode thinking budget (tokens) for an effort level, or `None` when the
+/// `max_tokens` window is too small to fit a budget plus room for the answer.
 /// The budget scales with `max_tokens` so raising the output cap gives Claude
-/// more room to think; Anthropic requires `budget ≥ 1024` and `budget <
-/// max_tokens`.
-pub(crate) fn thinking_budget(effort: Option<&str>, max_tokens: u32) -> Option<u32> {
-    let level = effort.and_then(crate::normalize_effort)?;
-    let frac = match level.as_str() {
-        "minimal" => 0.25,
-        "low" => 0.40,
-        "medium" => 0.60,
-        "high" => 0.75,
-        "xhigh" => 0.85,
-        "max" => 0.95,
-        // "none" (and anything unmapped) leaves extended thinking off.
-        _ => return None,
+/// more room to think, bounded by [`MAX_THINKING_BUDGET`]; Anthropic requires
+/// `budget ≥ 1024` and `budget < max_tokens`.
+fn thinking_budget(effort: Effort, max_tokens: u32) -> Option<u32> {
+    let frac = match effort {
+        Effort::Low => 0.40,
+        Effort::Medium => 0.60,
+        Effort::High => 0.75,
+        Effort::Xhigh => 0.85,
+        Effort::Max => 0.95,
     };
     // Reserve at least 1024 tokens below `max_tokens` for the actual answer.
-    let ceiling = max_tokens.checked_sub(1024).filter(|c| *c >= 1024)?;
+    let ceiling = max_tokens
+        .checked_sub(1024)
+        .filter(|c| *c >= 1024)?
+        .min(MAX_THINKING_BUDGET);
     Some(((max_tokens as f64 * frac) as u32).clamp(1024, ceiling))
 }
 
@@ -342,15 +602,7 @@ pub(crate) async fn chat_stream(
     // Auth-type names are filtered out here, so `x-api-key` above stays the only
     // credential on the request (see `crate::client::apply_extra_headers`).
     req = crate::client::apply_extra_headers(req, extra_headers);
-    // Betas: interleaved thinking (reason between tool calls) when thinking is on
-    // with tools; extended 1-hour cache TTL when requested.
-    let mut betas: Vec<&str> = Vec::new();
-    if body.get("thinking").is_some() && !tools.is_empty() {
-        betas.push("interleaved-thinking-2025-05-14");
-    }
-    if ttl_1h && cache == CacheMode::Ephemeral {
-        betas.push("extended-cache-ttl-2025-04-11");
-    }
+    let betas = beta_headers(&body, !tools.is_empty(), cache, ttl_1h);
     if !betas.is_empty() {
         req = req.header("anthropic-beta", betas.join(","));
     }
@@ -475,6 +727,7 @@ pub(crate) async fn chat_stream(
                 choices: vec![],
                 usage: None,
                 anthropic_thinking_blocks: thinking_blocks,
+                responses_reasoning_items: vec![],
             };
         }
         // If message_stop never arrived, the stream was cut mid-response.
@@ -491,6 +744,34 @@ pub(crate) async fn chat_stream(
         }
     };
     Ok(Box::pin(stream))
+}
+
+/// `anthropic-beta` values for a request, given the body [`build_body`] produced.
+///
+/// * interleaved thinking — reasoning *between* tool calls — is a beta only on
+///   the **manual** dialect. Adaptive thinking interleaves on its own and the
+///   header is unneeded (and ignored) there, so it rides only on `enabled`.
+/// * the 1-hour cache TTL no longer requires its beta, but the header remains
+///   harmless; it is kept so this fix doesn't quietly change caching too.
+fn beta_headers(
+    body: &Value,
+    has_tools: bool,
+    cache: CacheMode,
+    ttl_1h: bool,
+) -> Vec<&'static str> {
+    let mut betas = Vec::new();
+    let manual = body
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(Value::as_str)
+        == Some("enabled");
+    if manual && has_tools {
+        betas.push("interleaved-thinking-2025-05-14");
+    }
+    if ttl_1h && cache == CacheMode::Ephemeral {
+        betas.push("extended-cache-ttl-2025-04-11");
+    }
+    betas
 }
 
 /// Translate one Anthropic stream event into a [`ChatChunk`] (or `None` for
@@ -598,12 +879,22 @@ fn map_event(
             Ok(None)
         }
         "message_delta" => {
-            let out = ev
-                .get("usage")
+            let usage = ev.get("usage");
+            let out = usage
                 .and_then(|u| u.get("output_tokens"))
                 .and_then(Value::as_u64)
                 .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
                 .unwrap_or(0);
+            // Anthropic reports thinking spend only here, on the final
+            // `message_delta`, nested a level deeper than the totals. It is part
+            // of `output_tokens`, so it maps onto the OpenAI-shaped
+            // `completion_tokens_details.reasoning_tokens` the UI already reads
+            // for the OpenAI/Codex backends.
+            let reasoning = usage
+                .and_then(|u| u.get("output_tokens_details"))
+                .and_then(|d| d.get("thinking_tokens"))
+                .and_then(Value::as_u64)
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
             let finish = ev
                 .get("delta")
                 .and_then(|d| d.get("stop_reason"))
@@ -620,11 +911,16 @@ fn map_event(
                         }]
                     })
                     .unwrap_or_default(),
-                usage: (out > 0).then_some(Usage {
+                usage: (out > 0 || reasoning.is_some()).then(|| Usage {
                     completion_tokens: out,
+                    completion_tokens_details: TokenDetails {
+                        reasoning_tokens: reasoning,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 }),
                 anthropic_thinking_blocks: vec![],
+                responses_reasoning_items: vec![],
             };
             Ok((chunk.usage.is_some() || !chunk.choices.is_empty()).then_some(chunk))
         }
@@ -684,13 +980,22 @@ fn usage_field(usage: Option<&Value>, key: &str) -> u64 {
 }
 
 /// A prompt-usage chunk from Anthropic's `message_start`: total prompt tokens
-/// (`input` + both cache counters) with the cache-read portion surfaced as
-/// `cached_tokens`.
+/// (`input` + both cache counters), with **both** cache portions surfaced —
+/// reads as `cached_tokens`, writes as `cache_creation_input_tokens`.
+///
+/// `prompt_tokens` stays the inclusive total it has always been; the two cache
+/// counters are a breakdown of it, not an addition to it. Both are needed
+/// because the three parts are priced differently: a read is ~0.1x the input
+/// rate, a write is a *premium* over it (1.25x at the 5-minute TTL, 2x at the
+/// 1-hour one). Dropping the write counter — as this did before — priced every
+/// cache write as plain input, and hrdr writes the cache on nearly every turn.
+/// See [`crate::catalog::ModelCost::call_cost`].
 fn message_start_usage(usage: Option<&Value>) -> ChatChunk {
     let cache_read = usage_field(usage, "cache_read_input_tokens");
+    let cache_write = usage_field(usage, "cache_creation_input_tokens");
     let prompt = usage_field(usage, "input_tokens")
         .saturating_add(cache_read)
-        .saturating_add(usage_field(usage, "cache_creation_input_tokens"));
+        .saturating_add(cache_write);
     let mut u = Usage {
         prompt_tokens: u32::try_from(prompt).unwrap_or(u32::MAX),
         ..Default::default()
@@ -698,10 +1003,17 @@ fn message_start_usage(usage: Option<&Value>) -> ChatChunk {
     if cache_read > 0 {
         u.prompt_tokens_details.cached_tokens = Some(u32::try_from(cache_read).unwrap_or(u32::MAX));
     }
+    // Left `None` at zero, matching `cached_tokens` above: "the provider said
+    // nothing" and "the provider said zero" must stay distinguishable, and a
+    // request that wrote nothing has nothing to price.
+    if cache_write > 0 {
+        u.cache_creation_input_tokens = Some(u32::try_from(cache_write).unwrap_or(u32::MAX));
+    }
     ChatChunk {
         choices: vec![],
         usage: Some(u),
         anthropic_thinking_blocks: vec![],
+        responses_reasoning_items: vec![],
     }
 }
 
@@ -751,6 +1063,7 @@ mod tests {
             content: Some("let me check".into()),
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
             origin: MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_1".into(),
@@ -800,6 +1113,7 @@ mod tests {
             content: None,
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
             origin: MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_1".into(),
@@ -988,11 +1302,15 @@ mod tests {
         );
     }
 
+    /// The adaptive body shape: the thinking object is sent even with no effort
+    /// configured (thinking is off by default on Opus 4.6–4.8 / Sonnet 4.6, and
+    /// this is what turns it on), `output_config` appears only when an effort
+    /// level maps to something, and `budget_tokens` never appears — it is a 400
+    /// on every model that speaks this dialect.
     #[test]
-    fn effort_enables_thinking_and_suppresses_temperature() {
-        // No effort → no thinking; temperature passes through.
+    fn adaptive_models_send_adaptive_thinking_and_output_config() {
         let plain = build_body(
-            "claude",
+            "claude-opus-5",
             8192,
             None,
             Some(0.3),
@@ -1004,13 +1322,43 @@ mod tests {
             &[user("hi")],
             &[],
         );
-        assert!(plain.get("thinking").is_none());
-        let t = plain["temperature"].as_f64().unwrap();
-        assert!((t - 0.3).abs() < 1e-6, "temperature {t}");
+        assert_eq!(plain["thinking"]["type"], "adaptive");
+        assert_eq!(plain["thinking"]["display"], "summarized");
+        assert!(plain["thinking"].get("budget_tokens").is_none());
+        assert!(
+            plain.get("output_config").is_none(),
+            "no effort configured → no output_config"
+        );
+        // A thinking config is being sent, so sampling params are withheld.
+        assert!(plain.get("temperature").is_none());
 
-        // An effort level → thinking budget within max_tokens, temperature omitted.
         let think = build_body(
-            "claude",
+            "claude-opus-5",
+            8192,
+            Some("high"),
+            Some(0.3),
+            None,
+            &[],
+            CacheMode::Off,
+            false,
+            None,
+            &[user("hi")],
+            &[],
+        );
+        assert_eq!(think["thinking"]["type"], "adaptive");
+        assert_eq!(think["output_config"]["effort"], "high");
+        assert!(think["thinking"].get("budget_tokens").is_none());
+        assert!(think.get("temperature").is_none());
+    }
+
+    /// The manual body shape, still the only one Claude 4.5-and-earlier accept:
+    /// a budget that fits inside `max_tokens`, no `output_config` (Sonnet 4.5
+    /// has no effort knob), no `display` (`"summarized"` is already the default
+    /// on every model that speaks this dialect), and temperature withheld.
+    #[test]
+    fn manual_models_send_a_thinking_budget() {
+        let think = build_body(
+            "claude-sonnet-4-5",
             8192,
             Some("high"),
             Some(0.3),
@@ -1023,18 +1371,251 @@ mod tests {
             &[],
         );
         assert_eq!(think["thinking"]["type"], "enabled");
+        assert!(
+            think["thinking"].get("display").is_none(),
+            "manual thinking already defaults to summarized"
+        );
         let budget = think["thinking"]["budget_tokens"].as_u64().unwrap() as u32;
         assert!((1024..8192).contains(&budget), "budget {budget}");
+        assert!(think.get("output_config").is_none());
         assert!(think.get("temperature").is_none());
+
+        // Opus 4.5 is the one model that takes both dialect and effort.
+        let opus45 = build_body(
+            "claude-opus-4-5",
+            8192,
+            Some("medium"),
+            None,
+            None,
+            &[],
+            CacheMode::Off,
+            false,
+            None,
+            &[user("hi")],
+            &[],
+        );
+        assert_eq!(opus45["thinking"]["type"], "enabled");
+        assert_eq!(opus45["output_config"]["effort"], "medium");
+
+        // No effort at all on a manual-only model → no thinking config, and
+        // sampling params flow as before.
+        let off = build_body(
+            "claude-sonnet-4-5",
+            8192,
+            None,
+            Some(0.3),
+            None,
+            &[],
+            CacheMode::Off,
+            false,
+            None,
+            &[user("hi")],
+            &[],
+        );
+        assert!(off.get("thinking").is_none());
+        let t = off["temperature"].as_f64().unwrap();
+        assert!((t - 0.3).abs() < 1e-6, "temperature {t}");
+    }
+
+    /// An explicit "none" (or an unrecognized label) turns thinking off on every
+    /// model, including the ones that would otherwise think by default. Whether
+    /// sampling params then ride along is a separate, per-model question — see
+    /// `sampling_params_are_withheld_from_models_that_reject_them`.
+    #[test]
+    fn effort_none_sends_no_thinking_config_on_any_model() {
+        for model in ["claude-opus-5", "claude-sonnet-4-6", "claude-sonnet-4-5"] {
+            for effort in ["none", "off", "banana"] {
+                let body = build_body(
+                    model,
+                    8192,
+                    Some(effort),
+                    Some(0.3),
+                    Some(0.5),
+                    &[],
+                    CacheMode::Off,
+                    false,
+                    None,
+                    &[user("hi")],
+                    &[],
+                );
+                assert!(
+                    body.get("thinking").is_none(),
+                    "{model} / {effort} must send no thinking config"
+                );
+                assert!(body.get("output_config").is_none());
+            }
+        }
+    }
+
+    /// `temperature`/`top_p` are a **400 on every request** — thinking or not —
+    /// on Fable/Mythos 5, Opus 5, Opus 4.8/4.7 and Sonnet 5, so they are dropped
+    /// there rather than failing the turn. On Opus 4.6 / Sonnet 4.6 and earlier
+    /// the restriction is only "while thinking is on", which the thinking-config
+    /// check already covers, so they still ride on the no-thinking path.
+    #[test]
+    fn sampling_params_are_withheld_from_models_that_reject_them() {
+        // `effort: "none"` is the only way to reach the sampling path on a model
+        // that would otherwise think by default.
+        let body = |model: &str| {
+            build_body(
+                model,
+                8192,
+                Some("none"),
+                Some(0.3),
+                Some(0.5),
+                &[],
+                CacheMode::Off,
+                false,
+                None,
+                &[user("hi")],
+                &[],
+            )
+        };
+        for model in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+            "anthropic/claude-opus-5",
+            // Unknown / future ids are assumed locked: a dropped sampling param
+            // is a nudge, a 400 is a dead turn.
+            "claude-opus-9",
+            "some-gateway-alias",
+        ] {
+            let b = body(model);
+            assert!(
+                b.get("temperature").is_none(),
+                "{model} rejects temperature"
+            );
+            assert!(b.get("top_p").is_none(), "{model} rejects top_p");
+        }
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-sonnet-4-5",
+            "claude-opus-4-5",
+            "claude-haiku-4-5",
+            "claude-opus-4-1",
+            "claude-3-5-haiku-20241022",
+        ] {
+            let b = body(model);
+            let t = b["temperature"].as_f64().unwrap_or_default();
+            assert!((t - 0.3).abs() < 1e-6, "{model} takes temperature: {t}");
+            assert!(b.get("top_p").is_some(), "{model} takes top_p");
+        }
+        // Sonnet 4.6 with thinking on still withholds them — the lock is
+        // per-model, the thinking rule is per-request, and both apply.
+        let thinking = build_body(
+            "claude-sonnet-4-6",
+            8192,
+            None,
+            Some(0.3),
+            Some(0.5),
+            &[],
+            CacheMode::Off,
+            false,
+            None,
+            &[user("hi")],
+            &[],
+        );
+        assert!(thinking.get("temperature").is_none());
+        assert!(thinking.get("top_p").is_none());
+    }
+
+    /// Model classification. The manual-only set is a closed list of shipped
+    /// models; anything else — including ids that do not exist yet and
+    /// provider-prefixed forms — must default to adaptive, because the new
+    /// models are the ones that 400 on `type:"enabled"`.
+    #[test]
+    fn model_classification_defaults_to_adaptive() {
+        let adaptive = |m: &str| {
+            matches!(
+                thinking_config(m, Some("medium"), 8192),
+                ThinkingShape::Adaptive { .. }
+            )
+        };
+        for m in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            // Provider-prefixed and dated forms of the same models.
+            "anthropic/claude-opus-5",
+            "openrouter/anthropic/claude-opus-4-8",
+            "Claude-Opus-4-7-20260101",
+            // Unknown / future ids fall to the forward-compatible default.
+            "claude-opus-9",
+            "claude-quartz-5",
+            "some-gateway-alias",
+        ] {
+            assert!(adaptive(m), "{m} must be adaptive");
+        }
+        for m in [
+            "claude-3-opus-20240229",
+            "claude-3-5-haiku-20241022",
+            "claude-3-7-sonnet-latest",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-opus-4-5",
+            "claude-haiku-4-5",
+            "claude-opus-4-1",
+            "claude-opus-4-0",
+            "claude-sonnet-4-0",
+            "claude-sonnet-4-2",
+            // A dated Claude 4.0 snapshot: the trailing date must not read as a
+            // minor version and promote it to adaptive.
+            "claude-opus-4-20250514",
+            "anthropic/claude-sonnet-4-5",
+        ] {
+            assert!(!adaptive(m), "{m} must use manual thinking");
+        }
+    }
+
+    /// hrdr's effort ladder maps onto Anthropic's, and levels a model doesn't
+    /// know are clamped down instead of being sent (and 400'd).
+    #[test]
+    fn effort_maps_and_clamps_per_model() {
+        let level = |model: &str, effort: &str| match thinking_config(model, Some(effort), 200_000)
+        {
+            ThinkingShape::Adaptive { effort } | ThinkingShape::Manual { effort, .. } => {
+                effort.map(Effort::as_str)
+            }
+            ThinkingShape::Off => None,
+        };
+        // `minimal` has no Anthropic equivalent; the rest are one-to-one.
+        assert_eq!(level("claude-opus-5", "minimal"), Some("low"));
+        assert_eq!(level("claude-opus-5", "low"), Some("low"));
+        assert_eq!(level("claude-opus-5", "medium"), Some("medium"));
+        assert_eq!(level("claude-opus-5", "high"), Some("high"));
+        assert_eq!(level("claude-opus-5", "xhigh"), Some("xhigh"));
+        assert_eq!(level("claude-opus-5", "max"), Some("max"));
+        // Opus/Sonnet 4.6 took `max` before `xhigh` existed.
+        assert_eq!(level("claude-opus-4-6", "xhigh"), Some("high"));
+        assert_eq!(level("claude-opus-4-6", "max"), Some("max"));
+        assert_eq!(level("claude-sonnet-4-6", "xhigh"), Some("high"));
+        // Opus 4.5's effort knob stops at `high`.
+        assert_eq!(level("claude-opus-4-5", "xhigh"), Some("high"));
+        assert_eq!(level("claude-opus-4-5", "max"), Some("high"));
+        // Manual-only models with no effort knob send none at all.
+        assert_eq!(level("claude-sonnet-4-5", "max"), None);
+        assert_eq!(level("claude-haiku-4-5", "high"), None);
     }
 
     #[test]
     fn top_p_and_stop_sequences_map_onto_messages_api() {
-        // top_p is sent when thinking is off (temperature path).
+        // top_p is sent when no thinking config is (here: effort explicitly off)
+        // on a model that still accepts sampling params at all.
         let body = build_body(
-            "claude",
+            "claude-sonnet-4-6",
             8192,
-            None,
+            Some("none"),
             None,
             Some(0.5),
             &["STOP".to_string(), "END".to_string()],
@@ -1048,22 +1629,25 @@ mod tests {
         assert!((p - 0.5).abs() < 1e-6, "top_p {p}");
         assert_eq!(body["stop_sequences"], json!(["STOP", "END"]));
 
-        // top_p is withheld while extended thinking is enabled (Anthropic
-        // forbids setting it alongside `thinking`), same as temperature.
-        let thinking_body = build_body(
-            "claude",
-            8192,
-            Some("high"),
-            None,
-            Some(0.5),
-            &[],
-            CacheMode::Off,
-            false,
-            None,
-            &[user("hi")],
-            &[],
-        );
-        assert!(thinking_body.get("top_p").is_none());
+        // top_p is withheld whenever a thinking config is sent, on either
+        // dialect (Anthropic forbids it alongside manual thinking, and hrdr
+        // keeps the same conservative rule under adaptive).
+        for model in ["claude-opus-5", "claude-sonnet-4-5"] {
+            let thinking_body = build_body(
+                model,
+                8192,
+                Some("high"),
+                None,
+                Some(0.5),
+                &[],
+                CacheMode::Off,
+                false,
+                None,
+                &[user("hi")],
+                &[],
+            );
+            assert!(thinking_body.get("top_p").is_none(), "{model}");
+        }
 
         // No stop sequences configured → key omitted entirely.
         let no_stop = build_body(
@@ -1092,6 +1676,7 @@ mod tests {
             content: None,
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
             origin: MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_bad".into(),
@@ -1141,16 +1726,114 @@ mod tests {
 
     #[test]
     fn thinking_budget_scales_and_guards_small_windows() {
-        assert_eq!(thinking_budget(None, 8192), None); // no effort → off
-        assert_eq!(thinking_budget(Some("nonsense"), 8192), None); // unknown → off
         // Scales with max_tokens.
-        let small = thinking_budget(Some("high"), 8192).unwrap();
-        let big = thinking_budget(Some("high"), 32000).unwrap();
+        let small = thinking_budget(Effort::High, 8192).unwrap();
+        let big = thinking_budget(Effort::High, 32000).unwrap();
         assert!(big > small);
         // Budget always leaves ≥1024 for the answer and is ≥1024 itself.
         assert!((1024..=8192 - 1024).contains(&small));
         // A window too small to fit a budget + answer → thinking off.
-        assert_eq!(thinking_budget(Some("high"), 1500), None);
+        assert_eq!(thinking_budget(Effort::High, 1500), None);
+        assert_eq!(
+            thinking_config("claude-sonnet-4-5", Some("high"), 1500),
+            ThinkingShape::Off
+        );
+    }
+
+    /// With `max_tokens` now sized from the model's real output cap, the raw
+    /// fraction would ask for a ~120k-token budget on a single turn; the cap
+    /// keeps it inside what the docs consider a non-batch request, while the
+    /// `< max_tokens` and `≥ 1024` invariants still hold.
+    #[test]
+    fn manual_thinking_budget_is_capped() {
+        for &max_tokens in &[64_000, 128_000] {
+            for effort in [Effort::Low, Effort::High, Effort::Max] {
+                let b = thinking_budget(effort, max_tokens).unwrap();
+                assert!(b <= MAX_THINKING_BUDGET, "{effort:?}/{max_tokens}: {b}");
+                assert!(
+                    (1024..max_tokens).contains(&b),
+                    "{effort:?}/{max_tokens}: {b}"
+                );
+            }
+        }
+        // Below the cap the fraction still governs, so effort still matters.
+        assert!(thinking_budget(Effort::Low, 32_000).unwrap() < MAX_THINKING_BUDGET);
+    }
+
+    /// The interleaved-thinking beta rides on the manual dialect only.
+    #[test]
+    fn interleaved_thinking_beta_is_manual_only() {
+        let tools = vec![ToolDef::function("read", "d", json!({ "type": "object" }))];
+        let body = |model: &str| {
+            build_body(
+                model,
+                8192,
+                Some("high"),
+                None,
+                None,
+                &[],
+                CacheMode::Off,
+                false,
+                None,
+                &[user("hi")],
+                &tools,
+            )
+        };
+        assert_eq!(
+            beta_headers(&body("claude-sonnet-4-5"), true, CacheMode::Off, false),
+            vec!["interleaved-thinking-2025-05-14"],
+        );
+        assert!(
+            beta_headers(&body("claude-opus-5"), true, CacheMode::Off, false).is_empty(),
+            "adaptive models interleave without the beta"
+        );
+        // Without tools there is nothing to interleave between.
+        assert!(beta_headers(&body("claude-sonnet-4-5"), false, CacheMode::Off, false).is_empty());
+        // The 1h-TTL beta is independent of the thinking dialect.
+        assert_eq!(
+            beta_headers(&body("claude-opus-5"), true, CacheMode::Ephemeral, true),
+            vec!["extended-cache-ttl-2025-04-11"],
+        );
+    }
+
+    /// Anthropic reports thinking spend as `usage.output_tokens_details
+    /// .thinking_tokens` on the final `message_delta`; it must land on the same
+    /// `completion_tokens_details.reasoning_tokens` the OpenAI/Codex paths fill,
+    /// which is what the UI's reasoning readout reads.
+    #[test]
+    fn message_delta_reports_thinking_tokens_as_reasoning_tokens() {
+        let mut slot = std::collections::HashMap::new();
+        let mut next = 0usize;
+        let mut thinking: std::collections::HashMap<u64, (String, String)> =
+            std::collections::HashMap::new();
+        let mut redacted: Vec<(u64, Value)> = vec![];
+        let mut stop_seen = false;
+        let mut map = |ev: &Value| {
+            map_event(
+                ev,
+                &mut slot,
+                &mut next,
+                &mut thinking,
+                &mut redacted,
+                &mut stop_seen,
+            )
+            .unwrap()
+        };
+
+        let ev = json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 500, "output_tokens_details": {"thinking_tokens": 320}},
+        });
+        let usage = map(&ev).unwrap().usage.unwrap();
+        assert_eq!(usage.completion_tokens, 500);
+        assert_eq!(usage.reasoning_tokens(), Some(320));
+
+        // A turn without thinking omits the nested object entirely.
+        let plain = json!({"type": "message_delta", "usage": {"output_tokens": 7}});
+        let usage = map(&plain).unwrap().usage.unwrap();
+        assert_eq!(usage.completion_tokens, 7);
+        assert_eq!(usage.reasoning_tokens(), None);
     }
 
     #[test]
@@ -1237,6 +1920,7 @@ mod tests {
             anthropic_thinking_blocks: vec![
                 json!({"type":"thinking","thinking":"I should call read","signature":"SIG123"}),
             ],
+            responses_reasoning_items: vec![],
             origin: crate::types::MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_x".into(),
@@ -1257,6 +1941,41 @@ mod tests {
         // tool_use comes after
         assert_eq!(blocks[1]["type"], "tool_use");
         assert_eq!(blocks[1]["id"], "toolu_x");
+    }
+
+    /// `message_start` surfaces the cache-**write** counter as its own number
+    /// **without** changing `prompt_tokens`, which stays the inclusive total
+    /// (input + cache read + cache write). The breakdown exists because the
+    /// three parts are priced differently — a write is 1.25x/2x plain input, a
+    /// read 0.1x — and folding writes into the plain bucket under-billed every
+    /// turn hrdr's rolling breakpoint wrote the cache on (i.e. nearly all).
+    #[test]
+    fn message_start_reports_cache_writes_without_changing_the_prompt_total() {
+        let u = message_start_usage(Some(&json!({
+            "input_tokens": 10,
+            "cache_read_input_tokens": 5,
+            "cache_creation_input_tokens": 300,
+        })))
+        .usage
+        .unwrap();
+        // Inclusive total, exactly as before this breakdown existed.
+        assert_eq!(u.prompt_tokens, 315);
+        assert_eq!(u.cached_tokens(), Some(5));
+        assert_eq!(u.cache_creation_tokens(), Some(300));
+        // The three parts partition the total with nothing left over.
+        assert_eq!(
+            u.prompt_tokens,
+            10 + u.cached_tokens().unwrap() + u.cache_creation_tokens().unwrap()
+        );
+
+        // No cache activity: both counters stay `None` (not `Some(0)`), so
+        // "wrote nothing" can't be confused with "reported nothing".
+        let plain = message_start_usage(Some(&json!({ "input_tokens": 42 })))
+            .usage
+            .unwrap();
+        assert_eq!(plain.prompt_tokens, 42);
+        assert_eq!(plain.cached_tokens(), None);
+        assert_eq!(plain.cache_creation_tokens(), None);
     }
 
     #[test]
@@ -1396,6 +2115,7 @@ mod tests {
                 "thinking": "I should call read",
                 "signature": "SIG_ROUND_TRIP"
             })],
+            responses_reasoning_items: vec![],
             origin: crate::types::MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_rt".into(),

@@ -171,33 +171,129 @@ pub fn lookup(catalog: &Value, provider: Option<&str>, model: &str) -> Option<u3
     catalog.as_object()?.values().filter_map(window).min()
 }
 
+/// The largest `max_tokens` `model` accepts, from the already-cached catalog —
+/// no network, no await, for callers building a request inside a live turn.
+///
+/// Same shape as [`context_window_cached`], reading `limit.output` instead.
+/// `None` when the catalog isn't cached or doesn't know the model; the caller
+/// then falls back to its own conservative default.
+pub fn max_output_cached(provider: Option<&str>, model: &str) -> Option<u32> {
+    lookup_max_output(&load_cached()?, provider, model)
+}
+
+/// Find `model`'s output cap in an already-loaded catalog. Pure, so the
+/// resolution rules are testable without a cache or a network.
+///
+/// Resolution mirrors [`lookup`] — the configured provider's own answer first,
+/// then the **smallest** cap any provider reports for this model id. Small is
+/// the safe direction here for the same reason it is for the context window,
+/// but with a harder edge: asking for more output tokens than the model's real
+/// cap is a 400, so an overstatement fails every request rather than merely
+/// wasting a window.
+pub fn lookup_max_output(catalog: &Value, provider: Option<&str>, model: &str) -> Option<u32> {
+    let output = |p: &Value| -> Option<u32> {
+        p.get("models")?
+            .get(model)?
+            .get("limit")?
+            .get("output")?
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|&n| n > 0)
+    };
+    if let Some(name) = provider
+        && let Some(p) = catalog.get(name)
+        && let Some(n) = output(p)
+    {
+        return Some(n);
+    }
+    catalog.as_object()?.values().filter_map(output).min()
+}
+
 /// A model's price card: **USD per million tokens**, from the catalog's
 /// `cost` object. `cache_read` is the discounted rate for prompt tokens served
-/// from the provider's prompt cache; `None` when the provider doesn't publish
-/// one (cached tokens are then priced at the full input rate).
+/// from the provider's prompt cache; `cache_write` the *premium* rate for
+/// prompt tokens written into it. Either is `None` when the provider doesn't
+/// publish one, and [`ModelCost::call_cost`] then falls back — to the full
+/// input rate for reads, to a multiple of it for writes.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ModelCost {
     pub input: f64,
     pub output: f64,
     pub cache_read: Option<f64>,
+    /// Rate for prompt tokens **written** into the cache. See
+    /// [`CACHE_WRITE_5M_MULTIPLIER`] for what happens when it's absent.
+    pub cache_write: Option<f64>,
 }
 
+/// What a **5-minute** cache write costs relative to plain input: **1.25x**.
+/// Used only when the catalog publishes no `cache_write` rate for the model.
+///
+/// Anthropic's own worked example, Claude Opus 5 at $5/MTok input: a 5m cache
+/// write is $6.25/MTok, a 1h write $10/MTok, a cache read $0.50/MTok.
+const CACHE_WRITE_5M_MULTIPLIER: f64 = 1.25;
+
+/// What a **1-hour** cache write costs relative to plain input: **2x** (see
+/// [`CACHE_WRITE_5M_MULTIPLIER`]).
+const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
+
 impl ModelCost {
-    /// Estimated USD for one model call: uncached prompt tokens at the input
-    /// rate, cached ones at the cache-read rate, completion (which includes
-    /// any reasoning tokens) at the output rate.
+    /// Estimated USD for one model call.
+    ///
+    /// `prompt_tokens` is the **inclusive** prompt total the provider reported,
+    /// and is partitioned three ways — this is the part that has to be exactly
+    /// right, since both `/cost` and the budget cap run off this number:
+    ///
+    /// | bucket        | tokens                    | rate                       |
+    /// |---------------|---------------------------|----------------------------|
+    /// | cache read    | `cached`                  | `cache_read` (≈0.1x input) |
+    /// | cache write   | `cache_creation`          | `cache_write` (see below)  |
+    /// | plain input   | whatever is left over     | `input`                    |
+    ///
+    /// The three are disjoint and sum to `prompt_tokens` exactly: `cached` is
+    /// clamped to the prompt, `cache_creation` to what remains after it, and
+    /// plain input is the remainder — so no bucket can go negative and none can
+    /// be counted twice, whatever a provider reports.
+    ///
+    /// Cache **writes** are billed at a premium, not at the plain input rate:
+    /// 1.25x for the 5-minute TTL, 2x for the 1-hour one. hrdr writes the cache
+    /// on essentially every turn (the rolling `cache_control` breakpoint in
+    /// [`crate::apply_cache_breakpoints`] / `anthropic::build_body`), so pricing
+    /// those tokens as plain input — as this did before — understates every
+    /// priced session and, worse, loosens the budget cap that stops the agent.
+    ///
+    /// `ttl_1h` selects which fallback multiplier applies; it is ignored when
+    /// the catalog publishes a real `cache_write` rate. Completion tokens
+    /// (reasoning included) go at the output rate.
     pub fn call_cost(
         &self,
         prompt_tokens: u32,
         completion_tokens: u32,
         cached: Option<u32>,
+        cache_creation: Option<u32>,
+        ttl_1h: bool,
     ) -> f64 {
         const M: f64 = 1_000_000.0;
-        let cached = f64::from(cached.unwrap_or(0).min(prompt_tokens));
-        let uncached = f64::from(prompt_tokens) - cached;
-        uncached / M * self.input
-            + cached / M * self.cache_read.unwrap_or(self.input)
+        // Clamp in sequence so read + write can never exceed the prompt, and
+        // the plain-input remainder can never go negative.
+        let read = cached.unwrap_or(0).min(prompt_tokens);
+        let written = cache_creation.unwrap_or(0).min(prompt_tokens - read);
+        let plain = prompt_tokens - read - written;
+        let write_rate = self
+            .cache_write
+            .unwrap_or(self.input * write_multiplier(ttl_1h));
+        f64::from(plain) / M * self.input
+            + f64::from(read) / M * self.cache_read.unwrap_or(self.input)
+            + f64::from(written) / M * write_rate
             + f64::from(completion_tokens) / M * self.output
+    }
+}
+
+/// The fallback cache-write multiplier for the TTL in force.
+fn write_multiplier(ttl_1h: bool) -> f64 {
+    if ttl_1h {
+        CACHE_WRITE_1H_MULTIPLIER
+    } else {
+        CACHE_WRITE_5M_MULTIPLIER
     }
 }
 
@@ -221,6 +317,10 @@ fn lookup_cost(catalog: &Value, provider: Option<&str>, model: &str) -> Option<M
             input: f("input")?,
             output: f("output")?,
             cache_read: f("cache_read"),
+            // models.dev carries this for providers that publish it; absent
+            // leaves `None`, and `call_cost` falls back to a multiple of the
+            // input rate rather than pretending a write is plain input.
+            cache_write: f("cache_write"),
         })
     };
     if let Some(name) = provider
@@ -405,13 +505,52 @@ mod tests {
         })
     }
 
+    /// Output-cap resolution: the configured provider's own `limit.output`
+    /// wins; without one the smallest cap any provider reports is used, since
+    /// asking for more `max_tokens` than a model allows is a 400.
+    #[test]
+    fn lookup_max_output_prefers_provider_then_smallest() {
+        let c = json!({
+            "anthropic": { "models": {
+                "claude-opus-5": { "limit": { "context": 1_000_000, "output": 128_000 } },
+                "claude-opus-4-1": { "limit": { "context": 200_000, "output": 32_000 } },
+                // A model whose entry carries no limit at all.
+                "weird": { "id": "weird" },
+            }},
+            "some-reseller": { "models": {
+                "claude-opus-5": { "limit": { "context": 200_000, "output": 64_000 } },
+                // A zero cap is a missing one, not a real answer.
+                "claude-opus-4-1": { "limit": { "output": 0 } },
+            }},
+        });
+        assert_eq!(
+            lookup_max_output(&c, Some("anthropic"), "claude-opus-5"),
+            Some(128_000)
+        );
+        // No provider (hrdr's provider names are a different namespace from the
+        // catalog's keys) → the most conservative cap on offer.
+        assert_eq!(lookup_max_output(&c, None, "claude-opus-5"), Some(64_000));
+        // An unknown provider key falls through to the same scan.
+        assert_eq!(
+            lookup_max_output(&c, Some("nope"), "claude-opus-5"),
+            Some(64_000)
+        );
+        // Zero-capped entries are skipped rather than winning the `min`.
+        assert_eq!(lookup_max_output(&c, None, "claude-opus-4-1"), Some(32_000));
+        // Unknown model, and a known model with no `limit` at all.
+        assert_eq!(lookup_max_output(&c, None, "claude-opus-9"), None);
+        assert_eq!(lookup_max_output(&c, Some("anthropic"), "weird"), None);
+    }
+
     /// The price-card resolution: the configured provider wins; otherwise the
     /// most expensive offering across providers; `None` when unpriced.
     #[test]
     fn lookup_cost_prefers_provider_then_most_expensive() {
         let c = json!({
             "cheap": { "models": {
-                "m": { "cost": { "input": 1.0, "output": 5.0, "cache_read": 0.1 } },
+                "m": { "cost": {
+                    "input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25,
+                }},
             }},
             "pricey": { "models": {
                 "m": { "cost": { "input": 10.0, "output": 50.0 } },
@@ -424,8 +563,15 @@ mod tests {
             Some(ModelCost {
                 input: 1.0,
                 output: 5.0,
-                cache_read: Some(0.1)
+                cache_read: Some(0.1),
+                cache_write: Some(1.25),
             })
+        );
+        // A card without a `cache_write` key leaves it `None` (→ the fallback
+        // multiplier in `call_cost`), never `Some(0.0)`.
+        assert_eq!(
+            lookup_cost(&c, Some("pricey"), "m").unwrap().cache_write,
+            None
         );
         // No provider → the most expensive offering (safe overestimate).
         assert_eq!(lookup_cost(&c, None, "m").unwrap().input, 10.0);
@@ -443,22 +589,132 @@ mod tests {
             input: 10.0,
             output: 50.0,
             cache_read: Some(1.0),
+            cache_write: None,
         };
         // 1M uncached prompt + 1M output = $10 + $50.
-        assert!((card.call_cost(1_000_000, 1_000_000, None) - 60.0).abs() < 1e-9);
+        assert!((card.call_cost(1_000_000, 1_000_000, None, None, false) - 60.0).abs() < 1e-9);
         // Fully cached prompt: $1 instead of $10.
-        assert!((card.call_cost(1_000_000, 0, Some(1_000_000)) - 1.0).abs() < 1e-9);
+        assert!((card.call_cost(1_000_000, 0, Some(1_000_000), None, false) - 1.0).abs() < 1e-9);
         // Cached count is clamped to the prompt size.
         assert!(
-            (card.call_cost(100, 0, Some(1_000)) - card.call_cost(100, 0, Some(100))).abs() < 1e-12
+            (card.call_cost(100, 0, Some(1_000), None, false)
+                - card.call_cost(100, 0, Some(100), None, false))
+            .abs()
+                < 1e-12
         );
         // No published cache rate → cached tokens cost the full input rate.
         let flat = ModelCost {
             input: 10.0,
             output: 50.0,
             cache_read: None,
+            cache_write: None,
         };
-        assert!((flat.call_cost(1_000_000, 0, Some(1_000_000)) - 10.0).abs() < 1e-9);
+        assert!((flat.call_cost(1_000_000, 0, Some(1_000_000), None, false) - 10.0).abs() < 1e-9);
+    }
+
+    /// The three prompt buckets — plain input, cache **read**, cache **write** —
+    /// partition `prompt_tokens` exactly: disjoint, non-negative, summing to the
+    /// whole, whatever a provider reports. This is the part `/cost` and the
+    /// `max_cost` cap both ride on, so it is checked by reconstruction rather
+    /// than by a single expected total.
+    #[test]
+    fn call_cost_partitions_the_prompt_three_ways() {
+        // Distinct rates, so a token landing in the wrong bucket shows up.
+        let card = ModelCost {
+            input: 10.0,
+            output: 0.0,
+            cache_read: Some(1.0),
+            cache_write: Some(100.0),
+        };
+        // 1M prompt = 200k read + 300k write + 500k plain.
+        let got = card.call_cost(1_000_000, 0, Some(200_000), Some(300_000), false);
+        let want = 0.2 * 1.0 + 0.3 * 100.0 + 0.5 * 10.0;
+        assert!((got - want).abs() < 1e-9, "{got} != {want}");
+
+        // Every split of a fixed prompt costs the sum of its parts priced
+        // individually — the buckets never overlap and never leave a gap.
+        for (read, write) in [(0, 0), (0, 1_000), (1_000, 0), (400, 600), (999, 1)] {
+            let plain = 1_000 - read - write;
+            let want = f64::from(read) / 1e6 * 1.0
+                + f64::from(write) / 1e6 * 100.0
+                + f64::from(plain) / 1e6 * 10.0;
+            let got = card.call_cost(1_000, 0, Some(read), Some(write), false);
+            assert!((got - want).abs() < 1e-12, "read={read} write={write}");
+        }
+
+        // Clamping: counts larger than the prompt (or than what's left of it)
+        // can't push another bucket negative or double-count. A read that
+        // swallows the whole prompt leaves nothing to write.
+        assert!(
+            (card.call_cost(100, 0, Some(9_999), Some(9_999), false)
+                - card.call_cost(100, 0, Some(100), Some(0), false))
+            .abs()
+                < 1e-12
+        );
+        // A write larger than the prompt is clamped to the prompt.
+        assert!(
+            (card.call_cost(100, 0, None, Some(9_999), false)
+                - card.call_cost(100, 0, None, Some(100), false))
+            .abs()
+                < 1e-12
+        );
+        // Read + write over the prompt: the write absorbs only the remainder.
+        assert!(
+            (card.call_cost(100, 0, Some(60), Some(80), false)
+                - card.call_cost(100, 0, Some(60), Some(40), false))
+            .abs()
+                < 1e-12
+        );
+
+        // A call with no cache activity at all prices exactly as it did before
+        // cache-write pricing existed: every prompt token at the input rate.
+        let plain_only = ModelCost {
+            input: 10.0,
+            output: 50.0,
+            cache_read: Some(1.0),
+            cache_write: Some(100.0),
+        };
+        assert!(
+            (plain_only.call_cost(1_000_000, 1_000_000, None, None, false) - 60.0).abs() < 1e-9
+        );
+        assert!(
+            (plain_only.call_cost(1_000_000, 1_000_000, Some(0), Some(0), false) - 60.0).abs()
+                < 1e-9
+        );
+    }
+
+    /// Without a catalog `cache_write` rate, a write is priced as a multiple of
+    /// the input rate: **1.25x** at the 5-minute TTL, **2x** at the 1-hour one.
+    /// (Anthropic's worked example: $5/MTok input → $6.25 / $10 / $0.50 for a
+    /// 5m write, a 1h write, and a read.)
+    #[test]
+    fn call_cost_falls_back_to_the_write_multiplier() {
+        let card = ModelCost {
+            input: 5.0,
+            output: 25.0,
+            cache_read: Some(0.5),
+            cache_write: None,
+        };
+        // 1M cache-write tokens, 5-minute TTL: $6.25.
+        assert!((card.call_cost(1_000_000, 0, None, Some(1_000_000), false) - 6.25).abs() < 1e-9);
+        // Same call at the 1-hour TTL: $10.
+        assert!((card.call_cost(1_000_000, 0, None, Some(1_000_000), true) - 10.0).abs() < 1e-9);
+        // And a read is $0.50 either way — the TTL only selects the *write*
+        // fallback.
+        assert!((card.call_cost(1_000_000, 0, Some(1_000_000), None, true) - 0.5).abs() < 1e-9);
+
+        // A catalog-supplied rate wins outright, and the TTL then changes
+        // nothing: the published number already accounts for it.
+        let published = ModelCost {
+            cache_write: Some(3.0),
+            ..card
+        };
+        assert!(
+            (published.call_cost(1_000_000, 0, None, Some(1_000_000), false) - 3.0).abs() < 1e-9
+        );
+        assert!(
+            (published.call_cost(1_000_000, 0, None, Some(1_000_000), true) - 3.0).abs() < 1e-9
+        );
     }
 
     /// Effort-level resolution: the configured provider wins, else the first

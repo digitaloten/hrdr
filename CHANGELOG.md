@@ -6,6 +6,80 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reasoning worked on no current Claude model.** Setting any effort level on
+  the Anthropic backend sent `thinking: {type: "enabled", budget_tokens}`, which
+  Claude Opus 4.7 and later — Opus 4.8, Opus 5, Sonnet 5, Fable 5, Mythos 5 —
+  reject outright with a 400, and which is deprecated on the 4.6 generation. The
+  backend now picks the dialect the model actually speaks: adaptive thinking
+  (`{type: "adaptive", display: "summarized"}` plus a top-level
+  `output_config: {effort}`) on 4.6 and later, the `budget_tokens` form on the
+  models that only understand it (Sonnet/Opus/Haiku 4.5, Opus 4.1, Claude 3),
+  and unknown or future ids default to adaptive. `display: "summarized"` is
+  explicit because it now defaults to `"omitted"` — without it the thinking pane
+  stayed blank for the whole turn. hrdr's effort ladder maps onto Anthropic's
+  and is clamped to what each model accepts (`xhigh` down to `high` on 4.6,
+  `max` and `xhigh` down to `high` on Opus 4.5), and
+  `interleaved-thinking-2025-05-14` now rides only on the manual dialect, which
+  is the only one it applies to.
+
+- **`temperature` / `top_p` are withheld from models that reject them.** Opus
+  4.7, Opus 4.8, Opus 5, Sonnet 5, Fable 5 and Mythos 5 return a 400 for any
+  non-default sampling parameter on _every_ request, thinking or not. Anything
+  4.6 or older keeps today's behaviour (withheld only while thinking is on);
+  unrecognised ids are treated as locked.
+
+- **A mistyped model id no longer inherits a stranger's context window.** The
+  `/v1/models` probe fell back to the first entry in the list when nothing
+  matched the configured id. On OpenRouter that list is 364 models long and
+  begins with a 1M-token one, so a typo, an alias, or a variant suffix silently
+  adopted a 1M window — and the agent then never compacted, overflowing instead.
+  The fallback now applies only when the endpoint serves exactly one model (the
+  local-server case it was written for). The probe also reads Anthropic's
+  `max_input_tokens` and OpenRouter's nested `top_provider.context_length`.
+
+- **Anthropic replies are no longer capped at 8192 output tokens.** The default
+  now comes from the model's published output limit (128k on Opus 5 / Sonnet 5 /
+  Fable 5 / the 4.6–4.8 generation, 64k on Sonnet 4.5 / Opus 4.5 / Haiku 4.5),
+  falling back to 8192 only when the catalog can't answer. Manual thinking
+  budgets are capped at 32k, the point past which Anthropic recommends the batch
+  API.
+
+- **Reasoning is preserved across tool rounds on the Codex/Responses backend.**
+  Encrypted reasoning items are now captured off the stream, persisted with the
+  session, and replayed verbatim ahead of the assistant turn that produced them.
+  Previously they were dropped, so a reasoning model re-derived its whole chain
+  of thought on every tool round — paying output tokens each time. Items without
+  their `encrypted_content` are never stored, since that is the shape the
+  endpoint rejects.
+
+- **`prompt_cache_key` is sent on both OpenAI-shaped backends.** OpenAI combines
+  it with the prompt prefix hash to route cache lookups, and on GPT-5.6 models
+  setting it is required for reliable cache matching — without it hrdr's long,
+  highly repetitive prefix missed the cache. Each agent mints its own opaque key
+  for the life of its conversation, so sub-agents don't pool onto one key and
+  nothing about the machine or the prompt goes on the wire.
+
+- **Cache writes are priced at the premium they're billed at.** A cache write
+  costs 1.25x the input rate on the five-minute TTL and 2x on the one-hour one,
+  against 0.1x for a read; every prompt token that wasn't a cache read was
+  priced as plain input. Since hrdr's rolling breakpoint writes the cache on
+  nearly every turn, that under-reported the session and loosened the `max_cost`
+  cap. Anthropic's `cache_creation_input_tokens` is now carried through usage
+  and priced with the catalog's own rate where one is published.
+
+- **Every request gets its rolling cache breakpoint.** On the OpenAI-shaped path
+  the marker went on the last message unconditionally, so a turn ending in a
+  tool-call-only assistant message (whose `content` is `null`) got no breakpoint
+  at all. It now walks back to the newest message that can carry one.
+
+- **The fallback token estimate counts the tool schemas.** When a server reports
+  no usage of its own, the prompt estimate was built from messages alone and
+  ignored the tool definitions that ride on every request — several thousand
+  tokens, understating the context gauge and delaying auto-compaction by the
+  same constant amount.
+
 ## [0.9.2] - 2026-07-31
 
 ### Fixed

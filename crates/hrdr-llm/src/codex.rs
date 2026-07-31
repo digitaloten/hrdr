@@ -17,6 +17,12 @@
 //! [`ChatChunk`] the [`Accumulator`] already understands, so the agent loop and
 //! frontends are unchanged — the exact same structure as [`crate::anthropic`].
 //!
+//! Because hrdr runs this endpoint statelessly (`store:false`), it also captures
+//! the model's own encrypted `reasoning` output items off the stream and replays
+//! them verbatim in the next request — otherwise a reasoning model re-derives
+//! its entire plan on every tool round. See [`build_body`] for why that is
+//! correct here when feeding back prior reasoning is wrong everywhere else.
+//!
 //! Auth: `Authorization: Bearer <access_token>`, plus (when present as
 //! provider-configured extra headers) `ChatGPT-Account-Id: <id>`. `originator:
 //! hrdr` is always sent. The OAuth access token arrives as the client's
@@ -42,8 +48,9 @@ use crate::types::{
 ///   string (joined with blank lines), matching how the Codex endpoint consumes
 ///   the system prompt.
 /// - `Role::User` → `{ role:"user", content:[{type:"input_text", text}] }`.
-/// - `Role::Assistant` text → `{ role:"assistant", content:[{type:"output_text",
-///   text}] }`; each tool call → `{ type:"function_call", call_id, name,
+/// - `Role::Assistant` → its captured `responses_reasoning_items` verbatim
+///   first, then text → `{ role:"assistant", content:[{type:"output_text",
+///   text}] }`, then each tool call → `{ type:"function_call", call_id, name,
 ///   arguments }`.
 /// - `Role::Tool` → `{ type:"function_call_output", call_id, output }`.
 /// - Tool defs → flat `{ type:"function", name, description, parameters }`.
@@ -53,16 +60,51 @@ use crate::types::{
 /// only when configured. `seed` and `stop` have no Responses equivalent and are
 /// intentionally not threaded through.
 ///
-/// Note: `reasoning_content` / `anthropic_thinking_blocks` are never sent back —
-/// same invariant as the other backends (reasoning models degrade when prior
-/// reasoning is fed back into the prompt), and the Responses API rejects replayed
-/// reasoning items without their encrypted state anyway.
+/// # Why prior reasoning *is* replayed here
+///
+/// `reasoning_content` and `anthropic_thinking_blocks` are still never sent —
+/// the first is a plaintext `<think>` transcript (reasoning models degrade when
+/// that is fed back), the second is an Anthropic-native object this endpoint
+/// would reject. But [`ChatMessage::responses_reasoning_items`] are the
+/// *provider's own* opaque, encrypted reasoning items, replayed verbatim to the
+/// very provider that minted them. Under `store:false` the server keeps no
+/// state, so this replay is the only way the model can see the plan it already
+/// paid to derive; without it a reasoning model re-derives its entire chain of
+/// thought on every tool round — a quality *and* an output-token regression.
+/// This is what the stateless Responses API is designed for, and what the Codex
+/// CLI does.
+///
+/// The blob is opaque: items go back unmodified, in their original order, and
+/// items missing their `encrypted_content` are never stored in the first place
+/// (see [`capture_reasoning_item`]) because that is exactly the shape the
+/// endpoint rejects.
+///
+/// Known limitation: the items are bound to the model that produced them. If
+/// the conversation switched models mid-flight, the stored items belong to the
+/// previous model and the endpoint may reject them. Detecting that would mean
+/// tagging every message with its originating model; it is not solved here.
+///
+/// # `prompt_cache_key`
+///
+/// The Responses API accepts the same top-level `prompt_cache_key` as
+/// chat-completions, and it matters more here than anywhere else in hrdr: this
+/// endpoint runs `store:false`, so every round re-sends the whole conversation —
+/// instructions, history, replayed reasoning items — and that entire prefix is
+/// re-billed unless it hits the prompt cache. OpenAI combines the key with the
+/// prefix hash when matching, and **on GPT-5.6 models setting it is mandatory
+/// for reliable cache matching**. Passed through verbatim and omitted when
+/// `None`; see [`crate::Client::set_prompt_cache_key`] for why the caller must
+/// scope it to one conversation (roughly 15 requests per minute per key).
+///
+/// [`ChatMessage::responses_reasoning_items`]: crate::ChatMessage::responses_reasoning_items
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_body(
     model: &str,
     effort: Option<&str>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     max_tokens: Option<u32>,
+    prompt_cache_key: Option<&str>,
     messages: &[ChatMessage],
     tools: &[ToolDef],
 ) -> Value {
@@ -91,6 +133,9 @@ pub(crate) fn build_body(
     if let Some(p) = top_p {
         body["top_p"] = json!(p);
     }
+    if let Some(key) = prompt_cache_key {
+        body["prompt_cache_key"] = json!(key);
+    }
 
     if !tools.is_empty() {
         let defs: Vec<Value> = tools
@@ -112,6 +157,12 @@ pub(crate) fn build_body(
 
 /// Split hrdr history into the top-level `instructions` string (all system
 /// messages joined) plus the flat Responses `input[]` array.
+///
+/// An assistant turn that reasoned and then called a tool re-enters `input[]`
+/// as the model produced it: `{type:"reasoning", …}` items first, then the
+/// `output_text` message, then one `function_call` per call (its
+/// `function_call_output` arrives with the following `Role::Tool` message). See
+/// [`build_body`] for why the reasoning items are replayed at all.
 fn split_instructions_and_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     let mut instructions: Vec<&str> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
@@ -134,6 +185,14 @@ fn split_instructions_and_input(messages: &[ChatMessage]) -> (String, Vec<Value>
                 }
             }
             Role::Assistant => {
+                // Reasoning items come first, verbatim and in stream order:
+                // that is the order the model emitted them (it reasons, then
+                // speaks/calls), and the endpoint validates the encrypted state
+                // against the items that follow it. Cloned as-is — never
+                // rewritten, reordered, or partially dropped.
+                for item in &m.responses_reasoning_items {
+                    input.push(item.clone());
+                }
                 if let Some(text) = &m.content
                     && !text.is_empty()
                 {
@@ -184,6 +243,7 @@ pub(crate) async fn chat_stream(
     temperature: Option<f32>,
     top_p: Option<f32>,
     max_tokens: Option<u32>,
+    prompt_cache_key: Option<&str>,
     extra_headers: &[(String, String)],
     messages: &[ChatMessage],
     tools: &[ToolDef],
@@ -194,6 +254,7 @@ pub(crate) async fn chat_stream(
         temperature,
         top_p,
         max_tokens,
+        prompt_cache_key,
         messages,
         tools,
     );
@@ -295,6 +356,18 @@ pub(crate) async fn chat_stream(
             }
             if at_eof { break; }
         }
+        // Emit every captured reasoning item as one synthetic chunk, in stream
+        // order, so the Accumulator can hang them off the assistant message for
+        // the next request's `input[]` — the same shape of solution as
+        // `crate::anthropic::chat_stream`'s thinking-block flush.
+        if !state.reasoning_items.is_empty() {
+            yield crate::types::ChatChunk {
+                choices: vec![],
+                usage: None,
+                anthropic_thinking_blocks: vec![],
+                responses_reasoning_items: std::mem::take(&mut state.reasoning_items),
+            };
+        }
         // No terminal event (`response.completed`/`.incomplete`) means the stream
         // was cut mid-response. Classify as transient so the retry loop can
         // re-request. (`response.failed`/`error` already surfaced as terminal
@@ -331,6 +404,10 @@ struct StreamState {
     /// Whether a terminal `response.completed`/`.incomplete` arrived (truncation
     /// detection).
     terminal_seen: bool,
+    /// Complete `{"type":"reasoning", …}` output items, in stream order, for
+    /// replay in the next request's `input[]` (see [`build_body`]). Only items
+    /// carrying `encrypted_content` land here.
+    reasoning_items: Vec<Value>,
 }
 
 /// Translate one Responses stream event into a [`ChatChunk`] (or `None` for
@@ -395,10 +472,18 @@ fn map_event(state: &mut StreamState, ev: &Value) -> Result<Option<ChatChunk>> {
         // An output item finished. For a function call, emit the complete
         // arguments — but only when they were NOT already streamed via deltas
         // (else they'd double). If we never saw the item start, allocate a slot
-        // and emit id+name+args in one go.
+        // and emit id+name+args in one go. For a reasoning item, stash the
+        // whole item for replay.
         "response.output_item.done" => {
             let item = ev.get("item");
-            if item.and_then(|i| i.get("type")).and_then(Value::as_str) != Some("function_call") {
+            let item_type = item.and_then(|i| i.get("type")).and_then(Value::as_str);
+            // `.done` — not `.added` — is the point at which a reasoning item is
+            // whole (`.added` announces it before `encrypted_content` exists).
+            if item_type == Some("reasoning") {
+                capture_reasoning_item(state, item);
+                return Ok(None);
+            }
+            if item_type != Some("function_call") {
                 return Ok(None);
             }
             let fc_id = item_str(item, "id");
@@ -451,6 +536,7 @@ fn map_event(state: &mut StreamState, ev: &Value) -> Result<Option<ChatChunk>> {
                 }],
                 usage,
                 anthropic_thinking_blocks: vec![],
+                responses_reasoning_items: vec![],
             }))
         }
         // Hard failures — surface as terminal (non-retryable) errors carrying the
@@ -493,6 +579,32 @@ fn map_event(state: &mut StreamState, ev: &Value) -> Result<Option<ChatChunk>> {
         }
         _ => Ok(None), // response.created, .in_progress, output_item.added(non-fn), part events, …
     }
+}
+
+/// Stash a completed `{"type":"reasoning", …}` output item for replay in the
+/// next request's `input[]`, preserving stream order.
+///
+/// The item is stored **verbatim** (`id`, `summary`, `encrypted_content`, and
+/// anything else the server attached): the blob is opaque and must go back
+/// unmodified, so re-assembling a "clean" item here would only risk invalidating
+/// it.
+///
+/// An item with no (or an empty) `encrypted_content` is dropped rather than
+/// stored. Under `store:false` the encrypted state is what makes an item
+/// replayable; a stateful (`store:true`) deployment or a non-OpenAI provider
+/// variant may emit reasoning items without it, and replaying one of those is
+/// precisely the request the endpoint rejects. Dropping it costs a little
+/// context; sending it would fail the whole turn.
+fn capture_reasoning_item(state: &mut StreamState, item: Option<&Value>) {
+    let Some(item) = item else { return };
+    let has_state = item
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    if !has_state {
+        return;
+    }
+    state.reasoning_items.push(item.clone());
 }
 
 impl StreamState {
@@ -629,6 +741,7 @@ mod tests {
             content: Some("let me check".into()),
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
             origin: MessageOrigin::User,
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".into(),
@@ -649,6 +762,7 @@ mod tests {
         )];
         let body = build_body(
             "gpt-5.5",
+            None,
             None,
             None,
             None,
@@ -697,11 +811,12 @@ mod tests {
 
     #[test]
     fn instructions_omitted_without_system_and_tools_omitted_when_empty() {
-        let body = build_body("gpt-5.5", None, None, None, None, &[user("hi")], &[]);
+        let body = build_body("gpt-5.5", None, None, None, None, None, &[user("hi")], &[]);
         assert!(body.get("instructions").is_none());
         assert!(body.get("tools").is_none());
         assert!(body.get("reasoning").is_none());
         assert!(body.get("max_output_tokens").is_none());
+        assert!(body.get("prompt_cache_key").is_none());
     }
 
     #[test]
@@ -712,6 +827,7 @@ mod tests {
             Some(0.3),
             Some(0.9),
             Some(4096),
+            None,
             &[user("hi")],
             &[],
         );
@@ -723,10 +839,55 @@ mod tests {
         assert!((p - 0.9).abs() < 1e-6);
     }
 
+    /// The Responses body carries `prompt_cache_key` at the top level when the
+    /// caller set one, verbatim. Without it, GPT-5.6 does not reliably match the
+    /// prompt cache, and this endpoint re-sends the entire conversation every
+    /// round (`store:false`) — so the miss is charged on the whole prefix.
+    #[test]
+    fn prompt_cache_key_rides_at_the_top_level_when_set() {
+        let body = build_body(
+            "gpt-5.6",
+            None,
+            None,
+            None,
+            None,
+            Some("hrdr-agent-0f1e2d3c"),
+            &[sys("you are hrdr"), user("hi")],
+            &[],
+        );
+        assert_eq!(body["prompt_cache_key"], "hrdr-agent-0f1e2d3c");
+        // Nothing else moved: the key is additive, not a reshape.
+        assert_eq!(body["instructions"], "you are hrdr");
+        assert_eq!(body["store"], false);
+    }
+
+    /// The same builder, same conversation, two consecutive rounds: the key is
+    /// whatever the client holds, so it does not drift request to request. A
+    /// per-request value would share a prefix with nothing and defeat the
+    /// parameter entirely.
+    #[test]
+    fn prompt_cache_key_is_identical_across_consecutive_requests() {
+        let key = Some("hrdr-agent-0f1e2d3c");
+        let first = build_body("gpt-5.6", None, None, None, None, key, &[user("one")], &[]);
+        let second = build_body(
+            "gpt-5.6",
+            None,
+            None,
+            None,
+            None,
+            key,
+            &[user("one"), user("two")],
+            &[],
+        );
+        assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+        assert_eq!(first["prompt_cache_key"], "hrdr-agent-0f1e2d3c");
+    }
+
     #[test]
     fn multiple_system_messages_join_into_instructions() {
         let body = build_body(
             "gpt-5.5",
+            None,
             None,
             None,
             None,
@@ -1005,5 +1166,228 @@ mod tests {
             chunk.choices[0].delta.reasoning_content.as_deref(),
             Some("thinking")
         );
+    }
+
+    /// A completed reasoning item is captured verbatim off
+    /// `response.output_item.done` — the point at which the item (and its
+    /// `encrypted_content`) is whole. It yields no chunk of its own; it is
+    /// flushed once at end of stream.
+    #[test]
+    fn reasoning_item_captured_from_output_item_done() {
+        let mut state = StreamState::default();
+        let item = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "check the file"}],
+            "encrypted_content": "ENC_ABC",
+        });
+        let ev = json!({"type": "response.output_item.done", "item": item});
+        assert!(
+            map_event(&mut state, &ev).unwrap().is_none(),
+            "a reasoning item emits no chunk at capture time"
+        );
+        // Stored verbatim — the blob is opaque and must go back unmodified.
+        assert_eq!(state.reasoning_items, vec![item]);
+    }
+
+    /// `response.output_item.added` announces the item before its encrypted
+    /// state exists, so capturing there would store a useless (and
+    /// endpoint-rejected) item. Only `.done` captures.
+    #[test]
+    fn reasoning_item_added_event_is_not_captured() {
+        let mut state = StreamState::default();
+        let ev = json!({"type": "response.output_item.added", "item": {
+            "type": "reasoning", "id": "rs_1", "summary": []
+        }});
+        assert!(map_event(&mut state, &ev).unwrap().is_none());
+        assert!(state.reasoning_items.is_empty());
+    }
+
+    /// A reasoning item with no `encrypted_content` (a stateful `store:true`
+    /// deployment, or a provider variant) must be dropped at capture time:
+    /// replaying an item without its encrypted state is exactly the request the
+    /// Responses endpoint rejects, and one bad item fails the whole turn.
+    #[test]
+    fn reasoning_item_without_encrypted_content_is_dropped() {
+        let mut state = StreamState::default();
+        for item in [
+            json!({"type": "reasoning", "id": "rs_1", "summary": []}),
+            json!({"type": "reasoning", "id": "rs_2", "summary": [], "encrypted_content": ""}),
+            json!({"type": "reasoning", "id": "rs_3", "summary": [], "encrypted_content": null}),
+        ] {
+            let ev = json!({"type": "response.output_item.done", "item": item});
+            assert!(map_event(&mut state, &ev).unwrap().is_none());
+        }
+        assert!(
+            state.reasoning_items.is_empty(),
+            "unencrypted reasoning items must never be stored: {:?}",
+            state.reasoning_items
+        );
+    }
+
+    /// Stream order is the replay order: the encrypted state is validated
+    /// against the items that follow it, so a reorder is as bad as a drop.
+    #[test]
+    fn reasoning_items_preserve_stream_order() {
+        let mut state = StreamState::default();
+        for (id, enc) in [("rs_1", "E1"), ("rs_2", "E2"), ("rs_3", "E3")] {
+            let ev = json!({"type": "response.output_item.done", "item": {
+                "type": "reasoning", "id": id, "summary": [], "encrypted_content": enc
+            }});
+            map_event(&mut state, &ev).unwrap();
+        }
+        let ids: Vec<&str> = state
+            .reasoning_items
+            .iter()
+            .map(|i| i["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["rs_1", "rs_2", "rs_3"]);
+    }
+
+    /// End-to-end capture: reasoning items interleaved with a function call
+    /// reach the assembled [`ChatMessage`] via the same synthetic-chunk flush
+    /// `chat_stream` performs after the byte loop, without disturbing the text
+    /// or tool-call accumulation.
+    #[test]
+    fn reasoning_items_reach_the_assembled_message() {
+        let events = vec![
+            json!({"type": "response.output_item.done", "item": {
+                "type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "E1"
+            }}),
+            json!({"type": "response.output_text.delta", "delta": "checking"}),
+            json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                "name": "read", "arguments": "{}"
+            }}),
+            json!({"type": "response.completed", "response": {
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }}),
+        ];
+        let mut state = StreamState::default();
+        let mut acc = Accumulator::new();
+        for ev in &events {
+            if let Some(chunk) = map_event(&mut state, ev).unwrap() {
+                acc.push(&chunk);
+            }
+        }
+        // The end-of-stream flush `chat_stream` yields.
+        acc.push(&ChatChunk {
+            choices: vec![],
+            usage: None,
+            anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: std::mem::take(&mut state.reasoning_items),
+        });
+
+        let msg = acc.into_message();
+        assert_eq!(msg.content.as_deref(), Some("checking"));
+        assert_eq!(msg.tool_calls.as_ref().unwrap()[0].id, "call_1");
+        assert_eq!(msg.responses_reasoning_items.len(), 1);
+        assert_eq!(msg.responses_reasoning_items[0]["encrypted_content"], "E1");
+    }
+
+    /// The replay contract: an assistant turn that reasoned and then called a
+    /// tool re-enters `input[]` as reasoning items → `output_text` →
+    /// `function_call`, with the tool result following.
+    #[test]
+    fn reasoning_items_replay_before_text_and_function_calls() {
+        let rs1 = json!({
+            "type": "reasoning", "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "plan"}],
+            "encrypted_content": "ENC_1",
+        });
+        let rs2 = json!({
+            "type": "reasoning", "id": "rs_2", "summary": [], "encrypted_content": "ENC_2",
+        });
+        let assistant = ChatMessage {
+            role: Role::Assistant,
+            content: Some("let me check".into()),
+            reasoning_content: None,
+            anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![rs1.clone(), rs2.clone()],
+            origin: MessageOrigin::User,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: r#"{"path":"a.rs"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        };
+        let body = build_body(
+            "gpt-5.5",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[
+                user("go"),
+                assistant,
+                ChatMessage::tool_result("call_1", "file body"),
+            ],
+            &[],
+        );
+        let input = body["input"].as_array().unwrap();
+        // user, reasoning, reasoning, output_text, function_call, output.
+        assert_eq!(input.len(), 6, "{input:#?}");
+        assert_eq!(input[0]["role"], "user");
+        // Replayed byte-for-byte, in stream order, ahead of everything the turn
+        // produced after them.
+        assert_eq!(input[1], rs1);
+        assert_eq!(input[2], rs2);
+        assert_eq!(input[3]["role"], "assistant");
+        assert_eq!(input[3]["content"][0]["type"], "output_text");
+        assert_eq!(input[4]["type"], "function_call");
+        assert_eq!(input[4]["call_id"], "call_1");
+        assert_eq!(input[5]["type"], "function_call_output");
+    }
+
+    /// No-regression guard: a history with no stored reasoning items must build
+    /// byte-identical to what it built before replay existed.
+    #[test]
+    fn messages_without_reasoning_items_build_an_unchanged_body() {
+        let assistant = ChatMessage {
+            role: Role::Assistant,
+            content: Some("done".into()),
+            reasoning_content: Some("some plaintext thinking".into()),
+            anthropic_thinking_blocks: vec![json!({"type": "thinking", "thinking": "x"})],
+            responses_reasoning_items: vec![],
+            origin: MessageOrigin::User,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let body = build_body(
+            "gpt-5.5",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[sys("you are hrdr"), user("go"), assistant],
+            &[],
+        );
+        assert_eq!(
+            body,
+            json!({
+                "model": "gpt-5.5",
+                "stream": true,
+                "store": false,
+                "instructions": "you are hrdr",
+                "input": [
+                    {"role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                    {"role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+                ],
+            })
+        );
+        // The other two reasoning channels stay off this wire: `reasoning_content`
+        // is a plaintext transcript (feeding it back degrades the model) and
+        // thinking blocks are Anthropic-native objects this endpoint rejects.
+        let wire = body.to_string();
+        assert!(!wire.contains("some plaintext thinking"), "{wire}");
+        assert!(!wire.contains("thinking"), "{wire}");
     }
 }

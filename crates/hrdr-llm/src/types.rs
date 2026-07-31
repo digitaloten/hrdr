@@ -61,6 +61,27 @@ pub struct ChatMessage {
     /// are Anthropic-wire-only and must not go on the OpenAI wire.
     #[serde(default, skip_serializing)]
     pub anthropic_thinking_blocks: Vec<serde_json::Value>,
+    /// OpenAI **Responses API** reasoning items (`{"type":"reasoning", "id",
+    /// "summary", "encrypted_content"}`), captured verbatim off the stream in
+    /// [`crate::codex`] and replayed verbatim in the next request's `input[]`.
+    ///
+    /// Deliberately *not* merged with `anthropic_thinking_blocks`: they are
+    /// different wire objects, and one shared field would let an Anthropic
+    /// thinking block reach the Responses request builder (and vice versa),
+    /// which each provider rejects. Two fields make that mistake unrepresentable.
+    ///
+    /// Replaying these does **not** violate the `reasoning_content` rule above:
+    /// these are the provider's own opaque, encrypted items, handed straight
+    /// back to the provider that minted them — the stateless (`store:false`)
+    /// mode of the Responses API is built around exactly this, and the model
+    /// would otherwise re-derive its whole plan (and pay output tokens for it)
+    /// on every tool round.
+    ///
+    /// **Never serialized** — same invariant as `anthropic_thinking_blocks`:
+    /// these are Responses-wire-only and must not go on the OpenAI
+    /// chat-completions wire or the Anthropic wire.
+    #[serde(default, skip_serializing)]
+    pub responses_reasoning_items: Vec<serde_json::Value>,
     /// Internal origin marker — distinguishes real user turns from synthetic
     /// user-role context injected by the agent (steering, background results).
     /// Defaults to [`MessageOrigin::User`] (a real user turn) for backward
@@ -98,6 +119,7 @@ impl ChatMessage {
             content: Some(text.into()),
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
             origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: None,
@@ -112,6 +134,7 @@ impl ChatMessage {
             content: Some(content.into()),
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
             origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: Some(call_id.into()),
@@ -279,15 +302,15 @@ pub enum CacheMode {
 }
 
 /// Mark cache breakpoints on a serialized chat-request body (`messages[]`): the
-/// first `system` message and the last message each get a `cache_control`
-/// marker, converting their string `content` into a content-parts array. A
-/// supporting provider (e.g. OpenRouter) caches the prefix up to and including
-/// each marked block (≤4 breakpoints allowed; we use ≤3), so the stable
-/// system+tools prefix and the growing conversation prefix are reused turn to
-/// turn. Only call this for endpoints known to accept the marker — see
-/// [`CacheMode::Ephemeral`]. No-op when there are no messages, or a target's
-/// `content` isn't a plain string (already parts, or a tool-call-only assistant
-/// turn with no text).
+/// first `system` message and the **newest markable** message each get a
+/// `cache_control` marker, converting their string `content` into a
+/// content-parts array. A supporting provider (e.g. OpenRouter) caches the
+/// prefix up to and including each marked block (≤4 breakpoints allowed; we use
+/// ≤3), so the stable system+tools prefix and the growing conversation prefix
+/// are reused turn to turn. Only call this for endpoints known to accept the
+/// marker — see [`CacheMode::Ephemeral`]. No-op when there are no messages, or
+/// when no message's `content` is a plain string (all already parts, or
+/// tool-call-only assistant turns with no text).
 ///
 /// `system_cache_split` is the byte offset where the assembled system prompt's
 /// volatile environment tail begins (see `Agent`'s `system_cache_split`). Given
@@ -308,17 +331,42 @@ pub fn apply_cache_breakpoints(
     if messages.is_empty() {
         return;
     }
-    let last = messages.len() - 1;
     let system = messages
         .iter()
         .position(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"));
     if let Some(i) = system {
         mark_system_cache(&mut messages[i], ttl_1h, system_cache_split);
     }
-    // Rolling breakpoint on the last message (unless it's the system we marked).
-    if Some(last) != system {
-        mark_cache(&mut messages[last], ttl_1h);
+    // Rolling breakpoint on the newest message that can carry one — skipping the
+    // system message we just marked, and skipping anything [`mark_cache`] would
+    // no-op on.
+    //
+    // Marking `messages[last]` unconditionally, as this used to, meant a turn
+    // ending in a tool-call-only assistant message (`content: null`) got **no**
+    // rolling breakpoint at all: `mark_cache` silently returned, and the next
+    // request re-read a cached prefix that stopped at the previous turn instead
+    // of just before the tool calls. That is the common shape in an agentic
+    // loop, so the rolling breakpoint was missing far more often than not.
+    // Walking backward keeps the marker as new as it can be. A `role:"tool"`
+    // result is a legal breakpoint position (Anthropic allows `cache_control` on
+    // tool definitions, `system` blocks, and message content blocks including
+    // tool_use / tool_result), so it counts as markable like any other.
+    //
+    // Breakpoint budget: Anthropic allows **4** per request; this places at most
+    // 3 (system stable prefix + system volatile tail + this rolling one).
+    if let Some(i) = (0..messages.len())
+        .rev()
+        .find(|&i| Some(i) != system && is_markable(&messages[i]))
+    {
+        mark_cache(&mut messages[i], ttl_1h);
     }
+}
+
+/// Whether [`mark_cache`] would actually mark this message — i.e. its `content`
+/// is a plain string. Anything else (absent, `null`, or already a content-parts
+/// array) is a no-op there, and must not consume the rolling breakpoint.
+fn is_markable(msg: &serde_json::Value) -> bool {
+    msg.get("content").and_then(|c| c.as_str()).is_some()
 }
 
 /// A `cache_control` marker; `ttl_1h` requests the extended 1-hour cache TTL
@@ -399,6 +447,26 @@ pub struct Usage {
     /// `null_as_default` handling as `prompt_tokens_details` above.
     #[serde(default, deserialize_with = "null_as_default")]
     pub completion_tokens_details: TokenDetails,
+    /// Prompt tokens **written into** the provider's prompt cache on this call
+    /// (Anthropic's `cache_creation_input_tokens`), when the provider reports
+    /// it. Part of `prompt_tokens`, disjoint from
+    /// `prompt_tokens_details.cached_tokens` — a token is either read from the
+    /// cache or written to it, never both.
+    ///
+    /// Carried separately because a cache **write** is *more* expensive than
+    /// plain input (1.25x at the 5-minute TTL, 2x at the 1-hour one) while a
+    /// read is *cheaper* (0.1x); folding writes into the plain-input bucket, as
+    /// hrdr did before, silently under-bills every turn — and hrdr writes the
+    /// cache on essentially every turn via its rolling breakpoint. See
+    /// [`crate::catalog::ModelCost::call_cost`].
+    ///
+    /// Named for the Anthropic wire field so a proxy that forwards the key
+    /// verbatim (rather than remapping it into the OpenAI shape) is picked up
+    /// for free. `Option`, not `u32`: absent must stay distinguishable from a
+    /// reported zero, so a provider that never sends it can't be mistaken for
+    /// one reporting "no cache writes".
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
 }
 
 /// Per-side token breakdown some providers report (`prompt_tokens_details` /
@@ -422,6 +490,13 @@ impl Usage {
     /// Completion tokens spent on reasoning/thinking, if reported.
     pub fn reasoning_tokens(&self) -> Option<u32> {
         self.completion_tokens_details.reasoning_tokens
+    }
+
+    /// Prompt tokens written into the prompt cache on this call, if the
+    /// provider reported it. Priced at a **premium**, not the plain input rate
+    /// — see [`cache_creation_input_tokens`](Self::cache_creation_input_tokens).
+    pub fn cache_creation_tokens(&self) -> Option<u32> {
+        self.cache_creation_input_tokens
     }
 }
 
@@ -458,6 +533,12 @@ pub struct ChatChunk {
     /// Never serialized.
     #[serde(skip)]
     pub anthropic_thinking_blocks: Vec<serde_json::Value>,
+    /// Complete Responses API reasoning items accumulated during streaming
+    /// (emitted as a single synthetic chunk after the byte loop, in stream
+    /// order). Only populated on the [`crate::codex`] path; ignored by the
+    /// OpenAI path via `#[serde(skip)]`. Never serialized.
+    #[serde(skip)]
+    pub responses_reasoning_items: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -546,6 +627,7 @@ pub(crate) fn delta_chunk(delta: Delta) -> ChatChunk {
         }],
         usage: None,
         anthropic_thinking_blocks: vec![],
+        responses_reasoning_items: vec![],
     }
 }
 
@@ -566,6 +648,10 @@ pub struct Accumulator {
     /// Anthropic thinking blocks (with signature) for re-emission in the native
     /// Messages API request. Never serialized — same invariant as reasoning_content.
     anthropic_thinking_blocks: Vec<serde_json::Value>,
+    /// Responses API reasoning items (with their `encrypted_content`) for
+    /// replay in the next Responses request's `input[]`. Never serialized —
+    /// same invariant as `anthropic_thinking_blocks`.
+    responses_reasoning_items: Vec<serde_json::Value>,
     /// Per-accumulator draw from [`NEXT_ACCUMULATOR_NONCE`], mixed into
     /// synthesized tool-call ids in [`Self::into_message`] so they're unique
     /// across turns, not just within one (see that method's doc comment).
@@ -611,12 +697,26 @@ impl Accumulator {
                         existing.completion_tokens_details.reasoning_tokens =
                             new.completion_tokens_details.reasoning_tokens;
                     }
+                    // Same don't-clobber rule for the cache-write counter, and
+                    // for the same reason: Anthropic reports it on
+                    // `message_start` only, so the later `message_delta` usage
+                    // (completion tokens) carries `None` and must not erase it.
+                    if new.cache_creation_input_tokens.is_some() {
+                        existing.cache_creation_input_tokens = new.cache_creation_input_tokens;
+                    }
                 }
             }
         }
         if !chunk.anthropic_thinking_blocks.is_empty() {
             self.anthropic_thinking_blocks
                 .extend(chunk.anthropic_thinking_blocks.iter().cloned());
+        }
+        // Like the thinking blocks above, this must be folded in *before* the
+        // `choices.first()?` early return: the synthetic chunk that carries the
+        // reasoning items has no choices at all.
+        if !chunk.responses_reasoning_items.is_empty() {
+            self.responses_reasoning_items
+                .extend(chunk.responses_reasoning_items.iter().cloned());
         }
         let choice = chunk.choices.first()?;
         if let Some(fr) = &choice.finish_reason {
@@ -708,6 +808,7 @@ impl Accumulator {
             content: (!self.content.is_empty()).then_some(self.content),
             reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
             anthropic_thinking_blocks: self.anthropic_thinking_blocks,
+            responses_reasoning_items: self.responses_reasoning_items,
             origin: MessageOrigin::User,
             tool_calls: (!self.calls.is_empty()).then_some(self.calls),
             tool_call_id: None,
@@ -737,6 +838,17 @@ mod tests {
             serde_json::from_str(r#"{"prompt_tokens":10,"completion_tokens":5}"#).unwrap();
         assert_eq!(plain.cached_tokens(), None);
         assert_eq!(plain.reasoning_tokens(), None);
+        // The cache-write counter is likewise absent for every provider that
+        // doesn't publish one — `None`, never `Some(0)`, so "unreported" can't
+        // be mistaken for "wrote nothing".
+        assert_eq!(u.cache_creation_tokens(), None);
+        assert_eq!(plain.cache_creation_tokens(), None);
+        // …and is picked up when a provider does forward the Anthropic key.
+        let written: Usage = serde_json::from_str(
+            r#"{"prompt_tokens":1000,"completion_tokens":5,"cache_creation_input_tokens":300}"#,
+        )
+        .unwrap();
+        assert_eq!(written.cache_creation_tokens(), Some(300));
         // Some backends (GLM) send the details key EXPLICITLY as `null` rather
         // than omitting it — `#[serde(default)]` alone only covers a missing key,
         // so without `null_as_default` this whole chunk failed to decode.
@@ -793,6 +905,7 @@ mod tests {
             }],
             usage: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
         });
         assert_eq!(acc.finish_reason.as_deref(), Some("length"));
         assert!(acc.truncated());
@@ -805,6 +918,7 @@ mod tests {
             }],
             usage: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
         });
         assert!(!acc2.truncated());
     }
@@ -843,8 +957,9 @@ mod tests {
 
     #[test]
     fn cache_breakpoints_skip_contentless_last_message() {
-        // A tool-call-only assistant turn (no `content`) can't be marked; the
-        // system breakpoint still applies.
+        // A tool-call-only assistant turn (no `content`) can't be marked, and
+        // with nothing else markable behind it the system breakpoint is all
+        // that applies.
         let mut body = json!({
             "messages": [
                 { "role": "system", "content": "sys" },
@@ -857,6 +972,108 @@ mod tests {
             "ephemeral"
         );
         assert!(body["messages"][1].get("content").is_none());
+    }
+
+    /// The rolling breakpoint walks **backward** to the newest markable message
+    /// when the last one can't carry it.
+    ///
+    /// A tool-call-only assistant turn has `content: null`, so marking
+    /// `messages[last]` unconditionally (as this used to) silently placed no
+    /// rolling breakpoint at all — and that turn shape is the common one in an
+    /// agentic loop, so the request re-read a needlessly short cached prefix on
+    /// most rounds.
+    #[test]
+    fn rolling_breakpoint_walks_back_past_an_unmarkable_last_message() {
+        let mut body = json!({
+            "messages": [
+                { "role": "system", "content": "sys" },
+                { "role": "user", "content": "u1" },
+                { "role": "assistant", "content": "a1" },
+                // Newest, but unmarkable: tool calls, no text.
+                { "role": "assistant", "tool_calls": [{ "id": "1" }] },
+            ]
+        });
+        apply_cache_breakpoints(&mut body, false, None);
+        let msgs = body["messages"].as_array().unwrap();
+        // Landed on the newest message that *can* carry it, not on an older one
+        // and not nowhere.
+        assert_eq!(msgs[2]["content"][0]["text"], "a1");
+        assert_eq!(msgs[2]["content"][0]["cache_control"]["type"], "ephemeral");
+        // Everything else untouched.
+        assert_eq!(msgs[1]["content"], "u1");
+        assert!(msgs[3].get("content").is_none());
+    }
+
+    /// A `role:"tool"` result is a legal breakpoint position (Anthropic allows
+    /// `cache_control` on tool_use / tool_result content blocks), so it is
+    /// markable like any other message and is not walked past.
+    #[test]
+    fn rolling_breakpoint_may_land_on_a_tool_result() {
+        let mut body = json!({
+            "messages": [
+                { "role": "system", "content": "sys" },
+                { "role": "assistant", "tool_calls": [{ "id": "1" }] },
+                { "role": "tool", "tool_call_id": "1", "content": "result" },
+            ]
+        });
+        apply_cache_breakpoints(&mut body, false, None);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[2]["content"][0]["text"], "result");
+        assert_eq!(msgs[2]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// Nothing markable → still a no-op, and the system message is never taken
+    /// as the rolling target twice.
+    #[test]
+    fn rolling_breakpoint_noop_when_nothing_is_markable() {
+        let mut body = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "1" }] },
+                { "role": "assistant", "content": null },
+            ]
+        });
+        apply_cache_breakpoints(&mut body, false, None);
+        for m in body["messages"].as_array().unwrap() {
+            assert!(m["content"].as_array().is_none(), "{m}");
+        }
+    }
+
+    /// The breakpoint budget: Anthropic allows **4** `cache_control` markers per
+    /// request and this function must never exceed that. Worst case is the split
+    /// system prompt (2) plus the rolling one (3) — counted over the whole body
+    /// so an extra marker anywhere would trip it.
+    #[test]
+    fn cache_breakpoints_stay_within_the_four_allowed() {
+        fn count(v: &serde_json::Value) -> usize {
+            match v {
+                serde_json::Value::Object(o) => o
+                    .iter()
+                    .map(|(k, v)| usize::from(k == "cache_control") + count(v))
+                    .sum(),
+                serde_json::Value::Array(a) => a.iter().map(count).sum(),
+                _ => 0,
+            }
+        }
+        let sys = "stable|volatile";
+        let at = sys.find('|');
+        for split in [None, at] {
+            for msgs in [
+                json!([{ "role": "system", "content": sys }]),
+                json!([
+                    { "role": "system", "content": sys },
+                    { "role": "user", "content": "u1" },
+                    { "role": "assistant", "content": "a1" },
+                    { "role": "assistant", "tool_calls": [{ "id": "1" }] },
+                    { "role": "tool", "tool_call_id": "1", "content": "r" },
+                ]),
+            ] {
+                let mut body = json!({ "messages": msgs });
+                apply_cache_breakpoints(&mut body, false, split);
+                let n = count(&body);
+                assert!(n <= 4, "{n} breakpoints, split={split:?}: {body}");
+                assert!(n >= 1, "at least the rolling one must land: {body}");
+            }
+        }
     }
 
     #[test]
@@ -963,6 +1180,7 @@ mod tests {
             }],
             usage: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
         }
     }
 
@@ -1169,6 +1387,7 @@ mod tests {
                 ..Default::default()
             }),
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
         }
     }
 
@@ -1184,6 +1403,7 @@ mod tests {
             }],
             usage: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
         }
     }
 
@@ -1215,8 +1435,10 @@ mod tests {
                     ..Default::default()
                 },
                 completion_tokens_details: TokenDetails::default(),
+                cache_creation_input_tokens: None,
             }),
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
         });
         // Second chunk: completion only (message_delta shape).
         acc.push(&ChatChunk {
@@ -1227,11 +1449,56 @@ mod tests {
                 ..Default::default()
             }),
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
         });
         let u = acc.usage.as_ref().unwrap();
         assert_eq!(u.prompt_tokens, 100);
         assert_eq!(u.completion_tokens, 50);
         assert_eq!(u.cached_tokens(), Some(80));
+    }
+
+    /// The cache-**write** counter survives the same two-event merge. Anthropic
+    /// reports it on `message_start` only; the later `message_delta` usage
+    /// (completion tokens) carries `None` and must not erase it, or every
+    /// Anthropic call would be priced as if it wrote nothing to the cache.
+    #[test]
+    fn accumulator_usage_merge_keeps_cache_creation_across_events() {
+        let start = ChatChunk {
+            choices: vec![],
+            usage: Some(Usage {
+                prompt_tokens: 1_000,
+                prompt_tokens_details: TokenDetails {
+                    cached_tokens: Some(600),
+                    ..Default::default()
+                },
+                cache_creation_input_tokens: Some(300),
+                ..Default::default()
+            }),
+            anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
+        };
+        let delta = ChatChunk {
+            choices: vec![],
+            usage: Some(Usage {
+                completion_tokens: 50,
+                ..Default::default()
+            }),
+            anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
+        };
+        // Order-independent: the merge takes a max / refuses to clobber a
+        // `Some`, so neither emission order can lose a counter.
+        for order in [[&start, &delta], [&delta, &start]] {
+            let mut acc = Accumulator::new();
+            for c in order {
+                acc.push(c);
+            }
+            let u = acc.usage.as_ref().unwrap();
+            assert_eq!(u.prompt_tokens, 1_000);
+            assert_eq!(u.completion_tokens, 50);
+            assert_eq!(u.cached_tokens(), Some(600));
+            assert_eq!(u.cache_creation_tokens(), Some(300));
+        }
     }
 
     #[test]
@@ -1381,6 +1648,7 @@ mod tests {
                 "thinking": "The user wants me to read a file.",
                 "signature": "SIG_ABCDEF"
             })],
+            responses_reasoning_items: vec![],
             origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: None,
@@ -1422,6 +1690,87 @@ mod tests {
             !re_json.contains("anthropic_thinking_blocks"),
             "blocks must be dropped even after a round-trip: {re_json}"
         );
+    }
+
+    /// Regression for the `#[serde(default, skip_serializing)]` invariant on
+    /// `responses_reasoning_items`. These are OpenAI **Responses API** items,
+    /// meaningful only to the endpoint that minted them; on the
+    /// chat-completions wire (or the Anthropic wire) they are at best ignored
+    /// and at worst a 400. `ChatRequest` serializes `Vec<ChatMessage>` straight
+    /// onto that wire, so the invariant has to hold on the message type itself.
+    #[test]
+    fn responses_reasoning_items_never_serialized_onto_openai_wire() {
+        let item = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [],
+            "encrypted_content": "ENC_SECRET",
+        });
+        let msg = ChatMessage {
+            role: Role::Assistant,
+            content: Some("I'll read that file.".into()),
+            reasoning_content: None,
+            anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![item.clone()],
+            origin: MessageOrigin::User,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+
+        // Not just the key — the encrypted payload must not leak either.
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            !json.contains("responses_reasoning_items") && !json.contains("ENC_SECRET"),
+            "responses_reasoning_items must not appear on the OpenAI wire: {json}"
+        );
+        assert!(json.contains("I'll read that file."), "{json}");
+
+        // Nor via a whole `ChatRequest`, which is how they actually reach the wire.
+        let req = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![msg],
+            tools: vec![],
+            temperature: None,
+            reasoning_effort: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            top_p: None,
+            seed: None,
+            stop: vec![],
+            stream: true,
+            stream_options: None,
+        };
+        let req_json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !req_json.contains("responses_reasoning_items") && !req_json.contains("ENC_SECRET"),
+            "ChatRequest must not carry Responses reasoning items: {req_json}"
+        );
+
+        // `#[serde(default)]` keeps the decode side working: a session file that
+        // stored the items must load them back (see `persisted_messages` in
+        // hrdr-agent), and re-serializing must still drop them.
+        let parsed: ChatMessage = serde_json::from_str(
+            r#"{
+                "role": "assistant",
+                "content": "hi",
+                "responses_reasoning_items": [
+                    {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"ENC_SECRET"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.responses_reasoning_items, vec![item]);
+        assert!(
+            !serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("ENC_SECRET")
+        );
+
+        // Absent key → empty, not a deserialization error.
+        let bare: ChatMessage =
+            serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#).unwrap();
+        assert!(bare.responses_reasoning_items.is_empty());
     }
 
     #[test]

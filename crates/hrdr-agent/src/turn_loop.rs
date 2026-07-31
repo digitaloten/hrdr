@@ -433,6 +433,12 @@ impl Agent {
                 .await?;
         }
         let defs = self.tools.defs();
+        // The tool surface is part of the prompt on every round, so the no-usage
+        // token fallback has to count it. Estimated once here, alongside the defs
+        // it measures: the registry is fixed for the turn (a `/reload` builds the
+        // next turn's defs afresh), and re-serializing every schema each round
+        // would be pure waste.
+        let tool_tokens = estimate_tokens_in_tools(&defs);
         // Allow one automatic compaction per turn when the context overflows.
         let mut overflow_compacted = false;
         // Anti-loop breaker for verbatim retries — failing (refused) or
@@ -546,7 +552,7 @@ impl Agent {
                 cached_prompt_tokens,
                 cost_usd,
                 session_cost_usd,
-            ) = self.account_usage(&acc).await;
+            ) = self.account_usage(&acc, tool_tokens).await;
             self.last_prompt_tokens = Some(prompt_tokens);
             on_event(AgentEvent::Usage {
                 prompt_tokens,
@@ -793,8 +799,10 @@ impl Agent {
             .await;
         self.messages = real_messages;
         let Drained { acc, decode } = drained?;
+        // No `tools` went out on this round (see above), so none are in the
+        // prompt to account for.
         let (prompt_tokens, completion_tokens, cached_prompt_tokens, cost_usd, session_cost_usd) =
-            self.account_usage(&acc).await;
+            self.account_usage(&acc, 0).await;
         on_event(AgentEvent::Usage {
             prompt_tokens,
             completion_tokens,
@@ -1328,6 +1336,7 @@ mod tests {
             }],
             usage: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
         }
     }
 
@@ -1365,6 +1374,7 @@ mod tests {
             }],
             usage: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
         }
     }
 

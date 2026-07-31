@@ -90,7 +90,7 @@ pub(crate) use compaction::{
 };
 pub(crate) use compaction::{
     PRUNE_KEEP_TURNS, PRUNE_PROTECT_TOKENS, apply_prune, estimate_tokens,
-    estimate_tokens_in_messages, plan_prune,
+    estimate_tokens_in_messages, estimate_tokens_in_tools, plan_prune,
 };
 pub use compaction::{
     compaction_trigger, prune_meets_roi, prune_under_pressure, should_auto_compact,
@@ -933,9 +933,54 @@ pub fn context_window_for(provider: Option<&str>, base_url: &str, model: &str) -
     resolve::derived_context_window(provider, base_url, model)
 }
 
+/// Mint this agent's `prompt_cache_key` — the value hrdr sends to OpenAI on
+/// every request so its long, near-identical prompt prefix actually hits the
+/// prompt cache.
+///
+/// **Opaque by construction.** This string leaves the machine on every single
+/// request, so it must say nothing about the machine: no path, no project name,
+/// no hostname, no session title (hrdr's own session ids are slugified from the
+/// first user message, which is exactly the kind of thing that must not be
+/// exported). 16 random bytes, hex-encoded, describe nobody.
+///
+/// **Random rather than derived.** A hash of the cwd would also be opaque, but it
+/// would be *stable across runs and across agents in the same tree* — two
+/// concurrent sub-agents in one repo would land on one key and pool traffic that
+/// OpenAI asks be kept to roughly 15 requests per minute per key. Minting one per
+/// [`Agent`] gives the granularity the guidance actually asks for: requests that
+/// share a prompt prefix share a key, and nothing else does.
+fn new_prompt_cache_key() -> String {
+    use rand::RngExt;
+    let mut bytes = [0u8; 16];
+    rand::rng().fill(&mut bytes);
+    let mut out = String::with_capacity(2 * bytes.len());
+    for b in bytes {
+        use std::fmt::Write;
+        // Infallible: writing to a String never errors.
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// A running agent: model client + tools + conversation state.
 pub struct Agent {
     client: Client,
+    /// This agent's OpenAI `prompt_cache_key` (see [`new_prompt_cache_key`]).
+    ///
+    /// Held here, not just on the client, so the single writer of the identity
+    /// ([`Agent::adopt_resolved`]) can re-assert it after a `/model` switch. On
+    /// GPT-5.6 models OpenAI treats this parameter as **mandatory for reliable
+    /// cache matching**, and a switch that dropped it would not fail — it would
+    /// quietly start paying full uncached input price for the rest of the
+    /// session.
+    ///
+    /// Minted per `Agent`, which is exactly the conversation's lifetime: it is
+    /// created with the history and dies with it. A delegated sub-agent builds
+    /// its own `Agent` through this same constructor and so gets its own key —
+    /// correct, because its prompt prefix differs from the parent's by persona
+    /// and cwd, and a shared key would ask OpenAI to route two different prefixes
+    /// to one cache slot.
+    prompt_cache_key: String,
     /// **What this agent is running on**: the identity (provider AND model) and
     /// everything derived from it — endpoint, key, api-version, headers, trust
     /// kind, window. One value, moved as one by [`Agent::set_model_ref`], so the
@@ -1788,6 +1833,12 @@ impl Agent {
         });
         client.set_headers(resolved.headers().to_vec());
         client.set_system_cache_split(system_cache_split);
+        // One key for this agent's whole conversation — see the field docs and
+        // `new_prompt_cache_key`. Set unconditionally: the client only puts it on
+        // the wire for the two OpenAI-shaped backends, so there is nothing to gate
+        // on here, and gating would just be another way to forget it.
+        let prompt_cache_key = new_prompt_cache_key();
+        client.set_prompt_cache_key(Some(prompt_cache_key.clone()));
         client.set_api_version(resolved.api_version().map(str::to_string));
         client.set_cache_ttl_1h(config.prompt_cache_ttl.as_deref().map(str::trim) == Some("1h"));
         client.set_timeout(
@@ -1853,6 +1904,7 @@ impl Agent {
         let context_window = config.context_window.or_else(|| resolved.context_window());
         Ok(Self {
             client,
+            prompt_cache_key,
             resolved,
             providers: config.providers,
             pending_notices,
@@ -2327,6 +2379,15 @@ impl Agent {
             .set_api_key(resolved.api_key().map(str::to_string));
         self.client.set_cache(cache);
         self.client.set_headers(resolved.headers().to_vec());
+        // Re-assert the prompt-cache key here, in the single writer, with the
+        // SAME value: the conversation did not change, only what it runs on, and
+        // the requests after the switch still share their prefix with the ones
+        // before it. Re-set rather than left alone so no future rework of this
+        // function (which already rebuilds endpoint, key, headers and api-version
+        // from scratch) can silently leave the client without one — on GPT-5.6 an
+        // absent key means the cache stops matching, and nothing errors.
+        self.client
+            .set_prompt_cache_key(Some(self.prompt_cache_key.clone()));
         self.client
             .set_api_version(resolved.api_version().map(str::to_string));
         self.client.model = resolved.reference().model().to_string();
@@ -2903,10 +2964,11 @@ mod tests {
         PRUNE_TASK_PLACEHOLDER_PREFIX, PRUNE_TOOL_PLACEHOLDER_PREFIX, ProviderConfig,
         SubagentSlots, ToolOutputConfig, builtin_provider, child_transcript_id,
         compaction_tail_start, elide_tool_results, ensure_assistant_has_content, estimate_tokens,
-        estimate_tokens_in_messages, flatten_tool_protocol, format_duration, in_git_repo,
-        mega_turn_tail_start, parse_env_bool, provider_alias_collision_error,
-        repair_dangling_tool_calls, resolve, resolve_child_dir, steering_queue,
-        strip_user_timestamp, subagent_base_config, tail_window, timestamped_user_message,
+        estimate_tokens_in_messages, estimate_tokens_in_tools, flatten_tool_protocol,
+        format_duration, in_git_repo, mega_turn_tail_start, parse_env_bool,
+        provider_alias_collision_error, repair_dangling_tool_calls, resolve, resolve_child_dir,
+        steering_queue, strip_user_timestamp, subagent_base_config, tail_window,
+        timestamped_user_message,
     };
     use crate::cwd_slug;
     use crate::registry;
@@ -2927,6 +2989,7 @@ mod tests {
             content: None,
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
             origin: MessageOrigin::User,
             tool_calls: Some(
                 ids.iter()
@@ -3962,6 +4025,46 @@ mod tests {
             "https://api.openai.com/v1",
             "…and a provider switch lands on that provider's own endpoint"
         );
+    }
+
+    /// Every agent gets an opaque `prompt_cache_key`, it is the same for the life
+    /// of the agent, it survives a `/model` switch, and two agents never share
+    /// one. Without it, GPT-5.6 does not reliably match OpenAI's prompt cache —
+    /// and the failure mode is silent, so only a test catches a dropped key.
+    #[test]
+    fn every_agent_gets_its_own_stable_opaque_prompt_cache_key() {
+        let mut agent = Agent::new(AgentConfig {
+            model: r("openai://gpt-5-6"),
+            ..Default::default()
+        })
+        .unwrap();
+        let key = agent
+            .client
+            .prompt_cache_key()
+            .expect("an agent must always carry a key")
+            .to_string();
+        // Opaque: 16 random bytes as hex. Nothing about the machine — no path, no
+        // project name, no hostname — may ride to OpenAI on every request.
+        assert_eq!(key.len(), 32, "expected 16 hex-encoded random bytes: {key}");
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // A `/model` switch rebuilds endpoint, key, headers and api-version; the
+        // cache key must come through unchanged, because the conversation did.
+        agent.set_model_ref(r("openrouter://some-model")).unwrap();
+        assert_eq!(agent.client.prompt_cache_key(), Some(key.as_str()));
+        agent.set_model_ref(r("openai://gpt-5-6")).unwrap();
+        assert_eq!(agent.client.prompt_cache_key(), Some(key.as_str()));
+
+        // A second agent — a delegated sub-agent is built through this same
+        // constructor — gets its own. Its prompt prefix differs (persona, cwd),
+        // so sharing a key would point two prefixes at one cache slot and pool
+        // traffic OpenAI asks be kept near 15 requests per minute per key.
+        let other = Agent::new(AgentConfig {
+            model: r("openai://gpt-5-6"),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_ne!(other.client.prompt_cache_key(), Some(key.as_str()));
     }
 
     #[test]
@@ -8194,6 +8297,7 @@ mod tests {
             content: None,
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
             origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: None,
@@ -8233,6 +8337,7 @@ mod tests {
             content: None,
             reasoning_content: None,
             anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
             origin: MessageOrigin::User,
             tool_calls: None,
             tool_call_id: None,
@@ -8250,6 +8355,66 @@ mod tests {
         let short = estimate_tokens("hi");
         let long = estimate_tokens(&"word ".repeat(1000));
         assert!(long > short, "longer text must produce more tokens");
+    }
+
+    /// A schema with `fields` string properties, each described at `desc_len`
+    /// bytes — a stand-in for the real tools' parameter schemas.
+    fn tool_with_schema(name: &str, fields: usize, desc_len: usize) -> hrdr_llm::ToolDef {
+        let mut props = serde_json::Map::new();
+        for i in 0..fields {
+            props.insert(
+                format!("field_{i}"),
+                serde_json::json!({"type": "string", "description": "d".repeat(desc_len)}),
+            );
+        }
+        hrdr_llm::ToolDef::function(
+            name,
+            "does a thing",
+            serde_json::json!({"type": "object", "properties": props}),
+        )
+    }
+
+    #[test]
+    fn estimate_tokens_in_tools_empty_is_zero() {
+        // No tools advertised, nothing added to the prompt estimate — a
+        // no-tools round (the wrap-up round, the summarizer call) must not be
+        // charged for a tool surface it never sent.
+        assert_eq!(estimate_tokens_in_tools(&[]), 0);
+    }
+
+    #[test]
+    fn estimate_tokens_in_tools_counts_the_schema() {
+        // The whole point: a big parameter schema is thousands of prompt tokens,
+        // so it must dominate the estimate rather than being invisible.
+        let tiny = estimate_tokens_in_tools(&[tool_with_schema("t", 0, 0)]);
+        let big = estimate_tokens_in_tools(&[tool_with_schema("t", 40, 400)]);
+        assert!(
+            big > tiny + 1000,
+            "a large schema must materially raise the estimate: {big} vs {tiny}"
+        );
+    }
+
+    #[test]
+    fn estimate_tokens_in_tools_monotonic_in_schema_size() {
+        let sizes: Vec<u32> = [1usize, 4, 16, 64]
+            .iter()
+            .map(|&n| estimate_tokens_in_tools(&[tool_with_schema("t", n, 50)]))
+            .collect();
+        assert!(
+            sizes.windows(2).all(|w| w[1] > w[0]),
+            "estimate must grow with schema size, got {sizes:?}"
+        );
+        // And with the number of tools, at the same schema size.
+        let one = estimate_tokens_in_tools(&[tool_with_schema("t", 8, 50)]);
+        let three = estimate_tokens_in_tools(&[
+            tool_with_schema("a", 8, 50),
+            tool_with_schema("b", 8, 50),
+            tool_with_schema("c", 8, 50),
+        ]);
+        assert!(
+            three > one * 2,
+            "three tools cost more than one: {three} vs {one}"
+        );
     }
 
     // ---- in_git_repo ----

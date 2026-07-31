@@ -250,20 +250,25 @@ impl<'de> Deserialize<'de> for SessionState {
 
 /// Serialize chat messages *for the session file*, which is not the OpenAI wire.
 ///
-/// `Message`'s own `Serialize` is the wire format: it drops `reasoning_content`
-/// and `anthropic_thinking_blocks` via `skip_serializing`, because replaying a
-/// prior turn's thinking degrades reasoning models, and because those fields are
-/// Anthropic-only. `ChatRequest` serializes `Vec<Message>` straight onto the
-/// wire, so that invariant has to live on the type.
+/// `Message`'s own `Serialize` is the wire format: it drops `reasoning_content`,
+/// `anthropic_thinking_blocks` and `responses_reasoning_items` via
+/// `skip_serializing`, because replaying a prior turn's plaintext thinking
+/// degrades reasoning models, and because the latter two are each one
+/// provider's native objects that the others reject. `ChatRequest` serializes
+/// `Vec<Message>` straight onto the wire, so that invariant has to live on the
+/// type.
 ///
 /// A session file has the opposite requirement: it must preserve them. Losing
 /// `anthropic_thinking_blocks` breaks a resumed Anthropic conversation whose
 /// last assistant turn has a pending `tool_use` — the API requires the signed
-/// thinking block on the follow-up turn.
+/// thinking block on the follow-up turn. Losing `responses_reasoning_items`
+/// silently costs a resumed Codex/Responses conversation its whole reasoning
+/// chain: the model re-derives its plan from scratch, and pays output tokens to
+/// do it, on every tool round after the resume.
 ///
 /// Encoding therefore round-trips each message through its wire form and adds
-/// the two dropped fields back. Decoding needs no help: `skip_serializing` only
-/// affects the encode side, and both fields are `#[serde(default)]`.
+/// the dropped fields back. Decoding needs no help: `skip_serializing` only
+/// affects the encode side, and every one of them is `#[serde(default)]`.
 mod persisted_messages {
     use super::Message;
     use crate::MessageOrigin;
@@ -287,6 +292,12 @@ mod persisted_messages {
                 obj.insert(
                     "anthropic_thinking_blocks".into(),
                     serde_json::Value::Array(m.anthropic_thinking_blocks.clone()),
+                );
+            }
+            if !m.responses_reasoning_items.is_empty() {
+                obj.insert(
+                    "responses_reasoning_items".into(),
+                    serde_json::Value::Array(m.responses_reasoning_items.clone()),
                 );
             }
             // Preserve internal origin marker so real user turns stay
@@ -2689,6 +2700,71 @@ mod roundtrip_audit {
         );
     }
 
+    /// A resumed Codex/Responses conversation must keep its reasoning chain.
+    ///
+    /// The items are `skip_serializing` on the wire form (they are Responses-API
+    /// objects, meaningless to every other endpoint), so the session file has to
+    /// re-insert them exactly as it does the Anthropic thinking blocks. Without
+    /// this the resume silently loses the chain: the model re-derives its whole
+    /// plan, and pays output tokens to do it, on every tool round afterwards.
+    #[test]
+    fn responses_reasoning_items_survive_the_file() {
+        let item = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "plan"}],
+            "encrypted_content": "ENC_ABC",
+        });
+        let mut assistant = Message::assistant("hello");
+        assistant.responses_reasoning_items = vec![item.clone()];
+
+        let state = SessionState {
+            messages: vec![Message::user("hi"), assistant],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Session::new(state)).unwrap();
+        let back = serde_json::from_str::<Session>(&json).unwrap().state;
+
+        assert_eq!(
+            back.messages[1].responses_reasoning_items,
+            vec![item],
+            "the encrypted reasoning item survives verbatim: {json}"
+        );
+        // Messages with no items don't grow empty keys.
+        assert!(back.messages[0].responses_reasoning_items.is_empty());
+        assert!(
+            !json.contains("\"responses_reasoning_items\":[]"),
+            "no empty reasoning-item arrays written: {json}"
+        );
+    }
+
+    /// The same, through an actual file: save, load, and the encrypted reasoning
+    /// item is still there to replay in the next Responses request.
+    #[test]
+    fn responses_reasoning_items_survive_a_real_save_and_load() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let item = serde_json::json!({
+                "type": "reasoning", "id": "rs_1", "encrypted_content": "ENC_ABC",
+            });
+            let mut assistant = Message::assistant("hi");
+            assistant.responses_reasoning_items = vec![item.clone()];
+
+            let mut st = state("Reasoning", &cwd);
+            st.messages.push(assistant);
+            Session::new(st).save("reasoning").unwrap();
+
+            let back = Session::load(&cwd, "reasoning").unwrap().state;
+            assert_eq!(
+                back.messages.last().unwrap().responses_reasoning_items,
+                vec![item]
+            );
+        });
+    }
+
     /// The same, through an actual file: save, load, and the signed thinking
     /// block is still there for the follow-up Anthropic turn.
     #[test]
@@ -2715,18 +2791,22 @@ mod roundtrip_audit {
     }
 
     /// The wire invariant is untouched: `Message`'s own `Serialize` — what
-    /// `ChatRequest` puts on the OpenAI wire — still drops both fields. Only the
-    /// session file's encoding adds them back.
+    /// `ChatRequest` puts on the OpenAI wire — still drops every one of the
+    /// reasoning fields. Only the session file's encoding adds them back.
     #[test]
     fn the_openai_wire_form_still_drops_thinking() {
         let mut assistant = Message::assistant("hello");
         assistant.reasoning_content = Some("secret thoughts".into());
         assistant.anthropic_thinking_blocks = vec![serde_json::json!({"type": "thinking"})];
+        assistant.responses_reasoning_items =
+            vec![serde_json::json!({"type": "reasoning", "encrypted_content": "ENC_ABC"})];
 
         let wire = serde_json::to_string(&assistant).unwrap();
         assert!(!wire.contains("secret thoughts"), "{wire}");
         assert!(!wire.contains("anthropic_thinking_blocks"), "{wire}");
         assert!(!wire.contains("reasoning_content"), "{wire}");
+        assert!(!wire.contains("responses_reasoning_items"), "{wire}");
+        assert!(!wire.contains("ENC_ABC"), "{wire}");
     }
 
     /// Origin markers survive a session-file round-trip, so real user turns stay

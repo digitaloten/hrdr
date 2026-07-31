@@ -7,6 +7,7 @@
 //! and the rough token estimators the context gauge and triggers rely on.
 
 use anyhow::{Result, bail};
+use hrdr_llm::ToolDef;
 
 use crate::{
     Agent, AgentEvent, AgentRegistry, ChatMessage, MessageOrigin, RetryBudget, Role, drain_stream,
@@ -454,9 +455,40 @@ pub(crate) fn estimate_tokens(text: &str) -> u32 {
     (text.len() / 4) as u32
 }
 
+/// Estimate the prompt tokens of the request's `tools[]` block, on the same
+/// ~4-bytes-per-token basis as [`estimate_tokens`]: each tool's name,
+/// description and JSON-serialized parameter schema, plus a small per-tool
+/// structural overhead for the wrapper object's keys.
+///
+/// These are counted because they *ride on every request*. hrdr advertises a
+/// large tool surface whose schemas run to several thousand tokens, and the
+/// server charges for them on every single call — so leaving them out of the
+/// no-usage fallback understated `last_prompt_tokens` by a constant multi-thousand
+/// token offset, exactly on the endpoints that have no counter of their own. That
+/// figure drives auto-compaction, pruning and the frontends' context gauge, so the
+/// omission made compaction fire late (a hard context-overflow 400, recoverable
+/// only by burning a request) while the gauge quietly lied.
+///
+/// Serializing the schemas is not free, so callers estimate once per turn from
+/// the `defs` the turn already built rather than per round.
+pub(crate) fn estimate_tokens_in_tools(tools: &[ToolDef]) -> u32 {
+    tools
+        .iter()
+        .map(|t| {
+            let schema = serde_json::to_string(&t.function.parameters)
+                .map(|s| s.len())
+                .unwrap_or(0);
+            (t.function.name.len() + t.function.description.len() + schema) as u32 / 4 + 4
+        })
+        .sum()
+}
+
 /// Estimate the prompt tokens of a whole request: each message's content and any
 /// tool-call names/arguments, plus a small per-message overhead for the role and
 /// structural tokens the chat template adds.
+///
+/// Messages only — the `tools[]` block is [`estimate_tokens_in_tools`]'s job,
+/// because it is per-turn state rather than per-message and callers cache it.
 pub(crate) fn estimate_tokens_in_messages(messages: &[ChatMessage]) -> u32 {
     messages
         .iter()
@@ -658,7 +690,9 @@ impl Agent {
         // emits no `Usage` event, so its tokens never reach the turn's
         // throughput either. Counting one without the other would skew it.
         let acc = drain_stream(&mut stream, &mut |_| {}).await?.acc;
-        self.account_usage(&acc).await;
+        // A summarization request carries no `tools[]` (see the `&[]` above), so
+        // there is no tool surface in its prompt to estimate.
+        self.account_usage(&acc, 0).await;
         Ok(acc.into_message().content.unwrap_or_default())
     }
 

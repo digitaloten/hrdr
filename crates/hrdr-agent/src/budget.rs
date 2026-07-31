@@ -96,9 +96,19 @@ impl Agent {
     ///
     /// Returns `(prompt_tokens, completion_tokens, cached_prompt_tokens,
     /// cost_usd, session_cost_usd)`.
+    ///
+    /// `tool_tokens` is the caller's estimate of the `tools[]` block it sent with
+    /// this request (see [`crate::estimate_tokens_in_tools`]) — the tool surface
+    /// is part of the prompt on every call, so the no-usage fallback below is
+    /// short by thousands of tokens without it. Callers compute it once per turn
+    /// from the defs they already hold, and pass `0` for a round that sends no
+    /// tools at all (the wrap-up round, the summarizer call). It is ignored
+    /// entirely when the server reports usage: that number already counts the
+    /// tools.
     pub(crate) async fn account_usage(
         &mut self,
         acc: &Accumulator,
+        tool_tokens: u32,
     ) -> (u32, u32, Option<u32>, Option<f64>, Option<f64>) {
         let (prompt_tokens, completion_tokens) = match &acc.usage {
             Some(usage) => (usage.prompt_tokens, usage.completion_tokens),
@@ -107,19 +117,45 @@ impl Agent {
             // arguments are completion tokens too, and a round that writes a
             // file is almost entirely the latter — counting content alone put
             // this figure near zero for exactly the busiest rounds, which then
-            // understated throughput and the compaction trigger alike.
+            // understated throughput and the compaction trigger alike. The
+            // prompt side adds the tool schemas for the same reason: they are
+            // sent with every request and are the single largest fixed block in
+            // it, so omitting them made the gauge and the compaction trigger
+            // read low by a constant several thousand tokens.
             None => (
-                estimate_tokens_in_messages(&self.messages),
+                estimate_tokens_in_messages(&self.messages).saturating_add(tool_tokens),
                 estimate_tokens(&acc.content)
                     .saturating_add(estimate_tokens(&acc.reasoning))
                     .saturating_add(acc.tool_call_tokens()),
             ),
         };
         let cached_prompt_tokens = acc.usage.as_ref().and_then(|usage| usage.cached_tokens());
-        let cost_usd = self
-            .current_cost_rates()
-            .await
-            .map(|rates| rates.call_cost(prompt_tokens, completion_tokens, cached_prompt_tokens));
+        // Prompt tokens *written* into the cache on this call. Priced at a
+        // premium over plain input (1.25x / 2x by TTL), and hrdr's rolling
+        // breakpoint writes the cache on nearly every turn, so leaving these in
+        // the plain-input bucket under-billed the session — and with it the
+        // `max_cost` cap that `budget_preflight` enforces.
+        let cache_creation_tokens = acc
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.cache_creation_tokens());
+        let cost_usd = self.current_cost_rates().await.map(|rates| {
+            rates.call_cost(
+                prompt_tokens,
+                completion_tokens,
+                cached_prompt_tokens,
+                cache_creation_tokens,
+                // Which write multiplier the fallback uses — 1.25x on the
+                // 5-minute TTL, 2x on the 1-hour one. Read off the client that
+                // is about to make (or just made) the call rather than off the
+                // config, because the TTL travels with the identity and a
+                // `/model` switch can change it mid-session; asking the client
+                // is what keeps the estimate describing the same call the
+                // request did. Unused entirely for a model whose catalog entry
+                // publishes a real `cache_write` rate.
+                self.client.cache_ttl_1h(),
+            )
+        });
         // An unpriced call just happened and its cost is unknown, so it is not in
         // the running total: mark the total a floor. `session_cost_usd` stays
         // `None` until a priced call gives a figure to floor, so a purely local
@@ -140,5 +176,103 @@ impl Agent {
             cost_usd,
             session_cost_usd,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hrdr_llm::{Accumulator, ToolDef, Usage};
+
+    use crate::{Agent, AgentConfig, ChatMessage};
+
+    /// One tool with a schema roughly the size of a real hrdr tool's.
+    fn fat_tool() -> ToolDef {
+        let mut props = serde_json::Map::new();
+        for i in 0..30 {
+            props.insert(
+                format!("field_{i}"),
+                serde_json::json!({"type": "string", "description": "d".repeat(300)}),
+            );
+        }
+        ToolDef::function(
+            "write",
+            "writes a file",
+            serde_json::json!({"type": "object", "properties": props}),
+        )
+    }
+
+    fn agent_with_history() -> Agent {
+        let mut agent = Agent::new(AgentConfig::default()).unwrap();
+        agent.messages.push(ChatMessage::user("hello"));
+        agent
+    }
+
+    /// The bug this guards: a server that reports no usage left the tool surface
+    /// out of the prompt estimate, so `last_prompt_tokens` — and with it the
+    /// compaction trigger and the context gauge — read low by however many
+    /// thousand tokens the schemas take.
+    #[tokio::test]
+    async fn no_usage_fallback_counts_the_tool_surface() {
+        let tools = [fat_tool()];
+        let expected = crate::estimate_tokens_in_tools(&tools);
+        assert!(
+            expected > 500,
+            "the fixture is a big schema, not a rounding error"
+        );
+
+        let acc = Accumulator::new();
+        let without = agent_with_history().account_usage(&acc, 0).await.0;
+        let with = agent_with_history().account_usage(&acc, expected).await.0;
+        assert_eq!(
+            with,
+            without + expected,
+            "the tools sent with the request must land in the prompt estimate"
+        );
+    }
+
+    /// The server-reported path is untouched: its number already counts the
+    /// tools, so adding an estimate on top would double-count them.
+    #[tokio::test]
+    async fn server_reported_usage_ignores_the_tool_estimate() {
+        let mut acc = Accumulator::new();
+        acc.usage = Some(Usage {
+            prompt_tokens: 4321,
+            completion_tokens: 77,
+            ..Default::default()
+        });
+
+        let (prompt, completion, ..) = agent_with_history()
+            .account_usage(&acc, crate::estimate_tokens_in_tools(&[fat_tool()]))
+            .await;
+        assert_eq!(prompt, 4321, "the server's prompt count is used verbatim");
+        assert_eq!(completion, 77);
+    }
+
+    /// The cache-write premium is priced, not swallowed. `account_usage` has no
+    /// price card in a test (no catalog), so this checks the arithmetic on the
+    /// card directly — the seam `account_usage` feeds — with the numbers a
+    /// real turn produces: hrdr's rolling breakpoint writes the cache on nearly
+    /// every turn, and pricing those tokens as plain input under-reports the
+    /// session and loosens the `max_cost` cap that `budget_preflight` enforces.
+    #[test]
+    fn cache_writes_cost_more_than_plain_input() {
+        // Claude Opus 5's published card: $5/MTok in, $25 out, $0.50 read.
+        let card = hrdr_llm::catalog::ModelCost {
+            input: 5.0,
+            output: 25.0,
+            cache_read: Some(0.5),
+            cache_write: None,
+        };
+        // 100k prompt: 60k read, 30k written, 10k plain.
+        let with_write = card.call_cost(100_000, 0, Some(60_000), Some(30_000), false);
+        // What the old code charged, folding the 30k write into plain input.
+        let as_plain = card.call_cost(100_000, 0, Some(60_000), None, false);
+        assert!(
+            with_write > as_plain,
+            "a cache write must cost more than plain input: {with_write} vs {as_plain}"
+        );
+        // Exactly the 1.25x premium on the written tokens.
+        let premium = 30_000.0 / 1e6 * 5.0 * 0.25;
+        assert!((with_write - as_plain - premium).abs() < 1e-9);
     }
 }
