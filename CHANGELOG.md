@@ -8,6 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Flattening the tool protocol no longer leaves the provider's reasoning state
+  behind.** Two requests strip the tool protocol out of the history before
+  sending it — the compaction summarizer and the no-tools wrap-up round when the
+  tool-round budget is exhausted — but they removed only `tool_calls`, leaving
+  the Anthropic thinking blocks and OpenAI Responses reasoning items that were
+  minted alongside those calls. Both are replayed as opaque signed/encrypted
+  state asserting a call that is no longer in the request, and the Responses API
+  rejects exactly that shape
+  (`Item 'rs_…' of type 'reasoning' was provided without its required following item`).
+  On the compaction path a rejection was doubly expensive: the failure latches
+  proactive compaction off for the rest of the session, so the context quietly
+  stops compacting until it overflows.
+
+- **A truncated summary can no longer replace the conversation.** The summary
+  text becomes the session's entire memory of everything it replaces, so a reply
+  cut off at the output limit would silently delete half the session while
+  reading as complete to every later turn. Compaction now refuses it and leaves
+  the real history in place.
+
 - **hrdr's own default identity 404'd on vLLM.** `local://default` put the
   literal model id `default` on the wire. llama.cpp ignores the field, but vLLM
   validates it against its served names and answers `404` for anything else, and
@@ -110,6 +129,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ignored the tool definitions that ride on every request — several thousand
   tokens, understating the context gauge and delaying auto-compaction by the
   same constant amount.
+
+### Changed
+
+- **Compaction stops uploading requests that cannot fit.** It escalates through
+  shrink stages (full history → elided tool results → successively smaller
+  tails), but always started at stage one regardless of size — and since
+  compaction is usually triggered _by_ a context overflow, the first attempts
+  were often guaranteed 400s, each one a full upload of the whole history to
+  learn what could be computed locally. The starting stage is now chosen by
+  estimating each stage against the context window. The estimator under-counts,
+  so it errs toward starting too early, which the existing escalation still
+  handles; it only skips stages that plainly cannot fit. The elided copy of the
+  history is also built once and reused across stages instead of being rebuilt
+  per attempt.
+
+- **The summarization call has its own output cap** (32k) rather than inheriting
+  the session's, which is now the model's real ceiling — up to 128k on current
+  models. The cap is a backstop against a runaway summarizer, not a target, and
+  is restored on every exit so it can never leak into the next real turn.
 
 ## [0.9.2] - 2026-07-31
 

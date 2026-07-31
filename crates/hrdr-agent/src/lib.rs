@@ -2687,7 +2687,24 @@ pub use hrdr_tools::TodoItem as Todo;
 /// This also neutralizes a dangling tool_calls message (e.g. history left by
 /// an Esc-cancelled tool round, when `repair_dangling_tool_calls` hasn't run):
 /// with every `tool_calls` field stripped, there is nothing left to dangle.
+///
+/// **The provider's own reasoning artifacts go with them.** An Anthropic
+/// thinking block and an OpenAI Responses reasoning item are both minted
+/// *alongside* the tool call they preceded, and both are replayed as opaque,
+/// signed/encrypted state that claims that call is still there. Strip the call
+/// and keep the artifact and the request describes a turn that never happened:
+/// the Responses API is explicit that a reasoning item must be followed by the
+/// item it was produced with, and rejects histories where it isn't
+/// (`Item 'rs_…' of type 'reasoning' was provided without its required
+/// following item`). The tool protocol and the reasoning state are one package —
+/// half of it cannot be removed.
 fn flatten_tool_protocol(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    /// Drop the provider-native reasoning state from a flattened message.
+    fn strip_reasoning(mut m: ChatMessage) -> ChatMessage {
+        m.anthropic_thinking_blocks.clear();
+        m.responses_reasoning_items.clear();
+        m
+    }
     messages
         .iter()
         .map(|m| match m.role {
@@ -2706,13 +2723,15 @@ fn flatten_tool_protocol(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                     Some(t) if !t.trim().is_empty() => t.to_string(),
                     _ => format!("[called tools: {}]", names.join(", ")),
                 };
-                ChatMessage {
+                strip_reasoning(ChatMessage {
                     content: Some(text),
                     tool_calls: None,
                     ..m.clone()
-                }
+                })
             }
-            _ => m.clone(),
+            // A plain assistant turn keeps its text, but not the reasoning state
+            // that belongs to the flattened calls around it.
+            _ => strip_reasoning(m.clone()),
         })
         .collect()
 }
@@ -8252,6 +8271,46 @@ mod tests {
 
         // An ordinary text turn is passed through unchanged.
         assert_eq!(flat[3].content.as_deref(), Some("the answer is 42"));
+    }
+
+    /// The provider's reasoning state leaves with the tool protocol it belongs
+    /// to. An Anthropic thinking block and a Responses reasoning item are minted
+    /// alongside the call they preceded and replayed as opaque state claiming it
+    /// is still there; keeping one while stripping the call describes a turn
+    /// that never happened, and the Responses API rejects exactly that shape.
+    #[test]
+    fn flatten_tool_protocol_strips_the_provider_reasoning_state_too() {
+        let mut calling = assistant_with_calls(&["t"]);
+        calling.anthropic_thinking_blocks = vec![serde_json::json!({
+            "type": "thinking", "thinking": "…", "signature": "sig"
+        })];
+        calling.responses_reasoning_items = vec![serde_json::json!({
+            "type": "reasoning", "id": "rs_1", "encrypted_content": "ENC"
+        })];
+        // A plain text turn can carry them as well — same rule applies.
+        let mut talking = ChatMessage::assistant("done");
+        talking.responses_reasoning_items = vec![serde_json::json!({
+            "type": "reasoning", "id": "rs_2", "encrypted_content": "ENC2"
+        })];
+
+        let flat = flatten_tool_protocol(&[
+            ChatMessage::user("go"),
+            calling,
+            ChatMessage::tool_result("t", "42"),
+            talking,
+        ]);
+
+        assert!(
+            flat.iter().all(|m| m.anthropic_thinking_blocks.is_empty()),
+            "no thinking block may survive the flattening"
+        );
+        assert!(
+            flat.iter().all(|m| m.responses_reasoning_items.is_empty()),
+            "no reasoning item may survive the flattening"
+        );
+        // The turns themselves still read correctly.
+        assert_eq!(flat[1].content.as_deref(), Some("[called tools: t]"));
+        assert_eq!(flat[3].content.as_deref(), Some("done"));
     }
 
     /// An assistant message that has *both* text and tool_calls keeps its text

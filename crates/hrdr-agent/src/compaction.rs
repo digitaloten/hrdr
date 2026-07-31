@@ -181,6 +181,45 @@ summary.";
 /// Max bytes of a tool-result body kept when shrinking a compaction request.
 pub(crate) const ELIDE_TOOL_RESULT_BYTES: usize = 400;
 
+/// The last shrink stage [`Agent::compact`] will escalate to: full history,
+/// elided tool results, then the most recent 1/2, 1/4 and 1/8 of it.
+const MAX_COMPACT_STAGE: usize = 4;
+
+/// Output cap for the summarization call.
+///
+/// Bounded rather than inherited: the session's `max_tokens` is now the model's
+/// real ceiling (128k on the current Claude and GPT models), and a summarizer
+/// left to run against that can spend minutes and a fortune producing prose
+/// nobody asked for. 32k is far more than the structured summary needs — it is
+/// a backstop against a runaway, not a target — while leaving ample room for a
+/// thinking model to reason before it writes.
+const COMPACT_MAX_OUTPUT_TOKENS: u32 = 32_768;
+
+/// Tokens held back from the window when sizing the summarization request: the
+/// output cap above, plus slack for the summarizer's own system prompt, the
+/// trigger, and the estimator's own error.
+const COMPACT_INPUT_HEADROOM: u32 = COMPACT_MAX_OUTPUT_TOKENS + 8_192;
+
+/// The history a given shrink stage sends: the whole head, the head with bulky
+/// tool results elided, then the most recent 1/2, 1/4, 1/8 of the elided head.
+///
+/// `elided` memoizes the (O(n), allocating) elision across stages, since every
+/// stage above 0 starts from it.
+fn compact_stage_history(
+    stage: usize,
+    full: &[ChatMessage],
+    elided: &mut Option<Vec<ChatMessage>>,
+) -> Vec<ChatMessage> {
+    if stage == 0 {
+        return full.to_vec();
+    }
+    let elided = elided.get_or_insert_with(|| elide_tool_results(full));
+    match stage {
+        1 => elided.clone(),
+        n => tail_window(elided, 1 << (n - 1)),
+    }
+}
+
 /// Index where the kept-verbatim tail begins for compaction. Keeps the last
 /// `tail_turns` turns (a turn begins at a `role:"user"` message), but no more
 /// than `preserve_tokens` estimated tokens — walking newest → oldest, adding
@@ -592,7 +631,19 @@ impl Agent {
         // sees and retry: first elide bulky tool results, then keep only the
         // most recent half/quarter/eighth of the conversation.
         let full: Vec<ChatMessage> = self.messages[1..tail_start].to_vec();
-        let mut stage = 0usize;
+        // Elision is O(history) and allocates a copy of it; the stages above 0
+        // all start from the same elided copy, so build it at most once instead
+        // of once per attempt (stage 3 used to rebuild it, then window it).
+        let mut elided: Option<Vec<ChatMessage>> = None;
+        // Start at the first stage that stands a chance rather than always at
+        // stage 0. Compaction is usually triggered *by* a context overflow, so
+        // the summarization request is near the limit too — and each doomed
+        // attempt is a full upload of the whole history to be told, one round
+        // trip later, what could have been computed locally. The estimator
+        // under-counts (~4 bytes/token, and code is denser than that), so a
+        // wrong guess errs toward starting too early, which the escalation
+        // below still handles: this only skips stages that plainly cannot fit.
+        let mut stage = self.first_viable_compact_stage(&full, &mut elided);
         // Bounded retry (with the same backoff the main turn loop uses) for a
         // transient 429/503 hitting the summarization request itself — without
         // this, compaction (often triggered *because* the model is under
@@ -607,11 +658,7 @@ impl Agent {
         // request (connect and drain) — see `connect_and_drain`.
         let mut budget = RetryBudget::new(self.retry_policy);
         let summary = loop {
-            let history = match stage {
-                0 => full.clone(),
-                1 => elide_tool_results(&full),
-                n => tail_window(&elide_tool_results(&full), 1 << (n - 1)),
-            };
+            let history = compact_stage_history(stage, &full, &mut elided);
             // The summarizer is sent no `tools` (it must answer in prose), but
             // `history` still carries tool_use/tool_result blocks from the
             // conversation being summarized — including, if a `/compact` lands
@@ -682,9 +729,55 @@ impl Agent {
         Ok((before, self.messages.len()))
     }
 
+    /// The first shrink stage whose request plausibly fits the context window,
+    /// so the doomed attempts before it are never uploaded.
+    ///
+    /// `None` window (an endpoint that never said, and no configured value)
+    /// means there is nothing to size against: start at 0 and let the escalation
+    /// discover the limit the slow way, exactly as before.
+    fn first_viable_compact_stage(
+        &self,
+        full: &[ChatMessage],
+        elided: &mut Option<Vec<ChatMessage>>,
+    ) -> usize {
+        let Some(window) = self.context_window else {
+            return 0;
+        };
+        let budget = window.saturating_sub(COMPACT_INPUT_HEADROOM);
+        if budget == 0 {
+            // A window smaller than the headroom: nothing can be sized, and
+            // guessing the smallest stage would throw away the history for a
+            // model that may still have room. Let the escalation decide.
+            return 0;
+        }
+        (0..MAX_COMPACT_STAGE)
+            .find(|&stage| {
+                estimate_tokens_in_messages(&compact_stage_history(stage, full, elided)) <= budget
+            })
+            .unwrap_or(MAX_COMPACT_STAGE)
+    }
+
     /// Run one no-tools request to completion, returning the streamed text.
     /// Silent: the shared [`drain_stream`] gets a no-op event sink.
+    ///
+    /// The output cap is scoped to this call ([`COMPACT_MAX_OUTPUT_TOKENS`]) and
+    /// the session's own is restored on every exit, error included — the client
+    /// is the live one the next turn will use, so leaving a summarizer's cap on
+    /// it would silently truncate the model's real replies.
     async fn plain_completion(&mut self, req: Vec<ChatMessage>) -> Result<String> {
+        let saved = self.client.params().clone();
+        self.client.set_params(hrdr_llm::RequestParams {
+            max_tokens: Some(COMPACT_MAX_OUTPUT_TOKENS),
+            ..saved.clone()
+        });
+        let result = self.plain_completion_inner(req).await;
+        self.client.set_params(saved);
+        result
+    }
+
+    /// [`Self::plain_completion`]'s body, split out so the parameter restore
+    /// above cannot be skipped by an early `?`.
+    async fn plain_completion_inner(&mut self, req: Vec<ChatMessage>) -> Result<String> {
         let mut stream = self.client.chat_stream(&req, &[]).await?;
         // The round's generation time is dropped on purpose: a compaction call
         // emits no `Usage` event, so its tokens never reach the turn's
@@ -693,6 +786,17 @@ impl Agent {
         // A summarization request carries no `tools[]` (see the `&[]` above), so
         // there is no tool surface in its prompt to estimate.
         self.account_usage(&acc, 0).await;
+        // A summary cut off at the output cap is the one truncation that must
+        // never be accepted quietly: this text REPLACES the conversation, so
+        // half of it is not a degraded answer but a permanently missing half of
+        // the session — and it would read as complete to every later turn.
+        // Refusing leaves the real history in place, which is recoverable.
+        if acc.truncated() {
+            bail!(
+                "the summary was cut off at the output limit ({COMPACT_MAX_OUTPUT_TOKENS} \
+                 tokens) — refusing to replace the conversation with a partial summary"
+            );
+        }
         Ok(acc.into_message().content.unwrap_or_default())
     }
 
@@ -745,5 +849,98 @@ impl Agent {
                 )));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hrdr_llm::ChatMessage;
+
+    /// A message of roughly `tokens` estimated size (~4 bytes per token).
+    fn sized(role: Role, tokens: usize) -> ChatMessage {
+        let body = "x".repeat(tokens * 4);
+        match role {
+            Role::Tool => ChatMessage::tool_result("call-1", body),
+            Role::User => ChatMessage::user(body),
+            _ => ChatMessage::assistant(body),
+        }
+    }
+
+    /// The stage ladder: full history, elided tool results, then successively
+    /// smaller tails — and the elision is computed once and reused, not rebuilt
+    /// per stage.
+    #[test]
+    fn compact_stage_history_shrinks_and_memoizes_the_elision() {
+        let full: Vec<ChatMessage> = (0..8)
+            .map(|i| {
+                if i % 2 == 0 {
+                    sized(Role::User, 100)
+                } else {
+                    sized(Role::Tool, 1_000)
+                }
+            })
+            .collect();
+        let mut elided = None;
+
+        let stage0 = compact_stage_history(0, &full, &mut elided);
+        assert_eq!(stage0.len(), full.len(), "stage 0 is the whole head");
+        assert!(elided.is_none(), "stage 0 must not pay for the elision");
+
+        let stage1 = compact_stage_history(1, &full, &mut elided);
+        assert_eq!(stage1.len(), full.len(), "elision keeps every message");
+        assert!(elided.is_some(), "the elided copy is memoized");
+        assert!(
+            estimate_tokens_in_messages(&stage1) < estimate_tokens_in_messages(&stage0),
+            "eliding tool results must shrink the request"
+        );
+
+        // Each later stage keeps a smaller tail, and none of them rebuilds the
+        // elided copy (the memo is already populated and is reused as-is).
+        let stage2 = compact_stage_history(2, &full, &mut elided);
+        let stage3 = compact_stage_history(3, &full, &mut elided);
+        assert!(stage2.len() <= stage1.len());
+        assert!(stage3.len() <= stage2.len());
+    }
+
+    /// Pre-sizing skips the stages that cannot fit, so a doomed request is never
+    /// uploaded — but only when a window is actually known, and it never
+    /// over-shrinks past the last stage.
+    #[test]
+    fn first_viable_stage_skips_what_cannot_fit() {
+        let mut agent = crate::Agent::new(crate::AgentConfig::default()).unwrap();
+        // ~40k estimated tokens of tool output in the head.
+        let full: Vec<ChatMessage> = (0..10)
+            .map(|i| {
+                if i % 2 == 0 {
+                    sized(Role::User, 50)
+                } else {
+                    sized(Role::Tool, 8_000)
+                }
+            })
+            .collect();
+
+        // No window: nothing to size against, so behaviour is unchanged.
+        agent.set_context_window(None);
+        let mut elided = None;
+        assert_eq!(agent.first_viable_compact_stage(&full, &mut elided), 0);
+
+        // A window with ample room for the whole head still starts at 0.
+        agent.set_context_window(Some(400_000));
+        let mut elided = None;
+        assert_eq!(agent.first_viable_compact_stage(&full, &mut elided), 0);
+
+        // A window that the full head cannot fit skips straight past stage 0.
+        agent.set_context_window(Some(COMPACT_INPUT_HEADROOM + 20_000));
+        let mut elided = None;
+        let stage = agent.first_viable_compact_stage(&full, &mut elided);
+        assert!(stage > 0, "a doomed stage 0 must be skipped, got {stage}");
+        assert!(stage <= MAX_COMPACT_STAGE);
+
+        // A window smaller than the headroom has nothing to size against and
+        // must not throw the history away on a guess.
+        agent.set_context_window(Some(1_000));
+        let mut elided = None;
+        assert_eq!(agent.first_viable_compact_stage(&full, &mut elided), 0);
     }
 }

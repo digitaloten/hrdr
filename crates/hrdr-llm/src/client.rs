@@ -770,6 +770,16 @@ impl Client {
         self.params = params;
     }
 
+    /// The opt-in request parameters currently in force.
+    ///
+    /// Exists so a caller can make a **scoped** change — one out-of-band request
+    /// with a different output cap — and put back exactly what it found, rather
+    /// than reconstructing the session's parameters from a config it may no
+    /// longer have (see `hrdr_agent`'s summarization call).
+    pub fn params(&self) -> &crate::RequestParams {
+        &self.params
+    }
+
     /// Rebuild the HTTP client with a connect + per-chunk read timeout (so a
     /// hung or stalled provider fails the request instead of blocking forever).
     /// `None` sets a 300-second connect and per-chunk read timeout. (This differs
