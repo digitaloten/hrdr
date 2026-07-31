@@ -1,7 +1,8 @@
 //! Rendering: transcript + TODO panel + vim input pane + status line.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -14,7 +15,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Entry, EntryKind, StatusBarMode, TimestampStyle};
+use crate::app::{App, Entry, EntryKind, HitRect, SelectionSpan, StatusBarMode, TimestampStyle};
 use crate::theme::Theme;
 use hrdr_app::relative_time;
 
@@ -220,6 +221,66 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         app.completion_idx = app.completion_idx.min(comp.items.len() - 1);
         draw_completion(f, app, chunks[input_idx], &comp);
     }
+
+    // Last, over everything: the mouse selection (which reads the cells the rest
+    // of the frame just painted) and the toast stack.
+    draw_selection(f, app);
+    hjkl_holler_tui::render_active(
+        f,
+        area,
+        &app.toasts,
+        &hjkl_holler_tui::HollerLayout::default(),
+        std::time::SystemTime::now(),
+    );
+}
+
+/// Highlight the cells under the mouse selection and, once the drag has ended,
+/// hand their text to the clipboard.
+///
+/// The selection lives in screen coordinates and is resolved against the frame
+/// that has just been painted — what the reader sees selected is exactly what is
+/// copied, whatever produced those cells (a wrapped reply, a diff, a tool
+/// block). Selecting flows through the ends of the rows it crosses, like a
+/// terminal's own selection, rather than cutting a rectangular block.
+fn draw_selection(f: &mut Frame, app: &mut App) {
+    let Some(span) = app.selection_span() else {
+        // The selection went away before its frame (a key, a scroll): there is
+        // nothing to read the text out of, so the copy goes with it rather than
+        // firing against whatever is selected next.
+        app.pending_copy = false;
+        return;
+    };
+    let text = paint_selection(f.buffer_mut(), app.transcript_rect, span);
+    // The copy waits for this frame because only a painted frame has the text.
+    if std::mem::take(&mut app.pending_copy) {
+        app.copy_selection(&text);
+    }
+}
+
+/// Reverse-video the cells the selection covers and return their text, one row
+/// per line with trailing blanks trimmed. Split out from [`draw_selection`] so
+/// the geometry can be tested against a rendered buffer.
+fn paint_selection(buf: &mut Buffer, rect: HitRect, span: SelectionSpan) -> String {
+    let ((from_col, from_row), (to_col, to_row)) = span;
+    let last_col = (rect.x + rect.w).saturating_sub(1);
+    let mut text = String::new();
+    for row in from_row..=to_row {
+        let first = if row == from_row { from_col } else { rect.x };
+        let last = if row == to_row { to_col } else { last_col };
+        let mut line = String::new();
+        for col in first..=last {
+            let Some(cell) = buf.cell_mut(Position::new(col, row)) else {
+                continue;
+            };
+            cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+            line.push_str(cell.symbol());
+        }
+        text.push_str(line.trim_end());
+        if row != to_row {
+            text.push('\n');
+        }
+    }
+    text
 }
 
 /// One row of a two-column picker: a left label and a right-aligned detail.
@@ -828,8 +889,15 @@ fn clamp_u16(n: usize) -> u16 {
 }
 
 fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
-    // Publish the height so key handlers can compute half-page offsets.
+    // Publish the height so key handlers can compute half-page offsets, and the
+    // whole rect so a mouse drag knows what it may select.
     app.transcript_height = area.height;
+    app.transcript_rect = crate::app::HitRect {
+        x: area.x,
+        y: area.y,
+        w: area.width,
+        h: area.height,
+    };
 
     // Reserve the rightmost column for the scrollbar. Left padding is applied
     // per-block via pad_line's leading bg-coloured space.
@@ -2861,6 +2929,88 @@ mod clamp_tests {
         // What the bug actually did: `100_000 as u16` truncates to
         // `100_000 % 65_536 = 34_464` — nowhere near u16::MAX.
         assert_ne!(clamp_u16(100_000), (100_000usize % 65_536) as u16);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::{Buffer, HitRect, Modifier, Position, Rect, paint_selection};
+
+    /// A buffer with `rows` written left-aligned, one per line.
+    fn buffer(rows: &[&str], width: u16) -> Buffer {
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, rows.len() as u16));
+        for (y, row) in rows.iter().enumerate() {
+            for (x, ch) in row.chars().enumerate() {
+                if let Some(cell) = buf.cell_mut(Position::new(x as u16, y as u16)) {
+                    cell.set_symbol(&ch.to_string());
+                }
+            }
+        }
+        buf
+    }
+
+    /// A selection inside one row copies just that run of cells, and marks them.
+    #[test]
+    fn a_one_row_selection_copies_the_run_under_it() {
+        let mut buf = buffer(&["hello world"], 20);
+        let rect = HitRect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 1,
+        };
+
+        assert_eq!(paint_selection(&mut buf, rect, ((6, 0), (10, 0))), "world");
+        assert!(
+            buf.cell(Position::new(6, 0))
+                .expect("cell")
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "the selected cells are highlighted"
+        );
+        assert!(
+            !buf.cell(Position::new(5, 0))
+                .expect("cell")
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "and only those"
+        );
+    }
+
+    /// A selection across rows flows through the ends of the rows it crosses —
+    /// it is a terminal-style selection, not a rectangular block — and each row
+    /// loses its trailing blanks.
+    #[test]
+    fn a_multi_row_selection_flows_through_the_row_ends() {
+        let mut buf = buffer(&["first line", "second", "third line"], 20);
+        let rect = HitRect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 3,
+        };
+
+        assert_eq!(
+            paint_selection(&mut buf, rect, ((6, 0), (4, 2))),
+            "line\nsecond\nthird"
+        );
+    }
+
+    /// Trailing blanks are trimmed per row, so a selection dragged past the end
+    /// of the text doesn't copy the padding it swept over.
+    #[test]
+    fn trailing_blanks_are_trimmed() {
+        let mut buf = buffer(&["short"], 20);
+        let rect = HitRect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 1,
+        };
+
+        assert_eq!(paint_selection(&mut buf, rect, ((0, 0), (19, 0))), "short");
     }
 }
 

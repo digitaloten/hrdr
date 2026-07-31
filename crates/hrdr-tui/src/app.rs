@@ -10,6 +10,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use hjkl_clipboard::Clipboard;
+use hjkl_holler::HollerBus;
 use hrdr_agent::{Agent, AgentConfig, AgentEvent, Todo};
 use hrdr_editor::{PlainEngine, TuiEditorEngine, VimEngine};
 use tokio::sync::mpsc;
@@ -124,6 +125,35 @@ impl HitRect {
     pub fn contains(&self, col: u16, row: u16) -> bool {
         col >= self.x && col < self.x + self.w && row >= self.y && row < self.y + self.h
     }
+
+    /// `(col, row)` pulled inside this rectangle — a drag that leaves the
+    /// transcript still selects up to its edge.
+    pub fn clamp(&self, col: u16, row: u16) -> (u16, u16) {
+        (
+            col.clamp(self.x, (self.x + self.w).saturating_sub(1)),
+            row.clamp(self.y, (self.y + self.h).saturating_sub(1)),
+        )
+    }
+}
+
+/// An ordered selection: its `(start, end)` screen cells, top-left first.
+pub(crate) type SelectionSpan = ((u16, u16), (u16, u16));
+
+/// A mouse drag across the transcript, in screen cells. The text under it is
+/// harvested from the rendered frame — what is on screen is what is copied — so
+/// the selection is held as screen coordinates, not transcript offsets, and dies
+/// the moment the frame beneath it can no longer be trusted (a key, a scroll).
+#[derive(Clone, Copy)]
+pub(crate) struct MouseSelection {
+    /// Where the button went down, and where the pointer is now. Either may be
+    /// the earlier of the two on screen — [`App::selection_span`] orders them.
+    anchor: (u16, u16),
+    head: (u16, u16),
+    /// The button is still down: the head still follows the pointer.
+    dragging: bool,
+    /// The pointer left the anchor cell, which is what tells a selection from a
+    /// plain click (the click the transcript's blocks answer to).
+    moved: bool,
 }
 
 // The transcript item model + its representation-independent queries
@@ -504,6 +534,17 @@ pub(crate) struct App {
     /// call that spawned it; a left click jumps to that transcript entry. `None`
     /// for a row with no call context, whose click is a no-op.
     pub(crate) subagent_hits: Vec<(HitRect, hrdr_app::PaneId)>,
+    /// Screen rect of the transcript, set during draw: the region a drag may
+    /// select from, and the frame the selected text is read back out of.
+    pub(crate) transcript_rect: HitRect,
+    /// The live mouse selection over the transcript, if any.
+    pub(crate) selection: Option<MouseSelection>,
+    /// Set when the button comes up on a real drag: the next frame — the one
+    /// that has the rendered cells — harvests the selected text and copies it.
+    pub(crate) pending_copy: bool,
+    /// Toast notifications (copy/paste feedback), drawn over the top-right of
+    /// the screen and dismissed by their own TTLs.
+    pub(crate) toasts: HollerBus,
     /// Set after one idle Ctrl+C; a second consecutive Ctrl+C quits. Any other
     /// key (or a mouse action) disarms it.
     pub(crate) quit_armed: bool,
@@ -703,6 +744,15 @@ impl App {
             steering: hrdr_agent::steering_queue(),
             end_button: None,
             tool_hits: Vec::new(),
+            transcript_rect: HitRect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
+            selection: None,
+            pending_copy: false,
+            toasts: HollerBus::new(),
             background_tasks,
             subagent_hits: Vec::new(),
             quit_armed: false,
@@ -862,6 +912,9 @@ impl App {
         if key.code != KeyCode::Esc {
             self.cancel_armed = false;
         }
+        // A mouse selection is anchored to cells of the frame it was drawn on;
+        // typing is about to redraw them.
+        self.selection = None;
 
         // A `/resume` refused a session held open elsewhere and armed an offer to
         // open a forked copy: `f`/`y` forks, any other key cancels (and is then
@@ -992,6 +1045,25 @@ impl App {
                     } else {
                         self.stash.push(draft);
                         self.editor.set_content("");
+                    }
+                    return Action::None;
+                }
+                // Ctrl+] pastes the clipboard into the input, for terminals
+                // (and remote sessions) where the terminal's own paste doesn't
+                // reach the app as a bracketed paste.
+                KeyCode::Char(']') => {
+                    match hrdr_app::clipboard_read_text(&self.clipboard) {
+                        Some(text) if !text.is_empty() => {
+                            let chars = text.chars().count();
+                            self.on_paste(&text);
+                            self.toasts.info(format!("pasted {chars} chars"));
+                        }
+                        Some(_) => {
+                            self.toasts.warn("clipboard is empty");
+                        }
+                        None => {
+                            self.toasts.warn("clipboard unavailable");
+                        }
                     }
                     return Action::None;
                 }
@@ -1465,12 +1537,16 @@ impl App {
         }
         match m.kind {
             MouseEventKind::ScrollUp => {
+                // The rows under a selection are about to be different rows.
+                self.selection = None;
                 self.scroll_offset = self.scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
             }
             MouseEventKind::ScrollDown => {
+                self.selection = None;
                 self.scroll_offset = self.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                self.selection = None;
                 if let Some(rect) = self.end_button
                     && rect.contains(m.column, m.row)
                 {
@@ -1495,26 +1571,103 @@ impl App {
                     self.focus_pane(id);
                     return;
                 }
-                // Click a tool block to toggle its full output (per-entry /expand).
-                let hit = self
-                    .tool_hits
-                    .iter()
-                    .find(|(r, _)| r.contains(m.column, m.row))
-                    .map(|(_, i)| *i);
-                if let Some(idx) = hit
-                    && let Some(EntryKind::Tool { expanded, .. }) = self
-                        .panes
-                        .active_transcript_mut()
-                        .get_mut(idx)
-                        .map(|e| &mut e.kind)
+                // Inside the transcript the button going down is the start of a
+                // drag, not yet a click: what it turns out to be is settled on
+                // the way up, once we know whether the pointer moved.
+                if self.transcript_rect.contains(m.column, m.row) {
+                    self.selection = Some(MouseSelection {
+                        anchor: (m.column, m.row),
+                        head: (m.column, m.row),
+                        dragging: true,
+                        moved: false,
+                    });
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(sel) = &mut self.selection
+                    && sel.dragging
                 {
-                    *expanded = !*expanded;
-                    // The block's height just changed; keep its top where the
-                    // reader is looking instead of letting it slide.
-                    self.pending_scroll_entry = Some(idx);
+                    let head = self.transcript_rect.clamp(m.column, m.row);
+                    sel.moved |= head != sel.anchor;
+                    sel.head = head;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(sel) = &mut self.selection else {
+                    return;
+                };
+                sel.dragging = false;
+                if sel.moved {
+                    // A real drag: the next frame reads the cells under it back
+                    // out and copies them.
+                    self.pending_copy = true;
+                } else {
+                    // A click after all — the transcript's own hit targets get it.
+                    self.selection = None;
+                    self.toggle_tool_at(m.column, m.row);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Toggle the full output of the tool block under `(col, row)`, if a click
+    /// landed on one (the per-entry equivalent of `/expand`).
+    fn toggle_tool_at(&mut self, col: u16, row: u16) {
+        let hit = self
+            .tool_hits
+            .iter()
+            .find(|(r, _)| r.contains(col, row))
+            .map(|(_, i)| *i);
+        if let Some(idx) = hit
+            && let Some(EntryKind::Tool { expanded, .. }) = self
+                .panes
+                .active_transcript_mut()
+                .get_mut(idx)
+                .map(|e| &mut e.kind)
+        {
+            *expanded = !*expanded;
+            // The block's height just changed; keep its top where the reader is
+            // looking instead of letting it slide.
+            self.pending_scroll_entry = Some(idx);
+        }
+    }
+
+    /// The selection as an ordered `(start, end)` pair of screen cells, reading
+    /// order (top-left first). `None` when nothing is selected.
+    pub(crate) fn selection_span(&self) -> Option<((u16, u16), (u16, u16))> {
+        let sel = self.selection?;
+        let (a, b) = (sel.anchor, sel.head);
+        // Compare row-major: a selection flows through the ends of the rows it
+        // crosses, like a terminal's own, not as a rectangular block.
+        Some(if (a.1, a.0) <= (b.1, b.0) {
+            (a, b)
+        } else {
+            (b, a)
+        })
+    }
+
+    /// Put the text under the finished selection on the clipboard, and say so in
+    /// a toast — the transcript belongs to the conversation, so copy feedback
+    /// goes to the toast stack rather than pushing a notice into it.
+    pub(crate) fn copy_selection(&mut self, text: &str) {
+        let text = text.trim_end_matches('\n');
+        if text.trim().is_empty() {
+            return;
+        }
+        let lines = text.lines().count();
+        let plural = if lines == 1 { "" } else { "s" };
+        match hrdr_app::clipboard_copy(&mut self.clipboard, text) {
+            hrdr_app::ClipboardWrite::Copied => {
+                self.toasts
+                    .info(format!("copied {lines} line{plural} to clipboard"));
+            }
+            hrdr_app::ClipboardWrite::Failed => {
+                self.toasts.error("clipboard write failed");
+            }
+            hrdr_app::ClipboardWrite::Unavailable => {
+                self.toasts.warn("clipboard unavailable");
+            }
         }
     }
 

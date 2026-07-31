@@ -309,6 +309,8 @@ Review the working-tree diff. Focus on: $ARGUMENTS
 | `@name` / `@path`         | Mention a sub-agent (routes to it), attach a file, or attach a directory's listing                       |
 | `Ctrl+G`                  | Edit the input in `$EDITOR` / `$VISUAL`                                                                  |
 | `PageUp/Down`, mouse      | Scroll the transcript; `End` follows the newest output                                                   |
+| Drag in the transcript    | Select text; releasing copies it to the clipboard (a toast confirms)                                     |
+| `Ctrl+]`                  | Paste the clipboard into the input                                                                       |
 | `Ctrl+L`                  | Clear + repaint the screen                                                                               |
 | `Ctrl+S`                  | Stash the input (a stack); on an empty input, pop the newest stash back                                  |
 | `Ctrl+C`                  | Clear a non-empty input; on an empty one, interrupt the running turn or `!command`                       |

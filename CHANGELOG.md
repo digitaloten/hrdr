@@ -8,6 +8,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Select to copy.** Dragging the mouse across the transcript highlights the
+  cells under the pointer and, on release, copies what they say to the clipboard
+  — the app captures the mouse, so the terminal's own selection never reached
+  it. Selection flows through the ends of the rows it crosses (a terminal-style
+  selection, not a rectangular block) and trailing blanks are trimmed. A plain
+  click still toggles the tool block under it; the two are told apart by whether
+  the pointer moved before the button came up.
+
+- **`Ctrl+]` pastes the clipboard into the input**, for terminals and remote
+  sessions where a paste doesn't arrive as a bracketed paste.
+
+- **Toast notifications** (`hjkl-holler`), floated over the top-right of the
+  screen and dismissed by their own TTLs. Copy/paste feedback goes there instead
+  of into the transcript, which belongs to the conversation.
+
 - **`Ctrl+S` stashes the input.** A non-empty input box is pushed onto a stash
   stack and cleared; pressing `Ctrl+S` on an empty box pops the newest one back.
   The stash is a stack, so several drafts can wait at once (last stashed, first

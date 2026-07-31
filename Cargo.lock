@@ -1359,6 +1359,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hjkl-holler"
+version = "0.33.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1150d1a104e11d0965fa5c1e749496034c0d65e7a10efb34b35d1a14abeef750"
+
+[[package]]
+name = "hjkl-holler-tui"
+version = "0.33.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1dc788414064b764188409d19410eb8af19398d40d14a88c030801e99b04219b"
+dependencies = [
+ "hjkl-holler",
+ "ratatui",
+]
+
+[[package]]
 name = "hjkl-icons"
 version = "0.33.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1626,6 +1642,8 @@ dependencies = [
  "crossterm",
  "futures-util",
  "hjkl-clipboard",
+ "hjkl-holler",
+ "hjkl-holler-tui",
  "hjkl-icons",
  "hjkl-markdown",
  "hjkl-markdown-tui",

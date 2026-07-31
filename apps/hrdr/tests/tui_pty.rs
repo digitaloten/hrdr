@@ -711,3 +711,50 @@ fn resize_is_survived_and_eof_exits_cleanly() -> Result<(), String> {
     );
     Ok(())
 }
+
+/// 10. A mouse drag across the transcript selects text and copies it on release.
+///
+/// The app captures the mouse, so the terminal's own select-to-copy never
+/// reaches it — this is the replacement, and only a real terminal proves the
+/// whole chain: SGR mouse reports arriving as press/drag/release, the cells
+/// being read back out of the painted frame, and the toast that reports the
+/// result. The outcome depends on whether the machine has a clipboard at all
+/// (a headless runner does not), so the assertion is on the word every outcome
+/// carries rather than on the copy succeeding.
+#[test]
+fn a_mouse_drag_selects_the_transcript_and_copies_it() -> Result<(), String> {
+    if skip_for_want_of_a_pty() {
+        return Ok(());
+    }
+    let server = MockServer::start(vec![]);
+    let mut s = Session::spawn(&server.base_url());
+    s.wait_for("mock-model", BOOT);
+
+    // SGR mouse reports (1-based cells): press left, drag with it held (button
+    // 0 + the 32 motion bit), release. The band covers the banner and welcome
+    // text at the top of the transcript, so there is something under it.
+    s.send("\x1b[<0;4;4M");
+    s.send("\x1b[<32;60;12M");
+    s.send("\x1b[<0;60;12m");
+
+    s.wait_for("clipboard", EXIT);
+    assert!(
+        s.is_alive(),
+        "a drag-copy must not take the TUI down. Screen:\n{}",
+        s.snapshot()
+    );
+    assert!(
+        !s.snapshot().contains("panicked at"),
+        "the TUI panicked on a drag-copy. Screen:\n{}",
+        s.snapshot()
+    );
+
+    s.send("quit\r");
+    let status = s.wait_exit(EXIT);
+    assert!(
+        status.success(),
+        "clean exit after a drag-copy. Screen:\n{}",
+        s.snapshot()
+    );
+    Ok(())
+}

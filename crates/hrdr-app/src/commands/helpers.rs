@@ -151,22 +151,42 @@ pub fn session_saved_notice(id: &str) -> String {
     format!("session saved as '{id}' — /resume {id}")
 }
 
-/// Copy `text` to the OS clipboard, returning the status line both frontends
-/// show. `cb` is the frontend's long-lived clipboard handle (`None` when the
-/// platform has none).
-pub fn clipboard_copy_status(
-    cb: &mut Option<hjkl_clipboard::Clipboard>,
-    text: &str,
-    label: &str,
-) -> String {
+/// How a clipboard write went. Callers that only want the status line take
+/// [`clipboard_copy_status`]; callers that also grade the outcome (a toast's
+/// severity, say) match on this.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClipboardWrite {
+    Copied,
+    Failed,
+    /// The platform has no clipboard at all.
+    Unavailable,
+}
+
+/// Copy `text` to the OS clipboard. `cb` is the frontend's long-lived clipboard
+/// handle (`None` when the platform has none).
+pub fn clipboard_copy(cb: &mut Option<hjkl_clipboard::Clipboard>, text: &str) -> ClipboardWrite {
     use hjkl_clipboard::{MimeType, Selection};
     match cb
         .as_mut()
         .map(|cb| cb.set(Selection::Clipboard, MimeType::Text, text.as_bytes()))
     {
-        Some(Ok(())) => format!("copied {label} to clipboard"),
-        Some(Err(_)) => "clipboard write failed".to_string(),
-        None => "clipboard unavailable".to_string(),
+        Some(Ok(())) => ClipboardWrite::Copied,
+        Some(Err(_)) => ClipboardWrite::Failed,
+        None => ClipboardWrite::Unavailable,
+    }
+}
+
+/// Copy `text` to the OS clipboard, returning the status line both frontends
+/// show.
+pub fn clipboard_copy_status(
+    cb: &mut Option<hjkl_clipboard::Clipboard>,
+    text: &str,
+    label: &str,
+) -> String {
+    match clipboard_copy(cb, text) {
+        ClipboardWrite::Copied => format!("copied {label} to clipboard"),
+        ClipboardWrite::Failed => "clipboard write failed".to_string(),
+        ClipboardWrite::Unavailable => "clipboard unavailable".to_string(),
     }
 }
 

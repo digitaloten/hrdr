@@ -2758,12 +2758,21 @@ async fn clicking_a_tool_block_toggles_its_expansion() {
         "the tool hit rect misses the tool header at row {header_y}"
     );
 
-    // Clicking it expands the block; clicking again collapses it.
-    let click = |y: u16| MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: 2,
-        row: y,
-        modifiers: crossterm::event::KeyModifiers::empty(),
+    // Clicking it expands the block; clicking again collapses it. A click is
+    // press *and* release on the same cell — the transcript only knows a click
+    // from the start of a select-to-copy drag once the button comes back up.
+    let click = |app: &mut App, y: u16| {
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.on_mouse(MouseEvent {
+                kind,
+                column: 2,
+                row: y,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            });
+        }
     };
     let expanded = |app: &App| {
         app.transcript()
@@ -2771,11 +2780,103 @@ async fn clicking_a_tool_block_toggles_its_expansion() {
             .any(|e| matches!(&e.kind, EntryKind::Tool { expanded, .. } if *expanded))
     };
     assert!(!expanded(&h.app), "starts collapsed");
-    h.app.on_mouse(click(header_y));
+    click(&mut h.app, header_y);
     assert!(expanded(&h.app), "the click expanded it");
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
-    h.app.on_mouse(click(header_y));
+    click(&mut h.app, header_y);
     assert!(!expanded(&h.app), "the second click collapsed it");
+}
+
+/// Copy/paste feedback goes to a toast, not the transcript: it is chrome about
+/// the terminal, not part of the conversation, and it dismisses itself.
+#[tokio::test]
+async fn a_toast_paints_over_the_screen() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.toasts.info("copied 2 lines");
+
+    let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+
+    let screen = buffer_to_string(term.backend().buffer());
+    assert!(
+        screen.contains("copied 2 lines"),
+        "the toast renders:\n{screen}"
+    );
+    assert!(
+        !h.app
+            .transcript()
+            .iter()
+            .any(|e| format!("{:?}", e.kind).contains("copied 2 lines")),
+        "and stays out of the transcript"
+    );
+}
+
+/// Dragging across the transcript selects the cells under the pointer and, when
+/// the button comes up, copies what they say — the drag never reaches the tool
+/// block it started on, so selecting text can't toggle a block open.
+#[tokio::test]
+async fn dragging_the_transcript_selects_and_copies_instead_of_clicking() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::user("go"));
+    h.app.push_entry(Entry::now(EntryKind::Tool {
+        id: "c1".into(),
+        name: "bash".into(),
+        args: r#"{"command":"ls"}"#.into(),
+        result: "SELECTABLE".into(),
+        ok: true,
+        done: true,
+        expanded: false,
+    }));
+
+    let mut term = Terminal::new(TestBackend::new(40, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
+    let mouse = |kind, column, row| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    };
+
+    // Press on the tool header, drag two cells along it, release.
+    h.app.on_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        2,
+        rect.y + 1,
+    ));
+    h.app.on_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        12,
+        rect.y + 1,
+    ));
+    assert!(h.app.selection.is_some(), "the drag started a selection");
+    h.app
+        .on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 12, rect.y + 1));
+    assert!(h.app.pending_copy, "releasing a drag queues the copy");
+    assert!(
+        !h.app
+            .transcript()
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::Tool { expanded, .. } if *expanded)),
+        "a drag is not a click: the block it started on stays collapsed"
+    );
+
+    // The frame after the release harvests the cells and reports the result.
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(!h.app.pending_copy, "the copy ran on the next frame");
+    assert!(
+        h.app.toasts.last_body().is_some(),
+        "the copy says how it went in a toast"
+    );
+
+    // Anything that redraws those cells drops the selection.
+    h.press(KeyCode::Char('x'));
+    assert!(h.app.selection.is_none(), "a keypress clears the selection");
 }
 
 /// The per-turn stats line closes the turn's block instead of opening one of its
@@ -3149,12 +3250,17 @@ async fn collapsing_a_tool_block_keeps_it_at_the_top_of_the_view() {
     // Click it: the block collapses, and its top comes to the viewport's top.
     let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
     assert!(rect.contains(2, before));
-    h.app.on_mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: 2,
-        row: before,
-        modifiers: crossterm::event::KeyModifiers::empty(),
-    });
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        h.app.on_mouse(MouseEvent {
+            kind,
+            column: 2,
+            row: before,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+    }
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
 
     let after = header_row(&term).expect("tool header still on screen");
@@ -3193,12 +3299,17 @@ async fn collapsing_while_following_stays_at_the_bottom() {
 
     // The header is off the top of a long expanded block; click its last row.
     let (rect, _) = h.app.tool_hits.first().copied().expect("a tool hit rect");
-    h.app.on_mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: 2,
-        row: rect.y,
-        modifiers: crossterm::event::KeyModifiers::empty(),
-    });
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        h.app.on_mouse(MouseEvent {
+            kind,
+            column: 2,
+            row: rect.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+    }
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
 
     assert_eq!(h.app.scroll_offset, 0, "still following the newest output");
