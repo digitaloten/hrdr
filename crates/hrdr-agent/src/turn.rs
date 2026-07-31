@@ -18,6 +18,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::AgentEvent;
 
+/// Characters per output token, for the round in flight only. The usual rule of
+/// thumb for English and code alike, and it only has to hold until the provider
+/// reports that round's real count (see [`TurnStats::out_tokens`]).
+const CHARS_PER_TOKEN: usize = 4;
+
 /// The live state of one agent's turn.
 ///
 /// Two clocks, deliberately: `infer_*` is how long the model has been *on the
@@ -41,9 +46,10 @@ pub struct TurnStats {
     /// text, reasoning *and* tool-call arguments, which is the whole point of
     /// preferring its count to a delta tally (see [`Self::out_tokens`]).
     banked_tokens: usize,
-    /// Streamed deltas since the last usage report: the live stand-in for the
-    /// round in flight, discarded once the provider's real count lands.
-    live_deltas: usize,
+    /// Characters streamed since the last usage report: the live stand-in for
+    /// the round in flight (see [`Self::live_tokens`]), discarded once the
+    /// provider's real count lands.
+    live_chars: usize,
     /// Tool calls in flight this round. While any is running the model is idle.
     pub tools_running: usize,
     /// Model working time banked from earlier stretches of this turn.
@@ -80,7 +86,7 @@ impl TurnStats {
         match ev {
             // A streamed delta: the first one is time-to-first-token, and it
             // starts the generation clock for the round on screen.
-            AgentEvent::Text(_) | AgentEvent::Reasoning(_) => {
+            AgentEvent::Text(delta) | AgentEvent::Reasoning(delta) => {
                 self.first_token_at.get_or_insert_with(Instant::now);
                 // Only inside a turn: a delta recorded against an agent with no
                 // turn open (a replay, a test) must not start a clock that
@@ -88,7 +94,7 @@ impl TurnStats {
                 if self.started.is_some() {
                     self.decode_live.get_or_insert_with(Instant::now);
                 }
-                self.live_deltas += 1;
+                self.live_chars += delta.chars().count();
             }
             // The model has handed off: it is idle until every tool of this round
             // returns, so its clock stops rather than inflating the turn with time
@@ -120,13 +126,13 @@ impl TurnStats {
                 self.decode_live = None;
                 self.decode_banked += Duration::from_millis(*decode_ms as u64);
                 // A server that reports no completion tokens (some local ones
-                // report zeros) leaves the delta tally as the round's best
-                // estimate — never zero out a count we did observe.
+                // report zeros) leaves the live estimate as the round's best
+                // figure — never zero out output we did watch arrive.
                 self.banked_tokens += match *completion_tokens {
-                    0 => self.live_deltas,
+                    0 => self.live_tokens(),
                     n => n as usize,
                 };
-                self.live_deltas = 0;
+                self.live_chars = 0;
                 self.last_cached_tokens = *cached_prompt_tokens;
                 self.last_reasoning_tokens = *reasoning_tokens;
             }
@@ -166,11 +172,7 @@ impl TurnStats {
     /// How long the model has actually worked this turn: the banked stretches plus
     /// the one in progress. Excludes time spent waiting on tool calls.
     pub fn infer_elapsed(&self) -> Duration {
-        self.infer_banked
-            + self
-                .infer_started
-                .map(|t| t.elapsed())
-                .unwrap_or(Duration::ZERO)
+        elapsed(self.infer_banked, self.infer_started)
     }
 
     /// How long the model spent actually emitting tokens this turn: the measured
@@ -180,11 +182,15 @@ impl TurnStats {
     /// yields no tokens, which is what makes it the only honest denominator for
     /// throughput.
     pub fn decode_elapsed(&self) -> Duration {
-        self.decode_banked
-            + self
-                .decode_live
-                .map(|t| t.elapsed())
-                .unwrap_or(Duration::ZERO)
+        elapsed(self.decode_banked, self.decode_live)
+    }
+
+    /// The round in flight's output, estimated from the characters streamed so
+    /// far. An estimate, but a stable one: counting *deltas* instead measures the
+    /// provider's chunk size, so the same reply read as a different rate
+    /// depending on whether the server sent it a token or a sentence at a time.
+    fn live_tokens(&self) -> usize {
+        self.live_chars.div_ceil(CHARS_PER_TOKEN)
     }
 
     /// Output tokens produced this turn, across every round.
@@ -192,9 +198,9 @@ impl TurnStats {
     /// The provider's own count for each finished round, so tool-call arguments
     /// and reasoning are in it — a delta tally sees neither, and a turn spent
     /// writing files is nearly all tool-call arguments. Only the round in flight
-    /// is a delta estimate, and it is replaced the moment that round reports.
+    /// is estimated, and the estimate is replaced the moment that round reports.
     pub fn out_tokens(&self) -> usize {
-        self.banked_tokens + self.live_deltas
+        self.banked_tokens + self.live_tokens()
     }
 
     /// Time-to-first-token, in seconds.
@@ -205,15 +211,19 @@ impl TurnStats {
 
     /// Output tokens per second of *generation* time — see [`Self::decode_elapsed`].
     /// Neither the tool calls it waited on nor the prefill it sat through count
-    /// against the model here.
+    /// against the model here. Zero until something has been generated: a rate
+    /// over no elapsed time is not a fast model, it is no measurement.
     pub fn tok_per_sec(&self) -> f64 {
-        let secs = self.decode_elapsed().as_secs_f64();
-        match self.out_tokens() {
-            0 => 0.0,
-            n if secs > 0.0 => n as f64 / secs,
+        match self.decode_elapsed().as_secs_f64() {
+            secs if secs > 0.0 => self.out_tokens() as f64 / secs,
             _ => 0.0,
         }
     }
+}
+
+/// A two-part clock read: the stretches already banked, plus the one running.
+fn elapsed(banked: Duration, running: Option<Instant>) -> Duration {
+    banked + running.map(|t| t.elapsed()).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -277,10 +287,52 @@ mod tests {
         let mut t = TurnStats::default();
         t.begin();
         assert_eq!(t.ttft(), None, "nothing has streamed yet");
-        t.record(&AgentEvent::Text("a".into()));
-        t.record(&AgentEvent::Reasoning("b".into()));
-        assert_eq!(t.out_tokens(), 2, "reasoning is output too");
+        t.record(&AgentEvent::Text("four".into()));
+        t.record(&AgentEvent::Reasoning("four".into()));
+        assert_eq!(
+            t.out_tokens(),
+            2,
+            "reasoning is output too — 8 chars is ~2 tokens"
+        );
         assert!(t.ttft().is_some(), "the first delta is time-to-first-token");
+        assert!(t.tok_per_sec() > 0.0);
+    }
+
+    /// The live estimate is measured in characters, not in deltas. A delta is a
+    /// *chunk*, and chunk size is the provider's choice: one server streams a
+    /// token at a time, another a whole sentence. Counting them made the same
+    /// reply read as wildly different rates depending on who served it — and
+    /// then snap to the true figure the moment the round reported.
+    #[test]
+    fn the_live_estimate_does_not_depend_on_how_the_reply_was_chunked() {
+        let text = "the quick brown fox jumps over the lazy dog";
+
+        let mut one_chunk = TurnStats::default();
+        one_chunk.begin();
+        one_chunk.record(&AgentEvent::Text(text.into()));
+
+        let mut many_chunks = TurnStats::default();
+        many_chunks.begin();
+        for word in text.split_inclusive(' ') {
+            many_chunks.record(&AgentEvent::Text(word.into()));
+        }
+
+        assert_eq!(one_chunk.out_tokens(), many_chunks.out_tokens());
+        assert_eq!(
+            one_chunk.out_tokens(),
+            text.len().div_ceil(4),
+            "~4 characters to the token"
+        );
+    }
+
+    /// Anything streamed is at least a token: a rate of zero while text is
+    /// visibly arriving reads as a stalled model.
+    #[test]
+    fn a_partial_token_still_counts_as_one() {
+        let mut t = TurnStats::default();
+        t.begin();
+        t.record(&AgentEvent::Text("hi".into()));
+        assert_eq!(t.out_tokens(), 1);
         assert!(t.tok_per_sec() > 0.0);
     }
 
@@ -349,13 +401,17 @@ mod tests {
     fn a_reported_round_replaces_its_own_estimate() {
         let mut t = TurnStats::default();
         t.begin();
-        t.record(&AgentEvent::Text("a".into()));
-        t.record(&AgentEvent::Text("b".into()));
-        assert_eq!(t.out_tokens(), 2, "deltas stand in until the round reports");
+        t.record(&AgentEvent::Text("aaaa".into()));
+        t.record(&AgentEvent::Text("bbbb".into()));
+        assert_eq!(
+            t.out_tokens(),
+            2,
+            "the estimate stands in until the round reports"
+        );
         t.record(&usage(500, 50));
         assert_eq!(t.out_tokens(), 500, "not 502");
         // And the next round accumulates on top.
-        t.record(&AgentEvent::Text("c".into()));
+        t.record(&AgentEvent::Text("cccc".into()));
         assert_eq!(t.out_tokens(), 501);
         t.record(&usage(100, 50));
         assert_eq!(t.out_tokens(), 600);
@@ -366,14 +422,14 @@ mod tests {
         );
     }
 
-    /// Some local servers report zeros. Banking that would erase a count we
-    /// watched arrive, so the delta tally stands for that round.
+    /// Some local servers report zeros. Banking that would erase output we
+    /// watched arrive, so the live estimate stands for that round.
     #[test]
     fn a_round_reporting_no_tokens_keeps_what_was_observed() {
         let mut t = TurnStats::default();
         t.begin();
-        t.record(&AgentEvent::Text("a".into()));
-        t.record(&AgentEvent::Reasoning("b".into()));
+        t.record(&AgentEvent::Text("four".into()));
+        t.record(&AgentEvent::Reasoning("four".into()));
         t.record(&usage(0, 40));
         assert_eq!(t.out_tokens(), 2);
         assert!(t.tok_per_sec() > 0.0, "and it still reads as throughput");

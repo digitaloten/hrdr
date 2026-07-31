@@ -52,6 +52,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the quit confirmation); any other key disarms it, so a stray `Esc` can no
   longer kill a long turn or a running `!command`.
 
+### Fixed
+
+- **The live `tok/s` figure no longer measures the provider's chunk size.** The
+  round in flight was estimated by counting streamed _deltas_ as tokens, so the
+  same reply read as a different rate depending on whether the server sent it a
+  token or a sentence at a time — and then snapped to the true figure when the
+  round reported. The estimate is now taken from the characters streamed (~4 to
+  the token), which is stable across providers; finished rounds keep using the
+  provider's own count, as before.
+
 ## [0.9.3] - 2026-07-31
 
 ### Fixed
