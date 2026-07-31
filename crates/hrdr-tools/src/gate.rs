@@ -239,9 +239,11 @@ fn tool_family(command: &str) -> String {
 /// one, and reading it would be paying to parse a data blob.
 const MAX_CI_BYTES: u64 = 512 * 1024;
 
-/// How many CI files are read at all. A monorepo can carry dozens of workflows,
-/// and the gate is a summary — reading the first handful in sorted order gets
-/// the same answer as reading all of them, deterministically.
+/// How many *scanned* CI files are read at all. A monorepo can carry dozens of
+/// workflows, and the gate is a summary — reading the first handful in sorted
+/// order gets the same answer as reading all of them, deterministically. That
+/// holds within the workflow directories; the single-file configs are counted
+/// separately, since dropping a whole provider is not "the same answer".
 const MAX_CI_FILES: usize = 16;
 
 /// Keys whose value is shell, across every provider. `command` is CircleCI's
@@ -346,13 +348,20 @@ fn ci_files(root: &Path) -> Vec<PathBuf> {
         found.sort();
         out.extend(found);
     }
+    // Cap the directory scan *before* the named configs go on. `MAX_CI_FILES`
+    // is justified by "the first handful in sorted order gets the same answer",
+    // which holds inside one workflow directory and not at all across
+    // providers: truncating the combined list would let a monorepo with
+    // sixteen workflows hide `.gitlab-ci.yml` — a different pipeline, possibly
+    // the only one carrying the gate — entirely. `NAMED` is a fixed, short
+    // list, so appending it unconditionally still bounds the total.
+    out.truncate(MAX_CI_FILES);
     for name in NAMED {
         let path = root.join(name);
         if path.is_file() {
             out.push(path);
         }
     }
-    out.truncate(MAX_CI_FILES);
     out
 }
 
@@ -1103,5 +1112,30 @@ jobs:
         let gate = Gate::detect(dir.path());
         assert_eq!(commands(&gate), vec!["cargo test --workspace"]);
         assert_eq!(gate.origins, vec![".github/workflows/b.yml".to_string()]);
+    }
+
+    /// A workflow directory past `MAX_CI_FILES` must not push the single-file
+    /// configs out of the list. The cap is a per-directory summary, not a
+    /// budget the providers compete for — a repo with seventeen release
+    /// workflows and one GitLab pipeline still gates on the GitLab pipeline.
+    #[test]
+    fn many_workflows_do_not_hide_a_single_file_config() {
+        let dir = TempDir::new().expect("tempdir");
+        for i in 0..MAX_CI_FILES + 4 {
+            write(
+                dir.path(),
+                &format!(".github/workflows/{i:02}.yml"),
+                "jobs:\n  t:\n    steps:\n      - run: echo nothing to see here\n",
+            );
+        }
+        write(
+            dir.path(),
+            ".gitlab-ci.yml",
+            "test:\n  script:\n    - cargo test --workspace\n",
+        );
+        let gate = Gate::detect(dir.path());
+        assert_eq!(gate.source, Some(GateSource::Ci));
+        assert_eq!(commands(&gate), vec!["cargo test --workspace"]);
+        assert_eq!(gate.origins, vec![".gitlab-ci.yml".to_string()]);
     }
 }

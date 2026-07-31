@@ -454,12 +454,17 @@ fn parse_ddg(html: &str, n: usize) -> Vec<Hit> {
             .find("result__a")
             .map(|r| after + r)
             .unwrap_or(html.len());
+        // Every step stays inside the block, not just the class lookup: a
+        // `result__snippet` sitting right at `block_end` with its tag or its
+        // `</a>` beyond it would otherwise scan on into the next result and
+        // lift *its* text. Bounded, a malformed block yields no snippet, which
+        // is the honest answer.
         let snippet = html[after..block_end]
             .find("result__snippet")
             .and_then(|srel| {
                 let s = after + srel;
-                let sgt = html[s..].find('>')? + s + 1;
-                let send = html[sgt..].find("</a>")? + sgt;
+                let sgt = html[s..block_end].find('>')? + s + 1;
+                let send = html[sgt..block_end].find("</a>")? + sgt;
                 Some(collapse_ws(&decode_entities(&strip_tags(&html[sgt..send]))))
             })
             .unwrap_or_default();
@@ -588,11 +593,11 @@ fn is_internal_host_literal(host: &str) -> bool {
     false
 }
 
-/// Whether `ip` is a loopback/private/link-local/unique-local address —
-/// covers 127.0.0.0/8, 10/8, 172.16/12, 192.168/16, 169.254/16 (incl. the
-/// cloud metadata endpoint 169.254.169.254), `::1`, `fc00::/7`, `fe80::/10`,
-/// and an IPv4-mapped IPv6 address whose embedded v4 address is any of the
-/// above.
+/// Whether `ip` is a loopback/private/shared/link-local/unique-local address —
+/// covers 127.0.0.0/8, 10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16
+/// (incl. the cloud metadata endpoint 169.254.169.254), `::1`, `fc00::/7`,
+/// `fe80::/10`, and an IPv4-mapped IPv6 address whose embedded v4 address is
+/// any of the above.
 fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_blocked_ipv4(v4),
@@ -613,6 +618,12 @@ fn is_blocked_ipv4(v4: Ipv4Addr) -> bool {
         || v4.is_private() // 10/8, 172.16/12, 192.168/16
         || v4.is_link_local() // 169.254/16, incl. 169.254.169.254 (cloud metadata)
         || v4.is_unspecified() // 0.0.0.0
+        // 100.64/10 (RFC 6598 carrier-grade NAT). Not routable on the public
+        // internet, and hosting providers hand it to internal service meshes
+        // and ingress ranges — reaching one from a fetch is the same class of
+        // mistake as reaching 10/8. Spelled out rather than `Ipv4Addr::is_shared`,
+        // which is still behind the unstable `ip` feature.
+        || matches!(v4.octets(), [100, 64..=127, _, _])
 }
 
 // ---- small HTML helpers (no extra dependencies) ----
@@ -742,7 +753,20 @@ fn decode_entities(s: &str) -> String {
 /// The value of an HTML attribute within a single tag string (handles `"` / `'`).
 fn attr_value(tag: &str, attr: &str) -> Option<String> {
     let key = format!("{attr}=");
-    let start = tag.find(&key)? + key.len();
+    // The name has to *start* where the match does. A plain `find` also hits
+    // the tail of `data-href=` or `xlink:href=`, and then reads that
+    // attribute's value as if it were the one asked for — a wrong result URL
+    // out of a DDG result that carries both. Attribute names are separated
+    // from the tag name and from each other by whitespace, so a preceding
+    // whitespace character is the boundary; nothing else can precede one.
+    let mut from = 0;
+    let start = loop {
+        let at = from + tag[from..].find(&key)?;
+        if tag[..at].ends_with(char::is_whitespace) {
+            break at + key.len();
+        }
+        from = at + key.len();
+    };
     let rest = &tag[start..];
     let quote = rest.chars().next()?;
     if quote == '"' || quote == '\'' {
@@ -899,8 +923,12 @@ mod tests {
         assert!(is_blocked_host("http://172.16.0.5/x"));
         assert!(is_blocked_host("http://172.31.255.254/x"));
         assert!(is_blocked_host("http://192.168.1.1/x"));
+        // 100.64/10 (RFC 6598 shared address space) counts as private here too.
+        assert!(is_blocked_host("http://100.64.0.1/x"));
         // 172.32.x is outside the private /12 range — not blocked.
         assert!(!is_blocked_host("http://172.32.0.1/x"));
+        // …and 100.128.x is past the end of the /10 — also not blocked.
+        assert!(!is_blocked_host("http://100.128.0.1/x"));
     }
 
     /// The IP-level helper itself flags the cloud metadata address, an
@@ -913,6 +941,8 @@ mod tests {
         assert!(is_blocked_ip("::ffff:127.0.0.1".parse().unwrap()));
         assert!(is_blocked_ip("fc00::1".parse().unwrap()));
         assert!(is_blocked_ip("fe80::1".parse().unwrap()));
+        assert!(is_blocked_ip("100.100.0.1".parse().unwrap())); // 100.64/10 (RFC 6598)
+        assert!(!is_blocked_ip("100.128.0.1".parse().unwrap())); // just past the /10
         assert!(!is_blocked_ip("8.8.8.8".parse().unwrap()));
         assert!(!is_blocked_ip("2001:4860:4860::8888".parse().unwrap())); // public v6
     }
@@ -1000,11 +1030,42 @@ mod tests {
         assert_eq!(hits[0].1, "https://x");
     }
 
+    /// A result whose snippet markup is broken gets no snippet — it must not
+    /// reach past the end of its own block and read the next result's text.
+    #[test]
+    fn a_malformed_snippet_does_not_borrow_the_next_result() {
+        // The first result's snippet tag is never closed, so the next `>` in
+        // the document belongs to the *second* result's anchor.
+        let html = concat!(
+            "<a class=\"result__a\" href=\"http://a\">Title A</a>\n",
+            "<a class=\"result__snippet\"\n",
+            "<a class=\"result__a\" href=\"http://b\">Title B</a>\n",
+            "<a class=\"result__snippet\">Snippet B</a>\n",
+        );
+        let hits = parse_ddg(html, 5);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, "Title A");
+        assert_eq!(hits[0].2, "", "a broken block yields nothing, not B's text");
+        assert_eq!(hits[1].0, "Title B");
+        assert_eq!(hits[1].2, "Snippet B");
+    }
+
     #[test]
     fn extracts_attr() {
         assert_eq!(
             attr_value("<a class=\"result__a\" href=\"http://x\">", "href"),
             Some("http://x".to_string())
+        );
+        // An attribute whose name merely *ends* with the one asked for is a
+        // different attribute, and its value is not the answer.
+        assert_eq!(
+            attr_value("<a data-href=\"wrong\" href=\"right\">", "href"),
+            Some("right".to_string())
+        );
+        assert_eq!(
+            attr_value("<a xlink:href=\"only-this\">", "href"),
+            None,
+            "no real href means no value, not the namespaced one's",
         );
     }
 }

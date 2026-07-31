@@ -142,7 +142,7 @@ pub async fn run_file_hooks(hooks: &[Hook], tool: &str, path: &Path, cwd: &Path)
             }
             Ok(Err(e)) => notes.push(format!("[hook `{}` couldn't run: {e}]", hook.run)),
             Err(_) => notes.push(format!(
-                "[hook `{}` timed out after {}ms; killed]",
+                "[hook `{}` timed out after {}s; killed]",
                 hook.run, hook.timeout_secs
             )),
         }
@@ -332,7 +332,7 @@ pub async fn run_event_hooks(
                 .notes
                 .push(format!("[hook `{}` couldn't run: {e}]", hook.run)),
             Err(_) => out.notes.push(format!(
-                "[hook `{}` timed out after {}ms; killed]",
+                "[hook `{}` timed out after {}s; killed]",
                 hook.run, hook.timeout_secs
             )),
         }
@@ -431,7 +431,13 @@ mod tests {
         slow.timeout_secs = 1;
         let notes = run_file_hooks(&[slow], "edit", &file, dir.path()).await;
         assert_eq!(notes.len(), 1);
-        assert!(notes[0].contains("timed out"), "{}", notes[0]);
+        // The whole number, with its unit: the note said `1ms` for a full
+        // second once, because the format string outlived the field rename.
+        assert!(
+            notes[0].contains("timed out after 1s"),
+            "the timeout note must carry the field's real unit: {}",
+            notes[0]
+        );
     }
 
     #[cfg(unix)] // only the unix-gated integration test below builds these
@@ -529,5 +535,20 @@ mod tests {
         assert!(out.block.is_none());
         assert_eq!(out.notes.len(), 1);
         assert!(out.notes[0].contains("broken"), "{}", out.notes[0]);
+
+        // A hung hook is killed at its timeout and reports it in seconds — the
+        // unit the field is actually in. One second, not the old `100`: that
+        // was 100 *milliseconds* back when the field was `timeout_ms`, and
+        // reading it as seconds would make this wait a minute and a half.
+        let mut slow = event_hook(HookEvent::TurnEnd, "*", "sleep 5");
+        slow.timeout_secs = 1;
+        let out = run_event_hooks(&[slow], HookEvent::TurnEnd, None, &payload, dir.path()).await;
+        assert!(out.block.is_none());
+        assert_eq!(out.notes.len(), 1);
+        assert!(
+            out.notes[0].contains("timed out after 1s"),
+            "the timeout note must carry the field's real unit: {}",
+            out.notes[0]
+        );
     }
 }
