@@ -1287,6 +1287,25 @@ impl Client {
     ///
     /// Returns `None` when nothing exposes it (e.g. OpenAI itself, or infr
     /// today), so the caller can fall back to a configured/default value.
+    ///
+    /// # Known gap: Ollama
+    ///
+    /// Ollama's OpenAI-compatible surface publishes no window anywhere this
+    /// probe can see it. Its `/v1/models` entries are `{id, object, created,
+    /// owned_by}` and nothing more (`openai.go`'s `Model` struct), and it serves
+    /// no `/props`, so both branches come back empty and an Ollama user has to
+    /// set `context_window` in config.
+    ///
+    /// Deliberately not worked around here. Reaching the number means leaving
+    /// the OpenAI shape entirely — `POST /api/show`, reading
+    /// `model_info["<arch>.context_length"]` — and even that answers the wrong
+    /// question: it reports what the MODEL supports, while what a request
+    /// actually gets is Ollama's own `num_ctx`, which defaults far below the
+    /// model's maximum unless the user raises it. A probe that confidently
+    /// returned the model's ceiling would overstate the real window, which is
+    /// the direction that overflows rather than compacts (the same trap as
+    /// llama.cpp's `n_ctx_train` — see [`context_field`]). An explicitly
+    /// configured value is both more honest and more correct.
     pub async fn context_window(&self) -> Option<u32> {
         if let Some(n) = self.context_from_models().await {
             return Some(n);
