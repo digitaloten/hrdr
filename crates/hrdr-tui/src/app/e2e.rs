@@ -4313,11 +4313,12 @@ async fn the_scroll_buttons_float_above_the_input_and_are_clickable() {
     assert_eq!(end.y, home.y, "same row:\n{screen}");
     assert!(home.x >= end.x + end.w, "HOME right of END:\n{screen}");
 
-    // Two rows above the input pane, so they don't sit on the pane itself.
+    // Directly above the input pane, on the layout's spacer row — close enough
+    // to read as part of the input, without covering the pane itself.
     let pane_top = (0..20)
         .find(|&y| buf.cell(Position::new(2, y)).unwrap().bg == h.app.theme.user_bg)
         .expect("the input pane renders");
-    assert_eq!(end.y + 2, pane_top, "two rows above the pane:\n{screen}");
+    assert_eq!(end.y + 1, pane_top, "one row above the pane:\n{screen}");
 
     // Clicking HOME jumps to the top of the session.
     h.app.on_mouse(MouseEvent {
@@ -4526,8 +4527,8 @@ async fn the_generating_line_closes_the_transcript() {
     };
 
     let loader_y = find("inferring");
-    // Last in the scrollback: below the todo panel, above the input pane.
-    assert!(loader_y > find("ship it"), "below the todos:\n{screen}");
+    // It heads the panels: above the todo list, and above the input pane.
+    assert!(loader_y < find("ship it"), "above the todos:\n{screen}");
     assert!(loader_y < find("draft"), "above the input:\n{screen}");
 
     // A blank, untinted row above it (the panel before it ends with its own
@@ -6331,11 +6332,12 @@ async fn the_todo_panel_shows_the_active_agents_list() {
     assert!(screen.contains("sub task"), "sub-agent's todos:\n{screen}");
 }
 
-/// Regression: the TODO panel must not render while any sub-agent has
-/// `PaneStatus::Running`. A running main agent must not hide TODOs, and
-/// idle/done sub-agents must not hide them either.
+/// The TODO list stays up while sub-agents run. It used to be suppressed to
+/// save the rows the layout charged for it; the panels ride in the scrollback
+/// now, so there are no rows to save — and hiding the plan exactly while the
+/// work is being done is the wrong half of the trade.
 #[tokio::test]
-async fn the_todo_panel_hides_while_a_sub_agent_is_running() {
+async fn the_todo_panel_stays_up_while_a_sub_agent_runs() {
     let mut h = Harness::new(vec![]).await;
 
     // Give the main agent a TODO.
@@ -6379,18 +6381,20 @@ async fn the_todo_panel_hides_while_a_sub_agent_is_running() {
     });
     h.app.sync_panes();
 
-    // With a running sub-agent, the TODO panel should be hidden even though
-    // the main agent has TODOs.
+    // Both lists are up: the plan on the active agent, and the agents working it.
     let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
     assert!(
-        !screen.contains("main task"),
-        "main-agent todos hidden while sub-agent runs:\n{screen}"
+        screen.contains("main task"),
+        "the active agent's todos stay while a sub-agent runs:\n{screen}"
+    );
+    assert!(
+        screen.contains("explore"),
+        "and so does the list:\n{screen}"
     );
 
-    // Mark the sub-agent as no longer running (done). After re-sync, the TODO
-    // panel should reappear.
+    // And they are still there once the sub-agent is done.
     h.app.registry.update(sub_key, |s| {
         s.running = false;
         s.done = true;
@@ -6398,8 +6402,5 @@ async fn the_todo_panel_hides_while_a_sub_agent_is_running() {
     h.app.sync_panes();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let screen = buffer_to_string(term.backend().buffer());
-    assert!(
-        screen.contains("main task"),
-        "main-agent todos reappear when sub-agent done:\n{screen}"
-    );
+    assert!(screen.contains("main task"), "still listed:\n{screen}");
 }

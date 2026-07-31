@@ -1062,17 +1062,6 @@ fn draw_scrollbar(f: &mut Frame, app: &App, area: Rect, max_scroll: usize, offse
 /// The list belongs to the agent on screen — every agent has its own, and the
 /// `todo` tool a sub-agent calls writes to *its* list, not the main one's.
 fn todo_lines(app: &App) -> Option<(Vec<Line<'static>>, Option<usize>)> {
-    // Hide the list while a sub-agent is running: when one is mid-turn the
-    // viewer is watching that sub-agent's own thinking, not its task list. A
-    // running main agent does not suppress it.
-    if app
-        .panes
-        .subs()
-        .iter()
-        .any(|p| p.status == hrdr_app::PaneStatus::Running)
-    {
-        return None;
-    }
     let mut todos = app
         .panes
         .active_pane()
@@ -1272,30 +1261,27 @@ fn loader_line(app: &App) -> Option<Line<'static>> {
 /// window minus the input.
 fn live_panel_chunks(app: &App, width: u16) -> Vec<Chunk<'static>> {
     let w = width as usize;
-    let bg = app.theme.user_bg;
     let mut out = Vec::new();
 
-    // A block, its left rule, and what a click on each of its body rows does.
-    // Each panel carries the blank row above it that used to come from its
-    // layout section, so it never butts against the block before it.
-    let mut panel = |body: Vec<Line<'static>>, rule: Color, hits: Vec<(usize, RowHit)>| {
-        out.push(separator());
-        out.push(Chunk {
-            rows: ChunkRows::Ready(Rc::new(render_block(body, w, bg, Some(rule)))),
-            tool_idx: None,
-            row_hits: hits,
-        });
-    };
-
+    if let Some(line) = loader_line(app) {
+        // No block chrome: the loader is a single status row on the terminal's
+        // own background, as it was when it sat above the input. It heads the
+        // panels — it belongs with the reply it is still writing, above the
+        // lists of what is queued up around it.
+        out.extend([
+            separator(),
+            Chunk::plain(ChunkRows::Ready(Rc::new(vec![line])), None),
+        ]);
+    }
     if let Some((body, toggle)) = todo_lines(app) {
-        panel(
+        let hits = toggle.map(|i| (i, RowHit::ToggleDoneTodos));
+        out.extend(panel(
             body,
+            w,
+            app.theme.user_bg,
             app.theme.success,
-            toggle
-                .map(|i| (i, RowHit::ToggleDoneTodos))
-                .into_iter()
-                .collect(),
-        );
+            hits.into_iter().collect(),
+        ));
     }
     if let Some((body, ids)) = subagent_lines(app, w) {
         let hits = ids
@@ -1303,16 +1289,30 @@ fn live_panel_chunks(app: &App, width: u16) -> Vec<Chunk<'static>> {
             .enumerate()
             .map(|(i, id)| (i, RowHit::Agent(id)))
             .collect();
-        panel(body, app.theme.accent, hits);
-    }
-    if let Some(line) = loader_line(app) {
-        // No block chrome: the loader is a single status row on the terminal's
-        // own background, as it was when it sat above the input — and it goes
-        // last, closest to the input, because it is the live one.
-        out.push(separator());
-        out.push(Chunk::plain(ChunkRows::Ready(Rc::new(vec![line])), None));
+        out.extend(panel(body, w, app.theme.user_bg, app.theme.accent, hits));
     }
     out
+}
+
+/// One live panel: the blank row that keeps it off the block above (the spacer
+/// its layout section used to supply), then the panel itself — `bg` behind it, a
+/// `rule`-colored left edge, and `hits` saying what a click on each of its body
+/// rows does.
+fn panel(
+    body: Vec<Line<'static>>,
+    width: usize,
+    bg: Color,
+    rule: Color,
+    hits: Vec<(usize, RowHit)>,
+) -> [Chunk<'static>; 2] {
+    [
+        separator(),
+        Chunk {
+            rows: ChunkRows::Ready(Rc::new(render_block(body, width, bg, Some(rule)))),
+            tool_idx: None,
+            row_hits: hits,
+        },
+    ]
 }
 
 /// Paint a pane wearing the chrome of the user's own surfaces: the prompt's
@@ -1341,34 +1341,44 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = draw_pane(f, &app.theme, area, app.theme.prompt_border);
     app.editor.render(f, inner);
 
-    // The banners all float on the same row above the pane; a pending
-    // confirmation takes the spot when more than one would apply. Only the
-    // follow banner is clickable.
-    //
-    // `●` (U+25CF) is neutral-width and lives in the same geometric-shapes block
-    // as the bars and blocks the TUI already draws, so it can't be
-    // emoji-substituted or rendered double-wide the way `⚠` was.
-    if let Some(label) = confirmation_label(app) {
-        banner(f, area, "●", label, Color::White, app.theme.error);
-        app.end_button = None;
-        app.home_button = None;
-    } else if app.scroll_offset > 0 {
+    // The banners all share the one row above the pane; a pending confirmation
+    // takes it when more than one would apply. Only the scroll buttons are
+    // clickable.
+    let bold = |fg, bg| Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+    let (end, home) = match confirmation_label(app) {
+        // `●` (U+25CF) is neutral-width and lives in the same geometric-shapes
+        // block as the bars and blocks the TUI already draws, so it can't be
+        // emoji-substituted or rendered double-wide the way `⚠` was.
+        Some(label) => {
+            let pill = (
+                format!(" ● {label} ● "),
+                bold(Color::White, app.theme.error),
+            );
+            banner_row(f, area, &[pill]);
+            (None, None)
+        }
         // Two buttons, same color, side by side: END jumps back to the newest
         // output (down), HOME to the top of the session (up) — each arrow points
         // where its button goes.
-        let (end, home) = scroll_banners(f, area, Color::Black, app.theme.warn);
-        let hit = |rect: Rect| crate::app::HitRect {
-            x: rect.x,
-            y: rect.y,
-            w: rect.width,
-            h: rect.height,
-        };
-        app.end_button = Some(hit(end));
-        app.home_button = Some(hit(home));
-    } else {
-        app.end_button = None;
-        app.home_button = None;
-    }
+        None if app.scroll_offset > 0 => {
+            let style = bold(Color::Black, app.theme.warn);
+            let rects = banner_row(
+                f,
+                area,
+                &[
+                    (" ↓ Press END ↓ ".to_string(), style),
+                    (" ↑ Press HOME ↑ ".to_string(), style),
+                ],
+            );
+            match rects[..] {
+                [end, home] => (Some(end.into()), Some(home.into())),
+                _ => unreachable!("two pills in, two rects out"),
+            }
+        }
+        None => (None, None),
+    };
+    app.end_button = end;
+    app.home_button = home;
 }
 
 /// What a pending double-press confirmation should tell the user, if one is
@@ -1385,65 +1395,43 @@ fn confirmation_label(app: &App) -> Option<&'static str> {
     }
 }
 
-/// Rows above the input pane that a banner floats on, clear of its padding.
-const BANNER_LIFT: u16 = 2;
+/// Rows above the input pane that a banner floats on: the blank spacer row the
+/// layout keeps between the scrollback and the pane, so a banner sits right on
+/// top of the input without covering either.
+const BANNER_LIFT: u16 = 1;
 
-/// Render a banner over the transcript, just above the input pane: a bold,
-/// centered, single-row `label` in `fg` on `bg`, flanked by `icon` on each side.
-/// Returns its rect, for click hit-testing.
+/// Paint `pills` side by side on the banner row above `input` — centered as a
+/// group, one blank column between them — and return each one's rect, in order,
+/// for click hit-testing.
 ///
-/// Both banners — "follow output" and the quit confirmation — go through here,
-/// so they sit on the same row and differ only in their icon, text, and colors.
-fn banner(f: &mut Frame, input: Rect, icon: &str, label: &str, fg: Color, bg: Color) -> Rect {
-    let text = format!(" {icon} {label} {icon} ");
-    let w = (text.width() as u16).min(input.width);
-    let rect = Rect {
-        x: input.x + input.width.saturating_sub(w) / 2,
-        y: input.y.saturating_sub(BANNER_LIFT),
-        width: w,
-        height: 1,
-    };
-    let style = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
-    f.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), rect);
-    rect
-}
-
-/// Render the two scroll buttons side by side on the banner row, just above the
-/// input pane: "↓ Press END ↓" (jump to the newest output) and "↑ Press HOME ↑"
-/// (jump to the top), sharing one color. Centered as a pair with a one-column
-/// gap; returns `(end_rect, home_rect)` for click hit-testing.
-fn scroll_banners(f: &mut Frame, input: Rect, fg: Color, bg: Color) -> (Rect, Rect) {
-    let end_text = " ↓ Press END ↓ ";
-    let home_text = " ↑ Press HOME ↑ ";
+/// Every banner goes through here (the scroll buttons, the quit confirmation,
+/// the interrupt confirmation), so they can't drift apart: same row, same
+/// centering, same single-row height. They differ only in their text and colors.
+fn banner_row(f: &mut Frame, input: Rect, pills: &[(String, Style)]) -> Vec<Rect> {
+    /// Blank columns between two pills.
     const GAP: u16 = 1;
-    let end_w = end_text.width() as u16;
-    let home_w = home_text.width() as u16;
-    let total = (end_w + GAP + home_w).min(input.width);
-    let start_x = input.x + input.width.saturating_sub(total) / 2;
-    let y = input.y.saturating_sub(BANNER_LIFT);
-    let style = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
 
-    let end_rect = Rect {
-        x: start_x,
-        y,
-        width: end_w,
-        height: 1,
-    };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(end_text, style))),
-        end_rect,
-    );
-    let home_rect = Rect {
-        x: start_x + end_w + GAP,
-        y,
-        width: home_w,
-        height: 1,
-    };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(home_text, style))),
-        home_rect,
-    );
-    (end_rect, home_rect)
+    let widths: Vec<u16> = pills.iter().map(|(t, _)| t.width() as u16).collect();
+    let total: u16 = widths.iter().sum::<u16>() + GAP * widths.len().saturating_sub(1) as u16;
+    let mut x = input.x + input.width.saturating_sub(total.min(input.width)) / 2;
+    let y = input.y.saturating_sub(BANNER_LIFT);
+
+    pills
+        .iter()
+        .zip(widths)
+        .map(|((text, style), width)| {
+            let rect = Rect {
+                x,
+                y,
+                width: width.min(input.width),
+                height: 1,
+            };
+            let line = Line::from(Span::styled(text.clone(), *style));
+            f.render_widget(Paragraph::new(line), rect);
+            x += width + GAP;
+            rect
+        })
+        .collect()
 }
 
 /// One status-bar section: `(priority, spans)`. Lower priority is kept longer;

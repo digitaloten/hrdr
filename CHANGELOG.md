@@ -38,6 +38,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Their click targets (an agent row, and the TODO panel's new "finished" row)
   scroll with them, like a tool block's.
 
+- **The banner row sits directly above the input.** The END/HOME buttons and the
+  quit/interrupt confirmations moved down a row, onto the layout's spacer, so
+  they read as part of the input rather than floating in the scrollback.
+
+- **The TODO list stays up while sub-agents run.** It was suppressed to save the
+  rows the layout charged for it; the panels ride in the scrollback now, so
+  there are no rows to save, and hiding the plan exactly while the work is being
+  done was the wrong half of that trade.
+
+- **The loader heads the live panels** (above the TODO list and the agent
+  switcher) — it belongs with the reply it is still writing.
+
 - **Finished TODO items are folded away.** The panel lists what is left; the
   completed and cancelled tasks sit behind a `▸ N finished — click to show` row
   until they age out of the list (`todo_ttl`).

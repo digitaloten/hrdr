@@ -120,6 +120,17 @@ pub(crate) struct HitRect {
     pub h: u16,
 }
 
+impl From<ratatui::layout::Rect> for HitRect {
+    fn from(r: ratatui::layout::Rect) -> Self {
+        Self {
+            x: r.x,
+            y: r.y,
+            w: r.width,
+            h: r.height,
+        }
+    }
+}
+
 impl HitRect {
     /// Whether the cell at `(col, row)` is inside this rectangle.
     pub fn contains(&self, col: u16, row: u16) -> bool {
