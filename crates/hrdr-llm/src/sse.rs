@@ -217,16 +217,32 @@ impl SseDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`SseOverflow`] if overflow was flagged by a previous
-    /// [`Self::push`] call — the buffered data may be truncated and must not be
-    /// treated as a complete event stream.
+    /// Returns [`SseOverflow`] when overflow was flagged by an earlier
+    /// [`Self::push`] call **or** when flushing the trailing line here trips the
+    /// cap for the first time — an unterminated final `data:` line is only
+    /// parsed at EOF, so `push` had no way to see it coming. Either way the
+    /// buffered data may be truncated and must not be treated as a complete
+    /// event stream, so every pending event is discarded rather than returned.
     pub fn finish(&mut self) -> Result<Vec<SseEvent>, SseOverflow> {
-        if self.overflowed {
-            return Err(SseOverflow);
-        }
         // A trailing line with no terminating `\n` is still a complete line at EOF.
-        if !self.line_buf.is_empty() {
+        if !self.overflowed && !self.line_buf.is_empty() {
             self.flush_line();
+        }
+        // Recheck: the flush above parses a `data:` line that `push` never saw,
+        // and that parse can hit the cap itself and truncate the value. Checking
+        // only on entry would hand the caller a silently truncated event under
+        // an `Ok`, which every backend reads as "these events are intact" and
+        // feeds straight into JSON parsing — turning a clean overflow into a
+        // misleading parse error.
+        if self.overflowed {
+            // Drop everything buffered so a later `finish`/`drain` cannot leak
+            // the truncated event either.
+            self.ready.clear();
+            self.line_buf.clear();
+            self.cur_data.clear();
+            self.cur_data_started = false;
+            self.cur_event = None;
+            return Err(SseOverflow);
         }
         // A `data:` block with no blank-line terminator is still a complete event
         // once the stream ends.
@@ -518,6 +534,29 @@ mod tests {
             dec.finish().is_err(),
             "overflow flag persists across finish"
         );
+    }
+
+    #[test]
+    fn overflow_first_tripped_by_the_finish_flush_is_reported() {
+        // The trailing line is unterminated, so it is only parsed inside
+        // finish() — after the point where overflow used to be checked. The
+        // truncated event it produces must not come back as Ok.
+        let mut dec = SseDecoder::new();
+        let big = "a".repeat(MAX_BUFFER_BYTES - 10);
+        assert!(dec.push(format!("data: {big}\n").as_bytes()).is_ok());
+        assert!(
+            dec.push(b"data: this-tail-does-not-fit-in-the-remaining-room")
+                .is_ok(),
+            "an unterminated line is not parsed yet, so push cannot know"
+        );
+
+        assert!(
+            dec.finish().is_err(),
+            "the flush at EOF trips the cap and must be reported"
+        );
+        // The truncated event must not leak out of a later call either.
+        assert!(dec.drain().is_empty());
+        assert!(dec.finish().is_err(), "overflow flag persists");
     }
 
     #[test]

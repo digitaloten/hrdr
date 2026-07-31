@@ -562,8 +562,22 @@ fn map_event(state: &mut StreamState, ev: &Value) -> Result<Option<ChatChunk>> {
             // nested `server_error` (transient, retryable) into a terminal
             // "unknown error" that killed the turn.
             let err_obj = ev.get("error").filter(|e| e.is_object()).unwrap_or(ev);
-            let code = err_obj.get("code").and_then(Value::as_str);
-            let msg = error_message(err_obj).unwrap_or_else(|| {
+            // Hybrids of the two shapes turn up as well — the code at the top
+            // level beside a nested object carrying only the message. Read each
+            // field from the nested object first and fall back to the outer
+            // event, because taking the nested object's missing `code` at face
+            // value classifies a top-level `server_error` as terminal and kills
+            // a turn that was worth retrying. When there is no nested object
+            // `err_obj` *is* `ev` and the fallback is a no-op.
+            let code = err_obj
+                .get("code")
+                .and_then(Value::as_str)
+                .or_else(|| ev.get("code").and_then(Value::as_str));
+            let message = err_obj
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| ev.get("message").and_then(Value::as_str));
+            let msg = join_code_message(code, message).unwrap_or_else(|| {
                 // Nothing recognizable at either level: carry the raw event
                 // (bounded) so the failure stays diagnosable instead of the
                 // dead-end "unknown error".
@@ -632,8 +646,15 @@ fn item_str(item: Option<&Value>, key: &str) -> String {
 /// matching the two shapes Responses uses (top-level `error` event and
 /// `response.error`).
 fn error_message(err: &Value) -> Option<String> {
-    let message = err.get("message").and_then(Value::as_str);
-    let code = err.get("code").and_then(Value::as_str);
+    join_code_message(
+        err.get("code").and_then(Value::as_str),
+        err.get("message").and_then(Value::as_str),
+    )
+}
+
+/// Render an already-resolved `code`/`message` pair, for callers that had to
+/// source the two fields from different levels of the payload.
+fn join_code_message(code: Option<&str>, message: Option<&str>) -> Option<String> {
     match (code, message) {
         (Some(c), Some(m)) => Some(format!("{c}: {m}")),
         (_, Some(m)) => Some(m.to_string()),
@@ -1096,6 +1117,48 @@ mod tests {
         assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
         assert!(
             chat_err.message.contains("server_error") && chat_err.message.contains("overloaded"),
+            "{}",
+            chat_err.message
+        );
+    }
+
+    /// The two shapes also mix: the code at the top level, a nested object
+    /// holding only the message. Reading the code from the nested object alone
+    /// yields `None`, and an unknown code classifies as terminal — so a
+    /// retryable `server_error` would end the turn.
+    #[test]
+    fn hybrid_error_event_falls_back_to_the_outer_code() {
+        let mut state = StreamState::default();
+        let hybrid = json!({
+            "type": "error",
+            "code": "server_error",
+            "error": {"message": "try later"}
+        });
+        let err = map_event(&mut state, &hybrid).unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
+        assert!(
+            chat_err.message.contains("server_error") && chat_err.message.contains("try later"),
+            "{}",
+            chat_err.message
+        );
+    }
+
+    /// The mirror hybrid: the message at the top level, a nested object holding
+    /// only the code. The message must not be lost to the empty nested slot.
+    #[test]
+    fn hybrid_error_event_falls_back_to_the_outer_message() {
+        let mut state = StreamState::default();
+        let hybrid = json!({
+            "type": "error",
+            "message": "try later",
+            "error": {"code": "server_error"}
+        });
+        let err = map_event(&mut state, &hybrid).unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
+        assert!(
+            chat_err.message.contains("server_error") && chat_err.message.contains("try later"),
             "{}",
             chat_err.message
         );
