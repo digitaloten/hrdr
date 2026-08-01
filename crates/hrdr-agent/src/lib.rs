@@ -8632,6 +8632,8 @@ mod tests {
             Sse(Vec<String>),
             /// A plain HTTP error status (no body).
             HttpError(u16),
+            /// An HTTP error with a provider error body.
+            HttpErrorBody(u16, String),
         }
 
         impl MockResp {
@@ -8658,6 +8660,16 @@ mod tests {
                          \r\n"
                     )
                     .into_bytes(),
+                    MockResp::HttpErrorBody(status, body) => format!(
+                        "HTTP/1.1 {status} Error\r\n\
+                         Content-Type: application/json\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n\
+                         {body}",
+                        body.len()
+                    )
+                    .into_bytes(),
                 }
             }
         }
@@ -8671,7 +8683,7 @@ mod tests {
 
         impl MockServer {
             async fn start(responses: Vec<MockResp>) -> Self {
-                Self::start_with_hook(responses, |_| {}).await
+                Self::start_with_body_hook(responses, |_, _| {}).await
             }
 
             /// Like [`Self::start`], but `on_request(idx)` fires the instant the
@@ -8684,6 +8696,13 @@ mod tests {
             async fn start_with_hook<H>(responses: Vec<MockResp>, on_request: H) -> Self
             where
                 H: Fn(usize) + Send + Sync + 'static,
+            {
+                Self::start_with_body_hook(responses, move |idx, _| on_request(idx)).await
+            }
+
+            async fn start_with_body_hook<H>(responses: Vec<MockResp>, on_request: H) -> Self
+            where
+                H: Fn(usize, &str) + Send + Sync + 'static,
             {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let port = listener.local_addr().unwrap().port();
@@ -8732,12 +8751,18 @@ mod tests {
                             let remaining = content_len.saturating_sub(body_so_far);
                             if remaining > 0 {
                                 let mut body_buf = vec![0u8; remaining];
-                                let _ = stream.read_exact(&mut body_buf).await;
+                                if stream.read_exact(&mut body_buf).await.is_err() {
+                                    return;
+                                }
+                                buf.extend_from_slice(&body_buf);
                             }
+                            let body = String::from_utf8_lossy(
+                                &buf[headers_end..headers_end + content_len],
+                            );
                             // Send the next queued response. Fire the hook first:
                             // it happens-before the client can observe this reply.
                             if let Some(resp_bytes) = queue.lock().await.pop_front() {
-                                on_request(idx);
+                                on_request(idx, &body);
                                 let _ = stream.write_all(&resp_bytes).await;
                             }
                         });
@@ -9650,6 +9675,78 @@ mod tests {
                 "the wrap-up Notice fires instead: {events:?}"
             );
             assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
+        }
+
+        #[tokio::test]
+        async fn forced_wrap_up_overflow_compacts_canonical_history() {
+            let dir = tempfile::tempdir().unwrap();
+            let test_file = dir.path().join("data.txt");
+            std::fs::write(&test_file, "content").unwrap();
+            let args_json =
+                serde_json::to_string(&json!({"path": test_file.to_string_lossy()})).unwrap();
+
+            let server = MockServer::start(vec![
+                MockResp::Sse(vec![
+                    tool_start_chunk("c1", "call_1", "read"),
+                    tool_args_chunk("c1", &args_json),
+                    tool_calls_stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                MockResp::Sse(vec![
+                    json!({
+                        "error": {
+                            "code": "context_length_exceeded",
+                            "message": "context_length_exceeded"
+                        }
+                    })
+                    .to_string(),
+                ]),
+                MockResp::Sse(vec![
+                    text_chunk("s1", "Summary of the conversation so far."),
+                    stop_chunk("s1"),
+                    "[DONE]".to_string(),
+                ]),
+                MockResp::Sse(vec![
+                    text_chunk("c2", "Wrapped up after compaction."),
+                    stop_chunk("c2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.max_steps = 1;
+            let mut agent = Agent::new(cfg).unwrap();
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+            let before = agent.messages.len();
+            let mut events = Vec::new();
+
+            agent
+                .run_input("read the file", |event| events.push(event))
+                .await
+                .expect("wrap-up overflow should compact canonical history and retry");
+
+            assert!(
+                agent.messages.len() < before,
+                "canonical history must retain successful compaction: {before} -> {}",
+                agent.messages.len()
+            );
+            assert_eq!(
+                agent
+                    .messages
+                    .last()
+                    .and_then(|message| message.content.as_deref()),
+                Some("Wrapped up after compaction.")
+            );
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Text(text) if text.contains("Wrapped up after compaction.")
+            )));
         }
 
         /// Crossing 80% of the tool-round budget earns exactly one soft warning,
@@ -10649,6 +10746,203 @@ mod tests {
                 1,
                 "at most one automatic compaction per turn: {notices:#?}"
             );
+        }
+
+        #[tokio::test]
+        async fn compaction_retries_once_without_the_unsupported_output_cap() {
+            let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = bodies.clone();
+            let server = MockServer::start_with_body_hook(
+                vec![
+                    MockResp::HttpErrorBody(
+                        400,
+                        json!({"error": {"message": "Unsupported parameter: max_output_tokens"}})
+                            .to_string(),
+                    ),
+                    MockResp::Sse(vec![
+                        text_chunk("s1", "Summary of the conversation so far."),
+                        stop_chunk("s1"),
+                        "[DONE]".to_string(),
+                    ]),
+                ],
+                move |_, body| {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
+                },
+            )
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            agent.client.set_params(hrdr_llm::RequestParams {
+                max_tokens: Some(1_234),
+                ..Default::default()
+            });
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+
+            agent
+                .compact(None)
+                .await
+                .expect("the unsupported cap gets one uncapped retry");
+
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 2, "exactly capped then uncapped: {bodies:#?}");
+            // The local mock speaks Chat Completions (`max_tokens`); Codex maps
+            // the same RequestParams field to `max_output_tokens`.
+            assert_eq!(bodies[0]["max_tokens"], 32_768);
+            assert!(
+                bodies[1].get("max_tokens").is_none(),
+                "fallback omits the rejected cap: {bodies:#?}"
+            );
+            assert_eq!(
+                agent.client.params().max_tokens,
+                Some(1_234),
+                "the session's original params survive both attempts"
+            );
+        }
+
+        #[tokio::test]
+        async fn compaction_latches_unsupported_output_cap_across_transient_retries() {
+            let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = bodies.clone();
+            let server = MockServer::start_with_body_hook(
+                vec![
+                    MockResp::HttpErrorBody(
+                        400,
+                        json!({"error": {"message": "Unsupported parameter: max_output_tokens"}})
+                            .to_string(),
+                    ),
+                    MockResp::HttpError(429),
+                    MockResp::HttpError(503),
+                    MockResp::Sse(vec![
+                        text_chunk("s1", "Summary of the conversation so far."),
+                        stop_chunk("s1"),
+                        "[DONE]".to_string(),
+                    ]),
+                ],
+                move |_, body| {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
+                },
+            )
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            agent.client.set_params(hrdr_llm::RequestParams {
+                max_tokens: Some(1_234),
+                ..Default::default()
+            });
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+
+            agent
+                .compact(None)
+                .await
+                .expect("uncapped transient retries eventually succeed");
+
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(
+                bodies.len(),
+                4,
+                "all queued attempts were made: {bodies:#?}"
+            );
+            assert_eq!(bodies[0]["max_tokens"], 32_768);
+            assert!(
+                bodies[1..]
+                    .iter()
+                    .all(|body| body.get("max_tokens").is_none()),
+                "the cap is probed once, then every retry stays uncapped: {bodies:#?}"
+            );
+            assert_eq!(
+                agent.client.params().max_tokens,
+                Some(1_234),
+                "the session's original params survive all attempts"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_drain_time_context_overflow_compacts_once_and_retries() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counter = requests.clone();
+            let server = MockServer::start_with_hook(
+                vec![
+                    MockResp::Sse(vec![
+                        json!({
+                            "error": {
+                                "code": "context_length_exceeded",
+                                "message": "context_length_exceeded"
+                            }
+                        })
+                        .to_string(),
+                    ]),
+                    MockResp::Sse(vec![
+                        text_chunk("s1", "Summary of the conversation so far."),
+                        stop_chunk("s1"),
+                        "[DONE]".to_string(),
+                    ]),
+                    MockResp::Sse(vec![
+                        text_chunk("c1", "Recovered after compaction"),
+                        stop_chunk("c1"),
+                        "[DONE]".to_string(),
+                    ]),
+                ],
+                move |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+            let mut events = Vec::new();
+            agent
+                .run(steering_queue(), |event| events.push(event))
+                .await
+                .expect("drain-time overflow should compact and retry");
+
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                3,
+                "one failed stream + one summary + one successful retry"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        AgentEvent::Notice(message)
+                            if message.contains("compacting and retrying")
+                    ))
+                    .count(),
+                1,
+                "at most one automatic compaction per turn: {events:#?}"
+            );
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Text(text) if text.contains("Recovered after compaction")
+            )));
         }
 
         // ── compaction retries a transient error on the summarization call ────
