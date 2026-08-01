@@ -106,8 +106,8 @@ Releasing — "cut a release" / "cut" / "ship it" / "tag a release":
   it — a patch bump can hide this, because the pin often still resolves.
 - Update the changelog (`CHANGELOG.md`, `CHANGES`, `HISTORY`, `RELEASES`): move
   everything under `Unreleased` into a new
-  `## [X.Y.Z] - YYYY-MM-DD` heading, leave `Unreleased` empty above it, and add the
-  compare link if the file keeps them. If you kept `[Unreleased]` current as you
+  `## [X.Y.Z] - YYYY-MM-DD` heading, leave `Unreleased` empty above it. If you kept
+  `[Unreleased]` current as you
   worked (see Git), this is just an audit — confirm it captures every notable
   change since the last tag (`git log <tag>..HEAD`) and fill any gaps before you
   move it. If `Unreleased` is empty, draft the entries from those commits, under
@@ -117,6 +117,18 @@ Releasing — "cut a release" / "cut" / "ship it" / "tag a release":
   `git log`. If the project has no changelog at all, start one at this release
   rather than skipping it: the entries for THIS version, drafted from the commit
   range, under a `## [Unreleased]` heading kept empty above them.
+- **THE LINK BLOCK AT THE BOTTOM IS PART OF THE EDIT.** Where the file keeps
+  reference links, moving entries under a new heading is only half the job and
+  the half that shows: the new version needs **its own** compare link, and
+  `[Unreleased]` must be **repointed** at the tag you are about to create.
+  ```
+  [Unreleased]: https://…/compare/vX.Y.Z...HEAD     ← now the NEW version
+  [X.Y.Z]:      https://…/compare/vPREV...vX.Y.Z    ← added
+  ```
+  Miss the first and `[Unreleased]` shows the release's own changes forever;
+  miss the second and the heading is a dead link. Before you commit, check that
+  every `## [version]` heading has a matching `[version]:` reference — the
+  release is the moment they drift, and nothing else in the build will tell you.
 - Then: commit `chore: bump version` staging only the manifest, the lockfile and
   the changelog **by name**; tag `vX.Y.Z` matching the version you just wrote; push
   the commit *and* the tag.
