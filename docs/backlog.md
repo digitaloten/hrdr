@@ -34,6 +34,13 @@ left open is under [Review coverage still owed](#review-coverage-still-owed) and
 under
 [Cleared in the 2026-08-01 review pass](#cleared-in-the-2026-08-01-review-pass).
 
+**Pruned again 2026-08-02**, by the backend pass (`7e80605`..`9c3d012`). macOS
+Seatbelt turned out to have been running on CI all along and is closed; Windows
+gained an OS backend for `read` mode and is half closed, with the remaining half
+recorded under [Sandbox follow-ups](#sandbox-follow-ups) as a decision rather
+than an implementation. See
+[Cleared in the 2026-08-02 backend pass](#cleared-in-the-2026-08-02-backend-pass).
+
 Conventions:
 
 - **Symbol names, not line numbers.** Line numbers rot — the old docs cited
@@ -92,11 +99,12 @@ not work.
    whole-tree forms (`git checkout .`, `git restore .`) but not the single-path
    form — the one that discards someone else's uncommitted work file by file.
    And `templates/subagent_write.md` forbids `git checkout`/`restore`/`stash`
-   while `write.md` does not, though the main agent has more authority and the
-   same need. Both surfaced by a real incident: a concurrent hrdr session was
-   editing a file, an unexpected `M` appeared in `git status`, and it was
-   restored away on the assumption that the only other writer was a sub-agent.
-   Recovered because the other session had committed it.
+   outright while the main agent's copy — `write_main.md` since the 2026-08-01
+   split, not `write.md` — only tells it to look first, though the main agent
+   has more authority and the same need. Both surfaced by a real incident: a
+   concurrent hrdr session was editing a file, an unexpected `M` appeared in
+   `git status`, and it was restored away on the assumption that the only other
+   writer was a sub-agent. Recovered because the other session had committed it.
 
 ---
 
@@ -386,12 +394,22 @@ record). What closed and how:
   would have said.
 - **The `git` tool is outside the boundary** — moot: there is no `git` tool, and
   `shell` is wrapped.
-- **macOS Seatbelt has never run** — STILL OPEN and now the only untested
-  backend on a supported platform. Read a first-run denial as "profile too
-  tight" before "sandbox broken"; pty and `/dev/null` writes are the likely
-  first additions.
-- **Windows has no OS layer** — STILL OPEN, unchanged. Software path-guard only;
-  every Windows session gets `NO_OS_SANDBOX_NOTICE`.
+- **macOS Seatbelt has never run** — CLOSED 2026-08-02, see
+  [Cleared in the 2026-08-02 backend pass](#cleared-in-the-2026-08-02-backend-pass).
+  It had been running on every macOS CI job all along; the tests could not say
+  so.
+- **Windows has no OS layer** — HALF CLOSED 2026-08-02. `read` mode is confined
+  by Mandatory Integrity Control; `write` mode is not, and still takes
+  `NO_OS_SANDBOX_NOTICE`. The remaining half is the next item.
+- **Windows `write` mode has no OS confinement**, and closing it costs something
+  the other two backends do not. A Low-integrity child can only write to objects
+  _labelled_ Low, so each writable root would have to be relabelled
+  (`icacls <root> /setintegritylevel Low`) and reverted after. Two consequences,
+  both real: the label **persists** if hrdr dies between spawn and revert, and
+  while it is set **any other Low-integrity process can write there** — a
+  sandboxed browser renderer, say. Landlock and Seatbelt leave no trace at all.
+  Needs a decision before it touches a user's repository, not just an
+  implementation.
 
 Opened by the redesign:
 
@@ -1085,6 +1103,47 @@ What survives that would otherwise be relearned:
   Dependencies did not move to main-only with Git and Releasing: a sub-agent
   deletes files and reads dependency APIs like anyone else, and nothing is said
   before `rm -rf` that a gate could match on.
+
+## Cleared in the 2026-08-02 backend pass
+
+Six commits, `7e80605`..`9c3d012`. Two of the three OS backends changed status,
+neither by writing much code.
+
+**macOS Seatbelt was never untested — the tests just could not say so.** Its
+end-to-end test opened with two silent `return`s (no `/usr/bin/sandbox-exec`, no
+shell), so a run that exercised nothing was indistinguishable from one that
+passed, and this file recorded it as never having run while CI ran it on every
+macOS job. Both conditions now assert on a runner and skip only locally, and
+`ci_runs_a_real_os_backend` fails if a runner detects the `None` fallback.
+
+**Windows `read` mode is now confined**, by Mandatory Integrity Control: a
+Low-integrity process cannot write to any object labelled Medium or higher,
+which is everything the user owns, while reads are untouched. Applied the way
+Landlock is — by the child to itself — because `CreateProcessAsUserW` cannot be
+reached through a `tokio::process::Command`, so hrdr re-execs itself as
+`hrdr __sandbox-exec -- <shell> -c <cmd>` and lowers its own token first.
+
+What survives that would otherwise be relearned:
+
+- **A skip that cannot fail is not a skip.** The Seatbelt tests were the shape
+  `write.md` already warns about, one level up: not a check that could not fail,
+  but a check that could decline to run and report the same green. Any test
+  gated on a prerequisite needs to assert where that prerequisite is guaranteed.
+- **`current_exe()` is the test binary inside a unit test.** The first Windows
+  end-to-end test lived in `hrdr-tools`, whose test binary is what the backend
+  then re-executed — it handed `__sandbox-exec -- cmd …` to libtest as filter
+  arguments and wedged the Windows job for 37 minutes. Anything exercising the
+  real wrapper belongs in `apps/hrdr/tests/`, where `CARGO_BIN_EXE_hrdr` names
+  it.
+- **Blind FFI fails on names, not logic.** Three CI round trips, every one a
+  constant or trait import that had moved between `windows-sys` releases
+  (`SE_GROUP_INTEGRITY`, `anyhow::Context`) — never the token or SID logic,
+  which was written once and never changed. Spell a fixed ABI value out locally
+  instead of importing it and the class disappears.
+- **A red run skips its publish jobs rather than failing them.** Seen again on
+  `de1b12b`: rustfmt went red, and the six publish jobs reported `skipped`. The
+  release was not cut, which is the system working — but only because the tag
+  had not been pushed yet.
 
 ## Record: closed efforts
 
