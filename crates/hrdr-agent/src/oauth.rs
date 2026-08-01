@@ -663,6 +663,23 @@ struct CoordState {
 
 static CHATGPT_COORD: OnceLock<RefreshCoordinator> = OnceLock::new();
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_OAUTH_ACCESS: (String, Option<String>);
+}
+
+#[cfg(test)]
+pub(crate) async fn with_test_oauth_access<F>(
+    access: String,
+    account_id: Option<String>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    TEST_OAUTH_ACCESS.scope((access, account_id), future).await
+}
+
 fn chatgpt_coord() -> &'static RefreshCoordinator {
     CHATGPT_COORD.get_or_init(|| RefreshCoordinator {
         state: Mutex::new(CoordState::default()),
@@ -702,6 +719,10 @@ pub async fn coordinated_oauth_access(
         || base_url != crate::CHATGPT_CODEX_BASE_URL
     {
         bail!("coordinated_oauth_access is only valid for trusted ChatGPT OAuth");
+    }
+    #[cfg(test)]
+    if let Ok((access, account_id)) = TEST_OAUTH_ACCESS.try_with(Clone::clone) {
+        return Ok(OAuthAccess { access, account_id });
     }
     let path = oauth_file_path().ok_or_else(|| anyhow!("no config dir to locate auth.json"))?;
     coordinated_access_core(

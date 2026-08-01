@@ -8697,12 +8697,30 @@ mod tests {
             where
                 H: Fn(usize) + Send + Sync + 'static,
             {
-                Self::start_with_body_hook(responses, move |idx, _| on_request(idx)).await
+                Self::start_with_request_hook(responses, move |idx, _, _| on_request(idx)).await
             }
 
             async fn start_with_body_hook<H>(responses: Vec<MockResp>, on_request: H) -> Self
             where
                 H: Fn(usize, &str) + Send + Sync + 'static,
+            {
+                Self::start_with_request_hook(responses, move |idx, _, body| on_request(idx, body))
+                    .await
+            }
+
+            async fn start_with_headers_hook<H>(responses: Vec<MockResp>, on_request: H) -> Self
+            where
+                H: Fn(usize, &str) + Send + Sync + 'static,
+            {
+                Self::start_with_request_hook(responses, move |idx, headers, _| {
+                    on_request(idx, headers);
+                })
+                .await
+            }
+
+            async fn start_with_request_hook<H>(responses: Vec<MockResp>, on_request: H) -> Self
+            where
+                H: Fn(usize, &str, &str) + Send + Sync + 'static,
             {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let port = listener.local_addr().unwrap().port();
@@ -8738,7 +8756,7 @@ mod tests {
                                 }
                             };
                             // Consume body (Content-Length bytes).
-                            let hdrs = String::from_utf8_lossy(&buf[..headers_end]);
+                            let hdrs = String::from_utf8_lossy(&buf[..headers_end]).into_owned();
                             let content_len: usize = hdrs
                                 .lines()
                                 .find_map(|l| {
@@ -8762,7 +8780,7 @@ mod tests {
                             // Send the next queued response. Fire the hook first:
                             // it happens-before the client can observe this reply.
                             if let Some(resp_bytes) = queue.lock().await.pop_front() {
-                                on_request(idx, &body);
+                                on_request(idx, &hdrs, &body);
                                 let _ = stream.write_all(&resp_bytes).await;
                             }
                         });
@@ -10942,6 +10960,86 @@ mod tests {
                 event,
                 AgentEvent::Text(text) if text.contains("Recovered after compaction")
             )));
+        }
+
+        // ── compaction refreshes OAuth before its first request ───────────────
+
+        /// REGRESSION: a resumed ChatGPT OAuth session can compact before any
+        /// normal turn reaches `connect_stream`. The summarizer's first request
+        /// must receive the stored bearer and account header itself rather than
+        /// inheriting an unauthenticated client and failing 401.
+        #[tokio::test]
+        async fn first_compaction_request_injects_chatgpt_oauth() {
+            let headers = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let seen = headers.clone();
+            let server = MockServer::start_with_headers_hook(
+                vec![
+                    MockResp::HttpErrorBody(
+                        400,
+                        json!({"error": {"message": "Unsupported parameter: max_output_tokens"}})
+                            .to_string(),
+                    ),
+                    MockResp::Sse(vec![
+                        text_chunk("s1", "Summary of the conversation so far."),
+                        stop_chunk("s1"),
+                        "[DONE]".to_string(),
+                    ]),
+                ],
+                move |_, request_headers| {
+                    seen.lock().unwrap().push(request_headers.to_string());
+                },
+            )
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            let oauth_resolved = super::resolve(
+                &"openai://gpt-5.5".parse().unwrap(),
+                &AgentConfig {
+                    base_url: server.base_url(),
+                    model: "openai://gpt-5.5".parse().unwrap(),
+                    cwd: dir.path().to_path_buf(),
+                    subagents: false,
+                    memory: false,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+            agent.resolved = super::resolve::oauth_derived_with(oauth_resolved, true);
+            assert!(agent.resolved.is_codex_oauth());
+            assert!(
+                !agent.client.has_api_key(),
+                "precondition: no bearer on client"
+            );
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+
+            crate::oauth::with_test_oauth_access(
+                "test-oauth-bearer".to_string(),
+                Some("acct-test".to_string()),
+                agent.compact(None),
+            )
+            .await
+            .expect("compaction succeeds with injected OAuth");
+
+            let headers = headers.lock().unwrap();
+            assert_eq!(headers.len(), 2, "capped request plus uncapped fallback");
+            for request_headers in headers.iter() {
+                let normalized = request_headers.to_ascii_lowercase();
+                assert!(
+                    normalized.contains("authorization: bearer test-oauth-bearer\r\n"),
+                    "summarizer request must carry the fresh bearer: {request_headers}"
+                );
+                assert!(
+                    normalized.contains("chatgpt-account-id: acct-test\r\n"),
+                    "summarizer request must carry the account routing header: {request_headers}"
+                );
+            }
         }
 
         // ── compaction retries a transient error on the summarization call ────

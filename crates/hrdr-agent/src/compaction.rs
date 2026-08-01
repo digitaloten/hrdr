@@ -796,6 +796,13 @@ impl Agent {
         req: Vec<ChatMessage>,
         output_cap_supported: &mut bool,
     ) -> Result<String> {
+        // Compaction can run before any normal turn (notably `/compact` after
+        // resuming a process), so it cannot rely on `connect_stream` having
+        // refreshed and injected ChatGPT OAuth. Do it at the actual request
+        // boundary, after every no-op compaction exit and before cloning either
+        // the capped or uncapped client. The non-OAuth branch also retains the
+        // shared helper's stale account-header cleanup semantics.
+        self.refresh_oauth_if_needed().await;
         let saved = self.client.params().clone();
         if !*output_cap_supported {
             let mut uncapped = self.client.clone();
