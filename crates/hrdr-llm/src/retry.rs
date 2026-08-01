@@ -280,6 +280,118 @@ pub fn is_context_overflow(e: &anyhow::Error) -> bool {
     )
 }
 
+/// An optional request parameter a provider can reject outright, identified by
+/// the name it carries on the wire.
+///
+/// Only parameters hrdr sends *when configured* are listed — the ones a strict
+/// endpoint can 400 on without the request itself being wrong, and so the ones
+/// that can be dropped and the request retried. Required fields (`model`, the
+/// messages, `stream`) are deliberately absent: dropping one of those is not a
+/// negotiation, it is a broken request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnsupportedParam {
+    /// `max_tokens` on the chat-completions shape, `max_output_tokens` on the
+    /// Responses shape — one [`RequestParams`](crate::RequestParams) field, two
+    /// wire names.
+    MaxTokens,
+    Temperature,
+    TopP,
+    /// `prompt_cache_key`, the OpenAI-shaped cache routing hint.
+    PromptCacheKey,
+    /// `reasoning_effort` on the chat-completions shape, `reasoning.effort` on
+    /// the Responses shape.
+    ReasoningEffort,
+}
+
+impl UnsupportedParam {
+    /// Every wire name this parameter is known by, **longest first** so
+    /// [`unsupported_param`] cannot match `max_tokens` inside
+    /// `max_output_tokens` and drop the right field for the wrong reason.
+    fn wire_names(self) -> &'static [&'static str] {
+        match self {
+            Self::MaxTokens => &["max_output_tokens", "max_tokens"],
+            Self::Temperature => &["temperature"],
+            Self::TopP => &["top_p"],
+            Self::PromptCacheKey => &["prompt_cache_key"],
+            // Never the bare `reasoning`: it is a common English word in these
+            // bodies ("… for reasoning models"), and matching it would drop the
+            // effort level over a message about some other parameter entirely.
+            Self::ReasoningEffort => &["reasoning_effort", "reasoning.effort"],
+        }
+    }
+
+    /// The name to show a user, in the wire spelling they can look up.
+    pub fn as_str(self) -> &'static str {
+        self.wire_names()[0]
+    }
+
+    /// Every variant. The order only decides which one wins if a single body
+    /// somehow names two, so it is fixed here rather than left to chance.
+    const ALL: [Self; 5] = [
+        Self::MaxTokens,
+        Self::Temperature,
+        Self::TopP,
+        Self::PromptCacheKey,
+        Self::ReasoningEffort,
+    ];
+}
+
+/// Phrases with which a provider says "I do not know this parameter".
+///
+/// Deliberately short. A false positive here silently stops sending something
+/// the user configured, so this matches only wordings observed in the wild —
+/// OpenAI's two (`Unsupported parameter: …`, `Unrecognized request argument
+/// supplied: …`) and the generic `unknown parameter`. Everything else is left
+/// to fail loudly, which is the safe direction.
+const REJECTION_PHRASES: [&str; 4] = [
+    "unsupported parameter",
+    "unsupported_parameter",
+    "unrecognized request argument",
+    "unknown parameter",
+];
+
+/// Whether `haystack` contains `needle` as a whole identifier — not as a piece
+/// of a longer one. `max_output_tokens_v2` must not read as `max_output_tokens`,
+/// or a model with a *differently* named cap would have hrdr drop the cap it was
+/// actually sending and retry into the same rejection.
+fn mentions_identifier(haystack: &str, needle: &str) -> bool {
+    let boundary = |c: u8| !c.is_ascii_alphanumeric() && c != b'_';
+    haystack.match_indices(needle).any(|(start, _)| {
+        let before_ok = start == 0 || boundary(haystack.as_bytes()[start - 1]);
+        let after_ok = haystack
+            .as_bytes()
+            .get(start + needle.len())
+            .is_none_or(|&c| boundary(c));
+        before_ok && after_ok
+    })
+}
+
+/// Which optional parameter, if any, the provider rejected as unsupported —
+/// the one error class a caller can recover from by sending *less*.
+///
+/// Requires the typed [`ChatError`](crate::ChatError) with status 400: a rejected
+/// parameter is a request-shape complaint, and nothing else (a 422, a 5xx, an
+/// untyped transport failure) is evidence of one. The body must both carry a
+/// rejection phrase and name a parameter hrdr actually sends optionally; either
+/// half alone is not enough, because the whole point is to drop exactly the
+/// field the server named.
+pub fn unsupported_param(e: &anyhow::Error) -> Option<UnsupportedParam> {
+    let ce = e.downcast_ref::<crate::ChatError>()?;
+    if ce.status != Some(400) {
+        return None;
+    }
+    let message = ce.message.to_ascii_lowercase();
+    if !REJECTION_PHRASES.iter().any(|p| message.contains(p)) {
+        return None;
+    }
+    UnsupportedParam::ALL.into_iter().find(|param| {
+        param
+            .wire_names()
+            .iter()
+            .any(|name| mentions_identifier(&message, name))
+    })
+}
+
 /// The server-requested wait from a `Retry-After` header, if the client embedded
 /// one in the error as `retry-after: <seconds>s` (see the client's rate-limit
 /// error formatting). Clamped to [`MAX_BACKOFF`] so a hostile/oversized value
@@ -621,5 +733,91 @@ mod tests {
                 "throttling must not be treated as overflow: {msg}"
             );
         }
+    }
+
+    fn rejection(status: Option<u16>, message: &str) -> anyhow::Error {
+        anyhow::Error::new(crate::ChatError {
+            status,
+            retry_after: None,
+            kind: crate::ChatErrorKind::Other,
+            message: message.to_string(),
+        })
+    }
+
+    /// Both wire spellings of every parameter are recognized, and the variant
+    /// returned is the one the caller has to clear — not merely "something was
+    /// rejected".
+    #[test]
+    fn unsupported_param_names_the_parameter_to_drop() {
+        for (message, expected) in [
+            (
+                r#"HTTP 400: {"detail":"Unsupported parameter: max_output_tokens"}"#,
+                UnsupportedParam::MaxTokens,
+            ),
+            (
+                r#"{"error":{"message":"UNSUPPORTED PARAMETER: MAX_TOKENS."}}"#,
+                UnsupportedParam::MaxTokens,
+            ),
+            (
+                "Unrecognized request argument supplied: temperature",
+                UnsupportedParam::Temperature,
+            ),
+            (
+                "Unsupported parameter: 'top_p' is not supported with this model.",
+                UnsupportedParam::TopP,
+            ),
+            (
+                "unknown parameter: prompt_cache_key",
+                UnsupportedParam::PromptCacheKey,
+            ),
+            (
+                "Unsupported parameter: reasoning.effort",
+                UnsupportedParam::ReasoningEffort,
+            ),
+            (
+                "Unsupported parameter: reasoning_effort",
+                UnsupportedParam::ReasoningEffort,
+            ),
+        ] {
+            assert_eq!(
+                unsupported_param(&rejection(Some(400), message)),
+                Some(expected),
+                "{message}"
+            );
+        }
+    }
+
+    /// The negative half, and the one that matters: a false positive here stops
+    /// hrdr sending something the user configured, silently and for the rest of
+    /// the session.
+    #[test]
+    fn unsupported_param_refuses_everything_it_is_not_sure_about() {
+        for (status, message) in [
+            // A cap by another name is not our cap — dropping ours would retry
+            // into the identical rejection.
+            (Some(400), "Unsupported parameter: max_output_tokens_v2"),
+            (Some(400), "Unsupported parameter: xmax_tokens"),
+            // The bare word `reasoning` is prose in these bodies, not a field.
+            (Some(400), "Unsupported parameter: foo for reasoning models"),
+            // A rejection phrase naming nothing we send optionally.
+            (Some(400), "Unsupported parameter: logit_bias"),
+            // A parameter name with no rejection phrase around it.
+            (Some(400), "temperature must be between 0 and 2"),
+            // Right words, wrong status: a rejected parameter is a 400.
+            (Some(422), "Unsupported parameter: max_output_tokens"),
+            (Some(500), "Unsupported parameter: temperature"),
+        ] {
+            assert_eq!(
+                unsupported_param(&rejection(status, message)),
+                None,
+                "status={status:?} message={message}"
+            );
+        }
+        // Untyped errors carry no status, so they are never a parameter
+        // rejection however they read.
+        assert_eq!(
+            unsupported_param(&anyhow::anyhow!("Unsupported parameter: temperature")),
+            None
+        );
     }
 }

@@ -1059,10 +1059,19 @@ pub struct Agent {
     todo_turn: u64,
     todo_completed_at: HashMap<String, u64>,
     todo_ttl: u64,
-    /// A self-compaction attempt failed for this history. Latched so a summariser
-    /// that fails for a non-transient reason (a 401, a model that refuses the
-    /// request) is not retried on every subsequent round of the turn.
-    self_compact_failed: bool,
+    /// The prompt-token reading at which a proactive compaction last failed, so
+    /// a summariser that fails for a non-transient reason (a 401, a model that
+    /// refuses the request) is not retried on every subsequent round.
+    ///
+    /// A reading rather than a flag because the suppression has to end: see
+    /// [`Agent::self_compact_suppressed`]. `None` means the last attempt
+    /// succeeded, or none has run.
+    self_compact_failed_at: Option<u32>,
+    /// Optional request parameters this endpoint has rejected as unsupported
+    /// (see [`Agent::drop_unsupported_param`]). Already cleared from `client`;
+    /// kept so the negotiation is not re-probed, and so the summariser knows not
+    /// to re-add a cap the endpoint refuses.
+    unsupported_params: Vec<hrdr_llm::UnsupportedParam>,
     /// This agent has already said that its endpoint looks like it isn't parsing
     /// tool calls (see `turn_loop`'s `looks_like_unparsed_tool_call`). Latched:
     /// the condition persists for the whole session — the server would have to be
@@ -1935,7 +1944,8 @@ impl Agent {
             // Answered already, unless the identity had nothing to say — in which
             // case a later `ensure_context_window` may still find something.
             context_window_probed: context_window.is_some(),
-            self_compact_failed: false,
+            self_compact_failed_at: None,
+            unsupported_params: Vec::new(),
             tool_syntax_warned: false,
             todo_turn: 0,
             todo_completed_at: HashMap::new(),
@@ -2083,7 +2093,7 @@ impl Agent {
         // A fresh conversation deserves a fresh chance at proactive compaction —
         // whatever made the summarizer fail belonged to the old history (or was
         // transient), not to this agent for the rest of the session.
-        self.self_compact_failed = false;
+        self.self_compact_failed_at = None;
     }
 
     /// Forget which files the model has "seen": once the transcript no longer
@@ -2647,7 +2657,7 @@ impl Agent {
     fn invalidate_context_window(&mut self) {
         self.context_window = None;
         self.context_window_probed = false;
-        self.self_compact_failed = false;
+        self.self_compact_failed_at = None;
     }
 }
 
@@ -4387,18 +4397,18 @@ mod tests {
         );
     }
 
-    /// `clear()` (a `/new` conversation) must reset the `self_compact_failed`
-    /// latch — otherwise a summarizer failure in one conversation silently
-    /// disables proactive compaction in every conversation that follows it in
+    /// `clear()` (a `/new` conversation) must forget a recorded self-compaction
+    /// failure — otherwise a summarizer failure in one conversation silently
+    /// suppresses proactive compaction in the conversation that follows it in
     /// the same session, even though `clear()` starts from a blank history that
     /// has nothing to do with why the summarizer failed.
     #[test]
-    fn clear_resets_the_self_compact_failed_latch() {
+    fn clear_resets_the_self_compact_failure_record() {
         let mut agent = Agent::new(AgentConfig::default()).unwrap();
-        agent.self_compact_failed = true;
+        agent.self_compact_failed_at = Some(100_000);
         agent.clear();
-        assert!(
-            !agent.self_compact_failed,
+        assert_eq!(
+            agent.self_compact_failed_at, None,
             "a fresh conversation gets a fresh chance at proactive compaction"
         );
     }
@@ -10818,10 +10828,21 @@ mod tests {
                 bodies[1].get("max_tokens").is_none(),
                 "fallback omits the rejected cap: {bodies:#?}"
             );
+            // The endpoint refused the cap, so the session stops sending it —
+            // ordinary turns would otherwise keep offering the configured 1234
+            // and be rejected exactly as the summarizer was. What must never
+            // happen is the summarizer's own 32768 being left behind on the
+            // live client, which would silently truncate the model's replies.
             assert_eq!(
                 agent.client.params().max_tokens,
-                Some(1_234),
-                "the session's original params survive both attempts"
+                None,
+                "a refused cap is dropped session-wide, not restored"
+            );
+            assert!(
+                agent
+                    .unsupported_params
+                    .contains(&hrdr_llm::UnsupportedParam::MaxTokens),
+                "the rejection is remembered so it is not re-probed"
             );
         }
 
@@ -10886,8 +10907,123 @@ mod tests {
             );
             assert_eq!(
                 agent.client.params().max_tokens,
-                Some(1_234),
-                "the session's original params survive all attempts"
+                None,
+                "a refused cap is dropped session-wide, not restored"
+            );
+        }
+
+        /// REGRESSION: the uncapped-retry fallback used to wrap the summarizer
+        /// call alone, so a model that rejects an optional parameter left every
+        /// *ordinary* turn failing on a 400 — which is neither overflow nor
+        /// transient, so nothing retried it and the whole session was dead.
+        /// A rejected parameter is now dropped and the request retried on the
+        /// turn path too, through the same helper compaction uses.
+        #[tokio::test]
+        async fn a_turn_drops_a_rejected_parameter_and_retries() {
+            let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = bodies.clone();
+            let server = MockServer::start_with_body_hook(
+                vec![
+                    MockResp::HttpErrorBody(
+                        400,
+                        json!({"error": {"message": "Unsupported parameter: temperature"}})
+                            .to_string(),
+                    ),
+                    MockResp::Sse(vec![
+                        text_chunk("c1", "Answered without the rejected parameter."),
+                        stop_chunk("c1"),
+                        "[DONE]".to_string(),
+                    ]),
+                ],
+                move |_, body| {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
+                },
+            )
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.temperature = Some(0.7);
+            let mut agent = Agent::new(cfg).unwrap();
+            let mut events = Vec::new();
+
+            agent
+                .run_input("hello", |event| events.push(event))
+                .await
+                .expect("the turn survives the rejection");
+
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 2, "rejected once, then retried: {bodies:#?}");
+            // `f32` 0.7 widens to 0.6999999… as JSON, so compare the field's
+            // presence and magnitude rather than its exact decimal expansion.
+            assert!(
+                (bodies[0]["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-6,
+                "the first attempt carried the configured temperature: {bodies:#?}"
+            );
+            assert!(
+                bodies[1].get("temperature").is_none(),
+                "the retry omits the rejected parameter: {bodies:#?}"
+            );
+            assert_eq!(
+                agent.temperature(),
+                None,
+                "and it stays dropped for the rest of the session"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::Notice(message)
+                        if message.contains("rejected `temperature`")
+                )),
+                "the user is told their configured parameter was dropped: {events:#?}"
+            );
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Text(text) if text.contains("Answered without the rejected parameter.")
+            )));
+        }
+
+        /// The same rejection twice in a row must not loop: the second one finds
+        /// the parameter already dropped, so the error propagates instead of
+        /// provoking another identical request.
+        #[tokio::test]
+        async fn a_repeated_rejection_is_not_retried_forever() {
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = requests.clone();
+            let rejection = || {
+                MockResp::HttpErrorBody(
+                    400,
+                    json!({"error": {"message": "Unsupported parameter: temperature"}}).to_string(),
+                )
+            };
+            let server = MockServer::start_with_hook(
+                vec![rejection(), rejection(), rejection(), rejection()],
+                move |_| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.temperature = Some(0.7);
+            let mut agent = Agent::new(cfg).unwrap();
+
+            let err = agent
+                .run_input("hello", |_| {})
+                .await
+                .expect_err("a rejection that survives the drop must surface");
+            assert!(
+                err.to_string().contains("Unsupported parameter"),
+                "the real error reaches the caller: {err}"
+            );
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "the drop is attempted once, not once per round"
             );
         }
 
@@ -11252,17 +11388,17 @@ mod tests {
             );
         }
 
-        // ── self_compact_failed latch is reset by a later successful compact ──
+        // ── a recorded self-compaction failure is cleared by a later success ──
 
-        /// `maybe_self_compact` latches `self_compact_failed` on any summarizer
-        /// failure so it doesn't retry (and pay for) a broken summarizer every
-        /// round. Before this fix, only a model switch
-        /// (`invalidate_context_window`) ever cleared it back — a later
-        /// successful `compact()` (e.g. a manual `/compact` once the transient
-        /// issue passed) left proactive compaction silently disabled for the
-        /// rest of the session. It must clear the latch on success.
+        /// `maybe_self_compact` records the reading at which a summarizer failed
+        /// so it doesn't retry (and pay for) a broken summarizer every round.
+        /// Before this fix, only a model switch (`invalidate_context_window`)
+        /// ever cleared it back — a later successful `compact()` (e.g. a manual
+        /// `/compact` once the transient issue passed) left proactive compaction
+        /// silently disabled for the rest of the session. It must clear on
+        /// success.
         #[tokio::test]
-        async fn a_successful_compact_clears_the_self_compact_failed_latch() {
+        async fn a_successful_compact_clears_the_self_compact_failure_record() {
             let server = MockServer::start(vec![MockResp::Sse(vec![
                 text_chunk("s1", "Summary of the conversation so far."),
                 stop_chunk("s1"),
@@ -11278,13 +11414,95 @@ mod tests {
                     .messages
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
-            // Simulate an earlier self-compaction failure that latched the flag.
-            agent.self_compact_failed = true;
+            // Simulate an earlier self-compaction failure that was recorded.
+            agent.self_compact_failed_at = Some(100_000);
 
             agent.compact(None).await.expect("this compaction succeeds");
-            assert!(
-                !agent.self_compact_failed,
-                "a successful compact() must clear the latch"
+            assert_eq!(
+                agent.self_compact_failed_at, None,
+                "a successful compact() must clear the recorded failure"
+            );
+        }
+
+        /// REGRESSION: a failed proactive compaction used to disable proactive
+        /// compaction for the whole session, and only a *successful* `compact`
+        /// could re-enable it — which nothing would call, because the caller that
+        /// would have was the one just disabled. The suppression is now measured
+        /// against the reading the failure happened at, so growth re-probes it.
+        ///
+        /// Drives `maybe_self_compact` directly (rather than a whole turn) so the
+        /// prompt-token readings either side of the growth threshold are exact.
+        #[tokio::test]
+        async fn a_failed_self_compaction_is_re_probed_once_the_context_grows() {
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = requests.clone();
+            let server = MockServer::start_with_hook(
+                vec![
+                    // The first attempt fails for a reason retrying won't fix.
+                    MockResp::HttpError(401),
+                    // The re-probe after enough growth succeeds.
+                    MockResp::Sse(vec![
+                        text_chunk("s1", "Summary of the conversation so far."),
+                        stop_chunk("s1"),
+                        "[DONE]".to_string(),
+                    ]),
+                ],
+                move |_| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+            // A window with a trigger well below it, so every reading below is
+            // over the trigger and only the growth rule decides.
+            let window = 100_000;
+            agent.context_window = Some(window);
+            agent.context_window_probed = true;
+            agent.compaction_reserved = 1_000;
+            let growth = window / 16;
+            let failed_at = window - 500;
+
+            agent.last_prompt_tokens = Some(failed_at);
+            agent.maybe_self_compact(&mut |_| {}).await;
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the first attempt is made"
+            );
+            assert_eq!(
+                agent.self_compact_failed_at,
+                Some(failed_at),
+                "the failure is recorded against the reading it happened at"
+            );
+
+            // Still inside the growth window: no request, and no notice.
+            agent.last_prompt_tokens = Some(failed_at + growth - 1);
+            agent.maybe_self_compact(&mut |_| {}).await;
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "a failing summarizer is not re-tried every round"
+            );
+
+            // Grown past it: re-probed, and this time it works.
+            agent.last_prompt_tokens = Some(failed_at + growth);
+            agent.maybe_self_compact(&mut |_| {}).await;
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "growth earns another attempt — the old latch allowed none"
+            );
+            assert_eq!(
+                agent.self_compact_failed_at, None,
+                "and the success clears the record"
             );
         }
 

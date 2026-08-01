@@ -1239,6 +1239,40 @@ impl Agent {
         Ok(true)
     }
 
+    /// Recover from this endpoint rejecting an optional request parameter, by
+    /// dropping it and reporting `true` so the caller retries the same request
+    /// without it. `false` for every other error — including a second rejection
+    /// of a parameter already dropped, which is what bounds the caller's loop.
+    ///
+    /// **Session-wide and one-way.** Re-probing a parameter the server has
+    /// already refused cannot discover anything new and buys another guaranteed
+    /// 400, so the drop outlives the request that provoked it — and outlives the
+    /// *compaction* that provoked it, which is why this lives on the agent
+    /// rather than in a `&mut bool` threaded through one summarization.
+    ///
+    /// The user is told, because the parameter may be one they configured and
+    /// this silently changes what their setting does. The notice goes on
+    /// `pending_notices` rather than to a sink parameter: `compact` is
+    /// deliberately silent and has none to offer, and queueing means the one
+    /// caller that *does* have a sink still delivers it immediately — the drain
+    /// at the top of [`Self::connect_stream`] runs on the retry this returns
+    /// `true` for.
+    pub(crate) fn drop_unsupported_param(&mut self, error: &anyhow::Error) -> bool {
+        let Some(param) = hrdr_llm::unsupported_param(error) else {
+            return false;
+        };
+        if self.unsupported_params.contains(&param) {
+            return false;
+        }
+        self.unsupported_params.push(param);
+        self.client.clear_unsupported_param(param);
+        self.pending_notices.push(format!(
+            "this endpoint rejected `{}` — dropping it for the rest of the session",
+            param.as_str()
+        ));
+        true
+    }
+
     /// Stream one assistant turn, retrying both the connect and any transient
     /// mid-stream failure with the same backoff the connect path uses. A failed
     /// `drain_stream` appends nothing to history, so a clean re-request is safe
@@ -1275,6 +1309,9 @@ impl Agent {
                         .recover_context_overflow(&e, overflow_compacted, on_event)
                         .await?
                     {
+                        continue;
+                    }
+                    if self.drop_unsupported_param(&e) {
                         continue;
                     }
                     let retried = budget
@@ -1345,6 +1382,13 @@ impl Agent {
     ) -> Result<ChatStream> {
         self.refresh_oauth_if_needed().await;
         loop {
+            // Deliver anything queued since the last turn started — in practice
+            // a parameter this endpoint refused, dropped either by the retry
+            // that lands here or by a summarizer call, which has no sink of its
+            // own (see `drop_unsupported_param`).
+            for notice in self.take_pending_notices() {
+                on_event(AgentEvent::Notice(notice));
+            }
             let flattened = match history {
                 RequestHistory::Canonical => None,
                 RequestHistory::ProtocolFree => Some(flatten_tool_protocol(&self.messages)),
@@ -1357,6 +1401,9 @@ impl Agent {
                         .recover_context_overflow(&e, overflow_compacted, on_event)
                         .await?
                     {
+                        continue;
+                    }
+                    if self.drop_unsupported_param(&e) {
                         continue;
                     }
                     // Transient network/server error → backoff and retry (the

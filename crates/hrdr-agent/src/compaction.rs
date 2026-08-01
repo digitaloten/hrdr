@@ -195,27 +195,6 @@ const MAX_COMPACT_STAGE: usize = 4;
 /// thinking model to reason before it writes.
 const COMPACT_MAX_OUTPUT_TOKENS: u32 = 32_768;
 
-/// Codex Responses models vary on whether they accept `max_output_tokens`.
-/// Retry only the exact parameter rejection that removing our cap can fix.
-fn is_unsupported_max_output_tokens(error: &anyhow::Error) -> bool {
-    const REJECTION: &str = "unsupported parameter: max_output_tokens";
-
-    error
-        .downcast_ref::<hrdr_llm::ChatError>()
-        .is_some_and(|error| {
-            if error.status != Some(400) {
-                return false;
-            }
-            let message = error.message.to_ascii_lowercase();
-            message.match_indices(REJECTION).any(|(start, _)| {
-                message
-                    .as_bytes()
-                    .get(start + REJECTION.len())
-                    .is_none_or(|next| !next.is_ascii_alphanumeric() && *next != b'_')
-            })
-        })
-}
-
 /// Tokens held back from the window when sizing the summarization request: the
 /// output cap above, plus slack for the summarizer's own system prompt, the
 /// trigger, and the estimator's own error.
@@ -678,11 +657,6 @@ impl Agent {
         // none. The budgets that must not stack are the ones retrying the SAME
         // request (connect and drain) — see `connect_and_drain`.
         let mut budget = RetryBudget::new(self.retry_policy);
-        // Once this endpoint rejects the cap, every later attempt in this
-        // compaction stays uncapped — including transient retries and smaller
-        // context stages. Re-probing cannot discover anything new and only adds
-        // another guaranteed 400.
-        let mut output_cap_supported = true;
         let summary = loop {
             let history = compact_stage_history(stage, &full, &mut elided);
             // The summarizer is sent no `tools` (it must answer in prose), but
@@ -698,7 +672,7 @@ impl Agent {
             req.extend(history);
             req.push(ChatMessage::user(trigger.clone()));
             self.budget_preflight().await?;
-            match self.plain_completion(req, &mut output_cap_supported).await {
+            match self.plain_completion(req).await {
                 Ok(s) => break s,
                 Err(e) if is_context_overflow(&e) && stage < 4 => stage += 1,
                 Err(e) => {
@@ -751,7 +725,7 @@ impl Agent {
         // proactive compaction try again instead of staying silently disabled
         // for the rest of the session (only `invalidate_context_window`, on a
         // model switch, used to clear this).
-        self.self_compact_failed = false;
+        self.self_compact_failed_at = None;
         Ok((before, self.messages.len()))
     }
 
@@ -787,48 +761,37 @@ impl Agent {
     /// Silent: the shared [`drain_stream`] gets a no-op event sink.
     ///
     /// The output cap is applied to a clone of the live client, so the session's
-    /// own parameters remain untouched on success, error, or cancellation. A
-    /// Codex model that specifically rejects `max_output_tokens` gets one retry
-    /// with `max_tokens` cleared; `output_cap_supported` latches that rejection
-    /// across all retries in the current compaction. No other 400 is retried here.
-    async fn plain_completion(
-        &mut self,
-        req: Vec<ChatMessage>,
-        output_cap_supported: &mut bool,
-    ) -> Result<String> {
+    /// own parameters remain untouched on success, error, or cancellation.
+    ///
+    /// A parameter this endpoint rejects is dropped and the request retried,
+    /// through the same [`Agent::drop_unsupported_param`] the turn path uses —
+    /// including the summarizer's own cap, which is why the cap below is applied
+    /// only while `max_tokens` is still on speaking terms with the endpoint. The
+    /// loop terminates because each rejection can be honoured once: a parameter
+    /// already dropped makes the helper return `false` and the error propagate.
+    /// No other 400 is retried here.
+    async fn plain_completion(&mut self, req: Vec<ChatMessage>) -> Result<String> {
         // Compaction can run before any normal turn (notably `/compact` after
         // resuming a process), so it cannot rely on `connect_stream` having
         // refreshed and injected ChatGPT OAuth. Do it at the actual request
-        // boundary, after every no-op compaction exit and before cloning either
-        // the capped or uncapped client. The non-OAuth branch also retains the
-        // shared helper's stale account-header cleanup semantics.
+        // boundary, after every no-op compaction exit and before cloning the
+        // client. The non-OAuth branch also retains the shared helper's stale
+        // account-header cleanup semantics.
         self.refresh_oauth_if_needed().await;
-        let saved = self.client.params().clone();
-        // A copy of the live client with the summarizer's own cap — `None` for
-        // the uncapped fallback. Every other session parameter is carried over.
-        let with_cap = |client: &hrdr_llm::Client, cap: Option<u32>| {
-            let mut client = client.clone();
+        loop {
+            let cap = (!self
+                .unsupported_params
+                .contains(&hrdr_llm::UnsupportedParam::MaxTokens))
+            .then_some(COMPACT_MAX_OUTPUT_TOKENS);
+            let mut client = self.client.clone();
             client.set_params(hrdr_llm::RequestParams {
                 max_tokens: cap,
-                ..saved.clone()
+                ..self.client.params().clone()
             });
-            client
-        };
-        let uncapped = with_cap(&self.client, None);
-        if !*output_cap_supported {
-            return self.plain_completion_inner(&uncapped, &req, None).await;
-        }
-
-        let capped = with_cap(&self.client, Some(COMPACT_MAX_OUTPUT_TOKENS));
-        match self
-            .plain_completion_inner(&capped, &req, Some(COMPACT_MAX_OUTPUT_TOKENS))
-            .await
-        {
-            Err(error) if is_unsupported_max_output_tokens(&error) => {
-                *output_cap_supported = false;
-                self.plain_completion_inner(&uncapped, &req, None).await
+            match self.plain_completion_inner(&client, &req, cap).await {
+                Err(error) if self.drop_unsupported_param(&error) => continue,
+                result => return result,
             }
-            result => result,
         }
     }
 
@@ -880,7 +843,7 @@ impl Agent {
     /// Failure is non-fatal: if the summarising call fails, the turn proceeds and
     /// overflow recovery is still there to catch it.
     pub(crate) async fn maybe_self_compact<F: FnMut(AgentEvent)>(&mut self, on_event: &mut F) {
-        if !self.auto_compact || self.self_compact_failed || self.last_prompt_tokens.is_none() {
+        if !self.auto_compact || self.last_prompt_tokens.is_none() {
             return;
         }
         // Learn our own window before judging how full it is. Without this the
@@ -895,6 +858,14 @@ impl Agent {
         ) {
             return;
         }
+        if self.self_compact_suppressed() {
+            return;
+        }
+        // `compact` clears `last_prompt_tokens` on entry whatever the outcome, so
+        // the reading the failure happened at has to be captured before the call
+        // — read it afterwards and it is always `None`, the suppression never
+        // engages, and a failing summarizer is retried on every single round.
+        let attempted_at = self.last_prompt_tokens;
         match self.compact(None).await {
             // `compact` clears `last_prompt_tokens` itself: the reading described
             // the history we just replaced, and leaving it set would re-trigger on
@@ -909,52 +880,56 @@ impl Agent {
                 // Don't retry a summariser that failed for a reason a retry won't
                 // fix: it would burn a model call and a notice on every round.
                 // Overflow recovery is still there if the context really is too big.
-                self.self_compact_failed = true;
+                self.self_compact_failed_at = attempted_at;
                 on_event(AgentEvent::Notice(format!(
                     "could not compact a filling context ({e}) — continuing"
                 )));
             }
         }
     }
+
+    /// Whether an earlier proactive-compaction failure still suppresses this
+    /// attempt.
+    ///
+    /// Bounded, unlike the flag it replaces. A failure used to disable proactive
+    /// compaction for the entire session, and the only thing that could re-enable
+    /// it was a *successful* `compact` — which nothing else would call, because
+    /// the caller that would have was the one just disabled. The suppression
+    /// therefore lifted only after the context had actually overflowed and
+    /// reactive recovery had cleaned up, which is the event proactive compaction
+    /// exists to prevent.
+    ///
+    /// Now the failure is remembered against the context reading it happened at,
+    /// and a re-probe is allowed once usage has grown by
+    /// [`Self::self_compact_retry_growth`] since — so a summarizer that failed
+    /// for a passing reason gets another chance while the window is still
+    /// filling, and one that is genuinely broken costs a bounded handful of
+    /// calls rather than one per round.
+    fn self_compact_suppressed(&self) -> bool {
+        let (Some(failed_at), Some(now)) = (self.self_compact_failed_at, self.last_prompt_tokens)
+        else {
+            return false;
+        };
+        now < failed_at.saturating_add(self.self_compact_retry_growth())
+    }
+
+    /// How much the context must grow after a failed proactive compaction before
+    /// another is attempted.
+    ///
+    /// A sixteenth of the window, against a headroom above the trigger that
+    /// [`compaction_trigger`] caps at a quarter of it — so at most four further
+    /// attempts before the request overflows and reactive recovery takes the
+    /// wheel. An unknown window suppresses indefinitely, which is unreachable in
+    /// practice: `should_auto_compact` has already required one.
+    fn self_compact_retry_growth(&self) -> u32 {
+        self.context_window.map_or(u32::MAX, |window| window / 16)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hrdr_llm::{ChatError, ChatErrorKind, ChatMessage};
-
-    fn chat_error(status: Option<u16>, message: &str) -> anyhow::Error {
-        anyhow::Error::new(ChatError {
-            status,
-            retry_after: None,
-            kind: ChatErrorKind::Other,
-            message: message.to_string(),
-        })
-    }
-
-    #[test]
-    fn unsupported_output_cap_matcher_requires_exact_typed_400_rejection() {
-        for message in [
-            r#"HTTP 400: {"detail":"Unsupported parameter: max_output_tokens"}"#,
-            r#"HTTP 400: {"error":{"message":"UNSUPPORTED PARAMETER: MAX_OUTPUT_TOKENS."}}"#,
-        ] {
-            assert!(
-                is_unsupported_max_output_tokens(&chat_error(Some(400), message)),
-                "real parameter rejection must match: {message}"
-            );
-        }
-
-        for (status, message) in [
-            (Some(400), "Unsupported parameter: max_output_tokens_v2"),
-            (Some(400), "Unsupported parameter: max_tokens"),
-            (Some(422), "Unsupported parameter: max_output_tokens"),
-        ] {
-            assert!(
-                !is_unsupported_max_output_tokens(&chat_error(status, message)),
-                "unrelated error must not match: status={status:?}, message={message}"
-            );
-        }
-    }
+    use hrdr_llm::ChatMessage;
 
     /// A message of roughly `tokens` estimated size (~4 bytes per token).
     fn sized(role: Role, tokens: usize) -> ChatMessage {

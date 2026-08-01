@@ -47,6 +47,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   inside an established SSE stream through the same one-time compact-and-retry
   path as HTTP-level overflows.
 
+- **A rejected optional parameter no longer kills every ordinary turn.** The
+  fallback above covered the summarizer call alone, so a model that refuses
+  `temperature`, `top_p`, `prompt_cache_key`, `reasoning_effort` or a configured
+  output cap left compaction working and every real turn failing — a 400 is
+  neither an overflow nor transient, so nothing retried it and the session was
+  finished. hrdr now recognizes the rejection (`hrdr_llm::unsupported_param`,
+  which names _which_ parameter), drops that one parameter, retries, and tells
+  you it did. The drop lasts the rest of the session in both directions:
+  re-offering a parameter the endpoint has refused only buys another guaranteed
+  400, and a second compaction no longer re-probes what the first one learned.
+
+- **A failed proactive compaction no longer disables itself for the whole
+  session.** The failure was latched, and the only thing that cleared the latch
+  was a _successful_ compaction — which nothing would run, because the caller
+  that would have was the one just disabled. In practice the protection came
+  back only after the context had actually overflowed, which is the event it
+  exists to prevent. The failure is now recorded against the context reading it
+  happened at and re-probed once usage has grown a sixteenth of the window,
+  bounding it to a handful of attempts rather than one per round.
+
 ## [0.10.0] - 2026-08-01
 
 ### Added

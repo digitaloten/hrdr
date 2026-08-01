@@ -770,6 +770,25 @@ impl Client {
         self.params = params;
     }
 
+    /// Stop sending a parameter this endpoint rejected as unsupported (see
+    /// [`crate::unsupported_param`]), so the retry — and every later request —
+    /// omits it.
+    ///
+    /// The wire-name → field mapping lives here, next to the bodies that write
+    /// those names ([`Client::body_json`], [`crate::codex::build_body`],
+    /// [`crate::anthropic`]), rather than in the agent: a caller recovering from
+    /// a rejection knows *that* a parameter was refused, and should not also
+    /// have to know which of this struct's fields backs it.
+    pub fn clear_unsupported_param(&mut self, param: crate::UnsupportedParam) {
+        match param {
+            crate::UnsupportedParam::MaxTokens => self.params.max_tokens = None,
+            crate::UnsupportedParam::Temperature => self.temperature = None,
+            crate::UnsupportedParam::TopP => self.params.top_p = None,
+            crate::UnsupportedParam::PromptCacheKey => self.prompt_cache_key = None,
+            crate::UnsupportedParam::ReasoningEffort => self.effort = None,
+        }
+    }
+
     /// The opt-in request parameters currently in force.
     ///
     /// Exists so a caller can make a **scoped** change — one out-of-band request
