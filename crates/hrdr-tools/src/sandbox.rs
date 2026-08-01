@@ -865,6 +865,16 @@ pub enum OsSandboxBackend {
     Landlock,
     /// macOS `sandbox-exec(1)` with a generated SBPL profile.
     Seatbelt,
+    /// Windows Mandatory Integrity Control: the child lowers its own token to
+    /// Low integrity, after which the kernel refuses every write to an object
+    /// labelled Medium or higher — which is everything the user owns.
+    ///
+    /// Reads are unaffected (MIC's default policy is NO_WRITE_UP only), so this
+    /// is exactly [`SandboxMode::Read`]'s shape and needs no filesystem change
+    /// to deliver it. Granting writes back to the policy's writable roots is a
+    /// second step (labelling those roots Low) and is NOT part of this variant
+    /// yet — see [`low_integrity_args`].
+    LowIntegrity,
     /// Nothing available: the shell runs unconfined and says so.
     None,
 }
@@ -907,8 +917,22 @@ fn detect_backend_uncached() -> OsSandboxBackend {
     }
 }
 
-/// Every other platform: nothing. Windows stays software-layer-only in v1.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Windows: Mandatory Integrity Control, which every supported release has.
+///
+/// The only precondition is being able to name our own executable to re-exec —
+/// the confinement is applied by a child of ours that lowers its own token (see
+/// [`low_integrity_args`]), so an unresolvable `current_exe` means no backend
+/// rather than a backend that silently confines nothing.
+#[cfg(windows)]
+fn detect_backend_uncached() -> OsSandboxBackend {
+    match std::env::current_exe() {
+        Ok(_) => OsSandboxBackend::LowIntegrity,
+        Err(_) => OsSandboxBackend::None,
+    }
+}
+
+/// Every other platform: nothing.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn detect_backend_uncached() -> OsSandboxBackend {
     OsSandboxBackend::None
 }
@@ -1061,6 +1085,31 @@ fn shell_command_with_backend(
             notices.set(NO_OS_SANDBOX_NOTICE.to_string());
             shell.command(cmd_str)
         }
+        // Windows: only `Read` is confined so far. `Write` needs its roots
+        // labelled Low before a Low-integrity child could write to them, so it
+        // keeps the notice rather than getting a backend that would refuse every
+        // write it is supposed to allow.
+        #[cfg(windows)]
+        OsSandboxBackend::LowIntegrity if policy.mode == SandboxMode::Read => {
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    let mut cmd = tokio::process::Command::new(exe);
+                    cmd.args(low_integrity_args(shell, cmd_str));
+                    cmd
+                }
+                Err(_) => {
+                    notices.set(NO_OS_SANDBOX_NOTICE.to_string());
+                    shell.command(cmd_str)
+                }
+            }
+        }
+        // The Landlock/Seatbelt twin: unreachable off Windows, still a variant
+        // that has to compile there — and on Windows it is the not-yet-confined
+        // `Write` path falling through to the same admission.
+        OsSandboxBackend::LowIntegrity => {
+            notices.set(NO_OS_SANDBOX_NOTICE.to_string());
+            shell.command(cmd_str)
+        }
         OsSandboxBackend::None => {
             notices.set(NO_OS_SANDBOX_NOTICE.to_string());
             shell.command(cmd_str)
@@ -1180,6 +1229,99 @@ const SEATBELT_PROGRAM: &str = "/usr/bin/sandbox-exec";
 /// There is no `--chdir` to pass — Seatbelt only filters syscalls, so the child
 /// inherits the cwd the caller sets on the `Command`, and stdio, exit status,
 /// timeouts and group-kill are untouched.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// The hidden argv[1] that puts hrdr into its own confinement wrapper.
+///
+/// Windows has no `pre_exec`, and a `tokio::process::Command` cannot carry a
+/// custom token, so there is nowhere in the spawn seam to hand the kernel a
+/// lowered token. Re-execing ourselves is what closes that gap: the wrapper
+/// lowers ITS token — permitted, because only raising integrity is refused —
+/// and every descendant inherits the result. Same shape as `sandbox-exec -p
+/// <profile> -- <shell> -c <cmd>`, with hrdr playing `sandbox-exec`.
+///
+/// Double-underscored and undocumented: it is an implementation detail of the
+/// Windows backend, not a command anyone should type.
+pub const SANDBOX_EXEC_ARG: &str = "__sandbox-exec";
+
+/// The full argv for the Low-integrity wrapper: `__sandbox-exec -- <shell>
+/// <invoke args> <cmd>`, to be passed to our own executable.
+///
+/// No writable roots are threaded through yet. `Read` (and `Jail`, which holds
+/// no shell at all) is the whole of what this delivers: every write refused,
+/// reads untouched. `Write` still needs its roots labelled Low before a
+/// confined child could write to them, which is a filesystem mutation and a
+/// separate slice — until then `Write` keeps the software path-guard and the
+/// no-OS-sandbox notice, exactly as it did before this backend existed.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn low_integrity_args(shell: crate::Shell, cmd_str: &str) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> =
+        vec![SANDBOX_EXEC_ARG.into(), "--".into(), shell.program().into()];
+    args.extend(shell.invoke_args().iter().map(std::ffi::OsString::from));
+    args.push(cmd_str.into());
+    args
+}
+
+/// Lower this process's token to Low integrity, permanently and irreversibly.
+///
+/// Called by the [`SANDBOX_EXEC_ARG`] wrapper on itself before it spawns the
+/// real shell. After this returns, the kernel refuses every write to an object
+/// labelled Medium or higher; reads are unaffected.
+///
+/// # Errors
+///
+/// Any failure must be fatal to the caller: a wrapper that could not lower
+/// itself and ran the command anyway would execute it unconfined while the
+/// backend reported as active, which is worse than having no backend.
+#[cfg(windows)]
+pub fn lower_current_process_to_low_integrity() -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        SE_GROUP_INTEGRITY, SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
+        TOKEN_MANDATORY_LABEL, TokenIntegrityLevel,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // S-1-16-4096 built inline rather than via `ConvertStringSidToSidW`: that
+    // returns a `LocalFree`-owned allocation, and both the handle type and the
+    // module `LocalFree` lives in have moved between `windows-sys` releases. A
+    // literal SID needs no allocator and no second feature, and its layout is
+    // fixed by the SID format: revision, sub-authority count, the six-byte
+    // authority (SECURITY_MANDATORY_LABEL_AUTHORITY), then one little-endian
+    // sub-authority (SECURITY_MANDATORY_LOW_RID = 0x1000).
+    #[repr(C, align(4))]
+    struct LowIntegritySid([u8; 12]);
+    let mut low_sid = LowIntegritySid([1, 1, 0, 0, 0, 0, 0, 16, 0x00, 0x10, 0x00, 0x00]);
+
+    // SAFETY: `low_sid` is a stack local of exactly the SID layout the call
+    // expects and outlives the call; `token` is checked before use and closed on
+    // every path. Nothing here allocates, so there is nothing to leak.
+    unsafe {
+        let mut token: HANDLE = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_DEFAULT, &mut token) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut label = TOKEN_MANDATORY_LABEL {
+            Label: SID_AND_ATTRIBUTES {
+                Sid: std::ptr::addr_of_mut!(low_sid).cast(),
+                Attributes: SE_GROUP_INTEGRITY,
+            },
+        };
+        let ok = SetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            std::ptr::addr_of_mut!(label).cast(),
+            (std::mem::size_of::<TOKEN_MANDATORY_LABEL>() + std::mem::size_of::<LowIntegritySid>())
+                as u32,
+        );
+        let err = (ok == 0).then(std::io::Error::last_os_error);
+        CloseHandle(token);
+        match err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn seatbelt_args(
     policy: &SandboxPolicy,
@@ -2169,6 +2311,15 @@ mod tests {
         if std::env::var_os("CI").is_none() {
             return;
         }
+        if cfg!(windows) {
+            assert_eq!(
+                detect_backend(),
+                OsSandboxBackend::LowIntegrity,
+                "every supported Windows has Mandatory Integrity Control, so a CI \
+                 run that detects no backend means `current_exe` failed and the \
+                 Low-integrity assertions below it are vacuous"
+            );
+        }
         if cfg!(target_os = "macos") {
             assert_eq!(
                 detect_backend(),
@@ -2178,6 +2329,100 @@ mod tests {
                  below it is vacuous"
             );
         }
+    }
+
+    /// The wrapper argv, checked on every platform so the shape cannot rot
+    /// where it is not built: `__sandbox-exec -- <shell> -c <cmd>`, mirroring
+    /// Seatbelt's `-p <profile> -- <shell> -c <cmd>`.
+    #[test]
+    fn low_integrity_args_wrap_the_shell_invocation() {
+        let args = argv(&low_integrity_args(crate::Shell::Bash, "echo hi"));
+        assert_eq!(args[0], SANDBOX_EXEC_ARG);
+        assert_eq!(args[1], "--");
+        assert_eq!(args[2..], ["bash", "-c", "echo hi"]);
+    }
+
+    /// A Low-integrity child can write nowhere the user owns, so the backend is
+    /// only wired up for `Read` — the mode whose whole definition that is.
+    /// `Write` must keep falling through to the notice until its roots can be
+    /// labelled, or it would refuse every write it exists to permit.
+    #[cfg(windows)]
+    #[test]
+    fn windows_write_mode_is_not_confined_yet_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![canonicalize_nearest(dir.path())],
+            readable_roots: Vec::new(),
+            cache_roots: Vec::new(),
+            wrap_tool_results: false,
+        };
+        let n = notices();
+        let _ = shell_command_with_backend(
+            OsSandboxBackend::LowIntegrity,
+            crate::Shell::Bash,
+            "echo hi",
+            &policy,
+            &n,
+        );
+        assert_eq!(n.take().as_deref(), Some(NO_OS_SANDBOX_NOTICE));
+    }
+
+    /// The real thing on Windows: under `Read` every write is refused by the
+    /// kernel, wherever it points, while reads still work.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_writes_are_denied_under_low_integrity() {
+        let detected = crate::Shell::detect();
+        if skip_for_want_of("a shell (bash or sh)", detected.is_some()) {
+            return;
+        }
+        let shell = detected.expect("checked above");
+        let dir = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Read,
+            writable_roots: Vec::new(),
+            readable_roots: vec![canonicalize_nearest(dir.path())],
+            cache_roots: Vec::new(),
+            wrap_tool_results: false,
+        };
+
+        // A read of a file that exists still works…
+        let readable = canonicalize_nearest(dir.path()).join("readable.txt");
+        std::fs::write(&readable, "visible").unwrap();
+        let mut cmd = shell_command_with_backend(
+            OsSandboxBackend::LowIntegrity,
+            shell,
+            &format!("cat {}", readable.display()),
+            &policy,
+            &notices(),
+        );
+        cmd.current_dir(dir.path());
+        let out = cmd.output().await.unwrap();
+        assert!(
+            out.status.success(),
+            "Read mode must not confine reads: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("visible"));
+
+        // …and a write does not, even into the directory the command runs in.
+        let target = canonicalize_nearest(dir.path()).join("escaped");
+        let mut cmd = shell_command_with_backend(
+            OsSandboxBackend::LowIntegrity,
+            shell,
+            &format!("echo x > {}", target.display()),
+            &policy,
+            &notices(),
+        );
+        cmd.current_dir(dir.path());
+        let out = cmd.output().await.unwrap();
+        assert!(
+            !out.status.success(),
+            "the write was allowed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!target.exists(), "the write landed anyway");
     }
 
     /// The real thing, on the only platform that has it: a write outside the

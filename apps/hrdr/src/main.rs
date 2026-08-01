@@ -409,8 +409,55 @@ async fn startup_checks(config: &AgentConfig, listing: bool) -> Result<()> {
     Ok(())
 }
 
+/// The Windows sandbox wrapper: `hrdr __sandbox-exec -- <program> <args…>`.
+///
+/// Lowers this process to Low integrity and runs the rest of the argv, so every
+/// descendant inherits the confinement. Intercepted before `Cli::parse` because
+/// it is not a user-facing command and clap must never see it.
+///
+/// Returns `None` when this is an ordinary invocation. Any failure to confine is
+/// fatal: running the command unconfined while the backend reports itself active
+/// is the one outcome worse than having no backend at all.
+#[cfg(windows)]
+fn run_sandbox_exec_wrapper() -> Option<Result<std::process::ExitCode>> {
+    let mut argv = std::env::args_os().skip(1);
+    if argv.next()? != hrdr_tools::sandbox::SANDBOX_EXEC_ARG {
+        return None;
+    }
+    Some((|| {
+        let rest: Vec<std::ffi::OsString> = argv.skip_while(|a| a == "--").collect();
+        let (program, args) = rest
+            .split_first()
+            .context("__sandbox-exec: no program after `--`")?;
+        hrdr_tools::sandbox::lower_current_process_to_low_integrity()
+            .context("__sandbox-exec: could not lower this process to Low integrity")?;
+        let status = std::process::Command::new(program)
+            .args(args)
+            .status()
+            .with_context(|| format!("__sandbox-exec: spawning {}", program.display()))?;
+        // Propagate the child's code so the caller's exit-status handling is
+        // unchanged by the extra process in between.
+        Ok(std::process::ExitCode::from(
+            u8::try_from(status.code().unwrap_or(1)).unwrap_or(1),
+        ))
+    })())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before anything else, including the tracing subscriber and clap: this
+    // process may be a confinement wrapper rather than an hrdr session.
+    #[cfg(windows)]
+    if let Some(result) = run_sandbox_exec_wrapper() {
+        let code = result?;
+        // `ExitCode` cannot be returned from a `Result`-returning main, and the
+        // wrapper must not fall through into a session.
+        std::process::exit(match code == std::process::ExitCode::SUCCESS {
+            true => 0,
+            false => 1,
+        });
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
