@@ -931,7 +931,7 @@ mod tests {
     #[test]
     fn unsupported_output_cap_matcher_requires_exact_typed_400_rejection() {
         for message in [
-            r#"HTTP 400: {"error":{"message":"Unsupported parameter: max_output_tokens"}}"#,
+            r#"HTTP 400: {"detail":"Unsupported parameter: max_output_tokens"}"#,
             r#"HTTP 400: {"error":{"message":"UNSUPPORTED PARAMETER: MAX_OUTPUT_TOKENS."}}"#,
         ] {
             assert!(

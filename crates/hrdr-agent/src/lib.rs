@@ -10756,8 +10756,7 @@ mod tests {
                 vec![
                     MockResp::HttpErrorBody(
                         400,
-                        json!({"error": {"message": "Unsupported parameter: max_output_tokens"}})
-                            .to_string(),
+                        json!({"detail": "Unsupported parameter: max_output_tokens"}).to_string(),
                     ),
                     MockResp::Sse(vec![
                         text_chunk("s1", "Summary of the conversation so far."),
