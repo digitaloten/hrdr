@@ -2559,4 +2559,170 @@ mod tests {
             "the signed block is kept; the one with neither text nor signature is not"
         );
     }
+
+    /// Every arm of [`map_stop_reason`], fallthrough included.
+    ///
+    /// `max_tokens` → `length` is the load-bearing one:
+    /// [`crate::Accumulator::truncated`] matches only `"length" | "max_tokens"`,
+    /// so if that arm regressed, a reply cut off at the output cap would report
+    /// a clean finish — no truncation notice, no continuation, silently half an
+    /// answer. The stream-path test below pins the plumbing; this pins the map.
+    #[test]
+    fn map_stop_reason_maps_every_arm_onto_the_openai_vocabulary() {
+        for (stop, expected) in [
+            ("max_tokens", "length"),
+            ("tool_use", "tool_calls"),
+            ("end_turn", "stop"),
+            ("stop_sequence", "stop"),
+            // The fallthrough hands an unrecognized reason back verbatim rather
+            // than folding it into `stop`, so a reason a future Messages API
+            // version adds is not silently reported as a clean finish.
+            ("pause_turn", "pause_turn"),
+            ("refusal", "refusal"),
+            ("", ""),
+        ] {
+            assert_eq!(map_stop_reason(stop), expected, "stop_reason {stop:?}");
+        }
+    }
+
+    /// The user-visible half of the mapping above: a `message_delta` carrying
+    /// `stop_reason: "max_tokens"` has to travel the real stream path and land
+    /// in the [`crate::Accumulator`] as truncation. The table test alone would
+    /// stay green if the plumbing between `map_stop_reason` and the chunk's
+    /// `finish_reason` broke. The Codex equivalent is
+    /// `incomplete_max_output_tokens_maps_to_length`; on OpenAI `length` is
+    /// native, which leaves Anthropic the untested one of the three.
+    #[tokio::test]
+    async fn a_max_tokens_stop_reason_reaches_the_accumulator_as_truncated() {
+        let body = "event: message_start\n\
+                    data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"half an ans\"}}\n\n\
+                    event: message_delta\n\
+                    data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":5}}\n\n\
+                    event: message_stop\n\
+                    data: {\"type\":\"message_stop\"}\n\n";
+        let (chunks, err) = anthropic_stream(body).await;
+        assert!(
+            err.is_none(),
+            "hitting the output cap is not a stream error: {:#}",
+            err.unwrap()
+        );
+
+        // Fold exactly as the agent's turn loop does, then ask the question the
+        // agent asks.
+        let mut acc = crate::Accumulator::new();
+        for chunk in &chunks {
+            acc.push(chunk);
+        }
+        assert_eq!(
+            acc.finish_reason.as_deref(),
+            Some("length"),
+            "Anthropic's `max_tokens` must arrive as the OpenAI `length`"
+        );
+        assert!(
+            acc.truncated(),
+            "a reply cut off at the output cap must report truncated"
+        );
+    }
+
+    /// A `redacted_thinking` block — what Anthropic emits in place of a thinking
+    /// block when its safety classifier trips — carries all of its payload in
+    /// the `data` field of `content_block_start` and receives no deltas at all.
+    /// It still has to reach the post-loop flush intact: the follow-up request
+    /// carrying `tool_use` is rejected if a thinking block from the turn is
+    /// missing.
+    #[tokio::test]
+    async fn a_redacted_thinking_block_is_flushed_with_its_data_intact() {
+        let body = "event: message_start\n\
+                    data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n\
+                    event: content_block_start\n\
+                    data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"EroBCkYIAxgCIkD\"}}\n\n\
+                    event: content_block_stop\n\
+                    data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n\
+                    event: message_delta\n\
+                    data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n\
+                    event: message_stop\n\
+                    data: {\"type\":\"message_stop\"}\n\n";
+        let (chunks, err) = anthropic_stream(body).await;
+        assert!(err.is_none(), "stream terminated cleanly");
+
+        let blocks: Vec<&Vec<Value>> = chunks
+            .iter()
+            .map(|c| &c.anthropic_thinking_blocks)
+            .filter(|b| !b.is_empty())
+            .collect();
+        assert_eq!(blocks.len(), 1, "exactly one synthetic flush chunk");
+        assert_eq!(
+            *blocks[0],
+            vec![json!({"type": "redacted_thinking", "data": "EroBCkYIAxgCIkD"})],
+            "the opaque `data` must be replayed byte-for-byte"
+        );
+
+        // The block is opaque, so nothing of it is shown to the user — only the
+        // ordinary text block streams to the reasoning/content channels.
+        let reasoning: String = chunks
+            .iter()
+            .flat_map(|c| &c.choices)
+            .filter_map(|c| c.delta.reasoning_content.clone())
+            .collect();
+        assert_eq!(reasoning, "", "a redacted block has no deltas to stream");
+    }
+
+    /// Redacted and normal thinking blocks are collected in two separate places
+    /// — a `Vec` and a `HashMap` — and merged before the flush, so only the sort
+    /// by stream index keeps them in the order Anthropic sent them. Replaying
+    /// them out of order makes Anthropic reject the follow-up `tool_use` turn.
+    ///
+    /// The redacted block sits at the LOWER index on purpose: the merge appends
+    /// the redacted ones after the normal ones, so an implementation that
+    /// skipped the sort would emit thinking-then-redacted and fail here.
+    #[tokio::test]
+    async fn thinking_blocks_flush_in_stream_index_order_not_collection_order() {
+        let body = "event: message_start\n\
+                    data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n\
+                    event: content_block_start\n\
+                    data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"enc-first\"}}\n\n\
+                    event: content_block_stop\n\
+                    data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                    event: content_block_start\n\
+                    data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"then plain\"}}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-second\"}}\n\n\
+                    event: content_block_stop\n\
+                    data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+                    event: content_block_start\n\
+                    data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read\"}}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n\
+                    event: message_delta\n\
+                    data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n\
+                    event: message_stop\n\
+                    data: {\"type\":\"message_stop\"}\n\n";
+        let (chunks, err) = anthropic_stream(body).await;
+        assert!(err.is_none(), "stream terminated cleanly");
+
+        let blocks: Vec<&Vec<Value>> = chunks
+            .iter()
+            .map(|c| &c.anthropic_thinking_blocks)
+            .filter(|b| !b.is_empty())
+            .collect();
+        assert_eq!(blocks.len(), 1, "exactly one synthetic flush chunk");
+        assert_eq!(
+            *blocks[0],
+            vec![
+                json!({"type": "redacted_thinking", "data": "enc-first"}),
+                json!({
+                    "type": "thinking",
+                    "thinking": "then plain",
+                    "signature": "sig-second",
+                }),
+            ],
+            "index 0 (redacted) must precede index 1 (plain), as Anthropic sent them"
+        );
+    }
 }
