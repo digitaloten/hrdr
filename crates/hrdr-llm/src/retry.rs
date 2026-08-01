@@ -290,9 +290,12 @@ pub fn is_context_overflow(e: &anyhow::Error) -> bool {
 /// negotiation, it is a broken request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnsupportedParam {
-    /// `max_tokens` on the chat-completions shape, `max_output_tokens` on the
-    /// Responses shape — one [`RequestParams`](crate::RequestParams) field, two
-    /// wire names.
+    /// The output cap: one [`RequestParams`](crate::RequestParams) field and
+    /// *three* wire names — `max_tokens` on chat completions,
+    /// `max_completion_tokens` on the OpenAI reasoning models that renamed it
+    /// (see `uses_max_completion_tokens`), and `max_output_tokens` on the
+    /// Responses shape. All three have to be recognized: the endpoints most
+    /// likely to reject a cap are exactly the ones not using the oldest spelling.
     MaxTokens,
     Temperature,
     TopP,
@@ -304,12 +307,18 @@ pub enum UnsupportedParam {
 }
 
 impl UnsupportedParam {
-    /// Every wire name this parameter is known by, **longest first** so
-    /// [`unsupported_param`] cannot match `max_tokens` inside
-    /// `max_output_tokens` and drop the right field for the wrong reason.
+    /// Every wire name this parameter is known by, **canonical first** — the
+    /// name [`Self::as_str`] shows, which should be the one the user recognizes
+    /// from their own config rather than whichever spelling this endpoint
+    /// happens to use.
+    ///
+    /// Order does not affect matching. What stops `max_tokens` being found
+    /// inside `max_output_tokens` is [`mentions_identifier`]'s boundary check on
+    /// both ends, not the sequence here (none of these is a substring of another
+    /// anyway).
     fn wire_names(self) -> &'static [&'static str] {
         match self {
-            Self::MaxTokens => &["max_output_tokens", "max_tokens"],
+            Self::MaxTokens => &["max_tokens", "max_completion_tokens", "max_output_tokens"],
             Self::Temperature => &["temperature"],
             Self::TopP => &["top_p"],
             Self::PromptCacheKey => &["prompt_cache_key"],
@@ -320,7 +329,11 @@ impl UnsupportedParam {
         }
     }
 
-    /// The name to show a user, in the wire spelling they can look up.
+    /// The name to show a user: the canonical spelling, which for every variant
+    /// here is also the configuration key they would edit. Deliberately not the
+    /// spelling the server used — telling someone their `max_completion_tokens`
+    /// was refused, when what they set is `max_tokens`, sends them looking for a
+    /// setting that does not exist.
     pub fn as_str(self) -> &'static str {
         self.wire_names()[0]
     }
@@ -758,6 +771,11 @@ mod tests {
                 r#"{"error":{"message":"UNSUPPORTED PARAMETER: MAX_TOKENS."}}"#,
                 UnsupportedParam::MaxTokens,
             ),
+            // The spelling OpenAI's reasoning models use on chat completions.
+            (
+                "Unsupported parameter: max_completion_tokens",
+                UnsupportedParam::MaxTokens,
+            ),
             (
                 "Unrecognized request argument supplied: temperature",
                 UnsupportedParam::Temperature,
@@ -783,6 +801,35 @@ mod tests {
                 unsupported_param(&rejection(Some(400), message)),
                 Some(expected),
                 "{message}"
+            );
+        }
+    }
+
+    /// Every variant is reachable through every name it is known by. Driven off
+    /// `ALL` and `wire_names` rather than a hand-written list, so a sixth variant
+    /// — or a sixth spelling of an existing one — fails here until it is
+    /// recognized. A `match` arm returning an empty slice would otherwise be
+    /// indistinguishable from one that worked.
+    #[test]
+    fn every_variant_round_trips_through_every_wire_name_it_answers_to() {
+        for param in UnsupportedParam::ALL {
+            assert!(
+                !param.wire_names().is_empty(),
+                "{param:?} answers to no wire name at all"
+            );
+            for name in param.wire_names() {
+                let body = format!(r#"{{"error":{{"message":"Unsupported parameter: {name}"}}}}"#);
+                assert_eq!(
+                    unsupported_param(&rejection(Some(400), &body)),
+                    Some(param),
+                    "`{name}` must resolve to {param:?}"
+                );
+            }
+            // `as_str` is what the user is shown, so it has to be a name the
+            // matcher itself accepts, not a prettified label.
+            assert!(
+                param.wire_names().contains(&param.as_str()),
+                "{param:?} displays a name it does not answer to"
             );
         }
     }

@@ -11027,6 +11027,185 @@ mod tests {
             );
         }
 
+        /// Two different parameters, refused one after the other, are both
+        /// dropped — the negotiation is per-parameter, not a single latch that
+        /// gives up after the first one.
+        #[tokio::test]
+        async fn several_rejected_parameters_are_each_dropped_in_turn() {
+            let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = bodies.clone();
+            let server = MockServer::start_with_body_hook(
+                vec![
+                    MockResp::HttpErrorBody(
+                        400,
+                        json!({"error": {"message": "Unsupported parameter: temperature"}})
+                            .to_string(),
+                    ),
+                    MockResp::HttpErrorBody(
+                        400,
+                        json!({"error": {"message": "Unsupported parameter: top_p"}}).to_string(),
+                    ),
+                    MockResp::Sse(vec![
+                        text_chunk("c1", "Answered on the third try."),
+                        stop_chunk("c1"),
+                        "[DONE]".to_string(),
+                    ]),
+                ],
+                move |_, body| {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
+                },
+            )
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.temperature = Some(0.7);
+            cfg.top_p = Some(0.9);
+            let mut agent = Agent::new(cfg).unwrap();
+
+            agent
+                .run_input("hello", |_| {})
+                .await
+                .expect("both rejections are recoverable");
+
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 3, "two drops, then success: {bodies:#?}");
+            assert!(bodies[0].get("temperature").is_some());
+            assert!(bodies[0].get("top_p").is_some());
+            assert!(
+                bodies[1].get("temperature").is_none() && bodies[1].get("top_p").is_some(),
+                "only the first refusal is honoured on attempt two: {bodies:#?}"
+            );
+            assert!(
+                bodies[2].get("temperature").is_none() && bodies[2].get("top_p").is_none(),
+                "both are gone by attempt three: {bodies:#?}"
+            );
+            assert_eq!(agent.unsupported_params.len(), 2);
+        }
+
+        /// A 400 whose body reads as a context overflow must compact, not drop a
+        /// parameter. Both classifiers inspect a 400 body, so their order in
+        /// `connect_stream` is load-bearing: reversed, an oversized request would
+        /// lose an innocent parameter and then be re-sent at the same size.
+        #[tokio::test]
+        async fn an_overflow_400_compacts_rather_than_dropping_a_parameter() {
+            let server = MockServer::start(vec![
+                MockResp::HttpErrorBody(
+                    400,
+                    json!({"error": {"message": "This model's maximum context length is 8192 tokens"}})
+                        .to_string(),
+                ),
+                MockResp::Sse(vec![
+                    text_chunk("s1", "Summary of the conversation so far."),
+                    stop_chunk("s1"),
+                    "[DONE]".to_string(),
+                ]),
+                MockResp::Sse(vec![
+                    text_chunk("c1", "Recovered by compacting."),
+                    stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = test_cfg(server.base_url(), dir.path());
+            cfg.temperature = Some(0.7);
+            let mut agent = Agent::new(cfg).unwrap();
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+            let mut events = Vec::new();
+
+            agent
+                .run_input("hello", |event| events.push(event))
+                .await
+                .expect("an overflow 400 is recoverable by compacting");
+
+            assert!(
+                agent.unsupported_params.is_empty(),
+                "no parameter was blamed for an overflow: {:?}",
+                agent.unsupported_params
+            );
+            assert_eq!(
+                agent.temperature(),
+                Some(0.7),
+                "the configured parameter is untouched"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::Notice(message) if message.contains("compacting and retrying")
+                )),
+                "it was handled as an overflow: {events:#?}"
+            );
+        }
+
+        /// `compact` has no event sink by design, so a parameter dropped by the
+        /// summarizer would have nothing to report through. It is queued instead
+        /// and delivered on the next request — this covers that hand-off, which
+        /// is otherwise invisible until someone loses a notice.
+        #[tokio::test]
+        async fn a_drop_made_by_the_summarizer_is_reported_on_the_next_turn() {
+            let server = MockServer::start(vec![
+                // The summarizer's own capped request is refused…
+                MockResp::HttpErrorBody(
+                    400,
+                    json!({"detail": "Unsupported parameter: max_tokens"}).to_string(),
+                ),
+                // …and the uncapped retry succeeds.
+                MockResp::Sse(vec![
+                    text_chunk("s1", "Summary of the conversation so far."),
+                    stop_chunk("s1"),
+                    "[DONE]".to_string(),
+                ]),
+                // The next real turn is where the queued notice comes out.
+                MockResp::Sse(vec![
+                    text_chunk("c1", "Carrying on."),
+                    stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+
+            // Compaction takes no sink, so nothing is reported during it.
+            agent.compact(None).await.expect("the uncapped retry works");
+            assert!(
+                agent
+                    .unsupported_params
+                    .contains(&hrdr_llm::UnsupportedParam::MaxTokens),
+                "the drop happened"
+            );
+
+            let mut events = Vec::new();
+            agent
+                .run_input("carry on", |event| events.push(event))
+                .await
+                .expect("the following turn runs normally");
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::Notice(message) if message.contains("rejected `max_tokens`")
+                )),
+                "the queued notice is delivered rather than lost: {events:#?}"
+            );
+        }
+
         #[tokio::test]
         async fn a_drain_time_context_overflow_compacts_once_and_retries() {
             use std::sync::atomic::{AtomicUsize, Ordering};

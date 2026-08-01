@@ -46,7 +46,7 @@ use std::process::{Command, Output};
 
 use common::{
     Chat, MockServer, stop_chunk, text_chunk, tool_args_chunk, tool_calls_stop_chunk,
-    tool_start_chunk, write_config,
+    tool_start_chunk, write_config, write_config_with,
 };
 
 /// Run `hrdr <args…>` against `server`, in throwaway HOME/XDG/cwd dirs so the
@@ -66,14 +66,34 @@ fn run_hrdr_in(server: &MockServer, args: &[&str], project: Option<&std::path::P
     run_hrdr_inner(server, args, project, &[])
 }
 
+/// As [`run_hrdr`], but against a HOME the caller already populated — for a test
+/// whose config needs keys [`write_config`] does not write. The caller owns the
+/// tempdir, so it must outlive the call.
+fn run_hrdr_with_home(server: &MockServer, home: &std::path::Path, args: &[&str]) -> Output {
+    run_hrdr_inner_with_home(server, args, None, &[], Some(home))
+}
+
 fn run_hrdr_inner(
     server: &MockServer,
     args: &[&str],
     project: Option<&std::path::Path>,
     env: &[(&str, &str)],
 ) -> Output {
-    let home = tempfile::tempdir().expect("temp home");
-    write_config(home.path(), &server.base_url());
+    run_hrdr_inner_with_home(server, args, project, env, None)
+}
+
+fn run_hrdr_inner_with_home(
+    server: &MockServer,
+    args: &[&str],
+    project: Option<&std::path::Path>,
+    env: &[(&str, &str)],
+    preset_home: Option<&std::path::Path>,
+) -> Output {
+    let fresh_home = tempfile::tempdir().expect("temp home");
+    let home = preset_home.unwrap_or_else(|| fresh_home.path());
+    if preset_home.is_none() {
+        write_config(home, &server.base_url());
+    }
     let fresh = tempfile::tempdir().expect("temp project");
     let cwd = project.unwrap_or_else(|| fresh.path());
 
@@ -81,13 +101,13 @@ fn run_hrdr_inner(
     cmd.args(args);
     cmd.current_dir(cwd);
     for (key, value) in [
-        ("HOME", home.path()),
-        ("USERPROFILE", home.path()),
-        ("APPDATA", home.path()),
-        ("LOCALAPPDATA", home.path()),
-        ("XDG_CONFIG_HOME", home.path()),
-        ("XDG_DATA_HOME", home.path()),
-        ("XDG_STATE_HOME", home.path()),
+        ("HOME", home),
+        ("USERPROFILE", home),
+        ("APPDATA", home),
+        ("LOCALAPPDATA", home),
+        ("XDG_CONFIG_HOME", home),
+        ("XDG_DATA_HOME", home),
+        ("XDG_STATE_HOME", home),
     ] {
         cmd.env(key, value);
     }
@@ -345,5 +365,133 @@ fn run_rejects_a_negative_max_cost() {
         !out.status.success(),
         "a negative cap is a usage error: {:?}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ── 6. a rejected optional parameter ─────────────────────────────────────────
+
+/// REGRESSION, process level: a provider that refuses an optional parameter used
+/// to end the session. A 400 is neither a context overflow nor transient, so
+/// nothing retried it — and because the recovery that did exist wrapped the
+/// *summarizer* call only, compaction kept working while every real turn died.
+///
+/// The unit tests cover the negotiation itself. This one exists to prove it
+/// survives the process boundary: a real `hrdr run`, a real config carrying the
+/// parameter, the real exit-code contract.
+#[test]
+fn run_drops_a_rejected_parameter_and_finishes_the_turn() {
+    let server = MockServer::start(vec![
+        Chat::StatusBody(
+            400,
+            r#"{"error":{"message":"Unsupported parameter: temperature"}}"#.to_string(),
+        ),
+        text_turn("recovered"),
+    ]);
+    let home = tempfile::tempdir().expect("temp home");
+    write_config_with(home.path(), &server.base_url(), "temperature = 0.7\n");
+    let out = run_hrdr_with_home(&server, home.path(), &["run", "hi"]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the turn must survive the rejection.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(stdout, "recovered\n", "the reply still reaches stdout");
+    assert!(
+        stderr.contains("rejected `temperature`"),
+        "the user is told their configured parameter was dropped, got: {stderr:?}"
+    );
+
+    // The wire is the real assertion: the parameter went out once and never
+    // again. Asserting only on the reply would pass just as well if hrdr had
+    // retried with the same body and the mock had simply run out of errors.
+    let bodies = server.chat_bodies();
+    assert_eq!(bodies.len(), 2, "rejected once, then retried: {bodies:#?}");
+    assert!(
+        bodies[0].get("temperature").is_some(),
+        "the first attempt carried the configured parameter: {bodies:#?}"
+    );
+    assert!(
+        bodies[1].get("temperature").is_none(),
+        "the retry omits it: {bodies:#?}"
+    );
+}
+
+/// The same recovery under `--json`: the drop is reported as a `notice` event
+/// and the turn still ends with exactly one `done`, so a script consuming the
+/// stream sees a clean turn rather than an error.
+#[test]
+fn run_json_reports_a_dropped_parameter_as_a_notice() {
+    let server = MockServer::start(vec![
+        Chat::StatusBody(
+            400,
+            r#"{"error":{"message":"Unrecognized request argument supplied: top_p"}}"#.to_string(),
+        ),
+        text_turn("ok"),
+    ]);
+    let home = tempfile::tempdir().expect("temp home");
+    write_config_with(home.path(), &server.base_url(), "top_p = 0.9\n");
+    let out = run_hrdr_with_home(&server, home.path(), &["run", "--json", "hi"]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the turn must survive the rejection: {stdout}"
+    );
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("each line is one JSON event"))
+        .collect();
+    assert!(
+        events.iter().any(|e| e["type"] == "notice"
+            && e["text"]
+                .as_str()
+                .is_some_and(|m| m.contains("rejected `top_p`"))),
+        "the drop is a notice event: {events:#?}"
+    );
+    assert_eq!(
+        events.iter().filter(|e| e["type"] == "done").count(),
+        1,
+        "and the turn still ends exactly once: {events:#?}"
+    );
+    assert!(
+        events.iter().all(|e| e["type"] != "error"),
+        "a recovered rejection is not an error: {events:#?}"
+    );
+}
+
+/// A 400 whose body says the context is too long must NOT be read as a rejected
+/// parameter: overflow recovery is checked first, so this compacts and retries.
+/// Both classifiers look at a 400 body, and getting the order wrong would drop
+/// an innocent parameter and re-send the same oversized request.
+#[test]
+fn run_treats_a_400_overflow_as_overflow_not_a_rejected_parameter() {
+    let server = MockServer::start(vec![
+        Chat::StatusBody(
+            400,
+            r#"{"error":{"message":"This model's maximum context length is 8192 tokens"}}"#
+                .to_string(),
+        ),
+        text_turn("after compaction"),
+    ]);
+    let home = tempfile::tempdir().expect("temp home");
+    write_config_with(home.path(), &server.base_url(), "temperature = 0.7\n");
+    let out = run_hrdr_with_home(&server, home.path(), &["run", "hi"]);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("rejected `temperature`"),
+        "an overflow must not be mistaken for a parameter rejection: {stderr:?}"
+    );
+    // A single-message history has nothing to compact, so the turn legitimately
+    // fails here — what matters is that it failed as an overflow.
+    let bodies = server.chat_bodies();
+    assert!(
+        bodies
+            .first()
+            .is_some_and(|body| body.get("temperature").is_some()),
+        "and the parameter was never dropped: {bodies:#?}"
     );
 }

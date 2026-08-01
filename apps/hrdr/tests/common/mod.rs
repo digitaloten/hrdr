@@ -35,6 +35,11 @@ pub enum Chat {
     Drop,
     /// Reply with a bare HTTP error status and no body (e.g. 400, 500).
     Status(u16),
+    /// Reply with an HTTP error status **and** a JSON error body. The body is
+    /// what the agent classifies on — a rejected parameter and a context
+    /// overflow are both 400s, and only the body tells them apart — so a test
+    /// about either needs this rather than [`Chat::Status`].
+    StatusBody(u16, String),
     /// Open the SSE stream (200 + these initial `data:` lines), then hold the
     /// connection open without finishing — the turn stays "running" so a caller
     /// can cancel it (Esc) mid-flight. The socket is closed after a long sleep.
@@ -45,6 +50,11 @@ pub enum Chat {
 pub struct MockServer {
     port: u16,
     stop: Arc<Mutex<bool>>,
+    /// Every `/chat/completions` request body, in the order they arrived — so a
+    /// test can assert what actually went on the wire, not merely what came
+    /// back. Chat requests only: the `/models` probe would otherwise interleave
+    /// with them unpredictably.
+    chat_bodies: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockServer {
@@ -57,6 +67,8 @@ impl MockServer {
         let queue: Arc<Mutex<VecDeque<Chat>>> = Arc::new(Mutex::new(chats.into_iter().collect()));
         let stop = Arc::new(Mutex::new(false));
         let stop_thread = Arc::clone(&stop);
+        let chat_bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let bodies_thread = Arc::clone(&chat_bodies);
         thread::spawn(move || {
             for conn in listener.incoming() {
                 if *stop_thread.lock().unwrap() {
@@ -64,15 +76,32 @@ impl MockServer {
                 }
                 let Ok(stream) = conn else { break };
                 let queue = Arc::clone(&queue);
-                thread::spawn(move || handle(stream, &queue));
+                let bodies = Arc::clone(&bodies_thread);
+                thread::spawn(move || handle(stream, &queue, &bodies));
             }
         });
-        MockServer { port, stop }
+        MockServer {
+            port,
+            stop,
+            chat_bodies,
+        }
     }
 
     /// The base URL to configure a provider with (`…/v1`).
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}/v1", self.port)
+    }
+
+    /// The `/chat/completions` request bodies received so far, parsed as JSON.
+    /// Panics on a body that is not JSON — the binary only ever sends JSON here,
+    /// so that is a bug worth failing on rather than skipping past.
+    pub fn chat_bodies(&self) -> Vec<serde_json::Value> {
+        self.chat_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| serde_json::from_str(body).expect("chat request body is JSON"))
+            .collect()
     }
 }
 
@@ -83,7 +112,7 @@ impl Drop for MockServer {
 }
 
 /// Serve one connection: read the request head + body, then route on the path.
-fn handle(mut stream: TcpStream, queue: &Mutex<VecDeque<Chat>>) {
+fn handle(mut stream: TcpStream, queue: &Mutex<VecDeque<Chat>>, chat_bodies: &Mutex<Vec<String>>) {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     // Read until the end of the headers.
@@ -117,16 +146,31 @@ fn handle(mut stream: TcpStream, queue: &Mutex<VecDeque<Chat>>) {
     while remaining > 0 {
         match stream.read(&mut tmp) {
             Ok(0) | Err(_) => break,
-            Ok(n) => remaining = remaining.saturating_sub(n),
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                remaining = remaining.saturating_sub(n);
+            }
         }
     }
 
     if path.contains("/chat/completions") {
+        let end = (headers_end + content_len).min(buf.len());
+        chat_bodies
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(&buf[headers_end..end]).into_owned());
         let next = queue.lock().unwrap().pop_front();
         match next {
             Some(Chat::Sse(lines)) => write_sse(&mut stream, &lines),
             Some(Chat::Drop) => { /* write nothing: connection resets */ }
             Some(Chat::Status(code)) => write_status(&mut stream, code),
+            Some(Chat::StatusBody(code, body)) => {
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {code} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
             Some(Chat::Hang(lines)) => {
                 // Open the stream and flush the initial chunks, then hold the
                 // connection so the turn stays in-flight to be cancelled.
@@ -251,12 +295,20 @@ pub fn tool_calls_stop_chunk(id: &str) -> String {
 /// is deliberately not the `default` placeholder, so the placeholder-model
 /// network check is skipped too.
 pub fn write_config(config_home: &std::path::Path, base_url: &str) {
+    write_config_with(config_home, base_url, "");
+}
+
+/// [`write_config`] with `extra` top-level keys spliced in ahead of the provider
+/// table — for a test that needs hrdr to actually *send* an optional parameter
+/// (`temperature`, `max_tokens`, …), which it only does when one is configured.
+pub fn write_config_with(config_home: &std::path::Path, base_url: &str, extra: &str) {
     let dir = config_home.join("hrdr");
     std::fs::create_dir_all(&dir).expect("config dir");
     std::fs::write(
         dir.join("config.toml"),
         format!(
-            "model = \"mock://mock-model\"\n\n\
+            "model = \"mock://mock-model\"\n\
+             {extra}\n\
              [providers.mock]\n\
              base_url = \"{base_url}\"\n\
              context_window = 200000\n"

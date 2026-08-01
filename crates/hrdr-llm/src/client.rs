@@ -1519,6 +1519,121 @@ mod tests {
         assert!(cleared.get("prompt_cache_key").is_none());
     }
 
+    /// Every [`UnsupportedParam`](crate::UnsupportedParam) variant actually
+    /// leaves the chat-completions wire when cleared.
+    ///
+    /// Driven off `UnsupportedParam::ALL` rather than a hand-written list, so a
+    /// sixth variant fails here until its field mapping is written — a `match`
+    /// arm that forgot to clear anything would otherwise look exactly like one
+    /// that worked.
+    #[test]
+    fn clearing_a_rejected_parameter_removes_it_from_the_chat_completions_body() {
+        // `gpt-4o` keeps the original `max_tokens` spelling; a reasoning model
+        // renames the same field to `max_completion_tokens`
+        // (`uses_max_completion_tokens`), so both are exercised — a matcher that
+        // knew only one spelling would leave half of OpenAI unrecoverable.
+        for (model, cap_field) in [
+            ("gpt-4o", "max_tokens"),
+            ("o3-mini", "max_completion_tokens"),
+        ] {
+            for (param, field) in [
+                (crate::UnsupportedParam::MaxTokens, cap_field),
+                (crate::UnsupportedParam::Temperature, "temperature"),
+                (crate::UnsupportedParam::TopP, "top_p"),
+                (crate::UnsupportedParam::PromptCacheKey, "prompt_cache_key"),
+                (crate::UnsupportedParam::ReasoningEffort, "reasoning_effort"),
+            ] {
+                let mut client = Client::new("https://api.openai.com/v1", None, model);
+                client.temperature = Some(0.3);
+                client.set_effort(Some("high".to_string()));
+                client.set_prompt_cache_key(Some("hrdr-agent-0f1e2d3c".to_string()));
+                client.set_params(crate::RequestParams {
+                    max_tokens: Some(4096),
+                    top_p: Some(0.9),
+                    ..Default::default()
+                });
+
+                let before =
+                    client.body_json(&client.request(Some(client.model.clone()), &[], &[], true));
+                assert!(
+                    before.get(field).is_some(),
+                    "precondition: `{field}` is on the wire before clearing: {before}"
+                );
+
+                client.clear_unsupported_param(param);
+                let after =
+                    client.body_json(&client.request(Some(client.model.clone()), &[], &[], true));
+                assert!(
+                    after.get(field).is_none(),
+                    "`{field}` must be gone after clearing {param:?}: {after}"
+                );
+                // Only the named field goes: dropping one rejected parameter must
+                // not quietly take the others with it.
+                for other in [
+                    cap_field,
+                    "temperature",
+                    "top_p",
+                    "prompt_cache_key",
+                    "reasoning_effort",
+                ] {
+                    if other != field {
+                        assert!(
+                            after.get(other).is_some(),
+                            "clearing {param:?} must not also drop `{other}`: {after}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Responses shape spells two of them differently — `max_output_tokens`
+    /// and a nested `reasoning.effort` — off the *same* `Client` fields. Clearing
+    /// has to reach both spellings, or a Codex session would keep sending the
+    /// parameter it was just told to stop sending.
+    #[test]
+    fn clearing_a_rejected_parameter_removes_it_from_the_responses_body() {
+        let codex_body = |client: &Client| {
+            crate::codex::build_body(
+                &client.model,
+                client.effort(),
+                client.temperature,
+                client.params().top_p,
+                client.params().max_tokens,
+                client.prompt_cache_key(),
+                &[],
+                &[],
+            )
+        };
+        for (param, probe) in [
+            (crate::UnsupportedParam::MaxTokens, "max_output_tokens"),
+            (crate::UnsupportedParam::ReasoningEffort, "reasoning"),
+            (crate::UnsupportedParam::Temperature, "temperature"),
+            (crate::UnsupportedParam::TopP, "top_p"),
+            (crate::UnsupportedParam::PromptCacheKey, "prompt_cache_key"),
+        ] {
+            let mut client = Client::new("https://chatgpt.com/backend-api/codex", None, "gpt-5.6");
+            client.temperature = Some(0.3);
+            client.set_effort(Some("high".to_string()));
+            client.set_prompt_cache_key(Some("hrdr-agent-0f1e2d3c".to_string()));
+            client.set_params(crate::RequestParams {
+                max_tokens: Some(4096),
+                top_p: Some(0.9),
+                ..Default::default()
+            });
+
+            assert!(
+                codex_body(&client).get(probe).is_some(),
+                "precondition: `{probe}` is on the Responses wire before clearing"
+            );
+            client.clear_unsupported_param(param);
+            assert!(
+                codex_body(&client).get(probe).is_none(),
+                "`{probe}` must be gone after clearing {param:?}"
+            );
+        }
+    }
+
     /// Two consecutive requests from one client send the *same* key. That is the
     /// whole point: OpenAI combines the key with the prompt-prefix hash, so a
     /// value that changed per request would share a prefix with nothing. (It is

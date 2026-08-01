@@ -58,6 +58,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   re-offering a parameter the endpoint has refused only buys another guaranteed
   400, and a second compaction no longer re-probes what the first one learned.
 
+  All three wire spellings of the output cap are recognized — `max_tokens`,
+  `max_completion_tokens` (OpenAI's reasoning models on chat completions) and
+  `max_output_tokens` (the Responses shape) — since the endpoints most likely to
+  refuse a cap are exactly the ones not using the oldest name. The notice names
+  the parameter as your **config** spells it, not as the server does, so it
+  points at a key you can actually edit.
+
 - **A failed proactive compaction no longer disables itself for the whole
   session.** The failure was latched, and the only thing that cleared the latch
   was a _successful_ compaction — which nothing would run, because the caller
