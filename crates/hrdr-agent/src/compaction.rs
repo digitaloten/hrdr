@@ -195,6 +195,27 @@ const MAX_COMPACT_STAGE: usize = 4;
 /// thinking model to reason before it writes.
 const COMPACT_MAX_OUTPUT_TOKENS: u32 = 32_768;
 
+/// Codex Responses models vary on whether they accept `max_output_tokens`.
+/// Retry only the exact parameter rejection that removing our cap can fix.
+fn is_unsupported_max_output_tokens(error: &anyhow::Error) -> bool {
+    const REJECTION: &str = "unsupported parameter: max_output_tokens";
+
+    error
+        .downcast_ref::<hrdr_llm::ChatError>()
+        .is_some_and(|error| {
+            if error.status != Some(400) {
+                return false;
+            }
+            let message = error.message.to_ascii_lowercase();
+            message.match_indices(REJECTION).any(|(start, _)| {
+                message
+                    .as_bytes()
+                    .get(start + REJECTION.len())
+                    .is_none_or(|next| !next.is_ascii_alphanumeric() && *next != b'_')
+            })
+        })
+}
+
 /// Tokens held back from the window when sizing the summarization request: the
 /// output cap above, plus slack for the summarizer's own system prompt, the
 /// trigger, and the estimator's own error.
@@ -657,6 +678,11 @@ impl Agent {
         // none. The budgets that must not stack are the ones retrying the SAME
         // request (connect and drain) — see `connect_and_drain`.
         let mut budget = RetryBudget::new(self.retry_policy);
+        // Once this endpoint rejects the cap, every later attempt in this
+        // compaction stays uncapped — including transient retries and smaller
+        // context stages. Re-probing cannot discover anything new and only adds
+        // another guaranteed 400.
+        let mut output_cap_supported = true;
         let summary = loop {
             let history = compact_stage_history(stage, &full, &mut elided);
             // The summarizer is sent no `tools` (it must answer in prose), but
@@ -672,7 +698,7 @@ impl Agent {
             req.extend(history);
             req.push(ChatMessage::user(trigger.clone()));
             self.budget_preflight().await?;
-            match self.plain_completion(req).await {
+            match self.plain_completion(req, &mut output_cap_supported).await {
                 Ok(s) => break s,
                 Err(e) if is_context_overflow(&e) && stage < 4 => stage += 1,
                 Err(e) => {
@@ -760,25 +786,59 @@ impl Agent {
     /// Run one no-tools request to completion, returning the streamed text.
     /// Silent: the shared [`drain_stream`] gets a no-op event sink.
     ///
-    /// The output cap is scoped to this call ([`COMPACT_MAX_OUTPUT_TOKENS`]) and
-    /// the session's own is restored on every exit, error included — the client
-    /// is the live one the next turn will use, so leaving a summarizer's cap on
-    /// it would silently truncate the model's real replies.
-    async fn plain_completion(&mut self, req: Vec<ChatMessage>) -> Result<String> {
+    /// The output cap is applied to a clone of the live client, so the session's
+    /// own parameters remain untouched on success, error, or cancellation. A
+    /// Codex model that specifically rejects `max_output_tokens` gets one retry
+    /// with `max_tokens` cleared; `output_cap_supported` latches that rejection
+    /// across all retries in the current compaction. No other 400 is retried here.
+    async fn plain_completion(
+        &mut self,
+        req: Vec<ChatMessage>,
+        output_cap_supported: &mut bool,
+    ) -> Result<String> {
+        // Compaction can run before any normal turn (notably `/compact` after
+        // resuming a process), so it cannot rely on `connect_stream` having
+        // refreshed and injected ChatGPT OAuth. Do it at the actual request
+        // boundary, after every no-op compaction exit and before cloning either
+        // the capped or uncapped client. The non-OAuth branch also retains the
+        // shared helper's stale account-header cleanup semantics.
+        self.refresh_oauth_if_needed().await;
         let saved = self.client.params().clone();
-        self.client.set_params(hrdr_llm::RequestParams {
-            max_tokens: Some(COMPACT_MAX_OUTPUT_TOKENS),
-            ..saved.clone()
-        });
-        let result = self.plain_completion_inner(req).await;
-        self.client.set_params(saved);
-        result
+        // A copy of the live client with the summarizer's own cap — `None` for
+        // the uncapped fallback. Every other session parameter is carried over.
+        let with_cap = |client: &hrdr_llm::Client, cap: Option<u32>| {
+            let mut client = client.clone();
+            client.set_params(hrdr_llm::RequestParams {
+                max_tokens: cap,
+                ..saved.clone()
+            });
+            client
+        };
+        let uncapped = with_cap(&self.client, None);
+        if !*output_cap_supported {
+            return self.plain_completion_inner(&uncapped, &req, None).await;
+        }
+
+        let capped = with_cap(&self.client, Some(COMPACT_MAX_OUTPUT_TOKENS));
+        match self
+            .plain_completion_inner(&capped, &req, Some(COMPACT_MAX_OUTPUT_TOKENS))
+            .await
+        {
+            Err(error) if is_unsupported_max_output_tokens(&error) => {
+                *output_cap_supported = false;
+                self.plain_completion_inner(&uncapped, &req, None).await
+            }
+            result => result,
+        }
     }
 
-    /// [`Self::plain_completion`]'s body, split out so the parameter restore
-    /// above cannot be skipped by an early `?`.
-    async fn plain_completion_inner(&mut self, req: Vec<ChatMessage>) -> Result<String> {
-        let mut stream = self.client.chat_stream(&req, &[]).await?;
+    async fn plain_completion_inner(
+        &mut self,
+        client: &hrdr_llm::Client,
+        req: &[ChatMessage],
+        output_cap: Option<u32>,
+    ) -> Result<String> {
+        let mut stream = client.chat_stream(req, &[]).await?;
         // The round's generation time is dropped on purpose: a compaction call
         // emits no `Usage` event, so its tokens never reach the turn's
         // throughput either. Counting one without the other would skew it.
@@ -792,9 +852,15 @@ impl Agent {
         // the session — and it would read as complete to every later turn.
         // Refusing leaves the real history in place, which is recoverable.
         if acc.truncated() {
+            if let Some(output_cap) = output_cap {
+                bail!(
+                    "the summary was cut off at the output limit ({output_cap} tokens) — \
+                     refusing to replace the conversation with a partial summary"
+                );
+            }
             bail!(
-                "the summary was cut off at the output limit ({COMPACT_MAX_OUTPUT_TOKENS} \
-                 tokens) — refusing to replace the conversation with a partial summary"
+                "the uncapped summary ended at the model's output limit — refusing to replace \
+                 the conversation with a partial summary"
             );
         }
         Ok(acc.into_message().content.unwrap_or_default())
@@ -855,7 +921,40 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hrdr_llm::ChatMessage;
+    use hrdr_llm::{ChatError, ChatErrorKind, ChatMessage};
+
+    fn chat_error(status: Option<u16>, message: &str) -> anyhow::Error {
+        anyhow::Error::new(ChatError {
+            status,
+            retry_after: None,
+            kind: ChatErrorKind::Other,
+            message: message.to_string(),
+        })
+    }
+
+    #[test]
+    fn unsupported_output_cap_matcher_requires_exact_typed_400_rejection() {
+        for message in [
+            r#"HTTP 400: {"detail":"Unsupported parameter: max_output_tokens"}"#,
+            r#"HTTP 400: {"error":{"message":"UNSUPPORTED PARAMETER: MAX_OUTPUT_TOKENS."}}"#,
+        ] {
+            assert!(
+                is_unsupported_max_output_tokens(&chat_error(Some(400), message)),
+                "real parameter rejection must match: {message}"
+            );
+        }
+
+        for (status, message) in [
+            (Some(400), "Unsupported parameter: max_output_tokens_v2"),
+            (Some(400), "Unsupported parameter: max_tokens"),
+            (Some(422), "Unsupported parameter: max_output_tokens"),
+        ] {
+            assert!(
+                !is_unsupported_max_output_tokens(&chat_error(status, message)),
+                "unrelated error must not match: status={status:?}, message={message}"
+            );
+        }
+    }
 
     /// A message of roughly `tokens` estimated size (~4 bytes per token).
     fn sized(role: Role, tokens: usize) -> ChatMessage {

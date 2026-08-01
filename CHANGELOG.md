@@ -39,6 +39,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   check fails if CI detects the no-op backend instead of a real one. Seatbelt is
   confirmed to run and confine on every macOS job since.
 
+- **Codex sessions recover when compaction or a streamed response hits the
+  context limit.** Compaction now refreshes ChatGPT OAuth before its first
+  summarizer request, retries without `max_output_tokens` when a Responses model
+  rejects that optional parameter, remembers the rejection for the rest of the
+  compaction attempt, and handles `context_length_exceeded` errors delivered
+  inside an established SSE stream through the same one-time compact-and-retry
+  path as HTTP-level overflows.
+
 ## [0.10.0] - 2026-08-01
 
 ### Added

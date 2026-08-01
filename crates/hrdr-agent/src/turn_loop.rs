@@ -246,6 +246,20 @@ pub(crate) struct Drained {
     pub decode: std::time::Duration,
 }
 
+/// Which view of `self.messages` a round sends. It is a *view*, rebuilt per
+/// connection attempt, rather than a swap of the field: overflow recovery
+/// compacts `self.messages`, and it has to compact the canonical history — the
+/// one with the tool protocol intact — or the retry would flatten a history
+/// that had already lost its tool_use/tool_result pairing.
+#[derive(Clone, Copy)]
+enum RequestHistory {
+    /// Send `self.messages` as-is.
+    Canonical,
+    /// Send [`flatten_tool_protocol`]'s output: the forced wrap-up round carries
+    /// no `tools` definition, and backends 400 on tool blocks without one.
+    ProtocolFree,
+}
+
 /// Whether a chunk carried any of the model's output, as opposed to being the
 /// trailing usage-only chunk (or a keep-alive, or one of the empty deltas a
 /// Qwen3-style backend sprays). Tool-call fragments count: they are output the
@@ -566,7 +580,12 @@ impl Agent {
             // a context-length overflow. Mid-stream failures are retried too
             // (history is unchanged at that point, so re-requesting is safe).
             let Drained { acc, decode } = self
-                .connect_and_drain(&defs, &mut overflow_compacted, &mut on_event)
+                .connect_and_drain(
+                    &defs,
+                    RequestHistory::Canonical,
+                    &mut overflow_compacted,
+                    &mut on_event,
+                )
                 .await?;
             if let Some(warning) = hrdr_llm::take_client_warning() {
                 on_event(AgentEvent::Notice(warning));
@@ -838,21 +857,22 @@ impl Agent {
         // No `tools` are sent for this round (the model must answer in text),
         // but the turn's history is full of tool_use/tool_result blocks from
         // the rounds that already ran — the native Anthropic backend 400s any
-        // request carrying those without a `tools` definition. Flatten the
-        // protocol out for this request only; the real history (with the tool
-        // protocol intact) is restored right after, so later turns still see
-        // accurate tool-call pairing.
-        let flattened = flatten_tool_protocol(&self.messages);
+        // request carrying those without a `tools` definition. Each connection
+        // attempt builds a fresh protocol-free request view while canonical
+        // history stays in `self.messages`, so overflow recovery compacts the
+        // canonical history and the retry flattens that smaller result.
         if let Err(error) = self.budget_preflight().await {
             on_event(AgentEvent::Notice(error.to_string()));
             return Err(error);
         }
-        let real_messages = std::mem::replace(&mut self.messages, flattened);
-        let drained = self
-            .connect_and_drain(&[], &mut overflow_compacted, &mut on_event)
-            .await;
-        self.messages = real_messages;
-        let Drained { acc, decode } = drained?;
+        let Drained { acc, decode } = self
+            .connect_and_drain(
+                &[],
+                RequestHistory::ProtocolFree,
+                &mut overflow_compacted,
+                &mut on_event,
+            )
+            .await?;
         // No `tools` went out on this round (see above), so none are in the
         // prompt to account for.
         let (prompt_tokens, completion_tokens, cached_prompt_tokens, cost_usd, session_cost_usd) =
@@ -1192,9 +1212,39 @@ impl Agent {
         }
     }
 
+    /// Recover one context overflow per turn, regardless of whether the provider
+    /// rejected the request while connecting or reported failure in the stream.
+    /// Returns `true` only when compaction shrank history and the caller should
+    /// retry without spending its transient [`RetryBudget`].
+    async fn recover_context_overflow<F: FnMut(AgentEvent)>(
+        &mut self,
+        error: &anyhow::Error,
+        overflow_compacted: &mut bool,
+        on_event: &mut F,
+    ) -> Result<bool> {
+        if !is_context_overflow(error) || *overflow_compacted || self.messages.len() <= 2 {
+            return Ok(false);
+        }
+        on_event(AgentEvent::Notice(
+            "context window exceeded — compacting and retrying".to_string(),
+        ));
+        let (before, after) = self.compact(None).await?;
+        *overflow_compacted = true;
+        if after >= before {
+            bail!(
+                "context window exceeded and the current turn is too large to compact \
+                 ({after} messages, nothing left to shrink) — {error}"
+            );
+        }
+        Ok(true)
+    }
+
     /// Stream one assistant turn, retrying both the connect and any transient
-    /// mid-stream failure with the same backoff the connect path uses. History
-    /// is unchanged when `drain_stream` fails, so a clean re-request is safe.
+    /// mid-stream failure with the same backoff the connect path uses. A failed
+    /// `drain_stream` appends nothing to history, so a clean re-request is safe
+    /// — the one exception is [`Self::recover_context_overflow`], which shrinks
+    /// history on purpose and is why the retry re-reads `self.messages` rather
+    /// than resending a request view captured before the failure.
     ///
     /// **The round is the unit the retry budget is measured in.** Connecting and
     /// draining are two ways for one request to fail, so they share the single
@@ -1207,19 +1257,26 @@ impl Agent {
     async fn connect_and_drain<F: FnMut(AgentEvent)>(
         &mut self,
         defs: &[ToolDef],
+        history: RequestHistory,
         overflow_compacted: &mut bool,
         on_event: &mut F,
     ) -> Result<Drained> {
         let mut budget = RetryBudget::new(self.retry_policy);
         loop {
             let mut stream = self
-                .connect_stream(defs, overflow_compacted, &mut budget, on_event)
+                .connect_stream(defs, history, overflow_compacted, &mut budget, on_event)
                 .await?;
             match drain_stream(&mut stream, on_event).await {
                 // Only the round that actually streamed is timed: the retried
                 // attempts and the backoff between them are not generation.
                 Ok(drained) => return Ok(drained),
                 Err(e) => {
+                    if self
+                        .recover_context_overflow(&e, overflow_compacted, on_event)
+                        .await?
+                    {
+                        continue;
+                    }
                     let retried = budget
                         .retry(&e, &mut |a: RetryAttempt| {
                             on_event(AgentEvent::Notice(format!(
@@ -1281,41 +1338,30 @@ impl Agent {
     async fn connect_stream<F: FnMut(AgentEvent)>(
         &mut self,
         defs: &[ToolDef],
+        history: RequestHistory,
         overflow_compacted: &mut bool,
         budget: &mut RetryBudget,
         on_event: &mut F,
     ) -> Result<ChatStream> {
         self.refresh_oauth_if_needed().await;
         loop {
-            match self.client.chat_stream(&self.messages, defs).await {
+            let flattened = match history {
+                RequestHistory::Canonical => None,
+                RequestHistory::ProtocolFree => Some(flatten_tool_protocol(&self.messages)),
+            };
+            let messages = flattened.as_deref().unwrap_or(&self.messages);
+            match self.client.chat_stream(messages, defs).await {
                 Ok(stream) => return Ok(stream),
                 Err(e) => {
-                    // Context overflow → compact once, then retry.
-                    if is_context_overflow(&e) && !*overflow_compacted && self.messages.len() > 2 {
-                        on_event(AgentEvent::Notice(
-                            "context window exceeded — compacting and retrying".to_string(),
-                        ));
-                        let (before, after) = self.compact(None).await?;
-                        *overflow_compacted = true;
-                        // `compact` reports `before == after` on every no-op path
-                        // (nothing to summarize, or splitting the mega-turn bought
-                        // nothing). Retrying then would resend the exact request
-                        // that just failed and hit the same overflow again, having
-                        // burned the single retry this branch allows — so fail
-                        // clearly now instead of falling through to a generic
-                        // "background task failed" once the caller gives up.
-                        if after >= before {
-                            bail!(
-                                "context window exceeded and the current turn is too \
-                                 large to compact ({after} messages, nothing left to \
-                                 shrink) — {e}"
-                            );
-                        }
+                    if self
+                        .recover_context_overflow(&e, overflow_compacted, on_event)
+                        .await?
+                    {
                         continue;
                     }
                     // Transient network/server error → backoff and retry (the
                     // driver honours a server `Retry-After` over its own
-                    // schedule). Note the overflow branch above `continue`s
+                    // schedule). The overflow recovery above `continue`s
                     // *without* touching `budget`: a compaction is not a retry
                     // of the same request, it is a different, smaller one, and
                     // charging it here would cost the round a network retry it
