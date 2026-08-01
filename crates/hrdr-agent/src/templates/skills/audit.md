@@ -51,8 +51,7 @@ Depth: $ARGUMENTS (default `low` — report only high-confidence findings; `high
      vulnerability. Say so in the hardening notes instead of promoting it.
    - Trace to where the function RETURNS, not to the first step that agrees with
      you. Stopping at the interesting line is how a rejected input gets reported
-     as an accepted one — the parse two lines further down often throws the
-     whole thing out.
+     as accepted — the parse two lines down often throws the whole thing out.
    - Severity follows the traced impact, not the scariness of the function name.
      A call that cannot be reached is not critical; a `kill`, `exec` or `unsafe`
      that a guard already covers is not a finding at all.
@@ -77,12 +76,13 @@ Depth: $ARGUMENTS (default `low` — report only high-confidence findings; `high
      which you did not. Report a gap as a GAP: "not audited" is the honest line.
      Do not invent a constraint to excuse it — you have no clock, no budget and
      no deadline, so "limited by available time" is never true, and neither is
-     narrowing a full-codebase audit to a diff range nobody asked for.
-     "Audited everything" is almost never true either; saying where you stopped
-     is what lets the user judge the report.
+     narrowing a full-codebase audit to a diff range nobody asked for. "Audited
+     everything" is almost never true either; saying where you stopped is what
+     lets the user judge the report.
 
    End with a one-paragraph summary: total findings by severity, overall risk,
    and the top 1-3 things to fix first.
+
 6. Route the report by where you're working:
    - **Inside a git repo with a `docs/` directory** → write the full report to
      `docs/security-review.md`.

@@ -39,10 +39,10 @@ named in arguments if given: $ARGUMENTS
    - Trace the callers up to something whose frequency you can name (per
      request, per file, per token, once at startup). If you cannot reach such a
      caller, you do not know the path is hot, and you should say so or drop it.
-   - Re-read every line you are about to cite, and quote from that read — a
-     grep match tells you a pattern occurred, not what the surrounding loop
-     bounds are. When you contrast two call sites, open both and give each its
-     own `file:line`.
+   - Re-read every line you are about to cite, and quote from that read — a grep
+     match tells you a pattern occurred, not what the surrounding loop bounds
+     are. When you contrast two call sites, open both and give each its own
+     `file:line`.
    - Drop micro-optimizations that don't move a hot path — a speculative "might
      be faster" is noise. Note where a fix trades memory for speed or vice
      versa.

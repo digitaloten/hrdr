@@ -15,11 +15,11 @@ Diagnose and fix the error whose details were provided as arguments: $ARGUMENTS
 3. Identify the root cause — not the symptom. A `NullPointerException` is not
    the cause; the cause is what allowed a null to reach that point. State it in
    one sentence before touching any code.
-4. WRITE THE TEST BEFORE THE FIX, and run it against the unpatched code. It
-   must fail, and the failure it prints is what makes everything after it
-   verifiable — paste that output into your summary. A test written after the
-   fix passes on arrival, so it never demonstrated anything; you cannot tell it
-   from one that would pass against the bug too.
+4. WRITE THE TEST BEFORE THE FIX, and run it against the unpatched code. It must
+   fail, and the failure it prints is what makes everything after it verifiable
+   — paste that output into your summary. A test written after the fix passes on
+   arrival, so it never demonstrated anything; you cannot tell it from one that
+   would pass against the bug too.
    - If you cannot make it fail, stop. You have not found the bug — you have
      found something you believe about it. Go back to step 3.
    - If the error came from a report or review that already states the input,
@@ -36,6 +36,6 @@ Diagnose and fix the error whose details were provided as arguments: $ARGUMENTS
 6. Run the test again — it must now pass — then run the existing tests for the
    changed code, so the fix is shown to work and shown not to have cost
    anything.
-7. Report: what the root cause was, what you changed and why, the failing
-   output from step 4 and the passing result from step 6. If the fix is partial
-   or has known limitations, say so.
+7. Report: what the root cause was, what you changed and why, the failing output
+   from step 4 and the passing result from step 6. If the fix is partial or has
+   known limitations, say so.

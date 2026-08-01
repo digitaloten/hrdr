@@ -54,9 +54,14 @@ Git:
   — `type(scope): message`, e.g. `fix(parser): handle empty input` or
   `feat(auth): add token refresh`. The scope is optional; the types are `feat`,
   `fix`, `docs`, `style`, `refactor`, `test`, `chore`, `perf`, `ci`, `build`.
-  Then one blank line, then a body of 1–3 short paragraphs explaining the change.
-  Keep the body terse and technical: what changed and why (the failure it fixes,
-  the mechanism), not a restatement of the diff. Omit the body only for a truly
+  Respect the standard 50/72 commit-message convention: target 50 characters for
+  the subject and never exceed 72, Conventional Commit prefix included; a subject
+  that does not fit near 50 is summarized more tightly or the change split. Then
+  exactly one blank line, then a body of 1–3 short paragraphs — what changed and
+  why (the failure it fixes, the mechanism), not a restatement of the diff.
+  Hard-wrap every body paragraph at 72 columns: long paragraphs span multiple
+  physical lines, never one overlong line. Standard Git trailers and URLs that
+  cannot be safely wrapped may exceed 72 columns. Omit the body only for a truly
   trivial change whose subject already says everything.
 - For multi-line text that must not be mangled by shell expansion — commit
   messages, PR descriptions, issue bodies — pass a single-quoted heredoc
@@ -75,41 +80,10 @@ Git:
   )"
   ```
 
-  ```bash
-  # ── gh pr create (--title / --body) ─────────────────────────
-  gh pr create \
-    --title "fix(parser): handle empty payloads gracefully" \
-    --body "$(cat <<'EOF'
-  The parser panicked on an empty SSE payload.  `SseDecoder::feed`
-  now short-circuits and returns `Ok(None)`.
-
-  Fixes `#123`.
-  EOF
-  )"
-  ```
-
-  ```bash
-  # ── glab mr create (--title / --description) ────────────────
-  glab mr create \
-    --title "fix(parser): handle empty payloads gracefully" \
-    --description "$(cat <<'EOF'
-  The parser panicked on an empty SSE payload.  `SseDecoder::feed`
-  now short-circuits and returns `Ok(None)`.
-
-  Closes `#123`.
-  EOF
-  )"
-  ```
-
-  A one-line trivial message may still use a normal `-m "subject"`.
-- Respect the standard 50/72 commit-message convention. Target 50 characters
-  for the subject and never exceed 72 characters, including the Conventional
-  Commit prefix. Put exactly one blank line between subject and body. Hard-wrap
-  every body paragraph at 72 columns: long paragraphs must span multiple
-  physical lines, never one overlong line. Standard Git trailers and URLs that
-  cannot be safely wrapped may exceed 72 columns. A subject that does not fit
-  near 50 characters should be summarized more tightly or the change split.
-
+  The same form carries a PR or MR body — `gh pr create --title … --body
+  "$(cat <<'EOF' … EOF
+  )"`, and `glab mr create` with `--description` instead of `--body`. A one-line
+  trivial message may still use a normal `-m "subject"`.
 Releasing — "cut a release" / "cut" / "ship it" / "tag a release":
 - The whole job, in order: pick the version, update the changelog, bump the
   manifest, commit, tag, push. Do all of it; stop and ask only where a step below

@@ -42,9 +42,9 @@ findings clearly marked as such).
      promoting it.
    - Prefer cutting to hedging. A dropped true finding costs one bug; a
      confident false one costs the user's trust in the whole report.
-4. If you split the review across `task` sub-agents, what comes back is a list of
-   CANDIDATES, not findings. You are publishing them under your own name, so the
-   verification in step 3 is yours to do — a sub-agent's confidence is not
+4. If you split the review across `task` sub-agents, what comes back is a list
+   of CANDIDATES, not findings. You are publishing them under your own name, so
+   the verification in step 3 is yours to do — a sub-agent's confidence is not
    evidence, and reading its report is not checking its work.
    - Re-open every `file:line` a sub-agent cites and re-trace its scenario
      yourself before it enters the report. Two reads across ten findings is not
@@ -73,15 +73,17 @@ findings clearly marked as such).
      ```
 
      Not "an incorrect epoch is computed for dates near the year boundary".
-     Whoever fixes this next — you, another session, or the user — turns that
-     block into a failing test in one step and knows immediately when the fix
-     lands. A paragraph has to be re-derived first, and in practice is not:
-     it gets read, believed, patched around, and never observed to go green.
+     Whoever fixes this next turns that block into a failing test in one step
+     and knows when the fix lands. A paragraph has to be re-derived first, and
+     in practice is not: it gets read, believed, patched around, and never
+     observed to go green.
+
    - Where a finding genuinely has no expressible input — a race, an unbounded
      resource, a TOCTOU window — say so in the `Repro:` line and give the
      observable instead ("map length after 10k distinct IPs: expect 0 retained,
      actual 10k"). A thing you cannot state an observable for is a Hardening
      note, not a finding.
+
 6. Add three short sections after the findings:
    - **Cleared** — the things you suspected and disproved, one line each with
      the reason they are safe. This is worth as much as the findings: it is the
@@ -91,15 +93,14 @@ findings clearly marked as such).
      fragile: an invariant held by convention rather than by a type, a guard
      that exists in one place and not its sibling. Explicitly not defects, so
      the user can triage them separately.
-   - **Coverage** — what you actually examined and what you did not, in a few
-     lines. State the scope you were given (step 1) and, against it, exactly
-     what went unreviewed. Report a gap as a GAP: "not reviewed" is the honest
-     line, and it is more useful than a reason. Do not invent a constraint to
+   - **Coverage** — state the scope you were given (step 1) and, against it,
+     exactly what went unreviewed. Report a gap as a GAP: "not reviewed" is the
+     honest line and more useful than a reason. Do not invent a constraint to
      excuse it — you have no clock, no budget and no deadline, so "limited by
      available time" is never true, and neither is narrowing a full-codebase
      review to a diff range nobody asked for. "Reviewed everything" is almost
-     never true either; saying where you stopped is what lets the user judge
-     the report.
+     never true either; saying where you stopped is what lets the user judge the
+     report.
 7. Route the findings by where you're working:
    - **Inside a git repo with a `docs/` directory** → write the full report to
      `docs/code-review.md`.
