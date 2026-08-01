@@ -165,7 +165,12 @@ fn wire_log_over_cap(current: u64, line_len: u64, cap: u64) -> bool {
 
 /// Publish the one-shot client warning for delivery through the caller's
 /// event channel (see [`take_client_warning`]).
-fn set_client_warning(msg: String) {
+///
+/// `pub(crate)` because degradations worth telling the user about are not all
+/// discovered here: the native Anthropic path is the only code that sees a
+/// `stop_reason` hrdr does not recognize, and that is a claim about the reply's
+/// completeness the user has to hear (see [`crate::anthropic::map_stop_reason`]).
+pub(crate) fn set_client_warning(msg: String) {
     if let Ok(mut pending) = CLIENT_WARNING.get_or_init(|| Mutex::new(None)).lock() {
         *pending = Some(msg);
     }

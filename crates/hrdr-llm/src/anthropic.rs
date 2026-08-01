@@ -899,7 +899,22 @@ fn map_event(
                 .get("delta")
                 .and_then(|d| d.get("stop_reason"))
                 .and_then(Value::as_str)
-                .map(map_stop_reason);
+                .map(|stop| match map_stop_reason(stop) {
+                    Some(mapped) => mapped.to_string(),
+                    None => {
+                        // hrdr cannot know what a reason it has never seen means,
+                        // and must not pretend it did: the value rides through
+                        // verbatim (it carries the most information and invents
+                        // no semantics), and the user is told by name that the
+                        // reply may be incomplete. One-shot, through the same
+                        // slot the turn loop already drains into a Notice.
+                        crate::client::set_client_warning(format!(
+                            "hrdr does not recognize Anthropic stop_reason \
+                             `{stop}`, and the reply may be incomplete"
+                        ));
+                        stop.to_string()
+                    }
+                });
             // One chunk carrying end-of-turn usage + the mapped finish_reason
             // (so truncation — Anthropic's `max_tokens` → `length` — is detected).
             let chunk = ChatChunk {
@@ -960,15 +975,39 @@ fn map_event(
     }
 }
 
-/// Map an Anthropic `stop_reason` to the OpenAI `finish_reason` vocabulary.
-fn map_stop_reason(stop: &str) -> String {
+/// Map an Anthropic `stop_reason` to the OpenAI `finish_reason` vocabulary —
+/// `None` when hrdr does not recognize the reason.
+///
+/// The `None` is the point. An unrecognized reason could mean anything,
+/// including "the output was cut short", and [`crate::Accumulator::truncated`]
+/// matches only `"length" | "max_tokens"` — so folding an unknown into `stop`
+/// reports half an answer as a whole one, and folding it into `length` reports
+/// a *finished* reply (a refusal, say) as truncated. Both are silent and wrong,
+/// so the choice is handed back to the caller, which passes the value through
+/// verbatim and warns the user by name (see [`map_event`]). Keeping the mapping
+/// itself total and side-effect-free is what lets the table test cover it.
+fn map_stop_reason(stop: &str) -> Option<&'static str> {
     match stop {
-        "max_tokens" => "length",
-        "tool_use" => "tool_calls",
-        "end_turn" | "stop_sequence" => "stop",
-        other => other,
+        // Both of these are the reply ending early — one at the requested
+        // output cap, one at the model's context window — so both have to reach
+        // `truncated()`, which is what makes the turn loop say so.
+        "max_tokens" | "model_context_window_exceeded" => Some("length"),
+        "tool_use" => Some("tool_calls"),
+        "end_turn" | "stop_sequence" => Some("stop"),
+        // A refusal is a *finished* response the safety classifiers declined,
+        // not a cut-off one, so mapping it to `length` would be its own silent
+        // lie. `content_filter` is the OpenAI-shaped word, and the Codex backend
+        // already maps its own filter stop onto that same string — see
+        // [`crate::codex`]'s `map_finish_reason`.
+        "refusal" => Some("content_filter"),
+        // Deliberately not an arm: `pause_turn`, which Anthropic emits when its
+        // *server-side* tool loop pauses a turn a follow-up request resumes.
+        // Every tool hrdr sends is a plain `{name, description, input_schema}`
+        // definition it executes itself, so no server-side loop exists to pause,
+        // and there is no OpenAI-shaped word for "resume me" to map it onto. If
+        // one ever does arrive, the warning below is the honest answer.
+        _ => None,
     }
-    .to_string()
 }
 
 /// Read a `u64` counter from an Anthropic usage object.
@@ -2562,26 +2601,172 @@ mod tests {
 
     /// Every arm of [`map_stop_reason`], fallthrough included.
     ///
-    /// `max_tokens` → `length` is the load-bearing one:
+    /// The two `length` arms are the load-bearing ones:
     /// [`crate::Accumulator::truncated`] matches only `"length" | "max_tokens"`,
-    /// so if that arm regressed, a reply cut off at the output cap would report
-    /// a clean finish — no truncation notice, no continuation, silently half an
-    /// answer. The stream-path test below pins the plumbing; this pins the map.
+    /// so if either regressed, a reply cut off — at the output cap or at the
+    /// context window — would report a clean finish: no truncation notice, no
+    /// continuation, silently half an answer. The stream-path tests below pin
+    /// the plumbing; this pins the map.
     #[test]
     fn map_stop_reason_maps_every_arm_onto_the_openai_vocabulary() {
         for (stop, expected) in [
-            ("max_tokens", "length"),
-            ("tool_use", "tool_calls"),
-            ("end_turn", "stop"),
-            ("stop_sequence", "stop"),
-            // The fallthrough hands an unrecognized reason back verbatim rather
-            // than folding it into `stop`, so a reason a future Messages API
-            // version adds is not silently reported as a clean finish.
-            ("pause_turn", "pause_turn"),
-            ("refusal", "refusal"),
-            ("", ""),
+            ("max_tokens", Some("length")),
+            ("model_context_window_exceeded", Some("length")),
+            ("tool_use", Some("tool_calls")),
+            ("end_turn", Some("stop")),
+            ("stop_sequence", Some("stop")),
+            // A refusal finished; it was not cut short. `content_filter` says
+            // that in the OpenAI vocabulary, and leaves `truncated()` false.
+            ("refusal", Some("content_filter")),
+            // Unrecognized: no arm claims to know what these mean, so the caller
+            // passes them through verbatim and warns rather than reporting a
+            // clean finish for a reply that may be half an answer.
+            ("pause_turn", None),
+            ("nova_flare", None),
+            ("", None),
         ] {
             assert_eq!(map_stop_reason(stop), expected, "stop_reason {stop:?}");
+        }
+    }
+
+    /// The process-global one-shot warning slot ([`crate::take_client_warning`])
+    /// is shared state, so the tests that read it take this first rather than
+    /// racing each other's writes. It does not shut out the rest of the crate:
+    /// the only other writer reachable from this test binary is the one-shot
+    /// auth-header strip in `client::apply_extra_headers` (the wire-log warnings
+    /// need `HRDR_LOG_REQUESTS`, which only the separate integration-test binary
+    /// sets). That leaves one possible foreign write per process, which would
+    /// fail an assertion below rather than pass one.
+    ///
+    /// Async-aware because the guard is held across the stream `await` that
+    /// produces the warning — the whole window that needs protecting.
+    static WARNING_SLOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Empty the warning slot, and first burn the one foreign writer that can
+    /// still reach it from this test binary: `client::apply_extra_headers`
+    /// warns **once per process** when it drops an auth header, and that write
+    /// lands whenever those tests happen to run. Unburned it can sit in the slot
+    /// (it did — `a_recognized_stop_reason_raises_no_client_warning` failed on
+    /// exactly that) or clobber the warning under test mid-stream. Burning the
+    /// one-shot here means the only writer left during the stream below is the
+    /// code under test; the wire-log warnings need `HRDR_LOG_REQUESTS`, which
+    /// only the separate integration-test binary sets.
+    fn drain_warning_slot() {
+        let _burn = crate::client::apply_extra_headers(
+            reqwest::Client::new().get("http://127.0.0.1/"),
+            &[("x-api-key".to_string(), "burn".to_string())],
+        );
+        let _ = crate::client::take_client_warning();
+    }
+
+    /// A one-event stream whose `message_delta` carries `stop_reason`.
+    ///
+    /// `chat_stream`'s mock server takes a `&'static str`, so the body is leaked
+    /// — a few hundred bytes per case, in a test binary that is about to exit.
+    fn stop_reason_stream(stop_reason: &str) -> &'static str {
+        Box::leak(
+            format!(
+                "event: message_start\n\
+                 data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":7}}}}}}\n\n\
+                 event: content_block_delta\n\
+                 data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"half an ans\"}}}}\n\n\
+                 event: message_delta\n\
+                 data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop_reason}\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n\
+                 event: message_stop\n\
+                 data: {{\"type\":\"message_stop\"}}\n\n"
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    /// Fold a stream the way the agent's turn loop does.
+    async fn accumulate(body: &'static str) -> crate::Accumulator {
+        let (chunks, err) = anthropic_stream(body).await;
+        assert!(err.is_none(), "clean stream: {:#}", err.unwrap());
+        let mut acc = crate::Accumulator::new();
+        for chunk in &chunks {
+            acc.push(chunk);
+        }
+        acc
+    }
+
+    /// Anthropic's context-window stop has to land as truncation for the same
+    /// reason `max_tokens` does — the reply stopped early — and the whole way
+    /// down the real stream path, not just in the map.
+    #[tokio::test]
+    async fn a_context_window_stop_reason_reaches_the_accumulator_as_truncated() {
+        let acc = accumulate(stop_reason_stream("model_context_window_exceeded")).await;
+        assert_eq!(
+            acc.finish_reason.as_deref(),
+            Some("length"),
+            "running out of context window must arrive as the OpenAI `length`"
+        );
+        assert!(
+            acc.truncated(),
+            "a reply cut off at the context window must report truncated"
+        );
+    }
+
+    /// The loud half of the unknown case: the value rides through untranslated
+    /// *and* the user is told, by name, that hrdr did not recognize it. Without
+    /// the warning this is the original bug — an unknown reason is neither
+    /// `length` nor `tool_calls`, so the turn reads as a clean, complete finish
+    /// and a half answer is presented as whole.
+    #[tokio::test]
+    async fn an_unrecognized_stop_reason_rides_through_verbatim_and_warns_by_name() {
+        let _slot = WARNING_SLOT.lock().await;
+        drain_warning_slot();
+
+        let acc = accumulate(stop_reason_stream("nova_flare")).await;
+        assert_eq!(
+            acc.finish_reason.as_deref(),
+            Some("nova_flare"),
+            "an unrecognized reason is passed through verbatim, not folded"
+        );
+
+        let warning = crate::client::take_client_warning()
+            .expect("an unrecognized stop_reason must raise a client warning");
+        assert!(
+            warning.contains("nova_flare"),
+            "the warning must name the reason hrdr did not recognize: {warning}"
+        );
+        assert!(
+            warning.contains("may be incomplete"),
+            "the warning must say what is at stake for the reply: {warning}"
+        );
+    }
+
+    /// The negative half. Without it, a mapping that warned on *every* stop
+    /// reason — including the four that finish normally — would pass the test
+    /// above and bury the real signal under a warning on every single turn.
+    #[tokio::test]
+    async fn a_recognized_stop_reason_raises_no_client_warning() {
+        let _slot = WARNING_SLOT.lock().await;
+        drain_warning_slot();
+
+        for stop in [
+            "end_turn",
+            "stop_sequence",
+            "max_tokens",
+            "tool_use",
+            "refusal",
+            "model_context_window_exceeded",
+        ] {
+            let acc = accumulate(stop_reason_stream(stop)).await;
+            assert!(
+                acc.finish_reason.is_some(),
+                "stop_reason {stop:?} reached the accumulator"
+            );
+            // Scoped to *our* warning rather than `== None`: the burn above
+            // closes the ordinary path for a foreign write, but a second belt
+            // costs nothing here, and a mapping that warned on everything still
+            // fails — its warning names the stop reason.
+            if let Some(warning) = crate::client::take_client_warning() {
+                assert!(
+                    !warning.contains("stop_reason"),
+                    "stop_reason {stop:?} is recognized and must not warn: {warning}"
+                );
+            }
         }
     }
 

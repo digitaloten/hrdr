@@ -65,6 +65,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the parameter as your **config** spells it, not as the server does, so it
   points at a key you can actually edit.
 
+- **An Anthropic stop reason hrdr does not recognize is no longer read as a
+  clean finish.** `stop_reason` was passed through verbatim when it matched none
+  of the four known values, and `Accumulator::truncated()` matches only
+  `length`/`max_tokens` — so a reply that stopped early for a reason hrdr had
+  never seen was reported as complete, with nothing in the transcript to say
+  otherwise. Codex has no such hole because it carries an explicit incomplete
+  marker; Anthropic sends a positive reason, so there is nothing to fall back
+  on. hrdr now recognizes `model_context_window_exceeded` (the reply really did
+  stop early, so it reaches `truncated()` like `max_tokens` does) and `refusal`
+  (a _finished_ response the classifiers declined — reported as
+  `content_filter`, the same word the Codex backend uses). Anything still
+  unrecognized rides through verbatim **and raises a notice naming it**: hrdr
+  cannot know what a future reason means, and guessing either direction is
+  silently wrong — folding to `stop` hides a truncation, folding to `length`
+  calls a refusal truncated.
+
 - **A failed proactive compaction no longer disables itself for the whole
   session.** The failure was latched, and the only thing that cleared the latch
   was a _successful_ compaction — which nothing would run, because the caller

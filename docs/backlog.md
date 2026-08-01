@@ -598,15 +598,6 @@ to 241 tests. What was learned, kept because it shapes future work:
 Raised while doing the five slices, out of their scope, each re-verified against
 the tree before being written here:
 
-- **Anthropic has no unrecognized-stop-reason safety net; Codex does.**
-  `map_stop_reason`'s fallthrough is `other => other` — the reason is returned
-  verbatim. `Accumulator::truncated()` matches only `length`/`max_tokens`, so a
-  future Anthropic `stop_reason` that means "cut off" would report a clean
-  finish. Codex deliberately treats _any_ unrecognized incomplete reason as
-  truncation (`incomplete_with_unrecognized_reason_still_signals_truncation`).
-  Not strictly the same shape — Anthropic sends a positive `stop_reason` where
-  Codex sends an explicit incomplete marker — so this is a divergence to decide
-  on, not an obvious bug.
 - **The `UNNAMED_MODEL` docstring tells half the story.** It states that putting
   the sentinel on the wire "cannot succeed anywhere it is actually read", then
   says the _OpenAI-shaped_ builder omits the field. Correctly scoped as far as
