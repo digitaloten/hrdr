@@ -26,6 +26,14 @@ into this one and deleted it, so this is again the only backlog. Entries whose
 subject no longer exists are annotated where the reasoning still teaches
 something and deleted where it does not.
 
+**Pruned again 2026-08-01**, by the full-codebase review pass
+(`4e66a1c`..`2e3be29`, released v0.10.0). It closed all sixteen of its own
+findings, so `docs/code-review.md` is deleted per the convention below; what it
+left open is under [Review coverage still owed](#review-coverage-still-owed) and
+[Known behaviour to revisit](#known-behaviour-to-revisit), and what it taught is
+under
+[Cleared in the 2026-08-01 review pass](#cleared-in-the-2026-08-01-review-pass).
+
 Conventions:
 
 - **Symbol names, not line numbers.** Line numbers rot — the old docs cited
@@ -524,9 +532,43 @@ verified still open.
 
 ---
 
+## Review coverage still owed
+
+The 2026-08-01 pass (see
+[Cleared in the 2026-08-01 review pass](#cleared-in-the-2026-08-01-review-pass))
+closed every finding it raised, but it did not read everything. What it never
+opened, so nobody records it as reviewed:
+
+- **`hrdr-app/src/commands/dispatch.rs`** — 946 lines, the slash-command
+  dispatcher both frontends route through. Untouched by any review pass.
+- **`hrdr-tui/src/ui.rs` block rendering** and **`app/commands.rs`**. Only the
+  mouse/selection path (`e1b3023`) and the scroll/highlight math were read.
+- **Twelve `hrdr-tools` files**: `find`, `ls`, `secret_diff`, `mutation`,
+  `todo`, `tree`, `verify`, `memory`, `verification`, `ansi`, `test_nudge`,
+  `lsp`. The 2026-07-31 pass listed them as a gap and the 2026-08-01 pass
+  covered `gate`, `hooks`, `web`, `replace` and `mcp/client` instead.
+
 ## Known behaviour to revisit
 
 Not bugs; things whose surprise is worth having written down.
+
+- **A profile can allow-list itself into having no search tool.** `read_only`
+  keeps a shell on purpose, and `jail` keeps `grep`/`find`/`ls`/`tree`; but an
+  `allowed_tools` list naming neither leaves an agent that can only `read` by
+  exact path. Nothing validates that at load, and no prompt section can name a
+  search tool it does not hold — `base.md` says "whichever search tool you hold"
+  precisely because there may be none. Worth deciding whether such a profile
+  should be refused at load rather than shipped blind.
+- **The prompt tests pin literal prose spans**, so reflowing a paragraph breaks
+  them without changing a rule. Six of the ~10 breaks in the 2026-08-01 voice
+  pass were a phrase moving across a newline, not a phrase being cut. Fixing the
+  prose to satisfy the assertion is the right direction — rewriting assertions
+  to match new prose makes them tautological — but the coupling costs a test
+  round-trip per reflow. Matching on normalized whitespace would remove it.
+- **`write.md` is still 28 KB resident** after the git/release split, and
+  carries ~10 shouted ALL-CAPS rule headers. Emphasis that dense stops
+  selecting. Neither is a defect; both are what is left of "the always-on prompt
+  is too long".
 
 - **Building a sandbox policy touches the parent repo's `.git`.**
   `git_metadata_roots` `create_dir_all`s `refs/heads/hrdr` and
@@ -992,6 +1034,57 @@ What survives that would otherwise be relearned:
 - **`cargo` here runs through a wrapper that indents `error:` lines**, so
   `grep -E "^error"` reports a false pass. Read its summary line. This cost a
   follow-up commit.
+
+## Cleared in the 2026-08-01 review pass
+
+`docs/code-review.md` (2026-07-31, refreshed 2026-08-01) is **deleted** per this
+file's own convention — every finding in it shipped. Nine commits,
+`4e66a1c`..`2e3be29`, released as **v0.10.0**; `git log` is the history.
+
+Sixteen findings closed: the web server's missing `WWW-Authenticate` challenge
+and the `users` mode that had no browser entry point at all;
+`SseDecoder::finish` returning `Ok` with a truncated event; a Codex error whose
+code sat at one level and its message at another; a wire round-trip test that
+compared `Value` to itself and so green-lit three message types the protocol
+cannot parse; a hook timeout reporting seconds as `ms`; a crashed turn leaving
+its tool call spinning forever. Plus the SSRF blocklist's missing `100.64/10`,
+`attr_value` matching an attribute suffix, a DDG snippet reading past its block,
+a CI-file cap that hid every single-file config, four `unwrap()`s in a detached
+socket task, a leaked `String` per env var, a dead duplicate of the login
+handler, and a stale `allow(dead_code)`.
+
+What survives that would otherwise be relearned:
+
+- **A skill the model cannot see is not a copy that can be relied on.**
+  `write.md`'s Releasing section and the `:release` skill were the same
+  procedure twice, and only the skill said to watch the tag's CI run.
+  `model_invocable: false` keeps a skill out of the listing entirely, so
+  plain-English "cut a release" only ever reached the copy missing that step.
+  Duplication drifts; the reachable copy is the one that must be complete.
+- **A red tag run SKIPS its publish jobs rather than failing them.** The push
+  succeeds, the tag exists, nothing is published — how v0.4.3 and v0.5.0 were
+  tagged with nothing behind them, and it happened again on `de1b12b` in this
+  same pass. Enumerate the run's jobs and confirm the artifact landed; "tagged
+  and pushed" is not "released".
+- **Gate the prompt on what the tool set IS, not on what built it.**
+  `ToolRegistry::with_defaults` registers `grep`/`find`/`ls`/`tree` and
+  `Agent::new` strips them for every non-jail mode, so `has("grep")` alone
+  marked a full write agent as jailed. The jail is the whole shape: those tools,
+  no write tool, and no shell.
+- **A test that models an impossible agent proves nothing about the real one.**
+  The read-only prompt test built `retain_only(read_only_names())` — shell-less
+  — while `config.read_only` deliberately keeps a shell. It had never covered
+  the agent it was named for. Prefer building a live `Agent` over
+  hand-assembling a registry.
+- **Compressing prose has a ceiling the tests set.** 224 pinned literal spans
+  across the corpus, ~110 in `write.md` alone: careful rewording of four
+  always-on files yielded ~900 bytes, while moving git/release guidance behind
+  `!delegated` yielded 9.4 KB. Structure beats wording by an order of magnitude
+  when the wording is already frozen.
+- **Guidance with no trigger phrase has to stay resident.** Deleting and
+  Dependencies did not move to main-only with Git and Releasing: a sub-agent
+  deletes files and reads dependency APIs like anyone else, and nothing is said
+  before `rm -rf` that a gate could match on.
 
 ## Record: closed efforts
 
