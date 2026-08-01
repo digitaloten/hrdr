@@ -475,6 +475,42 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
 
 ## Consistency / robustness
 
+- **A normal turn has no fallback for a rejected optional parameter — only
+  compaction got one.** PR #24 taught `Agent::plain_completion` to retry
+  uncapped when a Codex Responses model 400s on `max_output_tokens`, but the
+  matcher (`is_unsupported_max_output_tokens`) is private to `compaction.rs` and
+  wraps the summarizer call alone. `codex::build_body` puts `max_output_tokens`
+  (127-128), `temperature` (130-131), `top_p` (133-134) and `prompt_cache_key`
+  (136-137) on the wire whenever they are set, and on the turn path a 400 is
+  terminal: `connect_stream` asks `is_context_overflow` (no) then
+  `is_transient`, whose marker list has no 400 (`retry.rs:199`), so the round
+  fails and every later round fails identically for the life of the session. The
+  asymmetry is now visible — with `max_tokens` configured against the model from
+  issue #23, compaction survives the rejection and ordinary turns do not.
+  `temperature`/`top_p` are the likelier trigger in practice: OpenAI's reasoning
+  models reject both on the Responses API. **Not on the default path** — every
+  `RequestParams` field defaults to "not sent" precisely so a strict provider
+  never sees an unexpected field — so this needs the user to have configured
+  one. Fixing it means lifting the matcher into `hrdr-llm` (it belongs next to
+  `is_transient`/`is_context_overflow`), generalizing it past
+  `max_output_tokens` to whichever parameter the body names, and deciding
+  whether the turn path drops the parameter for the rest of the session or just
+  for the retry. Not attempted.
+- **`self_compact_failed` still latches for the whole session on any
+  non-overflow summarizer failure.** This was issue #23's third expectation and
+  PR #24 addressed it only in part. `maybe_self_compact` sets the latch on _any_
+  `Err` (`compaction.rs:912`) and the guard at `compaction.rs:883` then skips
+  proactive compaction forever; the only clears are a successful `compact`
+  (`compaction.rs:754`), `/new`, and a model switch. Since proactive compaction
+  is what got disabled, the only thing that can still call `compact` is reactive
+  overflow recovery — so the latch lifts only _after_ the session has hit a real
+  overflow, which is the event it existed to prevent. The PR made this much less
+  likely to fire (the 400 that used to latch it is retried uncapped now, and
+  drain-time overflow recovers), but any other persistent summarizer error —
+  auth, a model that refuses the summarizer prompt, a provider outage outliving
+  the retry budget — still costs the session its proactive protection with no
+  way back. Worth a bounded latch (re-probe after N rounds, or on a new
+  high-water prompt-token reading) rather than a permanent one.
 - **Guardrail rules live in two places** — and now a test says so when they
   drift. The rule set is still encoded both in `hrdr-tools/src/guardrails.rs`
   (mechanical enforcement) and in the prompt fragments (guidance telling the
