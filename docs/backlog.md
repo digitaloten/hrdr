@@ -548,74 +548,107 @@ verified still open.
   and nothing asserts them; `wire_log_native_backends.rs` filters on
   `kind == "request"` only. The reason it was impossible is gone —
   `Client::set_backend_for_test` (`c5a6019`) makes both native paths reachable
-  from a `127.0.0.1` mock, and seven tests now drive them. Writing this one is
-  ordinary work now, not a blocked item.
-
-### Provider-divergence gaps — closed 2026-08-02
-
-The audit's ten findings were closed across five slices (`c5a6019`, `49feedd`,
-`5d87db5`, `2363e6b`, and the commit adding this line). `hrdr-llm` went from 215
-to 241 tests. What was learned, kept because it shapes future work:
-
-- **Host-keyed backend detection is why the native paths were untestable.**
-  `detect_backend` reads the host, so every mock on `127.0.0.1` is
-  `Backend::OpenAi`. A `#[cfg(test)] Client::set_backend_for_test` fixes it for
-  one client instance with no statics to race through; reach for it rather than
-  re-deriving the problem. It unblocks the wire-log entry above — which is now
-  merely unwritten, not impossible.
-- **Two gaps stay open by decision, not oversight.** (a) 408/522/524 are
-  retryable _only_ because `classify_status` says so — `is_transient`'s text
-  fallback has no needle for them, unlike the other six transient statuses. A
-  test now derives the unprotected set from real behaviour, so both deleting an
-  arm and quietly adding a needle fail loudly. Giving them needles is a
-  behaviour change nobody has asked for. (b) All three mid-stream error paths
-  hardcode `retry_after: None` (`client.rs`, `anthropic.rs`, `codex.rs`), and
-  `retry_after_hint` reads a typed error's field directly — so a rate limit
-  delivered _mid-stream_ never has its requested delay honoured on any backend.
-  Only the HTTP-status path (`error_from_response`) does. Asserted and
-  commented, not fixed.
-- **`UNNAMED_MODEL` reaches the wire literally on both native backends**,
-  because `wire_model` runs after their early returns. Pinned as a known
-  limitation. Erroring early is worth doing, but at provider-selection time in
-  hrdr-agent — not in `chat_stream`, where it would fire once per turn and where
-  a wrong error kind would make the retry loop spin on a permanent config error.
-- **The warm models.dev catalog path is deliberately uncovered.**
+  from a `127.0.0.1` mock, and seven tests now drive them. Ordinary work now,
+  not a blocked item.
+- **No end-to-end test consumes a real `Retry-After`.** hrdr-agent's `MockResp`
+  has three variants (`Sse`, `HttpError`, `HttpErrorBody`) and none can set a
+  response header, so the agent's retry loop honouring a server-named delay is
+  unexercised. `retry_after_from_headers` is covered directly instead. Closing
+  it means a fourth `MockResp` variant carrying headers.
+- **The warm models.dev catalog path is uncovered, deliberately.**
   `catalog::load_cached` reads process-global state (`HRDR_MODELS_PATH` / the
   XDG cache dir), so warming it in a test leaks into every other test in the
   binary. The cold path and the `ANTHROPIC_MAX_TOKENS` 8192 fallback are pinned;
   the warm resolution rules are covered separately in `catalog`'s own tests.
-- **Still not covered, stated as a gap:** hrdr-agent's `MockResp` cannot set a
-  response header, so no _end-to-end_ test exercises the agent's retry loop
-  consuming a real `Retry-After`. `retry_after_from_headers` is covered directly
-  instead.
-- **Not a coverage gap, do not re-derive:** `Delta` deserializes only
-  `reasoning_content`, so providers streaming `delta.reasoning` (several
-  OpenAI-compatible gateways) have their reasoning silently dropped. Missing
-  feature, not a missing test.
-- **Never audited at all:** `sse.rs`, `capped_read.rs`, `fs.rs`, most of
-  `catalog.rs`; hrdr-tui / hrdr-web / hrdr-tools / hrdr-app entirely.
+  Recorded so nobody "closes" it with a test that only appears to work.
+- **`serve_once` takes `&'static str`**, so every mock SSE body must be a
+  literal (the stop-reason tests `Box::leak` theirs). Fine today; it makes a
+  table-driven stream test awkward. `impl Into<String>` is a one-line change
+  when someone needs it.
 
-Raised while doing the five slices, out of their scope, each re-verified against
-the tree before being written here:
+---
+
+## Small corrections owed in hrdr-llm
+
+Raised while closing the provider-divergence audit, out of those slices' scope,
+each re-verified against the tree.
 
 - **The `UNNAMED_MODEL` docstring tells half the story.** It states that putting
   the sentinel on the wire "cannot succeed anywhere it is actually read", then
   says the _OpenAI-shaped_ builder omits the field. Correctly scoped as far as
   it goes, but it never says the two native builders emit it verbatim — and this
   docstring is where a reader would go to check the invariant. Add the caveat,
-  or fold it into whatever lands for the early-error decision above.
-- **`parse_imf_fixdate` ignores the weekday.** It splits on `", "` and discards
-  the prefix, so `Xyz, 06 Nov 2999 …` parses fine. Laxer than RFC 7231 and
-  harmless — the weekday is redundant with the date — but worth knowing before
-  someone "fixes" a test that relies on it.
+  or fold it into the early-error decision below.
 - **A `thinking_delta` for an index with no open block is silently dropped.**
   `map_event`'s `thinking_slot.get_mut` no-ops, which looks right; the point is
   that the neighbouring `input_json_delta` path carries an explicit note about
   why it must not default to slot 0, and the thinking path's equivalent choice
   is unexplained. A comment, not a fix.
-- **`serve_once` takes `&'static str`**, so every mock SSE body must be a
-  literal. Fine today; it makes a table-driven stream test awkward. Relaxing it
-  to `impl Into<String>` is a one-line change when someone needs it.
+- **`parse_imf_fixdate` ignores the weekday.** It splits on `", "` and discards
+  the prefix, so `Xyz, 06 Nov 2999 …` parses fine. Laxer than RFC 7231 and
+  harmless — the weekday is redundant with the date — but worth knowing before
+  someone "fixes" a test that relies on it.
+
+---
+
+## Provider divergences left open by decision
+
+Each is pinned by a test and commented in the source; what is missing is a
+decision, not work. Filed here rather than under the closed audit below, because
+a reader scanning for open items would not look inside a section labelled
+closed.
+
+- **408/522/524 are retryable only because `classify_status` says so.**
+  `is_transient`'s text fallback has needles for the other six transient
+  statuses and none for these, so those three arms are the only thing making a
+  Cloudflare origin timeout retryable rather than fatal. A test derives the
+  unprotected set from real behaviour, so both deleting an arm and quietly
+  adding a needle fail loudly. Giving them needles is a behaviour change nobody
+  has asked for — decide, don't drift.
+- **All three mid-stream error paths hardcode `retry_after: None`**
+  (`client.rs`, `anthropic.rs`, `codex.rs`), and `retry_after_hint` reads a
+  typed error's field directly — so a rate limit delivered _mid-stream_ never
+  has its requested delay honoured on any backend. Only the HTTP-status path
+  (`error_from_response`) does. Asserted and commented, not fixed.
+- **`UNNAMED_MODEL` reaches the wire literally on both native backends**,
+  because `wire_model` runs after their early returns. Pinned as a known
+  limitation. Erroring early is worth doing, but at provider-selection time in
+  hrdr-agent — not in `chat_stream`, where it would fire once per turn and where
+  a wrong error kind would make the retry loop spin on a permanent config error.
+- **An unrecognized Anthropic `stop_reason` still reports
+  `truncated() == false`.** Deliberate: it now raises a notice naming the value
+  (`1871631`), and guessing a direction is wrong either way — folding to `stop`
+  hides a truncation, folding to `length` calls a refusal truncated. Revisit
+  only if a real reason turns up that wants a fourth answer.
+
+---
+
+## Provider-divergence audit — closed 2026-08-02
+
+Ten findings closed across six commits (`c5a6019`, `49feedd`, `5d87db5`,
+`2363e6b`, `d602b7d`, `1871631`). `hrdr-llm` went from 215 to 244 tests. What is
+kept is the part that shapes future work; the open residue is in the three
+sections above.
+
+- **Host-keyed backend detection is why the native paths were untestable.**
+  `detect_backend` reads the host, so every mock on `127.0.0.1` is
+  `Backend::OpenAi`, and `Client::chat_stream` never dispatched to
+  `anthropic`/`codex` — leaving both backends' post-loop stream assembly
+  unreachable. A `#[cfg(test)] Client::set_backend_for_test` fixes it for one
+  client instance with no statics to race through. Reach for it rather than
+  re-deriving the problem.
+- **The client-warning slot is process-global**, and a test asserting on it will
+  catch foreign writes — `apply_extra_headers` warns once per process when it
+  drops an auth header, which is exactly what made the first run of the
+  no-warning test fail. The stop-reason tests serialize on a mutex and burn that
+  latch first. Anything new asserting on `take_client_warning` needs the same
+  care.
+- **Not a coverage gap, do not re-derive:** `Delta` deserializes only
+  `reasoning_content`, so providers streaming `delta.reasoning` (several
+  OpenAI-compatible gateways) have their reasoning silently dropped. Missing
+  feature, not a missing test.
+- **Never audited at all:** `sse.rs`, `capped_read.rs`, `fs.rs`, most of
+  `catalog.rs`; hrdr-tui / hrdr-web / hrdr-tools / hrdr-app entirely.
 
 ---
 
