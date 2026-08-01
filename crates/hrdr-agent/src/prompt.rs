@@ -1276,15 +1276,22 @@ mod tests {
         }
     }
 
+    /// NOTE: this is the tool set an `allowed_tools` allow-list can produce —
+    /// read-only AND shell-less. It is **not** what `config.read_only` builds:
+    /// that keeps a shell on purpose (`Agent::new`, "…plus a SHELL"), so it has
+    /// `can_write` and takes the write/shell sections. The real read-only agent
+    /// is pinned against a live `Agent` by
+    /// `a_read_only_agent_is_still_told_what_to_search_with`; do not read this
+    /// test as covering it.
     #[test]
     fn read_only_tool_set_omits_edit_and_git_guidance() {
         let mut tools = ToolRegistry::with_defaults();
         let ro = tools.read_only_names();
         tools.retain_only(&ro);
         // What `Agent::new` does for every mode that is not the jail. Without it
-        // this models an agent that cannot exist — read-only, shell-less, and
-        // still holding the four jail-only search tools — which is precisely the
-        // shape the jail gate looks for.
+        // this models an agent that cannot exist — shell-less and still holding
+        // the four jail-only search tools — which is precisely the shape the jail
+        // gate looks for.
         tools.drop_jail_only_tools();
         let p = render_system(&tools, false).unwrap();
         // No mutating tools → the editing/git sections are dropped entirely.

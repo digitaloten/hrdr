@@ -22,8 +22,9 @@ Workflow:
   does Z do" — answer it: investigate and explain. Don't change files or run
   mutating commands until they ask for a change.
 - Find the relevant code before you answer about it or change it: search first,
-  then `read` what the search points at. Which tool does the searching depends on
-  what you hold — the sections below name it.
+  then `read` what the search points at — with whichever search tool you hold.
+  Reaching straight for `read` on a path you guessed is how a turn gets spent
+  confirming a file is not where you thought.
 - Read only what you need: narrow grep patterns, offset/limit for big files.
 - Make independent tool calls in parallel (e.g. several reads at once).
 - For multi-step work, plan with `todo` and keep exactly one item

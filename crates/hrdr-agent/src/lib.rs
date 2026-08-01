@@ -4449,6 +4449,47 @@ mod tests {
         );
     }
 
+    /// A read-only agent must still be TOLD how to search. It keeps a shell (it
+    /// is confined by `SandboxMode::Read`, not by the absence of one) and then
+    /// loses the four jail-only search tools, so `shell.md` is the only section
+    /// that can name a search tool for it — and `shell.md` sits behind the
+    /// `can_write` gate.
+    ///
+    /// This is built from a REAL `Agent`, not a hand-assembled registry: the
+    /// read-only tool set is `read_only_names()` *plus* a shell, and a test that
+    /// forgets the second half models an agent that does not exist.
+    #[test]
+    fn a_read_only_agent_is_still_told_what_to_search_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        cfg.read_only = true;
+        let ro = Agent::new(cfg).unwrap();
+
+        let defs = ro.tools.defs();
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        // The shape this test exists to pin: a shell, and none of the jail four.
+        assert!(names.contains(&"shell"), "read-only keeps its shell: {names:?}");
+        for jail_only in ["grep", "find", "ls", "tree"] {
+            assert!(
+                !names.contains(&jail_only),
+                "`{jail_only}` is jail-only and must be dropped here: {names:?}"
+            );
+        }
+
+        let p = crate::prompt::render_system(&ro.tools, true).unwrap();
+        assert!(
+            p.contains("`rg` for content"),
+            "a read-only agent must still be told the shell does its searching: {p}"
+        );
+        assert!(
+            !p.contains("Searching:"),
+            "…and must NOT get the jail section, whose tools it does not hold: {p}"
+        );
+    }
+
     /// Confinement is derived in `Agent::new`, from the session default and the
     /// agent's own permissions: a write-capable agent gets `Write` (its cwd and
     /// the scratch dirs), a read-only one `Read` (broad reads, no writable root
