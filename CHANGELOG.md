@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-01
+
 ### Added
 
 - **A jailed agent is told what it can search with.** It takes none of the
@@ -31,6 +33,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   section is now the single source and carries it; the skill states only what
   `:release` adds. Same for commit guidance across `committing.md` and the
   `:commit` skill, which had drifted on subject length.
+
+- **Git and release guidance is main-agent-only.** `write.md` was 38 KB resident
+  for every write agent, and ~9 KB of it told a sub-agent how to do things
+  `subagent_write.md` separately forbids — committing, branching, touching
+  history. Those sections moved to `write_main.md`, gated
+  `can_write && !delegated`, the same seam `committing.md`/`committing_main.md`
+  already uses. Deleting and Dependencies deliberately stayed resident for both:
+  a sub-agent deletes files and reads dependency APIs like any other agent, and
+  neither has a trigger phrase that reliably precedes the damage.
+
+- **The prompt corpus follows its own Voice rule.** `base.md`, `shell.md`,
+  `write.md`, `write_main.md`, `delegate.md` and the `review`/`audit` skills had
+  bullets that restated their own conclusion, and the commit guidance showed one
+  heredoc pattern three times over. Compression only — every rule, named failure
+  mode, command and path survives verbatim, per that section's own terms: "same
+  facts, fewer words".
 
 ### Fixed
 
@@ -5633,7 +5651,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.9.4...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/kryptic-sh/hrdr/compare/v0.9.4...v0.10.0
 [0.9.4]: https://github.com/kryptic-sh/hrdr/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/kryptic-sh/hrdr/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/kryptic-sh/hrdr/compare/v0.9.1...v0.9.2
