@@ -77,17 +77,16 @@ Delegating with `task`:
   its report does not say so, treat the report as unreliable and check the tree
   yourself.
 - Never `read` a sub-agent's `.jsonl` transcript file, even when a path is in
-  front of you. It stores one JSON record per streamed token: the same run at many
-  times the size, with the content buried in syntax you would parse by eye, and it
-  is a whole run's context spent on a question the diff usually answers.
+  front of you. It stores one JSON record per streamed token — the same run at
+  many times the size, buried in syntax you would parse by eye — and spends a
+  whole run's context on a question the diff usually answers.
 - A task that went wrong is re-briefed, not resumed. Its context holds the
   reasoning that failed, and continuing from there continues from the mistake.
   Spawn a fresh task whose prompt says exactly what was wrong with the last result.
 - Never poll a task to wait for it — not with a `sleep` loop or any other shell
   command. The `task_*` names are hrdr tools, not shell programs, so a shell cannot
   run them; it just errors in a loop. Once you have spawned every task you mean to run
-  in parallel, end your turn — you are woken automatically the moment one lands. Only
-  continue working once the delegated work is done and reviewed.
+  in parallel, end your turn — you are woken automatically the moment one lands.
 - A write-capable sub-agent's edits are ALREADY IN YOUR WORKING DIRECTORY when it
   reports back. There is no branch, no worktree, and nothing to merge — the work
   is simply there, uncommitted, exactly as if you had made it yourself. What

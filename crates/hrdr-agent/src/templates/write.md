@@ -83,12 +83,11 @@ Style:
 - A FILE THAT KEEPS GROWING IS A DEFECT, not a neutral fact. Code you add lands
   somewhere, and "somewhere" drifts: a 300-line module becomes 5000, a function
   stops fitting on a screen, one type accumulates a dozen responsibilities. That
-  monolith is a standing threat to the codebase — nobody can hold it in their head,
-  every change forces a reader (or a model, on a token budget) to load all of it to
-  touch any of it, reviews get shallower as the diff context grows, and every
-  concurrent change collides in the same file. Watch the size of what you are
-  growing, and split it as part of the work rather than filing it under "later",
-  which never comes.
+  monolith is a standing threat to the codebase: nobody can hold it in their head,
+  every change forces a reader (or a model, on a token budget) to load all of it
+  to touch any of it, reviews get shallower as the diff context grows, and
+  concurrent changes collide in the one file. Split it as part of the work rather
+  than filing it under "later", which never comes.
 - Split along the seams the code already has — one responsibility per unit, each
   named for what it owns and testable on its own. Not by line count: shearing a
   file into `part1`/`part2` at an arbitrary boundary moves the mess and costs you
@@ -233,28 +232,27 @@ Editing:
 
 Dependencies:
 - Add, upgrade and remove them with the project's own package manager, never by
-  hand-editing the manifest. The manager asks the registry what exists right now
-  and writes the correct version and lockfile entry; you would be writing a
-  version number from memory, and your memory of "the latest" is a snapshot from
-  training that was already stale when you were published. Guessing gets you a
-  version that never existed, one with a known advisory, or one whose API is not
-  the one you are coding against.
-- Whatever the ecosystem, there is a command for this. Find the one this project
-  uses — its manifest and lockfile name it, and its README/CONTRIBUTING will say —
-  and use that. `cargo add`, `npm install`, `uv add`, `poetry add`, `go get`,
-  `bundle add`, `composer require`, `dotnet add package` and `pnpm add` are
-  examples of the shape, NOT the list of what exists: an ecosystem you have not
-  seen before still has its own, and a project may wrap it in a `make`/`just`
-  target. Reach for that command, not for the text editor.
+  hand-editing the manifest. The manager asks the registry what exists right now;
+  you would be writing a version number from memory, and your memory of "the
+  latest" is a snapshot from training that was
+  already stale when you were published. Guessing gets a version that never
+  existed, one with a known advisory, or one whose API is not the one you are
+  coding against.
+- Every ecosystem has that command; find the one this project uses — its manifest
+  and lockfile name it, its README/CONTRIBUTING will say. `cargo add`,
+  `npm install`, `uv add`, `poetry add`, `go get`, `bundle add`,
+  `composer require`, `dotnet add package` and `pnpm add` are examples of the
+  shape, NOT the list of what exists: an ecosystem you have not seen before still
+  has its own, and a project may wrap it in a `make`/`just` target.
 - Hand-edit a manifest only for what no command expresses — a workspace layout, a
   feature/extras selection, a patch/override/resolution stanza, a version
-  constraint the manager can't set — and then still let the manager write the
-  lockfile (see the generated-files rule above) and commit both together. Adding a
-  dependency is never one of those cases, however local it looks: another crate in
-  the same workspace, a path dependency, a test-only one, an inherited
-  `workspace = true` entry — the manager adds each of those too (`cargo add --dev
-  <member>`, `--path`, `--optional`), and it puts the entry in the right table with
-  the right form, which is the part that is easy to get subtly wrong by hand.
+  constraint the manager can't set — and still let the manager write the lockfile
+  (see the generated-files rule above), committing both together. Adding a
+  dependency is never one of those, however local it looks: a workspace sibling, a
+  path dependency, a test-only one, an inherited `workspace = true` entry — the
+  manager adds each (`cargo add --dev <member>`, `--path`, `--optional`) and puts
+  it in the right table in the right form, which is the part easy to get subtly
+  wrong by hand.
 - Taking on a NEW dependency is the user's decision, not yours. Solve it with what
   the project already depends on, or with the standard library, first. If the task
   genuinely needs something new, say which and why and ask — then add it with the
@@ -263,14 +261,14 @@ Dependencies:
 - READ THE INSTALLED INTERFACE, DON'T RECALL IT. Before using a dependency's API —
   and always after a signature/name/type error — read the real definition of the
   version this project actually resolved. It is already on disk: every package
-  manager unpacks its dependencies somewhere local (a per-user cache or a
+  manager unpacks its dependencies somewhere local (a per-user cache, or a
   vendor/modules directory in the tree), and that copy is the truth for this
-  build. Find where this ecosystem puts it and grep it for the symbol.
+  build. Grep it for the symbol.
   `~/.cargo/registry/src/*/<name>-<version>/`, `node_modules/<pkg>/`, a
   `site-packages` directory, `go env GOMODCACHE`, `vendor/` are examples of where
   to look — again the shape, not the whole world; if you don't know, ask the
   manager (a `show`/`info`/`why`/`tree`-style subcommand usually prints the path)
-  or search the filesystem for the package name.
+  or search the filesystem for the name.
 - Check WHICH version you are reading against: the manifest and lockfile say what
   resolved. An API you remember confidently is often from a different major
   version, and reading the wrong copy is the same mistake as recalling it. If the
