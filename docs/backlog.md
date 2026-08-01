@@ -652,6 +652,106 @@ sections above.
 
 ---
 
+## dispatch.rs review — findings 2026-08-02
+
+`hrdr-app/src/commands/dispatch.rs` (946 lines, both frontends route through it)
+was read in full for the first time, with its six sibling modules, the
+`CommandHost` trait and both call sites. Ten tests exist, covering `/add` and
+`/copy msg`; the other ~30 commands have none. Findings below are traced from
+source — nothing was reproduced at runtime.
+
+**Fix first — the web silently compacts the wrong conversation.**
+`CommandHost::agent`'s contract names `/compact` as acting on the agent on
+screen, and the TUI honours it (`hrdr-tui/src/app.rs:2344`, `active_agent()`,
+with a comment saying so). `WebHost::start_compaction` uses
+`self.session.agent()` — the main agent — and keys on `MAIN_KEY`. In the web UI,
+switching to a sub-agent pane and running `/compact` leaves that pane untouched
+and irreversibly summarizes the **main** conversation, announced only as
+"compacting conversation…". Verified by reading both implementations.
+
+**`supports_command` has never matched anything.** `HELP_GROUPS` entries carry
+the leading slash (`hrdr-app/src/lib.rs:140`) and `WebHost::supports_command`
+matches unslashed names (`hrdr-web/src/host.rs:395`). Its only caller in the
+workspace is the `/help` filter, so the web advertises `/edit`, `/paste`,
+`/copy`, `/theme`, `/reload` as available; `/goto`, `/find`, `/next`, `/prev`
+are listed too and exist only in the TUI. Verified both spellings by reading
+them. Fix is `trim_start_matches('/')` plus adding the four TUI-only names.
+
+**Nothing gates execution on `supports_command` — only help text.** That is the
+structural half, and it needs a decision: gate in `dispatch`, or override per
+host. Two live consequences today. `/edit <file>` over the web reaches the
+default `open_editor`, which spawns `xdg-open`/`open`/`start` **on the machine
+hosting the server** and tells the remote user it opened. `/theme <path>` calls
+a `set_theme` the web host discards, then `persist_setting` — which is _not_
+overridden — writing the **server operator's** `config.toml` with a remotely
+chosen path, and reporting success. `/theme reset` deletes their key.
+
+**The web does not trim the input line.** `hrdr-web/src/server.rs:660` tests
+`!line.starts_with('/')` on the raw line; the TUI trims first. A leading space —
+a paste, a mobile keyboard — sends `" /new"` to the model as a user message and
+burns a turn.
+
+**`/cwd` writes one agent and reads another.** `dispatch.rs` resolves the
+argument against `host.cwd()` and writes `host.agent()`, and those are different
+agents in _both_ frontends (`cwd()` is main-derived, `agent()` is the active
+pane). On a sub-agent pane, a relative `/cwd` resolves against main's cwd, moves
+only the sub-agent, then repoints the global chrome as if main had moved. A bare
+`/cwd` afterwards contradicts the status bar. `/status` has the same split —
+main's cwd beside the active agent's message count. Needs a call: derive the
+base from `host.agent()`, or add `active_cwd()` so both halves name one agent.
+
+**Canonical names are case-sensitive, aliases are not.** `resolve_alias`
+lowercases only for its match arms and returns the original on fall-through, so
+`/CD`, `/RESET`, `/Clear` work while `/CWD`, `/Status`, `/Model`, `/Help` answer
+"unknown command". Two spellings of one command behave oppositely. Decide which
+way, then pin it — neither side has a test, so any fix could regress silently.
+
+**`/temp` takes any `f32` and cannot be cleared.** No range check: `/temp 5`,
+`-1`, `nan`, `1e40` all parse and are **persisted to `config.toml`**, so every
+future launch carries it. Non-finite values serialize to `"temperature": null`.
+There is no in-UI escape — the empty-argument branch only reads, `Some(t)` is
+the only `set_temperature` call, and `/temp default` is not accepted — so
+recovery means hand-editing the config file.
+
+Smaller, each verified: `/copy msg 1-99999999999999` labels the range it
+_requested_ rather than what it copied (the existing bounded-scan test uses
+exactly that input); `/export notes.json` writes Markdown into it because format
+keys off `--json` alone, drops extra tokens silently, and overwrites without
+confirmation using blocking `fs::write` inside an async task; `/effort`,
+`/login` and `/skills` discard their argument in silence (`/effort high` prints
+a level listing on the default host, so the user reasonably believes it
+applied); `/doctor` runs `git branch` and filesystem probes **before** its spawn
+— on the TUI thread, and on the web while the global session lock is held, so a
+slow `git` stalls every connected client. `/status` already does this correctly
+inside the spawn.
+
+**Checked and fine, so nobody re-derives it:** the `bool` contract is sound —
+every in-arm return is `true`, only the unknown arm and the non-`/` guard return
+`false`, so nothing swallows input or leaks a command. No byte-offset `&str`
+slicing, no indexing, no `unwrap`/`expect` outside tests. `/etc/hosts` correctly
+falls through to the model. `parse_msg_range` rejects the degenerate ranges. The
+`/add` size cap that looks duplicated is not — `read_attach_file` gates on
+`metadata().len()`, which is `0` for procfs, so the post-read check is the real
+backstop. No arm reads state, awaits, then writes back stale. `dispatch` is
+synchronous and holds no lock across an await.
+
+**Coverage worth adding first**, in order of how bad a silent regression is: a
+table asserting `dispatch` returns `true` for every name in `SLASH_COMMANDS` and
+`false` only for unknown input (catches an arm being deleted, or a
+`return false` slipping into a handler); `/help` actually filtering on
+`supports_command`; `/edit` not reaching `open_editor` on a host that refuses
+it; the busy guards firing at all — they are the "check that cannot fail" shape
+and nothing observes them today.
+
+**Not covered by this pass:** no runtime exercise, TUI or web. The concurrency
+claims are reasoned from lock scopes, not from a racing repro. TUI modal/picker
+key routing was judged only at its `begin_*` entry points. `login.rs`,
+`skills.rs`, `completion.rs` and `sessions.rs` were read only where dispatch
+calls into them. `open_system_handler`'s Windows and macOS arms are `#[cfg]`-
+gated and were not compiled.
+
+---
+
 ## Review coverage still owed
 
 The 2026-08-01 pass (see
@@ -659,8 +759,9 @@ The 2026-08-01 pass (see
 closed every finding it raised, but it did not read everything. What it never
 opened, so nobody records it as reviewed:
 
-- **`hrdr-app/src/commands/dispatch.rs`** — 946 lines, the slash-command
-  dispatcher both frontends route through. Untouched by any review pass.
+- ~~`hrdr-app/src/commands/dispatch.rs`~~ — **read 2026-08-02**, see
+  [dispatch.rs review](#dispatchrs-review-findings-2026-08-02). Twelve findings,
+  one of them history loss on the wrong conversation.
 - **`hrdr-tui/src/ui.rs` block rendering** and **`app/commands.rs`**. Only the
   mouse/selection path (`e1b3023`) and the scroll/highlight math were read.
 - **Twelve `hrdr-tools` files**: `find`, `ls`, `secret_diff`, `mutation`,
