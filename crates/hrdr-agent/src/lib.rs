@@ -5611,6 +5611,10 @@ mod tests {
         }
         expected.extend([
             "committing",
+            // git mechanics + the release workflow, main-only: a sub-agent is
+            // told not to commit, branch or touch history, so it carried ~9 KB
+            // describing how to do exactly those
+            "write_main",
             "committing_main",
             // names + one-liners of what `skill` can load: project-scoped, so
             // above the persona and out of the volatile tail

@@ -25,8 +25,18 @@ mod frag {
     /// content, safety. Byte-identical for every agent hrdr runs — main or sub,
     /// read-only or write — which is what makes it the shared cache prefix.
     pub const BASE: &str = include_str!("templates/base.md");
-    /// `can_write`: scope, editing, tests, debugging, git.
+    /// `can_write`: scope, style, correctness, editing, dependencies, tests,
+    /// debugging, deleting.
     pub const WRITE: &str = include_str!("templates/write.md");
+    /// `can_write` and NOT a sub-agent: git mechanics and the release workflow.
+    ///
+    /// Split out of `WRITE` because a sub-agent does neither by default — it is
+    /// told not to commit, branch or touch history (`SUBAGENT_WRITE`), and one
+    /// briefed to commit anyway gets its staging rule there. Deleting and
+    /// Dependencies deliberately did NOT come with it: a sub-agent deletes and
+    /// reads dependency APIs like anyone else, and neither has a trigger phrase
+    /// that would reliably precede the damage.
+    pub const WRITE_MAIN: &str = include_str!("templates/write_main.md");
     /// The `memory` tool is registered — how to save a durable fact. Its own
     /// fragment rather than part of `WRITE`, because the tool is main-agent-only
     /// and telling a sub-agent to "save it with the `memory` tool" would name a
@@ -154,6 +164,10 @@ pub fn capability_sections_for(
         // `SUBAGENT_WRITE`, pushed below under the same gate (can_write &&
         // delegated), so a delegated writer still gets exactly one of the two.
         if !delegated {
+            // Git mechanics and the release workflow: ~9 KB a write sub-agent
+            // carried on every turn to be told how to do things it is separately
+            // forbidden from doing.
+            out.push((SECTION_WRITE_MAIN, frag::WRITE_MAIN));
             out.push((SECTION_COMMITTING_MAIN, frag::COMMITTING_MAIN));
         }
     }
@@ -252,6 +266,7 @@ pub const SECTION_WRITE: &str = "write";
 pub const SECTION_SHELL: &str = "shell";
 pub const SECTION_SHELL_POSIX: &str = "shell_posix";
 pub const SECTION_COMMITTING: &str = "committing";
+pub const SECTION_WRITE_MAIN: &str = "write_main";
 pub const SECTION_COMMITTING_MAIN: &str = "committing_main";
 pub const SECTION_DELEGATE: &str = "delegate";
 pub const SECTION_SUBAGENT: &str = "subagent";
@@ -1273,6 +1288,44 @@ mod tests {
         assert!(!p.contains("Searching:"), "no jail section: {p}");
         if p.contains("Shell:") {
             assert!(p.contains("`rg` for content"), "{p}");
+        }
+    }
+
+    /// Git mechanics and the release workflow are the MAIN agent's. A write
+    /// sub-agent is told not to commit, not to branch and not to touch history
+    /// (`subagent_write.md`), and the one briefed to commit anyway gets its
+    /// staging rule there — so carrying the full Git and Releasing sections cost
+    /// it ~9 KB on every turn to describe work it is forbidden to do.
+    ///
+    /// What deliberately did NOT move: Deleting and Dependencies. A sub-agent
+    /// deletes files and reads dependency APIs like any other agent, and neither
+    /// has a trigger phrase that reliably precedes the damage.
+    #[test]
+    fn a_write_subagent_does_not_carry_git_or_release_guidance() {
+        let tools = ToolRegistry::with_defaults();
+        let main = render_system(&tools, false).unwrap();
+        let sub = render_system(&tools, true).unwrap();
+
+        for gone in [
+            "Git:",
+            "Branch by ownership and intent",
+            "Never force-push",
+            "Releasing",
+            "Never move or reuse a tag",
+        ] {
+            assert!(main.contains(gone), "the main agent keeps `{gone}`: {main}");
+            assert!(
+                !sub.contains(gone),
+                "a sub-agent should not carry `{gone}`: {sub}"
+            );
+        }
+        // …and the two that stay, for both.
+        for kept in ["Deleting:", "Dependencies:", "READ THE INSTALLED INTERFACE"] {
+            assert!(main.contains(kept), "main keeps `{kept}`");
+            assert!(
+                sub.contains(kept),
+                "a sub-agent deletes and reads dependency APIs too — `{kept}` must stay: {sub}"
+            );
         }
     }
 
