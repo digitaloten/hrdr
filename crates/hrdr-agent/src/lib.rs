@@ -4471,7 +4471,10 @@ mod tests {
         let defs = ro.tools.defs();
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         // The shape this test exists to pin: a shell, and none of the jail four.
-        assert!(names.contains(&"shell"), "read-only keeps its shell: {names:?}");
+        assert!(
+            names.contains(&"shell"),
+            "read-only keeps its shell: {names:?}"
+        );
         for jail_only in ["grep", "find", "ls", "tree"] {
             assert!(
                 !names.contains(&jail_only),
