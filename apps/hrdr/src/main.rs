@@ -420,6 +420,10 @@ async fn startup_checks(config: &AgentConfig, listing: bool) -> Result<()> {
 /// is the one outcome worse than having no backend at all.
 #[cfg(windows)]
 fn run_sandbox_exec_wrapper() -> Option<Result<std::process::ExitCode>> {
+    // Scoped to this function: `main.rs` imports only `anyhow::Result`, and a
+    // top-level `use` would be an unused import on every non-Windows build.
+    use anyhow::Context as _;
+
     let mut argv = std::env::args_os().skip(1);
     if argv.next()? != hrdr_tools::sandbox::SANDBOX_EXEC_ARG {
         return None;
