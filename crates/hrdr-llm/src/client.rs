@@ -2754,6 +2754,291 @@ mod tests {
         assert_eq!(days_from_civil(1970, 1, 32), None);
     }
 
+    // ── Retry-After parsing ──────────────────────────────────────────────
+
+    /// A `HeaderMap` carrying one `Retry-After` value — the only input
+    /// [`retry_after_from_headers`] reads.
+    fn retry_after_header(value: &str) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_str(value).expect("valid header value"),
+        );
+        headers
+    }
+
+    /// Format `epoch_secs` as an RFC 7231 IMF-fixdate, so the date cases below
+    /// can be stated relative to *now* rather than as a literal that goes stale.
+    ///
+    /// This is Hinnant's `civil_from_days`, the inverse of [`days_from_civil`]
+    /// above — which is why `imf_fixdate_helper_is_correct` pins it against the
+    /// RFC's own worked example first. A wrong helper would hand every case
+    /// below a date that only *looks* like the one it asked for.
+    fn imf_fixdate(epoch_secs: u64) -> String {
+        const WKDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        const MONTH: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+
+        let days = (epoch_secs / 86400) as i64;
+        let tod = epoch_secs % 86400;
+
+        let z = days + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = if m <= 2 { y + 1 } else { y };
+
+        format!(
+            "{wkday}, {d:02} {mon} {year:04} {h:02}:{mi:02}:{s:02} GMT",
+            // Day 0 (1970-01-01) was a Thursday, index 4.
+            wkday = WKDAY[(days + 4).rem_euclid(7) as usize],
+            mon = MONTH[(m - 1) as usize],
+            h = tod / 3600,
+            mi = (tod % 3600) / 60,
+            s = tod % 60,
+        )
+    }
+
+    #[test]
+    fn imf_fixdate_helper_is_correct() {
+        assert_eq!(imf_fixdate(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        // RFC 7231 §7.1.1.1's own example date, built from the epoch-day count
+        // `days_from_civil_known_dates` already pins.
+        assert_eq!(days_from_civil(1994, 11, 6), Some(9075));
+        let rfc_example = 9075 * 86400 + 8 * 3600 + 49 * 60 + 37;
+        assert_eq!(imf_fixdate(rfc_example), "Sun, 06 Nov 1994 08:49:37 GMT");
+        // A leap day, where an off-by-one in the era arithmetic would show.
+        let leap = days_from_civil(2024, 2, 29).unwrap() as u64 * 86400 + 23 * 3600 + 59 * 60 + 59;
+        assert_eq!(imf_fixdate(leap), "Thu, 29 Feb 2024 23:59:59 GMT");
+    }
+
+    /// The `Retry-After` parse, over a real `HeaderMap`.
+    ///
+    /// Nothing else reaches this function: hrdr-agent's mock responses set no
+    /// response headers, and retry.rs's `retry_after_hint_parses_and_clamps`
+    /// parses the ` (retry-after: Ns)` suffix back *out* of a message string —
+    /// this function's output, not this function. Untested, a 429 that named its
+    /// own delay would be answered with hrdr's jittered backoff instead, i.e.
+    /// hammering a provider that just said when to come back.
+    #[test]
+    fn retry_after_from_headers_parses_seconds_dates_and_clamps() {
+        let max = crate::MAX_BACKOFF;
+
+        // Delta-seconds (RFC 7231 §7.1.3) — the form providers actually send.
+        assert_eq!(
+            retry_after_from_headers(&retry_after_header("30")),
+            Some(Duration::from_secs(30))
+        );
+        // Surrounding whitespace is trimmed before the parse.
+        assert_eq!(
+            retry_after_from_headers(&retry_after_header(" 30 ")),
+            Some(Duration::from_secs(30))
+        );
+        // Zero is "come back now": no hint, so the jittered backoff applies.
+        assert_eq!(retry_after_from_headers(&retry_after_header("0")), None);
+        // No header at all — the overwhelmingly common case.
+        assert_eq!(
+            retry_after_from_headers(&reqwest::header::HeaderMap::new()),
+            None
+        );
+
+        // The clamp, which is what stops a hostile or absurd value parking the
+        // turn. Asserted against the constant by name: hard-coding 60 here would
+        // let a raised `MAX_BACKOFF` turn this into a check of nothing.
+        assert!(
+            max < Duration::from_secs(86_400),
+            "the clamp cases below only mean something while 86400 is over the ceiling"
+        );
+        assert_eq!(
+            retry_after_from_headers(&retry_after_header("86400")),
+            Some(max)
+        );
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_secs();
+
+        // An IMF-fixdate inside the ceiling comes back as the remaining wait.
+        // A range rather than an equality: the clock moves between formatting
+        // the date and parsing it.
+        let soon = retry_after_from_headers(&retry_after_header(&imf_fixdate(now + 45)))
+            .expect("a future IMF-fixdate is a wait");
+        assert!(
+            soon <= Duration::from_secs(45) && soon >= Duration::from_secs(40),
+            "expected ~45s from a date 45s out, got {soon:?}"
+        );
+        // The date form obeys the same ceiling as the integer form — a separate
+        // `.min()` call site, so it needs its own case.
+        assert_eq!(
+            retry_after_from_headers(&retry_after_header(&imf_fixdate(now + 3600))),
+            Some(max)
+        );
+        // A date already past is not a wait at all.
+        assert_eq!(
+            retry_after_from_headers(&retry_after_header(&imf_fixdate(now - 60))),
+            None
+        );
+
+        // Garbage in each shape the parser can meet: not a number, empty, a
+        // negative delta, a date missing its zone, a date with a bad month.
+        for junk in [
+            "soon",
+            "",
+            "-5",
+            "Sun, 06 Nov 2999 08:49:37",
+            "Xyz, 09 Zzz 2999 08:49:37 GMT",
+        ] {
+            assert_eq!(
+                retry_after_from_headers(&retry_after_header(junk)),
+                None,
+                "{junk:?} must not parse as a delay"
+            );
+        }
+    }
+
+    // ── Status classification ────────────────────────────────────────────
+
+    /// Every arm of [`classify_status`], plus representatives of the default.
+    ///
+    /// The kind is what hrdr-agent's retry and compaction decisions read, so a
+    /// dropped arm is not a cosmetic problem: it is a turn that dies instead of
+    /// retrying, or one that never compacts. The four call sites of this
+    /// function were all indirect before this test — the closest thing to
+    /// coverage was one end-to-end 413 on the OpenAI path.
+    #[test]
+    fn classify_status_maps_every_arm_and_its_default() {
+        assert_eq!(classify_status(413), ChatErrorKind::Overflow);
+
+        for status in [408u16, 429, 500, 502, 503, 504, 522, 524, 529] {
+            assert_eq!(
+                classify_status(status),
+                ChatErrorKind::Transient,
+                "{status} must be retryable"
+            );
+        }
+
+        // The default arm. 501/505 pin that 5xx is *not* blanket-transient, and
+        // 523 that the Cloudflare pair is two codes rather than a range — both
+        // are the shape a careless widening would take.
+        for status in [200u16, 400, 401, 403, 404, 422, 501, 505, 523] {
+            assert_eq!(
+                classify_status(status),
+                ChatErrorKind::Other,
+                "{status} must classify as Other"
+            );
+        }
+
+        // Spelled out separately because it is the expensive direction to get
+        // wrong: a 400 is a malformed request and a 401 is a bad credential, and
+        // retrying either buys the same failure a few backoffs later while
+        // looking, to the user, like the provider is slow.
+        for status in [400u16, 401] {
+            assert_ne!(classify_status(status), ChatErrorKind::Transient);
+        }
+    }
+
+    /// Serve one canned non-2xx response — status line, extra header lines (each
+    /// already `\r\n`-terminated), body.
+    ///
+    /// Separate from [`serve_once`] above, which always answers `200 OK`: this
+    /// is the only way to hand [`error_from_response`] a real
+    /// `reqwest::Response`, since nothing in this crate can construct one.
+    async fn serve_error_once(
+        status_line: &'static str,
+        extra_headers: &'static str,
+        body: &'static str,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut tmp = [0u8; 4096];
+            let _ = stream.read(&mut tmp).await;
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {len}\r\n\
+                 {extra_headers}\
+                 Connection: close\r\n\
+                 \r\n\
+                 {body}",
+                len = body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+        });
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    /// One case per [`ChatErrorKind`]: the typed error must carry the status
+    /// through, classify it with [`classify_status`], and pick `Retry-After` off
+    /// the response headers — the three fields hrdr-agent reads — while leaving
+    /// the server's own body in `message` for the untyped fallback scanner.
+    #[tokio::test]
+    async fn error_from_response_round_trips_status_kind_and_retry_after() {
+        for (status_line, extra_headers, body, status, kind, retry_after) in [
+            (
+                "413 Payload Too Large",
+                "",
+                r#"{"error":"prompt is too long"}"#,
+                413u16,
+                ChatErrorKind::Overflow,
+                None,
+            ),
+            (
+                "429 Too Many Requests",
+                "Retry-After: 12\r\n",
+                r#"{"error":"slow down"}"#,
+                429,
+                ChatErrorKind::Transient,
+                Some(Duration::from_secs(12)),
+            ),
+            (
+                "400 Bad Request",
+                "",
+                r#"{"error":"invalid tool schema"}"#,
+                400,
+                ChatErrorKind::Other,
+                None,
+            ),
+        ] {
+            let url = serve_error_once(status_line, extra_headers, body).await;
+            let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+            let err = error_from_response(resp).await;
+            let chat_err = err.downcast_ref::<ChatError>().expect("typed ChatError");
+
+            assert_eq!(chat_err.status, Some(status), "{status_line}");
+            assert_eq!(chat_err.kind, kind, "{status_line}");
+            assert_eq!(chat_err.retry_after, retry_after, "{status_line}");
+            assert!(
+                chat_err.message.contains(body),
+                "the server's body must survive into the message: {}",
+                chat_err.message
+            );
+            // A hint also has to reach the text suffix, which is the only form
+            // of it an error that never went through the typed path can carry.
+            if let Some(d) = retry_after {
+                let suffix = format!("(retry-after: {}s)", d.as_secs());
+                assert!(
+                    chat_err.message.contains(&suffix),
+                    "expected {suffix} in: {}",
+                    chat_err.message
+                );
+            }
+        }
+    }
+
     #[test]
     fn rotated_path_appends_dot_one() {
         assert_eq!(

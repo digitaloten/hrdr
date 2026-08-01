@@ -709,6 +709,72 @@ mod tests {
         }
     }
 
+    /// Every status [`crate::client::classify_status`] calls transient, paired
+    /// with whether the substring scan in [`is_transient`] would **also** catch
+    /// it once the typed error is out of the picture.
+    ///
+    /// The two covers do not line up. The scan's needles include
+    /// `returned 429`/`500`/`502`/`503`/`504`/`529` and `overloaded`, but
+    /// nothing for 408, 522 or 524 — so for those three the `classify_status`
+    /// arm is the *only* thing making them retryable. They are exactly what a
+    /// Cloudflare-fronted gateway emits when its origin stalls, so losing one of
+    /// those arms turns a retryable stall into a terminal error that kills the
+    /// turn, with no other code path to notice.
+    const TRANSIENT_STATUS_HAS_TEXT_FALLBACK: &[(u16, bool)] = &[
+        (408, false),
+        (429, true),
+        (500, true),
+        (502, true),
+        (503, true),
+        (504, true),
+        (522, false),
+        (524, false),
+        (529, true),
+    ];
+
+    /// The message shape `error_from_response` builds, as an *untyped*
+    /// `anyhow::Error` — what [`is_transient`]'s fallback alone would see. The
+    /// body deliberately carries none of the scan's marker words, so only the
+    /// `returned <code>` needles can match.
+    fn untyped_status_error(status: u16) -> anyhow::Error {
+        let code = reqwest::StatusCode::from_u16(status).expect("a valid status code");
+        anyhow::anyhow!("chat endpoint returned {code}: upstream said no")
+    }
+
+    #[test]
+    fn three_transient_statuses_have_no_text_fallback_safety_net() {
+        use crate::client::classify_status;
+
+        for &(status, has_net) in TRANSIENT_STATUS_HAS_TEXT_FALLBACK {
+            assert_eq!(
+                classify_status(status),
+                ChatErrorKind::Transient,
+                "{status} must stay in the transient table"
+            );
+            let untyped = untyped_status_error(status);
+            assert_eq!(
+                is_transient(&untyped),
+                has_net,
+                "text-fallback coverage for {status} changed: {untyped}"
+            );
+        }
+
+        // Derived from the scan's actual behaviour, not re-read off the table
+        // above, and compared with the three spelled out by name. Adding a
+        // `returned 408`-style needle should fail here so the claim gets
+        // updated; deleting a `classify_status` arm fails the loop above.
+        let unprotected: Vec<u16> = TRANSIENT_STATUS_HAS_TEXT_FALLBACK
+            .iter()
+            .filter(|&&(status, _)| !is_transient(&untyped_status_error(status)))
+            .map(|&(status, _)| status)
+            .collect();
+        assert_eq!(
+            unprotected,
+            vec![408, 522, 524],
+            "these three are retryable only because `classify_status` says so"
+        );
+    }
+
     #[test]
     fn is_context_overflow_more_variants() {
         for msg in [
