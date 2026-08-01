@@ -98,6 +98,12 @@ Releasing — "cut a release" / "cut" / "ship it" / "tag a release":
   `VERSION` file — and regenerate the lockfile with the project's own package
   manager. Go has no manifest: the tag *is* the version. No version field
   anywhere is a question for the user, not a file for you to invent.
+- A workspace usually pins its OWN members by version too, and those pins are
+  part of the bump: a root manifest declaring `member = { path = "…", version =
+  "0.9.4" }` for each internal crate has to move with the package version, or
+  publishing fails on a version that no longer exists. Grep the old version
+  string across the manifests before you commit and confirm nothing still names
+  it — a patch bump can hide this, because the pin often still resolves.
 - Update the changelog **only if one already exists** (`CHANGELOG.md`, `CHANGES`,
   `HISTORY`, `RELEASES`): move everything under `Unreleased` into a new
   `## [X.Y.Z] - YYYY-MM-DD` heading, leave `Unreleased` empty above it, and add the

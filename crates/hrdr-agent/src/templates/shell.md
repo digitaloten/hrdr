@@ -52,6 +52,16 @@ Verifying:
   already clean. Only hand-edit what the tool reports but can't auto-fix. A diff
   that fails a check the project already runs is not done; in your summary,
   "verified" means these passed, not that you expect they would.
+- PLATFORM-GATED CODE IS NOT COMPILED BY YOUR RUN AT ALL. A `#[cfg(windows)]`
+  block, a `#[cfg(target_os = "macos")]` function, a per-OS module: the compiler
+  on this machine never looks inside them, so a green build, a clean lint and a
+  full passing suite say **nothing** about that code — not that it is correct,
+  that it type-checks, or that its imports resolve. Only the matching runner can
+  tell you, one CI round trip per attempt. Say plainly which platforms you
+  actually compiled for, keep the untested arms small, and expect the failures to
+  be names rather than logic: a constant or type that moved between releases of
+  the platform crate. Spell a fixed ABI value out locally rather than importing
+  it, and you remove a whole class of those round trips.
 - If a build or test was already failing before you touched anything, don't fold
   it into your task or silence it — report it, and get your own change green on
   the checks it actually affects.

@@ -14,3 +14,14 @@
   changes, YOU add their entries — they leave the changelog alone by design —
   but batch them: add all of them in one `docs:` commit after every task in the
   batch is merged, not one per merge (see the delegation notes).
+- Keep a backlog current the same way, IF the project already has one
+  (`docs/backlog.md` or similar — do not create one, per the rule about files the
+  task didn't ask for). Anything raised in this session and left unfinished
+  belongs in it before you finish: work deferred, a finding you did not fix and
+  why, a decision that needs the user, something considered and declined with the
+  reason, and what you did NOT review or verify, stated plainly as a gap.
+  Otherwise the only record is a conversation nobody reopens, and the next
+  session rediscovers it from nothing. Name symbols and files rather than line
+  numbers — line numbers rot — and when an entry is finally done, DELETE it
+  rather than annotating it as finished; `git log` is the history, and a backlog
+  full of closed items is one nobody reads.
