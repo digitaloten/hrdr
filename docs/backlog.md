@@ -588,6 +588,17 @@ Not bugs; things whose surprise is worth having written down.
   selecting. Neither is a defect; both are what is left of "the always-on prompt
   is too long".
 
+- **A mid-stream retry can double the text the user already saw.**
+  `drain_stream` forwards `AgentEvent::Text` to the frontend as it arrives, so a
+  stream that fails after emitting some output and is then retried — by
+  `RetryBudget` on a transient error, or now by `recover_context_overflow` on a
+  drain-time `context_length_exceeded` (PR #24) — re-streams the model's reply
+  from the start, and the frontend has no signal to discard the first partial.
+  Not new and not observed in practice: Codex reports overflow as a
+  `response.failed` event before any content. Noted because the overflow path
+  widened the set of errors that reach the retry, and because the fix (a
+  "discard what I streamed for this round" event) is a protocol change, not a
+  local one.
 - **Building a sandbox policy touches the parent repo's `.git`.**
   `git_metadata_roots` `create_dir_all`s `refs/heads/hrdr` and
   `logs/refs/heads/hrdr` so they exist to be canonicalized and bind-mounted — so
