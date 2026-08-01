@@ -1834,6 +1834,67 @@ mod tests {
         assert_eq!(body["model"], "qwen3-coder");
     }
 
+    /// **Known limitation, pinned deliberately** — this test documents current
+    /// behaviour, it does not endorse it.
+    ///
+    /// The sentinel is handled on the OpenAI path only. [`Client::chat_stream`]
+    /// returns into [`crate::anthropic`] / [`crate::codex`] with `&self.model`
+    /// *before* it reaches `wire_model()`, and both native builders write
+    /// `"model": model` unconditionally — so a provider entry left at `default`
+    /// and pointed at either endpoint puts the literal string on the wire, and
+    /// the only diagnosis is that provider's own "unknown model" error.
+    ///
+    /// It is not resolved there because there is nothing to resolve it *to*:
+    /// [`Client::wire_model`] adopts a `/v1/models` listing only when it holds
+    /// exactly one entry, which a hosted multi-model provider's never does. So
+    /// the honest choices are today's pass-through or an up-front error — not
+    /// asking the endpoint.
+    #[test]
+    fn the_unnamed_model_sentinel_reaches_the_wire_on_the_native_backends() {
+        let anthropic = crate::anthropic::build_body(
+            UNNAMED_MODEL,
+            8192,
+            None,
+            None,
+            None,
+            &[],
+            CacheMode::Off,
+            false,
+            None,
+            &[ChatMessage::user("hi")],
+            &[],
+        );
+        assert_eq!(
+            anthropic["model"], UNNAMED_MODEL,
+            "pinned: the Messages API body carries the sentinel verbatim"
+        );
+
+        let codex = crate::codex::build_body(
+            UNNAMED_MODEL,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[ChatMessage::user("hi")],
+            &[],
+        );
+        assert_eq!(
+            codex["model"], UNNAMED_MODEL,
+            "pinned: the Responses API body carries the sentinel verbatim"
+        );
+
+        // The divergence is the finding, so assert both halves in one place:
+        // handed the same sentinel (already resolved to nothing), the OpenAI
+        // builder omits the field entirely instead of sending `"default"`.
+        let openai = Client::new("http://gpu-box.lan:8000/v1", None, UNNAMED_MODEL);
+        let body = openai.body_json(&openai.request(None, &[], &[], true));
+        assert!(
+            body.get("model").is_none(),
+            "the OpenAI path still omits it: {body}"
+        );
+    }
+
     /// `prompt_cache_key` goes only to the endpoints that read it. The gate is
     /// an allowlist rather than "not localhost" on purpose: a self-hosted vLLM,
     /// llama.cpp or Ollama is as likely to sit behind private DNS on another
@@ -1983,6 +2044,47 @@ mod tests {
         let keys: Vec<_> = req.headers().get_all("x-api-key").iter().collect();
         assert_eq!(keys.len(), 1, "exactly one x-api-key header");
         assert_eq!(keys[0].to_str().unwrap(), "real-key");
+    }
+
+    /// Azure OpenAI is the one auth arm whose *guard* can fail rather than just
+    /// its header: it is selected by `api_version.is_some()`, not by the
+    /// backend, so anything that disturbs that condition falls through to the
+    /// `Bearer` arm below it and every Azure request 401s while OpenAI,
+    /// Anthropic and Codex stay green. The two neighbours above cover their own
+    /// arms; this covers that one, with a key actually set.
+    #[test]
+    fn azure_auth_sends_api_key_and_never_a_bearer() {
+        let mut client = Client::new(
+            "https://my-org.openai.azure.com/openai/deployments/gpt-5",
+            Some("real-key".to_string()),
+            "gpt-5",
+        );
+        client.set_api_version(Some("2024-10-21".to_string()));
+        client.set_headers(vec![
+            ("api-key".to_string(), "forged".to_string()),
+            ("Authorization".to_string(), "Bearer forged".to_string()),
+        ]);
+        let req = client
+            .auth(client.http.post(client.url("chat/completions")))
+            .build()
+            .expect("request builds");
+
+        let keys: Vec<_> = req.headers().get_all("api-key").iter().collect();
+        assert_eq!(keys.len(), 1, "exactly one api-key header");
+        assert_eq!(keys[0].to_str().unwrap(), "real-key");
+        // The negative half is the point. "`api-key` carries the key" is equally
+        // true of a client that sends `Authorization` alongside it — the likelier
+        // bug, since Bearer is what every other OpenAI-shaped endpoint wants.
+        assert!(
+            req.headers().get("authorization").is_none(),
+            "Azure authenticates with api-key alone, never Bearer too"
+        );
+        // Same request, so the URL half of the Azure shape is covered here too:
+        // the `api-version` query the auth arm keys on is actually on the wire.
+        assert_eq!(
+            req.url().as_str(),
+            "https://my-org.openai.azure.com/openai/deployments/gpt-5/chat/completions?api-version=2024-10-21"
+        );
     }
 
     #[test]
