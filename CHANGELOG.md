@@ -65,6 +65,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the parameter as your **config** spells it, not as the server does, so it
   points at a key you can actually edit.
 
+- **`/compact` summarized the wrong conversation.** `CommandHost::agent`'s
+  contract names `/compact` as acting on the agent on screen, and the TUI
+  honoured it — but the web host compacted the session's main agent regardless
+  of which pane was active. Switching to a sub-agent and compacting left that
+  pane untouched and irreversibly summarized the **main** conversation, saying
+  only "compacting conversation…". The agent and the registry key now come from
+  one derivation, so the conversation being summarized and the pane whose clock
+  says so cannot be different agents. The TUI had a milder form of the same
+  split: it compacted the right agent while running the turn clock — and
+  resetting the context gauge — on main.
+
 - **An Anthropic stop reason hrdr does not recognize is no longer read as a
   clean finish.** `stop_reason` was passed through verbatim when it matched none
   of the four known values, and `Accumulator::truncated()` matches only

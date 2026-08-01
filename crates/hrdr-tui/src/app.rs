@@ -190,7 +190,10 @@ pub(crate) enum TurnMsg {
     /// Out-of-band diff block (e.g. async `/diff` result).
     Diff(String),
     /// Compaction finished: `Ok((before, after))` message counts, or an error.
-    Compacted(Result<(usize, usize), String>),
+    /// Carries the pane whose agent was summarized — `/compact` acts on the
+    /// conversation being viewed, so its clock and its stale context reading are
+    /// that agent's, not the session's.
+    Compacted(hrdr_app::PaneId, Result<(usize, usize), String>),
     /// A model/provider switch re-probed the endpoint's advertised context window.
     /// Carries the pane whose agent was switched: `/model` acts on the agent being
     /// viewed, so its probe result belongs to that agent and not to the session's.
@@ -2336,16 +2339,20 @@ impl App {
 
     /// Run a compaction pass on the background task, reporting via `TurnMsg`.
     fn spawn_compaction(&mut self, instructions: Option<String>) {
-        // Summarizing is the model working: its own clock, no tools.
-        self.registry.begin_turn(hrdr_agent::MAIN_KEY);
         // Compaction acts on the conversation you are looking at. `run_compaction`
         // takes any agent — a sub-agent's history fills a context window like any
         // other, and it is the agent's own to manage.
-        let agent = self.active_agent();
+        let pane = self.panes.active();
+        // Summarizing is the model working: its own clock, no tools — on the agent
+        // doing the work, so the pane that shows busy is the one being summarized.
+        // Keyed to main regardless, this said a sub-agent's `/compact` was the main
+        // conversation working.
+        self.registry.begin_turn(pane.key());
+        let agent = self.agent_for(pane);
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
             let res = hrdr_app::run_compaction(agent, instructions).await;
-            let _ = tx.send(TurnMsg::Compacted(res)).await;
+            let _ = tx.send(TurnMsg::Compacted(pane, res)).await;
         });
         self.turn_handle = Some(handle);
     }
@@ -2499,12 +2506,15 @@ impl App {
                 warning,
             } => self.apply_catalog_result(generation, models, source, warning),
             TurnMsg::ConfigChanged => self.maybe_reload_config(),
-            TurnMsg::Compacted(res) => {
+            TurnMsg::Compacted(pane, res) => {
                 self.turn_handle = None;
-                self.registry.end_turn(hrdr_agent::MAIN_KEY);
+                self.registry.end_turn(pane.key());
                 // Context shrank; drop stale usage so the status bar refreshes
-                // on the next turn (and we don't immediately re-trigger).
-                self.state_mut().usage.set_last(None);
+                // on the next turn (and we don't immediately re-trigger). Through
+                // `update_chrome`, so it lands on the compacted agent's registry
+                // entry — which is what every pane, main included, is rebuilt from
+                // each frame; a write to the pane alone was undone at the next draw.
+                self.update_chrome(pane, |s| s.usage.set_last(None));
                 self.push_entry(Entry::system(hrdr_app::compaction_message(&res)));
                 if res.is_ok() {
                     self.autosave();
@@ -2683,6 +2693,115 @@ mod tests {
             "zero-size rect must never contain any cell"
         );
         assert!(!r.contains(0, 0));
+    }
+
+    // ---- /compact acts on the pane you are looking at ----
+
+    use super::App;
+    use hrdr_agent::{AgentConfig, AgentEntry, AgentRegistry, MAIN_KEY, PaneId};
+
+    /// An app with one delegated sub-agent registered, whose pane is the one on
+    /// screen — the state a `/compact` typed into a sub-agent's pane runs in.
+    ///
+    /// The endpoint is a closed loopback port: nothing here is allowed to reach a
+    /// model, and the sub-agent's history is empty, so the compaction pass returns
+    /// before it would make a request.
+    fn app_viewing_a_sub_agent() -> (App, u64, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = AgentConfig {
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "local://test-model".parse().unwrap(),
+            cwd: tmp.path().to_path_buf(),
+            sandbox: hrdr_tools::SandboxMode::None,
+            ..Default::default()
+        };
+        let ui = hrdr_app::UiConfig {
+            auto_resume: false, // never pick up the developer's real sessions
+            ..Default::default()
+        };
+        let mut app = App::new(config.clone(), ui, "logo").unwrap();
+
+        let sub = hrdr_agent::Agent::new(config).expect("minimal sub-agent");
+        let key = AgentRegistry::next_key();
+        app.registry.register(AgentEntry {
+            key,
+            bg_id: None,
+            tool_id: None,
+            label: "sub".to_string(),
+            model: sub.model_name(),
+            provider: Some(sub.provider_name().to_string()),
+            base_url: sub.endpoint_base_url(),
+            effort: None,
+            auto_compact: true,
+            compaction_reserved: 0,
+            todos: Default::default(),
+            usage: Default::default(),
+            events: hrdr_agent::event_log(),
+            turn: hrdr_agent::TurnStats::default(),
+            agent: std::sync::Arc::new(tokio::sync::Mutex::new(sub)),
+            steering: hrdr_agent::steering_queue(),
+            running: false,
+            compacting: false,
+            done: false,
+            delivered: false,
+            pinned: true,
+            transcript: None,
+        });
+        // The pane only exists once the registry has been folded in.
+        app.sync_panes();
+        app.panes.focus(PaneId(key));
+        assert_eq!(
+            app.panes.active(),
+            PaneId(key),
+            "the sub-agent's pane is the one on screen"
+        );
+        // The cwd goes back with it: an app whose working directory has been
+        // deleted saves and reads nothing like a real one.
+        (app, key, tmp)
+    }
+
+    /// That agent's latest `(prompt, completion)` context reading.
+    fn usage_last(live: &AgentRegistry, key: u64) -> Option<(u32, u32)> {
+        live.with(|v| v.iter().find(|e| e.key == key).and_then(|e| e.usage.last()))
+    }
+
+    /// Compacting a sub-agent's pane is that agent working, so its pane is the one
+    /// that shows busy and its stale context reading is the one dropped. Keyed to
+    /// `MAIN_KEY` regardless, the main conversation showed as working while a
+    /// sub-agent summarized, and the main gauge was the one reset.
+    #[tokio::test]
+    async fn compacting_a_sub_agent_pane_runs_that_panes_clock() {
+        let (mut app, key, _tmp) = app_viewing_a_sub_agent();
+        let live = app.registry.clone();
+        live.update(MAIN_KEY, |e| e.usage.set_last(Some((100, 5))));
+        live.update(key, |e| e.usage.set_last(Some((200, 7))));
+
+        app.spawn_compaction(None);
+        assert!(
+            live.is_running(key),
+            "the summarized pane is the one whose clock runs"
+        );
+        assert!(
+            !live.is_running(MAIN_KEY),
+            "the main conversation is not the one working"
+        );
+
+        // What the compaction task reports back when it lands.
+        app.on_turn_msg(TurnMsg::Compacted(PaneId(key), Ok((1, 1))));
+        assert!(
+            !live.is_running(key),
+            "the clock stops on the pane it started on"
+        );
+        assert_eq!(
+            usage_last(&live, key),
+            None,
+            "the compacted agent's stale context reading is the one dropped"
+        );
+        assert_eq!(
+            usage_last(&live, MAIN_KEY),
+            Some((100, 5)),
+            "the main conversation's context reading is untouched"
+        );
     }
 
     // ---- EventSender: bounded, coalescing UI event sink ----

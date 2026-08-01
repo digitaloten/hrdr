@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hrdr_agent::{Agent, EntryKind, MAIN_KEY, ModelRef, PaneId, Session};
+use hrdr_agent::{Agent, AgentRegistry, EntryKind, MAIN_KEY, ModelRef, PaneId, Session};
 use hrdr_app::{CommandHost, ExpandMode, LineKind};
 use tokio::sync::mpsc;
 
@@ -18,7 +18,46 @@ pub struct WebHost<'a> {
     pub line_tx: mpsc::UnboundedSender<(LineKind, String)>,
 }
 
+/// Agent `key`'s turn clock, started on construction and stopped on drop.
+///
+/// A plain `end_turn` at the end of the task never runs when the task is *aborted*
+/// — the future is simply dropped — and the abort paths (`WebSession::cancel`,
+/// [`CommandHost::clear_conversation`]) end `MAIN_KEY`'s clock, which is no longer
+/// the compacted agent's now that a sub-agent's pane can be the target. Without
+/// this, an aborted sub-pane compaction left that pane marked running forever: its
+/// loader spun, input to it steered a turn that had died, and the registry could
+/// never release it. Held *by the task's future*, so it covers an abort that lands
+/// before the task is ever polled too.
+struct TurnClock {
+    live: AgentRegistry,
+    key: u64,
+}
+
+impl TurnClock {
+    fn begin(live: AgentRegistry, key: u64) -> Self {
+        live.begin_turn(key);
+        Self { live, key }
+    }
+}
+
+impl Drop for TurnClock {
+    fn drop(&mut self) {
+        self.live.end_turn(self.key);
+    }
+}
+
 impl WebHost<'_> {
+    /// The registry key of the agent on screen — the one a command acts on.
+    ///
+    /// The single derivation behind [`CommandHost::agent`] and
+    /// [`CommandHost::start_compaction`]. They each had their own before, and they
+    /// disagreed: `/compact` on a sub-agent's pane summarized (irreversibly) the
+    /// *main* conversation, because the agent came from one and the key from the
+    /// other. Anything that resolves the active pane's agent uses this.
+    fn active_key(&self) -> u64 {
+        self.session.panes().active().key()
+    }
+
     /// Repoint the agent at the `(provider, model)` the just-adopted session ran on —
     /// the tail of the TUI's `adopt_state`, factored out of [`CommandHost::resume`].
     ///
@@ -65,15 +104,11 @@ impl CommandHost for WebHost<'_> {
     }
 
     fn agent(&self) -> Arc<tokio::sync::Mutex<Agent>> {
-        let pane_id = self.session.panes().active();
-        let key = match pane_id {
-            PaneId::MAIN => MAIN_KEY,
-            PaneId(k) => k,
-        };
         self.session
             .live()
-            .handle(key)
+            .handle(self.active_key())
             .map(|(a, _)| a)
+            // Released while being viewed — fall back rather than do nothing.
             .unwrap_or_else(|| self.session.agent().clone())
     }
 
@@ -364,20 +399,36 @@ impl CommandHost for WebHost<'_> {
     /// could start a turn on top of the summarizer. It goes in the same slot a turn's
     /// handle does (as the TUI's `turn_handle` does), which also gives it the turn's
     /// end-of-work handling for free: `end_turn`, a save, and any queued steer relaunched.
+    ///
+    /// That slot is the session's only one, so the busy-blocking it buys is
+    /// SESSION-WIDE while the compaction itself is now per-pane: summarizing a
+    /// sub-agent parks its handle here, the tick recomputes the MAIN pane's
+    /// `running` from it, and a prompt to the main conversation queues behind a
+    /// summarization happening in another pane. That is the safe direction of
+    /// wrong — it over-blocks, and the queued messages are relaunched by the same
+    /// turn-end handling above — so it stays until there is a per-pane handle slot
+    /// to put it in. What must NOT be session-wide is the summarization: it
+    /// rewrites a conversation's history, and doing that to the wrong one cannot be
+    /// undone.
     fn start_compaction(&mut self, instructions: Option<String>) {
-        let agent = self.session.agent().clone();
+        // Agent and key from the one derivation, so the conversation being
+        // summarized and the pane whose clock says so cannot be different agents.
+        let key = self.active_key();
+        let agent = self.agent();
         let live = self.session.live().clone();
         let line_tx = self.line_tx.clone();
         let notify = self.session.tick_notify().clone();
-        let key = MAIN_KEY;
 
-        live.begin_turn(key);
+        // Started here, so the pane shows busy from this instant; handed to the task,
+        // which stops it however it ends. Not a `TurnDone` event either way: compaction
+        // is not a turn in the conversation, so nothing is folded into the transcript
+        // for it — the clock is simply stopped, as the TUI's Compacted handler does.
+        let clock = TurnClock::begin(live.clone(), key);
         let handle = tokio::spawn(async move {
-            let result = hrdr_app::run_compaction(agent, instructions).await;
-            // Not a `TurnDone` event: compaction is not a turn in the conversation, so
-            // nothing is folded into the transcript for it — the turn clock is simply
-            // stopped, exactly as the TUI's Compacted handler does.
-            live.end_turn(key);
+            let result = {
+                let _clock = clock;
+                hrdr_app::run_compaction(agent, instructions).await
+            };
             if result.is_ok() {
                 // The context shrank: drop the stale reading so the gauge refreshes on
                 // the next turn instead of immediately re-triggering compaction. The
@@ -455,5 +506,196 @@ impl CommandHost for WebHost<'_> {
         // Needed by `restore_session_provider` (and `/model`): without it every
         // provider is "unknown" and a resumed session's endpoint can never be restored.
         self.session.cfg().resolve_provider(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hrdr_agent::{AgentConfig, AgentEntry, AgentRegistry};
+    use std::time::Duration;
+
+    /// A session with one delegated sub-agent registered, whose pane is the one
+    /// being viewed — the state a `/compact` typed into a sub-agent's pane runs in.
+    ///
+    /// The endpoint is a closed loopback port and no test here lets a model call
+    /// happen: the question is *which conversation* a command picks up, and a
+    /// summarization that actually reached a model would be a test of the model.
+    async fn viewing_a_sub_agent(cwd: PathBuf) -> (WebSession, u64) {
+        let cfg = AgentConfig {
+            cwd,
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            retry: hrdr_agent::RetryPolicy {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut session = WebSession::new(cfg.clone())
+            .await
+            .expect("minimal web session");
+
+        let sub = Agent::new(cfg).expect("minimal sub-agent");
+        let (model, provider, base_url) = (
+            sub.model_name(),
+            Some(sub.provider_name().to_string()),
+            sub.endpoint_base_url(),
+        );
+        let key = AgentRegistry::next_key();
+        session.live().register(AgentEntry {
+            key,
+            bg_id: None,
+            tool_id: None,
+            label: "sub".to_string(),
+            model,
+            provider,
+            base_url,
+            effort: None,
+            auto_compact: true,
+            compaction_reserved: 0,
+            todos: Default::default(),
+            usage: Default::default(),
+            events: hrdr_agent::event_log(),
+            turn: hrdr_agent::TurnStats::default(),
+            agent: Arc::new(tokio::sync::Mutex::new(sub)),
+            steering: hrdr_agent::steering_queue(),
+            running: false,
+            compacting: false,
+            done: false,
+            delivered: false,
+            pinned: true,
+            transcript: None,
+        });
+
+        // The pane only exists once the registry has been folded in.
+        let live = session.live().clone();
+        session.panes_mut().sync(&live);
+        session.panes_mut().focus(PaneId(key));
+        assert_eq!(
+            session.panes().active(),
+            PaneId(key),
+            "the sub-agent's pane is the one on screen"
+        );
+        (session, key)
+    }
+
+    /// That agent's latest `(prompt, completion)` context reading.
+    fn usage_last(live: &AgentRegistry, key: u64) -> Option<(u32, u32)> {
+        live.with(|v| v.iter().find(|e| e.key == key).and_then(|e| e.usage.last()))
+    }
+
+    /// `/compact` from a sub-agent's pane must summarize THAT conversation.
+    ///
+    /// The main agent's lock is held for the whole test, so a compaction pointed at
+    /// main cannot get past `run_compaction`'s `agent.lock().await` — it hangs here
+    /// instead of finishing. That is the discriminator: the compaction reporting a
+    /// result at all proves it took the sub-agent's lock, and what it reports proves
+    /// it read the sub-agent's history. Pointed at main it would (and in the shipped
+    /// web UI did) irreversibly rewrite the main conversation's history while the
+    /// pane on screen was a sub-agent's.
+    #[tokio::test]
+    async fn compaction_summarizes_the_pane_being_viewed_not_main() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut session, sub_key) = viewing_a_sub_agent(tmp.path().to_path_buf()).await;
+        let live = session.live().clone();
+
+        // A context reading on each, so "whose gauge was reset" is answerable.
+        live.update(MAIN_KEY, |e| e.usage.set_last(Some((100, 5))));
+        live.update(sub_key, |e| e.usage.set_last(Some((200, 7))));
+
+        // Whatever compacts the MAIN conversation has to get past this.
+        let main_lock = session
+            .agent()
+            .clone()
+            .try_lock_owned()
+            .expect("nothing is running");
+
+        let (line_tx, mut line_rx) = mpsc::unbounded_channel();
+        {
+            let mut host = WebHost {
+                session: &mut session,
+                line_tx,
+            };
+            host.start_compaction(None);
+        }
+
+        assert!(
+            live.is_running(sub_key),
+            "the summarized pane is the one whose clock runs"
+        );
+        assert!(
+            !live.is_running(MAIN_KEY),
+            "the main conversation is not the one working"
+        );
+
+        let handle = session
+            .main_turn_handle_mut()
+            .take()
+            .expect("the compaction parked its handle");
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect(
+                "the compaction never finished: it is blocked on the MAIN agent's lock, \
+                 so it is summarizing the main conversation and not the pane on screen",
+            )
+            .expect("the compaction task panicked");
+        drop(main_lock);
+
+        let (_, line) = line_rx.try_recv().expect("the compaction reported");
+        assert_eq!(
+            line, "nothing to compact yet",
+            "the history read was not the sub-agent's own (which has nothing to summarize)"
+        );
+        assert!(
+            !live.is_running(sub_key),
+            "the clock stops on the pane it started on"
+        );
+        assert_eq!(
+            usage_last(&live, sub_key),
+            None,
+            "the compacted agent's stale context reading is the one dropped"
+        );
+        assert_eq!(
+            usage_last(&live, MAIN_KEY),
+            Some((100, 5)),
+            "the main conversation's context reading is untouched"
+        );
+    }
+
+    /// Cancelling the session's turn aborts whatever is in the handle slot — which
+    /// may be a sub-agent's compaction, since that is where its handle is parked.
+    /// The clock must stop on the pane it was started on regardless, or that pane
+    /// spins forever: nothing else ends a turn it never saw begin.
+    #[tokio::test]
+    async fn aborting_the_compaction_still_stops_the_compacted_panes_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut session, sub_key) = viewing_a_sub_agent(tmp.path().to_path_buf()).await;
+        let live = session.live().clone();
+
+        // Hold the SUB agent's lock: the compaction now parks on it, so the abort
+        // lands mid-flight rather than racing a task that already finished.
+        let sub_agent = live.handle(sub_key).expect("registered").0;
+        let sub_lock = sub_agent.try_lock_owned().expect("nothing is running");
+
+        let (line_tx, _line_rx) = mpsc::unbounded_channel();
+        {
+            let mut host = WebHost {
+                session: &mut session,
+                line_tx,
+            };
+            host.start_compaction(None);
+        }
+        assert!(live.is_running(sub_key), "the compaction started its clock");
+
+        // What `WebSession::cancel` and `/new` do to the slot.
+        let handle = session.main_turn_handle_mut().take().expect("parked");
+        handle.abort();
+        let _ = handle.await;
+        drop(sub_lock);
+
+        assert!(
+            !live.is_running(sub_key),
+            "the aborted compaction left the sub-agent's pane marked running forever"
+        );
     }
 }

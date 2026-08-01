@@ -652,6 +652,81 @@ sections above.
 
 ---
 
+## Frontend sharing: tighten the seam, don't re-layer
+
+Raised 2026-08-02 after the `dispatch.rs` review turned up several TUI-vs-web
+divergences: should the codebase be refactored so functionality is written
+frontend-agnostically and shared? **Considered, and the answer is no — the
+sharing already exists; the seam is what leaks.** Recorded so the question is
+not re-opened from scratch.
+
+The measurements: `hrdr-app` is the agnostic layer at ~8.2k lines and both
+frontends already route commands through its `CommandHost`; hrdr-tui is ~16.4k,
+hrdr-web ~4.2k. One review of the shared dispatcher found bugs in both frontends
+at once, which is the abstraction working.
+
+**The actual defect is that `CommandHost` has ~66 methods of which ~43 carry
+default bodies**, and the web overrides roughly 37 — so it silently inherits
+around 29. Every default was written with a terminal in mind. `open_editor`'s
+default spawns `xdg-open`, and the web never overrode it _by omission, not by
+decision_, so `/edit` over HTTP spawns a desktop process on the server host.
+`/theme` is the same shape half-overridden: `set_theme` is discarded but
+`persist_setting` is not, so the command no-ops for the caller and writes the
+operator's `config.toml`. **A default body is a silent opt-out**, and adding a
+frontend today means inheriting terminal behaviour without ever naming it.
+
+What to do instead of re-layering, in one slice:
+
+1. Environment-touching defaults — anything that spawns a process, opens a file,
+   or writes user config — should default to **declining**, not to the terminal
+   behaviour. The TUI overrides them all already, so it loses nothing, and that
+   whole family of divergences becomes unrepresentable rather than patched one
+   at a time.
+2. Have `dispatch` consult `supports_command` before **executing**, not only
+   when filtering help text. It currently gates the menu and not the door.
+3. Fix the slash mismatch so `supports_command` matches at all.
+
+Why not the larger refactor: most of hrdr-tui is rendering, input and scrollback
+— genuinely terminal-specific, and making it agnostic is a rewrite with no
+user-visible payoff that would put the currently-simple part (each frontend owns
+its drawing) behind an abstraction serving two masters. `/goto`, `/find`,
+`/next`, `/prev` are the honest case: they are scrollback navigation and
+_should_ stay TUI-only; the bug is that `HELP_GROUPS` advertises them to the
+web. And the two genuinely-shared-logic bugs found — `/compact` targeting the
+wrong agent, `/cwd` reading one agent and writing another — are contracts
+written in a doc comment and enforced by nothing. That is a typing and testing
+problem, not a layering one.
+
+If divergence keeps appearing after those three changes, that is evidence for
+something deeper — and there will be a much better idea where.
+
+### Left open by the compaction fix (`/compact` pane targeting)
+
+The data-loss half is fixed: both frontends now summarize the conversation on
+screen. Three residuals, all from the same root — the turn **handle** slot is
+session-wide while the compaction is now per-pane:
+
+- **The web parks a sub-pane compaction's handle in `main_turn_handle`**, so the
+  main pane reads as busy and queues prompts to it while a sub-agent is
+  summarized. Deliberate for now: over-blocking is recoverable (queued steers
+  are relaunched by the same turn-end handling as a normal turn) where
+  summarizing the wrong history is not. Needs a per-pane handle slot to move to.
+- **The TUI can no longer Esc-cancel a sub-pane compaction.** `in_flight`,
+  `is_busy` and `cancel_turn` are all keyed to `MAIN_KEY`, so with the clock now
+  on the sub key they see nothing in flight. Before the fix Esc did cancel it —
+  while also stopping main's clock, which was the defect. Needs a decision on
+  per-pane cancellation, not a patch.
+- **The TUI's compaction result line lands in main's transcript** (`push_entry`
+  is main-scoped), so "compacted: N → M" appears in the main conversation even
+  when a sub-agent was summarized. TUI system lines are main-scoped generally;
+  changing that is a wider call.
+- **Web `is_busy()` reads `MAIN_KEY` only**, so for up to one tick (~100 ms)
+  after starting a sub-pane compaction a second `/compact` would overwrite the
+  handle slot and orphan the first task — it still completes, but becomes
+  uncancellable.
+
+---
+
 ## dispatch.rs review — findings 2026-08-02
 
 `hrdr-app/src/commands/dispatch.rs` (946 lines, both frontends route through it)
