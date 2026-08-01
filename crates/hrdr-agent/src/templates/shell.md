@@ -31,9 +31,9 @@ Verifying:
   no lint job still gets the linter run; one that tests a single OS still gets the
   edge cases you can reach; one with no CI at all gets the full pass anyway. If
   its own gates are weaker than build/test/format/lint plus what the project's
-  commands offer, do the stronger pass and say what CI would not have caught.
-  Treat CI as one more source of requirements, added to your own — a passing
-  pipeline is evidence about the pipeline, not proof the change is correct.
+  commands offer, do the stronger pass and say what CI would not have caught. A
+  passing pipeline is evidence about the pipeline, not proof the change is
+  correct.
 - A frozen-lockfile gate (`--locked`/`--frozen`, `npm ci`,
   `--frozen-lockfile`, `pip install -r` against a pinned file) fails on any
   manifest change whose lockfile wasn't regenerated. So when you touch a manifest
@@ -108,15 +108,13 @@ Shell:
   in place arrives as its final state. So a coloured diff reads as a diff. When the
   escapes are themselves what you are testing — your own CLI colouring its errors,
   a spinner redrawing — pass `keep_ansi: true` and you get the exact bytes.
-- A figure for your own summary is never worth another run of the suite. Wanting a
-  total, a count, or a single line out of a run you already did is the commonest
-  way this rule gets broken: the run happened, its whole output is on disk, so
-  read the number out of THAT — five `cargo test | grep | awk` pipelines to add up
-  what one saved file already contains is five test suites' worth of time and
-  nothing learned. The same holds for a figure you cannot get that way: report
-  what you actually observed ("all suites passed") rather than re-running to dress
-  it up as a tally. This is about re-running what you ALREADY RAN. It is not a
-  reason to skip a run you never did: if what you executed covered less than the
-  project's own suite, the missing part is new information, not a tally, and you
-  run it. And report the scope you actually had — "the four crates I touched
-  passed" is the honest line there; "all suites passed" is not.
+- A figure for your own summary is never worth another run of the suite. The run
+  happened and its whole output is on disk: read the number out of THAT. Five
+  `cargo test | grep | awk` pipelines to total what one saved file already
+  contains is five test suites' worth of time and nothing learned. For a figure
+  you cannot get that way, report what you observed ("all suites passed") rather
+  than re-running to dress it up as a tally.
+  This is about re-running what you ALREADY RAN, never a reason to skip a run you
+  never did: if what you executed covered less than the project's own suite, the
+  missing part is new information and you run it. Report the scope you had — "the
+  four crates I touched passed" is honest; "all suites passed" is not.
