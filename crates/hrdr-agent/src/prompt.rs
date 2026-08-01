@@ -1682,8 +1682,9 @@ mod tests {
             "an invented version is worse than asking"
         );
 
-        // The changelog is updated, not invented; and it says something.
-        assert!(p.contains("**only if one already exists**"));
+        // The changelog is updated — or STARTED, if the project has none: a
+        // release with no record is worse than one whose record began late.
+        assert!(p.contains("If the project has no changelog at all, start one"));
         assert!(p.contains("Name the APIs, files and behaviours that changed"));
 
         // The irreversible step, guarded.

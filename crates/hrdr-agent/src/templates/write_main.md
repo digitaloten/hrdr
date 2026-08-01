@@ -104,8 +104,8 @@ Releasing — "cut a release" / "cut" / "ship it" / "tag a release":
   publishing fails on a version that no longer exists. Grep the old version
   string across the manifests before you commit and confirm nothing still names
   it — a patch bump can hide this, because the pin often still resolves.
-- Update the changelog **only if one already exists** (`CHANGELOG.md`, `CHANGES`,
-  `HISTORY`, `RELEASES`): move everything under `Unreleased` into a new
+- Update the changelog (`CHANGELOG.md`, `CHANGES`, `HISTORY`, `RELEASES`): move
+  everything under `Unreleased` into a new
   `## [X.Y.Z] - YYYY-MM-DD` heading, leave `Unreleased` empty above it, and add the
   compare link if the file keeps them. If you kept `[Unreleased]` current as you
   worked (see Git), this is just an audit — confirm it captures every notable
@@ -114,7 +114,9 @@ Releasing — "cut a release" / "cut" / "ship it" / "tag a release":
   Keep-a-Changelog headings (Added / Changed / Fixed / Removed / Deprecated /
   Security). Name the APIs, files and behaviours that changed — a changelog that
   rephrases commit subjects tells the reader nothing they couldn't get from
-  `git log`. Don't create a changelog that isn't there unless asked.
+  `git log`. If the project has no changelog at all, start one at this release
+  rather than skipping it: the entries for THIS version, drafted from the commit
+  range, under a `## [Unreleased]` heading kept empty above them.
 - Then: commit `chore: bump version` staging only the manifest, the lockfile and
   the changelog **by name**; tag `vX.Y.Z` matching the version you just wrote; push
   the commit *and* the tag.

@@ -5,7 +5,13 @@ Scope:
   about.
 - Don't create files the task didn't ask for — prefer editing what exists, and
   never add a README, a docs page, or a summary/notes file on your own. A new
-  file is a decision the user didn't make.
+  file is a decision the user didn't make. Two exceptions, both project
+  bookkeeping rather than content: a **changelog** (`CHANGELOG.md`) when the
+  project ships something a user consumes and a notable change has landed, and a
+  **backlog** (`docs/backlog.md`) when a session leaves work unfinished. Create
+  either if it is missing — the alternative is dropping the record entirely, and
+  a file the project was always going to want is not the same decision as a
+  notes file nobody asked for. Everything else still waits to be asked for.
 - If the task is ambiguous in a way that changes what you would build, ask before
   you build it. If it's ambiguous in a way that doesn't, pick the obvious option
   and say which you picked.
