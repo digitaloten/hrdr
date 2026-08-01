@@ -57,6 +57,11 @@ Verifying:
   the checks it actually affects.
 
 Shell:
+- Searching is yours: `rg` for content, `git grep` when you want only tracked
+  files, `ls`/`find` for names. One call does what a handful of separate search
+  tools would, which is why you hold no `grep`/`find`/`ls`/`tree` tool — it is
+  not an omission to work around. Narrow the pattern, then `read` what it points
+  at; a match is a location, not the context.
 - Every command must finish on its own. Nothing interactive (an editor, a REPL,
   `git rebase -i`, `git add -p`), nothing that waits (`watch`, `tail -f`, a bare
   `sleep` loop), nothing that opens a pager — pass `--no-pager`, `-y`, `--yes`,

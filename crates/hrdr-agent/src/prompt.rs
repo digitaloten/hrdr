@@ -32,6 +32,11 @@ mod frag {
     /// and telling a sub-agent to "save it with the `memory` tool" would name a
     /// tool it does not have.
     pub const MEMORY: &str = include_str!("templates/memory.md");
+    /// The jail-only search tools are registered — i.e. this is a jailed agent.
+    /// Its own fragment because it is the ONLY guidance such an agent gets: with
+    /// no write tool and no `task` it takes none of the gates below, and `BASE`
+    /// cannot name its tools without naming a shell it does not hold.
+    pub const JAIL: &str = include_str!("templates/jail.md");
     /// `can_write` + a shell on PATH.
     pub const SHELL: &str = include_str!("templates/shell.md");
     /// …and that shell is plain POSIX `sh`, not bash.
@@ -119,8 +124,23 @@ pub fn capability_sections_for(
     can_delegate: bool,
     delegated: bool,
     shell: Option<hrdr_tools::Shell>,
+    has_jail_tools: bool,
 ) -> Vec<(&'static str, &'static str)> {
     let mut out: Vec<(&'static str, &'static str)> = Vec::new();
+    // The jail is the whole shape, not just the search tools: `cap_to_jail_set`
+    // leaves an agent that holds them, holds no shell, and cannot write. Testing
+    // all three matters because `ToolRegistry::with_defaults` also registers the
+    // four — `Agent::new` is what strips them for every other mode — so a prompt
+    // built from a raw default registry would otherwise be told it is jailed
+    // while holding a shell and every write tool.
+    let jailed = has_jail_tools && !can_write && shell.is_none();
+    // First, because for a jailed agent it is the only capability section there
+    // is: `can_write` and `can_delegate` are both false, so every gate below is
+    // skipped and this would otherwise be an agent told nothing about the four
+    // tools that exist solely for it.
+    if jailed {
+        out.push((SECTION_JAIL, frag::JAIL));
+    }
     if can_write {
         out.push((SECTION_WRITE, frag::WRITE));
         if let Some(shell) = shell {
@@ -164,10 +184,22 @@ pub fn capability_sections(
     // has no `task` tool, and telling it how to pick a model for one would be
     // instructions for a tool it cannot call.
     let can_delegate = has("task") && has("models");
+    // `grep` is jail-only in a *built* agent — `Agent::new` calls
+    // `drop_jail_only_tools` for every other mode. Read off the tool set like the
+    // gates above rather than passed down as a mode, so the prompt can only
+    // describe tools that were actually registered; the caller decides what the
+    // absence of a shell and a write tool alongside it means.
+    let has_jail_tools = has("grep");
     // The shell the `shell` tool runs, or `None` when the agent has no shell
     // (read-only, or no shell on PATH). Read from the tool set itself so the prompt
     // agrees with what was actually registered.
-    capability_sections_for(can_write, can_delegate, delegated, tools.shell())
+    capability_sections_for(
+        can_write,
+        can_delegate,
+        delegated,
+        tools.shell(),
+        has_jail_tools,
+    )
 }
 
 /// The base body plus the capability sections, concatenated — the whole
@@ -215,6 +247,7 @@ pub const SECTION_PROJECT_MEMORY: &str = "project_memory";
 // The capability-gated group: everything that differs by tool set or by
 // main-vs-sub. Sits after the project content so a read-only `explore` and a
 // write `coder` in the same project share every byte above it.
+pub const SECTION_JAIL: &str = "jail";
 pub const SECTION_WRITE: &str = "write";
 pub const SECTION_SHELL: &str = "shell";
 pub const SECTION_SHELL_POSIX: &str = "shell_posix";
@@ -1069,7 +1102,7 @@ mod tests {
         shell: Option<hrdr_tools::Shell>,
     ) -> String {
         let mut out = base_section();
-        for (_, body) in capability_sections_for(can_write, can_delegate, delegated, shell) {
+        for (_, body) in capability_sections_for(can_write, can_delegate, delegated, shell, false) {
             out.push_str(&section_text(body));
         }
         out
@@ -1199,11 +1232,60 @@ mod tests {
         );
     }
 
+    /// The jailed agent's whole prompt. It takes none of the capability gates —
+    /// no write tool, no `task` — so before this section existed its only
+    /// guidance was `base.md`, which pointed it at `shell` for searching: a tool
+    /// `cap_to_jail_set` had just removed, while the four that exist solely for
+    /// it went unmentioned.
+    #[test]
+    fn a_jailed_tool_set_gets_the_section_naming_its_search_tools() {
+        let mut tools = ToolRegistry::with_defaults();
+        tools.cap_to_jail_set();
+        let p = render_system(&tools, false).unwrap();
+
+        assert!(p.contains("Searching:"), "{p}");
+        for tool in ["grep", "find", "ls", "tree"] {
+            assert!(
+                p.contains(&format!("`{tool}`")),
+                "the jail section must name `{tool}`: {p}"
+            );
+        }
+        // The gates it does not take, so the section is not merely additive.
+        assert!(!p.contains("Shell:"), "{p}");
+        assert!(!p.contains("Deleting:"), "{p}");
+        assert!(!p.contains("old_string"), "{p}");
+        // And `base.md` must no longer route it at a shell it does not hold.
+        assert!(
+            !p.contains("`shell` (`rg`"),
+            "the unconditional block still names a shell to a jailed agent: {p}"
+        );
+    }
+
+    /// The mirror: a shell agent keeps `grep`/`find`/`ls`/`tree` guidance OUT of
+    /// its prompt (it holds none of them) and is told the shell does that job, so
+    /// neither kind of agent is described in the other's terms.
+    #[test]
+    fn a_shell_agent_is_told_the_shell_does_the_searching() {
+        let mut tools = ToolRegistry::with_defaults();
+        tools.drop_jail_only_tools();
+        let p = render_system(&tools, false).unwrap();
+
+        assert!(!p.contains("Searching:"), "no jail section: {p}");
+        if p.contains("Shell:") {
+            assert!(p.contains("`rg` for content"), "{p}");
+        }
+    }
+
     #[test]
     fn read_only_tool_set_omits_edit_and_git_guidance() {
         let mut tools = ToolRegistry::with_defaults();
         let ro = tools.read_only_names();
         tools.retain_only(&ro);
+        // What `Agent::new` does for every mode that is not the jail. Without it
+        // this models an agent that cannot exist — read-only, shell-less, and
+        // still holding the four jail-only search tools — which is precisely the
+        // shape the jail gate looks for.
+        tools.drop_jail_only_tools();
         let p = render_system(&tools, false).unwrap();
         // No mutating tools → the editing/git sections are dropped entirely.
         assert!(!p.contains("old_string"), "{p}");
@@ -1218,10 +1300,15 @@ mod tests {
         // It cannot edit a manifest, commit, or tag — a release workflow is a
         // workflow it has no way to carry out.
         assert!(!p.contains("Releasing"), "{p}");
-        // The read/search workflow and the working-directory safety line remain.
+        // The read/search workflow and the working-directory safety line remain —
+        // stated without naming a search tool, since which one does the searching
+        // is exactly what differs between this agent, a shell agent and a jailed
+        // one.
+        assert!(p.contains("search first,"), "{p}");
+        assert!(p.contains("`read` what the search points at"), "{p}");
         assert!(
-            p.contains("`shell` (`rg`, `git grep`, `ls`) and `read`"),
-            "{p}"
+            !p.contains("Searching:"),
+            "no jail section without the jail tools: {p}"
         );
         assert!(p.contains("working directory is your home base"), "{p}");
         // And so do the rules that bind *any* agent, whatever it can reach: a
@@ -1265,7 +1352,13 @@ mod tests {
             // `shell` counts as available to a read-only agent: it IS in that tool
             // set (the sandbox is what makes the agent read-only, not the absence of
             // a command line), so a prompt line naming it is safe for everyone.
-            ("shell", true),
+            // `shell` is NOT read-only, and the unconditional block must not name
+            // it: a jailed agent holds no shell, so the line that used to say
+            // "find the relevant code with `shell`" was routing it at a tool the
+            // registry had just removed. Naming which tool searches is now the
+            // capability sections' job (`shell.md`, `jail.md`); if a reword puts
+            // it back into `base.md`, the loop below fails.
+            ("shell", false),
             ("task", false),
             ("memory", false),
         ];
@@ -1295,7 +1388,7 @@ mod tests {
         }
         // Not vacuous: these are the mentions the defect was about. If a rewording
         // removes them, this fails and whoever reworded reads the paragraph above.
-        for expected in ["read", "todo", "shell"] {
+        for expected in ["read", "todo"] {
             assert!(
                 found.contains(&expected),
                 "expected the unconditional block to still name `{expected}`; \
