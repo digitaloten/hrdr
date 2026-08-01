@@ -1276,10 +1276,17 @@ fn low_integrity_args(shell: crate::Shell, cmd_str: &str) -> Vec<std::ffi::OsStr
 pub fn lower_current_process_to_low_integrity() -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{
-        SE_GROUP_INTEGRITY, SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
-        TOKEN_MANDATORY_LABEL, TokenIntegrityLevel,
+        SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_MANDATORY_LABEL,
+        TokenIntegrityLevel,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    /// `SE_GROUP_INTEGRITY`, spelled out for the same reason the SID below is:
+    /// `windows-sys` 0.52 does not export it from `Win32::Security`, and which
+    /// module a constant lives in has moved between releases. The value is fixed
+    /// by the ABI — it marks the SID in a `TOKEN_MANDATORY_LABEL` as the token's
+    /// integrity label rather than an ordinary group.
+    const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
 
     // S-1-16-4096 built inline rather than via `ConvertStringSidToSidW`: that
     // returns a `LocalFree`-owned allocation, and both the handle type and the
