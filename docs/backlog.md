@@ -543,10 +543,13 @@ verified still open.
 
 ## Test coverage gaps
 
-- **Wire log on the native backends.** `error_response` and `sse` records are
-  emitted by `anthropic.rs`/`codex.rs` but untested — backend selection keys on
-  the host, so a mock server on `127.0.0.1` cannot reach those paths. Verified:
-  `wire_log_native_backends.rs` filters on `kind == "request"` only.
+- **Wire log on the native backends — unblocked, still unwritten.**
+  `error_response` and `sse` records are emitted by `anthropic.rs`/`codex.rs`
+  and nothing asserts them; `wire_log_native_backends.rs` filters on
+  `kind == "request"` only. The reason it was impossible is gone —
+  `Client::set_backend_for_test` (`c5a6019`) makes both native paths reachable
+  from a `127.0.0.1` mock, and seven tests now drive them. Writing this one is
+  ordinary work now, not a blocked item.
 
 ### Provider-divergence gaps — closed 2026-08-02
 
@@ -558,7 +561,8 @@ to 241 tests. What was learned, kept because it shapes future work:
   `detect_backend` reads the host, so every mock on `127.0.0.1` is
   `Backend::OpenAi`. A `#[cfg(test)] Client::set_backend_for_test` fixes it for
   one client instance with no statics to race through; reach for it rather than
-  re-deriving the problem. It also closes the older wire-log entry above.
+  re-deriving the problem. It unblocks the wire-log entry above — which is now
+  merely unwritten, not impossible.
 - **Two gaps stay open by decision, not oversight.** (a) 408/522/524 are
   retryable _only_ because `classify_status` says so — `is_transient`'s text
   fallback has no needle for them, unlike the other six transient statuses. A
@@ -590,6 +594,37 @@ to 241 tests. What was learned, kept because it shapes future work:
   feature, not a missing test.
 - **Never audited at all:** `sse.rs`, `capped_read.rs`, `fs.rs`, most of
   `catalog.rs`; hrdr-tui / hrdr-web / hrdr-tools / hrdr-app entirely.
+
+Raised while doing the five slices, out of their scope, each re-verified against
+the tree before being written here:
+
+- **Anthropic has no unrecognized-stop-reason safety net; Codex does.**
+  `map_stop_reason`'s fallthrough is `other => other` — the reason is returned
+  verbatim. `Accumulator::truncated()` matches only `length`/`max_tokens`, so a
+  future Anthropic `stop_reason` that means "cut off" would report a clean
+  finish. Codex deliberately treats _any_ unrecognized incomplete reason as
+  truncation (`incomplete_with_unrecognized_reason_still_signals_truncation`).
+  Not strictly the same shape — Anthropic sends a positive `stop_reason` where
+  Codex sends an explicit incomplete marker — so this is a divergence to decide
+  on, not an obvious bug.
+- **The `UNNAMED_MODEL` docstring tells half the story.** It states that putting
+  the sentinel on the wire "cannot succeed anywhere it is actually read", then
+  says the _OpenAI-shaped_ builder omits the field. Correctly scoped as far as
+  it goes, but it never says the two native builders emit it verbatim — and this
+  docstring is where a reader would go to check the invariant. Add the caveat,
+  or fold it into whatever lands for the early-error decision above.
+- **`parse_imf_fixdate` ignores the weekday.** It splits on `", "` and discards
+  the prefix, so `Xyz, 06 Nov 2999 …` parses fine. Laxer than RFC 7231 and
+  harmless — the weekday is redundant with the date — but worth knowing before
+  someone "fixes" a test that relies on it.
+- **A `thinking_delta` for an index with no open block is silently dropped.**
+  `map_event`'s `thinking_slot.get_mut` no-ops, which looks right; the point is
+  that the neighbouring `input_json_delta` path carries an explicit note about
+  why it must not default to slot 0, and the thinking path's equivalent choice
+  is unexplained. A comment, not a fix.
+- **`serve_once` takes `&'static str`**, so every mock SSE body must be a
+  literal. Fine today; it makes a table-driven stream test awkward. Relaxing it
+  to `impl Into<String>` is a one-line change when someone needs it.
 
 ---
 
