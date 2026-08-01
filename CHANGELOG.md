@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Windows `read` mode is confined by the OS.** Windows was the last supported
+  platform with no sandbox backend at all — the file tools were guarded in
+  process and `shell` ran free. It now uses Mandatory Integrity Control: a
+  Low-integrity process cannot write to any object labelled Medium or higher,
+  which is everything the user owns, while reads are untouched because MIC's
+  default policy is NO_WRITE_UP only. That is exactly what `read` mode promises,
+  and it costs no change to the filesystem to deliver.
+
+  Applied the way Landlock is, by the child to itself: `CreateProcessAsUserW`
+  cannot be reached through a `tokio::process::Command` and Windows has no
+  `pre_exec`, so hrdr re-execs itself as
+  `hrdr __sandbox-exec -- <shell> -c <cmd>` and lowers its own token before
+  running the command — every descendant inherits it. A wrapper that cannot
+  lower itself fails rather than running the command unconfined.
+
+  `write` mode is **not** covered yet and still reports no OS sandbox: a
+  Low-integrity child can only write to objects labelled Low, so its writable
+  roots would have to be relabelled first — a persistent change to the user's
+  own directories, and a separate decision.
+
+### Fixed
+
+- **The macOS Seatbelt tests can no longer skip themselves in CI.** Both the
+  end-to-end test and its backend check opened with silent `return`s when
+  `/usr/bin/sandbox-exec` or a shell was missing, so a run that exercised
+  nothing was indistinguishable from one that passed — which is why the backlog
+  could still record Seatbelt as never having run while CI ran the suite on
+  macOS every time. They now skip locally and **assert** on a runner, and a new
+  check fails if CI detects the no-op backend instead of a real one. Seatbelt is
+  confirmed to run and confine on every macOS job since.
+
 ## [0.10.0] - 2026-08-01
 
 ### Added
