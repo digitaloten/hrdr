@@ -548,110 +548,48 @@ verified still open.
   the host, so a mock server on `127.0.0.1` cannot reach those paths. Verified:
   `wire_log_native_backends.rs` filters on `kind == "request"` only.
 
-### Provider-divergence gaps (audited 2026-08-02)
+### Provider-divergence gaps — closed 2026-08-02
 
-An `hrdr-llm` audit for behaviour that differs per backend and is exercised on
-some but not all of them. Every claim below was re-verified against the tree
-after the audit reported it; the evidence quoted is the check that was run.
+The audit's ten findings were closed across five slices (`c5a6019`, `49feedd`,
+`5d87db5`, `2363e6b`, and the commit adding this line). `hrdr-llm` went from 215
+to 241 tests. What was learned, kept because it shapes future work:
 
-- **Nothing executes `anthropic::chat_stream` or `codex::chat_stream` at all.**
-  Same root cause as the wire-log entry above, and it is the parent of most of
-  what follows: `detect_backend` keys on the HOST, so every mock on `127.0.0.1`
-  resolves to `Backend::OpenAi`, and `wire_log_native_backends.rs` uses an
-  out-of-range port so `send()` fails before a stream exists. Verified:
-  `rg -c "tokio::test"` returns **0** for both files — their test modules are
-  entirely `#[test]` units over `build_body`/`map_event`. What that leaves
-  unreachable is the per-stream assembly each backend does _after_ `map_event`:
-  Anthropic's synthetic thinking-block flush (including the filter that keeps a
-  **signed block with empty text**), Codex's reasoning-item flush, and both
-  missing-terminator truncation errors. Consequences if any regressed, all
-  silent: a truncated Anthropic/Codex reply reads as complete instead of
-  retrying (the OpenAI equivalent _is_ covered, by
-  `agent_run_incomplete_stream_then_retry`); a dropped thinking flush means the
-  next Anthropic request omits the signed block before `tool_use` and 400s on
-  every follow-up turn. **This is the one worth fixing first** — making backend
-  selection injectable, or extracting the post-loop assembly into a pure
-  function, unblocks most of the rest of this list.
-- **Anthropic `map_stop_reason` only ever sees `end_turn`.** Verified: two
-  references workspace-wide (definition and its single call site), and
-  `stop_reason` inside the test module appears twice, both `"end_turn"`. So the
-  `max_tokens`→`length` arm is unexercised — and `Accumulator::truncated()`
-  matches only `"length" | "max_tokens"`, so a regression makes an Anthropic
-  reply cut at the output cap report a clean finish, with no truncation notice.
-  Covered on Codex (`incomplete_max_output_tokens_maps_to_length`) and native on
-  OpenAI: a divergence tested on two backends of three.
-- **`redacted_thinking` has no coverage.** Verified: the literal appears only at
-  `anthropic.rs` lines 503 (doc), 815 (branch) and 821 (the pushed value) —
-  every test passes an empty `redacted` vec and none asserts on it after.
-  Anthropic emits these when its safety classifier trips; they carry no deltas,
-  so all data arrives in `content_block_start`. Drop one, or merge it out of
-  index order against a normal `thinking` block, and the follow-up request
-  carrying `tool_use` is rejected.
-- **The Azure `api-key` auth branch is never built.** Azure authenticates with
-  an `api-key` header rather than `Bearer`. Verified: `rg set_api_version` finds
-  no test that also sets an API key — the one Azure test constructs its clients
-  with `None` and asserts only the URL. The neighbouring Bearer and Anthropic
-  `x-api-key` branches both have tests, so this is the single hole in an
-  otherwise-covered match. Azure-only: flip the guard and every Azure request
-  401s while the other three backends stay green.
-- **`classify_status` has no direct test.** Verified: four references, none in a
-  test — what exists is one end-to-end `HttpError(413)` on the OpenAI path, and
-  `retry.rs` tests that hand-construct a `ChatError` with the kind already
-  chosen. The sharp edge is that `retry.rs::is_transient`'s text fallback covers
-  429/500/502/503/504/529 but **not 408, 522 or 524**, so those three arms are
-  the only thing making a Cloudflare origin timeout retryable. 529 would degrade
-  to the text scanner and still work; 408/522/524 would not. Nothing records
-  that asymmetry.
-- **`retry_after_from_headers` / `parse_imf_fixdate` are unreachable from any
-  test.** Verified: two references each, both being the definition and its sole
-  call site; only the leaf `days_from_civil` has tests. No end-to-end path can
-  reach them either — `MockResp` has three variants and none sets a response
-  header. (`retry.rs`'s `retry_after_hint_parses_and_clamps` parses the
-  `(retry-after: Ns)` suffix back _out_ of a message string, i.e. this
-  function's output, not the function.) A 429 naming a delay would be ignored in
-  favour of hrdr's own backoff, and the clamp that stops a hostile value parking
-  a turn for hours is equally unexercised.
-- **Codex `content_filter` mapping.** Verified: the literal appears exactly once
-  in the workspace — the `map_finish_reason` arm itself. Its three neighbours
-  all have tests. Drop it and a filtered reply falls through to the
-  `is_incomplete` catch-all and reports `length`, telling the user they hit the
-  token cap when they were filtered.
-- **`anthropic_max_tokens`'s 8192 fallback.** Verified: neither the function nor
-  `ANTHROPIC_MAX_TOKENS` is named by any test. With a cold or absent models.dev
-  cache — first run, or offline — every Anthropic turn goes out capped at 8192
-  against models whose real cap is 64k–128k, and the manual-thinking budget
-  scales out of the same number. Silent truncation, no warning.
-- **`UNNAMED_MODEL` is resolved on the OpenAI path only.** Verified:
-  `wire_model()` is called at `client.rs:1133`, _after_ the Anthropic (1080) and
-  Codex (1109) early returns, and both native builders write `"model": model`
-  unconditionally. The one test covering the sentinel builds OpenAI bodies only.
-  A provider entry left at `model = "default"` against Anthropic or Codex puts
-  the literal string on the wire. Worth deciding whether to reject it early or
-  simply pin the current behaviour so it is a decision rather than an oversight.
-- **Cross-backend error equivalence is asserted per-backend, never across.**
-  Each backend has mid-stream error tests; nothing asserts the same situation
-  yields the same `ChatErrorKind` on all three, and the three classifiers are
-  genuinely different in shape (OpenAI substring-matches `type`/`code` plus
-  `classify_status`; Anthropic matches three exact type names; Codex matches a
-  four-item allowlist). One shared asymmetry nothing records: **all three
-  mid-stream paths hardcode `retry_after: None`**, so a rate limit delivered
-  mid-stream never has its requested delay honoured on any backend. A single
-  table-driven test — {rate limit, overload, server error, auth failure} ×
-  {OpenAI, Anthropic, Codex} — would close it.
-
-Not a coverage gap, recorded here so it is not re-derived: `Delta` deserializes
-only `reasoning_content`, so providers streaming `delta.reasoning` (several
-OpenAI-compatible gateways) have their reasoning silently dropped. That is a
-missing feature, not a missing test.
-
-What the audit did **not** open, stated as a gap: `sse.rs`, `capped_read.rs`,
-`fs.rs`, `catalog.rs` beyond `lookup_max_output`; hrdr-tui / hrdr-web /
-hrdr-tools / hrdr-app entirely; and hrdr-agent's ~13k-line test module, which
-was greped rather than read — so a test under a name none of the greps hit could
-exist, though for the `map_stop_reason`, `redacted_thinking`, `set_api_version`,
-`retry_after_from_headers` and `content_filter` findings the greps were on
-unique literals and returned no test hits anywhere. No `cargo test` was run: the
-findings are from reading source, not from observed failures.
+- **Host-keyed backend detection is why the native paths were untestable.**
+  `detect_backend` reads the host, so every mock on `127.0.0.1` is
+  `Backend::OpenAi`. A `#[cfg(test)] Client::set_backend_for_test` fixes it for
+  one client instance with no statics to race through; reach for it rather than
+  re-deriving the problem. It also closes the older wire-log entry above.
+- **Two gaps stay open by decision, not oversight.** (a) 408/522/524 are
+  retryable _only_ because `classify_status` says so — `is_transient`'s text
+  fallback has no needle for them, unlike the other six transient statuses. A
+  test now derives the unprotected set from real behaviour, so both deleting an
+  arm and quietly adding a needle fail loudly. Giving them needles is a
+  behaviour change nobody has asked for. (b) All three mid-stream error paths
+  hardcode `retry_after: None` (`client.rs`, `anthropic.rs`, `codex.rs`), and
+  `retry_after_hint` reads a typed error's field directly — so a rate limit
+  delivered _mid-stream_ never has its requested delay honoured on any backend.
+  Only the HTTP-status path (`error_from_response`) does. Asserted and
+  commented, not fixed.
+- **`UNNAMED_MODEL` reaches the wire literally on both native backends**,
+  because `wire_model` runs after their early returns. Pinned as a known
+  limitation. Erroring early is worth doing, but at provider-selection time in
+  hrdr-agent — not in `chat_stream`, where it would fire once per turn and where
+  a wrong error kind would make the retry loop spin on a permanent config error.
+- **The warm models.dev catalog path is deliberately uncovered.**
+  `catalog::load_cached` reads process-global state (`HRDR_MODELS_PATH` / the
+  XDG cache dir), so warming it in a test leaks into every other test in the
+  binary. The cold path and the `ANTHROPIC_MAX_TOKENS` 8192 fallback are pinned;
+  the warm resolution rules are covered separately in `catalog`'s own tests.
+- **Still not covered, stated as a gap:** hrdr-agent's `MockResp` cannot set a
+  response header, so no _end-to-end_ test exercises the agent's retry loop
+  consuming a real `Retry-After`. `retry_after_from_headers` is covered directly
+  instead.
+- **Not a coverage gap, do not re-derive:** `Delta` deserializes only
+  `reasoning_content`, so providers streaming `delta.reasoning` (several
+  OpenAI-compatible gateways) have their reasoning silently dropped. Missing
+  feature, not a missing test.
+- **Never audited at all:** `sse.rs`, `capped_read.rs`, `fs.rs`, most of
+  `catalog.rs`; hrdr-tui / hrdr-web / hrdr-tools / hrdr-app entirely.
 
 ---
 

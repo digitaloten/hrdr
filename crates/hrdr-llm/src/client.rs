@@ -2183,6 +2183,319 @@ mod tests {
         assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
     }
 
+    /// Drive a canned SSE body through the real [`Client::chat_stream`] on a
+    /// forced backend and return the typed error the stream ended with.
+    ///
+    /// The forced backend is what makes one helper serve all three: a mock bound
+    /// to `127.0.0.1` is `Backend::OpenAi` to [`detect_backend`], so the native
+    /// paths are unreachable from a test without it.
+    async fn stream_error(backend: Backend, body: &'static str) -> ChatError {
+        let base_url = serve_once(body).await;
+        let mut client = Client::new(base_url, Some("test-key".to_string()), "test-model");
+        client.set_backend_for_test(backend);
+        let mut stream = client
+            .chat_stream(&[ChatMessage::user("hi")], &[])
+            .await
+            .expect("the mock server answers 200");
+        let mut last = None;
+        while let Some(item) = stream.next().await {
+            if let Err(e) = item {
+                last = Some(e);
+            }
+        }
+        let err = last.expect("the stream must have terminated with an error");
+        let typed = err
+            .downcast_ref::<ChatError>()
+            .unwrap_or_else(|| panic!("error must be a typed ChatError, got: {err:#}"));
+        ChatError {
+            status: typed.status,
+            retry_after: typed.retry_after,
+            kind: typed.kind,
+            message: typed.message.clone(),
+        }
+    }
+
+    /// The same failure, delivered mid-stream by each of the three backends,
+    /// must reach hrdr-agent's retry loop as the same [`ChatErrorKind`] — that
+    /// kind is the entire difference between backing off and abandoning the
+    /// turn, and a user switching providers should not get a different answer to
+    /// "is this worth retrying".
+    ///
+    /// Every backend is tested against this alone elsewhere; nothing compares
+    /// them, and the three classifiers have nothing in common but their output.
+    /// The OpenAI one (in `Client::chat_stream` above) substring-matches
+    /// `type`/`code` *and* runs a numeric `code`/`status` through
+    /// [`classify_status`]; `anthropic::map_event` matches three exact type
+    /// names; `codex::classify_codex_error` matches a four-code allowlist. Three
+    /// shapes agreeing today is a coincidence a table has to hold in place.
+    ///
+    /// The last situation is a **divergence**, kept in the table rather than
+    /// dropped: a rate limit that names itself only by numeric HTTP status
+    /// inside the error object is retryable on OpenAI and terminal on the other
+    /// two, because only the OpenAI classifier reads a number there. The
+    /// gateways that emit that shape (OpenRouter, LiteLLM) are OpenAI-shaped, so
+    /// nothing is known to hit it on the native paths — but the asymmetry is
+    /// real and this is where it is recorded.
+    ///
+    /// Also asserted, and the reason `retry_after` is in the loop below: all
+    /// three mid-stream paths hardcode `retry_after: None` (the `ChatError`
+    /// literals in `Client::chat_stream`, `anthropic::map_event`'s `"error"`
+    /// arm, and `codex::map_event`'s), so a rate limit delivered mid-stream
+    /// never carries the delay the server asked for. `retry::retry_after_hint`
+    /// returns a typed error's field directly without falling back to its text
+    /// scan, and these messages carry no `retry-after:` suffix either, so the
+    /// agent backs off on its own schedule. Only the HTTP-status path
+    /// (`error_from_response`) honours `Retry-After`. Recorded, not fixed.
+    #[tokio::test]
+    async fn one_failure_classifies_the_same_on_all_three_backends() {
+        for (situation, backend, body, expected) in [
+            (
+                "rate limit",
+                Backend::OpenAi,
+                "data: {\"error\":{\"type\":\"rate_limit_exceeded\",\"message\":\"rate limit reached\"}}\n\n",
+                ChatErrorKind::Transient,
+            ),
+            (
+                "rate limit",
+                Backend::Anthropic,
+                "event: error\n\
+                 data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"rate limit reached\"}}\n\n",
+                ChatErrorKind::Transient,
+            ),
+            (
+                "rate limit",
+                Backend::Codex,
+                "event: error\n\
+                 data: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"rate limit reached\"}\n\n",
+                ChatErrorKind::Transient,
+            ),
+            (
+                "server overload",
+                Backend::OpenAi,
+                "data: {\"error\":{\"type\":\"server_error\",\"message\":\"upstream overloaded\"}}\n\n",
+                ChatErrorKind::Transient,
+            ),
+            (
+                "server overload",
+                Backend::Anthropic,
+                "event: error\n\
+                 data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream overloaded\"}}\n\n",
+                ChatErrorKind::Transient,
+            ),
+            (
+                "server overload",
+                Backend::Codex,
+                "event: error\n\
+                 data: {\"type\":\"error\",\"code\":\"server_is_overloaded\",\"message\":\"upstream overloaded\"}\n\n",
+                ChatErrorKind::Transient,
+            ),
+            (
+                "bad credential",
+                Backend::OpenAi,
+                "data: {\"error\":{\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\",\"message\":\"Incorrect API key\"}}\n\n",
+                ChatErrorKind::Other,
+            ),
+            (
+                "bad credential",
+                Backend::Anthropic,
+                "event: error\n\
+                 data: {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"Incorrect API key\"}}\n\n",
+                ChatErrorKind::Other,
+            ),
+            (
+                "bad credential",
+                Backend::Codex,
+                "event: error\n\
+                 data: {\"type\":\"error\",\"code\":\"invalid_api_key\",\"message\":\"Incorrect API key\"}\n\n",
+                ChatErrorKind::Other,
+            ),
+            // The divergence. Identical situation to the first three rows, said
+            // with a number instead of a name.
+            (
+                "rate limit named only by HTTP status",
+                Backend::OpenAi,
+                "data: {\"error\":{\"code\":429,\"message\":\"rate limit reached\"}}\n\n",
+                ChatErrorKind::Transient,
+            ),
+            (
+                "rate limit named only by HTTP status",
+                Backend::Anthropic,
+                // Terminal, not Transient: `map_event` reads `error.type` and
+                // nothing else, so a bare 429 is an unrecognized error.
+                "event: error\n\
+                 data: {\"type\":\"error\",\"error\":{\"status\":429,\"message\":\"rate limit reached\"}}\n\n",
+                ChatErrorKind::Other,
+            ),
+            (
+                "rate limit named only by HTTP status",
+                Backend::Codex,
+                // Terminal for a second, different reason: the code is read with
+                // `as_str`, so a JSON *number* is not a code at all.
+                "event: error\n\
+                 data: {\"type\":\"error\",\"code\":429,\"message\":\"rate limit reached\"}\n\n",
+                ChatErrorKind::Other,
+            ),
+        ] {
+            // The server's own message text for this situation; every payload in
+            // the table above carries it verbatim.
+            let needle = match situation {
+                "rate limit" | "rate limit named only by HTTP status" => "rate limit reached",
+                "server overload" => "upstream overloaded",
+                "bad credential" => "Incorrect API key",
+                other => panic!("no expected message text for {other:?}"),
+            };
+            let err = stream_error(backend, body).await;
+            // Checked before the kind, because it is what stops half this table
+            // passing for the wrong reason: a body whose error object went
+            // unrecognized runs off the end of the stream, and every backend's
+            // missing-terminator error is *also* Transient with no
+            // `retry_after`. Every row's payload carries the server's message,
+            // so the message is what proves the error came from the classifier.
+            assert!(
+                !err.message.contains("incomplete stream"),
+                "{situation} on {backend:?} fell through to the truncation error \
+                 instead of being classified: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(needle),
+                "{situation} on {backend:?} lost the server's message ({needle:?}): {}",
+                err.message
+            );
+            assert_eq!(
+                err.kind, expected,
+                "{situation} on {backend:?} classified {:?}, expected {expected:?}: {}",
+                err.kind, err.message
+            );
+            assert_eq!(
+                err.retry_after, None,
+                "{situation} on {backend:?}: no mid-stream path sets retry_after \
+                 (see this test's doc comment) — if one now does, the comment is stale"
+            );
+        }
+    }
+
+    /// Serve one canned SSE body like [`serve_once`], but hand the **request**
+    /// back: the returned handle resolves to the JSON hrdr actually put on the
+    /// wire. `serve_once` reads the request only to drain the socket and then
+    /// discards it, and what the two tests below are about is a request field.
+    async fn serve_once_capturing(
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<serde_json::Value>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("the client connects");
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let headers_end = loop {
+                let n = stream.read(&mut tmp).await.expect("reading the request");
+                assert_ne!(n, 0, "the client closed before sending its headers");
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break p + 4;
+                }
+            };
+            let content_len: usize = String::from_utf8_lossy(&buf[..headers_end])
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                })
+                .expect("a POST body carries Content-Length");
+            let mut request = buf[headers_end..].to_vec();
+            while request.len() < content_len {
+                let n = stream
+                    .read(&mut tmp)
+                    .await
+                    .expect("reading the request body");
+                assert_ne!(n, 0, "the client closed mid-body");
+                request.extend_from_slice(&tmp[..n]);
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/event-stream\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {body}"
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            serde_json::from_slice(&request).expect("the request body is JSON")
+        });
+        (format!("http://127.0.0.1:{port}/v1"), handle)
+    }
+
+    /// The shortest Anthropic stream that ends cleanly — the two tests below
+    /// assert on the REQUEST, so the response only has to let `chat_stream` run
+    /// to completion without an error of its own.
+    const MINIMAL_ANTHROPIC_STREAM: &str = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n\n";
+
+    /// [`Client::anthropic_max_tokens`] and its [`ANTHROPIC_MAX_TOKENS`]
+    /// fallback, asserted where it lands: the `max_tokens` the Messages API
+    /// requires on every request.
+    ///
+    /// `max_output_cached` answers `None` in two situations that share this one
+    /// branch — no catalog on disk (a first run, or offline) and a catalog that
+    /// does not list the model. Naming a model no catalog can list is what
+    /// reaches that branch on *any* machine, a developer box with a warm cache
+    /// included, without setting `HRDR_MODELS_PATH` or redirecting the XDG cache
+    /// dir: both are process-global and would leak into every other test in this
+    /// binary. The warm path is therefore not asserted here at all; the
+    /// resolution rules it uses are covered purely by `catalog`'s
+    /// `lookup_max_output_prefers_provider_then_smallest`.
+    #[tokio::test]
+    async fn an_uncatalogued_model_sends_the_fallback_max_tokens() {
+        let (url, request) = serve_once_capturing(MINIMAL_ANTHROPIC_STREAM).await;
+        let mut client = Client::new(url, Some("test-key".to_string()), "no-such-model-8c1f");
+        client.set_backend_for_test(Backend::Anthropic);
+        assert_eq!(client.anthropic_max_tokens(), ANTHROPIC_MAX_TOKENS);
+
+        let mut stream = client
+            .chat_stream(&[ChatMessage::user("hi")], &[])
+            .await
+            .expect("the mock server answers 200");
+        while stream.next().await.is_some() {}
+
+        let body = request.await.expect("the server captured the request");
+        // Spelled as a literal on purpose. Written as `ANTHROPIC_MAX_TOKENS`
+        // this assertion would follow the constant anywhere it went, and the
+        // constant's VALUE is the thing that hurts: every Anthropic reply capped
+        // at 8192 against models that allow 64k-128k, with the manual thinking
+        // budget scaled out of the same number, and no error to show for it.
+        assert_eq!(body["max_tokens"], 8192, "{body}");
+    }
+
+    /// The other half of `params.max_tokens.unwrap_or_else(…)`: a configured cap
+    /// must reach the wire untouched. Without this, dropping the `unwrap_or_else`
+    /// and always calling [`Client::anthropic_max_tokens`] would keep the test
+    /// above green while silently overriding what the user asked for.
+    #[tokio::test]
+    async fn a_configured_max_tokens_wins_over_the_fallback() {
+        let (url, request) = serve_once_capturing(MINIMAL_ANTHROPIC_STREAM).await;
+        let mut client = Client::new(url, Some("test-key".to_string()), "no-such-model-8c1f");
+        client.set_backend_for_test(Backend::Anthropic);
+        client.set_params(crate::RequestParams {
+            max_tokens: Some(4321),
+            ..Default::default()
+        });
+
+        let mut stream = client
+            .chat_stream(&[ChatMessage::user("hi")], &[])
+            .await
+            .expect("the mock server answers 200");
+        while stream.next().await.is_some() {}
+
+        let body = request.await.expect("the server captured the request");
+        assert_eq!(body["max_tokens"], 4321, "{body}");
+    }
+
     /// Serve one canned JSON body (with `Connection: close`, so the client reads
     /// to EOF) — enough to drive the `/v1/models` context probe.
     async fn serve_json_once(body: &'static str) -> String {

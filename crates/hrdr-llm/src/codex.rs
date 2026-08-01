@@ -1016,6 +1016,28 @@ mod tests {
         assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
     }
 
+    /// The `content_filter` arm of [`map_finish_reason`]. Both of its
+    /// neighbours — `max_output_tokens` above it and the incomplete catch-all
+    /// below — map to `"length"`, so losing this arm changes nothing a test
+    /// would otherwise notice: the stream still ends, the reply is still
+    /// flagged truncated. The only casualty is what the user is told, and they
+    /// are told they hit the token cap when the reply was filtered.
+    #[test]
+    fn incomplete_content_filter_maps_to_content_filter() {
+        let ev = json!({"type": "response.incomplete", "response": {
+            "incomplete_details": {"reason": "content_filter"},
+            "usage": {"input_tokens": 5, "output_tokens": 5}
+        }});
+        let mut state = StreamState::default();
+        let chunk = map_event(&mut state, &ev).unwrap().unwrap();
+        assert!(state.terminal_seen);
+        assert_eq!(
+            chunk.choices[0].finish_reason.as_deref(),
+            Some("content_filter"),
+            "a filtered reply must not be reported as a token-cap truncation"
+        );
+    }
+
     #[test]
     fn incomplete_with_unrecognized_reason_still_signals_truncation() {
         // A `response.incomplete` whose `incomplete_details.reason` is neither
