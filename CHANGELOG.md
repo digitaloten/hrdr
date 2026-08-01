@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **A jailed agent is told what it can search with.** It takes none of the
+  capability gates — no write tool, no `task` — so its entire guidance was the
+  unconditional block, and that block pointed it at `shell` for finding code: a
+  tool `cap_to_jail_set` had just removed. The four that exist solely for it
+  (`grep`, `find`, `ls`, `tree`) went unmentioned. There is now a `jail.md`
+  section naming them and how to work outward from `tree`/`ls` to `read`.
+
+### Changed
+
+- **The unconditional block no longer names a search tool.** Which tool does the
+  searching is a capability, so it is stated in the capability sections —
+  `shell.md` for an agent with a shell, `jail.md` for one without. The test that
+  pins which tools the shared block may name now treats `shell` as what it is
+  (not read-only), so putting it back fails.
+
+- **The release and commit procedures each live in one place.** `write.md`'s
+  Releasing section and the `:release` skill were near-identical copies, and had
+  already drifted: only the skill said to watch the tag's CI run. Since a skill
+  marked `model_invocable: false` is never even listed to the model, a release
+  asked for in plain English reached the copy missing that step. The always-on
+  section is now the single source and carries it; the skill states only what
+  `:release` adds. Same for commit guidance across `committing.md` and the
+  `:commit` skill, which had drifted on subject length.
+
+### Fixed
+
+- **"Tagged and pushed" is no longer reported as "released".** Release pipelines
+  gate publish jobs on build jobs, so a red check skips them silently rather
+  than failing loudly — leaving a tag on the remote and nothing published. The
+  Releasing section now requires watching the tag's run and confirming the
+  artifact landed.
+
 ## [0.9.4] - 2026-08-01
 
 ### Added

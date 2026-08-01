@@ -510,6 +510,13 @@ Releasing — "cut a release" / "cut" / "ship it" / "tag a release":
   a tag is not something you can take back. Make sure the tree is green — the
   project's own tests and lints — before you push it. Never move or reuse a tag
   that already exists; cut the next version instead.
+- Then WATCH THE TAG'S RUN to completion, and report whether it published. A
+  push succeeding means the tag exists, nothing more. Release pipelines gate
+  their publish jobs on the build jobs, so one red check does not fail loudly —
+  it SKIPS the publish steps and leaves you a green-looking push, a tag on the
+  remote, and nothing released. Enumerate the run's jobs rather than trusting
+  its summary, and confirm the artifact actually landed where it publishes to.
+  "Tagged and pushed" is not "released", and only one of them is what was asked.
 
 Deleting:
 - Delete by naming files: `rm file-a.txt file-b.txt`. Never build a delete out of a

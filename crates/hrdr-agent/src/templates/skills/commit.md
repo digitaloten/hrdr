@@ -9,13 +9,12 @@ Commit the current work.
    changed. If arguments were given, scope the commit to them: $ARGUMENTS
 2. Group the changes. If there are unrelated clusters, split them into separate
    commits — one logical change per commit — and commit each in turn.
-3. Stage files explicitly by path. Never use `git add -A`, `git add .`, or
-   `git commit -a`; they pick up files you haven't reviewed.
-4. Write the message in Conventional Commits form: `type(scope): subject`.
-   Types: feat, fix, docs, style, refactor, test, chore, perf, ci, build.
-   Subject imperative and ≤72 chars. Add a body only when the _why_ isn't
-   obvious from the diff.
-5. Never skip hooks (`--no-verify`). If a hook fails, fix what it flagged and
+3. Stage and word each commit as the Git section of your instructions says —
+   explicit paths, Conventional Commits subject, body when the _why_ isn't
+   obvious. Not restated here: it is already in front of you, and the copy that
+   drifted from it is how this skill came to specify a different subject length
+   than the rules it was meant to follow.
+4. Never skip hooks (`--no-verify`). If a hook fails, fix what it flagged and
    commit again.
-6. After committing, show the result with `git log -1 --stat` and stop — don't
+5. After committing, show the result with `git log -1 --stat` and stop — don't
    push unless asked.
