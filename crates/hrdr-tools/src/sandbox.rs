@@ -2375,62 +2375,13 @@ mod tests {
         assert_eq!(n.take().as_deref(), Some(NO_OS_SANDBOX_NOTICE));
     }
 
-    /// The real thing on Windows: under `Read` every write is refused by the
-    /// kernel, wherever it points, while reads still work.
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn shell_writes_are_denied_under_low_integrity() {
-        let detected = crate::Shell::detect();
-        if skip_for_want_of("a shell (bash or sh)", detected.is_some()) {
-            return;
-        }
-        let shell = detected.expect("checked above");
-        let dir = tempfile::tempdir().unwrap();
-        let policy = SandboxPolicy {
-            mode: SandboxMode::Read,
-            writable_roots: Vec::new(),
-            readable_roots: vec![canonicalize_nearest(dir.path())],
-            cache_roots: Vec::new(),
-            wrap_tool_results: false,
-        };
-
-        // A read of a file that exists still works…
-        let readable = canonicalize_nearest(dir.path()).join("readable.txt");
-        std::fs::write(&readable, "visible").unwrap();
-        let mut cmd = shell_command_with_backend(
-            OsSandboxBackend::LowIntegrity,
-            shell,
-            &format!("cat {}", readable.display()),
-            &policy,
-            &notices(),
-        );
-        cmd.current_dir(dir.path());
-        let out = cmd.output().await.unwrap();
-        assert!(
-            out.status.success(),
-            "Read mode must not confine reads: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(String::from_utf8_lossy(&out.stdout).contains("visible"));
-
-        // …and a write does not, even into the directory the command runs in.
-        let target = canonicalize_nearest(dir.path()).join("escaped");
-        let mut cmd = shell_command_with_backend(
-            OsSandboxBackend::LowIntegrity,
-            shell,
-            &format!("echo x > {}", target.display()),
-            &policy,
-            &notices(),
-        );
-        cmd.current_dir(dir.path());
-        let out = cmd.output().await.unwrap();
-        assert!(
-            !out.status.success(),
-            "the write was allowed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(!target.exists(), "the write landed anyway");
-    }
+    // The end-to-end Windows test does NOT live here. The backend re-execs
+    // `std::env::current_exe()`, which in a `hrdr-tools` unit test is the TEST
+    // BINARY — this crate ships no hrdr binary to re-exec — so the spawn fed
+    // `__sandbox-exec -- …` to libtest as filter arguments and wedged the
+    // Windows job for 37 minutes. It is an integration test in
+    // `apps/hrdr/tests/sandbox_windows.rs`, where `CARGO_BIN_EXE_hrdr` names the
+    // real wrapper.
 
     /// The real thing, on the only platform that has it: a write outside the
     /// roots is refused by the kernel, a write inside lands.
