@@ -1453,4 +1453,154 @@ mod tests {
         assert!(!wire.contains("some plaintext thinking"), "{wire}");
         assert!(!wire.contains("thinking"), "{wire}");
     }
+
+    /// Drive a canned SSE body through the real [`chat_stream`] and collect what
+    /// came out: the chunks, then the error that terminated the stream (if any —
+    /// `try_stream` stops at the first `Err`, so there is at most one).
+    ///
+    /// The forced backend is the whole point. [`crate::client::detect_backend`]
+    /// keys on the HOST *and* the path, so a mock bound to `127.0.0.1` is
+    /// `Backend::OpenAi` and `Client::chat_stream` would dispatch to the
+    /// chat-completions path — none of this module would run. Everything after
+    /// the byte loop above (the reasoning-item flush, the missing-terminator
+    /// truncation error) is reachable from a test only this way.
+    async fn codex_stream(body: &'static str) -> (Vec<ChatChunk>, Option<anyhow::Error>) {
+        let base_url = crate::client::serve_once(body).await;
+        let mut client = crate::Client::new(base_url, Some("test-token".to_string()), "gpt-5.5");
+        client.set_backend_for_test(crate::client::Backend::Codex);
+        let mut stream = client
+            .chat_stream(&[user("hi")], &[])
+            .await
+            .expect("the mock server answers 200");
+        let (mut chunks, mut err) = (Vec::new(), None);
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => chunks.push(chunk),
+                Err(e) => err = Some(e),
+            }
+        }
+        (chunks, err)
+    }
+
+    /// The control for the truncation test below: a stream that DOES terminate
+    /// must come back clean, so a green truncation test cannot be explained by
+    /// "everything through this path errors".
+    #[tokio::test]
+    async fn a_complete_stream_yields_text_and_the_mapped_finish_reason() {
+        let body = "event: response.output_text.delta\n\
+                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\n\n\
+                    event: response.output_text.delta\n\
+                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n\
+                    event: response.completed\n\
+                    data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":5}}}\n\n";
+        let (chunks, err) = codex_stream(body).await;
+        assert!(
+            err.is_none(),
+            "a terminated stream must not error: {:#}",
+            err.unwrap()
+        );
+
+        let text: String = chunks
+            .iter()
+            .flat_map(|c| &c.choices)
+            .filter_map(|c| c.delta.content.clone())
+            .collect();
+        assert_eq!(text, "hello");
+
+        let finish: Vec<&str> = chunks
+            .iter()
+            .flat_map(|c| &c.choices)
+            .filter_map(|c| c.finish_reason.as_deref())
+            .collect();
+        assert_eq!(
+            finish,
+            ["stop"],
+            "a completion with no function call is a plain stop"
+        );
+
+        let usage = chunks
+            .iter()
+            .find_map(|c| c.usage.as_ref())
+            .expect("response.completed carries usage");
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (11, 5));
+
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.responses_reasoning_items.is_empty()),
+            "no reasoning items in the stream → no synthetic chunk"
+        );
+    }
+
+    /// A stream cut before `response.completed` must be **Transient**, which is
+    /// what makes the agent re-request instead of accepting half a reply as
+    /// final. The OpenAI equivalent is covered end-to-end by hrdr-agent's
+    /// `agent_run_incomplete_stream_then_retry`.
+    #[tokio::test]
+    async fn a_stream_without_a_terminal_event_is_a_transient_error() {
+        let body = "event: response.output_text.delta\n\
+                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"half a rep\"}\n\n";
+        let (chunks, err) = codex_stream(body).await;
+
+        // The partial text still arrives — the error is about the *ending*, not
+        // about the chunks that got through.
+        let text: String = chunks
+            .iter()
+            .flat_map(|c| &c.choices)
+            .filter_map(|c| c.delta.content.clone())
+            .collect();
+        assert_eq!(text, "half a rep");
+
+        let err = err.expect("the stream must have terminated with an error");
+        let typed = err
+            .downcast_ref::<crate::client::ChatError>()
+            .unwrap_or_else(|| panic!("error must be a typed ChatError, got: {err:#}"));
+        assert_eq!(
+            typed.kind,
+            crate::client::ChatErrorKind::Transient,
+            "a cut stream must be retryable, not terminal"
+        );
+        assert!(
+            typed.message.contains("response.completed"),
+            "message must name the missing terminator: {}",
+            typed.message
+        );
+    }
+
+    /// The post-loop flush: reasoning items captured off the stream are re-emitted
+    /// as one synthetic chunk so the [`Accumulator`] can hang them off the
+    /// assistant message for the next request's `input[]`. Under `store:false`
+    /// the encrypted blob is the model's only memory of its own plan, so the
+    /// items' CONTENT is the assertion — and it must be verbatim, since the blob
+    /// is opaque and re-encoding it would invalidate it.
+    #[tokio::test]
+    async fn reasoning_items_are_flushed_after_the_loop() {
+        let body = "event: response.output_item.done\n\
+                    data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"blob-one\"}}\n\n\
+                    event: response.output_item.done\n\
+                    data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_2\",\"encrypted_content\":\"\"}}\n\n\
+                    event: response.output_text.delta\n\
+                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n\
+                    event: response.completed\n\
+                    data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":5}}}\n\n";
+        let (chunks, err) = codex_stream(body).await;
+        assert!(err.is_none(), "stream terminated cleanly");
+
+        let items: Vec<&Vec<Value>> = chunks
+            .iter()
+            .map(|c| &c.responses_reasoning_items)
+            .filter(|i| !i.is_empty())
+            .collect();
+        assert_eq!(items.len(), 1, "exactly one synthetic flush chunk");
+        assert_eq!(
+            *items[0],
+            vec![json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [],
+                "encrypted_content": "blob-one",
+            })],
+            "the item is stored verbatim; the one with no encrypted state is dropped"
+        );
+    }
 }

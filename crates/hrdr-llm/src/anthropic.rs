@@ -2322,4 +2322,241 @@ mod tests {
         );
         assert!(chat_err.message.contains("generic"));
     }
+
+    /// Drive a canned SSE body through the real [`chat_stream`] and collect what
+    /// came out: the chunks, then the error that terminated the stream (if any —
+    /// `try_stream` stops at the first `Err`, so there is at most one).
+    ///
+    /// The forced backend is the whole point. [`crate::client::detect_backend`]
+    /// keys on the HOST, so a mock bound to `127.0.0.1` is `Backend::OpenAi` and
+    /// `Client::chat_stream` would dispatch to the chat-completions path — none
+    /// of this module would run. Everything after the byte loop above (the
+    /// thinking-block flush, the missing-`message_stop` truncation error) is
+    /// reachable from a test only this way.
+    async fn anthropic_stream(body: &'static str) -> (Vec<ChatChunk>, Option<anyhow::Error>) {
+        let base_url = crate::client::serve_once(body).await;
+        let mut client = crate::Client::new(base_url, Some("test-key".to_string()), "claude-test");
+        client.set_backend_for_test(crate::client::Backend::Anthropic);
+        let mut stream = client
+            .chat_stream(&[user("hi")], &[])
+            .await
+            .expect("the mock server answers 200");
+        let (mut chunks, mut err) = (Vec::new(), None);
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => chunks.push(chunk),
+                Err(e) => err = Some(e),
+            }
+        }
+        (chunks, err)
+    }
+
+    /// The typed error a stream ended with, or a panic naming what arrived
+    /// instead — an untyped `anyhow` here would sail past hrdr-agent's retry
+    /// classifier, so the type is part of the assertion.
+    fn chat_error(err: Option<anyhow::Error>) -> crate::client::ChatError {
+        let err = err.expect("the stream must have terminated with an error");
+        let typed = err
+            .downcast_ref::<crate::client::ChatError>()
+            .unwrap_or_else(|| panic!("error must be a typed ChatError, got: {err:#}"));
+        crate::client::ChatError {
+            status: typed.status,
+            retry_after: typed.retry_after,
+            kind: typed.kind,
+            message: typed.message.clone(),
+        }
+    }
+
+    /// The control for the truncation test below: a stream that DOES terminate
+    /// must come back clean, so a green truncation test cannot be explained by
+    /// "everything through this path errors".
+    #[tokio::test]
+    async fn a_complete_stream_yields_text_and_the_mapped_finish_reason() {
+        let body = "event: message_start\n\
+                    data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n\
+                    event: message_delta\n\
+                    data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n\
+                    event: message_stop\n\
+                    data: {\"type\":\"message_stop\"}\n\n";
+        let (chunks, err) = anthropic_stream(body).await;
+        assert!(
+            err.is_none(),
+            "a terminated stream must not error: {:#}",
+            err.unwrap()
+        );
+
+        let text: String = chunks
+            .iter()
+            .flat_map(|c| &c.choices)
+            .filter_map(|c| c.delta.content.clone())
+            .collect();
+        assert_eq!(text, "hello");
+
+        let finish: Vec<&str> = chunks
+            .iter()
+            .flat_map(|c| &c.choices)
+            .filter_map(|c| c.finish_reason.as_deref())
+            .collect();
+        assert_eq!(finish, ["stop"], "end_turn maps to the OpenAI `stop`");
+
+        // `message_start` carries the prompt total, `message_delta` the output —
+        // both have to survive the assembly, not just the text.
+        let prompt: Vec<u32> = chunks
+            .iter()
+            .filter_map(|c| c.usage.as_ref())
+            .map(|u| u.prompt_tokens)
+            .collect();
+        assert_eq!(prompt, [7, 0]);
+        let completion: Vec<u32> = chunks
+            .iter()
+            .filter_map(|c| c.usage.as_ref())
+            .map(|u| u.completion_tokens)
+            .collect();
+        assert_eq!(completion, [0, 5]);
+
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.anthropic_thinking_blocks.is_empty()),
+            "no thinking blocks in the stream → no synthetic chunk"
+        );
+    }
+
+    /// A stream cut before `message_stop` must be **Transient**, which is what
+    /// makes the agent re-request instead of accepting half a reply as final.
+    /// The OpenAI equivalent is covered end-to-end by hrdr-agent's
+    /// `agent_run_incomplete_stream_then_retry`.
+    #[tokio::test]
+    async fn a_stream_without_message_stop_is_a_transient_error() {
+        let body = "event: message_start\n\
+                    data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"half a rep\"}}\n\n";
+        let (chunks, err) = anthropic_stream(body).await;
+
+        // The partial text still arrives — the error is about the *ending*, not
+        // about the chunks that got through.
+        let text: String = chunks
+            .iter()
+            .flat_map(|c| &c.choices)
+            .filter_map(|c| c.delta.content.clone())
+            .collect();
+        assert_eq!(text, "half a rep");
+
+        let err = chat_error(err);
+        assert_eq!(
+            err.kind,
+            crate::client::ChatErrorKind::Transient,
+            "a cut stream must be retryable, not terminal"
+        );
+        assert!(
+            err.message.contains("message_stop"),
+            "message must name the missing terminator: {}",
+            err.message
+        );
+    }
+
+    /// The post-loop flush: a thinking block streamed alongside a tool call is
+    /// re-emitted as one synthetic chunk so the [`crate::Accumulator`] can hang it
+    /// off the assistant message. Anthropic 400s the follow-up request if the
+    /// signed block does not come back with the `tool_use` turn, so the block's
+    /// CONTENT is the assertion, not merely that a chunk appeared.
+    #[tokio::test]
+    async fn a_thinking_block_is_flushed_after_the_loop_with_its_signature() {
+        let body = "event: message_start\n\
+                    data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n\
+                    event: content_block_start\n\
+                    data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"weigh \"}}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"the options\"}}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-abc\"}}\n\n\
+                    event: content_block_stop\n\
+                    data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                    event: content_block_start\n\
+                    data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read\"}}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n\
+                    event: message_delta\n\
+                    data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n\
+                    event: message_stop\n\
+                    data: {\"type\":\"message_stop\"}\n\n";
+        let (chunks, err) = anthropic_stream(body).await;
+        assert!(err.is_none(), "stream terminated cleanly");
+
+        // The thinking text also streams live to the reasoning pane, which is a
+        // different path from the flush and must not be traded for it.
+        let reasoning: String = chunks
+            .iter()
+            .flat_map(|c| &c.choices)
+            .filter_map(|c| c.delta.reasoning_content.clone())
+            .collect();
+        assert_eq!(reasoning, "weigh the options");
+
+        // The tool call is what makes replaying the signed block mandatory.
+        let tool_ids: Vec<String> = chunks
+            .iter()
+            .flat_map(|c| &c.choices)
+            .flat_map(|c| c.delta.tool_calls.iter().flatten())
+            .filter_map(|t| t.id.clone())
+            .collect();
+        assert_eq!(tool_ids, ["toolu_1"]);
+
+        let blocks: Vec<&Vec<Value>> = chunks
+            .iter()
+            .map(|c| &c.anthropic_thinking_blocks)
+            .filter(|b| !b.is_empty())
+            .collect();
+        assert_eq!(blocks.len(), 1, "exactly one synthetic flush chunk");
+        assert_eq!(
+            *blocks[0],
+            vec![json!({
+                "type": "thinking",
+                "thinking": "weigh the options",
+                "signature": "sig-abc",
+            })],
+            "the deltas must be reassembled verbatim, signature included"
+        );
+    }
+
+    /// The flush filter keeps a block that carries EITHER text or a signature.
+    /// A signed block with empty text is the normal shape on the adaptive
+    /// dialect when `display` is omitted, and dropping it makes Anthropic 400 the
+    /// follow-up request — so both halves of the filter are asserted here: the
+    /// signed-but-empty block survives, the block that got neither is dropped.
+    #[tokio::test]
+    async fn a_signed_thinking_block_with_empty_text_survives_the_flush_filter() {
+        let body = "event: message_start\n\
+                    data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n\
+                    event: content_block_start\n\
+                    data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-only\"}}\n\n\
+                    event: content_block_start\n\
+                    data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+                    event: message_delta\n\
+                    data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n\
+                    event: message_stop\n\
+                    data: {\"type\":\"message_stop\"}\n\n";
+        let (chunks, err) = anthropic_stream(body).await;
+        assert!(err.is_none(), "stream terminated cleanly");
+
+        let blocks: Vec<&Vec<Value>> = chunks
+            .iter()
+            .map(|c| &c.anthropic_thinking_blocks)
+            .filter(|b| !b.is_empty())
+            .collect();
+        assert_eq!(blocks.len(), 1, "exactly one synthetic flush chunk");
+        assert_eq!(
+            *blocks[0],
+            vec![json!({"type": "thinking", "thinking": "", "signature": "sig-only"})],
+            "the signed block is kept; the one with neither text nor signature is not"
+        );
+    }
 }

@@ -420,7 +420,7 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
 /// endpoint → the OpenAI Responses API), else the OpenAI chat-completions shape
 /// every other server uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Backend {
+pub(crate) enum Backend {
     OpenAi,
     Anthropic,
     /// OpenAI **Responses API** — the ChatGPT/Codex OAuth endpoint
@@ -882,6 +882,23 @@ impl Client {
             .resolved_model
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Point this client at `backend` regardless of what [`detect_backend`] says
+    /// about its `base_url`.
+    ///
+    /// Test-only, and the only way the native backends can be exercised at all:
+    /// detection keys on the **host**, so a mock server bound to `127.0.0.1` is
+    /// always [`Backend::OpenAi`] and [`Client::chat_stream`] never dispatches to
+    /// [`crate::anthropic`] / [`crate::codex`]. Everything those two do *after*
+    /// their event loop — the thinking-block and reasoning-item flushes, the
+    /// missing-terminator truncation errors — is unreachable without this, which
+    /// is why it is not dead code even though nothing in the crate proper calls
+    /// it. It mutates one client instance and touches no shared state, so
+    /// parallel tests cannot race through it.
+    #[cfg(test)]
+    pub(crate) fn set_backend_for_test(&mut self, backend: Backend) {
+        self.backend = backend;
     }
 
     /// Whether this endpoint is one that reads OpenAI's `prompt_cache_key`:
@@ -1453,6 +1470,69 @@ fn json_u32(v: &serde_json::Value) -> Option<u32> {
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
+/// Minimal in-process HTTP server used only to exercise the SSE decoding paths
+/// in the `chat_stream` implementations (mirrors the mock server in hrdr-agent's
+/// test module, trimmed to a single canned response).
+///
+/// Lives outside `mod tests` because [`crate::anthropic`] and [`crate::codex`]
+/// drive their own streams through it too — the path is ignored, so the same
+/// server answers `/v1/chat/completions`, `/v1/messages` and `/v1/responses`.
+/// The response carries no `Content-Length` and closes the connection, so the
+/// client reads to EOF: a body that stops short of its terminator is exactly a
+/// truncated stream.
+#[cfg(test)]
+pub(crate) async fn serve_once(body: &'static str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        // Read (and discard) the request headers + body; we don't care
+        // about the request shape for this test.
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let headers_end = loop {
+            match stream.read(&mut tmp).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                }
+            }
+        };
+        let hdrs = String::from_utf8_lossy(&buf[..headers_end]);
+        let content_len: usize = hdrs
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+            })
+            .unwrap_or(0);
+        let body_so_far = buf.len().saturating_sub(headers_end);
+        let remaining = content_len.saturating_sub(body_so_far);
+        if remaining > 0 {
+            let mut body_buf = vec![0u8; remaining];
+            let _ = stream.read_exact(&mut body_buf).await;
+        }
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/event-stream\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {body}"
+        );
+        let _ = stream.write_all(resp.as_bytes()).await;
+    });
+    format!("http://127.0.0.1:{port}/v1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1930,61 +2010,6 @@ mod tests {
             req.headers().get("originator").unwrap().to_str().unwrap(),
             "hrdr"
         );
-    }
-
-    /// Minimal in-process HTTP server used only to exercise the SSE decoding
-    /// path in `chat_stream` (mirrors the mock server in hrdr-agent's test
-    /// module, trimmed to a single canned response).
-    async fn serve_once(body: &'static str) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            // Read (and discard) the request headers + body; we don't care
-            // about the request shape for this test.
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 4096];
-            let headers_end = loop {
-                match stream.read(&mut tmp).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => {
-                        buf.extend_from_slice(&tmp[..n]);
-                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                            break p + 4;
-                        }
-                    }
-                }
-            };
-            let hdrs = String::from_utf8_lossy(&buf[..headers_end]);
-            let content_len: usize = hdrs
-                .lines()
-                .find_map(|l| {
-                    l.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                })
-                .unwrap_or(0);
-            let body_so_far = buf.len().saturating_sub(headers_end);
-            let remaining = content_len.saturating_sub(body_so_far);
-            if remaining > 0 {
-                let mut body_buf = vec![0u8; remaining];
-                let _ = stream.read_exact(&mut body_buf).await;
-            }
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: text/event-stream\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 {body}"
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
-        });
-        format!("http://127.0.0.1:{port}/v1")
     }
 
     #[tokio::test]
