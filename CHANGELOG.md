@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **A write-capable sub-agent's result now tells the parent to review the diff
+  and run `verify` before trusting it.** The instruction existed already — in
+  the spawn acknowledgement and in the delegation prompt — but both are many
+  turns and several tool calls behind by the time a background task lands, and
+  the moment the parent decides whether to trust the work is the moment it reads
+  the result. It rides on the result itself now, including the failure and panic
+  paths, which are exactly where the tree holds a half-finished edit and the
+  report is least likely to say so. Read-only tasks are unaffected: they changed
+  nothing, so the note would be noise.
+
 ### Added
 
 - **Windows `read` mode is confined by the OS.** Windows was the last supported

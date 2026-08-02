@@ -93,6 +93,23 @@ pub(crate) fn bg_handles() -> BgHandles {
 /// a pointer at the transcript for the rest.
 pub(crate) const BACKGROUND_REPORT_MAX_BYTES: usize = 24_000;
 
+/// Appended to a write-capable sub-agent's result, whatever the outcome.
+///
+/// The spawn acknowledgement already says this, and so does `delegate.md`. Both
+/// are far away by the time a background task lands — many turns and several
+/// tool calls back — and the moment the parent decides whether to trust the work
+/// is the moment it reads the result, not the moment it spawned the task. So the
+/// instruction rides on the result.
+///
+/// It goes on the failure and panic paths too, deliberately: a run that died
+/// half-way is exactly when the tree holds a partial edit and the report is
+/// least likely to mention it.
+pub(crate) const WRITE_HANDBACK_NOTE: &str = "\n\n(Its edits are already in your working tree — \
+     there is nothing to merge. REVIEW THEM LIKE A PR before you build on them, report them \
+     finished, or commit them: `git diff`, plus `git status --short --untracked-files=all` for \
+     new files, every hunk. Then run `verify`. The report above says what it claims; the diff \
+     says what it did, and a task whose own checks failed can still report success.)";
+
 /// Where a delegated run's state is snapshotted, and everything about the run
 /// that never changes once it is spawned.
 ///
@@ -483,6 +500,13 @@ fn spawn_background(
                 }
                 format!("(background task panicked: {msg})")
             }
+        };
+        // A read-only task changed nothing, so the note would be noise; a
+        // write-capable one handed back a tree it may already have edited.
+        let final_result = if cfg_read_only {
+            final_result
+        } else {
+            format!("{final_result}{WRITE_HANDBACK_NOTE}")
         };
         if let Ok(mut v) = reg_done.lock()
             && let Some(t) = v.iter_mut().find(|t| t.id == id)

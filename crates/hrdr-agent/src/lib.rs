@@ -12615,6 +12615,106 @@ mod tests {
                 "the refusal says why writers serialize: {err}"
             );
         }
+
+        /// A `SubagentTool` over `cfg`, with the background handles reachable so
+        /// [`await_background`] can join the run.
+        fn subagent_tool_from(cfg: AgentConfig) -> SubagentTool {
+            let runtime = super::super::new_delegation_runtime(
+                &cfg,
+                &super::super::ResolvedModel::from_config(&cfg),
+            );
+            SubagentTool::new(
+                cfg,
+                runtime,
+                Vec::new(),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                None,
+                super::super::AgentRegistry::new(),
+            )
+        }
+
+        /// One mock run, returning the result the parent is handed.
+        async fn one_task_result(read_only: bool, reply: &str) -> String {
+            use hrdr_tools::Tool;
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("c1", reply),
+                stop_chunk("c1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+            let cwd = tempfile::tempdir().unwrap();
+            let mut cfg = test_cfg(server.base_url(), cwd.path());
+            cfg.read_only = read_only;
+            let tool = subagent_tool_from(cfg);
+            let ctx = hrdr_tools::ToolContext::new(cwd.path());
+            tool.execute(json!({"prompt": "p", "description": "d"}), &ctx)
+                .await
+                .unwrap();
+            await_background(&tool, &ctx).await
+        }
+
+        /// The parent decides whether to trust the work when it reads the RESULT,
+        /// which is many turns past the spawn acknowledgement that said the same
+        /// thing. So the result carries the instruction itself.
+        #[tokio::test]
+        async fn a_write_task_result_tells_the_parent_to_review_and_verify() {
+            let result = one_task_result(false, "edited a file").await;
+            assert!(
+                result.starts_with("edited a file"),
+                "the sub-agent's own report comes first: {result}"
+            );
+            assert!(
+                result.contains("REVIEW THEM LIKE A PR"),
+                "the result asks for a real review: {result}"
+            );
+            assert!(
+                result.contains("`verify`"),
+                "and names the gate to run: {result}"
+            );
+            assert!(
+                result.contains("can still report success"),
+                "and says why the report alone is not enough: {result}"
+            );
+        }
+
+        /// A read-only task changed nothing. Telling its parent to review a diff
+        /// that cannot exist trains it to skim the instruction when it matters.
+        #[tokio::test]
+        async fn a_read_only_task_result_carries_no_review_note() {
+            let result = one_task_result(true, "found three call sites").await;
+            assert_eq!(
+                result, "found three call sites",
+                "a read-only result is the report and nothing else"
+            );
+        }
+
+        /// The failure and panic paths are exactly where a partial edit is most
+        /// likely and the report least likely to mention it, so they carry it too.
+        #[tokio::test]
+        async fn a_failed_write_task_still_carries_the_review_note() {
+            use hrdr_tools::Tool;
+            // No mock responses queued: the run errors instead of reporting.
+            let server = MockServer::start(vec![MockResp::HttpError(500)]).await;
+            let cwd = tempfile::tempdir().unwrap();
+            let cfg = test_cfg(server.base_url(), cwd.path());
+            let tool = subagent_tool_from(cfg);
+            let ctx = hrdr_tools::ToolContext::new(cwd.path());
+            tool.execute(json!({"prompt": "p", "description": "d"}), &ctx)
+                .await
+                .unwrap();
+            let result = await_background(&tool, &ctx).await;
+            assert!(
+                result.contains("background task failed"),
+                "the failure is reported: {result}"
+            );
+            assert!(
+                result.contains("REVIEW THEM LIKE A PR"),
+                "a half-finished write task still leaves a tree to review: {result}"
+            );
+        }
     } // mod mock_server
 
     #[test]

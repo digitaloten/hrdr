@@ -90,22 +90,15 @@ not work.
    repos a coding agent gets pointed at (security tooling, shell-hardening
    guides, this file), and hermes needed three scopes to make it tolerable.
    **Wants evidence of a real attempt first.**
-2. **Delegation has no post-merge verification hook.** Every sub-agent checks
-   its own change against a tree the others are also editing; nothing checks the
-   union. `verify` exists, so the hook has somewhere to point: after the last
-   task in a batch, run the gate. Sharpened by a real observation — two of three
-   fix sub-agents called `verify`, got `Err`, and reported success anyway — and
-   now _forced_, because `task_transcript` is gone: the fix has to be structural
-   in the hand-back rather than "the parent can go read what happened".
-3. **The test nudge has no teeth.** Fired 3/3 in one session, obeyed 1/3. With
+2. **The test nudge has no teeth.** Fired 3/3 in one session, obeyed 1/3. With
    `verify` in place it has somewhere to escalate to instead of staying
    advisory.
-4. **The evidence gate checks presence, not relevance.** A `verification` field
+3. **The evidence gate checks presence, not relevance.** A `verification` field
    containing "git log shows 3 commits" satisfies a claim it does not support.
    Weakest of the set — whether evidence _answers_ its claim is a semantic
    judgement a string check cannot make. One observation behind it; worth
    leaving until there is a second.
-5. **`git restore <path>` / `git checkout <path>` is unguarded, and the
+4. **`git restore <path>` / `git checkout <path>` is unguarded, and the
    don't-discard-others'-work rule is sub-agent-only.** The guardrails block the
    whole-tree forms (`git checkout .`, `git restore .`) but not the single-path
    form — the one that discards someone else's uncommitted work file by file.
