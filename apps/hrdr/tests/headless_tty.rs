@@ -10,11 +10,11 @@ extern crate hrdr_test_support;
 
 mod common;
 
-use std::io::Read;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{Chat, MockServer, text_chunk};
+use common::{Chat, MockServer, drain_pty, pty_text, text_chunk};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 /// Generous: a cold runner is slow, and a flaky timeout is worse than a slow test.
@@ -99,19 +99,12 @@ fn run_on_a_pty(env: &[(&str, &str)]) -> String {
 
     let mut child = pty.slave.spawn_command(cmd).expect("spawn hrdr");
     drop(pty.slave);
-    let mut reader = pty.master.try_clone_reader().expect("pty reader");
-    let seen = Arc::new(Mutex::new(String::new()));
-    let sink = Arc::clone(&seen);
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            let mut s = sink.lock().unwrap_or_else(|e| e.into_inner());
-            s.push_str(&String::from_utf8_lossy(&buf[..n]));
-        }
-    });
+    let reader = pty.master.try_clone_reader().expect("pty reader");
+    // The shared drainer, not a bare read loop: on Windows the child blocks on a
+    // cursor-position query until the harness answers it.
+    let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+        Arc::new(Mutex::new(pty.master.take_writer().expect("pty writer")));
+    let seen = drain_pty(reader, writer);
 
     let deadline = Instant::now() + DONE;
     while Instant::now() < deadline {
@@ -124,8 +117,7 @@ fn run_on_a_pty(env: &[(&str, &str)]) -> String {
     let _ = child.wait();
     // Let the reader drain what the child wrote before it exited.
     std::thread::sleep(Duration::from_millis(200));
-    let out = seen.lock().unwrap_or_else(|e| e.into_inner());
-    out.clone()
+    pty_text(&seen)
 }
 
 /// On a terminal, the chrome is coloured. The counterpart to

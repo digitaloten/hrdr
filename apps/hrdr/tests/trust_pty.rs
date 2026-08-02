@@ -12,10 +12,13 @@
 // Its own test binary, so it links the sandbox ctor itself — see `tui_pty.rs`.
 extern crate hrdr_test_support;
 
-use std::io::{Read, Write};
+mod common;
+
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use common::{drain_pty, pty_text};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 /// Generous: a cold runner is slow, and a flaky timeout here is worse than a slow
@@ -151,29 +154,17 @@ fn ask_themed(keys: &[&str], theme: Option<&str>) -> Asked {
 
     let mut child = pty.slave.spawn_command(cmd).expect("spawn hrdr");
     drop(pty.slave);
-    let mut reader = pty.master.try_clone_reader().expect("pty reader");
-    let mut writer = pty.master.take_writer().expect("pty writer");
-
-    let screen = Arc::new(Mutex::new(String::new()));
-    let sink = Arc::clone(&screen);
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            let mut s = sink.lock().unwrap_or_else(|e| e.into_inner());
-            s.push_str(&String::from_utf8_lossy(&buf[..n]));
-        }
-    });
+    let reader = pty.master.try_clone_reader().expect("pty reader");
+    // Shared with the drainer: on Windows the child blocks on a cursor-position
+    // query until the harness answers it, and the answer goes out this way.
+    let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+        Arc::new(Mutex::new(pty.master.take_writer().expect("pty writer")));
+    let screen = drain_pty(reader, Arc::clone(&writer));
 
     // Wait for the question to paint before answering it.
     let deadline = Instant::now() + BOOT;
     while Instant::now() < deadline {
-        let seen = {
-            let s = screen.lock().unwrap_or_else(|e| e.into_inner());
-            visible(&s)
-        };
+        let seen = visible(&pty_text(&screen));
         if seen.contains("has not been opened in this directory before") {
             break;
         }
@@ -184,8 +175,9 @@ fn ask_themed(keys: &[&str], theme: Option<&str>) -> Asked {
         // A beat between keys: the menu redraws on a timer, and a burst would
         // test the input buffer rather than the menu.
         std::thread::sleep(Duration::from_millis(150));
-        let _ = writer.write_all(k.as_bytes());
-        let _ = writer.flush();
+        let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = w.write_all(k.as_bytes());
+        let _ = w.flush();
     }
     // Give it a moment to leave if the answer was cancel.
     let mut exited_itself = false;
@@ -204,10 +196,7 @@ fn ask_themed(keys: &[&str], theme: Option<&str>) -> Asked {
     let _ = child.wait();
 
     let store = std::fs::read_to_string(home.path().join("hrdr").join("trusted-dirs")).ok();
-    let raw = {
-        let s = screen.lock().unwrap_or_else(|e| e.into_inner());
-        s.clone()
-    };
+    let raw = pty_text(&screen);
     // Each frame begins by homing the cursor and clearing, so the text after the
     // last clear is the frame on screen.
     let last_frame = visible(raw.rsplit("\x1b[2J").next().unwrap_or(&raw));

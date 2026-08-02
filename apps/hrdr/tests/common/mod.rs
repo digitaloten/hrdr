@@ -316,3 +316,62 @@ pub fn write_config_with(config_home: &std::path::Path, base_url: &str, extra: &
     )
     .expect("write config.toml");
 }
+
+// ── pty plumbing ─────────────────────────────────────────────────────────────
+
+/// Drain a pty master into a shared buffer, answering the terminal handshake.
+///
+/// **Two Windows traps live here, and both cost a red CI run before this was
+/// shared rather than re-written per test file.**
+///
+/// 1. A ConPTY opens by asking the terminal where the cursor is (`ESC[6n`) and
+///    *waits for the reply* before flushing anything the child wrote. A real
+///    terminal answers; a harness has to as well. Without it Windows produces
+///    exactly four bytes — the query — and hangs, so every assertion fails on a
+///    timeout with an empty screen and nothing to say why.
+/// 2. A ConPTY master returns `WouldBlock`/`Interrupted` before the child has
+///    written anything. A loop that treats the first `Err` as the end (a plain
+///    `while let Ok(n) = read(..)`) reads zero bytes forever.
+///
+/// `writer` is shared so a test can type into the same pty afterwards.
+pub fn drain_pty(
+    mut reader: Box<dyn Read + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+) -> Arc<Mutex<String>> {
+    let seen = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&seen);
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                // EOF: the child closed the pty. Nothing more is coming.
+                Ok(0) => break,
+                Ok(n) => {
+                    if buf[..n].windows(4).any(|w| w == b"\x1b[6n") {
+                        let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
+                        let _ = w.write_all(b"\x1b[1;1R");
+                        let _ = w.flush();
+                    }
+                    let mut s = sink.lock().unwrap_or_else(|e| e.into_inner());
+                    s.push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    seen
+}
+
+/// Read the shared buffer, ignoring poisoning. A test that panics mid-assertion
+/// should report *its* failure, not have a poisoned mutex bury it.
+pub fn pty_text(seen: &Arc<Mutex<String>>) -> String {
+    seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}

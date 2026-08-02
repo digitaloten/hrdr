@@ -55,7 +55,6 @@ clap_complete_nushell = "4"
 clap_mangen = "0.3"
 tracing-subscriber.workspace = true
 crossterm.workspace = true
-hjkl-splash.workspace = true
 
 [dev-dependencies]
 # Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).
