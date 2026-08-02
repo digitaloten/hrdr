@@ -766,17 +766,6 @@ const AGENTS_FILE: &str = "AGENTS.md";
 /// silence is worse than one that was never written.
 const MAX_AGENTS_FILE_BYTES: u64 = 64 * 1024;
 
-/// Aggregate ceiling on ALL gathered instruction bytes — every `AGENTS.md` up
-/// the ancestor chain plus the one global file, combined. It holds many files at
-/// the per-file [`MAX_AGENTS_FILE_BYTES`] cap, already far more instruction text
-/// than any real project carries, so a genuine checkout never approaches it; the cap only stops a
-/// hostile or accidental deep tree of large `AGENTS.md` files from reading
-/// unbounded bytes into the prompt. When it bites we keep the nearest
-/// (most-specific) files and drop the farthest ancestors, since the walk is
-/// cwd-first — and the file the budget ran out on is recorded as a
-/// [`SkippedAgentDoc`] so the truncation is not silent either.
-const MAX_AGENTS_TOTAL_BYTES: usize = 1024 * 1024;
-
 /// Collect project instructions from `AGENTS.md` files, walking from `cwd` up to
 /// the filesystem root, plus global instruction files from standard locations.
 /// Less specific files (system, then user-global, then ancestors) come first so
@@ -814,9 +803,6 @@ impl AgentDocs {
 pub enum AgentDocSkip {
     /// Over the per-file cap (`MAX_AGENTS_FILE_BYTES`) on its own.
     TooLarge,
-    /// It would have fit, but nearer files had already spent the aggregate
-    /// budget (`MAX_AGENTS_TOTAL_BYTES`).
-    BudgetSpent,
 }
 
 /// An instruction file hrdr saw and chose not to read, with enough detail to say
@@ -852,12 +838,6 @@ impl SkippedAgentDoc {
                  the file to have them read.",
                 MAX_AGENTS_FILE_BYTES / 1024,
             ),
-            AgentDocSkip::BudgetSpent => format!(
-                "AGENTS.md at {path} ({kib:.1} KiB) was skipped — the {} MiB total \
-                 instruction budget was already spent by nearer files. Its \
-                 instructions are NOT in the prompt.",
-                MAX_AGENTS_TOTAL_BYTES / (1024 * 1024),
-            ),
         }
     }
 }
@@ -876,30 +856,33 @@ impl SkippedAgentDoc {
 /// with no instructions at all is not more contained — just worse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectInstructions {
-    /// Read `AGENTS.md` up the ancestor chain, and the project skill directories.
+    /// Read the working directory's own `AGENTS.md` and its skill directories.
     Load,
     /// Read neither. Built-ins plus the operator's global config, nothing else.
     Skip,
 }
 
+/// Gather the working directory's `AGENTS.md` plus the operator's global file.
+///
+/// **The working directory only — no ancestor walk.** Trust is answered per
+/// directory and never inherited (see [`crate::trust`]), so instructions must not
+/// be inherited either: opening a trusted `~/Projects` would otherwise mean a
+/// freshly-cloned `~/Projects/thing` inherits `~/Projects/AGENTS.md`, and opening
+/// that clone directly would mean its own file is read beside its parent's. One
+/// directory, one answer, one file. The global file is unaffected — it is the
+/// operator's own and arrives through its own section.
 pub fn gather_agent_docs(cwd: &Path, project: ProjectInstructions) -> AgentDocs {
-    // Walk up from cwd; collect cwd-first (most specific first). Accumulate a
-    // running byte total and stop once the next file would push it over the
-    // aggregate ceiling: because the walk is cwd-first, breaking here keeps the
-    // nearest/most-specific files already collected and drops only the farther
-    // ancestors — the correct precedence (a nearer file overrides a farther one).
     let mut docs: Vec<String> = Vec::new();
     let mut global: Option<String> = None;
     let mut skipped: Vec<SkippedAgentDoc> = Vec::new();
-    let mut total: usize = 0;
-    // `None` skips the walk entirely rather than filtering after it: a jailed
+    // `None` skips the read entirely rather than filtering after it: a jailed
     // agent must not even read the bytes, and the skip records below describe
     // *project* files, so they would be noise about a tree nobody loaded.
-    let mut dir = match project {
+    let dir = match project {
         ProjectInstructions::Load => Some(cwd),
         ProjectInstructions::Skip => None,
     };
-    while let Some(d) = dir {
+    if let Some(d) = dir {
         let af = d.join(AGENTS_FILE);
         // `metadata` is both caps' gate and the existence check: no metadata means
         // no file (or one we cannot stat), which is nothing to report. Only a file
@@ -914,30 +897,11 @@ pub fn gather_agent_docs(cwd: &Path, project: ProjectInstructions) -> AgentDocs 
             } else if let Ok(text) = std::fs::read_to_string(&af) {
                 let text = text.trim();
                 if !text.is_empty() {
-                    // Stop at the nearest files once the running total would exceed
-                    // the aggregate ceiling — the walk is cwd-first, so this keeps
-                    // the most-specific AGENTS.md and drops only farther ancestors.
-                    // The record names the file the budget ran out on, i.e. the
-                    // boundary; farther ancestors are never stat'd, so they cannot
-                    // be named individually without reading more than the cap
-                    // exists to bound.
-                    if total.saturating_add(text.len()) > MAX_AGENTS_TOTAL_BYTES {
-                        skipped.push(SkippedAgentDoc {
-                            path: af,
-                            bytes,
-                            reason: AgentDocSkip::BudgetSpent,
-                        });
-                        break;
-                    }
-                    total += text.len();
                     docs.push(text.to_string());
                 }
             }
         }
-        dir = d.parent();
     }
-    // Reverse to outer-first (root ancestor … cwd).
-    docs.reverse();
 
     // A single global instruction file, if any — first match wins.
     // Priority: hrdr → agents → opencode → claude.
@@ -965,19 +929,7 @@ pub fn gather_agent_docs(cwd: &Path, project: ProjectInstructions) -> AgentDocs 
         } else if let Ok(text) = std::fs::read_to_string(path) {
             let text = text.trim();
             if !text.is_empty() {
-                // The global file is the least-specific source (it prepends at the
-                // front), so it only goes in if the budget the ancestor walk left
-                // can hold it; otherwise it's the first thing to drop — and, being
-                // the user's *own* file, the one whose loss they most need told.
-                if total.saturating_add(text.len()) <= MAX_AGENTS_TOTAL_BYTES {
-                    global = Some(text.to_string());
-                } else {
-                    skipped.push(SkippedAgentDoc {
-                        path: path.clone(),
-                        bytes,
-                        reason: AgentDocSkip::BudgetSpent,
-                    });
-                }
+                global = Some(text.to_string());
             }
         }
     }
@@ -3224,63 +3176,54 @@ mod tests {
         );
     }
 
-    /// A deep ancestor chain of large `AGENTS.md` files whose combined size
-    /// exceeds the aggregate ceiling is bounded: the result stays under
-    /// `MAX_AGENTS_TOTAL_BYTES`, keeps the nearest (most-specific) files, and
-    /// drops the farthest ancestors — the walk is cwd-first, so precedence
-    /// (nearer overrides farther) is preserved when truncating.
+    /// Only the working directory's own `AGENTS.md` is read. An ancestor's file
+    /// is not inherited, because the trust answer that permitted this directory
+    /// was not inherited either — trusting `~/Projects` must not silently hand
+    /// `~/Projects/just-cloned` a set of instructions, nor the reverse.
     #[test]
-    fn gather_agent_docs_caps_total_bytes_and_keeps_the_nearest() {
+    fn gather_agent_docs_reads_the_cwd_only_and_never_an_ancestor() {
         let tmp = tempfile::tempdir().unwrap();
-        // Each file is ~60 KiB (under the 64 KiB per-file cap), so ~18 of them
-        // exceed the 1 MiB aggregate ceiling — build a chain of 40 to be sure.
-        const LEVELS: usize = 40;
-        const PAD: usize = 60 * 1024;
-        let mut dir = tmp.path().to_path_buf();
-        for level in 0..LEVELS {
-            dir = dir.join(format!("l{level:02}"));
-            std::fs::create_dir(&dir).unwrap();
-            // Marker line names the level so we can tell which files survived;
-            // padding makes the file big enough to fill the budget quickly.
-            let body = format!("LEVEL_{level:02}\n{}", "x".repeat(PAD));
-            std::fs::write(dir.join(AGENTS_FILE), body).unwrap();
-        }
-        // `dir` is now the deepest level (l39) — the cwd, most specific.
-        let gathered = gather_agent_docs(&dir, ProjectInstructions::Load);
+        let parent = tmp.path().join("parent");
+        let cwd = parent.join("child");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(parent.join(AGENTS_FILE), "PARENT_RULE: obey the parent.").unwrap();
+        std::fs::write(cwd.join(AGENTS_FILE), "CHILD_RULE: obey the child.").unwrap();
+
+        let gathered = gather_agent_docs(&cwd, ProjectInstructions::Load);
         let docs = gathered.project.as_deref().unwrap();
 
-        // Bounded: never more than the aggregate ceiling (any dropped global
-        // only shrinks it further).
         assert!(
-            docs.len() <= MAX_AGENTS_TOTAL_BYTES,
-            "gathered instructions must be bounded by the aggregate ceiling, got {}",
-            docs.len()
+            says(docs, "CHILD_RULE"),
+            "the cwd's own file is read: {docs}"
         );
-        // The nearest file (cwd, l39) is kept…
         assert!(
-            docs.contains(&format!("LEVEL_{:02}", LEVELS - 1)),
-            "the nearest AGENTS.md must survive truncation"
+            !says(docs, "PARENT_RULE"),
+            "an ancestor's file must not be inherited: {docs}"
         );
-        // …and the farthest ancestor (l00) is dropped to fit.
+        // Not reading it is not the same as skipping it: an ancestor is out of
+        // scope entirely, so there is nothing to report about one.
         assert!(
-            !says(docs, "LEVEL_00"),
-            "the farthest ancestor must be dropped when the total exceeds the cap"
+            !gathered.skipped.iter().any(|s| s.path.starts_with(&parent)),
+            "an ancestor is out of scope, not skipped: {:?}",
+            gathered.skipped
         );
-        // The aggregate cap is no more silent than the per-file one: the walk stops
-        // at the file the budget ran out on, and that boundary file is named.
-        let rec = gathered
-            .skipped
-            .iter()
-            .find(|s| s.reason == AgentDocSkip::BudgetSpent && s.path.starts_with(tmp.path()))
-            .unwrap_or_else(|| {
-                panic!(
-                    "the file the budget ran out on must be recorded: {:?}",
-                    gathered.skipped
-                )
-            });
-        let notice = rec.notice();
-        assert!(says(&notice, "1 MiB total instruction budget"), "{notice}");
-        assert!(says(&notice, "NOT in the prompt"), "{notice}");
+    }
+
+    /// The same directory read from a parent's point of view: opening the parent
+    /// must not pull in a child's file either. Neither direction inherits.
+    #[test]
+    fn gather_agent_docs_does_not_descend_into_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let child = tmp.path().join("just-cloned");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join(AGENTS_FILE), "CHILD_RULE: obey the child.").unwrap();
+
+        let gathered = gather_agent_docs(tmp.path(), ProjectInstructions::Load);
+        assert!(
+            gathered.project.is_none(),
+            "a child's AGENTS.md is not this directory's: {:?}",
+            gathered.project
+        );
     }
 
     /// The gate section names commands, traces them to where they came from,

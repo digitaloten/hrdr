@@ -177,10 +177,17 @@ fn run_tui(keys: &str) -> Run {
         ("XDG_CONFIG_HOME", home.path()),
         ("XDG_DATA_HOME", home.path()),
         ("XDG_STATE_HOME", home.path()),
+        ("XDG_CACHE_HOME", home.path()),
         ("XDG_RUNTIME_DIR", runtime.path()),
     ] {
         cmd.env(key, value);
     }
+    // The TUI is what a user sees AFTER they have answered for this directory,
+    // so answer it here. Without this the child stops on the trust question and
+    // every assertion below reads a prompt instead of a first frame — and the
+    // store has to be the throwaway one, which is why `XDG_CACHE_HOME` joins the
+    // list above rather than leaking the developer's real answers into the test.
+    pre_trust(home.path(), project.path());
     cmd.env("TERM", "xterm-256color");
     // Whatever the developer has exported must not reach the child. (`$HRDR_BASE_URL`
     // is not on the list because it no longer exists — the endpoint belongs to the
@@ -441,10 +448,17 @@ fn spawn_pty(
         ("XDG_CONFIG_HOME", home.path()),
         ("XDG_DATA_HOME", home.path()),
         ("XDG_STATE_HOME", home.path()),
+        ("XDG_CACHE_HOME", home.path()),
         ("XDG_RUNTIME_DIR", runtime.path()),
     ] {
         cmd.env(key, value);
     }
+    // The TUI is what a user sees AFTER they have answered for this directory,
+    // so answer it here. Without this the child stops on the trust question and
+    // every assertion below reads a prompt instead of a first frame — and the
+    // store has to be the throwaway one, which is why `XDG_CACHE_HOME` joins the
+    // list above rather than leaking the developer's real answers into the test.
+    pre_trust(home.path(), project.path());
     cmd.env("TERM", "xterm-256color");
     for key in ["HRDR_MODEL", "HRDR_API_KEY", "RUST_LOG"] {
         cmd.env_remove(key);
@@ -455,6 +469,20 @@ fn spawn_pty(
     let reader = pty.master.try_clone_reader().expect("pty reader");
     let writer = pty.master.take_writer().expect("pty writer");
     (child, pty.master, reader, writer, home, project, runtime)
+}
+
+/// Record `project` as trusted in a throwaway `$XDG_CACHE_HOME`, the way the
+/// user would have on their first launch. Mirrors `hrdr_agent::trust`'s format:
+/// one canonical directory per line.
+fn pre_trust(cache_home: &std::path::Path, project: &std::path::Path) {
+    let dir = cache_home.join("hrdr");
+    std::fs::create_dir_all(&dir).expect("cache dir");
+    let canonical = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+    std::fs::write(
+        dir.join("trusted-dirs"),
+        format!("{}\n", canonical.display()),
+    )
+    .expect("write trusted-dirs");
 }
 
 /// A live TUI in a pty with a background reader thread, kept open across steps.

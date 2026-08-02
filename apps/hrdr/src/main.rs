@@ -738,6 +738,23 @@ async fn main() -> Result<()> {
         }
     }
 
+    // The working directory decides whether this session may be steered by files
+    // in it. Answered before anything reads `AGENTS.md` or a project skill —
+    // `Agent::new` does both, and the TUI builds one immediately.
+    match trust_gate(&config.cwd, cli.command.is_some()) {
+        TrustGate::Proceed => {}
+        TrustGate::Jail => {
+            // Both, and the second is not optional: `jail` floors at `write` for a
+            // write-capable session (it has no shell and no writers, so a writing
+            // agent cannot run under it), which would hand an untrusted checkout a
+            // write-capable session and load its `AGENTS.md` — the exact opposite
+            // of the answer the user gave. Read-only is what makes the jail hold.
+            config.sandbox = hrdr_tools::SandboxMode::Jail;
+            config.read_only = true;
+        }
+        TrustGate::Stop => return Ok(()),
+    }
+
     match cli.command {
         Some(Command::Run {
             json,
@@ -773,6 +790,128 @@ async fn main() -> Result<()> {
             let command = (!cli.input.is_empty()).then(|| cli.input.join(" "));
             hrdr_tui::run(config, ui, LOGO_ART, command).await
         }
+    }
+}
+
+/// What the trust check decided for this session.
+enum TrustGate {
+    /// The directory is trusted: start normally.
+    Proceed,
+    /// Not trusted: start jailed — read the tree, run nothing out of it.
+    Jail,
+    /// The user cancelled. Start nothing.
+    Stop,
+}
+
+/// Decide whether this working directory may steer the session, asking the user
+/// the first time hrdr is opened in it.
+///
+/// `headless` covers every path with nobody at the keyboard (`hrdr run …`,
+/// `hrdr models`). There is no one to answer, and the two silent answers are both
+/// wrong: trusting by default makes the gate bypassable by adding a subcommand,
+/// and refusing to start breaks every script in a fresh checkout. Jailing is the
+/// third option — the script runs, on the restricted tool set, and says so.
+fn trust_gate(cwd: &std::path::Path, headless: bool) -> TrustGate {
+    trust_gate_with(
+        cwd,
+        headless,
+        hrdr_agent::trust::is_trusted(cwd),
+        ask_to_trust,
+    )
+}
+
+/// The decision itself, with the store read and the question already supplied —
+/// so the table below is testable without moving this process's XDG roots or
+/// finding a terminal to answer on.
+fn trust_gate_with(
+    cwd: &std::path::Path,
+    headless: bool,
+    trusted: bool,
+    ask: impl FnOnce(&std::path::Path) -> hrdr_agent::trust::TrustChoice,
+) -> TrustGate {
+    use hrdr_agent::trust;
+
+    if trusted {
+        return TrustGate::Proceed;
+    }
+    if headless {
+        eprintln!(
+            "hrdr: {} is not a trusted directory — running in jail mode (read-only, no shell).\n\
+             hrdr: open hrdr here interactively once to decide.",
+            cwd.display()
+        );
+        return TrustGate::Jail;
+    }
+    match ask(cwd) {
+        trust::TrustChoice::Trusted => {
+            if let Err(e) = trust::trust(cwd) {
+                // Recording failed, but the user did answer. Honour the answer for
+                // this session and say the answer will not stick, rather than
+                // silently downgrading them to a jail they did not ask for.
+                eprintln!("hrdr: could not record this directory as trusted: {e:#}");
+                eprintln!("hrdr: continuing for this session; you will be asked again.");
+            }
+            TrustGate::Proceed
+        }
+        trust::TrustChoice::Untrusted => TrustGate::Jail,
+        trust::TrustChoice::Cancel => TrustGate::Stop,
+    }
+}
+
+/// Put the question to the user on the terminal, before the TUI starts.
+///
+/// Trusting takes a second confirmation. It is the answer that cannot be undone
+/// by doing nothing — it is written down, and it licenses every future session in
+/// this directory to load instructions out of it — so it is the one answer worth
+/// making the user say twice. Anything unrecognized, EOF included, is `Cancel`:
+/// the safe reading of "I do not know what is being asked" is to open nothing.
+fn ask_to_trust(cwd: &std::path::Path) -> hrdr_agent::trust::TrustChoice {
+    use hrdr_agent::trust::TrustChoice;
+    use std::io::Write;
+
+    println!("\n  hrdr has not been opened in this directory before:\n");
+    println!("    {}\n", cwd.display());
+    println!("  Its AGENTS.md and skill files are instructions that reach the model,");
+    println!("  and its code is what any command you approve will run. Trust it only");
+    println!("  if you know where it came from.\n");
+    println!("    [t] trust      — load this directory's instructions, full tool set");
+    println!("    [u] untrusted  — open in jail mode: read the tree, run nothing from it");
+    println!("    [c] cancel     — quit without opening (default)\n");
+    print!("  Your choice [t/u/c]: ");
+    let _ = std::io::stdout().flush();
+
+    match read_line().as_str() {
+        "t" | "trust" => {
+            print!(
+                "\n  Trusting a directory is remembered. Are you sure? [type `yes` to confirm]: "
+            );
+            let _ = std::io::stdout().flush();
+            match read_line().as_str() {
+                "yes" => {
+                    println!();
+                    TrustChoice::Trusted
+                }
+                _ => {
+                    println!("\n  Not confirmed — opening in jail mode.\n");
+                    TrustChoice::Untrusted
+                }
+            }
+        }
+        "u" | "untrusted" => {
+            println!("\n  Opening in jail mode.\n");
+            TrustChoice::Untrusted
+        }
+        _ => TrustChoice::Cancel,
+    }
+}
+
+/// One trimmed, lowercased line from stdin. EOF reads as empty, which every
+/// caller treats as the cautious answer.
+fn read_line() -> String {
+    let mut s = String::new();
+    match std::io::stdin().read_line(&mut s) {
+        Ok(_) => s.trim().to_ascii_lowercase(),
+        Err(_) => String::new(),
     }
 }
 
@@ -963,6 +1102,50 @@ async fn list_models(config: AgentConfig) -> Result<()> {
         println!("{}://{}", m.provider, m.model);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod trust_gate_tests {
+    use super::*;
+    use hrdr_agent::trust::TrustChoice;
+
+    fn never_asked(_: &std::path::Path) -> TrustChoice {
+        panic!("a trusted directory must not be asked about")
+    }
+
+    #[test]
+    fn a_trusted_directory_is_never_asked_about() {
+        let g = trust_gate_with(std::path::Path::new("/x"), false, true, never_asked);
+        assert!(matches!(g, TrustGate::Proceed));
+    }
+
+    /// Headless has nobody to answer, so it takes the middle answer rather than
+    /// the two bad ones — the script runs, jailed, and stderr says why.
+    #[test]
+    fn headless_in_an_unknown_directory_jails_instead_of_asking() {
+        let g = trust_gate_with(std::path::Path::new("/x"), true, false, never_asked);
+        assert!(matches!(g, TrustGate::Jail));
+    }
+
+    /// A trusted directory short-circuits ahead of the headless branch: adding a
+    /// subcommand must not turn an answered directory into a jailed one.
+    #[test]
+    fn headless_still_honours_an_existing_answer() {
+        let g = trust_gate_with(std::path::Path::new("/x"), true, true, never_asked);
+        assert!(matches!(g, TrustGate::Proceed));
+    }
+
+    #[test]
+    fn declining_jails_and_cancelling_starts_nothing() {
+        let jailed = trust_gate_with(std::path::Path::new("/x"), false, false, |_| {
+            TrustChoice::Untrusted
+        });
+        assert!(matches!(jailed, TrustGate::Jail));
+        let stopped = trust_gate_with(std::path::Path::new("/x"), false, false, |_| {
+            TrustChoice::Cancel
+        });
+        assert!(matches!(stopped, TrustGate::Stop));
+    }
 }
 
 #[cfg(test)]

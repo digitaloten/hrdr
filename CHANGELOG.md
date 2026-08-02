@@ -6,8 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **hrdr asks before it trusts a working directory.** A project's `AGENTS.md`
+  and its `.hrdr/skills` are instructions that reach the model, and they come
+  from a checkout the user may have done nothing but clone. The first time hrdr
+  opens in a directory it asks: **trust** (a second confirmation, then the
+  answer is remembered), **untrusted** (open jailed — read the tree, run nothing
+  from it), or **cancel** (open nothing; also what an unrecognized answer and
+  EOF mean). Trusted directories are stored one per line in
+  `$XDG_CACHE_HOME/hrdr/trusted-dirs`, owner-only.
+
+  **Only the yes is stored**, so declining is asked again next time rather than
+  becoming a decision that quietly sticks. **Matching is on the exact canonical
+  path, never an ancestor** — trusting `~/Projects` must not silently trust
+  `~/Projects/just-cloned`, which is precisely the directory nobody has read.
+  Symlinks resolve to their target, so a link into a trusted tree does not
+  borrow its answer.
+
+  A headless run (`hrdr run …`, `hrdr models`) has nobody to answer, so an
+  unknown directory starts **jailed** and says so on stderr. Trusting by default
+  would make the gate bypassable by adding a subcommand; refusing to start would
+  break every script in a fresh checkout.
+
 ### Changed
 
+- **`AGENTS.md` is read from the working directory only — no ancestor walk.**
+  Trust is answered per directory and never inherited, so instructions are not
+  inherited either. Previously the walk went from the working directory up to
+  the filesystem root, joining every `AGENTS.md` it found. If you relied on a
+  parent directory's file applying to everything beneath it, move those rules
+  into the global (user-level) `AGENTS.md`, which is unaffected. Project skill
+  discovery already worked this way. With one project file and one global file
+  in scope the aggregate instruction budget can no longer be reached, so it is
+  gone; the per-file cap is unchanged and still reports what it skips.
 - **A write-capable sub-agent's result now tells the parent to review the diff
   and run `verify` before trusting it.** The instruction existed already — in
   the spawn acknowledgement and in the delegation prompt — but both are many

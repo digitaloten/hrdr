@@ -79,17 +79,21 @@ walked round it), so there is no list to extend; and there is no `git` tool, so
 nothing runs outside `sandboxed_shell_command`. What is left needs a decision,
 not work.
 
-1. **Full `AGENTS.md` injection scanning, if wanted.** The cheap 80% shipped
-   (`2bee4bf`): a skipped file surfaces as a notice naming path and size, and
-   the block header states the files come from the project tree and cannot
-   override the cardinal rules or the user. A jailed agent now skips the
-   project's `AGENTS.md` and skills entirely, which covers the untrusted-repo
-   case. What is still open is hermes' `_scan_context_content` — blocking a file
-   with a `[BLOCKED: …]` placeholder on an injection heuristic. Deliberately
-   deferred: a regex scanner over project docs false-positives on exactly the
-   repos a coding agent gets pointed at (security tooling, shell-hardening
-   guides, this file), and hermes needed three scopes to make it tolerable.
-   **Wants evidence of a real attempt first.**
+1. **Content scanning for `AGENTS.md`, if ever wanted.** Largely superseded
+   2026-08-02 by the directory trust gate (`hrdr_agent::trust`): the question
+   "may this checkout's files steer my agent" is now answered by the user before
+   anything is read, an unanswered directory opens jailed and loads neither
+   `AGENTS.md` nor project skills, and the read no longer walks ancestors. What
+   was already there stays — a skipped file surfaces as a notice naming path and
+   size, and the block header states the provenance and the ceiling. What is
+   still unbuilt is hermes' `_scan_context_content` — blocking a file with a
+   `[BLOCKED: …]` placeholder on an injection heuristic — which would now only
+   bite inside a directory the user explicitly vouched for. Deliberately
+   deferred, and more so than before: a regex scanner over project docs
+   false-positives on exactly the repos a coding agent gets pointed at (security
+   tooling, shell-hardening guides, this file), hermes needed three scopes to
+   make it tolerable, and a false positive silently drops conventions the user
+   asked for. **Wants evidence of a real attempt first.**
 2. **The test nudge has no teeth.** Fired 3/3 in one session, obeyed 1/3. With
    `verify` in place it has somewhere to escalate to instead of staying
    advisory.
@@ -225,19 +229,23 @@ outlier is most likely to be a mistake rather than a stance.
 
 ### Permissions, isolation, and state
 
-**Instruction surfaces a repo can write, outside `jail`.** From the 2026-07-29
-sub-agent attack-surface audit (traced against codex `81da9de`). `jail` closed
-both for the untrusted-repo case — it loads neither — but every other mode still
-reads them, and that is a deliberate trade rather than an oversight:
+**Instruction surfaces a repo can write.** From the 2026-07-29 sub-agent
+attack-surface audit (traced against codex `81da9de`). The entry point is now
+gated: hrdr asks before it trusts a working directory (`hrdr_agent::trust`), an
+untrusted one opens jailed and loads neither file, and `AGENTS.md` is read from
+the working directory only, so nothing is inherited from an ancestor the user
+never answered for. What the gate does **not** answer is what a trusted
+directory's files may then do:
 
 - **Project `AGENTS.md` is writable by a write sub-agent** and read back as
   project conventions on the parent's next prompt rebuild (`/clear`, `set_cwd`,
-  a new agent), **with no trust framing** — unlike memory, which arrives under
-  `MEMORY_PREAMBLE`'s "trust them but verify". Left open on purpose: `AGENTS.md`
-  is also how a project legitimately carries instructions, and narrowing it
-  costs that. A `// NOTE:` sits on the push site in
-  `build_system_prompt_sections`. The cheap half is a trust frame comparable to
-  memory's — that is the actual open item, not the write.
+  a new agent). The trust answer is given once, at open, so a sub-agent editing
+  the file mid-session changes what the parent reads next without being asked
+  again. Left open on purpose: `AGENTS.md` is also how a project legitimately
+  carries instructions, and narrowing it costs that. A `// NOTE:` sits on the
+  push site in `build_system_prompt_sections`. Closing it would mean the
+  `memory`-tool treatment (main agent only), which that tool could afford
+  because it had no second use.
 - **Project skills shadow built-ins by name.** `skill_dirs` includes
   `cwd/.hrdr/skills`, `cwd/.claude/commands`, `cwd/.opencode/command`, all under
   the writable cwd; project files are discovered _before_ built-ins and win,
@@ -246,6 +254,13 @@ reads them, and that is a deliberate trade rather than an oversight:
   new `Agent::new`. Same shape as `AGENTS.md` but with a **weaker second use** —
   a project skill is a convenience where `AGENTS.md` is a core feature — which
   makes it the stronger candidate of the two if either is closed.
+- **Trust is answered for the directory hrdr opened in, and `set_cwd` moves the
+  agent without re-asking.** The gate runs once, in `main`, before the first
+  `Agent`. A session that starts in a trusted directory and then moves to an
+  untrusted one carries its trusted tool set there and loads the new directory's
+  `AGENTS.md`. Not exercised: no test covers it, and the fix is either re-asking
+  on `set_cwd` (no terminal is available by then — the TUI owns it) or refusing
+  the move. **Needs a decision.**
 
 **Two smaller confinement gaps, verified and unchanged:**
 

@@ -73,6 +73,7 @@ pub use turn::TurnStats;
 mod budget;
 mod config;
 mod hooks;
+pub mod trust;
 mod turn_loop;
 #[cfg(test)]
 pub(crate) use turn_loop::{
