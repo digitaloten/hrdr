@@ -76,6 +76,9 @@ fn visible(raw: &str) -> String {
 /// One run: an untrusted project, the keys to answer with, and what came back.
 struct Asked {
     screen: String,
+    /// Everything painted since the last full-screen clear — i.e. what the user
+    /// is actually looking at, as opposed to every frame ever drawn.
+    last_frame: String,
     /// The trusted-dirs store's contents afterwards, if it was written at all.
     store: Option<String>,
     /// The process left on its own after the keys were sent, rather than having
@@ -188,12 +191,17 @@ fn ask(keys: &[&str]) -> Asked {
     let _ = child.wait();
 
     let store = std::fs::read_to_string(home.path().join("hrdr").join("trusted-dirs")).ok();
-    let out = {
+    let raw = {
         let s = screen.lock().unwrap_or_else(|e| e.into_inner());
-        visible(&s)
+        s.clone()
     };
+    // Each frame begins by homing the cursor and clearing, so the text after the
+    // last clear is the frame on screen.
+    let last_frame = visible(raw.rsplit("\x1b[2J").next().unwrap_or(&raw));
+    let out = visible(&raw);
     Asked {
         screen: out,
+        last_frame,
         store,
         exited_itself,
     }
@@ -288,6 +296,34 @@ fn accepting_the_confirmations_default_records_nothing() {
     assert!(
         asked.store.is_none(),
         "the confirmation's default must not trust: {:?}",
+        asked.store
+    );
+}
+
+/// Declining the confirmation goes back to the first question **in place**. The
+/// menu owns the screen and repaints it, so the header appears once — not once
+/// per visit, scrolled under the last copy.
+#[test]
+fn going_back_from_the_confirmation_does_not_stack_a_second_header() {
+    if skip_for_want_of_a_pty() {
+        return;
+    }
+    // Up to `trust`, Enter to confirm, Enter again on "no, go back".
+    let asked = ask(&["k", "k", "\r", "\r"]);
+    assert_eq!(
+        asked.last_frame.matches("has not been opened").count(),
+        1,
+        "one header on screen after going back, not a stack: {}",
+        asked.last_frame
+    );
+    assert!(
+        !asked.last_frame.contains("Trusting is remembered"),
+        "the confirmation is replaced, not left above: {}",
+        asked.last_frame
+    );
+    assert!(
+        asked.store.is_none(),
+        "going back records nothing: {:?}",
         asked.store
     );
 }

@@ -15,10 +15,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (a second confirmation, then the answer is remembered), **untrusted** (open
   jailed — read the tree, run nothing from it), or **cancel** (open nothing).
   Arrow keys or `j`/`k` move, Enter chooses, Esc cancels, and the selection
-  **starts on cancel** — so a reflex Enter opens nothing. The confirmation
-  likewise starts on "no", which returns to the first question rather than
-  choosing for you. Trusted directories are stored one per line in
-  `$XDG_CACHE_HOME/hrdr/trusted-dirs`, owner-only.
+  **starts on cancel** — so a reflex Enter opens nothing. It draws on the
+  alternate screen in the active hjkl theme's colours, so each question replaces
+  the last rather than scrolling under it, and cancelling leaves the terminal
+  exactly as it was. The confirmation likewise starts on "no", which returns to
+  the first question rather than choosing for you. Trusted directories are
+  stored one per line in `$XDG_CACHE_HOME/hrdr/trusted-dirs`, owner-only.
 
   **Only the yes is stored**, so declining is asked again next time rather than
   becoming a decision that quietly sticks. **Matching is on the exact canonical
