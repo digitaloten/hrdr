@@ -706,14 +706,115 @@ cannot express a completion request at all. These are not wiring oversights: the
 protocol has no vocabulary for them, and `!command` sits in the frontend when it
 belongs below both.
 
-Most of hrdr-tui is rendering, input handling and scrollback, and that part
-stays terminal-specific — but "terminal-specific" has to be _argued_ per feature
-now, not assumed from where the code happens to live today.
+**"Terminal-specific" must be argued from what a browser cannot do, never
+inferred from where the code lives.** The first draft of this entry got that
+wrong — it filed `/goto`/`/find`/`/next`/`/prev` as rightly TUI-only because
+they live in `hrdr-tui/src/app/commands.rs:24-27`. Overruled by the owner: they
+are transcript _navigation_, and half the split is already done
+(`hrdr-app/src/transcript.rs` holds `goto_action`, `FindState`, `find_hits`).
 
-A parity inventory is being taken: every capability gap, classified as
-wiring-only / needs-protocol / needs-moving-out-of-`hrdr-tui` /
-genuinely-terminal-specific, with the concrete `ClientMsg`/`ServerMsg` additions
-and a slice order.
+### The measured picture (audit 2026-08-02)
+
+**The SPA ships in no binary.** `hrdr-web` embeds `../hrdr-ui/dist` only under
+its optional `ui` feature (`crates/hrdr-web/Cargo.toml:12`, `default = []`), and
+the workspace dependency (`Cargo.toml:37`) requests no features — so
+`spa_index_html()` returns `None` and a browser gets a stub page telling it to
+connect a WebSocket. CI's release job needs `[test]`, not `web-ui`, and nothing
+consumes the wasm artifact. **Every SPA-side gap below is gap-on-top-of-gap
+until a one-line feature flag lands.**
+
+**The client cannot reach the shared layer.** `crates/hrdr-ui` (Dioxus, desktop
+
+- web) is 780 lines whose only hrdr dependency is `hrdr-protocol` — not
+  `hrdr-app`. So `themes.rs`, `completion.rs`, `format.rs`, `highlight.rs`,
+  `palette.rs` are unreachable _by construction_. It is `exclude`d from the root
+  workspace (`Cargo.toml:16`), so `cargo test --workspace` never builds it; it
+  has five tests, all in `state.rs`; its version is 0.8.5 against 0.10.0.
+
+hrdr-tui is 16,526 lines, **8,364 production**: drawing 3,144 (37.6%),
+terminal-bound 397 (**4.7%** — `lib.rs` + `tui.rs`), logic 4,823. `App` holds no
+ratatui or crossterm types. The terminal coupling is far smaller than the crate
+size suggests.
+
+### Gaps by cost
+
+**Wiring only, inside the 780-line SPA** — no protocol, no shared-crate change.
+The SPA discards `Notice`, `SetInput` and `Error` (`main.rs:241` is a
+`_ => {}`), so **every slash-command reply the web produces is thrown away** —
+`/status`, `/cost`, `/doctor`, `/help` all answer into the void, and
+`/paste`/`/add`/`/copy` silently do nothing. It never sends `Cancel` (so a turn
+cannot be stopped from a browser) or `Resume` (reconnect is an empty closure).
+It emits a bogus `/switch` on every tab click, which dispatch answers "unknown
+command". Input is an `<input>`, so multiline is impossible. `show_thinking` is
+stored and never read. Tool blocks have no expand toggle while `WebHost` tells
+the user to use one. Plus draft stash, toasts, scrollback and selection — all
+SPA-local.
+
+**Needs protocol:** `!command`; completion of every kind (`@path` _must_ be
+server-side — it ranks against a file index of the server's cwd); the
+`/goto`/`/find`/`/next`/`/prev` family; the six pickers; input history recall;
+per-pane cancellation. Note the last is a _server bug_, not just unwiring:
+`WebSession::cancel` aborts the turn handle only when `key == MAIN_KEY`, so a
+sub-pane cancel never aborts its task.
+
+**Must move out of `hrdr-tui` first:** `submit_input`'s routing rules — its doc
+comment claims they "live here and nowhere else", which is now false, there are
+three implementations of "what did the user mean"; `user_shell_command`;
+`app/completion.rs` (232 lines, depends on nothing terminal); `Selector<T>` (60
+generic lines — moving it keeps picker filtering client-side, so no
+per-keystroke round trip); dispatcher arms for the navigation family; and
+collapsing the `/edit` + `/reload` double implementations.
+
+### Protocol additions
+
+Five pairs cover it: `ClientMsg::Shell`; `Complete`/`Completions` (echo the
+request text rather than carrying a request id — completions are idempotent and
+newest-wins); `ServerMsg::Locate` for search/goto; `Picker`/`PickerChoose`/
+`PickerCancel` collapsing all six modals into one pair; and `LoginSubmit` kept
+**separate** from `PickerChoose` because a credential must not ride the message
+that also carries theme names. `ClientMsg` 5 → 10, `ServerMsg` 8 → 11.
+Completions and search results look alike and must not share a pair — one is a
+non-blocking popup, the other a one-shot viewport instruction.
+
+### Slice order
+
+0. Ship the SPA (feature flag + CI artifact). Blocks everything.
+1. SPA wiring — biggest function-restored-per-effort in the list.
+2. Move `classify_input` + `user_shell_command`, add `Shell`. Early, so there is
+   one answer to "what did the user type" before anything else touches submit.
+3. Per-pane abort (server-only bug fix) — what makes slice 1's Cancel button
+   actually work on a sub-agent.
+4. Move `completion.rs`, then the `Complete` pair. The move must land first —
+   the wire types _are_ the moved types.
+5. Navigation arms + `Locate`, fixing `supports_command` in the same commit.
+6. `Selector<T>` + pickers + collapsing the `/edit`/`/reload` fork.
+7. History, after the client-vs-server ownership decision.
+
+Parallel-safe: {0} → {1} ∥ {2} ∥ {3} → {4} ∥ {5} → {6}. Slices 4 and 5 both
+touch `hrdr-app`; do not give them to concurrent write agents.
+
+### Security consequences of closing the gap
+
+The auth layer is careful — three modes, argon2id, a refuse-to-bind matrix
+requiring TLS off-loopback, 10 failures/min/IP, WS `Origin` checked against
+`Host` including port. Three things need deciding rather than inheriting:
+
+- **There is no authorization, only authentication.** Every authenticated
+  connection attaches to the _same_ `WebSession` and gets the same full
+  capability. Two logged-in users are two hands on one keyboard, not two
+  sessions.
+- **`cookie_secret` regenerates on every start**, so every restart logs every
+  device out — friction that will tempt someone to weaken it on a phone-first
+  workflow. Decide whether to persist it.
+- **`!command` runs unconfined with guardrails explicitly emptied** and a
+  24-hour timeout: `user_shell_command` builds `SandboxPolicy::unconfined()` and
+  clears `ctx.guardrails` ("user's own shell"). Correct for a terminal user at
+  their own machine; over the network a session cookie becomes a day-long
+  unconfined shell on the host. Not a reason to withhold it — a reason to decide
+  deliberately, when it moves into `hrdr-app`, whether the web path reuses that
+  `ToolContext` or a sandbox-respecting one.
+- `LoginSubmit` must stay out of frame logging and off the replay buffer that
+  `Resume` re-sends.
 
 ### Left open by the compaction fix (`/compact` pane targeting)
 
