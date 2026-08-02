@@ -790,16 +790,10 @@ Not bugs; things whose surprise is worth having written down.
   search tool it does not hold — `base.md` says "whichever search tool you hold"
   precisely because there may be none. Worth deciding whether such a profile
   should be refused at load rather than shipped blind.
-- **The prompt tests pin literal prose spans**, so reflowing a paragraph breaks
-  them without changing a rule. Six of the ~10 breaks in the 2026-08-01 voice
-  pass were a phrase moving across a newline, not a phrase being cut. Fixing the
-  prose to satisfy the assertion is the right direction — rewriting assertions
-  to match new prose makes them tautological — but the coupling costs a test
-  round-trip per reflow. Matching on normalized whitespace would remove it.
-- **`write.md` is still 28 KB resident** after the git/release split, and
-  carries ~10 shouted ALL-CAPS rule headers. Emphasis that dense stops
-  selecting. Neither is a defect; both are what is left of "the always-on prompt
-  is too long".
+- **`write.md` is the largest always-on prompt** after the git/release split,
+  and most of its rules carry a shouted ALL-CAPS header. Emphasis that dense
+  stops selecting. Neither is a defect; both are what is left of "the always-on
+  prompt is too long".
 
 - **A mid-stream retry can double the text the user already saw.**
   `drain_stream` forwards `AgentEvent::Text` to the frontend as it arrives, so a
