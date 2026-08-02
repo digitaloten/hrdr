@@ -1695,9 +1695,9 @@ impl Agent {
         if sandbox_mode == hrdr_tools::SandboxMode::Jail {
             tools.cap_to_jail_set();
         } else {
-            // …and every other mode drops the four that exist only for jail. They
+            // …and every other mode drops the tools that exist only for jail. They
             // are `shell`'s job everywhere a shell exists, and one call to it does
-            // all four better; carrying them costs a decision on every turn.
+            // all of them better; carrying them costs a decision on every turn.
             tools.drop_jail_only_tools();
         }
         let delegation_enabled = tools.defs().iter().any(|d| d.function.name == "task");

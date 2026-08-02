@@ -256,10 +256,10 @@ kill it silently.
 `grep`, `find`, `tree`, `ls` are removed from every other mode and kept **only**
 in jail, which has no shell and would otherwise be unable to search or orient.
 
-> **The jail tool set is not a subset of the normal one.** Jail holds four tools
-> no other mode gets. Without this written down, a later cleanup will "fix" the
-> inconsistency by putting `shell` into jail or deleting the search tools as
-> dead code. Both would be wrong.
+> **The jail tool set is not a subset of the normal one.** Jail holds search
+> tools no other mode gets. Without this written down, a later cleanup will
+> "fix" the inconsistency by putting `shell` into jail or deleting the search
+> tools as dead code. Both would be wrong.
 
 ### Kept, and why shell is not enough
 
@@ -1064,7 +1064,7 @@ the plan assumes the stated recommendation for the rest.
   **`replace` is kept** despite low usage: it is the only multi-file
   mechanical-edit path and `edit` has no batch form, so dropping it would push
   mechanical refactors onto `sed -i`.
-- **The `task` family is three tools**: `task`, `task_steer`, `task_cancel`.
+- **The `task` family is** `task`, `task_steer` and `task_cancel`.
   `task_output`, `task_transcript`, `task_revive` and `task_list` are all
   removed — the user watches sub-agent panes live and steers them with `@agent`,
   results are delivered automatically, and reviving a failed run continues from

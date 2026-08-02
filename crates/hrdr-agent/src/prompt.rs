@@ -140,13 +140,13 @@ pub fn capability_sections_for(
     // The jail is the whole shape, not just the search tools: `cap_to_jail_set`
     // leaves an agent that holds them, holds no shell, and cannot write. Testing
     // all three matters because `ToolRegistry::with_defaults` also registers the
-    // four — `Agent::new` is what strips them for every other mode — so a prompt
+    // jail-only tools — `Agent::new` strips them for every other mode — so a prompt
     // built from a raw default registry would otherwise be told it is jailed
     // while holding a shell and every write tool.
     let jailed = has_jail_tools && !can_write && shell.is_none();
     // First, because for a jailed agent it is the only capability section there
     // is: `can_write` and `can_delegate` are both false, so every gate below is
-    // skipped and this would otherwise be an agent told nothing about the four
+    // skipped and this would otherwise be an agent told nothing about the
     // tools that exist solely for it.
     if jailed {
         out.push((SECTION_JAIL, frag::JAIL));
@@ -475,7 +475,7 @@ const SKILL_DESCRIPTION_MAX_CHARS: usize = 120;
 
 /// The skill listing — what the `skill` tool can load, as `name — description`
 /// lines. Bodies are never inlined: that is the whole point of the tool (pay for
-/// one procedure when it applies, not for all ten every turn).
+/// one procedure when it applies, not for every one every turn).
 ///
 /// Empty — and so dropped by [`SystemPrompt::push`] — when there are no skills or
 /// when this agent has no `skill` tool (a custom profile's `tools:` allow-list can
@@ -764,18 +764,18 @@ const AGENTS_FILE: &str = "AGENTS.md";
 /// Max bytes for a single AGENTS.md file; a larger one is skipped whole — and
 /// recorded as a [`SkippedAgentDoc`], because a user instruction dropped in
 /// silence is worse than one that was never written.
-const MAX_AGENTS_FILE_BYTES: u64 = 64 * 1024; // 64 KiB
+const MAX_AGENTS_FILE_BYTES: u64 = 64 * 1024;
 
 /// Aggregate ceiling on ALL gathered instruction bytes — every `AGENTS.md` up
-/// the ancestor chain plus the one global file, combined. 1 MiB is ~16 full
-/// 64 KiB files, already far more instruction text than any real project
-/// carries, so a genuine checkout never approaches it; the cap only stops a
+/// the ancestor chain plus the one global file, combined. It holds many files at
+/// the per-file [`MAX_AGENTS_FILE_BYTES`] cap, already far more instruction text
+/// than any real project carries, so a genuine checkout never approaches it; the cap only stops a
 /// hostile or accidental deep tree of large `AGENTS.md` files from reading
 /// unbounded bytes into the prompt. When it bites we keep the nearest
 /// (most-specific) files and drop the farthest ancestors, since the walk is
 /// cwd-first — and the file the budget ran out on is recorded as a
 /// [`SkippedAgentDoc`] so the truncation is not silent either.
-const MAX_AGENTS_TOTAL_BYTES: usize = 1024 * 1024; // 1 MiB
+const MAX_AGENTS_TOTAL_BYTES: usize = 1024 * 1024;
 
 /// Collect project instructions from `AGENTS.md` files, walking from `cwd` up to
 /// the filesystem root, plus global instruction files from standard locations.
@@ -2545,6 +2545,50 @@ mod tests {
         );
         assert!(
             p.contains("the\n  comment outlives the checking nobody did"),
+            "{p}"
+        );
+    }
+
+    /// A comment must point at a value rather than restate it.
+    ///
+    /// Prompted by a real cleanup: removing a frontend left "Four `CommandHost`
+    /// impls" when there were three, "nine-crate workspace" in two comments after
+    /// the workspace shrank, and a CI note claiming a publish count the list no
+    /// longer had. None of them broke anything, and every one read as verified.
+    ///
+    /// Both halves have to arrive together. Told only "drop the number", a model
+    /// deletes a genuinely useful cap from a doc; told only "name the constant",
+    /// it invents a `const` to hold a count of source elements. So the rule
+    /// separates a count of code (drop it) from a value something already owns
+    /// (name the owner), and sends an unnamed literal to a `const` first.
+    #[test]
+    fn the_prompt_forbids_restating_values_in_comments() {
+        let tools = ToolRegistry::with_defaults();
+        let p = render_system(&tools, false).unwrap();
+        assert!(
+            p.contains("A COMMENT POINTS AT A VALUE, IT NEVER REPEATS IT"),
+            "{p}"
+        );
+        // Counting code elements: the number goes, the sentence stays.
+        assert!(
+            p.contains("loses the number entirely"),
+            "a count of code elements must be dropped, not renamed: {p}"
+        );
+        // A value with an owner: name the owner instead of its digits.
+        assert!(p.contains("rather than\n  restating its digits"), "{p}");
+        // The "doing something wrong" case — an unnamed literal.
+        assert!(
+            p.contains("hoist it to a named\n  constant"),
+            "an unnamed literal is the defect the rule is really about: {p}"
+        );
+        // A derived total belongs in a check that can go red.
+        assert!(
+            p.contains("put it in an assertion rather than a\n  sentence"),
+            "{p}"
+        );
+        // Without the carve-out the model strips spec and API constants too.
+        assert!(
+            p.contains("Numbers fixed outside your code are exempt"),
             "{p}"
         );
     }

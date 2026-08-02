@@ -6,9 +6,10 @@
 use std::path::{Path, PathBuf};
 
 /// Expand `@path` mentions in `input` (resolved under `cwd`) for sending to the
-/// model: a **file** contributes its contents, truncated at 100 KiB on a char
-/// boundary; a **directory** contributes a one-level listing of what it holds,
-/// since a directory is a pointer at files to read rather than content itself.
+/// model: a **file** contributes its contents, truncated at
+/// [`MAX_ATTACH_BYTES`] on a char boundary; a **directory** contributes a
+/// one-level listing of what it holds, since a directory is a pointer at files
+/// to read rather than content itself.
 /// Each distinct path is attached once under a trailing "Referenced paths"
 /// section; unreadable/missing/duplicate references are skipped. Returns `input`
 /// unchanged when nothing resolves. The display copy should keep the bare

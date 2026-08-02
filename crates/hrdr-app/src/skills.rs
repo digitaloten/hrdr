@@ -92,7 +92,7 @@ mod tests {
     }
 
     /// The picker filter matches across name, description and source — the
-    /// three fields the `/skills` rows show.
+    /// fields the `/skills` rows show.
     #[test]
     fn filter_matches_name_description_and_source() {
         let skills = vec![skill("ship", "release checklist"), skill("audit", "review")];

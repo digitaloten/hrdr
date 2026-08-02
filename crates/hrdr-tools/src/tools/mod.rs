@@ -1332,7 +1332,7 @@ mod tests {
     /// the next commit is silent.
     ///
     /// `cargo` is shadowed by a shell function so this asserts on the ledger
-    /// rather than spawning an eight-crate suite; the ledger classifies the
+    /// rather than spawning the real suite; the ledger classifies the
     /// command text, which is exactly what a real session hands it.
     #[cfg(unix)]
     #[tokio::test]

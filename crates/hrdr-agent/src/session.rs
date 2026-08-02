@@ -374,7 +374,7 @@ impl SessionState {
     }
 }
 
-/// Maximum size of a single session file we are willing to load (100 MiB).
+/// Maximum size of a single session file we are willing to load.
 ///
 /// This prevents OOM from a corrupt or pathologically large session file.
 /// The limit is generous: even a conversation with tens of thousands of turns
@@ -1392,8 +1392,14 @@ pub fn save_session(state: &SessionState) -> anyhow::Result<Option<SaveOutcome>>
     }))
 }
 
+/// Longest auto-derived session name, in characters. Long enough to stay
+/// recognisable in the `/resume` picker, short enough that the name column does
+/// not push the other columns off a narrow terminal.
+pub const SESSION_NAME_MAX_CHARS: usize = 60;
+
 /// A short session name derived from the first user message (first line, trimmed,
-/// capped at 60 chars). Falls back to `"untitled"` when there's no usable text.
+/// capped at [`SESSION_NAME_MAX_CHARS`]). Falls back to `"untitled"` when there's
+/// no usable text.
 pub fn session_name_from(msgs: &[Message]) -> String {
     msgs.iter()
         .find(|m| m.role == MessageRole::User)
@@ -1407,7 +1413,7 @@ pub fn session_name_from(msgs: &[Message]) -> String {
                 .unwrap_or("")
                 .trim()
                 .chars()
-                .take(60)
+                .take(SESSION_NAME_MAX_CHARS)
                 .collect::<String>()
         })
         .filter(|s| !s.is_empty())

@@ -32,7 +32,7 @@ pub(crate) fn checkpoint_warning_round(max_steps: usize) -> Option<usize> {
 /// authoritative tool result, so both channels are bounded rather than
 /// unbounded: a tool that emits output faster than the UI drains it (e.g. a
 /// shell command printing millions of lines) must never queue without limit.
-/// 1024 lines is generous for a normal burst — far more than a screen's worth
+/// The cap is generous for a normal burst — far more than a screen's worth
 /// — while keeping the per-in-flight-tool buffer small and fixed; anything past
 /// the cap is dropped (`try_send` returns `Full`), never queued or blocked on.
 ///
@@ -59,7 +59,7 @@ const REPEAT_REFUSE_AFTER: u32 = 2;
 const REPEAT_NUDGE_AFTER: u32 = 3;
 
 /// Byte budget for per-turn **relevance recall** injected alongside the opening
-/// user message (the full text of the most relevant memories). 4 KiB stays small
+/// user message (the full text of the most relevant memories). It stays small
 /// next to the always-loaded pointer index (~25 KB) while giving the model room
 /// for a few complete facts; recall truncates/drops entries to never exceed it.
 const MEMORY_RECALL_BUDGET: usize = 4 * 1024;

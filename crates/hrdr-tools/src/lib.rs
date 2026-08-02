@@ -597,7 +597,7 @@ pub struct TrackedSigs(Vec<(FileSig, PathBuf)>);
 
 /// A shell command shortened for an error message: whitespace collapsed (a
 /// heredoc or line-continuation must not spray across the message) and cut to
-/// 80 characters. The model only needs to recognize *which* command ran.
+/// `MAX` characters. The model only needs to recognize *which* command ran.
 fn shorten_command(command: &str) -> String {
     const MAX: usize = 80;
     let flat = command.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1429,8 +1429,8 @@ pub(crate) fn timeout_floor_note(asked: u64, used: u64) -> String {
 /// The tool set a [`SandboxMode::Jail`] agent holds, and the whole of it.
 ///
 /// **Deliberately not a subset of the normal set.** `grep`, `find`, `tree` and
-/// `ls` exist *for* this mode — every other mode has `shell`, which does all four
-/// better — so jail holds four tools no other mode gets. Without that written
+/// `ls` exist *for* this mode — every other mode has `shell`, which does all of
+/// them better — so jail holds search tools no other mode gets. Without that written
 /// down, a later cleanup "fixes" the inconsistency by either putting `shell` into
 /// jail or deleting the search tools as dead code, and both are wrong.
 ///
@@ -1446,10 +1446,10 @@ pub(crate) fn timeout_floor_note(asked: u64, used: u64) -> String {
 /// and the next agent someone writes with `sandbox: jail` silently gets a network.
 pub const JAIL_TOOLS: [&str; 5] = ["read", "grep", "find", "ls", "tree"];
 
-/// The four tools that exist **only** for jail, and are removed from every other
+/// The tools that exist **only** for jail, and are removed from every other
 /// mode: `grep`, `find`, `ls`, `tree`.
 ///
-/// Every other mode has `shell`, which does all four better and in one call — and
+/// Every other mode has `shell`, which does all of them better and in one call — and
 /// more tools is not more capability, it is more to choose between on every turn.
 /// The evidence for cutting them was not usage (a tool the model was handed gets
 /// called; that measures availability) but the reverse case: tools that were

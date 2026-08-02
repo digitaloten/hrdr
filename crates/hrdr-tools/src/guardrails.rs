@@ -271,7 +271,7 @@ pub fn check_guardrails<'a>(command: &str, rails: &'a [Guardrail]) -> Option<&'a
 const MAX_NESTED_PAYLOAD_BYTES: usize = 64 * 1024;
 /// never run them — a model that shells one out is (wrongly) trying to poll a
 /// background task, which just errors in a loop.
-/// Kept as the FULL historical set, not just the three tools that exist. A model
+/// Kept as the FULL historical set, not just the tools that exist. A model
 /// trained on an older hrdr (or on another harness) reaches for `task_output` or
 /// `task_list` by name, and shelling out a tool that no longer exists produces
 /// `command not found` — which reads as a broken machine rather than as a tool it

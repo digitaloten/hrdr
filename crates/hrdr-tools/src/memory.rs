@@ -60,7 +60,7 @@ struct MemoryArgs {
     query: Option<String>,
 }
 
-/// The four kinds of memory, in the order they appear in the index.
+/// The kinds of memory, in the order they appear in the index.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MemType {
     User,

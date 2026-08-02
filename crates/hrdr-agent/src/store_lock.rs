@@ -57,9 +57,10 @@ const STALE_LOCK_AGE_SECS: u64 = 60;
 /// (every attempt fails) or a wedged peer cannot hang a login forever.
 const LOCK_ACQUIRE_ATTEMPTS: u32 = 100;
 
-/// Delay between acquisition attempts. `100 * 50ms = 5s` worst-case wait, which
-/// comfortably outlasts any honest read-modify-write of a small credential file
-/// while still failing fast against a truly stuck lock.
+/// Delay between acquisition attempts. Together with [`LOCK_ACQUIRE_ATTEMPTS`]
+/// it bounds the worst-case wait, which comfortably outlasts any honest
+/// read-modify-write of a small credential file while still failing fast against
+/// a truly stuck lock.
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// RAII cross-process write lock for a credential store file.

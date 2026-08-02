@@ -46,7 +46,7 @@ const CATALOG_TTL_MS: u64 = 5 * 60 * 1000;
 /// the caller and the "timeout" stale-cache trigger could never fire.
 const CATALOG_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Hard cap (10 MiB) on the catalog body, enforced while streaming so a hostile
+/// Hard cap on the catalog body, enforced while streaming so a hostile
 /// endpoint cannot force an unbounded allocation before the check fires.
 const MAX_CATALOG_BYTES: usize = 10 * 1024 * 1024;
 

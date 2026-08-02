@@ -235,7 +235,7 @@ pub(crate) enum TurnMsg {
 /// empty. A bound is still needed for the window where the consumer is *not*
 /// draining — a slow `terminal.draw`, or the seconds/minutes the loop is
 /// suspended inside `$EDITOR` — while a fast local model streams tokens. The
-/// old unbounded channel let that window queue without limit. 1024 leaves
+/// old unbounded channel let that window queue without limit. The cap leaves
 /// generous headroom for the control events (tool start/end, notices, usage)
 /// that accrue during such a stall — the token deltas themselves are coalesced
 /// by [`EventSender`] into O(1) messages — while capping worst-case memory.

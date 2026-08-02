@@ -172,6 +172,24 @@ Correctness:
   the values, read the specification, write the one-case test. Overstating what a
   mechanism gives you is how a correct implementation grows a false guarantee: the
   comment outlives the checking nobody did.
+- A COMMENT POINTS AT A VALUE, IT NEVER REPEATS IT. Nothing recomputes prose when
+  the code beneath it changes, so a number written into a comment is wrong the
+  moment someone edits what it describes — and it goes on reading as verified. A
+  count of code elements ("four impls", "the three call sites", "a nine-crate
+  workspace") loses the number entirely: "every impl", "each call site", "the
+  workspace" all read fine, because the count was decoration. A value some
+  constant, default or config key already owns ("capped at 1024 lines",
+  "defaults to 30s") names that item and lets the reader follow it, rather than
+  restating its digits. If the value has no name to point at — a bare literal
+  sitting in an expression — that is the real defect: hoist it to a named
+  constant, document it there, and use it at the call site. Needing to write a
+  number into a comment is a signal the value belongs in a variable and is not in
+  one yet. When a derived total genuinely earns explaining — a retry budget's
+  whole duration, a buffer's worst case — put it in an assertion rather than a
+  sentence: a test goes red when its inputs move, and a comment never can.
+  Numbers fixed outside your code are exempt — a wire format's field width, an
+  upstream API's cap, an RFC's range, a dated account of what once happened —
+  since none of them drift when you edit.
 - Any number or status you write into a doc, changelog, README or plan must come
   from a command you just ran, pasted from its output: test counts, benchmark
   figures, coverage, a phase marked done. Never estimate one, and never carry an

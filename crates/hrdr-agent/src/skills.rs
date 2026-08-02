@@ -41,17 +41,17 @@ const BUILTIN_TIDY: &str = include_str!("templates/skills/tidy.md");
 const BUILTIN_PERF: &str = include_str!("templates/skills/perf.md");
 
 /// Max bytes for a single skill file; files larger than this are skipped.
-const MAX_SKILL_FILE_BYTES: u64 = 64 * 1024; // 64 KiB
+const MAX_SKILL_FILE_BYTES: u64 = 64 * 1024;
 
 /// Aggregate ceilings on skill ingestion across ALL skill dirs combined: at
 /// most this many skill files read, and at most this many total bytes. A real
-/// setup has a handful of small skill Markdown files, so 256 files / 4 MiB is
+/// setup has a handful of small skill Markdown files, so these ceilings are
 /// far beyond anything genuine — the cap only stops a hostile or accidental
 /// directory full of files from making hrdr read unbounded bytes on every `:`
 /// input and skill listing. Once either is hit we stop reading and warn; the
 /// built-ins are always appended regardless.
 const MAX_SKILLS: usize = 256;
-const MAX_SKILLS_TOTAL_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+const MAX_SKILLS_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 
 /// One discovered skill.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,8 +163,9 @@ pub fn discover_skills(cwd: &Path, project: crate::prompt::ProjectInstructions) 
         if truncated {
             // Silent on purpose: `discover_skills` runs inside the TUI (on every
             // cwd change and `:`-completion), so writing to stderr here would
-            // corrupt the display. The cap is a defensive ceiling (256 files /
-            // 4 MiB) no real setup reaches, so there is nothing actionable to say.
+            // corrupt the display. The cap is a defensive ceiling (`MAX_SKILLS` /
+            // `MAX_SKILLS_TOTAL_BYTES`) no real setup reaches, so there is nothing
+            // actionable to say.
             break;
         }
     }
@@ -380,8 +381,8 @@ pub fn expand_body(skill: &Skill, arguments: &str) -> String {
 pub(crate) type SharedSkills = Arc<Mutex<Vec<Skill>>>;
 
 /// Cap on the bytes one `skill` call returns. Discovery already refuses a skill
-/// file over 64 KiB, so this only bounds a pathological one; it is deliberately
-/// far above `ctx.max_output` (5 KiB by default) because a skill body is a
+/// file over [`MAX_SKILL_FILE_BYTES`], so this only bounds a pathological one; it
+/// is deliberately far above `ctx.max_output` because a skill body is a
 /// *procedure the model just asked for by name*, and half a procedure is worse
 /// than the tokens — the model would follow it anyway. Overflow still spills to
 /// a file it can `read`, like every other tool's.
@@ -498,7 +499,7 @@ impl hrdr_tools::Tool for SkillTool {
 }
 
 /// Skill names for an unknown-name error: all of them while that is a readable
-/// list, otherwise the first few plus a count — a wall of 256 names is how a
+/// list, otherwise the first few plus a count — a wall of names is how a
 /// half-remembered name gets matched onto the wrong skill.
 fn known_names(skills: &[Skill]) -> String {
     const SHOWN: usize = 40;
@@ -1039,7 +1040,7 @@ mod tests {
         assert!(tool.execute(serde_json::json!({}), &ctx).await.is_err());
     }
 
-    /// The unknown-name list is bounded: a directory of 256 skills must not dump
+    /// The unknown-name list is bounded: a directory of many skills must not dump
     /// every name into one error, which is how a half-remembered name gets matched
     /// onto the wrong skill.
     #[test]

@@ -370,7 +370,7 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "stdio"
     }
 
     /// Exercise every capability the mock advertises: the `echo` tool, resource
-    /// list/read, and prompt list/get. Shared across all three transports.
+    /// list/read, and prompt list/get. Shared across every transport.
     #[cfg(unix)]
     async fn exercise_all(server: &str, tools: Vec<Arc<dyn Tool>>) {
         let by = |suffix: &str| {

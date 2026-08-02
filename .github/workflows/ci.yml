@@ -464,8 +464,8 @@ jobs:
                 return 1
               fi
             done
-            # Six attempts honouring the server's own timestamps: a whole release
-            # publishes 7 crates, and crates.io refills the "updates to existing
+            # Every attempt honours the server's own timestamp: a whole release
+            # publishes every crate in `ORDER`, and crates.io refills the "updates to existing
             # crates" bucket about once a minute, so a release cut minutes after
             # another one needs real patience here.
             echo "::error::publish failed for ${crate} after 6 rate-limit retries"

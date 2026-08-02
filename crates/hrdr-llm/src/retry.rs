@@ -21,10 +21,13 @@ use std::time::Duration;
 
 /// Attempts — not retries — one logical operation gets before it gives up.
 ///
-/// Ten attempts means nine waits: 5, 10, 20, 40, 60, 60, 60, 60, 60 seconds —
-/// 375 s, a shade over six minutes of riding out a provider's bad afternoon.
-/// The old budgets (4 connect, 3 drain, 3 compaction) gave up after roughly 8
-/// seconds of backoff, which is shorter than most rate-limit windows.
+/// Each wait doubles from [`FIRST_BACKOFF`] and is capped at [`MAX_BACKOFF`],
+/// so the budget adds up to several minutes of riding out a provider's bad
+/// afternoon. The total is not written out here — it is derived from those three
+/// constants and would rot the moment one of them moved; it is pinned instead by
+/// `default_budget_outlasts_a_rate_limit_window`, which fails if a change to any
+/// of the three drags it out of range. The per-loop budgets this replaced gave
+/// up after a few seconds of backoff, far shorter than most rate-limit windows.
 const MAX_ATTEMPTS: usize = 10;
 
 /// The wait after the first failure; each subsequent wait doubles it.
@@ -117,8 +120,8 @@ pub struct RetryAttempt {
 /// One assistant round is one operation: connecting the stream and draining it
 /// share a single budget, because they are two ways for the same request to
 /// fail and the model does not care which one hit. Passing this value into both
-/// is what makes "10 attempts" the truth for a round instead of 10 per loop,
-/// multiplied wherever the loops nest.
+/// is what makes the policy's attempt count the truth for a whole round, rather
+/// than a separate allowance per loop, multiplied wherever the loops nest.
 #[derive(Debug)]
 pub struct RetryBudget {
     policy: RetryPolicy,
@@ -432,6 +435,29 @@ pub fn retry_after_hint(e: &anyhow::Error) -> Option<Duration> {
 mod tests {
     use super::*;
     use crate::{ChatError, ChatErrorKind};
+
+    /// The default budget exists to outlast a provider's rate-limit window, and
+    /// how long it actually lasts is derived from [`MAX_ATTEMPTS`],
+    /// [`FIRST_BACKOFF`] and [`MAX_BACKOFF`]. That total used to be spelled out
+    /// in a comment, where nothing updated it when one of the three moved. It
+    /// lives here instead: change any of them enough to matter and this goes
+    /// red, which a comment can never do.
+    #[test]
+    fn default_budget_outlasts_a_rate_limit_window() {
+        let p = RetryPolicy::default();
+        // `max_attempts` attempts means one fewer wait between them.
+        let total: Duration = (1..p.max_attempts).map(|retry| p.backoff(retry)).sum();
+        assert!(
+            total >= Duration::from_secs(5 * 60),
+            "the default retry budget is {total:?} — too short to sit out a \
+             typical rate-limit window"
+        );
+        assert!(
+            total <= Duration::from_secs(10 * 60),
+            "the default retry budget is {total:?} — long enough that a turn \
+             looks hung rather than patient"
+        );
+    }
 
     fn chat_err(kind: ChatErrorKind, retry_after: Option<Duration>) -> anyhow::Error {
         anyhow::Error::new(ChatError {

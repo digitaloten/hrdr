@@ -22,7 +22,7 @@
 /// buffers without limit for as long as bytes keep arriving. Tens of MB is
 /// far beyond any legitimate SSE line or event payload (chat deltas run
 /// bytes to low KB).
-const MAX_BUFFER_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+const MAX_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
 /// One complete SSE event, yielded by [`SseDecoder`] after its blank-line
 /// terminator is received.

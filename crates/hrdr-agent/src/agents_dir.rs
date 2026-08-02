@@ -30,17 +30,17 @@ use anyhow::{Result, bail};
 use crate::SubagentProfile;
 
 /// Max bytes for a single agent profile file; files larger than this are skipped.
-const MAX_AGENTS_FILE_BYTES: u64 = 64 * 1024; // 64 KiB
+const MAX_AGENTS_FILE_BYTES: u64 = 64 * 1024;
 
 /// Aggregate ceilings on agent-profile ingestion in one directory: at most this
 /// many profile files, and at most this many total bytes across them. A real
 /// `.claude/agents` (or `.hrdr/agents`) holds a handful of small Markdown
-/// files, so 256 files / 4 MiB is orders of magnitude beyond anything genuine —
+/// files, so these ceilings are orders of magnitude beyond anything genuine —
 /// the cap only stops a hostile or accidental directory full of files from
 /// making hrdr read unbounded bytes. Once either is hit we stop reading the
 /// directory and warn.
 const MAX_AGENT_PROFILES: usize = 256;
-const MAX_AGENT_PROFILES_TOTAL_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
+const MAX_AGENT_PROFILES_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Discover agent-definition files across the Claude/opencode/hrdr locations,
 /// relative to `cwd` for project scopes and the home/XDG dirs for user scopes.

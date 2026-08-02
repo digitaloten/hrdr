@@ -448,8 +448,8 @@ impl AgentRegistry {
     /// repair: that one edits already-folded [`crate::Entry`]s, and a *live*
     /// crash has to settle the thing the entries are folded FROM. So this hands
     /// back events. Emitted the way the turn's own events are emitted, they
-    /// reach the TUI, the web frontend and the durable jsonl through the one
-    /// fold ([`crate::transcript::apply_event`]) all three already share, rather
+    /// reach the TUI and the durable jsonl through the one
+    /// fold ([`crate::transcript::apply_event`]) they already share, rather
     /// than being patched into one renderer and missing in the others.
     ///
     /// The caller emits them rather than this recording them itself, because the

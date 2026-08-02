@@ -2,9 +2,9 @@
 //! still holds.
 //!
 //! A session ran `cargo test -p hrdr-app -p hrdr-llm`, read the green summary,
-//! edited three more files, committed, and reported the work verified. Two of
-//! eight crates were covered and the run predated half the edits. Nothing in the
-//! harness noticed, because nothing was keeping score.
+//! edited three more files, committed, and reported the work verified. Only a
+//! couple of the workspace's crates were covered and the run predated half the
+//! edits. Nothing in the harness noticed, because nothing was keeping score.
 //!
 //! This keeps score. Every source mutation bumps [`source_epoch`]; every shell
 //! command that looks like a check is classified and recorded against the epoch
@@ -725,7 +725,7 @@ fn classify_cargo(args: &[&str]) -> Option<(CheckKind, Scope)> {
 ///
 /// Bare `cargo test` is *partial* even though it covers everything in a
 /// single-crate project: from the command line alone there is no telling a
-/// single-crate project from an eight-crate workspace where it covers one, and
+/// single-crate project from a multi-crate workspace where it covers one, and
 /// the wrong guess in that direction is the exact reassurance this file exists to
 /// withhold.
 fn cargo_scope(args: &[&str]) -> Scope {

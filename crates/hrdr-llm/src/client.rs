@@ -297,11 +297,11 @@ pub(crate) fn classify_status(status: u16) -> ChatErrorKind {
 
 /// Turn a non-2xx HTTP response into the typed error every backend reports.
 ///
-/// One definition, called from all three backends (this one, `anthropic.rs`,
+/// One definition, called from every backend (this one, `anthropic.rs`,
 /// `codex.rs`), which each carried a byte-identical copy of it. They were
 /// identical because they must be — the agent's retry and compaction decisions
 /// read `kind`/`retry_after`, so a backend that classified differently would
-/// silently retry differently — and three copies is exactly the shape that
+/// silently retry differently — and a copy per backend is exactly the shape that
 /// drifts. Consumes `resp`: the body is read (capped) for the diagnostic.
 pub(crate) async fn error_from_response(resp: reqwest::Response) -> anyhow::Error {
     let status = resp.status();
@@ -631,7 +631,7 @@ fn is_auth_header_name(name: &str) -> bool {
 /// arriving through `extra_headers` would ride on the wire *alongside* the real
 /// credential — and which of two same-named headers a server or proxy honors is
 /// undefined. Dropping the configured one leaves exactly one credential on the
-/// request. Shared by all three backends' request builders so the guarantee
+/// request. Shared by every backend's request builder so the guarantee
 /// can't drift between them.
 pub(crate) fn apply_extra_headers(
     mut req: reqwest::RequestBuilder,
@@ -2220,14 +2220,14 @@ mod tests {
         }
     }
 
-    /// The same failure, delivered mid-stream by each of the three backends,
+    /// The same failure, delivered mid-stream by each backend,
     /// must reach hrdr-agent's retry loop as the same [`ChatErrorKind`] — that
     /// kind is the entire difference between backing off and abandoning the
     /// turn, and a user switching providers should not get a different answer to
     /// "is this worth retrying".
     ///
     /// Every backend is tested against this alone elsewhere; nothing compares
-    /// them, and the three classifiers have nothing in common but their output.
+    /// them, and the classifiers have nothing in common but their output.
     /// The OpenAI one (in `Client::chat_stream` above) substring-matches
     /// `type`/`code` *and* runs a numeric `code`/`status` through
     /// [`classify_status`]; `anthropic::map_event` matches three exact type
@@ -3227,7 +3227,7 @@ mod tests {
     ///
     /// The kind is what hrdr-agent's retry and compaction decisions read, so a
     /// dropped arm is not a cosmetic problem: it is a turn that dies instead of
-    /// retrying, or one that never compacts. The four call sites of this
+    /// retrying, or one that never compacts. The call sites of this
     /// function were all indirect before this test — the closest thing to
     /// coverage was one end-to-end 413 on the OpenAI path.
     #[test]
@@ -3301,7 +3301,7 @@ mod tests {
 
     /// One case per [`ChatErrorKind`]: the typed error must carry the status
     /// through, classify it with [`classify_status`], and pick `Retry-After` off
-    /// the response headers — the three fields hrdr-agent reads — while leaving
+    /// the response headers — the fields hrdr-agent reads — while leaving
     /// the server's own body in `message` for the untyped fallback scanner.
     #[tokio::test]
     async fn error_from_response_round_trips_status_kind_and_retry_after() {

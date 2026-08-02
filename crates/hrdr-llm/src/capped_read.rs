@@ -13,18 +13,18 @@ use futures_util::StreamExt;
 /// etc.) while avoiding unbounded allocation for error display and wire logs.
 pub const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 
-/// Maximum bytes for a structured JSON response body (**1 MiB**).
+/// Maximum bytes for a structured JSON response body.
 ///
 /// Used for model listings and other provider metadata endpoints that may
 /// return many entries. Rejects oversized responses rather than growing
 /// unbounded.
 pub const MAX_STRUCTURED_JSON_BYTES: usize = 1024 * 1024;
 
-/// Maximum bytes for the models.dev catalog (**32 MiB**).
+/// Maximum bytes for the models.dev catalog.
 ///
 /// The catalog is a *whole-ecosystem* index — every provider, every model, with
 /// prices, limits and capabilities — and is a different order of magnitude from a
-/// single endpoint's `/v1/models`. It passed 3 MiB some time ago, and the 1 MiB
+/// single endpoint's `/v1/models`. It passed 3 MiB some time ago, and the
 /// [`MAX_STRUCTURED_JSON_BYTES`] cap had been silently rejecting it ever since:
 /// [`crate::catalog::fetch`] treats any read error as "no catalog", so the fetch
 /// failed, nothing was cached, and every consumer fell back to whatever it could
@@ -40,7 +40,7 @@ pub const MAX_CATALOG_JSON_BYTES: usize = 32 * 1024 * 1024;
 /// the caller's limit.
 pub const TRUNCATION_MARKER: &str = "\n… [truncated]";
 
-/// Maximum size for the `HRDR_LOG_REQUESTS` log file in bytes (**10 MiB**).
+/// Maximum size for the `HRDR_LOG_REQUESTS` log file in bytes.
 ///
 /// When the active file reaches this size it is rotated: renamed to
 /// `<name>.1` (replacing any previous `.1`) and a fresh active file is

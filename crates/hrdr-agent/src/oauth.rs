@@ -44,7 +44,7 @@ pub const OPENAI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 
 /// The unreserved character set for a PKCE verifier (RFC 7636 §4.1).
 const PKCE_CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
-/// Verifier length. 64 sits comfortably inside the spec's 43–128 range.
+/// Verifier length. Sits comfortably inside the spec's 43–128 range.
 const PKCE_VERIFIER_LEN: usize = 64;
 /// The OpenRouter callback server gives up after this long (matches codex.ts).
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);

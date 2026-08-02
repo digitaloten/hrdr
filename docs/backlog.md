@@ -532,13 +532,13 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   carry default bodies that list the choices as text "for a frontend without
   modal support" — that frontend was `hrdr-web`. `TuiHost`
   (`hrdr-tui/src/app/commands.rs`) overrides every one of them, so the only
-  callers left are the two test hosts, `TestHost` (`commands/dispatch.rs`) and
+  callers left are the test hosts, `TestHost` (`commands/dispatch.rs`) and
   `RouteTestHost` (`login.rs`). Same shape for `supports_command`: the trait
   default is `true`, `TuiHost` returns `true` with the comment "the TUI
   implements the full registry", and `help_body_for`'s `show` closure therefore
   never filters anything in production — nor in tests, which never pass a
   closure that returns `false`. Deleting the defaults would force the test hosts
-  to spell out seven no-ops; keeping them keeps a documented seam. Worth a
+  to spell out the no-ops; keeping them keeps a documented seam. Worth a
   decision either way rather than drifting.
 
 ---
@@ -550,13 +550,13 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   and nothing asserts them; `wire_log_native_backends.rs` filters on
   `kind == "request"` only. The reason it was impossible is gone —
   `Client::set_backend_for_test` (`c5a6019`) makes both native paths reachable
-  from a `127.0.0.1` mock, and seven tests now drive them. Ordinary work now,
-  not a blocked item.
+  from a `127.0.0.1` mock, and tests now drive them. Ordinary work now, not a
+  blocked item.
 - **No end-to-end test consumes a real `Retry-After`.** hrdr-agent's `MockResp`
-  has three variants (`Sse`, `HttpError`, `HttpErrorBody`) and none can set a
+  has the variants `Sse`, `HttpError` and `HttpErrorBody`, and none can set a
   response header, so the agent's retry loop honouring a server-named delay is
   unexercised. `retry_after_from_headers` is covered directly instead. Closing
-  it means a fourth `MockResp` variant carrying headers.
+  it means another `MockResp` variant carrying headers.
 - **The warm models.dev catalog path is uncovered, deliberately.**
   `catalog::load_cached` reads process-global state (`HRDR_MODELS_PATH` / the
   XDG cache dir), so warming it in a test leaks into every other test in the
@@ -607,10 +607,10 @@ closed.
   unprotected set from real behaviour, so both deleting an arm and quietly
   adding a needle fail loudly. Giving them needles is a behaviour change nobody
   has asked for — decide, don't drift.
-- **All three mid-stream error paths hardcode `retry_after: None`**
-  (`client.rs`, `anthropic.rs`, `codex.rs`), and `retry_after_hint` reads a
-  typed error's field directly — so a rate limit delivered _mid-stream_ never
-  has its requested delay honoured on any backend. Only the HTTP-status path
+- **Every mid-stream error path hardcodes `retry_after: None`** (`client.rs`,
+  `anthropic.rs`, `codex.rs`), and `retry_after_hint` reads a typed error's
+  field directly — so a rate limit delivered _mid-stream_ never has its
+  requested delay honoured on any backend. Only the HTTP-status path
   (`error_from_response`) does. Asserted and commented, not fixed.
 - **`UNNAMED_MODEL` reaches the wire literally on both native backends**,
   because `wire_model` runs after their early returns. Pinned as a known
@@ -929,7 +929,7 @@ with the reason, don't re-file the finding.
   both.**
 
 Seams already done right, worth copying rather than reinventing: `Shell`
-(`tools/shell.rs`), `EditorEngine` (`hrdr-editor`, trait + 2 impls with zero
+(`tools/shell.rs`), `EditorEngine` (`hrdr-editor`, trait + impls with zero
 call-site branching), `Transport` (`mcp/types.rs`), `GrepBackend`, `ModelRef`,
 `ChatErrorKind`, `proc::ProcessGroup`.
 
@@ -973,10 +973,10 @@ away. Not work; guardrails on work.
   briefly replaced it went too (2026-07-30) — it refused the file tools a write
   `shell` walked round. What a sub-agent's scope is now: its `cwd`, which `task`
   can narrow, enforced by the kernel.**
-- **Read-before-write that refuses.** hrdr blocks all three non-`Fresh`
-  `ReadState`s. Hermes detects staleness and its own docstring says _"Does not
-  block — the write still proceeds"_; pi's `write` overwrites unconditionally. A
-  lead over two peers independently — do not soften it into a warning.
+- **Read-before-write that refuses.** hrdr blocks every non-`Fresh` `ReadState`.
+  Hermes detects staleness and its own docstring says _"Does not block — the
+  write still proceeds"_; pi's `write` overwrites unconditionally. A lead over
+  two peers independently — do not soften it into a warning.
 - **Semantic `rename`.** No LSP at all in codex or hermes; opencode's `lsp` tool
   is experimental and has **no rename op**. The single capability no other
   harness in this comparison has.
@@ -1023,6 +1023,32 @@ away. Not work; guardrails on work.
 
 Decisions from completed work that still govern new work. These are not backlog
 items — they are rules.
+
+- **Never run prettier on `crates/hrdr-agent/src/templates/*.md`.** The prompt
+  regression tests in `prompt.rs` assert on rendered text _including its line
+  wraps_ (`p.contains("the\n  comment outlives …")`), so reflowing a template
+  rewrites lines the tests pin. `prettier --write write.md` reflowed most of the
+  file and turned 9 prompt tests red on 2026-08-02 — the repo-wide "run prettier
+  on markdown" rule stops at this directory. Edit templates by hand at the wrap
+  width already in the file. Nothing enforces this: there is no
+  `.prettierignore` (considered; the templates are the only exception and a
+  stray ignore file invites `prettier .` to be run repo-wide, which is the
+  actual hazard), so the test suite is the guard — run
+  `cargo test -p hrdr-agent` after touching one.
+
+- **No drifting numbers in comments or docs.** Decided 2026-08-02 by the owner,
+  after the web removal left three separate stale counts behind ("Four
+  `CommandHost` impls", "nine-crate workspace" twice, "publishes ~9 crates"). A
+  count of code elements — impls, crates, call sites, tests, fields, variants —
+  must not appear in prose: nothing updates it when the code changes, and a
+  wrong number reads as verified. Either say it without the number ("a
+  multi-crate workspace", "the test hosts") or, if the reader genuinely needs
+  the value, put the value in a `const` and have the prose name the `const`
+  instead of repeating its digits. **A number that has to be written out in a
+  comment is a sign the value belongs in a variable and is not there yet.**
+  Numbers that describe something outside the tree (a wire protocol's limit, an
+  upstream API's cap, a dated incident report) are fine — they cannot drift with
+  our code.
 
 - **hrdr is terminal-only.** Decided 2026-08-02 by the owner: the web server,
   the browser SPA and the desktop/mobile shell are removed, not deferred. The
