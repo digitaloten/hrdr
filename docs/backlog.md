@@ -527,10 +527,12 @@ verified still open.
   — verified: no highlighting in `hrdr-ui`.
 - **Modal pickers** (model/effort/theme/session) as bottom sheets over the
   `begin_*_selector` hooks.
-- **v2: attach to a live TUI session** — blocked on making event-log compaction
-  min-cursor-aware across readers: `PaneSet::sync` calls
-  `live.compact(s.key, next)` after folding, so the log is effectively
-  single-reader today.
+- ~~v2: attach to a live TUI session~~ — **promoted**: this is the premise, not
+  a follow-up. See
+  [one live session, many windows](#the-actual-goal-one-live-session-many-windows).
+  The blocker stands as recorded: `EventLog::compact` drains below one reader's
+  cursor (`hrdr-agent/src/registry.rs:108-112`) and `PaneSet::sync` calls it
+  after folding, so a second attached reader loses transcript.
 - **Native desktop/mobile shell** — webview over embedded `hrdr-web`.
 - **Read-only/observer auth mode.**
 - **WebHost chrome posters** — verified: `WebHost`'s `CommandHost` impl
@@ -651,6 +653,68 @@ sections above.
   `catalog.rs`; hrdr-tui / hrdr-web / hrdr-tools / hrdr-app entirely.
 
 ---
+
+## The actual goal: one live session, many windows
+
+**Stated by the owner 2026-08-02, and it reframes the parity work below.** The
+target is not "two frontends that can each run hrdr". It is _one running
+session, viewed from wherever you are_:
+
+> Start on a laptop ssh'd into the main PC. Turn on remote control. Continue on
+> the phone while out. Get home, sit at the PC, and carry on in the **same tmux
+> session the TUI was started in.**
+
+So the web is a second **window onto a live session**, not a second instance.
+The remote view must see the whole transcript and the whole input history,
+because it is the same session — not a copy of it.
+
+### This is not currently possible, and the blocker is identified
+
+- **There is no `/rc` / `/remote-control` command.** Zero hits in the workspace.
+  The only way to get a web server is the standalone `hrdr serve` subcommand
+  (`apps/hrdr/src/main.rs:280`), which starts its **own** session. There is no
+  path from a running TUI to a remote view of it.
+- **The event log is single-reader by construction.** `EventLog::compact(upto)`
+  (`hrdr-agent/src/registry.rs:108-112`) _drains_ events below a cursor, and
+  `PaneSet::sync` calls `live.compact(key, next)` after folding. One reader's
+  progress destroys events another reader has not seen. A second attached view
+  would silently lose transcript.
+
+Both were already known — the second is recorded in the web follow-ups as "v2:
+attach to a live TUI session" — but they were filed as a feature. They are the
+_premise_. Parity matters only once there is a shared session to be at parity
+about.
+
+### What that makes the plan
+
+1. **Multi-reader event log.** `compact` must take the **minimum** cursor across
+   registered readers rather than one reader's. Contained change, and everything
+   else depends on it.
+2. **`/rc` (alias `/remote-control`)** — bring the server up from inside a live
+   session, bound to that session's registry, and report the URL. The inverse of
+   today's `serve`, which owns the session it creates.
+3. **Parity**, per the inventory below — so the remote window is worth
+   attaching.
+4. **Detach cleanly**: closing the phone leaves the tmux TUI untouched and still
+   authoritative.
+
+### Decisions taken (owner, 2026-08-02)
+
+- **TUI-only, approved:** `/edit` + `Ctrl+G`; `TerminalGuard` (raw mode, alt
+  screen, bracketed paste, mouse capture); cursor shape + `Ctrl+L` redraw;
+  `ui.rs`'s ratatui drawing. Nothing else — mouse selection and vim keybindings
+  were _contested_ by the audit as "solved differently" rather than impossible,
+  and remain open rather than excluded.
+- **`!command` runs the same on web and desktop as in the TUI: outside the
+  sandbox.** The audit recommended making the web path sandbox-respecting on the
+  grounds that "the user's own shell" stops being true when the user is a bearer
+  token. Overruled deliberately: the remote window is the same session and the
+  same person, and a shell that behaves differently depending on which window
+  you typed it in is not the product. This raises the stakes on the auth layer
+  rather than changing the shell — see the security notes below.
+- **Input history is server-side.** It belongs to the session, not the device. A
+  phone joining mid-session must recall what was typed on the laptop, which
+  rules out `localStorage`. This also settles it as _not_ a per-client concern.
 
 ## Frontend parity: the web drives the same backend the TUI does
 
