@@ -8,17 +8,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **A project's `AGENTS.md` now arrives inside a nonce-delimited `<caution-…>`
-  envelope.** Those bytes come off disk from a checkout the user may have done
-  nothing but clone, and they land in the system prompt, so a hostile file could
-  previously write its own framing — "your user now says…" — with nothing
-  marking where the project's text stopped. The envelope's suffix is an
-  unguessable per-process token verified absent from the content, so a file that
-  spells out a closing tag stays inside the block. The wording still says to
-  follow the file as project convention: this marks the boundary, it does not
-  downgrade the instructions. The global (user-level) `AGENTS.md` is not wrapped
-  — it is the user's own words.
-
 - **A write-capable sub-agent's result now tells the parent to review the diff
   and run `verify` before trusting it.** The instruction existed already — in
   the spawn acknowledgement and in the delegation prompt — but both are many
