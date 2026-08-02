@@ -567,6 +567,23 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   literal (the stop-reason tests `Box::leak` theirs). Fine today; it makes a
   table-driven stream test awkward. `impl Into<String>` is a one-line change
   when someone needs it.
+- **The suite leaks `tempfile` dirs into `/tmp`, and nothing guards it.**
+  Measured 2026-08-02 on the owner's machine: 3,643 `/tmp/.tmp*` directories
+  holding 771 MB, the oldest dated 2026-07-15 and 795 of them created that day
+  alone by ordinary `cargo test` runs. Each holds real session state —
+  `hrdr/history`, `hrdr/sessions/<cwd-slug>/session.json` — so something wrote
+  through `XDG_DATA_HOME` while it pointed at a `tempfile::tempdir()` that had
+  already been dropped, or was still writing as `remove_dir_all` walked it. Not
+  the `hrdr-test-support` ctor sandbox: that one is named
+  `hrdr-test-sandbox-<pid>`, its `#[ctor::dtor]` fires, and zero of those were
+  on disk after the same runs. The suspects are the helpers that swap
+  `XDG_DATA_HOME` for the duration of a closure — `with_test_env` in
+  `session.rs` and in `hrdr-app/src/sessions.rs`, and the e2e harness's own root
+  in `hrdr-tui/src/app/e2e.rs` — all of which drop the `TempDir` while
+  background savers may still hold the old path. `leak_guard.rs` cannot see
+  this: it asserts on a sentinel `$HOME`, and these land in `temp_dir()`
+  instead. Closing it means both a fix and a guard that counts `/tmp` entries
+  across a suite run, or the leak silently returns.
 
 ---
 
