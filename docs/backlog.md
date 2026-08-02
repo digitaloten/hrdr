@@ -793,6 +793,56 @@ non-blocking popup, the other a one-shot viewport instruction.
 Parallel-safe: {0} → {1} ∥ {2} ∥ {3} → {4} ∥ {5} → {6}. Slices 4 and 5 both
 touch `hrdr-app`; do not give them to concurrent write agents.
 
+### Measured: what can and cannot move to the client
+
+`cargo check -p hrdr-app --target wasm32-unknown-unknown` **fails** — `mio`, 48
+errors. Structural, not incidental: `hrdr-app` takes `tokio.workspace = true`
+and the workspace pins `tokio = { features = ["full"] }` (`Cargo.toml:57`) → mio
+→ sockets. It also pulls `hrdr-agent` (reqwest), `hrdr-tools` (OS sandbox),
+`ignore`, `notify`, `syntect`. So moving `hrdr-app` wholesale is closed.
+
+Per-module, roughly 740 lines are portable today (`completion.rs`, `palette.rs`,
+`themes.rs`, `types.rs`) and ~1,830 more if their `hrdr_agent::Entry` dependency
+is re-pointed at `hrdr-protocol::WireEntry`, which already mirrors it.
+Everything the owner actually wants from the server — file index, session list,
+model catalog, theme files, shell — is filesystem or network by nature and can
+never move.
+
+**Themes: ship over the wire, don't split a crate.** A probe crate carrying
+`hjkl-theme` + the role mapping _does_ compile to wasm (4.72s), so the split is
+genuinely available — it just buys nothing. The layering is already right and
+already documented: `ChatPalette` (`palette.rs:20-48`) is 13 roles of
+`Option<(u8,u8,u8)>`, pure data; `from_hjkl` (`:74-103`) holds the role mapping
+and fallback chain, already shared; and all the TUI adds is **18 lines**
+(`hrdr-tui/src/theme.rs:53-71`) turning `Option<Rgb>` into `ratatui::Color`. The
+module doc says so outright: _"a frontend converts to its own color type and
+applies its own medium-appropriate final fallbacks."_ User themes live in
+`~/.config/hrdr/themes` **on the server**, so the client must ask for the choice
+list regardless; once that round-trip exists, sending 13 resolved triples costs
+less than a published crate, a second TOML parser in the wasm bundle, and a
+version-skew surface. Add `palette: WireChatPalette` to `Snapshot` plus a
+`ServerMsg::Theme` delta; the client writes its own 18-line mirror.
+
+### Fix the harness before the features
+
+Three facts bound what a green build currently means, and they explain why the
+client's bugs went unnoticed:
+
+- **A protocol change that breaks the client fails nothing.** `hrdr-ui` is
+  outside `cargo test --workspace`, and the CI `web-ui` job's `dist/` output
+  feeds no other job. A `ServerMsg` variant the client cannot parse merges
+  green.
+- **Version drift 0.8.5 vs 0.10.0** accumulated silently, because nothing
+  compiles them together.
+- **Its five tests all cover the reducer** (`state.rs`); nothing tests
+  `main.rs`, which is where every client bug found lives. `main.rs:241`'s
+  `_ => {}` is exactly the shape the guardrails warn about — a match arm that
+  silently matches _more_ every time the protocol grows, while reporting
+  "handled".
+
+One round-trip test asserting that every `ServerMsg` variant changes client
+state would have caught three of the four. Do this before the feature work.
+
 ### Security consequences of closing the gap
 
 The auth layer is careful — three modes, argon2id, a refuse-to-bind matrix
@@ -814,7 +864,23 @@ requiring TLS off-loopback, 10 failures/min/IP, WS `Origin` checked against
   deliberately, when it moves into `hrdr-app`, whether the web path reuses that
   `ToolContext` or a sandbox-respecting one.
 - `LoginSubmit` must stay out of frame logging and off the replay buffer that
-  `Resume` re-sends.
+  `Resume` re-sends. And `/login` over the web would let a client mint and
+  persist provider API keys on the host — its own decision, currently declined
+  by default.
+- **`/edit` must be blocked, not hidden.** `supports_command` is a help-text
+  filter; the dispatcher does not consult it before acting, so `WebHost` needs a
+  real `open_editor` override that refuses.
+- **Inconsistent HTML escaping in the client** — PLAUSIBLE, not proven.
+  `state.rs:295` has a proper `html_escape` (`& < > "`), but `main.rs`'s status
+  and todo rendering escape **only `<`** (e.g. `main.rs:338`), and all of it
+  goes through `dangerous_inner_html`. Status text and todo content are model-
+  and tool-influenced. No payload was constructed and quote-free attribute
+  contexts may save it; the fix is to use the escaper that already exists rather
+  than to reason about whether it is exploitable.
+- **The parity gaps are currently load-bearing security controls.** `/paste` and
+  `/copy` are blocked because the clipboard is not there, not because anyone
+  decided. Closing gaps deliberately removes that accidental hardening, so each
+  item needs its own verdict rather than "the TUI does it".
 
 ### Left open by the compaction fix (`/compact` pane targeting)
 
