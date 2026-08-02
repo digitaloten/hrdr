@@ -524,6 +524,22 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   equivalent at all, so callers relying on it keep their own preflight check.
   Recorded on `owner_only_options_no_follow`; closing it properly means
   resolving the whole path under a directory handle.
+- **`CommandHost`'s text-fallback defaults are now test-only.** Found in the
+  2026-08-02 web-removal sweep, not fixed — the parent's call, and the
+  Standing-constraints host seam is deliberately kept. `begin_login`,
+  `begin_model_selector`, `begin_model_selector_for`, `begin_session_selector`,
+  `begin_skill_selector`, `begin_effort_selector` and `begin_theme_selector` all
+  carry default bodies that list the choices as text "for a frontend without
+  modal support" — that frontend was `hrdr-web`. `TuiHost`
+  (`hrdr-tui/src/app/commands.rs`) overrides every one of them, so the only
+  callers left are the two test hosts, `TestHost` (`commands/dispatch.rs`) and
+  `RouteTestHost` (`login.rs`). Same shape for `supports_command`: the trait
+  default is `true`, `TuiHost` returns `true` with the comment "the TUI
+  implements the full registry", and `help_body_for`'s `show` closure therefore
+  never filters anything in production — nor in tests, which never pass a
+  closure that returns `false`. Deleting the defaults would force the test hosts
+  to spell out seven no-ops; keeping them keeps a documented seam. Worth a
+  decision either way rather than drifting.
 
 ---
 
@@ -635,6 +651,14 @@ sections above.
   feature, not a missing test.
 - **Never audited at all:** `sse.rs`, `capped_read.rs`, `fs.rs`, most of
   `catalog.rs`; hrdr-tui / hrdr-tools / hrdr-app entirely.
+- **`duration_constant_names.rs` walks `crates/` on disk, not
+  `[workspace] members`.** Its `rust_sources` recurses `crates` and `apps`,
+  skipping only `target`, so a directory left behind by a removed crate is
+  scanned. Harmless as of 2026-08-02 — the leftover `crates/hrdr-ui/` holds only
+  `dist/` and `target/` and no `.rs` — but it means the rule's scope is
+  "whatever is on disk", unlike `every_test_binary_is_sandboxed.rs`, which
+  parses `members` and documents why. Verified by reading both, not by a failing
+  run.
 
 ---
 

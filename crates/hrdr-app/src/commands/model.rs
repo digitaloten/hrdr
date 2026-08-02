@@ -240,9 +240,9 @@ pub(crate) fn missing_credential_guidance(provider: Option<&str>, base_url: &str
 }
 
 /// First-run guidance for an unreachable endpoint: what `base_url` failed and
-/// how to get hrdr talking to a model. Pure (no I/O) so it's unit-testable and
-/// identical across frontends. Now that hrdr never spawns a server, this is the
-/// nudge a fresh user sees when nothing is listening yet.
+/// how to get hrdr talking to a model. Pure (no I/O) so it's unit-testable.
+/// Now that hrdr never spawns a server, this is the nudge a fresh user sees
+/// when nothing is listening yet.
 pub(crate) fn unreachable_guidance(base_url: &str, err: &str) -> String {
     format!(
         "⚠ endpoint {base_url} looks unreachable: {err}\n\

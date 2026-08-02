@@ -38,8 +38,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   session server, its token/basic/users auth modes, the SQLite users database
   and the TLS listener), `hrdr-ui` (the Dioxus/WASM browser SPA) and
   `hrdr-protocol` (the wire types the two shared and nothing else used). The
-  `[web]` config table and the `HRDR_WEB_*` environment variables no longer do
-  anything — delete them.
+  `HRDR_WEB_*` environment variables are ignored, and a leftover `[web]` table
+  in `config.toml` makes hrdr exit with an "unknown field" error rather than
+  being quietly skipped — delete both.
 
   Anyone serving hrdr over HTTP has no upgrade path within hrdr: the TUI (over
   ssh or tmux, which is how the workflow was actually used) and `hrdr run` for

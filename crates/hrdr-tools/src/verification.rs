@@ -725,8 +725,8 @@ fn classify_cargo(args: &[&str]) -> Option<(CheckKind, Scope)> {
 ///
 /// Bare `cargo test` is *partial* even though it covers everything in a
 /// single-crate project: from the command line alone there is no telling a
-/// single-crate project from a nine-crate workspace where it covers one, and the
-/// wrong guess in that direction is the exact reassurance this file exists to
+/// single-crate project from an eight-crate workspace where it covers one, and
+/// the wrong guess in that direction is the exact reassurance this file exists to
 /// withhold.
 fn cargo_scope(args: &[&str]) -> Scope {
     /// Flags that narrow the run: a package selection, a target selection, or a

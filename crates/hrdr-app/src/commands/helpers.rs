@@ -85,8 +85,8 @@ pub struct ResumePlan {
     pub lines: Vec<String>,
 }
 
-/// The `/resume` semantics: follow the session's
-/// working directory (in-process only) and surface the same notices.
+/// The `/resume` semantics: follow the session's working directory (in-process
+/// only) and surface the notices that go with it.
 pub fn resume_plan(session: &SessionState, prev_cwd: &Path, current_base_url: &str) -> ResumePlan {
     let mut lines = vec![format!(
         "resumed '{}' ({} messages)",

@@ -2,8 +2,8 @@
 //!
 //! hrdr reuses hjkl's theme system (a palette + `[ui]` styles TOML). The
 //! mapping from that editor-oriented palette onto hrdr's *chat roles* — which
-//! palette entries feed which role, and in what fallback order — lives here so
-//! frontends can't drift. Each role resolves to an RGB triple or `None` (the
+//! palette entries feed which role, and in what fallback order — lives here,
+//! above any renderer. Each role resolves to an RGB triple or `None` (the
 //! theme doesn't cover it); a frontend converts to its own color type and
 //! applies its own medium-appropriate final fallbacks (ANSI names in the
 //! terminal).
