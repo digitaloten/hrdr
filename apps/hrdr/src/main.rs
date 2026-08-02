@@ -30,17 +30,64 @@ use hrdr_agent::{Agent, AgentConfig, AgentEvent};
 /// session header (passed to [`hrdr_tui::run`], which embeds no art of its own).
 const LOGO_ART: &str = include_str!("../art.txt");
 
-/// SGR: reset every attribute back to the terminal's own default.
-const SGR_RESET: &str = "\x1b[0m";
-/// SGR: bright black — a headless run's chrome (notices, usage, streamed tool
-/// output).
-const SGR_GREY: &str = "\x1b[90m";
-/// SGR: yellow — a headless run's tool-call line.
-const SGR_YELLOW: &str = "\x1b[33m";
-/// SGR: green — a headless run's tool-succeeded mark.
-const SGR_GREEN: &str = "\x1b[32m";
-/// SGR: red — a headless run's tool-failed mark.
-const SGR_RED: &str = "\x1b[31m";
+/// Whether a headless run colours its stderr chrome.
+///
+/// Decided once, from three things, and all three have to agree:
+///
+/// * **stderr is a terminal.** `hrdr run … 2>build.log` should leave a log a
+///   person can read, not one with escape codes wrapped round every line. This
+///   is the case that actually bites — a headless run is the thing people pipe.
+/// * **`NO_COLOR` is unset or empty**, per <https://no-color.org>. hrdr already
+///   sets this on every subprocess it spawns (`hrdr_tools`'s shell), so honouring
+///   it for hrdr's own output is consistency, not a new convention.
+/// * **`TERM` is not `dumb`.**
+///
+/// Colour itself goes out through crossterm rather than as bytes written by
+/// hand: on a Windows console that cannot enable VT processing, crossterm sets
+/// the attribute through the WinAPI instead, where a literal escape sequence
+/// would have printed as garbage.
+fn colour_stderr() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        use std::io::IsTerminal;
+        std::io::stderr().is_terminal()
+            && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+            && std::env::var_os("TERM").is_none_or(|t| t != "dumb")
+    })
+}
+
+/// One line of headless chrome on stderr: `styled` in `colour`, then `rest`
+/// unstyled, then a newline. Uncoloured, it is the same text with nothing
+/// around it — the layout never depends on the colour being there.
+fn chrome_line(colour: crossterm::style::Color, styled: &str, rest: &str) {
+    use crossterm::style::{Print, ResetColor, SetForegroundColor};
+    let mut err = std::io::stderr();
+    if colour_stderr() {
+        let _ = crossterm::execute!(
+            err,
+            SetForegroundColor(colour),
+            Print(styled),
+            ResetColor,
+            Print(rest),
+            Print("\n"),
+        );
+    } else {
+        let _ = writeln!(err, "{styled}{rest}");
+    }
+}
+
+/// A chrome fragment with no newline — streamed tool output, which arrives in
+/// chunks that must not each become a line.
+fn chrome_fragment(colour: crossterm::style::Color, text: &str) {
+    use crossterm::style::{Print, ResetColor, SetForegroundColor};
+    let mut err = std::io::stderr();
+    if colour_stderr() {
+        let _ = crossterm::execute!(err, SetForegroundColor(colour), Print(text), ResetColor);
+    } else {
+        let _ = write!(err, "{text}");
+    }
+    let _ = err.flush();
+}
 
 #[derive(Parser)]
 #[command(
@@ -900,7 +947,11 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
     // set); surface the per-server status on stderr unless quiet.
     for notice in agent.connect_mcp().await {
         if !quiet {
-            eprintln!("{SGR_GREY}[{notice}]{SGR_RESET}");
+            chrome_line(
+                crossterm::style::Color::DarkGrey,
+                &format!("[{notice}]"),
+                "",
+            );
         }
     }
     // A headless run is a one-turn session: session hooks bracket the turn.
@@ -909,7 +960,7 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
         .await
     {
         if !quiet {
-            eprintln!("{SGR_GREY}[{note}]{SGR_RESET}");
+            chrome_line(crossterm::style::Color::DarkGrey, &format!("[{note}]"), "");
         }
     }
     // Headless runs have no interactive steering: enqueue the prompt as the
@@ -933,23 +984,24 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
                 }
                 AgentEvent::Reasoning(_) => {}
                 AgentEvent::ToolStart { name, args, .. } if !quiet => {
-                    eprintln!(
-                        "{SGR_YELLOW}⚙ {name}{SGR_RESET} {}",
-                        hrdr_tools::truncate_inline(&args, 120)
+                    chrome_line(
+                        crossterm::style::Color::Yellow,
+                        &format!("⚙ {name}"),
+                        &format!(" {}", hrdr_tools::truncate_inline(&args, 120)),
                     );
                 }
                 AgentEvent::ToolOutput { chunk, .. } if !quiet => {
-                    eprint!("{SGR_GREY}{chunk}{SGR_RESET}");
+                    chrome_fragment(crossterm::style::Color::DarkGrey, &chunk);
                     let _ = std::io::stderr().flush();
                 }
-                AgentEvent::Notice(text) if !quiet => eprintln!("{SGR_GREY}[{text}]{SGR_RESET}"),
+                AgentEvent::Notice(text) if !quiet => chrome_line(crossterm::style::Color::DarkGrey, &format!("[{text}]"), ""),
                 AgentEvent::ToolEnd { name, ok, .. } if !quiet => {
-                    let mark = if ok {
-                        format!("{SGR_GREEN}✓{SGR_RESET}")
+                    let (mark, colour) = if ok {
+                        ("✓", crossterm::style::Color::Green)
                     } else {
-                        format!("{SGR_RED}✗{SGR_RESET}")
+                        ("✗", crossterm::style::Color::Red)
                     };
-                    eprintln!("{mark} {name}");
+                    chrome_line(colour, mark, &format!(" {name}"));
                 }
                 AgentEvent::Usage {
                     prompt_tokens,
@@ -974,9 +1026,13 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
                             )
                         })
                         .unwrap_or_default();
-                    eprintln!(
-                        "{SGR_GREY}[usage] ctx {prompt_tokens}{cached} · out {completion_tokens}{reasoning}{cost}{SGR_RESET}"
-                    );
+                    chrome_line(
+                            crossterm::style::Color::DarkGrey,
+                            &format!(
+                                "[usage] ctx {prompt_tokens}{cached} · out {completion_tokens}{reasoning}{cost}"
+                            ),
+                            "",
+                        );
                 }
                 AgentEvent::TurnDone => println!(),
                 _ => {}
@@ -988,7 +1044,7 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
         .await
     {
         if !quiet {
-            eprintln!("{SGR_GREY}[{note}]{SGR_RESET}");
+            chrome_line(crossterm::style::Color::DarkGrey, &format!("[{note}]"), "");
         }
     }
     if let Err(e) = result {

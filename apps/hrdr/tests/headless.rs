@@ -12,10 +12,13 @@
 //! Default (no `--json`, no `--quiet`):
 //!   * stdout — the assistant reply text, streamed verbatim (no per-delta
 //!     newline), with a single trailing newline at end of turn (`TurnDone`).
-//!   * stderr — tool/usage "chrome", all ANSI-colored: `⚙ <tool> <args>` at a
+//!   * stderr — tool/usage "chrome": `⚙ <tool> <args>` at a
 //!     tool start, streamed tool output, `✓/✗ <tool>` at tool end, a
 //!     `[usage] ctx … · out …` line, `[notice]` lines, MCP/hook notes, plus any
 //!     startup warnings (e.g. a missing API key). Nothing a script parses.
+//!     Coloured only when stderr is a terminal, `NO_COLOR` is unset and `TERM`
+//!     is not `dumb` — so everything captured below is plain text, and the
+//!     colour path is exercised from a pty in `headless_tty.rs`.
 //!   * exit — `0` on a completed turn.
 //!
 //! `--json`:
@@ -108,6 +111,7 @@ fn run_hrdr_inner_with_home(
         ("XDG_CONFIG_HOME", home),
         ("XDG_DATA_HOME", home),
         ("XDG_STATE_HOME", home),
+        ("XDG_CACHE_HOME", home),
     ] {
         cmd.env(key, value);
     }
@@ -149,6 +153,44 @@ fn run_streams_plain_text_to_stdout() {
     assert!(
         stdout.contains("Hello from the mock endpoint."),
         "reply text must reach stdout, got: {stdout:?}"
+    );
+}
+
+/// Captured stderr is plain text. `hrdr run … 2>build.log` should leave a log a
+/// person can read, and a pipe is not a terminal.
+///
+/// Asserts the chrome was actually produced first: "no escape codes" is trivially
+/// true of output that never happened, and that is the shape of check that passes
+/// forever after the thing it guards stops running.
+#[test]
+fn captured_stderr_carries_no_escape_codes() {
+    let project = tempfile::tempdir().expect("temp project");
+    let file = project.path().join("note.txt");
+    std::fs::write(&file, "the-secret-content").unwrap();
+    let args_json = serde_json::to_string(&serde_json::json!({
+        "path": file.to_string_lossy(),
+    }))
+    .unwrap();
+    let server = MockServer::start(vec![
+        Chat::Sse(vec![
+            tool_start_chunk("c1", "call_1", "read"),
+            tool_args_chunk("c1", &args_json),
+            tool_calls_stop_chunk("c1"),
+            "[DONE]".to_string(),
+        ]),
+        text_turn("Read it."),
+    ]);
+
+    let out = run_hrdr_in(&server, &["run", "read the note"], Some(project.path()));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        stderr.contains("read") && stderr.contains("[usage]"),
+        "the chrome this test is about must have run: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains('\x1b'),
+        "a captured stderr must be plain text: {stderr:?}"
     );
 }
 

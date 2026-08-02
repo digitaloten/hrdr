@@ -37,6 +37,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A headless run's stderr chrome is only coloured when stderr is a terminal.**
+  `hrdr run … 2>build.log` previously wrote ANSI escape codes into the log;
+  captured output is now plain text. `NO_COLOR` (per <https://no-color.org>) and
+  `TERM=dumb` turn it off on a terminal too — hrdr already set `NO_COLOR` on
+  every subprocess it spawns, and now honours it for its own output. The colour
+  itself goes out through crossterm rather than as hand-written escapes, so a
+  Windows console that cannot enable VT processing gets the attribute set
+  through the WinAPI instead of the escape bytes printed literally.
+
 - **`AGENTS.md` is read from the working directory only — no ancestor walk.**
   Trust is answered per directory and never inherited, so instructions are not
   inherited either. Previously the walk went from the working directory up to
