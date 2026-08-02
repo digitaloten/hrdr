@@ -11,10 +11,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **hrdr asks before it trusts a working directory.** A project's `AGENTS.md`
   and its `.hrdr/skills` are instructions that reach the model, and they come
   from a checkout the user may have done nothing but clone. The first time hrdr
-  opens in a directory it asks: **trust** (a second confirmation, then the
-  answer is remembered), **untrusted** (open jailed — read the tree, run nothing
-  from it), or **cancel** (open nothing; also what an unrecognized answer and
-  EOF mean). Trusted directories are stored one per line in
+  opens in a directory it asks, under the animated logo, with a menu: **trust**
+  (a second confirmation, then the answer is remembered), **untrusted** (open
+  jailed — read the tree, run nothing from it), or **cancel** (open nothing).
+  Arrow keys or `j`/`k` move, Enter chooses, Esc cancels, and the selection
+  **starts on cancel** — so a reflex Enter opens nothing. The confirmation
+  likewise starts on "no", which returns to the first question rather than
+  choosing for you. Trusted directories are stored one per line in
   `$XDG_CACHE_HOME/hrdr/trusted-dirs`, owner-only.
 
   **Only the yes is stored**, so declining is asked again next time rather than

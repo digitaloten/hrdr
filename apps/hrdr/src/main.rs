@@ -860,59 +860,226 @@ fn trust_gate_with(
 
 /// Put the question to the user on the terminal, before the TUI starts.
 ///
-/// Trusting takes a second confirmation. It is the answer that cannot be undone
-/// by doing nothing — it is written down, and it licenses every future session in
-/// this directory to load instructions out of it — so it is the one answer worth
-/// making the user say twice. Anything unrecognized, EOF included, is `Cancel`:
-/// the safe reading of "I do not know what is being asked" is to open nothing.
+/// A menu rather than a typed letter: the answer is a security decision, and the
+/// one thing worse than asking is asking in a way people learn to dismiss by
+/// reflex. Arrow keys or `j`/`k` move, Enter locks it in, and the selection
+/// **starts on Cancel** — a stray Enter opens nothing.
+///
+/// Trusting takes a second confirmation, which also starts on the safe option.
+/// It is the answer that cannot be undone by doing nothing: it is written down,
+/// and it licenses every future session in this directory to load instructions
+/// out of it. Declining the confirmation returns to the first menu rather than
+/// choosing for the user.
 fn ask_to_trust(cwd: &std::path::Path) -> hrdr_agent::trust::TrustChoice {
     use hrdr_agent::trust::TrustChoice;
-    use std::io::Write;
 
-    println!("\n  hrdr has not been opened in this directory before:\n");
-    println!("    {}\n", cwd.display());
-    println!("  Its AGENTS.md and skill files are instructions that reach the model,");
-    println!("  and its code is what any command you approve will run. Trust it only");
-    println!("  if you know where it came from.\n");
-    println!("    [t] trust      — load this directory's instructions, full tool set");
-    println!("    [u] untrusted  — open in jail mode: read the tree, run nothing from it");
-    println!("    [c] cancel     — quit without opening (default)\n");
-    print!("  Your choice [t/u/c]: ");
-    let _ = std::io::stdout().flush();
+    // Raw mode is what makes a keypress arrive without Enter. If it cannot be
+    // entered there is no interactive terminal to ask on, and the caller's rule
+    // for "nobody can answer" applies: cancel rather than guess.
+    if crossterm::terminal::enable_raw_mode().is_err() {
+        return TrustChoice::Cancel;
+    }
+    let choice = ask_to_trust_raw(cwd);
+    let _ = crossterm::terminal::disable_raw_mode();
+    println!();
+    choice
+}
 
-    match read_line().as_str() {
-        "t" | "trust" => {
-            print!(
-                "\n  Trusting a directory is remembered. Are you sure? [type `yes` to confirm]: "
-            );
-            let _ = std::io::stdout().flush();
-            match read_line().as_str() {
-                "yes" => {
-                    println!();
-                    TrustChoice::Trusted
-                }
-                _ => {
-                    println!("\n  Not confirmed — opening in jail mode.\n");
-                    TrustChoice::Untrusted
-                }
-            }
+/// The menu loop, with raw mode already on and guaranteed to be turned off by the
+/// caller however this returns.
+fn ask_to_trust_raw(cwd: &std::path::Path) -> hrdr_agent::trust::TrustChoice {
+    use hrdr_agent::trust::TrustChoice;
+
+    const ASK: &[(&str, &str)] = &[
+        ("trust", "load this directory's instructions, full tool set"),
+        (
+            "untrusted",
+            "open jailed: read the tree, run nothing from it",
+        ),
+        ("cancel", "quit without opening"),
+    ];
+    const CONFIRM: &[(&str, &str)] = &[
+        ("yes, I'm sure", "remember this directory as trusted"),
+        ("no, go back", "return to the previous question"),
+    ];
+
+    let head = [
+        String::new(),
+        "  hrdr has not been opened in this directory before:".to_string(),
+        String::new(),
+        format!("    {}", cwd.display()),
+        String::new(),
+        "  Its AGENTS.md and skill files are instructions that reach the model,".to_string(),
+        "  and its code is what any command you approve will run. Trust it only".to_string(),
+        "  if you know where it came from.".to_string(),
+        String::new(),
+    ];
+    let confirm_head = [
+        String::new(),
+        "  Trusting is remembered — every future session here loads this".to_string(),
+        "  directory's instructions without asking again.".to_string(),
+        String::new(),
+    ];
+
+    loop {
+        // Default: cancel, the last entry.
+        match menu(&head, ASK, ASK.len() - 1) {
+            Some(0) => match menu(&confirm_head, CONFIRM, 1) {
+                Some(0) => return TrustChoice::Trusted,
+                // "no, go back" and Esc both return to the first question.
+                _ => continue,
+            },
+            Some(1) => return TrustChoice::Untrusted,
+            _ => return TrustChoice::Cancel,
         }
-        "u" | "untrusted" => {
-            println!("\n  Opening in jail mode.\n");
-            TrustChoice::Untrusted
-        }
-        _ => TrustChoice::Cancel,
     }
 }
 
-/// One trimmed, lowercased line from stdin. EOF reads as empty, which every
-/// caller treats as the cautious answer.
-fn read_line() -> String {
-    let mut s = String::new();
-    match std::io::stdin().read_line(&mut s) {
-        Ok(_) => s.trim().to_ascii_lowercase(),
-        Err(_) => String::new(),
+/// Draw `head`, then `items` as a selectable list starting at `default`, and
+/// return the chosen index — or `None` for Esc, `q` and Ctrl-C.
+///
+/// The logo animates above it while the menu waits, on the same `hjkl_splash`
+/// path the TUI's header uses, so the first thing a new directory shows is
+/// recognisably hrdr rather than a bare question.
+fn menu(head: &[String], items: &[(&str, &str)], default: usize) -> Option<usize> {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use std::io::Write;
+
+    let mut sel = default;
+    let anchor = std::time::Instant::now();
+    let path = logo_path(LOGO_ART);
+    let logo_rows = LOGO_ART.lines().count();
+    let mut drawn = 0usize;
+    let mut out = std::io::stdout();
+
+    loop {
+        // Rewind over the previous frame. `\r` first: raw mode leaves the cursor
+        // wherever the last line ended.
+        if drawn > 0 {
+            let _ = write!(out, "\r\x1b[{drawn}A\x1b[J");
+        }
+        let mut lines: Vec<String> = Vec::new();
+        lines.extend(logo_frame(&path, anchor, logo_rows));
+        lines.extend(head.iter().cloned());
+        // Pad the labels to a common width so the descriptions form a column —
+        // measured from the labels themselves, so adding an option cannot leave
+        // the list looking ragged.
+        let label_w = items
+            .iter()
+            .map(|(l, _)| l.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (i, (label, blurb)) in items.iter().enumerate() {
+            let label = format!("{label:label_w$}");
+            lines.push(if i == sel {
+                // Bold plus a caret, so the selection survives a terminal with no
+                // colour as well as one with it.
+                format!("  \x1b[1m❯ {label}\x1b[0m   \x1b[2m{blurb}\x1b[0m")
+            } else {
+                format!("    \x1b[2m{label}\x1b[0m   \x1b[2m{blurb}\x1b[0m")
+            });
+        }
+        lines.push(String::new());
+        lines
+            .push("  \x1b[2m↑/↓ or j/k to move · enter to choose · esc cancels\x1b[0m".to_string());
+        for line in &lines {
+            let _ = write!(out, "{line}\r\n");
+        }
+        let _ = out.flush();
+        drawn = lines.len();
+
+        // Wake often enough to advance the animation whether or not a key came.
+        match crossterm::event::poll(std::time::Duration::from_millis(80)) {
+            Ok(true) => match crossterm::event::read() {
+                Ok(Event::Key(KeyEvent {
+                    code, modifiers, ..
+                })) => match (code, modifiers) {
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => return None,
+                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                        sel = sel.checked_sub(1).unwrap_or(items.len() - 1);
+                    }
+                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                        sel = (sel + 1) % items.len();
+                    }
+                    (KeyCode::Enter, _) => return Some(sel),
+                    (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => return None,
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(_) => return None,
+            },
+            Ok(false) => {}
+            Err(_) => return None,
+        }
     }
+}
+
+/// One animation frame of the logo, as ANSI-coloured lines.
+fn logo_frame(path: &[(u8, u8, char)], anchor: std::time::Instant, rows: usize) -> Vec<String> {
+    use hjkl_splash::{CellKind, Layout, Rgb, Splash, default_trail_color};
+
+    let cols = LOGO_ART
+        .lines()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    let splash = Splash::new(LOGO_ART, path).with_anchor(anchor);
+    let layout = Layout {
+        origin_x: 0,
+        origin_y: 0,
+        rows: rows as u16,
+        cols: cols as u16,
+    };
+    // Paint into a grid first: `cells` yields art, then trail, then cursor, and
+    // later cells are meant to overwrite earlier ones at the same position.
+    let mut grid = vec![vec![(' ', None::<Rgb>, false); cols]; rows];
+    for cell in splash.cells(layout) {
+        let (y, x) = (cell.y as usize, cell.x as usize);
+        if y >= rows || x >= cols {
+            continue;
+        }
+        grid[y][x] = match cell.kind {
+            CellKind::Art => (cell.ch, None, false),
+            CellKind::Trail { age } => (cell.ch, Some(default_trail_color(age)), false),
+            CellKind::Cursor => (cell.ch, None, true),
+        };
+    }
+    let mut lines: Vec<String> = grid
+        .into_iter()
+        .map(|row| {
+            let mut s = String::from("  ");
+            for (ch, colour, cursor) in row {
+                match (colour, cursor) {
+                    (_, true) => s.push_str(&format!("\x1b[1;97m{ch}\x1b[0m")),
+                    (Some(Rgb(r, g, b)), _) => {
+                        s.push_str(&format!("\x1b[38;2;{r};{g};{b}m{ch}\x1b[0m"))
+                    }
+                    (None, _) => s.push_str(&format!("\x1b[2m{ch}\x1b[0m")),
+                }
+            }
+            s
+        })
+        .collect();
+    lines.push(String::new());
+    lines
+}
+
+/// The sweep path through the art: every glyph cell, column by column. Mirrors
+/// the TUI's `logo_path` so both animate the same way.
+fn logo_path(art: &str) -> Vec<(u8, u8, char)> {
+    let rows: Vec<Vec<char>> = art.lines().map(|l| l.chars().collect()).collect();
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut path = Vec::new();
+    for col in 0..cols {
+        for (row_idx, row) in rows.iter().enumerate() {
+            if let Some(&ch) = row.get(col)
+                && !ch.is_whitespace()
+            {
+                path.push((row_idx as u8, col as u8, ch));
+            }
+        }
+    }
+    path
 }
 
 /// Headless single-turn run. Default: reply text on stdout, tool/usage chrome

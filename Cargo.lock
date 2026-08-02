@@ -1231,6 +1231,8 @@ dependencies = [
  "clap_complete",
  "clap_complete_nushell",
  "clap_mangen",
+ "crossterm",
+ "hjkl-splash",
  "hrdr-agent",
  "hrdr-app",
  "hrdr-llm",
