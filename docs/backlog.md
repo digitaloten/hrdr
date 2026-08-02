@@ -80,6 +80,24 @@ Conventions:
 
 ---
 
+## Owed right now
+
+- **v0.11.0 is not on the AUR.** Every other channel published on 2026-08-03 —
+  the GitHub release with all its assets, the seven crates on crates.io,
+  Homebrew, Scoop, Alpine — and `Publish AUR (hrdr-bin)` failed on run
+  `30767495527` with `The AUR is down due to maintenance`, an outage on Arch's
+  side with nothing wrong in this tree. `hrdr-bin` still reads `0.10.0-1`.
+  Probed for an hour afterwards and it was still down: note that the package
+  page and the RPC endpoint stay **up** through this, so neither one tells you
+  whether it has cleared — the check that answers is
+  `git ls-remote ssh://aur@aur.archlinux.org/hrdr-bin.git`, and SSH auth
+  succeeding says nothing either (the login banner works while the git backend
+  refuses). **The fix is `gh run rerun 30767495527 --failed`, not a new tag**;
+  the job stages the PKGBUILD and exits 0 when the diff is empty, so re-running
+  it is safe. The tag run stays red until it lands, which is
+  `tag-release status` working as intended. **Delete this entry once the RPC
+  reports `0.11.0-1`.**
+
 ## Top of the list
 
 The five that were here are all shipped — see
