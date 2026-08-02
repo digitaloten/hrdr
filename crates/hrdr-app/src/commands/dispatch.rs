@@ -265,6 +265,21 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 return true;
             }
             let new = new.canonicalize().unwrap_or(new);
+            // Trust is answered per directory, when hrdr opens in one, and it
+            // cannot be asked again here: the TUI owns the terminal by now, and
+            // the question is a security decision that must not be reduced to a
+            // line of chat the model could later be talked into answering. So an
+            // unanswered directory is refused rather than entered — otherwise a
+            // trusted session could walk into a fresh checkout and read its
+            // AGENTS.md with the tool set the *first* directory earned.
+            if !hrdr_agent::trust::is_trusted(&new) {
+                host.info(format!(
+                    "not a trusted directory: {} — hrdr asks about a directory when it opens \
+                     there, and cannot ask mid-session. Start hrdr in it to answer.",
+                    new.display()
+                ));
+                return true;
+            }
             let agent = host.agent();
             let target = new.clone();
             host.spawn_line(Box::pin(async move {
@@ -829,6 +844,67 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("model selector isn't available")),
             "the default host reports the picker as unavailable: {:?}",
+            host.info_log
+        );
+    }
+
+    /// `/cwd` into a directory nobody has answered for is refused, and the
+    /// session stays where it was.
+    ///
+    /// The gate that asks runs once, in `main`, before the first agent — so
+    /// without this a session that answered for one directory could walk into a
+    /// fresh checkout and read its `AGENTS.md` with the tool set the first
+    /// directory earned.
+    ///
+    /// No environment juggling: the test-support ctor already points this
+    /// process's `$XDG_CACHE_HOME` at a throwaway, so the store starts empty and
+    /// `trust()` below writes into that copy, not the developer's.
+    #[tokio::test]
+    async fn cwd_refuses_a_directory_that_was_never_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().join("here");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        let mut host = TestHost::new(here.clone());
+        assert!(dispatch(
+            &mut host,
+            &format!("/cwd {}", elsewhere.display())
+        ));
+
+        assert_eq!(host.cwd, here, "the session must not have moved");
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("not a trusted directory")),
+            "and it must say why: {:?}",
+            host.info_log
+        );
+    }
+
+    /// A directory that *was* answered for is entered normally — the check is a
+    /// gate, not a ban on `/cwd`.
+    #[tokio::test]
+    async fn cwd_enters_a_trusted_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().join("here");
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        hrdr_agent::trust::trust(&target).expect("record the answer");
+
+        let mut host = TestHost::new(here.clone());
+        assert!(dispatch(&mut host, &format!("/cwd {}", target.display())));
+
+        assert!(
+            host.info_log.iter().any(|l| l.contains("cwd →")),
+            "a trusted directory is entered: {:?}",
+            host.info_log
+        );
+        assert!(
+            !host.info_log.iter().any(|l| l.contains("not a trusted")),
+            "and is not refused: {:?}",
             host.info_log
         );
     }

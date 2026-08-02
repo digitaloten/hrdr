@@ -37,6 +37,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`/cwd` refuses a directory that has never been trusted.** The trust gate
+  runs once, when hrdr opens, so without this a session could answer for one
+  directory and then move into a fresh checkout — reading its `AGENTS.md` with
+  the tool set the first directory earned. The question cannot be re-asked
+  mid-session (the TUI owns the terminal by then), so the move is refused with a
+  message saying to start hrdr in that directory instead.
 - **A headless run's stderr chrome is only coloured when stderr is a terminal.**
   `hrdr run … 2>build.log` previously wrote ANSI escape codes into the log;
   captured output is now plain text. `NO_COLOR` (per <https://no-color.org>) and

@@ -254,13 +254,21 @@ directory's files may then do:
   new `Agent::new`. Same shape as `AGENTS.md` but with a **weaker second use** —
   a project skill is a convenience where `AGENTS.md` is a core feature — which
   makes it the stronger candidate of the two if either is closed.
-- **Trust is answered for the directory hrdr opened in, and `set_cwd` moves the
-  agent without re-asking.** The gate runs once, in `main`, before the first
-  `Agent`. A session that starts in a trusted directory and then moves to an
-  untrusted one carries its trusted tool set there and loads the new directory's
-  `AGENTS.md`. Not exercised: no test covers it, and the fix is either re-asking
-  on `set_cwd` (no terminal is available by then — the TUI owns it) or refusing
-  the move. **Needs a decision.**
+- **A jailed session cannot `/cwd` into another untrusted directory.** The hole
+  is closed — `/cwd` refuses a directory nobody has answered for, so a trusted
+  session can no longer walk into a fresh checkout and read its `AGENTS.md` with
+  the tool set the first directory earned. The refusal is unconditional, which
+  is stricter than it needs to be for a session that is _already_ jailed: it
+  loads no project instructions wherever it stands, so moving between untrusted
+  repos could safely be allowed for an audit session. Left strict on purpose —
+  one rule is easier to state than one with an exception — but if auditing
+  across repos becomes real work, this is the exception to add.
+- **There is no way to answer the trust question mid-session.** The menu needs
+  the terminal, which the TUI owns once it starts, so the only answer available
+  to `/cwd` is "no": a user who wants to move into a new directory has to start
+  hrdr there. Closing it means a TUI modal on the `CommandHost` seam
+  (`begin_*`), which is a bigger change than the gate itself and wants the
+  `CommandHost` default-bodies question settled first.
 
 **Two smaller confinement gaps, verified and unchanged:**
 
