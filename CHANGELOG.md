@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-03
+
 ### Added
 
 - **hrdr asks before it trusts a working directory.** A project's `AGENTS.md`
@@ -5828,7 +5830,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/kryptic-sh/hrdr/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/kryptic-sh/hrdr/compare/v0.9.4...v0.10.0
 [0.9.4]: https://github.com/kryptic-sh/hrdr/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/kryptic-sh/hrdr/compare/v0.9.2...v0.9.3
