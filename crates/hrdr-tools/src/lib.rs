@@ -1776,7 +1776,14 @@ pub fn wrap_untrusted(source: &str, body: &str) -> String {
 /// the payload is authored, and the final `contains` check makes absence a proof
 /// rather than a probability: on the astronomically-unlikely collision it just
 /// draws again.
-fn untrusted_nonce(body: &str) -> String {
+///
+/// **Per-call is right for tool output and wrong for the system prompt.** A
+/// fresh token every call is free when the envelope is one tool result, but a
+/// delimiter that changes on every prompt rebuild would move bytes inside the
+/// cached prefix — and two agents in one project would stop sharing it. A caller
+/// wrapping prompt content mints one of these ONCE and re-checks absence against
+/// each body it wraps (see `prompt::caution_nonce`), which keeps the proof.
+pub fn untrusted_nonce(body: &str) -> String {
     use std::hash::{Hash, Hasher};
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     loop {

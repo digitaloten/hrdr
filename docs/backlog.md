@@ -84,12 +84,16 @@ not work.
    the block header states the files come from the project tree and cannot
    override the cardinal rules or the user. A jailed agent now skips the
    project's `AGENTS.md` and skills entirely, which covers the untrusted-repo
-   case. What is still open is hermes' `_scan_context_content` — blocking a file
-   with a `[BLOCKED: …]` placeholder on an injection heuristic. Deliberately
-   deferred: a regex scanner over project docs false-positives on exactly the
-   repos a coding agent gets pointed at (security tooling, shell-hardening
-   guides, this file), and hermes needed three scopes to make it tolerable.
-   **Wants evidence of a real attempt first.**
+   case. The boundary is now machine-clear as well as stated: the content sits
+   in a nonce-delimited `<caution-…>` envelope (`prompt::caution_nonce`), so a
+   file cannot forge a closing tag and write its own framing after it — the gap
+   codex still has, since its `<user_instructions>` tags are fixed strings. What
+   is still open is hermes' `_scan_context_content` — blocking a file with a
+   `[BLOCKED: …]` placeholder on an injection heuristic. Deliberately deferred:
+   a regex scanner over project docs false-positives on exactly the repos a
+   coding agent gets pointed at (security tooling, shell-hardening guides, this
+   file), and hermes needed three scopes to make it tolerable. **Wants evidence
+   of a real attempt first.**
 2. **The test nudge has no teeth.** Fired 3/3 in one session, obeyed 1/3. With
    `verify` in place it has somewhere to escalate to instead of staying
    advisory.
@@ -232,12 +236,15 @@ reads them, and that is a deliberate trade rather than an oversight:
 
 - **Project `AGENTS.md` is writable by a write sub-agent** and read back as
   project conventions on the parent's next prompt rebuild (`/clear`, `set_cwd`,
-  a new agent), **with no trust framing** — unlike memory, which arrives under
-  `MEMORY_PREAMBLE`'s "trust them but verify". Left open on purpose: `AGENTS.md`
-  is also how a project legitimately carries instructions, and narrowing it
-  costs that. A `// NOTE:` sits on the push site in
-  `build_system_prompt_sections`. The cheap half is a trust frame comparable to
-  memory's — that is the actual open item, not the write.
+  a new agent). The framing half is now done: `project_agent_docs_section` names
+  the provenance and the ceiling, and wraps the content in a nonce-delimited
+  `<caution-…>` envelope whose token is verified absent from the body, so a file
+  cannot forge its way out and write its own framing. What remains is the
+  **write** itself, left open on purpose — `AGENTS.md` is also how a project
+  legitimately carries instructions, and narrowing it costs that. A `// NOTE:`
+  sits on the push site in `build_system_prompt_sections`. Closing it would mean
+  the `memory`-tool treatment (main agent only), which that tool could afford
+  because it had no second use.
 - **Project skills shadow built-ins by name.** `skill_dirs` includes
   `cwd/.hrdr/skills`, `cwd/.claude/commands`, `cwd/.opencode/command`, all under
   the writable cwd; project files are discovered _before_ built-ins and win,
