@@ -28,6 +28,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   roots would have to be relabelled first — a persistent change to the user's
   own directories, and a separate decision.
 
+### Removed
+
+- **BREAKING: the web UI and the desktop/GUI shell are gone. hrdr is
+  terminal-only.** The `hrdr serve` subcommand is removed, with every flag it
+  carried (`--bind`, `--port`, `--auth`, `--allow-remote`, `--hash-password`,
+  `--add-user`, `--remove-user`, `--users-db`, `--tls-cert`, `--tls-key`), and
+  so are the three crates behind it: `hrdr-web` (the axum HTTP + WebSocket
+  session server, its token/basic/users auth modes, the SQLite users database
+  and the TLS listener), `hrdr-ui` (the Dioxus/WASM browser SPA) and
+  `hrdr-protocol` (the wire types the two shared and nothing else used). The
+  `[web]` config table and the `HRDR_WEB_*` environment variables no longer do
+  anything — delete them.
+
+  Anyone serving hrdr over HTTP has no upgrade path within hrdr: the TUI (over
+  ssh or tmux, which is how the workflow was actually used) and `hrdr run` for
+  headless/scripted turns are the whole frontend surface now. The three crates
+  are also no longer published to crates.io.
+
 ### Fixed
 
 - **The macOS Seatbelt tests can no longer skip themselves in CI.** Both the

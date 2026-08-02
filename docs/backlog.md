@@ -41,6 +41,17 @@ recorded under [Sandbox follow-ups](#sandbox-follow-ups) as a decision rather
 than an implementation. See
 [Cleared in the 2026-08-02 backend pass](#cleared-in-the-2026-08-02-backend-pass).
 
+**Pruned again 2026-08-02**, by the **removal of the web and desktop UIs**.
+`hrdr-web`, `hrdr-ui` and `hrdr-protocol` are deleted from the tree and
+`hrdr serve` is gone; hrdr is terminal-only. Everything downstream of that went
+with them — the Web UI follow-ups, the "one live session, many windows" goal and
+its `EventLog` multi-reader blocker, the whole frontend-parity plan (seam
+analysis, protocol additions, slice order, wasm portability measurements) and
+every web-only review finding. This is a **deletion, not a deferral**: nothing
+here is waiting for the web to come back. See [Record](#record-closed-efforts)
+for the one-paragraph epitaph and [Standing constraints](#standing-constraints)
+for the rule it leaves behind.
+
 Conventions:
 
 - **Symbol names, not line numbers.** Line numbers rot — the old docs cited
@@ -516,33 +527,6 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
 
 ---
 
-## Web UI follow-ups
-
-Post-parity: the implemented spec's deferred list plus review residuals. All
-verified still open.
-
-- **Session-browser UI** — list + open other sessions from the client; the
-  server gains a `list_sessions()`-backed message pair.
-- **Syntax highlighting in code blocks** (syntect-wasm or highlight.js interop)
-  — verified: no highlighting in `hrdr-ui`.
-- **Modal pickers** (model/effort/theme/session) as bottom sheets over the
-  `begin_*_selector` hooks.
-- ~~v2: attach to a live TUI session~~ — **promoted**: this is the premise, not
-  a follow-up. See
-  [one live session, many windows](#the-actual-goal-one-live-session-many-windows).
-  The blocker stands as recorded: `EventLog::compact` drains below one reader's
-  cursor (`hrdr-agent/src/registry.rs:108-112`) and `PaneSet::sync` calls it
-  after folding, so a second attached reader loses transcript.
-- **Native desktop/mobile shell** — webview over embedded `hrdr-web`.
-- **Read-only/observer auth mode.**
-- **WebHost chrome posters** — verified: `WebHost`'s `CommandHost` impl
-  overrides **neither** `identity_poster` nor `context_window_poster`, so an
-  async `/model` switch updates chrome only via the agent's republish; and a
-  failed autosave is silent (no web equivalent of the TUI's
-  `record_session_save` notice).
-
----
-
 ## Test coverage gaps
 
 - **Wire log on the native backends — unblocked, still unwritten.**
@@ -650,313 +634,16 @@ sections above.
   OpenAI-compatible gateways) have their reasoning silently dropped. Missing
   feature, not a missing test.
 - **Never audited at all:** `sse.rs`, `capped_read.rs`, `fs.rs`, most of
-  `catalog.rs`; hrdr-tui / hrdr-web / hrdr-tools / hrdr-app entirely.
+  `catalog.rs`; hrdr-tui / hrdr-tools / hrdr-app entirely.
 
 ---
 
-## The actual goal: one live session, many windows
+## Left open by the compaction fix (`/compact` pane targeting)
 
-**Stated by the owner 2026-08-02, and it reframes the parity work below.** The
-target is not "two frontends that can each run hrdr". It is _one running
-session, viewed from wherever you are_:
-
-> Start on a laptop ssh'd into the main PC. Turn on remote control. Continue on
-> the phone while out. Get home, sit at the PC, and carry on in the **same tmux
-> session the TUI was started in.**
-
-So the web is a second **window onto a live session**, not a second instance.
-The remote view must see the whole transcript and the whole input history,
-because it is the same session — not a copy of it.
-
-### This is not currently possible, and the blocker is identified
-
-- **There is no `/rc` / `/remote-control` command.** Zero hits in the workspace.
-  The only way to get a web server is the standalone `hrdr serve` subcommand
-  (`apps/hrdr/src/main.rs:280`), which starts its **own** session. There is no
-  path from a running TUI to a remote view of it.
-- **The event log is single-reader by construction.** `EventLog::compact(upto)`
-  (`hrdr-agent/src/registry.rs:108-112`) _drains_ events below a cursor, and
-  `PaneSet::sync` calls `live.compact(key, next)` after folding. One reader's
-  progress destroys events another reader has not seen. A second attached view
-  would silently lose transcript.
-
-Both were already known — the second is recorded in the web follow-ups as "v2:
-attach to a live TUI session" — but they were filed as a feature. They are the
-_premise_. Parity matters only once there is a shared session to be at parity
-about.
-
-### What that makes the plan
-
-1. **Multi-reader event log.** `compact` must take the **minimum** cursor across
-   registered readers rather than one reader's. Contained change, and everything
-   else depends on it.
-2. **`/rc` (alias `/remote-control`)** — bring the server up from inside a live
-   session, bound to that session's registry, and report the URL. The inverse of
-   today's `serve`, which owns the session it creates.
-3. **Parity**, per the inventory below — so the remote window is worth
-   attaching.
-4. **Detach cleanly**: closing the phone leaves the tmux TUI untouched and still
-   authoritative.
-
-### Decisions taken (owner, 2026-08-02)
-
-- **TUI-only, approved:** `/edit` + `Ctrl+G`; `TerminalGuard` (raw mode, alt
-  screen, bracketed paste, mouse capture); cursor shape + `Ctrl+L` redraw;
-  `ui.rs`'s ratatui drawing. Nothing else — mouse selection and vim keybindings
-  were _contested_ by the audit as "solved differently" rather than impossible,
-  and remain open rather than excluded.
-- **`!command` runs the same on web and desktop as in the TUI: outside the
-  sandbox.** The audit recommended making the web path sandbox-respecting on the
-  grounds that "the user's own shell" stops being true when the user is a bearer
-  token. Overruled deliberately: the remote window is the same session and the
-  same person, and a shell that behaves differently depending on which window
-  you typed it in is not the product. This raises the stakes on the auth layer
-  rather than changing the shell — see the security notes below.
-- **Input history is server-side.** It belongs to the session, not the device. A
-  phone joining mid-session must recall what was typed on the laptop, which
-  rules out `localStorage`. This also settles it as _not_ a per-client concern.
-
-## Frontend parity: the web drives the same backend the TUI does
-
-**Decided 2026-08-02 by the owner.** The web/remote UI is a full client of the
-same backend, reaching it through the protocol — _not_ a rendered headless TUI
-streamed to the browser, and not a reduced-capability viewer. It should have
-**almost all** the TUI's features. The one intended exception is `/edit` and its
-`Ctrl+G` binding, which launch an external editor and genuinely cannot work in a
-browser. Everything else — `!command`, `@path` completion, pickers, scrollback
-search, panes, cancellation — is meant to work from a phone against the real
-working tree. Pair this with the standing constraint that server-side execution
-is the feature and auth is the whole boundary.
-
-That makes almost every TUI/web difference a **bug or an unfinished feature**,
-not a design choice. Judge them that way.
-
-### Why the seam, not the layering, is what needs work
-
-An earlier reading of this question (after the `dispatch.rs` review) concluded
-"the sharing already exists, tighten the seam". That was right about _commands_
-and too narrow: it missed a second seam, the **input layer**, where the answer
-differs. Both halves are recorded because both still bind.
-
-**Commands — the sharing is real.** `hrdr-app` is the agnostic layer at ~8.2k
-lines and both frontends route commands through its `CommandHost`; hrdr-tui is
-~16.4k, hrdr-web ~4.2k. One review of the shared dispatcher found bugs in both
-frontends at once, which is the abstraction working. The defect there is that
-`CommandHost` has ~66 methods of which ~43 carry default bodies, and the web
-overrides roughly 37 — so it silently inherits ~29, every one written with a
-terminal in mind. **A default body is a silent opt-out.** `open_editor`'s
-default spawns `xdg-open`, and the web never overrode it by omission rather than
-decision.
-
-Still worth doing, and now _more_ clearly right given the decision above —
-`/edit` is precisely the command that must decline on the web rather than
-silently act on the server:
-
-1. Environment-touching defaults should default to **declining**, not to the
-   terminal behaviour.
-2. `dispatch` should consult `supports_command` before **executing**, not only
-   when filtering help. It currently gates the menu and not the door.
-3. Fix the slash mismatch so `supports_command` matches at all — `HELP_GROUPS`
-   entries carry a leading slash and the web host matches unslashed names, so it
-   has never matched anything.
-
-**Input — the sharing was never done.** Confirmed: `!command` has exactly one
-handler in the workspace, `hrdr-tui/src/app.rs:1211`, so a browser sends
-`!git status` to the model as chat. `@path` completion lives in
-`hrdr-app/src/completion.rs` — correctly placed — but its only consumer is
-`hrdr-tui/src/app.rs`, and `ClientMsg` (`hrdr-protocol/src/lib.rs:292`) has five
-variants (`Submit`, `Command`, `Cancel`, `SwitchPane`, `Resume`), so the wire
-cannot express a completion request at all. These are not wiring oversights: the
-protocol has no vocabulary for them, and `!command` sits in the frontend when it
-belongs below both.
-
-**"Terminal-specific" must be argued from what a browser cannot do, never
-inferred from where the code lives.** The first draft of this entry got that
-wrong — it filed `/goto`/`/find`/`/next`/`/prev` as rightly TUI-only because
-they live in `hrdr-tui/src/app/commands.rs:24-27`. Overruled by the owner: they
-are transcript _navigation_, and half the split is already done
-(`hrdr-app/src/transcript.rs` holds `goto_action`, `FindState`, `find_hits`).
-
-### The measured picture (audit 2026-08-02)
-
-**The SPA ships in no binary.** `hrdr-web` embeds `../hrdr-ui/dist` only under
-its optional `ui` feature (`crates/hrdr-web/Cargo.toml:12`, `default = []`), and
-the workspace dependency (`Cargo.toml:37`) requests no features — so
-`spa_index_html()` returns `None` and a browser gets a stub page telling it to
-connect a WebSocket. CI's release job needs `[test]`, not `web-ui`, and nothing
-consumes the wasm artifact. **Every SPA-side gap below is gap-on-top-of-gap
-until a one-line feature flag lands.**
-
-**The client cannot reach the shared layer.** `crates/hrdr-ui` (Dioxus, desktop
-
-- web) is 780 lines whose only hrdr dependency is `hrdr-protocol` — not
-  `hrdr-app`. So `themes.rs`, `completion.rs`, `format.rs`, `highlight.rs`,
-  `palette.rs` are unreachable _by construction_. It is `exclude`d from the root
-  workspace (`Cargo.toml:16`), so `cargo test --workspace` never builds it; it
-  has five tests, all in `state.rs`; its version is 0.8.5 against 0.10.0.
-
-hrdr-tui is 16,526 lines, **8,364 production**: drawing 3,144 (37.6%),
-terminal-bound 397 (**4.7%** — `lib.rs` + `tui.rs`), logic 4,823. `App` holds no
-ratatui or crossterm types. The terminal coupling is far smaller than the crate
-size suggests.
-
-### Gaps by cost
-
-**Wiring only, inside the 780-line SPA** — no protocol, no shared-crate change.
-The SPA discards `Notice`, `SetInput` and `Error` (`main.rs:241` is a
-`_ => {}`), so **every slash-command reply the web produces is thrown away** —
-`/status`, `/cost`, `/doctor`, `/help` all answer into the void, and
-`/paste`/`/add`/`/copy` silently do nothing. It never sends `Cancel` (so a turn
-cannot be stopped from a browser) or `Resume` (reconnect is an empty closure).
-It emits a bogus `/switch` on every tab click, which dispatch answers "unknown
-command". Input is an `<input>`, so multiline is impossible. `show_thinking` is
-stored and never read. Tool blocks have no expand toggle while `WebHost` tells
-the user to use one. Plus draft stash, toasts, scrollback and selection — all
-SPA-local.
-
-**Needs protocol:** `!command`; completion of every kind (`@path` _must_ be
-server-side — it ranks against a file index of the server's cwd); the
-`/goto`/`/find`/`/next`/`/prev` family; the six pickers; input history recall;
-per-pane cancellation. Note the last is a _server bug_, not just unwiring:
-`WebSession::cancel` aborts the turn handle only when `key == MAIN_KEY`, so a
-sub-pane cancel never aborts its task.
-
-**Must move out of `hrdr-tui` first:** `submit_input`'s routing rules — its doc
-comment claims they "live here and nowhere else", which is now false, there are
-three implementations of "what did the user mean"; `user_shell_command`;
-`app/completion.rs` (232 lines, depends on nothing terminal); `Selector<T>` (60
-generic lines — moving it keeps picker filtering client-side, so no
-per-keystroke round trip); dispatcher arms for the navigation family; and
-collapsing the `/edit` + `/reload` double implementations.
-
-### Protocol additions
-
-Five pairs cover it: `ClientMsg::Shell`; `Complete`/`Completions` (echo the
-request text rather than carrying a request id — completions are idempotent and
-newest-wins); `ServerMsg::Locate` for search/goto; `Picker`/`PickerChoose`/
-`PickerCancel` collapsing all six modals into one pair; and `LoginSubmit` kept
-**separate** from `PickerChoose` because a credential must not ride the message
-that also carries theme names. `ClientMsg` 5 → 10, `ServerMsg` 8 → 11.
-Completions and search results look alike and must not share a pair — one is a
-non-blocking popup, the other a one-shot viewport instruction.
-
-### Slice order
-
-0. Ship the SPA (feature flag + CI artifact). Blocks everything.
-1. SPA wiring — biggest function-restored-per-effort in the list.
-2. Move `classify_input` + `user_shell_command`, add `Shell`. Early, so there is
-   one answer to "what did the user type" before anything else touches submit.
-3. Per-pane abort (server-only bug fix) — what makes slice 1's Cancel button
-   actually work on a sub-agent.
-4. Move `completion.rs`, then the `Complete` pair. The move must land first —
-   the wire types _are_ the moved types.
-5. Navigation arms + `Locate`, fixing `supports_command` in the same commit.
-6. `Selector<T>` + pickers + collapsing the `/edit`/`/reload` fork.
-7. History, after the client-vs-server ownership decision.
-
-Parallel-safe: {0} → {1} ∥ {2} ∥ {3} → {4} ∥ {5} → {6}. Slices 4 and 5 both
-touch `hrdr-app`; do not give them to concurrent write agents.
-
-### Measured: what can and cannot move to the client
-
-`cargo check -p hrdr-app --target wasm32-unknown-unknown` **fails** — `mio`, 48
-errors. Structural, not incidental: `hrdr-app` takes `tokio.workspace = true`
-and the workspace pins `tokio = { features = ["full"] }` (`Cargo.toml:57`) → mio
-→ sockets. It also pulls `hrdr-agent` (reqwest), `hrdr-tools` (OS sandbox),
-`ignore`, `notify`, `syntect`. So moving `hrdr-app` wholesale is closed.
-
-Per-module, roughly 740 lines are portable today (`completion.rs`, `palette.rs`,
-`themes.rs`, `types.rs`) and ~1,830 more if their `hrdr_agent::Entry` dependency
-is re-pointed at `hrdr-protocol::WireEntry`, which already mirrors it.
-Everything the owner actually wants from the server — file index, session list,
-model catalog, theme files, shell — is filesystem or network by nature and can
-never move.
-
-**Themes: ship over the wire, don't split a crate.** A probe crate carrying
-`hjkl-theme` + the role mapping _does_ compile to wasm (4.72s), so the split is
-genuinely available — it just buys nothing. The layering is already right and
-already documented: `ChatPalette` (`palette.rs:20-48`) is 13 roles of
-`Option<(u8,u8,u8)>`, pure data; `from_hjkl` (`:74-103`) holds the role mapping
-and fallback chain, already shared; and all the TUI adds is **18 lines**
-(`hrdr-tui/src/theme.rs:53-71`) turning `Option<Rgb>` into `ratatui::Color`. The
-module doc says so outright: _"a frontend converts to its own color type and
-applies its own medium-appropriate final fallbacks."_ User themes live in
-`~/.config/hrdr/themes` **on the server**, so the client must ask for the choice
-list regardless; once that round-trip exists, sending 13 resolved triples costs
-less than a published crate, a second TOML parser in the wasm bundle, and a
-version-skew surface. Add `palette: WireChatPalette` to `Snapshot` plus a
-`ServerMsg::Theme` delta; the client writes its own 18-line mirror.
-
-### Fix the harness before the features
-
-Three facts bound what a green build currently means, and they explain why the
-client's bugs went unnoticed:
-
-- **A protocol change that breaks the client fails nothing.** `hrdr-ui` is
-  outside `cargo test --workspace`, and the CI `web-ui` job's `dist/` output
-  feeds no other job. A `ServerMsg` variant the client cannot parse merges
-  green.
-- **Version drift 0.8.5 vs 0.10.0** accumulated silently, because nothing
-  compiles them together.
-- **Its five tests all cover the reducer** (`state.rs`); nothing tests
-  `main.rs`, which is where every client bug found lives. `main.rs:241`'s
-  `_ => {}` is exactly the shape the guardrails warn about — a match arm that
-  silently matches _more_ every time the protocol grows, while reporting
-  "handled".
-
-One round-trip test asserting that every `ServerMsg` variant changes client
-state would have caught three of the four. Do this before the feature work.
-
-### Security consequences of closing the gap
-
-The auth layer is careful — three modes, argon2id, a refuse-to-bind matrix
-requiring TLS off-loopback, 10 failures/min/IP, WS `Origin` checked against
-`Host` including port. Three things need deciding rather than inheriting:
-
-- **There is no authorization, only authentication.** Every authenticated
-  connection attaches to the _same_ `WebSession` and gets the same full
-  capability. Two logged-in users are two hands on one keyboard, not two
-  sessions.
-- **`cookie_secret` regenerates on every start**, so every restart logs every
-  device out — friction that will tempt someone to weaken it on a phone-first
-  workflow. Decide whether to persist it.
-- **`!command` runs unconfined with guardrails explicitly emptied** and a
-  24-hour timeout: `user_shell_command` builds `SandboxPolicy::unconfined()` and
-  clears `ctx.guardrails` ("user's own shell"). Correct for a terminal user at
-  their own machine; over the network a session cookie becomes a day-long
-  unconfined shell on the host. Not a reason to withhold it — a reason to decide
-  deliberately, when it moves into `hrdr-app`, whether the web path reuses that
-  `ToolContext` or a sandbox-respecting one.
-- `LoginSubmit` must stay out of frame logging and off the replay buffer that
-  `Resume` re-sends. And `/login` over the web would let a client mint and
-  persist provider API keys on the host — its own decision, currently declined
-  by default.
-- **`/edit` must be blocked, not hidden.** `supports_command` is a help-text
-  filter; the dispatcher does not consult it before acting, so `WebHost` needs a
-  real `open_editor` override that refuses.
-- **Inconsistent HTML escaping in the client** — PLAUSIBLE, not proven.
-  `state.rs:295` has a proper `html_escape` (`& < > "`), but `main.rs`'s status
-  and todo rendering escape **only `<`** (e.g. `main.rs:338`), and all of it
-  goes through `dangerous_inner_html`. Status text and todo content are model-
-  and tool-influenced. No payload was constructed and quote-free attribute
-  contexts may save it; the fix is to use the escaper that already exists rather
-  than to reason about whether it is exploitable.
-- **The parity gaps are currently load-bearing security controls.** `/paste` and
-  `/copy` are blocked because the clipboard is not there, not because anyone
-  decided. Closing gaps deliberately removes that accidental hardening, so each
-  item needs its own verdict rather than "the TUI does it".
-
-### Left open by the compaction fix (`/compact` pane targeting)
-
-The data-loss half is fixed: both frontends now summarize the conversation on
-screen. Three residuals, all from the same root — the turn **handle** slot is
+The data-loss half is fixed: the TUI now summarizes the conversation on screen.
+Two residuals, both from the same root — the turn **handle** slot is
 session-wide while the compaction is now per-pane:
 
-- **The web parks a sub-pane compaction's handle in `main_turn_handle`**, so the
-  main pane reads as busy and queues prompts to it while a sub-agent is
-  summarized. Deliberate for now: over-blocking is recoverable (queued steers
-  are relaunched by the same turn-end handling as a normal turn) where
-  summarizing the wrong history is not. Needs a per-pane handle slot to move to.
 - **The TUI can no longer Esc-cancel a sub-pane compaction.** `in_flight`,
   `is_busy` and `cancel_turn` are all keyed to `MAIN_KEY`, so with the clock now
   on the sub key they see nothing in flight. Before the fix Esc did cancel it —
@@ -966,60 +653,24 @@ session-wide while the compaction is now per-pane:
   is main-scoped), so "compacted: N → M" appears in the main conversation even
   when a sub-agent was summarized. TUI system lines are main-scoped generally;
   changing that is a wider call.
-- **Web `is_busy()` reads `MAIN_KEY` only**, so for up to one tick (~100 ms)
-  after starting a sub-pane compaction a second `/compact` would overwrite the
-  handle slot and orphan the first task — it still completes, but becomes
-  uncancellable.
 
 ---
 
 ## dispatch.rs review — findings 2026-08-02
 
-`hrdr-app/src/commands/dispatch.rs` (946 lines, both frontends route through it)
-was read in full for the first time, with its six sibling modules, the
-`CommandHost` trait and both call sites. Ten tests exist, covering `/add` and
-`/copy msg`; the other ~30 commands have none. Findings below are traced from
-source — nothing was reproduced at runtime.
-
-**Fix first — the web silently compacts the wrong conversation.**
-`CommandHost::agent`'s contract names `/compact` as acting on the agent on
-screen, and the TUI honours it (`hrdr-tui/src/app.rs:2344`, `active_agent()`,
-with a comment saying so). `WebHost::start_compaction` uses
-`self.session.agent()` — the main agent — and keys on `MAIN_KEY`. In the web UI,
-switching to a sub-agent pane and running `/compact` leaves that pane untouched
-and irreversibly summarizes the **main** conversation, announced only as
-"compacting conversation…". Verified by reading both implementations.
-
-**`supports_command` has never matched anything.** `HELP_GROUPS` entries carry
-the leading slash (`hrdr-app/src/lib.rs:140`) and `WebHost::supports_command`
-matches unslashed names (`hrdr-web/src/host.rs:395`). Its only caller in the
-workspace is the `/help` filter, so the web advertises `/edit`, `/paste`,
-`/copy`, `/theme`, `/reload` as available; `/goto`, `/find`, `/next`, `/prev`
-are listed too and exist only in the TUI. Verified both spellings by reading
-them. Fix is `trim_start_matches('/')` plus adding the four TUI-only names.
-
-**Nothing gates execution on `supports_command` — only help text.** That is the
-structural half, and it needs a decision: gate in `dispatch`, or override per
-host. Two live consequences today. `/edit <file>` over the web reaches the
-default `open_editor`, which spawns `xdg-open`/`open`/`start` **on the machine
-hosting the server** and tells the remote user it opened. `/theme <path>` calls
-a `set_theme` the web host discards, then `persist_setting` — which is _not_
-overridden — writing the **server operator's** `config.toml` with a remotely
-chosen path, and reporting success. `/theme reset` deletes their key.
-
-**The web does not trim the input line.** `hrdr-web/src/server.rs:660` tests
-`!line.starts_with('/')` on the raw line; the TUI trims first. A leading space —
-a paste, a mobile keyboard — sends `" /new"` to the model as a user message and
-burns a turn.
+`hrdr-app/src/commands/dispatch.rs` (946 lines) was read in full for the first
+time, with its six sibling modules, the `CommandHost` trait and its call site.
+Ten tests exist, covering `/add` and `/copy msg`; the other ~30 commands have
+none. Findings below are traced from source — nothing was reproduced at runtime.
 
 **`/cwd` writes one agent and reads another.** `dispatch.rs` resolves the
 argument against `host.cwd()` and writes `host.agent()`, and those are different
-agents in _both_ frontends (`cwd()` is main-derived, `agent()` is the active
-pane). On a sub-agent pane, a relative `/cwd` resolves against main's cwd, moves
-only the sub-agent, then repoints the global chrome as if main had moved. A bare
-`/cwd` afterwards contradicts the status bar. `/status` has the same split —
-main's cwd beside the active agent's message count. Needs a call: derive the
-base from `host.agent()`, or add `active_cwd()` so both halves name one agent.
+agents (`cwd()` is main-derived, `agent()` is the active pane). On a sub-agent
+pane, a relative `/cwd` resolves against main's cwd, moves only the sub-agent,
+then repoints the global chrome as if main had moved. A bare `/cwd` afterwards
+contradicts the status bar. `/status` has the same split — main's cwd beside the
+active agent's message count. Needs a call: derive the base from `host.agent()`,
+or add `active_cwd()` so both halves name one agent.
 
 **Canonical names are case-sensitive, aliases are not.** `resolve_alias`
 lowercases only for its match arms and returns the original on fall-through, so
@@ -1041,10 +692,9 @@ keys off `--json` alone, drops extra tokens silently, and overwrites without
 confirmation using blocking `fs::write` inside an async task; `/effort`,
 `/login` and `/skills` discard their argument in silence (`/effort high` prints
 a level listing on the default host, so the user reasonably believes it
-applied); `/doctor` runs `git branch` and filesystem probes **before** its spawn
-— on the TUI thread, and on the web while the global session lock is held, so a
-slow `git` stalls every connected client. `/status` already does this correctly
-inside the spawn.
+applied); `/doctor` runs `git branch` and filesystem probes **before** its
+spawn, on the TUI thread, so a slow `git` stalls the UI. `/status` already does
+this correctly inside the spawn.
 
 **Checked and fine, so nobody re-derives it:** the `bool` contract is sound —
 every in-arm return is `true`, only the unknown arm and the non-`/` guard return
@@ -1059,17 +709,15 @@ synchronous and holds no lock across an await.
 **Coverage worth adding first**, in order of how bad a silent regression is: a
 table asserting `dispatch` returns `true` for every name in `SLASH_COMMANDS` and
 `false` only for unknown input (catches an arm being deleted, or a
-`return false` slipping into a handler); `/help` actually filtering on
-`supports_command`; `/edit` not reaching `open_editor` on a host that refuses
-it; the busy guards firing at all — they are the "check that cannot fail" shape
-and nothing observes them today.
+`return false` slipping into a handler); the busy guards firing at all — they
+are the "check that cannot fail" shape and nothing observes them today.
 
-**Not covered by this pass:** no runtime exercise, TUI or web. The concurrency
-claims are reasoned from lock scopes, not from a racing repro. TUI modal/picker
-key routing was judged only at its `begin_*` entry points. `login.rs`,
-`skills.rs`, `completion.rs` and `sessions.rs` were read only where dispatch
-calls into them. `open_system_handler`'s Windows and macOS arms are `#[cfg]`-
-gated and were not compiled.
+**Not covered by this pass:** no runtime exercise. The concurrency claims are
+reasoned from lock scopes, not from a racing repro. TUI modal/picker key routing
+was judged only at its `begin_*` entry points. `login.rs`, `skills.rs`,
+`completion.rs` and `sessions.rs` were read only where dispatch calls into them.
+`open_system_handler`'s Windows and macOS arms are `#[cfg]`- gated and were not
+compiled.
 
 ---
 
@@ -1081,8 +729,8 @@ closed every finding it raised, but it did not read everything. What it never
 opened, so nobody records it as reviewed:
 
 - ~~`hrdr-app/src/commands/dispatch.rs`~~ — **read 2026-08-02**, see
-  [dispatch.rs review](#dispatchrs-review-findings-2026-08-02). Twelve findings,
-  one of them history loss on the wrong conversation.
+  [dispatch.rs review](#dispatchrs-review-findings-2026-08-02). The web-only
+  findings went with the web UI; what is left is listed there.
 - **`hrdr-tui/src/ui.rs` block rendering** and **`app/commands.rs`**. Only the
   mouse/selection path (`e1b3023`) and the scroll/highlight math were read.
 - **Twelve `hrdr-tools` files**: `find`, `ls`, `secret_diff`, `mutation`,
@@ -1196,11 +844,10 @@ with the reason, don't re-file the finding.
   so a shared iterator is cheaper than it was; still ~15 lines each with
   diverging payloads (skill dirs vs `AGENTS.md`), so still judged borderline
   over-engineering. Re-examine only if a third walk appears.
-- **Four `CommandHost` impls** — `TuiHost`, `WebHost`, and the test hosts
-  `TestHost` and `RouteTestHost`. The trait is the shared mechanism; the test
-  hosts share some trivial no-op bodies, but the login host carries
-  login-specific state. A shared test base would remove a few no-ops for very
-  little gain.
+- **Three `CommandHost` impls** — `TuiHost` and the test hosts `TestHost` and
+  `RouteTestHost`. The trait is the shared mechanism; the test hosts share some
+  trivial no-op bodies, but the login host carries login-specific state. A
+  shared test base would remove a few no-ops for very little gain.
 - **Secret-file write/edit guards are tailored, not shared.** `write.rs`,
   `edit.rs` and `fileops.rs` each `bail!` with their own message ("refusing to
   write…", "refusing to edit…", "copying it would place its contents…"). The
@@ -1353,28 +1000,12 @@ away. Not work; guardrails on work.
 Decisions from completed work that still govern new work. These are not backlog
 items — they are rules.
 
-- **The web UI is meant to execute on the host. That is the feature, not a
-  leak.** Decided 2026-08-02 by the owner: the point of the remote interface is
-  to work from a phone or another machine against the real working tree, so
-  `!command`, `@path` completion and the file tools are all _supposed_ to run
-  server-side with the host's filesystem. Do not "harden" this by removing
-  capability from the web client or by gating commands as unsafe-when-remote — a
-  web session is meant to be as capable as a terminal one.
-
-  What that moves the boundary to: **authentication is the entire security
-  model.** hrdr-web is locked down by its auth layer, and every capability
-  question reduces to "can anyone but the owner reach this endpoint". So auth
-  and session handling carry the weight that per-command gating would otherwise
-  carry, and a weakness there is not one bug — it is arbitrary execution on the
-  host. Judge changes to `hrdr-web/src/auth.rs` accordingly.
-
-  Two things this does **not** excuse, because they are wrong for reasons other
-  than security: `/edit` reaching the default `open_editor` spawns a desktop
-  handler on the _server_, where a headless host has no display and the remote
-  user cannot see it either — the command should act on the client or decline,
-  not silently succeed elsewhere. And `/theme` writing config the remote caller
-  cannot see the effect of is a correctness bug in the same family. Capability
-  belongs on the web; _acting on the wrong machine_ does not.
+- **hrdr is terminal-only.** Decided 2026-08-02 by the owner: the web server,
+  the browser SPA and the desktop/mobile shell are removed, not deferred. The
+  TUI (plus `hrdr run` for headless) is the whole frontend surface. Do not
+  reintroduce a second frontend, a wire protocol or a `CommandHost` impl for one
+  without the owner asking for it — `hrdr-app`'s host seam exists to keep the
+  TUI honest, not to hold a place for a client that no longer exists.
 
 - **hrdr-agent owns ALL agent logic; hrdr-app is only agent↔TUI glue.** Every
   agent, main or sub, runs the same codepath — no special-casing, no parity
@@ -1506,9 +1137,9 @@ now.
    patterns plus 2 pipe-to-shell rules (POSIX and `iwr|iex`). So
    `deferred-improvements.md`'s "the pipe-to-shell guardrail assumes POSIX" was
    true only of its **recovery text**, not its coverage.
-4. **There are four `CommandHost` impls, not three** — `WebHost` arrived with
-   the web UI and was never added to the count — and the login test host is
-   named `RouteTestHost`, not `TestLoginHost`.
+4. **The login test host is named `RouteTestHost`, not `TestLoginHost`.** (The
+   `CommandHost` impl count this item also corrected is moot now that the web UI
+   is gone: `TuiHost` plus the two test hosts, `RouteTestHost` and `TestHost`.)
 5. **The two project-dir walks are now in one crate.** `skill_dirs` moved to
    `hrdr-agent` with the skills work, so the "different crates" half of the
    reason to leave them alone is gone; the verdict survives on size and
@@ -1539,9 +1170,9 @@ now.
 
 Fifteen commits, `0fae706`..`36a7f2b`, cleared every item that was actionable
 without a decision: the five that were top of this list, plus the LSP dedup,
-revive capability, the notice channel, both web auth holes, the grep-backend and
-guardrail-drift and TUI-history test gaps. Read `git log` for what each did —
-the entries are gone from the sections above, per this file's own convention.
+revive capability, the notice channel, and the grep-backend, guardrail-drift and
+TUI-history test gaps. Read `git log` for what each did — the entries are gone
+from the sections above, per this file's own convention.
 
 What survives is the part that would otherwise be relearned:
 
@@ -1617,17 +1248,14 @@ What survives that would otherwise be relearned:
 file's own convention — every finding in it shipped. Nine commits,
 `4e66a1c`..`2e3be29`, released as **v0.10.0**; `git log` is the history.
 
-Sixteen findings closed: the web server's missing `WWW-Authenticate` challenge
-and the `users` mode that had no browser entry point at all;
-`SseDecoder::finish` returning `Ok` with a truncated event; a Codex error whose
-code sat at one level and its message at another; a wire round-trip test that
-compared `Value` to itself and so green-lit three message types the protocol
-cannot parse; a hook timeout reporting seconds as `ms`; a crashed turn leaving
-its tool call spinning forever. Plus the SSRF blocklist's missing `100.64/10`,
-`attr_value` matching an attribute suffix, a DDG snippet reading past its block,
-a CI-file cap that hid every single-file config, four `unwrap()`s in a detached
-socket task, a leaked `String` per env var, a dead duplicate of the login
-handler, and a stale `allow(dead_code)`.
+Sixteen findings closed. The ones still in the tree: `SseDecoder::finish`
+returning `Ok` with a truncated event; a Codex error whose code sat at one level
+and its message at another; a hook timeout reporting seconds as `ms`; a crashed
+turn leaving its tool call spinning forever; the SSRF blocklist's missing
+`100.64/10`; `attr_value` matching an attribute suffix; a DDG snippet reading
+past its block; a CI-file cap that hid every single-file config; a leaked
+`String` per env var; and a stale `allow(dead_code)`. The rest were in the
+since-removed web server and its wire protocol — `git log` is their history.
 
 What survives that would otherwise be relearned:
 
@@ -1764,13 +1392,16 @@ Seatbelt on macOS, software-only on Windows; degradation notices byte-pinned.
 What survives as rules is under Standing constraints; what was left out is under
 Sandbox follow-ups.
 
-**Web UI** (2026-07-26). `hrdr serve` — axum HTTP+WS, an optional embedded
-Dioxus SPA, three auth modes (token/basic/users), TLS-gated remote access. The
-plan doc is deleted; leftovers are under Web UI follow-ups.
+**Web UI** (shipped 2026-07-26, **removed 2026-08-02**). `hrdr serve` — axum
+HTTP+WS, an optional embedded Dioxus SPA, three auth modes, TLS-gated remote
+access — plus the `hrdr-ui` client and the `hrdr-protocol` wire crate. Deleted
+outright by owner decision, along with every follow-up and parity entry it had
+accumulated here; hrdr is terminal-only (see Standing constraints). `git log`
+and CHANGELOG.md are its history.
 
 **Also closed and deleted along the way:** the transcript unification
-(hrdr-agent owns the `Entry` model, `apply_event` builder and renderer;
-frontends render only), the agent-logic migration (main and sub-agents on one
+(hrdr-agent owns the `Entry` model, `apply_event` builder and renderer; the
+frontend renders only), the agent-logic migration (main and sub-agents on one
 codepath), session retention/compression, the memory tool's design, the DRY and
 seam audits (their survivors are under Considered and declined), and the
 tool-robustness audit (13 items: 11 shipped, 2 dropped in re-triage).

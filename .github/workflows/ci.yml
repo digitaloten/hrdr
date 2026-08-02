@@ -167,59 +167,6 @@ jobs:
           done
           cargo run --locked -q -p hrdr -- --man > /dev/null
 
-  web-ui:
-    name: web-ui (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: wasm32-unknown-unknown
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-          target: wasm32-unknown-unknown
-          cache: false
-      - run: rustup update --no-self-update stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install Dioxus CLI
-        run: cargo install --locked 'dioxus-cli@^0.7'
-      - name: Build hrdr-ui WASM
-        working-directory: crates/hrdr-ui
-        run: dx build --platform web --release
-      - name: Copy build output to dist/
-        working-directory: crates/hrdr-ui
-        shell: bash
-        run: |
-          # dx keys the output dir by the BIN name (hrdr-ui-wasm), not the
-          # package name, and the servable bundle is the web/public subdir.
-          SRC=target/dx/hrdr-ui-wasm/release/web/public
-          test -d "$SRC" || { echo "::error::dx output not found at $SRC"; find target/dx -maxdepth 4 -type d; exit 1; }
-          rm -rf dist
-          cp -r "$SRC" dist
-          touch dist/.gitkeep
-          ls -la dist
-      - name: Check gzipped WASM size
-        working-directory: crates/hrdr-ui
-        shell: bash
-        run: |
-          WASM=$(find dist -name '*.wasm' | head -1)
-          if [ -z "$WASM" ]; then
-            echo "::warning::No .wasm file found in dist/"
-            exit 0
-          fi
-          SIZE=$(gzip -c "$WASM" | wc -c)
-          echo "gzipped WASM size: ${SIZE} bytes"
-          echo "gzipped_wasm_bytes=${SIZE}" >> "$GITHUB_STEP_SUMMARY"
-          MAX=$((3 * 1024 * 1024))
-          if [ "$SIZE" -gt "$MAX" ]; then
-            echo "::error::gzipped WASM ${SIZE} bytes exceeds ${MAX} byte budget"
-            exit 1
-          fi
-
   # Runs on every main push (dry-run) and every v* tag / dispatch. Skips
   # PRs. Artifact upload happens always; publishing to the GitHub Release
   # is a separate tag-gated job. This catches packaging breakage before a
@@ -518,22 +465,22 @@ jobs:
               fi
             done
             # Six attempts honouring the server's own timestamps: a whole release
-            # publishes ~9 crates, and crates.io refills the "updates to existing
+            # publishes 7 crates, and crates.io refills the "updates to existing
             # crates" bucket about once a minute, so a release cut minutes after
             # another one needs real patience here.
             echo "::error::publish failed for ${crate} after 6 rate-limit retries"
             return 1
           }
-          # Dependency order. `hrdr-protocol` first (no internal deps),
-          # `hrdr-web` after the three it needs (protocol, app, agent), and the
-          # `hrdr` binary last because it depends on every one of them.
-          ORDER="hrdr-protocol hrdr-llm hrdr-tools hrdr-agent hrdr-editor hrdr-app hrdr-tui hrdr-web hrdr"
+          # Dependency order. `hrdr-llm` first (no internal deps), each crate
+          # after the ones it needs, and the `hrdr` binary last because it
+          # depends on every one of them.
+          ORDER="hrdr-llm hrdr-tools hrdr-agent hrdr-editor hrdr-app hrdr-tui hrdr"
           # A crate missing from ORDER fails the release *before* anything is
-          # uploaded, rather than half-publishing and stranding the binary: that
-          # is exactly what v0.8.0 did — `hrdr-web` shipped with the web UI, was
-          # never added here, and `hrdr` (which depends on it) could not publish
-          # once the six libs were already up. `publish = false` members and the
-          # workspace-excluded `hrdr-ui` are not publishable and are not listed.
+          # uploaded, rather than half-publishing and stranding the binary: a new
+          # library that ships without being added here cannot be published, and
+          # neither can `hrdr` once the libs ahead of it are already up — leaving
+          # a tagged release with no binary. `publish = false` members are not
+          # publishable and are not listed.
           MEMBERS=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.publish != []) | .name' | sort)
           LISTED=$(printf '%s\n' $ORDER | sort)

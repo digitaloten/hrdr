@@ -9360,8 +9360,8 @@ mod tests {
             assert!(outcome.panicked, "the turn crashed: {outcome:?}");
 
             let seen = seen.lock().unwrap();
-            // The transcript every frontend builds is this fold, so asserting on
-            // it asserts on what the TUI and the web UI both show.
+            // The transcript a frontend builds is this fold, so asserting on it
+            // asserts on what the TUI shows.
             let mut entries: Vec<crate::Entry> = Vec::new();
             for ev in seen.iter() {
                 crate::transcript::apply_event(&mut entries, ev);

@@ -6,7 +6,7 @@ use super::host::CommandHost;
 use super::model::endpoint_health_warning;
 use super::types::ExpandMode;
 
-/// Handle a `/…` command shared by both frontends. Returns `true` if it was a
+/// Handle a `/…` command, independent of renderer. Returns `true` if it was a
 /// recognized command (and thus shouldn't be sent to the model). Unknown input
 /// returns `false` so the caller can pass it to the model or handle it locally.
 pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {

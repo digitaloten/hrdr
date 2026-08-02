@@ -8,12 +8,8 @@ members = [
     "crates/hrdr-app",
     "crates/hrdr-tui",
     "crates/hrdr-test-support",
-    "crates/hrdr-protocol",
-    "crates/hrdr-web",
     "apps/hrdr",
 ]
-
-exclude = ["crates/hrdr-ui"]
 
 [workspace.package]
 version = "0.10.0"
@@ -33,8 +29,6 @@ hrdr-tui = { path = "crates/hrdr-tui", version = "0.10.0" }
 # Dev-only, never published: the ctor that sandboxes $HOME/XDG before any test runs.
 # Path-only on purpose — cargo strips a versionless path dev-dependency on publish.
 hrdr-test-support = { path = "crates/hrdr-test-support" }
-hrdr-protocol = { path = "crates/hrdr-protocol", version = "0.10.0" }
-hrdr-web = { path = "crates/hrdr-web", version = "0.10.0" }
 
 # hjkl — crates.io pins (caret-minor; lockfile holds the exact patch).
 hjkl-engine = "0.33"
@@ -81,15 +75,6 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.10"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# web server (used only by hrdr-web)
-axum = { version = "0.8", features = ["ws"] }
-axum-server = { version = "0.8", features = ["tls-rustls"] }
-rust-embed = "8"
-rusqlite = { version = "0.40", features = ["bundled"] }
-argon2 = "0.5"
-subtle = "2"
-hmac = "0.12"
 
 [profile.release]
 lto = "thin"

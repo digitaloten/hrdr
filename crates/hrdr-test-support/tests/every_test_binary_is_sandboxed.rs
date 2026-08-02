@@ -75,11 +75,11 @@ fn every_integration_test_binary_links_the_sandbox_ctor() {
 
 /// Every crate directory listed in the root manifest's `[workspace] members`.
 ///
-/// Members only, deliberately. A crate outside the workspace (`[workspace] exclude` —
-/// today the wasm-only `hrdr-ui`, which dioxus-cli builds standalone) is never compiled
-/// or run by the workspace `cargo test`, so it has no test binary that could reach the
-/// developer's real $HOME through this harness. The link line buys nothing there, and
-/// demanding it would force a dev-dependency on non-wasm code into a wasm crate.
+/// Members only, deliberately. A crate outside the workspace (`[workspace] exclude`) is
+/// never compiled or run by the workspace `cargo test`, so it has no test binary that
+/// could reach the developer's real $HOME through this harness, and the link line would
+/// buy nothing there. The root manifest currently has no `exclude` key at all, so today
+/// this is the whole workspace.
 ///
 /// The flip side: a crate that is missing from `members` is not scanned. That is the same
 /// condition as not being tested at all, so it costs no coverage — but it does mean adding

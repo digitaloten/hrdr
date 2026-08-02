@@ -1,9 +1,9 @@
 //! The verification ledger: what this session actually checked, and whether it
 //! still holds.
 //!
-//! A session ran `cargo test -p hrdr-web -p hrdr-llm`, read the green summary,
+//! A session ran `cargo test -p hrdr-app -p hrdr-llm`, read the green summary,
 //! edited three more files, committed, and reported the work verified. Two of
-//! nine crates were covered and the run predated half the edits. Nothing in the
+//! eight crates were covered and the run predated half the edits. Nothing in the
 //! harness noticed, because nothing was keeping score.
 //!
 //! This keeps score. Every source mutation bumps [`source_epoch`]; every shell
@@ -1037,7 +1037,7 @@ mod tests {
     fn anything_narrower_than_the_whole_tree_is_partial() {
         // The exact command from the session that motivated this file.
         for command in [
-            "cargo test -p hrdr-web -p hrdr-llm",
+            "cargo test -p hrdr-app -p hrdr-llm",
             "cargo test --workspace --lib",
             "cargo test --workspace some_test_name",
             "cargo nextest run --workspace -E 'test(verification)'",
@@ -1157,7 +1157,7 @@ mod tests {
     fn a_partial_pass_and_a_failed_whole_run_both_settle_nothing() {
         let mut led = VerificationLedger::default();
         led.bump_source();
-        led.record("cargo test -p hrdr-web -p hrdr-llm", true);
+        led.record("cargo test -p hrdr-app -p hrdr-llm", true);
         assert_eq!(led.stale_kinds(), vec![CheckKind::Test], "a green subset");
         led.record("cargo test --workspace", false);
         assert_eq!(led.stale_kinds(), vec![CheckKind::Test], "a red tree");
@@ -1189,14 +1189,14 @@ mod tests {
     fn the_note_names_the_kinds_the_run_and_the_edits_that_followed() {
         let mut led = VerificationLedger::default();
         led.bump_source();
-        led.record("cargo test -p hrdr-web -p hrdr-llm", true);
+        led.record("cargo test -p hrdr-app -p hrdr-llm", true);
         led.bump_source();
         led.bump_source();
         let note = led.commit_note().expect("a note is owed");
         assert!(note.starts_with("[verify] committed, but"), "{note}");
         assert!(note.contains("test"), "the owed kind is named: {note}");
         assert!(
-            note.contains("cargo test -p hrdr-web -p hrdr-llm"),
+            note.contains("cargo test -p hrdr-app -p hrdr-llm"),
             "the run is named verbatim: {note}"
         );
         assert!(note.contains("partial"), "its scope is named: {note}");
@@ -1255,9 +1255,9 @@ mod tests {
     fn the_summary_names_commands_with_their_scope_newest_first() {
         let mut led = VerificationLedger::default();
         led.record("cargo fmt --all", true);
-        led.record("cargo test -p hrdr-web", false);
+        led.record("cargo test -p hrdr-app", false);
         let summary = led.summary();
-        assert!(summary.contains("cargo test -p hrdr-web"), "{summary}");
+        assert!(summary.contains("cargo test -p hrdr-app"), "{summary}");
         assert!(summary.contains("partial"), "{summary}");
         assert!(summary.contains("failed"), "{summary}");
         assert!(

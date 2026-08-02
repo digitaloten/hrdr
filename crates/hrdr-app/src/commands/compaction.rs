@@ -22,7 +22,7 @@ pub async fn run_compaction(
         .map_err(|e| e.to_string())
 }
 
-/// The system line a finished compaction shows — identical in both frontends.
+/// The system line a finished compaction shows.
 pub fn compaction_message(res: &Result<(usize, usize), String>) -> String {
     match res {
         Ok((before, after)) if before == after => "nothing to compact yet".to_string(),

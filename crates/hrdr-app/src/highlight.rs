@@ -1,8 +1,8 @@
-//! Shared syntect resources for code highlighting. Both frontends highlight
-//! fenced code blocks (and tint tool-output panels) with the same syntax set,
-//! theme, and panel background — loading them once here keeps the two visually
-//! identical and drops the duplicated setup. The actual span→color rendering
-//! stays per-frontend (the TUI maps them onto ratatui `Line`s).
+//! Shared syntect resources for code highlighting. Fenced code blocks (and the
+//! tint on tool-output panels) resolve against one syntax set, theme, and panel
+//! background, loaded once here rather than per call site. The actual
+//! span→color rendering stays with the renderer (the TUI maps them onto
+//! ratatui `Line`s).
 //!
 //! [`HighlightCache`] adds *incremental* highlighting for streaming blocks: a
 //! code block that only grows (tokens appending during a turn) re-highlights

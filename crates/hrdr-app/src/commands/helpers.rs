@@ -13,7 +13,7 @@ pub fn busy_generic() -> String {
     "busy — try again after the current turn".to_string()
 }
 
-/// `/expand` status lines (both frontends show the same wording).
+/// `/expand` status lines.
 pub mod expand_msg {
     pub const ALL: &str = "tool output expanded (all)";
     pub const OFF: &str = "tool output collapsed";
@@ -22,7 +22,7 @@ pub mod expand_msg {
     pub const NONE: &str = "no tool output to expand";
 }
 
-/// `/reload` + hot-reload status lines (both frontends).
+/// `/reload` + hot-reload status lines.
 pub const RELOAD_MANUAL_MSG: &str = "reloaded config (theme, effort, toggles)";
 
 /// Hot-reload notice, naming the config file that changed (home collapsed to
@@ -85,7 +85,7 @@ pub struct ResumePlan {
     pub lines: Vec<String>,
 }
 
-/// The shared `/resume` semantics both frontends apply: follow the session's
+/// The `/resume` semantics: follow the session's
 /// working directory (in-process only) and surface the same notices.
 pub fn resume_plan(session: &SessionState, prev_cwd: &Path, current_base_url: &str) -> ResumePlan {
     let mut lines = vec![format!(
@@ -126,7 +126,7 @@ pub fn should_bell(enabled: bool, elapsed_secs: Option<f64>) -> bool {
     enabled && elapsed_secs.is_some_and(|e| e >= BELL_MIN_SECS)
 }
 
-/// The cancel notice both frontends show (with the discarded-queue count).
+/// The cancel notice (with the discarded-queue count).
 pub fn cancel_message(dropped: usize) -> String {
     if dropped > 0 {
         format!("[cancelled · {dropped} queued message(s) discarded]")
@@ -176,8 +176,7 @@ pub fn clipboard_copy(cb: &mut Option<hjkl_clipboard::Clipboard>, text: &str) ->
     }
 }
 
-/// Copy `text` to the OS clipboard, returning the status line both frontends
-/// show.
+/// Copy `text` to the OS clipboard, returning the status line to show.
 pub fn clipboard_copy_status(
     cb: &mut Option<hjkl_clipboard::Clipboard>,
     text: &str,

@@ -46,7 +46,6 @@ hrdr-app.workspace = true
 hrdr-llm.workspace = true
 hrdr-tools.workspace = true
 hrdr-tui.workspace = true
-hrdr-web.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

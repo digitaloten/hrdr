@@ -883,7 +883,7 @@ jobs:
         write(
             dir.path(),
             ".github/workflows/a.yml",
-            "jobs:\n  t:\n    steps:\n      - run: cargo test -p hrdr-web\n",
+            "jobs:\n  t:\n    steps:\n      - run: cargo test -p hrdr-app\n",
         );
         write(
             dir.path(),

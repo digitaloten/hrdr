@@ -25,7 +25,7 @@ pub async fn save_agent_session(
 
 /// The most recent saved session for `cwd` that has actual conversation
 /// content (more than just the system prompt) — the startup auto-resume
-/// lookup shared by both frontends. `None` = nothing to resume, start fresh.
+/// lookup, independent of renderer. `None` = nothing to resume, start fresh.
 pub fn latest_session_for_cwd(cwd: &str) -> Option<(String, Session)> {
     let cur = hrdr_agent::cwd_slug(cwd);
     let meta = crate::list_sessions()

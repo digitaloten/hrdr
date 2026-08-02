@@ -22,7 +22,7 @@ use hrdr_agent::parse_env_bool;
 /// pruned: the turn it finishes plus four more.
 pub const DEFAULT_TODO_TTL_TURNS: u64 = 5;
 
-/// Max text rows the input box auto-grows to (both frontends).
+/// Max text rows the input box auto-grows to.
 pub const INPUT_MAX_ROWS: u16 = 5;
 
 /// Frontend/display configuration. Loaded from the same

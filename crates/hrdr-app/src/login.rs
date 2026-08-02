@@ -1,7 +1,7 @@
 //! The `/login` setup wizard: pick a provider, enter an API key, save it to the
 //! dedicated credential store ([`hrdr_agent::save_auth_token`]), and make it the
-//! default. Shared by both frontends — each keeps an `Option<LoginWizard>` in a
-//! modal slot and, while it's `Some`, routes every submitted line to
+//! default. Renderer-independent — the caller keeps an `Option<LoginWizard>` in
+//! a modal slot and, while it's `Some`, routes every submitted line to
 //! [`LoginWizard::step`] instead of the model or the slash dispatcher.
 
 use crate::commands::{

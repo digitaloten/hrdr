@@ -222,7 +222,7 @@ pub struct TurnStatsLine {
     pub reasoning_tokens: Option<u32>,
 }
 
-/// The per-turn stats line both frontends append after a completed turn
+/// The per-turn stats line appended after a completed turn
 /// (`✓ N tok · tok/s · elapsed · ttft · ctx`). `None` when the turn produced
 /// nothing measurable.
 pub fn turn_stats_line(stats: TurnStatsLine) -> Option<String> {
@@ -271,7 +271,7 @@ pub fn turn_stats_line(stats: TurnStatsLine) -> Option<String> {
 }
 
 /// Semantic role of one unified-diff line, for `/diff` coloring — the
-/// classification both frontends map onto their theme.
+/// classification the renderer maps onto its theme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffLineKind {
     /// `+++`/`---` file headers and unclassified context: dim.

@@ -34,9 +34,9 @@ pub enum StatusRole {
     Session,
 }
 
-/// Theme slot a semantic role colors from. Both frontends' themes expose
-/// these eight colors (under their own field names); mapping slot → concrete
-/// color is the only per-frontend piece.
+/// Theme slot a semantic role colors from. A theme exposes these eight colors
+/// (under its own field names); mapping slot → concrete color is the only
+/// renderer-specific piece.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeSlot {
     User,

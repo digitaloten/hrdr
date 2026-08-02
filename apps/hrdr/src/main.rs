@@ -277,29 +277,6 @@ enum Command {
     /// List available models, as `provider://model`, across every provider this
     /// machine is set up for.
     Models,
-    /// Start the web server (HTTP + WebSocket) for the browser UI.
-    Serve {
-        #[arg(long)]
-        bind: Option<String>,
-        #[arg(long)]
-        port: Option<u16>,
-        #[arg(long)]
-        auth: Option<String>,
-        #[arg(long)]
-        allow_remote: bool,
-        #[arg(long)]
-        hash_password: bool,
-        #[arg(long)]
-        add_user: Option<String>,
-        #[arg(long)]
-        remove_user: Option<String>,
-        #[arg(long)]
-        users_db: Option<String>,
-        #[arg(long)]
-        tls_cert: Option<String>,
-        #[arg(long)]
-        tls_key: Option<String>,
-    },
 }
 
 /// The identity this process runs on, from the sources that can name it.
@@ -789,109 +766,6 @@ async fn main() -> Result<()> {
             run_headless(config, prompt.join(" "), json, quiet).await
         }
         Some(Command::Models) => list_models(config).await,
-        Some(Command::Serve {
-            bind,
-            port,
-            auth,
-            allow_remote,
-            hash_password,
-            add_user,
-            remove_user,
-            users_db,
-            tls_cert,
-            tls_key,
-        }) => {
-            // --hash-password: read stdin, print hash, exit.
-            if hash_password {
-                use std::io::Read;
-                let mut pw = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut pw)
-                    .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
-                let pw = pw.trim();
-                if pw.is_empty() {
-                    anyhow::bail!("no password on stdin");
-                }
-                let hash = hrdr_web::auth::hash_password(pw)
-                    .map_err(|e| anyhow::anyhow!("hashing: {e}"))?;
-                println!("{hash}");
-                return Ok(());
-            }
-
-            // --add-user / --remove-user: manage users DB, then exit.
-            let add_or_rm = add_user.clone().or(remove_user.clone());
-            if let Some(username) = add_or_rm {
-                let (web_cfg, warnings) =
-                    hrdr_web::config::WebConfig::load(&hrdr_web::config::CliOverrides {
-                        users_db: users_db.map(std::path::PathBuf::from),
-                        ..Default::default()
-                    });
-                for w in &warnings {
-                    eprintln!("hrdr: {w}");
-                }
-                let db = hrdr_web::users::open_db(&web_cfg.users_db)?;
-                if add_user.is_some() {
-                    use std::io::Read;
-                    let mut pw = String::new();
-                    std::io::stdin()
-                        .read_to_string(&mut pw)
-                        .map_err(|e| anyhow::anyhow!("reading password: {e}"))?;
-                    let pw = pw.trim();
-                    if pw.is_empty() {
-                        anyhow::bail!("no password on stdin");
-                    }
-                    let hash = hrdr_web::auth::hash_password(pw)
-                        .map_err(|e| anyhow::anyhow!("hashing: {e}"))?;
-                    hrdr_web::users::add_user(&db, &username, &hash)?;
-                    eprintln!("added user {username}");
-                } else {
-                    let removed = hrdr_web::users::remove_user(&db, &username)?;
-                    if removed {
-                        eprintln!("removed user {username}");
-                    } else {
-                        eprintln!("user {username} not found");
-                    }
-                }
-                return Ok(());
-            }
-
-            let cli = hrdr_web::config::CliOverrides {
-                bind,
-                port,
-                auth,
-                allow_remote,
-                users_db: users_db.map(std::path::PathBuf::from),
-                tls_cert: tls_cert.map(std::path::PathBuf::from),
-                tls_key: tls_key.map(std::path::PathBuf::from),
-            };
-            let (web_cfg, warnings) = hrdr_web::config::WebConfig::load(&cli);
-            for w in &warnings {
-                eprintln!("hrdr: {w}");
-            }
-
-            let bind_addr = web_cfg.bind;
-            let port = web_cfg.port;
-
-            let shared = hrdr_web::SharedSession::start(config).await?;
-
-            let auth_state = hrdr_web::auth::AuthState::from_config(&web_cfg);
-            if web_cfg.auth == hrdr_web::config::AuthMode::Users {
-                let db = hrdr_web::users::open_db(&web_cfg.users_db)?;
-                *auth_state.users_db.lock().unwrap() = Some(db);
-            }
-            if let Some(token) = auth_state.token_str() {
-                eprintln!("open http://{bind_addr}:{port}/?token={token}");
-            }
-
-            let server_cfg = hrdr_web::server::ServeConfig {
-                bind: bind_addr,
-                port,
-            };
-            let running = hrdr_web::server::serve(shared, server_cfg, &web_cfg, auth_state).await?;
-            eprintln!("serving http://{bind_addr}:{port}/ (Ctrl-C to stop)");
-            running.wait().await;
-            Ok(())
-        }
         // Trailing words are a command for the TUI to run at startup — the same
         // line the input box would take. Joined, so `hrdr /model gpt-5` and
         // `hrdr "/model gpt-5"` mean the same thing.

@@ -3,8 +3,8 @@
 //! Logic that is identical regardless of how it's rendered lives here so the TUI
 //! (`hrdr-tui`) and the headless runner share one implementation instead of each
 //! reimplementing it. Today: the slash-command registry, alias resolution, and
-//! "quit command" detection. More (help metadata is already here) will move in
-//! as the frontends converge.
+//! "quit command" detection. More (help metadata is already here) moves in as
+//! logic is found to be renderer-independent.
 
 // Every test in this crate — including one written tomorrow by someone who read none
 // of this — runs with `$HOME` and the XDG roots pointed at a throwaway directory. The

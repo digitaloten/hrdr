@@ -667,10 +667,8 @@ timeout and listener counting, `EscalationPolicy`/`EscalationRule`,
 `segment_is_safe`, `retry_rules`, `consider`/`consider_retry`,
 `unsandboxed_execution_allowed`, the `escalate` config list, `AgentEvent::`
 `ApprovalRequested` and `EscalationDecided`, `Record::EscalationDecided` and its
-transcript fold, `ServerMsg::ApprovalRequested`/`ApprovalClosed`,
-`ClientMsg::AnswerApproval`, `allow_session`, the TUI `ApprovalModal` with its
-arming and default-Deny logic, the wasm modal, and hrdr-web's approval inbox and
-pump.
+transcript fold, the approval/escalation wire frames, `allow_session`, and the
+TUI `ApprovalModal` with its arming and default-Deny logic.
 
 That deletes most of what shipped earlier today (`c2e472f` … `b7f82ed`),
 including the consent audit trail and the frontend work. Correctly: the audit
@@ -708,12 +706,10 @@ the same shape the escalation test used, writing to a path outside the writable
 roots and asserting it lands. A property this load-bearing should fail loudly
 when someone changes it.
 
-**One parity gap, recorded as a decision rather than left as an accident.** The
-passthrough is TUI-only: neither hrdr-web nor the wasm UI has `!` handling or a
-protocol frame for it, so a browser session has no user shell escape. That may
-well be correct — a remote frontend running arbitrary local commands is a
-different security question from a local terminal doing it — but it means the
-relief valve does not exist for web users, and they have no escalation either.
+**The passthrough is TUI-only, and that is now the whole story.** `!command` has
+one handler, in the TUI. It was recorded here as a parity gap when a second
+frontend existed; with hrdr terminal-only there is no other surface to be at
+parity with, and the relief valve reaches every user there is.
 
 ## `write` mode must be able to fetch dependencies — verified
 
@@ -994,7 +990,7 @@ Mostly-deletion first, so each slice is independently reviewable.
      widening and there is a window where every uncached dependency fetch fails
      with no relief valve at all.
    - Then `protect_git`, `deny_git_writes` and friends; `escalation.rs`,
-     `approval.rs`, the protocol frames, both frontend modals, the consent audit
+     `approval.rs`, the protocol frames, the frontend modal, the consent audit
      trail.
    - Add the `!command`-is-unsandboxed test here too: it becomes the only
      remaining relief valve and is untested today.

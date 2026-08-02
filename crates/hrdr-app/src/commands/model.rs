@@ -256,8 +256,8 @@ pub(crate) fn unreachable_guidance(base_url: &str, err: &str) -> String {
 /// Probe the endpoint (list its models) and return a warning line when it
 /// looks unreachable, doesn't advertise `model`, or is being addressed with the
 /// `default` placeholder despite serving a model list; `None` when healthy. The
-/// startup health-check core — both frontends spawn it and surface the
-/// warning as a system line before the first turn.
+/// startup health-check core — the caller spawns it and surfaces the warning
+/// as a system line before the first turn.
 ///
 /// The `default` rule rides on THIS probe rather than one of its own: `/v1/models`
 /// is already on the wire here, and its answer is exactly what decides whether
