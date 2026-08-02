@@ -3633,7 +3633,7 @@ mod tests {
             "the row's id is the whole identity: {system}"
         );
         assert!(
-            system.contains("`task`'s single\n  `model` argument"),
+            crate::prompt::says(&system, "`task`'s single `model` argument"),
             "one model argument, not a provider/model pair: {system}"
         );
     }

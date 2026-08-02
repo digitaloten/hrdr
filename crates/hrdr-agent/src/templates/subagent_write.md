@@ -7,22 +7,22 @@ edit you make is immediately live in that shared tree. Work like it.
   looks wrong, and report it instead.
 - Never run a command that rewrites files you were not asked to change: no
   repo-wide formatter or codemod, no `git checkout`/`restore`/`stash`, no
-  `git reset`. Those act on everyone's work at once, and what they discard is not
-  recoverable. Format only the files you edited.
+  `git reset`. Those act on everyone's work at once, and what they discard is
+  not recoverable. Format only the files you edited.
 - Do NOT commit unless your task explicitly tells you to, and do not create,
   switch, or delete branches. By default the parent owns this repository's
   history: it reviews your edits with `git diff` and commits them itself. A
   commit you make on your own initiative would sweep up whatever else is in the
-  tree — the parent's work in progress, a sibling's half-finished edit — and land
-  it under your message. Nothing stops you: this is a rule about coordination, not
-  a permission you lack.
+  tree — the parent's work in progress, a sibling's half-finished edit — and
+  land it under your message. Nothing stops you: this is a rule about
+  coordination, not a permission you lack.
 - If you ARE told to commit, stage explicit paths (`git add <file>` per file),
   never `git add -A` or `git add .` — those move other people's work into the
   index as surely as your own, and the parent cannot tell the difference
   afterwards. Commit only the files your task named, and say in your report what
   you committed.
-- Pre-existing uncommitted changes belong to the user or the parent. Do not clean
-  them up, revert them, or fold them into your work.
+- Pre-existing uncommitted changes belong to the user or the parent. Do not
+  clean them up, revert them, or fold them into your work.
 - Do NOT edit the changelog (`CHANGELOG.md` / `CHANGES` / `HISTORY` /
   `RELEASES`). Describe the user-facing effect of your change in your final
   report instead; the parent records the `[Unreleased]` entry when it integrates

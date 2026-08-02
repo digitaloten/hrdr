@@ -1024,17 +1024,28 @@ away. Not work; guardrails on work.
 Decisions from completed work that still govern new work. These are not backlog
 items — they are rules.
 
-- **Never run prettier on `crates/hrdr-agent/src/templates/*.md`.** The prompt
-  regression tests in `prompt.rs` assert on rendered text _including its line
-  wraps_ (`p.contains("the\n  comment outlives …")`), so reflowing a template
-  rewrites lines the tests pin. `prettier --write write.md` reflowed most of the
-  file and turned 9 prompt tests red on 2026-08-02 — the repo-wide "run prettier
-  on markdown" rule stops at this directory. Edit templates by hand at the wrap
-  width already in the file. Nothing enforces this: there is no
-  `.prettierignore` (considered; the templates are the only exception and a
-  stray ignore file invites `prettier .` to be run repo-wide, which is the
-  actual hazard), so the test suite is the guard — run
-  `cargo test -p hrdr-agent` after touching one.
+- **Every markdown file goes through prettier — the prompt templates included.**
+  Prettier is the owner's markdown standard and has no exceptions in this repo.
+  When a reflow turns a test red, the TEST is what changes; the formatter is not
+  negotiable. Stated because the opposite rule was briefly written here on
+  2026-08-02 after `prettier --write` on `templates/write.md` reflowed the file
+  and failed 9 prompt tests — carving the directory out of the standard was the
+  wrong fix and the owner rejected it.
+
+  Those tests failed because they pinned where a sentence WRAPPED
+  (`p.contains("the\n  comment outlives …")`), which is layout, not content.
+  `prompt::says` / `prompt::unwrapped` fix that properly: they collapse a soft
+  wrap (a single newline plus its indent) to one space on both sides of the
+  comparison, so an assertion tracks words rather than columns. Blank lines
+  survive, so tests that genuinely assert structure still can. Assert prompt
+  text through `says`, never `contains`. Verified by reformatting every template
+  at `--print-width 60` and re-running: 631 passed, unchanged — and a real
+  wording change still fails, checked by editing one.
+
+  Watch for two things prettier normalizes beyond wrapping: `*emphasis*` becomes
+  `_emphasis_`, and byte-offset tests (the shared-prefix checks in `prompt.rs`)
+  must compare `unwrapped` text or a wrap inside the searched phrase breaks the
+  `find`.
 
 - **No drifting numbers in comments or docs.** Decided 2026-08-02 by the owner,
   after the web removal left three separate stale counts behind ("Four
