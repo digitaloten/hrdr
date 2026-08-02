@@ -664,11 +664,11 @@ sections above.
 - **`duration_constant_names.rs` walks `crates/` on disk, not
   `[workspace] members`.** Its `rust_sources` recurses `crates` and `apps`,
   skipping only `target`, so a directory left behind by a removed crate is
-  scanned. Harmless as of 2026-08-02 — the leftover `crates/hrdr-ui/` holds only
-  `dist/` and `target/` and no `.rs` — but it means the rule's scope is
-  "whatever is on disk", unlike `every_test_binary_is_sandboxed.rs`, which
-  parses `members` and documents why. Verified by reading both, not by a failing
-  run.
+  scanned. The leftover that prompted this (`crates/hrdr-ui/`, build output the
+  crate's deletion could not take with it) has since been removed from disk, so
+  nothing is mis-scanned today — but the rule's scope is still "whatever is on
+  disk", unlike `every_test_binary_is_sandboxed.rs`, which parses `members` and
+  documents why. Verified by reading both, not by a failing run.
 
 ---
 
