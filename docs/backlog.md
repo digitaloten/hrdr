@@ -1107,6 +1107,29 @@ away. Not work; guardrails on work.
 Decisions from completed work that still govern new work. These are not backlog
 items — they are rules.
 
+- **The web UI is meant to execute on the host. That is the feature, not a
+  leak.** Decided 2026-08-02 by the owner: the point of the remote interface is
+  to work from a phone or another machine against the real working tree, so
+  `!command`, `@path` completion and the file tools are all _supposed_ to run
+  server-side with the host's filesystem. Do not "harden" this by removing
+  capability from the web client or by gating commands as unsafe-when-remote — a
+  web session is meant to be as capable as a terminal one.
+
+  What that moves the boundary to: **authentication is the entire security
+  model.** hrdr-web is locked down by its auth layer, and every capability
+  question reduces to "can anyone but the owner reach this endpoint". So auth
+  and session handling carry the weight that per-command gating would otherwise
+  carry, and a weakness there is not one bug — it is arbitrary execution on the
+  host. Judge changes to `hrdr-web/src/auth.rs` accordingly.
+
+  Two things this does **not** excuse, because they are wrong for reasons other
+  than security: `/edit` reaching the default `open_editor` spawns a desktop
+  handler on the _server_, where a headless host has no display and the remote
+  user cannot see it either — the command should act on the client or decline,
+  not silently succeed elsewhere. And `/theme` writing config the remote caller
+  cannot see the effect of is a correctness bug in the same family. Capability
+  belongs on the web; _acting on the wrong machine_ does not.
+
 - **hrdr-agent owns ALL agent logic; hrdr-app is only agent↔TUI glue.** Every
   agent, main or sub, runs the same codepath — no special-casing, no parity
   forks. Do not ask "how should sub-agents behave"; they behave exactly like the
