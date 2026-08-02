@@ -35,6 +35,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   would make the gate bypassable by adding a subcommand; refusing to start would
   break every script in a fresh checkout.
 
+- **Windows `read` mode is confined by the OS.** Windows was the last supported
+  platform with no sandbox backend at all — the file tools were guarded in
+  process and `shell` ran free. It now uses Mandatory Integrity Control: a
+  Low-integrity process cannot write to any object labelled Medium or higher,
+  which is everything the user owns, while reads are untouched because MIC's
+  default policy is NO_WRITE_UP only. That is exactly what `read` mode promises,
+  and it costs no change to the filesystem to deliver.
+
+  Applied the way Landlock is, by the child to itself: `CreateProcessAsUserW`
+  cannot be reached through a `tokio::process::Command` and Windows has no
+  `pre_exec`, so hrdr re-execs itself as
+  `hrdr __sandbox-exec -- <shell> -c <cmd>` and lowers its own token before
+  running the command — every descendant inherits it. A wrapper that cannot
+  lower itself fails rather than running the command unconfined.
+
+  `write` mode is **not** covered yet and still reports no OS sandbox: a
+  Low-integrity child can only write to objects labelled Low, so its writable
+  roots would have to be relabelled first — a persistent change to the user's
+  own directories, and a separate decision.
+
 ### Changed
 
 - **`/cwd` refuses a directory that has never been trusted.** The trust gate
@@ -70,28 +90,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   paths, which are exactly where the tree holds a half-finished edit and the
   report is least likely to say so. Read-only tasks are unaffected: they changed
   nothing, so the note would be noise.
-
-### Added
-
-- **Windows `read` mode is confined by the OS.** Windows was the last supported
-  platform with no sandbox backend at all — the file tools were guarded in
-  process and `shell` ran free. It now uses Mandatory Integrity Control: a
-  Low-integrity process cannot write to any object labelled Medium or higher,
-  which is everything the user owns, while reads are untouched because MIC's
-  default policy is NO_WRITE_UP only. That is exactly what `read` mode promises,
-  and it costs no change to the filesystem to deliver.
-
-  Applied the way Landlock is, by the child to itself: `CreateProcessAsUserW`
-  cannot be reached through a `tokio::process::Command` and Windows has no
-  `pre_exec`, so hrdr re-execs itself as
-  `hrdr __sandbox-exec -- <shell> -c <cmd>` and lowers its own token before
-  running the command — every descendant inherits it. A wrapper that cannot
-  lower itself fails rather than running the command unconfined.
-
-  `write` mode is **not** covered yet and still reports no OS sandbox: a
-  Low-integrity child can only write to objects labelled Low, so its writable
-  roots would have to be relabelled first — a persistent change to the user's
-  own directories, and a separate decision.
 
 ### Removed
 

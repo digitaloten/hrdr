@@ -52,6 +52,17 @@ here is waiting for the web to come back. See [Record](#record-closed-efforts)
 for the one-paragraph epitaph and [Standing constraints](#standing-constraints)
 for the rule it leaves behind.
 
+**Pruned again 2026-08-03**, by the **directory trust gate**
+(`0f4b440`..`ccbe08e`). hrdr now asks, once per working directory, whether that
+directory's files may steer the session, and the answer decides whether
+`AGENTS.md` and project skills are read at all. That reframes the
+instruction-surface entries rather than closing them: what a trusted directory's
+files may then do is still open, and is rewritten in place under
+[Permissions, isolation, and state](#permissions-isolation-and-state). What it
+opened is one gap of its own, under
+[Tooling / agent capability](#tooling--agent-capability), and one rule, under
+[Standing constraints](#standing-constraints).
+
 Conventions:
 
 - **Symbol names, not line numbers.** Line numbers rot — the old docs cited
@@ -476,6 +487,18 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
 
 ## Tooling / agent capability
 
+- **Trust can be granted and never revoked.** `hrdr_agent::trust` has
+  `is_trusted` and `trust`; there is no `untrust`, no listing, and no command
+  that reaches either. Undoing an answer means finding
+  `$XDG_CACHE_HOME/hrdr/trusted-dirs` and editing it by hand — which is fine for
+  the owner and is not a thing a user can be expected to discover. The asymmetry
+  is deliberate as far as it goes (only the yes is stored, so declining needs no
+  undo), but a directory whose provenance turns out to be wrong is exactly the
+  case the gate exists for. Smallest honest version: a `/trust` command that
+  prints the store and takes `revoke [path]`, defaulting to the current
+  directory. Needs a decision about whether revoking mid-session also has to
+  downgrade the running session, which is the same terminal-ownership problem as
+  answering the question mid-session.
 - **Memory drift detection.** A periodic prune/verify pass over the `memory`
   store — check each `<slug>.md` still has a `MEMORY.md` pointer (and vice
   versa) and flag/prune stale or contradicted memories. Cheap because
@@ -579,6 +602,16 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   binary. The cold path and the `ANTHROPIC_MAX_TOKENS` 8192 fallback are pinned;
   the warm resolution rules are covered separately in `catalog`'s own tests.
   Recorded so nobody "closes" it with a test that only appears to work.
+- **`no_color_turns_it_off_on_a_terminal` cannot fail on hrdr's own check.** Two
+  layers deliver the behaviour it asserts: `colour_stderr` in `apps/hrdr`, and
+  crossterm, which suppresses colour under `NO_COLOR` by itself
+  (`style/types/colored.rs`). Forcing hrdr's decision permanently on leaves the
+  test green — verified by doing it. `term_dumb_turns_it_off_on_a_terminal` is
+  the one that goes red, so the check is guarded; what is unguarded is the
+  `NO_COLOR` arm of it specifically. Both tests are kept and the limitation is
+  written on the test itself, because what the user cares about is that the
+  variable works, not which layer honoured it. Closing it means asserting on
+  `colour_stderr` directly, which is a private fn in a binary crate.
 - **`serve_once` takes `&'static str`**, so every mock SSE body must be a
   literal (the stop-reason tests `Box::leak` theirs). Fine today; it makes a
   table-driven stream test awkward. `impl Into<String>` is a one-line change
@@ -1095,6 +1128,20 @@ items — they are rules.
   without the owner asking for it — `hrdr-app`'s host seam exists to keep the
   TUI honest, not to hold a place for a client that no longer exists.
 
+- **A pty test drains through `common::drain_pty`, never a bare read loop.** Two
+  Windows-only traps sit behind that helper, and both are silent on Linux and
+  macOS. A ConPTY asks the terminal where the cursor is (`ESC[6n`) and **blocks
+  until something answers**, so a harness that only reads captures exactly those
+  four bytes and then times out; and a ConPTY master returns `WouldBlock` before
+  the child has written anything, so `while let Ok(n) = read(…)` treats a
+  not-yet as end-of-stream. `tui_pty.rs` carried both fixes and a comment saying
+  they had cost a red run — writing a second harness from scratch cost another
+  one (`c0e22e9`), which is why this is a rule rather than a comment. Likewise
+  **do not assert that output contains no escape byte**: a ConPTY writes its own
+  mode sets, window title and cursor commands regardless of what the child does,
+  so that assertion tests the terminal. Assert on the specific sequence under
+  test — `ESC[38;5;` for a foreground colour.
+
 - **hrdr-agent owns ALL agent logic; hrdr-app is only agent↔TUI glue.** Every
   agent, main or sub, runs the same codepath — no special-casing, no parity
   forks. Do not ask "how should sub-agents behave"; they behave exactly like the
@@ -1486,6 +1533,27 @@ access — plus the `hrdr-ui` client and the `hrdr-protocol` wire crate. Deleted
 outright by owner decision, along with every follow-up and parity entry it had
 accumulated here; hrdr is terminal-only (see Standing constraints). `git log`
 and CHANGELOG.md are its history.
+
+**Directory trust gate** (`0f4b440`..`ccbe08e`, 2026-08-03). Replaced the
+never-built plan to _scan_ `AGENTS.md` for injection with asking the user
+instead: `hrdr_agent::trust` stores one canonical path per line under the XDG
+cache dir, `apps/hrdr`'s `trust_gate` runs before any command, and an unanswered
+directory opens in `SandboxMode::Jail` with `read_only` forced — without that
+second flag `effective_sandbox` floors jail to `write`, which was found by
+running the binary rather than by reading it. The question is drawn by
+`hrdr-tui`'s `trust_prompt` with ratatui on the alternate screen, sharing the
+header's `splash_lines` and the session's `Theme`. Three decisions worth not
+re-litigating: **exact paths, never ancestors** (owner's reason: trusting
+`~/Projects` must not trust a repo just cloned into it); **only the yes is
+stored**, so declining is asked again rather than sticking; and the **default
+selection is cancel**, so a reflex Enter opens nothing. A caution-envelope
+around `AGENTS.md` was built first (`2ae5e77`) and reverted (`de9bd83`) in
+favour of this — do not rebuild it. The same effort made `gather_agent_docs`
+read the working directory only and moved the headless chrome's colour onto
+crossterm; what it left open is under
+[Tooling / agent capability](#tooling--agent-capability),
+[Permissions, isolation, and state](#permissions-isolation-and-state) and
+[Test coverage gaps](#test-coverage-gaps).
 
 **Also closed and deleted along the way:** the transcript unification
 (hrdr-agent owns the `Entry` model, `apply_event` builder and renderer; the
