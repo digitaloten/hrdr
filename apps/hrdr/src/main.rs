@@ -30,6 +30,18 @@ use hrdr_agent::{Agent, AgentConfig, AgentEvent};
 /// session header (passed to [`hrdr_tui::run`], which embeds no art of its own).
 const LOGO_ART: &str = include_str!("../art.txt");
 
+/// SGR: reset every attribute back to the terminal's own default.
+const SGR_RESET: &str = "\x1b[0m";
+/// SGR: bright black — a headless run's chrome (notices, usage, streamed tool
+/// output).
+const SGR_GREY: &str = "\x1b[90m";
+/// SGR: yellow — a headless run's tool-call line.
+const SGR_YELLOW: &str = "\x1b[33m";
+/// SGR: green — a headless run's tool-succeeded mark.
+const SGR_GREEN: &str = "\x1b[32m";
+/// SGR: red — a headless run's tool-failed mark.
+const SGR_RED: &str = "\x1b[31m";
+
 #[derive(Parser)]
 #[command(
     name = "hrdr",
@@ -860,339 +872,16 @@ fn trust_gate_with(
     }
 }
 
-/// Put the question to the user on the terminal, before the TUI starts.
+/// Put the question to the user, before the TUI starts.
 ///
-/// A menu rather than a typed letter: the answer is a security decision, and the
-/// one thing worse than asking is asking in a way people learn to dismiss by
-/// reflex. Arrow keys or `j`/`k` move, Enter locks it in, and the selection
-/// **starts on Cancel** — a stray Enter opens nothing.
-///
-/// Trusting takes a second confirmation, which also starts on the safe option.
-/// It is the answer that cannot be undone by doing nothing: it is written down,
-/// and it licenses every future session in this directory to load instructions
-/// out of it. Declining the confirmation returns to the first menu rather than
-/// choosing for the user.
+/// The screen itself lives in `hrdr-tui`: it is drawn with ratatui so every
+/// colour and attribute goes out through crossterm, which knows whether the
+/// console can parse ANSI at all — a hand-written escape sequence does not, and
+/// on a Windows console without VT processing it reaches the screen as literal
+/// garbage. Drawing it there also shares the session's own theme and logo
+/// animation rather than keeping a second copy that could drift.
 fn ask_to_trust(cwd: &std::path::Path, theme: Option<&str>) -> hrdr_agent::trust::TrustChoice {
-    use hrdr_agent::trust::TrustChoice;
-
-    // Raw mode is what makes a keypress arrive without Enter. If it cannot be
-    // entered there is no interactive terminal to ask on, and the caller's rule
-    // for "nobody can answer" applies: cancel rather than guess.
-    let Some(_screen) = AskScreen::enter() else {
-        return TrustChoice::Cancel;
-    };
-    ask_to_trust_raw(cwd, &MenuTheme::load(theme))
-    // `_screen` drops here: cursor back, alternate screen left, raw mode off —
-    // on every path out, including a panic in the menu.
-}
-
-/// The terminal state the question borrows, given back on drop.
-///
-/// The question draws on the **alternate screen**: it owns the whole viewport
-/// while it is up, so each menu paints from the top instead of scrolling a new
-/// block under the last one — going back from the confirmation redraws in place
-/// rather than stacking a second copy of the header. Leaving it puts the user's
-/// scrollback back exactly as it was, which is what makes cancelling leave no
-/// trace on their terminal.
-///
-/// A guard rather than a pair of calls because there are several ways out of the
-/// menu — a choice, Esc, Ctrl-C, a panic — and a terminal left in raw mode on the
-/// alternate screen is a shell the user has to `reset` by hand.
-struct AskScreen;
-
-impl AskScreen {
-    /// Take the terminal, or `None` if it cannot be taken (no tty).
-    fn enter() -> Option<Self> {
-        use crossterm::{cursor, execute, terminal};
-        if terminal::enable_raw_mode().is_err() {
-            return None;
-        }
-        if execute!(
-            std::io::stdout(),
-            terminal::EnterAlternateScreen,
-            cursor::Hide
-        )
-        .is_err()
-        {
-            let _ = terminal::disable_raw_mode();
-            return None;
-        }
-        Some(Self)
-    }
-}
-
-impl Drop for AskScreen {
-    fn drop(&mut self) {
-        use crossterm::{cursor, execute, terminal};
-        let _ = execute!(
-            std::io::stdout(),
-            cursor::Show,
-            terminal::LeaveAlternateScreen
-        );
-        let _ = terminal::disable_raw_mode();
-    }
-}
-
-/// The question's colours, from the same hjkl theme the TUI runs on — so the
-/// first screen a directory shows already looks like the session behind it, and
-/// a user who picked a light theme is not handed a dark one for one screen.
-///
-/// Roles are mapped exactly as `ui.rs`'s session header maps them: static logo
-/// glyphs take `dim`, the sweep takes the crate's own trail ramp, and the cursor
-/// cell takes `user`. Matching there matters more than picking nicer colours —
-/// the same art animates in both places moments apart.
-struct MenuTheme {
-    /// Body text and the question itself.
-    text: Option<(u8, u8, u8)>,
-    /// Chrome: option descriptions, the key hint, the static logo glyphs.
-    dim: Option<(u8, u8, u8)>,
-    /// The selected row and the logo's cursor cell.
-    accent: Option<(u8, u8, u8)>,
-    /// The directory being asked about — the one fact worth reading twice.
-    path: Option<(u8, u8, u8)>,
-}
-
-impl MenuTheme {
-    fn load(spec: Option<&str>) -> Self {
-        let p = hrdr_app::ChatPalette::load(spec);
-        Self {
-            text: p.assistant,
-            dim: p.dim,
-            accent: p.user,
-            path: p.accent,
-        }
-    }
-}
-
-/// An SGR foreground sequence for `c`, or the terminal's own dim attribute when
-/// the theme leaves that role unset — never nothing, so an incomplete theme
-/// still renders as chrome rather than as body text.
-fn fg(c: Option<(u8, u8, u8)>) -> String {
-    match c {
-        Some((r, g, b)) => format!("\x1b[38;2;{r};{g};{b}m"),
-        None => "\x1b[2m".to_string(),
-    }
-}
-
-/// Reset back to the terminal's default styling.
-const OFF: &str = "\x1b[0m";
-
-/// The menu loop, with the terminal already taken and guaranteed to be given
-/// back by the caller however this returns.
-fn ask_to_trust_raw(cwd: &std::path::Path, theme: &MenuTheme) -> hrdr_agent::trust::TrustChoice {
-    use hrdr_agent::trust::TrustChoice;
-
-    const ASK: &[(&str, &str)] = &[
-        ("trust", "load this directory's instructions, full tool set"),
-        (
-            "untrusted",
-            "open jailed: read the tree, run nothing from it",
-        ),
-        ("cancel", "quit without opening"),
-    ];
-    const CONFIRM: &[(&str, &str)] = &[
-        ("yes, I'm sure", "remember this directory as trusted"),
-        ("no, go back", "return to the previous question"),
-    ];
-
-    let (text, dim, path_c) = (fg(theme.text), fg(theme.dim), fg(theme.path));
-    let head = [
-        String::new(),
-        format!("  {text}hrdr has not been opened in this directory before:{OFF}"),
-        String::new(),
-        format!("    {path_c}{}{OFF}", cwd.display()),
-        String::new(),
-        format!("  {dim}Its AGENTS.md and skill files are instructions that reach the model,{OFF}"),
-        format!("  {dim}and its code is what any command you approve will run. Trust it only{OFF}"),
-        format!("  {dim}if you know where it came from.{OFF}"),
-        String::new(),
-    ];
-    let confirm_head = [
-        String::new(),
-        format!("  {text}Trusting is remembered — every future session here loads this{OFF}"),
-        format!("  {text}directory's instructions without asking again.{OFF}"),
-        String::new(),
-    ];
-
-    loop {
-        // Default: cancel, the last entry.
-        match menu(&head, ASK, ASK.len() - 1, theme) {
-            Some(0) => match menu(&confirm_head, CONFIRM, 1, theme) {
-                Some(0) => return TrustChoice::Trusted,
-                // "no, go back" and Esc both return to the first question.
-                _ => continue,
-            },
-            Some(1) => return TrustChoice::Untrusted,
-            _ => return TrustChoice::Cancel,
-        }
-    }
-}
-
-/// Draw `head`, then `items` as a selectable list starting at `default`, and
-/// return the chosen index — or `None` for Esc, `q` and Ctrl-C.
-///
-/// The logo animates above it while the menu waits, on the same `hjkl_splash`
-/// path the TUI's header uses, so the first thing a new directory shows is
-/// recognisably hrdr rather than a bare question.
-fn menu(
-    head: &[String],
-    items: &[(&str, &str)],
-    default: usize,
-    theme: &MenuTheme,
-) -> Option<usize> {
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use std::io::Write;
-
-    let mut sel = default;
-    let anchor = std::time::Instant::now();
-    let path = logo_path(LOGO_ART);
-    let logo_rows = LOGO_ART.lines().count();
-    let mut out = std::io::stdout();
-
-    loop {
-        // Home the cursor and wipe, rather than counting lines back: every menu
-        // starts at the top of its own screen, so a second question replaces the
-        // first instead of appearing beneath it.
-        let _ = crossterm::queue!(
-            out,
-            crossterm::cursor::MoveTo(0, 0),
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-        );
-        let mut lines: Vec<String> = Vec::new();
-        lines.extend(logo_frame(&path, anchor, logo_rows, theme));
-        lines.extend(head.iter().cloned());
-        // Pad the labels to a common width so the descriptions form a column —
-        // measured from the labels themselves, so adding an option cannot leave
-        // the list looking ragged.
-        let label_w = items
-            .iter()
-            .map(|(l, _)| l.chars().count())
-            .max()
-            .unwrap_or(0);
-        let (dim, accent) = (fg(theme.dim), fg(theme.accent));
-        for (i, (label, blurb)) in items.iter().enumerate() {
-            let label = format!("{label:label_w$}");
-            lines.push(if i == sel {
-                // Caret AND bold AND colour: the selection has to survive a
-                // terminal with no truecolour and a theme that left the role
-                // unset, and a caret alone survives both.
-                format!("  {accent}\x1b[1m❯ {label}{OFF}   {dim}{blurb}{OFF}")
-            } else {
-                format!("    {dim}{label}{OFF}   {dim}{blurb}{OFF}")
-            });
-        }
-        lines.push(String::new());
-        lines.push(format!(
-            "  {dim}↑/↓ or j/k to move · enter to choose · esc cancels{OFF}"
-        ));
-        for line in &lines {
-            let _ = write!(out, "{line}\r\n");
-        }
-        let _ = out.flush();
-
-        // Wake often enough to advance the animation whether or not a key came.
-        match crossterm::event::poll(std::time::Duration::from_millis(80)) {
-            Ok(true) => match crossterm::event::read() {
-                Ok(Event::Key(KeyEvent {
-                    code, modifiers, ..
-                })) => match (code, modifiers) {
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => return None,
-                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
-                        sel = sel.checked_sub(1).unwrap_or(items.len() - 1);
-                    }
-                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
-                        sel = (sel + 1) % items.len();
-                    }
-                    (KeyCode::Enter, _) => return Some(sel),
-                    (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => return None,
-                    _ => {}
-                },
-                Ok(_) => {}
-                Err(_) => return None,
-            },
-            Ok(false) => {}
-            Err(_) => return None,
-        }
-    }
-}
-
-/// One animation frame of the logo, as ANSI-coloured lines.
-fn logo_frame(
-    path: &[(u8, u8, char)],
-    anchor: std::time::Instant,
-    rows: usize,
-    theme: &MenuTheme,
-) -> Vec<String> {
-    use hjkl_splash::{CellKind, Layout, Rgb, Splash, default_trail_color};
-
-    let cols = LOGO_ART
-        .lines()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(0);
-    let splash = Splash::new(LOGO_ART, path).with_anchor(anchor);
-    let layout = Layout {
-        origin_x: 0,
-        origin_y: 0,
-        rows: rows as u16,
-        cols: cols as u16,
-    };
-    // Paint into a grid first: `cells` yields art, then trail, then cursor, and
-    // later cells are meant to overwrite earlier ones at the same position.
-    let mut grid = vec![vec![(' ', None::<Rgb>, false); cols]; rows];
-    for cell in splash.cells(layout) {
-        let (y, x) = (cell.y as usize, cell.x as usize);
-        if y >= rows || x >= cols {
-            continue;
-        }
-        grid[y][x] = match cell.kind {
-            CellKind::Art => (cell.ch, None, false),
-            CellKind::Trail { age } => (cell.ch, Some(default_trail_color(age)), false),
-            CellKind::Cursor => (cell.ch, None, true),
-        };
-    }
-    let art = fg(theme.dim);
-    let cursor = fg(theme.accent);
-    let mut lines: Vec<String> = grid
-        .into_iter()
-        .map(|row| {
-            let mut s = String::from("  ");
-            for (ch, colour, is_cursor) in row {
-                match (colour, is_cursor) {
-                    // The cursor cell leads the sweep — `user`, bold, as in the
-                    // session header.
-                    (_, true) => s.push_str(&format!("{cursor}\x1b[1m{ch}{OFF}")),
-                    // The trail keeps the crate's own age ramp, so the fade is
-                    // identical to the one the TUI paints.
-                    (Some(Rgb(r, g, b)), _) => {
-                        s.push_str(&format!("\x1b[38;2;{r};{g};{b}m{ch}{OFF}"))
-                    }
-                    (None, _) => s.push_str(&format!("{art}{ch}{OFF}")),
-                }
-            }
-            s
-        })
-        .collect();
-    lines.push(String::new());
-    lines
-}
-
-/// The sweep path through the art: every glyph cell, column by column. Mirrors
-/// the TUI's `logo_path` so both animate the same way.
-fn logo_path(art: &str) -> Vec<(u8, u8, char)> {
-    let rows: Vec<Vec<char>> = art.lines().map(|l| l.chars().collect()).collect();
-    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let mut path = Vec::new();
-    for col in 0..cols {
-        for (row_idx, row) in rows.iter().enumerate() {
-            if let Some(&ch) = row.get(col)
-                && !ch.is_whitespace()
-            {
-                path.push((row_idx as u8, col as u8, ch));
-            }
-        }
-    }
-    path
+    hrdr_tui::ask_trust(cwd, LOGO_ART, theme)
 }
 
 /// Headless single-turn run. Default: reply text on stdout, tool/usage chrome
@@ -1211,7 +900,7 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
     // set); surface the per-server status on stderr unless quiet.
     for notice in agent.connect_mcp().await {
         if !quiet {
-            eprintln!("\x1b[90m[{notice}]\x1b[0m");
+            eprintln!("{SGR_GREY}[{notice}]{SGR_RESET}");
         }
     }
     // A headless run is a one-turn session: session hooks bracket the turn.
@@ -1220,7 +909,7 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
         .await
     {
         if !quiet {
-            eprintln!("\x1b[90m[{note}]\x1b[0m");
+            eprintln!("{SGR_GREY}[{note}]{SGR_RESET}");
         }
     }
     // Headless runs have no interactive steering: enqueue the prompt as the
@@ -1245,20 +934,20 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
                 AgentEvent::Reasoning(_) => {}
                 AgentEvent::ToolStart { name, args, .. } if !quiet => {
                     eprintln!(
-                        "\x1b[33m⚙ {name}\x1b[0m {}",
+                        "{SGR_YELLOW}⚙ {name}{SGR_RESET} {}",
                         hrdr_tools::truncate_inline(&args, 120)
                     );
                 }
                 AgentEvent::ToolOutput { chunk, .. } if !quiet => {
-                    eprint!("\x1b[90m{chunk}\x1b[0m");
+                    eprint!("{SGR_GREY}{chunk}{SGR_RESET}");
                     let _ = std::io::stderr().flush();
                 }
-                AgentEvent::Notice(text) if !quiet => eprintln!("\x1b[90m[{text}]\x1b[0m"),
+                AgentEvent::Notice(text) if !quiet => eprintln!("{SGR_GREY}[{text}]{SGR_RESET}"),
                 AgentEvent::ToolEnd { name, ok, .. } if !quiet => {
                     let mark = if ok {
-                        "\x1b[32m✓\x1b[0m"
+                        format!("{SGR_GREEN}✓{SGR_RESET}")
                     } else {
-                        "\x1b[31m✗\x1b[0m"
+                        format!("{SGR_RED}✗{SGR_RESET}")
                     };
                     eprintln!("{mark} {name}");
                 }
@@ -1286,7 +975,7 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
                         })
                         .unwrap_or_default();
                     eprintln!(
-                        "\x1b[90m[usage] ctx {prompt_tokens}{cached} · out {completion_tokens}{reasoning}{cost}\x1b[0m"
+                        "{SGR_GREY}[usage] ctx {prompt_tokens}{cached} · out {completion_tokens}{reasoning}{cost}{SGR_RESET}"
                     );
                 }
                 AgentEvent::TurnDone => println!(),
@@ -1299,7 +988,7 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
         .await
     {
         if !quiet {
-            eprintln!("\x1b[90m[{note}]\x1b[0m");
+            eprintln!("{SGR_GREY}[{note}]{SGR_RESET}");
         }
     }
     if let Err(e) = result {

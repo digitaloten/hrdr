@@ -76,6 +76,9 @@ fn visible(raw: &str) -> String {
 /// One run: an untrusted project, the keys to answer with, and what came back.
 struct Asked {
     screen: String,
+    /// The bytes as they went to the terminal, escape sequences intact — what a
+    /// colour assertion has to read.
+    raw: String,
     /// Everything painted since the last full-screen clear — i.e. what the user
     /// is actually looking at, as opposed to every frame ever drawn.
     last_frame: String,
@@ -91,6 +94,11 @@ struct Asked {
 /// Spawn hrdr in a fresh (therefore untrusted) directory, wait for the question,
 /// send `keys`, and collect the screen and the store.
 fn ask(keys: &[&str]) -> Asked {
+    ask_themed(keys, None)
+}
+
+/// As [`ask`], with `theme` written into the config the child reads.
+fn ask_themed(keys: &[&str], theme: Option<&str>) -> Asked {
     let home = tempfile::tempdir().expect("temp home");
     let project = tempfile::tempdir().expect("temp project");
     let runtime = tempfile::tempdir().expect("temp runtime");
@@ -99,9 +107,14 @@ fn ask(keys: &[&str]) -> Asked {
     // rather than reaching anything real.
     let config_dir = home.path().join("hrdr");
     std::fs::create_dir_all(&config_dir).expect("config dir");
+    let theme_line = theme
+        .map(|t| format!("theme = \"{t}\"\n"))
+        .unwrap_or_default();
     std::fs::write(
         config_dir.join("config.toml"),
-        "model = \"dead://trust\"\n\n[providers.dead]\nbase_url = \"http://127.0.0.1:1/v1\"\n",
+        format!(
+            "{theme_line}model = \"dead://trust\"\n\n[providers.dead]\nbase_url = \"http://127.0.0.1:1/v1\"\n"
+        ),
     )
     .expect("write config.toml");
 
@@ -201,6 +214,7 @@ fn ask(keys: &[&str]) -> Asked {
     let out = visible(&raw);
     Asked {
         screen: out,
+        raw,
         last_frame,
         store,
         exited_itself,
@@ -325,5 +339,58 @@ fn going_back_from_the_confirmation_does_not_stack_a_second_header() {
         asked.store.is_none(),
         "going back records nothing: {:?}",
         asked.store
+    );
+}
+
+/// The truecolour-foreground *parameters* for a palette role, or `None` when the
+/// theme left it unset (nothing to assert on).
+///
+/// Deliberately not a whole terminated sequence: ratatui batches attributes, so
+/// a foreground goes out as `…38;2;R;G;B;49m` with the background reset folded
+/// into the same escape. Matching the parameters is what survives that batching
+/// — and it is still specific enough that another theme's colour cannot satisfy
+/// it.
+fn fg_params(role: Option<(u8, u8, u8)>) -> Option<String> {
+    role.map(|(r, g, b)| format!("38;2;{r};{g};{b}"))
+}
+
+/// The question is painted in the theme from **config.toml**, not only the one
+/// `--theme` names — the config is where a user actually sets it.
+///
+/// The expected colours come from `ChatPalette` rather than being written out
+/// here, so this tracks the theme file: it proves the config reached the screen,
+/// and it cannot go stale when a palette is retuned.
+#[test]
+fn the_question_is_painted_in_the_theme_from_config() {
+    if skip_for_want_of_a_pty() {
+        return;
+    }
+    const THEME: &str = "dracula";
+    let want = hrdr_app::ChatPalette::load(Some(THEME));
+    let default = hrdr_app::ChatPalette::load(None);
+    // The premise: these two themes must actually differ, or the assertion below
+    // would pass without the config ever being read.
+    assert_ne!(
+        want.assistant, default.assistant,
+        "{THEME} and the default theme must differ for this test to mean anything"
+    );
+
+    let asked = ask_themed(&["\x1b"], Some(THEME));
+
+    let question = fg_params(want.assistant).expect("the theme sets `assistant`");
+    assert!(
+        asked.raw.contains(&question),
+        "the question is drawn in {THEME}'s `assistant`"
+    );
+    let selection = fg_params(want.user).expect("the theme sets `user`");
+    assert!(
+        asked.raw.contains(&selection),
+        "the selected row is drawn in {THEME}'s `user`"
+    );
+    assert!(
+        !asked
+            .raw
+            .contains(&fg_params(default.assistant).expect("default sets `assistant`")),
+        "the default theme's colours must not appear when config named another"
     );
 }

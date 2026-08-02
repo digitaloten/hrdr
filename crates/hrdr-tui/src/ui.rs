@@ -1826,11 +1826,22 @@ fn logo_size(art: &str) -> (u16, u16) {
 /// The session banner: the animated logo on the left, session details on the
 /// right. `anchor` is the app's persistent animation clock — passing
 /// `Instant::now()` here would re-anchor every frame and freeze the tick at 0.
-fn header_lines(app: &App, anchor: std::time::Instant, width: u16) -> Vec<Line<'static>> {
+/// One animation frame of `art`, as a styled grid.
+///
+/// Shared by the session header and the trust question so the same art animates
+/// identically in both — they are seen seconds apart, and a second copy of this
+/// mapping would drift.
+///
+/// `cells()` yields art first, then the trail (oldest → cursor), and later cells
+/// overwrite earlier ones, so a plain grid write in iteration order gives the
+/// same result the crate's own renderer produces.
+pub(crate) fn splash_grid(
+    art: &str,
+    theme: &Theme,
+    anchor: std::time::Instant,
+) -> Vec<Vec<(char, Style)>> {
     use hjkl_splash::{CellKind, Layout, Rgb, Splash, default_trail_color};
 
-    let theme = &app.theme;
-    let art = app.logo;
     let (rows, cols) = logo_size(art);
     let path = logo_path(art);
     let splash = Splash::new(art, &path).with_anchor(anchor);
@@ -1840,11 +1851,6 @@ fn header_lines(app: &App, anchor: std::time::Instant, width: u16) -> Vec<Line<'
         rows,
         cols,
     };
-
-    // Paint the animation's cells into a grid, then flatten each row to a Line.
-    // `cells()` yields art first, then the trail (oldest → cursor), and later
-    // cells overwrite earlier ones — so a plain grid write in iteration order
-    // gives the same result the crate's own renderer produces.
     let blank = (' ', Style::default().fg(theme.dim));
     let mut grid = vec![vec![blank; cols as usize]; rows as usize];
     let rgb = |Rgb(r, g, b): Rgb| Color::Rgb(r, g, b);
@@ -1859,6 +1865,32 @@ fn header_lines(app: &App, anchor: std::time::Instant, width: u16) -> Vec<Line<'
         };
         row[cell.x as usize] = (cell.ch, style);
     }
+    grid
+}
+
+/// [`splash_grid`] flattened to lines, for a screen with nothing beside the art.
+pub(crate) fn splash_lines(
+    art: &str,
+    theme: &Theme,
+    anchor: std::time::Instant,
+) -> Vec<Line<'static>> {
+    splash_grid(art, theme, anchor)
+        .into_iter()
+        .map(|row| {
+            Line::from(
+                row.into_iter()
+                    .map(|(ch, style)| Span::styled(ch.to_string(), style))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+fn header_lines(app: &App, anchor: std::time::Instant, width: u16) -> Vec<Line<'static>> {
+    let theme = &app.theme;
+    let art = app.logo;
+    let (_rows, cols) = logo_size(art);
+    let grid = splash_grid(art, theme, anchor);
 
     // The details column, beside the logo. Every row is a `key value` pair on
     // the same two columns, so the values line up down the block.

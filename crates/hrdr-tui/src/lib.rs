@@ -17,7 +17,9 @@ extern crate hrdr_test_support;
 
 mod app;
 mod theme;
+mod trust_prompt;
 mod tui;
+pub use trust_prompt::ask_trust;
 mod ui;
 
 use std::io::{Stdout, stdout};
