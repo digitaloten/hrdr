@@ -20,6 +20,18 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 /// Generous: a cold runner is slow, and a flaky timeout is worse than a slow test.
 const DONE: Duration = Duration::from_secs(60);
 
+/// Whether hrdr set a foreground colour anywhere in `seen`.
+///
+/// Deliberately not "contains an escape byte". A ConPTY writes its own sequences
+/// into the stream — a cursor-position query, mode sets, the window title, cursor
+/// show/hide — so on Windows the stream is never escape-free no matter what hrdr
+/// does, and asserting on that tested the terminal rather than the program. It
+/// cost a red CI run to find out. crossterm emits a foreground colour as
+/// `ESC[38;5;<n>m`, which is the thing actually under test.
+fn set_a_colour(seen: &str) -> bool {
+    seen.contains("\x1b[38;5;")
+}
+
 fn pty_available() -> bool {
     native_pty_system()
         .openpty(PtySize {
@@ -133,11 +145,17 @@ fn chrome_on_a_terminal_is_coloured() {
         seen.contains("[usage]"),
         "the chrome this test is about must have run: {seen:?}"
     );
-    assert!(seen.contains('\x1b'), "a terminal gets colour: {seen:?}");
+    assert!(set_a_colour(&seen), "a terminal gets colour: {seen:?}");
 }
 
 /// `NO_COLOR` turns it off even on a terminal — the convention hrdr already
 /// imposes on every subprocess it spawns, now honoured for its own output.
+///
+/// This asserts the BEHAVIOUR, and two layers provide it: hrdr's own check, and
+/// crossterm, which suppresses colour under `NO_COLOR` on its own. So forcing
+/// hrdr's decision on does not turn this red — `term_dumb_turns_it_off…` is the
+/// one that guards hrdr's check. Both are kept: the user cares that the variable
+/// works, not which layer honoured it.
 #[test]
 fn no_color_turns_it_off_on_a_terminal() {
     if skip_for_want_of_a_pty() {
@@ -149,7 +167,7 @@ fn no_color_turns_it_off_on_a_terminal() {
         "the chrome this test is about must have run: {seen:?}"
     );
     assert!(
-        !seen.contains('\x1b'),
+        !set_a_colour(&seen),
         "NO_COLOR is honoured on a terminal: {seen:?}"
     );
 }
@@ -166,5 +184,5 @@ fn term_dumb_turns_it_off_on_a_terminal() {
         seen.contains("[usage]"),
         "the chrome this test is about must have run: {seen:?}"
     );
-    assert!(!seen.contains('\x1b'), "TERM=dumb is honoured: {seen:?}");
+    assert!(!set_a_colour(&seen), "TERM=dumb is honoured: {seen:?}");
 }

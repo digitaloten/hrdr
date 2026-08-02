@@ -985,7 +985,7 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
                 AgentEvent::Reasoning(_) => {}
                 AgentEvent::ToolStart { name, args, .. } if !quiet => {
                     chrome_line(
-                        crossterm::style::Color::Yellow,
+                        crossterm::style::Color::DarkYellow,
                         &format!("⚙ {name}"),
                         &format!(" {}", hrdr_tools::truncate_inline(&args, 120)),
                     );
@@ -997,9 +997,9 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
                 AgentEvent::Notice(text) if !quiet => chrome_line(crossterm::style::Color::DarkGrey, &format!("[{text}]"), ""),
                 AgentEvent::ToolEnd { name, ok, .. } if !quiet => {
                     let (mark, colour) = if ok {
-                        ("✓", crossterm::style::Color::Green)
+                        ("✓", crossterm::style::Color::DarkGreen)
                     } else {
-                        ("✗", crossterm::style::Color::Red)
+                        ("✗", crossterm::style::Color::DarkRed)
                     };
                     chrome_line(colour, mark, &format!(" {name}"));
                 }
