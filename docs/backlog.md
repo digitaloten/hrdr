@@ -652,53 +652,68 @@ sections above.
 
 ---
 
-## Frontend sharing: tighten the seam, don't re-layer
+## Frontend parity: the web drives the same backend the TUI does
 
-Raised 2026-08-02 after the `dispatch.rs` review turned up several TUI-vs-web
-divergences: should the codebase be refactored so functionality is written
-frontend-agnostically and shared? **Considered, and the answer is no — the
-sharing already exists; the seam is what leaks.** Recorded so the question is
-not re-opened from scratch.
+**Decided 2026-08-02 by the owner.** The web/remote UI is a full client of the
+same backend, reaching it through the protocol — _not_ a rendered headless TUI
+streamed to the browser, and not a reduced-capability viewer. It should have
+**almost all** the TUI's features. The one intended exception is `/edit` and its
+`Ctrl+G` binding, which launch an external editor and genuinely cannot work in a
+browser. Everything else — `!command`, `@path` completion, pickers, scrollback
+search, panes, cancellation — is meant to work from a phone against the real
+working tree. Pair this with the standing constraint that server-side execution
+is the feature and auth is the whole boundary.
 
-The measurements: `hrdr-app` is the agnostic layer at ~8.2k lines and both
-frontends already route commands through its `CommandHost`; hrdr-tui is ~16.4k,
-hrdr-web ~4.2k. One review of the shared dispatcher found bugs in both frontends
-at once, which is the abstraction working.
+That makes almost every TUI/web difference a **bug or an unfinished feature**,
+not a design choice. Judge them that way.
 
-**The actual defect is that `CommandHost` has ~66 methods of which ~43 carry
-default bodies**, and the web overrides roughly 37 — so it silently inherits
-around 29. Every default was written with a terminal in mind. `open_editor`'s
-default spawns `xdg-open`, and the web never overrode it _by omission, not by
-decision_, so `/edit` over HTTP spawns a desktop process on the server host.
-`/theme` is the same shape half-overridden: `set_theme` is discarded but
-`persist_setting` is not, so the command no-ops for the caller and writes the
-operator's `config.toml`. **A default body is a silent opt-out**, and adding a
-frontend today means inheriting terminal behaviour without ever naming it.
+### Why the seam, not the layering, is what needs work
 
-What to do instead of re-layering, in one slice:
+An earlier reading of this question (after the `dispatch.rs` review) concluded
+"the sharing already exists, tighten the seam". That was right about _commands_
+and too narrow: it missed a second seam, the **input layer**, where the answer
+differs. Both halves are recorded because both still bind.
 
-1. Environment-touching defaults — anything that spawns a process, opens a file,
-   or writes user config — should default to **declining**, not to the terminal
-   behaviour. The TUI overrides them all already, so it loses nothing, and that
-   whole family of divergences becomes unrepresentable rather than patched one
-   at a time.
-2. Have `dispatch` consult `supports_command` before **executing**, not only
-   when filtering help text. It currently gates the menu and not the door.
-3. Fix the slash mismatch so `supports_command` matches at all.
+**Commands — the sharing is real.** `hrdr-app` is the agnostic layer at ~8.2k
+lines and both frontends route commands through its `CommandHost`; hrdr-tui is
+~16.4k, hrdr-web ~4.2k. One review of the shared dispatcher found bugs in both
+frontends at once, which is the abstraction working. The defect there is that
+`CommandHost` has ~66 methods of which ~43 carry default bodies, and the web
+overrides roughly 37 — so it silently inherits ~29, every one written with a
+terminal in mind. **A default body is a silent opt-out.** `open_editor`'s
+default spawns `xdg-open`, and the web never overrode it by omission rather than
+decision.
 
-Why not the larger refactor: most of hrdr-tui is rendering, input and scrollback
-— genuinely terminal-specific, and making it agnostic is a rewrite with no
-user-visible payoff that would put the currently-simple part (each frontend owns
-its drawing) behind an abstraction serving two masters. `/goto`, `/find`,
-`/next`, `/prev` are the honest case: they are scrollback navigation and
-_should_ stay TUI-only; the bug is that `HELP_GROUPS` advertises them to the
-web. And the two genuinely-shared-logic bugs found — `/compact` targeting the
-wrong agent, `/cwd` reading one agent and writing another — are contracts
-written in a doc comment and enforced by nothing. That is a typing and testing
-problem, not a layering one.
+Still worth doing, and now _more_ clearly right given the decision above —
+`/edit` is precisely the command that must decline on the web rather than
+silently act on the server:
 
-If divergence keeps appearing after those three changes, that is evidence for
-something deeper — and there will be a much better idea where.
+1. Environment-touching defaults should default to **declining**, not to the
+   terminal behaviour.
+2. `dispatch` should consult `supports_command` before **executing**, not only
+   when filtering help. It currently gates the menu and not the door.
+3. Fix the slash mismatch so `supports_command` matches at all — `HELP_GROUPS`
+   entries carry a leading slash and the web host matches unslashed names, so it
+   has never matched anything.
+
+**Input — the sharing was never done.** Confirmed: `!command` has exactly one
+handler in the workspace, `hrdr-tui/src/app.rs:1211`, so a browser sends
+`!git status` to the model as chat. `@path` completion lives in
+`hrdr-app/src/completion.rs` — correctly placed — but its only consumer is
+`hrdr-tui/src/app.rs`, and `ClientMsg` (`hrdr-protocol/src/lib.rs:292`) has five
+variants (`Submit`, `Command`, `Cancel`, `SwitchPane`, `Resume`), so the wire
+cannot express a completion request at all. These are not wiring oversights: the
+protocol has no vocabulary for them, and `!command` sits in the frontend when it
+belongs below both.
+
+Most of hrdr-tui is rendering, input handling and scrollback, and that part
+stays terminal-specific — but "terminal-specific" has to be _argued_ per feature
+now, not assumed from where the code happens to live today.
+
+A parity inventory is being taken: every capability gap, classified as
+wiring-only / needs-protocol / needs-moving-out-of-`hrdr-tui` /
+genuinely-terminal-specific, with the concrete `ClientMsg`/`ServerMsg` additions
+and a slice order.
 
 ### Left open by the compaction fix (`/compact` pane targeting)
 
