@@ -132,6 +132,92 @@ would have gone on refusing nothing at all. Parse a `toml::Table` for a
 document. Three existing tests went red and are the only reason this was not
 shipped silently.
 
+## Compaction rewrite — designed 2026-08-04, not built
+
+From a read of hrdr's `compaction.rs` against codex at `78306a3` (pulled that
+day). Pruning was deleted the same day, so compaction now carries the whole job.
+
+**The headline defect: hrdr's compaction request deliberately breaks the prompt
+cache.** `Agent::compact` builds a one-off request — a dedicated
+`COMPACT_SYSTEM` summarizer prompt instead of the session's, only
+`messages[1..tail_start]` with the session's own system prompt stripped, and no
+`tools[]`. Four independent reasons the cached prefix cannot match, so
+compaction pays FULL input price on the whole head, at the most expensive moment
+in a session, and again per shrink stage. The code already admits the cost:
+_"each doomed attempt is a full upload of the whole history"_. Codex instead
+clones the live history, appends the instruction as an ordinary user message,
+and sends it under `sess.get_base_instructions()` — same prefix, so the cache
+hits and it pays for the instruction plus output.
+
+Work, in the order it is worth doing:
+
+1. **Compact in place, against the live prefix.** Send the session's own system
+   prompt, tools and history with the instruction appended. This is where the
+   money is.
+2. **A `CompactionReason`, logged AND persisted into the post-compaction
+   transcript.** Today the summary lands with no provenance, so nothing can tell
+   a `/compact` from an overflow rescue — including a resumed session. Codex
+   carries `UserRequested | ContextLimit | ModelDownshift | CompHashChanged`
+   through to a counter tagged `(reason, implementation, outcome)`.
+3. **Frame the reinjected summary.** Codex's `compact/summary_prefix.md` tells
+   the resuming model the summary came from another model and to build on it
+   _"and avoid duplicating work"_ — the exact failure a compacted agent has.
+   hrdr reinjects with no framing at all.
+4. **Trigger on the body, not the total.** hrdr measures total prompt tokens,
+   but the prefix (system, tools, memory) is what compaction CANNOT reclaim, and
+   hrdr's prefix is deliberately large. Codex has
+   `AutoCompactTokenLimitScope::{Total, BodyAfterPrefix}` for this.
+5. **Compact with the OUTGOING model on a model switch, before adopting the new
+   one.** hrdr handles a downshift reactively (verified: `adopt_resolved`
+   invalidates the window, the next `maybe_self_compact` fires against the new
+   smaller trigger) — but the summarizing is done by the incoming model, on a
+   history that may not fit it, with a cold cache. Codex compacts with the
+   previous model's turn context first, then retries with the current one if
+   that fails (`should_retry_with_current_model` lists the errors worth
+   switching model over: `InvalidRequest`, `UnexpectedStatus`,
+   `ContextWindowExceeded`, `UsageLimitReached`, `ServerOverloaded`,
+   `InternalServerError`, `RetryLimit`).
+
+**Decided 2026-08-04: do NOT use `tool_choice` on the compaction call.** The
+tempting shortcut is `tool_choice: "none"` — tools stay in the request so the
+prefix survives, while the model is forbidden from calling one. Anthropic's
+documented cache hierarchy is `tools → system → messages`, and a change
+invalidates that level and every level after it; `tool_choice` "only affects
+message blocks", so it keeps the CHEAP half (tools, system) and invalidates the
+expensive half (messages) — exactly backwards for a long conversation. The
+owner's call was to leave the request shape byte-identical to an ordinary turn,
+which is provider-independent and needs no per-provider caching research. The
+guarantee comes from two other layers instead: the instruction states explicitly
+that only prose may be returned, and **a tool call returned during compaction is
+never executed** — it is a failed attempt, retried through the existing
+`RetryBudget`. Executing one would run a side effect the user never asked for,
+at the worst possible moment.
+
+**Open before this can be planned fully:**
+
+- **What happens on the SECOND compaction — the blocker.** Codex has
+  `is_summary_message` and
+  `insert_initial_context_before_last_real_user_or_summary`, so it clearly
+  distinguishes an existing summary; hrdr's behaviour is unverified. If a
+  summary is summarized again each time, a long session degrades silently.
+  Decides whether the summary is an ordinary message or a distinguished one.
+- **`InitialContextInjection`** — codex re-injects something after a wipe and
+  suppresses it on the switch paths (`DoNotInject`). hrdr rebuilds its system
+  sections per request so it may be free; that is an assumption, not a finding.
+- **No way to measure the win.** The case is entirely cache economics and hrdr
+  has no prompt-size introspection, so item 1 would ship on argument alone.
+  Wants a cached-vs-uncached input figure before and after.
+- **Sub-agents and `/compact`.** A delegated agent's history is one long turn
+  (`mega_turn_tail_start` exists for exactly that shape) and must keep working;
+  `/compact`'s optional steering instructions need a home in the new request.
+
+Not read, deliberately: `compact_remote_v2.rs` (~30 KB) and `compact_remote.rs`
+(~18 KB), codex's provider-gated server-side path, unlikely to be portable.
+**Two items in this list were corrected after being described from filenames
+alone** — `comp_hash` is a per-model compaction-COMPATIBILITY hash, not a cache
+hash, and the model fallback is the retry arm of the switch path rather than a
+general safety net. Open the code before trusting a name.
+
 ## Owed right now
 
 - **v0.11.0 is not on the AUR.** Every other channel published on 2026-08-03 —
