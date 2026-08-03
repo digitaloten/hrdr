@@ -83,7 +83,7 @@ pub(crate) use turn_loop::{
 pub(crate) use turn_loop::{drain_stream, is_context_overflow};
 mod compaction;
 mod turn_state;
-pub use compaction::{CompactionReport, compaction_trigger, should_auto_compact};
+pub use compaction::{CompactionReport, ShrinkStage, compaction_trigger, should_auto_compact};
 #[cfg(test)]
 pub(crate) use compaction::{
     ELIDE_TOOL_RESULT_BYTES, compaction_tail_start, elide_tool_results, mega_turn_tail_start,
@@ -11562,6 +11562,16 @@ mod tests {
             // the summary, which is a different question from what was spent.
             assert_eq!(report.prompt_tokens, 1_000);
             assert_eq!(report.output_tokens, 25);
+            // It DOES carry what it took, though — the refused tool call is why
+            // the winning attempt found a warm cache, and the notice has to be
+            // able to say so.
+            assert_eq!(report.attempts, 2);
+            assert_eq!(report.stage, crate::ShrinkStage::Full);
+            assert!(
+                report.notice().contains("2 attempts"),
+                "{}",
+                report.notice()
+            );
         }
 
         /// The summary is a distinguished message, and there is never more than

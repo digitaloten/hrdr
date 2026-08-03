@@ -68,6 +68,8 @@ mod tests {
             cached_prompt_tokens: Some(900),
             output_tokens: 42,
             cost_usd: None,
+            stage: hrdr_agent::ShrinkStage::Full,
+            attempts: 1,
         };
         assert_eq!(
             compaction_message(&Ok(report(2, 2))),

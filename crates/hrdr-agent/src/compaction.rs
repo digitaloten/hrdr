@@ -124,6 +124,17 @@ pub struct CompactionReport {
     pub output_tokens: u32,
     /// Estimated cost of the summarization call, when the model is priced.
     pub cost_usd: Option<f64>,
+    /// Which rung of the shrink ladder produced the summary, and how many
+    /// requests it took to get there.
+    ///
+    /// These are what make [`cached_prompt_tokens`](Self::cached_prompt_tokens)
+    /// readable. Below [`ShrinkStage::Full`] a near-zero cache fraction is the
+    /// shrink working as designed; after a retry a near-total one may be the
+    /// identical previous request warming the cache rather than the live
+    /// session's prefix matching. Without them the same number means opposite
+    /// things and there is no way to tell which.
+    pub stage: ShrinkStage,
+    pub attempts: usize,
 }
 
 impl CompactionReport {
@@ -137,6 +148,8 @@ impl CompactionReport {
             cached_prompt_tokens: None,
             output_tokens: 0,
             cost_usd: None,
+            stage: ShrinkStage::Full,
+            attempts: 0,
         }
     }
 
@@ -162,6 +175,19 @@ impl CompactionReport {
             self.before,
             self.after
         );
+        // What it took to get the summary, when that was not the plain case —
+        // and it is not decoration: each of these changes how the cache
+        // fraction below should be read.
+        let mut how: Vec<String> = Vec::new();
+        if self.attempts > 1 {
+            how.push(format!("{} attempts", self.attempts));
+        }
+        if self.stage.rewrites_the_prompt() {
+            how.push(format!("{} stage", self.stage.label()));
+        }
+        if !how.is_empty() {
+            line.push_str(&format!(" · {}", how.join(", ")));
+        }
         // Everything past here describes the summarization request and nothing
         // else, so it says so. Unscoped, "90% from cache" reads as a claim about
         // the session — while in fact the turn AFTER a compaction starts cold,
@@ -238,9 +264,70 @@ fn continuation_framing(reason: CompactionReason, has_tail: bool) -> String {
 /// Max bytes of a tool-result body kept when shrinking a compaction request.
 pub(crate) const ELIDE_TOOL_RESULT_BYTES: usize = 400;
 
-/// The last shrink stage [`Agent::compact`] will escalate to: full history,
-/// elided tool results, then the most recent 1/2, 1/4 and 1/8 of it.
-const MAX_COMPACT_STAGE: usize = 4;
+/// How much of the history one compaction attempt sends — the ladder
+/// [`Agent::compact`] escalates down when the summarization request is itself
+/// too big for the context window.
+///
+/// A type rather than an index because advancing the ladder and running out of
+/// it are one decision: [`next`](Self::next) returns `None` at the end, where an
+/// increment sitting beside a separate `<` bound could drift from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShrinkStage {
+    /// The whole history, verbatim — the only stage whose request still extends
+    /// the prefix the live session just cached, and so the only one compacting
+    /// in place is cheap at.
+    Full,
+    /// Bulky tool-result bodies truncated. Tool output is the usual context hog
+    /// and the summarizer mostly needs the turns around it.
+    Elided,
+    /// The most recent half, quarter, eighth of the elided history.
+    Half,
+    Quarter,
+    Eighth,
+}
+
+impl ShrinkStage {
+    /// The ladder in order, for the sizing pass that picks a starting rung.
+    const LADDER: [Self; 5] = [
+        Self::Full,
+        Self::Elided,
+        Self::Half,
+        Self::Quarter,
+        Self::Eighth,
+    ];
+
+    /// The next-smaller stage, or `None` when there is nothing left to shrink.
+    fn next(self) -> Option<Self> {
+        match self {
+            Self::Full => Some(Self::Elided),
+            Self::Elided => Some(Self::Half),
+            Self::Half => Some(Self::Quarter),
+            Self::Quarter => Some(Self::Eighth),
+            Self::Eighth => None,
+        }
+    }
+
+    /// Whether this stage rewrites message bodies — and so gives up the prompt
+    /// cache the whole in-place design exists to hit.
+    ///
+    /// This is what makes a compaction's cache fraction readable: below `Full`
+    /// a near-zero reading is the shrink working as designed, not the cache
+    /// failing.
+    pub fn rewrites_the_prompt(self) -> bool {
+        self != Self::Full
+    }
+
+    /// How a notice names it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full-history",
+            Self::Elided => "elided-history",
+            Self::Half => "half-history",
+            Self::Quarter => "quarter-history",
+            Self::Eighth => "eighth-history",
+        }
+    }
+}
 
 /// The output allowance assumed when the endpoint reports no `max_tokens` at
 /// all, so the shrink ladder still has a figure to reserve against. Only ever a
@@ -259,18 +346,24 @@ const COMPACT_INPUT_SLACK: u32 = 8_192;
 /// `elided` memoizes the (O(n), allocating) elision across stages, since every
 /// stage above 0 starts from it.
 fn compact_stage_history(
-    stage: usize,
+    stage: ShrinkStage,
     full: &[ChatMessage],
     elided: &mut Option<Vec<ChatMessage>>,
 ) -> Vec<ChatMessage> {
-    if stage == 0 {
+    if stage == ShrinkStage::Full {
         return full.to_vec();
     }
     let elided = elided.get_or_insert_with(|| elide_tool_results(full));
-    match stage {
-        1 => elided.clone(),
-        n => carry_prior_summary(elided, tail_window(elided, 1 << (n - 1))),
-    }
+    let div = match stage {
+        // `Full` returned above; naming it (rather than a catch-all) is what
+        // makes a new stage a compile error here instead of silently taking
+        // whichever arm was written last.
+        ShrinkStage::Full | ShrinkStage::Elided => return elided.clone(),
+        ShrinkStage::Half => 2,
+        ShrinkStage::Quarter => 4,
+        ShrinkStage::Eighth => 8,
+    };
+    carry_prior_summary(elided, tail_window(elided, div))
 }
 
 /// Put the previous compaction's summary back at the front of a `window` that
@@ -682,10 +775,15 @@ impl Agent {
         // the summary. Counted apart from `budget`, which only retries
         // transient network and server failures — this is neither.
         let mut tool_call_attempts = 0usize;
+        // Every request this compaction issued, whatever became of it. Reported
+        // so a reader can tell a cache fraction warmed by an identical retry
+        // from one the live session's prefix actually produced.
+        let mut attempts = 0usize;
         // The summary and what the attempt that produced it was billed, bound
         // together: a spend exists only where a request succeeded, so there is
         // no zeroed placeholder to mistake for a real reading.
         let (summary, spend) = loop {
+            attempts += 1;
             let history = compact_stage_history(stage, &full, &mut elided);
             let mut req = Vec::with_capacity(history.len() + 2);
             req.push(self.messages[0].clone());
@@ -717,7 +815,14 @@ impl Agent {
                     }
                     break (msg.content.unwrap_or_default(), spend);
                 }
-                Err(e) if is_context_overflow(&e) && stage < MAX_COMPACT_STAGE => stage += 1,
+                Err(e) if is_context_overflow(&e) => match stage.next() {
+                    Some(smaller) => stage = smaller,
+                    // Out of ladder: the request cannot be made to fit, and the
+                    // retry budget below would refuse a non-transient error
+                    // anyway. Say so here rather than routing it through a
+                    // helper that only looks like it might retry.
+                    None => return Err(e),
+                },
                 Err(e) => {
                     // Silent: `compact` has no event sink (it is called from
                     // overflow recovery and from `/compact` alike), so the retry
@@ -790,6 +895,8 @@ impl Agent {
             cached_prompt_tokens: spend.cached_prompt_tokens,
             output_tokens: spend.completion_tokens,
             cost_usd: spend.cost_usd,
+            stage,
+            attempts,
         })
     }
 
@@ -815,9 +922,9 @@ impl Agent {
         full: &[ChatMessage],
         elided: &mut Option<Vec<ChatMessage>>,
         prefix_tokens: u32,
-    ) -> usize {
+    ) -> ShrinkStage {
         let Some(window) = self.context_window else {
-            return 0;
+            return ShrinkStage::Full;
         };
         let headroom = self
             .client
@@ -832,13 +939,14 @@ impl Agent {
             // A window smaller than the headroom: nothing can be sized, and
             // guessing the smallest stage would throw away the history for a
             // model that may still have room. Let the escalation decide.
-            return 0;
+            return ShrinkStage::Full;
         }
-        (0..MAX_COMPACT_STAGE)
+        ShrinkStage::LADDER
+            .into_iter()
             .find(|&stage| {
                 estimate_tokens_in_messages(&compact_stage_history(stage, full, elided)) <= budget
             })
-            .unwrap_or(MAX_COMPACT_STAGE)
+            .unwrap_or(ShrinkStage::Eighth)
     }
 
     /// Run one request to completion, returning the assistant message the model
@@ -1082,24 +1190,36 @@ mod tests {
             .collect();
         let mut elided = None;
 
-        let stage0 = compact_stage_history(0, &full, &mut elided);
-        assert_eq!(stage0.len(), full.len(), "stage 0 is the whole head");
-        assert!(elided.is_none(), "stage 0 must not pay for the elision");
+        let whole = compact_stage_history(ShrinkStage::Full, &full, &mut elided);
+        assert_eq!(whole.len(), full.len(), "the first stage is the whole head");
+        assert!(
+            elided.is_none(),
+            "the first stage must not pay for the elision"
+        );
 
-        let stage1 = compact_stage_history(1, &full, &mut elided);
-        assert_eq!(stage1.len(), full.len(), "elision keeps every message");
+        let elided_stage = compact_stage_history(ShrinkStage::Elided, &full, &mut elided);
+        assert_eq!(
+            elided_stage.len(),
+            full.len(),
+            "elision keeps every message"
+        );
         assert!(elided.is_some(), "the elided copy is memoized");
         assert!(
-            estimate_tokens_in_messages(&stage1) < estimate_tokens_in_messages(&stage0),
+            estimate_tokens_in_messages(&elided_stage) < estimate_tokens_in_messages(&whole),
             "eliding tool results must shrink the request"
         );
 
         // Each later stage keeps a smaller tail, and none of them rebuilds the
         // elided copy (the memo is already populated and is reused as-is).
-        let stage2 = compact_stage_history(2, &full, &mut elided);
-        let stage3 = compact_stage_history(3, &full, &mut elided);
-        assert!(stage2.len() <= stage1.len());
-        assert!(stage3.len() <= stage2.len());
+        let half = compact_stage_history(ShrinkStage::Half, &full, &mut elided);
+        let quarter = compact_stage_history(ShrinkStage::Quarter, &full, &mut elided);
+        assert!(half.len() <= elided_stage.len());
+        assert!(quarter.len() <= half.len());
+
+        // The ladder ends, and that is how the escalation knows to stop rather
+        // than by comparing against a bound written down somewhere else.
+        assert_eq!(ShrinkStage::Eighth.next(), None);
+        assert_eq!(ShrinkStage::LADDER.last(), Some(&ShrinkStage::Eighth));
     }
 
     /// A shrink stage drops the front of the history — but never the previous
@@ -1123,26 +1243,28 @@ mod tests {
             }
         }));
 
-        let carried = |stage: usize| -> Vec<ChatMessage> {
+        let carried = |stage: ShrinkStage| -> Vec<ChatMessage> {
             let mut elided = None;
             compact_stage_history(stage, &full, &mut elided)
         };
-        // Stages 0 and 1 send every message, so the summary is already there.
-        for stage in 0..=1 {
-            assert_eq!(carried(stage).len(), full.len(), "stage {stage}");
+        // The first two stages send every message, so the summary is already
+        // there.
+        for stage in [ShrinkStage::Full, ShrinkStage::Elided] {
+            assert_eq!(carried(stage).len(), full.len(), "{}", stage.label());
         }
         // The windowing stages cut the front. Each must still open with the
         // summary, and must not have grown a second copy of it.
-        for stage in 2..=MAX_COMPACT_STAGE {
+        for stage in [ShrinkStage::Half, ShrinkStage::Quarter, ShrinkStage::Eighth] {
+            let label = stage.label();
             let history = carried(stage);
             assert!(
                 history.len() < full.len(),
-                "precondition: stage {stage} shrinks the history"
+                "precondition: the {label} stage shrinks the history"
             );
             assert_eq!(
                 history[0].origin,
                 MessageOrigin::Summary(CompactionReason::ContextOverflow),
-                "stage {stage} dropped the only record of the older session"
+                "the {label} stage dropped the only record of the older session"
             );
             assert_eq!(
                 history
@@ -1150,7 +1272,7 @@ mod tests {
                     .filter(|m| matches!(m.origin, MessageOrigin::Summary(_)))
                     .count(),
                 1,
-                "stage {stage} carried it twice"
+                "the {label} stage carried it twice"
             );
         }
 
@@ -1158,13 +1280,65 @@ mod tests {
         // the window just because it was cut.
         let plain: Vec<ChatMessage> = full[1..].to_vec();
         let mut elided = None;
-        let history = compact_stage_history(MAX_COMPACT_STAGE, &plain, &mut elided);
+        let history = compact_stage_history(ShrinkStage::Eighth, &plain, &mut elided);
         assert!(
             history
                 .iter()
                 .all(|m| !matches!(m.origin, MessageOrigin::Summary(_))),
             "nothing to carry, nothing carried"
         );
+    }
+
+    /// The notice says what it took to get the summary, because that is what
+    /// decides how to read its cache fraction.
+    ///
+    /// The same percentage means opposite things depending on two facts the
+    /// line used to omit. Below `Full` the request rewrites message bodies, so
+    /// a near-zero reading is the shrink ladder working, not the cache failing.
+    /// And after a retry the winning attempt's prefix was warmed by the
+    /// identical attempt before it, so a near-total reading may say nothing
+    /// about the live session's prefix at all. Neither is decoration: without
+    /// them a reader cannot tell a healthy compaction from a broken one, which
+    /// is the only reason the fraction is printed.
+    #[test]
+    fn the_notice_says_what_it_took_to_produce_the_summary() {
+        let report = |stage, attempts| CompactionReport {
+            reason: CompactionReason::ContextOverflow,
+            before: 40,
+            after: 6,
+            prompt_tokens: 1_000,
+            cached_prompt_tokens: Some(30),
+            output_tokens: 900,
+            cost_usd: None,
+            stage,
+            attempts,
+        };
+
+        // The plain case says neither — one attempt at the full history is what
+        // every healthy compaction does, and naming it would be noise.
+        let plain = report(ShrinkStage::Full, 1).notice();
+        assert!(!plain.contains("attempts"), "{plain}");
+        assert!(!plain.contains("stage"), "{plain}");
+        assert!(plain.contains("3% from cache"), "{plain}");
+
+        // A rescue that escalated: the stage explains the 3%.
+        let escalated = report(ShrinkStage::Quarter, 1).notice();
+        assert!(
+            escalated.contains("quarter-history stage"),
+            "a low cache fraction below the full stage is expected, and the line \
+             has to say so: {escalated}"
+        );
+        assert!(!escalated.contains("attempts"), "{escalated}");
+
+        // A retried one: the attempt count explains a fraction that may have
+        // been warmed by the previous attempt rather than by the session.
+        let retried = report(ShrinkStage::Full, 2).notice();
+        assert!(retried.contains("2 attempts"), "{retried}");
+        assert!(!retried.contains("stage"), "{retried}");
+
+        // Both, and they read as one clause rather than two stray fields.
+        let both = report(ShrinkStage::Eighth, 3).notice();
+        assert!(both.contains("3 attempts, eighth-history stage"), "{both}");
     }
 
     /// The reinjected summary is framed as a RECORD, and says which of the two
@@ -1223,12 +1397,18 @@ mod tests {
         // No window: nothing to size against, so behaviour is unchanged.
         agent.set_context_window(None);
         let mut elided = None;
-        assert_eq!(agent.first_viable_compact_stage(&full, &mut elided, 0), 0);
+        assert_eq!(
+            agent.first_viable_compact_stage(&full, &mut elided, 0),
+            ShrinkStage::Full
+        );
 
         // A window with ample room for the whole history still starts at 0.
         agent.set_context_window(Some(400_000));
         let mut elided = None;
-        assert_eq!(agent.first_viable_compact_stage(&full, &mut elided, 0), 0);
+        assert_eq!(
+            agent.first_viable_compact_stage(&full, &mut elided, 0),
+            ShrinkStage::Full
+        );
 
         // Headroom tracks the session's own output allowance rather than a
         // fixed cap, so read it off the agent instead of restating it here.
@@ -1241,13 +1421,16 @@ mod tests {
                 .saturating_add(COMPACT_INPUT_SLACK)
         };
 
-        // A window that the full history cannot fit skips straight past stage 0.
+        // A window the whole history cannot fit skips straight past the first
+        // stage.
         let window = headroom(&agent) + 20_000;
         agent.set_context_window(Some(window));
         let mut elided = None;
         let stage = agent.first_viable_compact_stage(&full, &mut elided, 0);
-        assert!(stage > 0, "a doomed stage 0 must be skipped, got {stage}");
-        assert!(stage <= MAX_COMPACT_STAGE);
+        assert!(
+            stage.rewrites_the_prompt(),
+            "a doomed first stage must be skipped, got {stage:?}"
+        );
 
         // The prefix — system prompt and tools — rides on every stage, so it
         // comes off the budget: a window that fits the history alone does not
@@ -1255,10 +1438,15 @@ mod tests {
         let window = headroom(&agent) + 60_000;
         agent.set_context_window(Some(window));
         let mut elided = None;
-        assert_eq!(agent.first_viable_compact_stage(&full, &mut elided, 0), 0);
+        assert_eq!(
+            agent.first_viable_compact_stage(&full, &mut elided, 0),
+            ShrinkStage::Full
+        );
         let mut elided = None;
         assert!(
-            agent.first_viable_compact_stage(&full, &mut elided, 40_000) > 0,
+            agent
+                .first_viable_compact_stage(&full, &mut elided, 40_000)
+                .rewrites_the_prompt(),
             "the prefix must be charged against the same budget"
         );
 
@@ -1273,7 +1461,9 @@ mod tests {
         agent.client.set_params(params);
         let mut elided = None;
         assert!(
-            agent.first_viable_compact_stage(&full, &mut elided, 0) > 0,
+            agent
+                .first_viable_compact_stage(&full, &mut elided, 0)
+                .rewrites_the_prompt(),
             "the output allowance must be charged against the same budget"
         );
 
@@ -1281,6 +1471,9 @@ mod tests {
         // must not throw the history away on a guess.
         agent.set_context_window(Some(1_000));
         let mut elided = None;
-        assert_eq!(agent.first_viable_compact_stage(&full, &mut elided, 0), 0);
+        assert_eq!(
+            agent.first_viable_compact_stage(&full, &mut elided, 0),
+            ShrinkStage::Full
+        );
     }
 }

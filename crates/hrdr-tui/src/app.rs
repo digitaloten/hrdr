@@ -2857,6 +2857,8 @@ mod tests {
                 cached_prompt_tokens: None,
                 output_tokens: 0,
                 cost_usd: None,
+                stage: hrdr_agent::ShrinkStage::Full,
+                attempts: 1,
             }),
         ));
         assert!(
