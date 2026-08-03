@@ -766,6 +766,54 @@ const AGENTS_FILE: &str = "AGENTS.md";
 /// silence is worse than one that was never written.
 const MAX_AGENTS_FILE_BYTES: u64 = 64 * 1024;
 
+/// A line that ends the part of an `AGENTS.md` hrdr reads: everything from it
+/// onward is left out of the prompt, and the file keeps it for everyone else.
+///
+/// `AGENTS.md` is an open standard, so one file is read by several harnesses,
+/// and their built-in prompts do not agree on what they already say. Guidance
+/// hrdr ships in its own templates — run the formatter, verify before claiming,
+/// never weaken a test — has to stay in the file for the agents that do NOT ship
+/// it, while adding nothing but bloat to hrdr's own prompt. The marker lets one
+/// file serve both: what is above it hrdr does not already know, what is below
+/// it hrdr does.
+///
+/// An HTML comment because it must be invisible in rendered markdown and survive
+/// `prettier`, which reflows prose around it but never rewrites a comment line.
+const AGENTS_IGNORE_MARKER: &str = "<!-- hrdr:ignore-below -->";
+
+/// The part of `text` above [`AGENTS_IGNORE_MARKER`], or all of it when the
+/// marker is absent.
+///
+/// Matches a whole line, trimmed, so indentation and a CRLF ending both work and
+/// a mention of the marker *inside a sentence* does not truncate the file. A
+/// typo'd marker therefore does nothing and the whole file is read: the failure
+/// direction is "hrdr sees instructions it did not need", not "the user's
+/// instructions vanished".
+fn before_ignore_marker(text: &str) -> &str {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.trim() == AGENTS_IGNORE_MARKER {
+            return &text[..offset];
+        }
+        offset += line.len();
+    }
+    text
+}
+
+/// The part of the instruction file at `path` that belongs in the prompt: cut at
+/// [`AGENTS_IGNORE_MARKER`], trimmed, and `None` when that leaves nothing (or the
+/// file cannot be read).
+///
+/// One function rather than the same three lines at the project and global read
+/// sites: the two files differ in where they come from and in nothing else, and a
+/// marker honoured in one but not the other is exactly the kind of drift that
+/// looks fine in review.
+fn read_agent_doc(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = before_ignore_marker(&text).trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// Collect project instructions from `AGENTS.md` files, walking from `cwd` up to
 /// the filesystem root, plus global instruction files from standard locations.
 /// Less specific files (system, then user-global, then ancestors) come first so
@@ -871,6 +919,13 @@ pub enum ProjectInstructions {
 /// that clone directly would mean its own file is read beside its parent's. One
 /// directory, one answer, one file. The global file is unaffected — it is the
 /// operator's own and arrives through its own section.
+///
+/// Both files are cut at [`AGENTS_IGNORE_MARKER`] if they carry one. Note the
+/// order against the size cap: the cap is checked on the file's length **on
+/// disk**, before anything is read, so a file over it is skipped whole even when
+/// the marker would have brought it under. Keeping the cap a `metadata` check
+/// means an enormous file is never read into memory to find out how much of it
+/// counts.
 pub fn gather_agent_docs(cwd: &Path, project: ProjectInstructions) -> AgentDocs {
     let mut docs: Vec<String> = Vec::new();
     let mut global: Option<String> = None;
@@ -894,11 +949,8 @@ pub fn gather_agent_docs(cwd: &Path, project: ProjectInstructions) -> AgentDocs 
                     bytes,
                     reason: AgentDocSkip::TooLarge,
                 });
-            } else if let Ok(text) = std::fs::read_to_string(&af) {
-                let text = text.trim();
-                if !text.is_empty() {
-                    docs.push(text.to_string());
-                }
+            } else if let Some(text) = read_agent_doc(&af) {
+                docs.push(text);
             }
         }
     }
@@ -926,11 +978,8 @@ pub fn gather_agent_docs(cwd: &Path, project: ProjectInstructions) -> AgentDocs 
                 bytes,
                 reason: AgentDocSkip::TooLarge,
             });
-        } else if let Ok(text) = std::fs::read_to_string(path) {
-            let text = text.trim();
-            if !text.is_empty() {
-                global = Some(text.to_string());
-            }
+        } else {
+            global = read_agent_doc(path);
         }
     }
 
@@ -3206,6 +3255,90 @@ mod tests {
             !gathered.skipped.iter().any(|s| s.path.starts_with(&parent)),
             "an ancestor is out of scope, not skipped: {:?}",
             gathered.skipped
+        );
+    }
+
+    /// The marker cuts the file: what is above it reaches the prompt, what is
+    /// below it does not. The point is a single `AGENTS.md` that still carries
+    /// the guidance hrdr already ships, for the harnesses that do not ship it.
+    #[test]
+    fn the_ignore_marker_cuts_a_project_agents_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(AGENTS_FILE),
+            format!(
+                "KEPT_RULE: this one is mine.\n\n{AGENTS_IGNORE_MARKER}\n\nCUT_RULE: hrdr says \
+                 this already.\n"
+            ),
+        )
+        .unwrap();
+
+        let docs = gather_agent_docs(tmp.path(), ProjectInstructions::Load);
+        let project = docs.project.as_deref().unwrap();
+        assert!(
+            says(project, "KEPT_RULE"),
+            "above the marker is read: {project}"
+        );
+        assert!(
+            !says(project, "CUT_RULE"),
+            "below the marker is not: {project}"
+        );
+        assert!(
+            !project.contains(AGENTS_IGNORE_MARKER),
+            "the marker line itself goes too: {project}"
+        );
+    }
+
+    /// A file whose every section is below the marker contributes nothing —
+    /// rather than contributing an empty section, or the marker line alone.
+    #[test]
+    fn an_agents_file_that_is_entirely_below_the_marker_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(AGENTS_FILE),
+            format!("{AGENTS_IGNORE_MARKER}\n\nCUT_RULE: hrdr says this already.\n"),
+        )
+        .unwrap();
+
+        let docs = gather_agent_docs(tmp.path(), ProjectInstructions::Load);
+        assert!(
+            docs.project.is_none(),
+            "nothing above the marker is nothing at all: {:?}",
+            docs.project
+        );
+    }
+
+    /// Whole-line match, so the two ways a marker gets written by hand both work
+    /// — and a sentence that merely *names* it does not silently truncate the
+    /// file, which is the failure nobody would think to look for.
+    #[test]
+    fn the_ignore_marker_matches_a_whole_line_only() {
+        let indented = format!("KEPT\n   {AGENTS_IGNORE_MARKER}   \nCUT\n");
+        assert_eq!(
+            before_ignore_marker(&indented).trim(),
+            "KEPT",
+            "leading and trailing space on the marker line is fine"
+        );
+
+        let crlf = format!("KEPT\r\n{AGENTS_IGNORE_MARKER}\r\nCUT\r\n");
+        assert_eq!(
+            before_ignore_marker(&crlf).trim(),
+            "KEPT",
+            "a CRLF file is entirely normal on Windows"
+        );
+
+        let mentioned = format!("Write {AGENTS_IGNORE_MARKER} to cut the file here.\nKEPT\n");
+        assert_eq!(
+            before_ignore_marker(&mentioned),
+            mentioned,
+            "the marker inside a sentence is prose, not a marker"
+        );
+
+        let absent = "KEPT\nALSO KEPT\n";
+        assert_eq!(
+            before_ignore_marker(absent),
+            absent,
+            "no marker means the whole file, so a typo'd one loses nothing"
         );
     }
 

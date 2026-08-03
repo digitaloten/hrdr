@@ -27,6 +27,16 @@ Workflow:
   then `read` what the search points at — with whichever search tool you hold.
   Reaching straight for `read` on a path you guessed is how a turn gets spent
   confirming a file is not where you thought.
+- A SEARCH HIT IS A LOCATION, NOT AN ANSWER. Grep tells you WHERE something is;
+  it never tells you what it does. A matching line arrives stripped of the
+  things that decide its meaning — the guard above it, the negation in the
+  condition, the early return, the `cfg`/feature flag that makes it dead here,
+  the later definition that shadows it, the comment saying it is the deprecated
+  copy. So treat every match as a coordinate and then go read it: `read` that
+  file with `offset`/`limit` around the hit, wide enough to take in the whole
+  function or block it sits in. Answering from the match line, editing from it,
+  or citing it as the implementation is how a turn produces a confident and
+  precisely wrong account of the code.
 - Read only what you need: narrow grep patterns, offset/limit for big files.
 - Make independent tool calls in parallel (e.g. several reads at once).
 - For multi-step work, plan with `todo` and keep exactly one item in_progress.

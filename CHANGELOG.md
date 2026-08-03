@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **An `AGENTS.md` can now end early, for hrdr only.** A line reading
+  `<!-- hrdr:ignore-below -->` cuts the file: hrdr reads what is above it and
+  ignores everything from the marker down. `AGENTS.md` is an open standard, so
+  one file is usually read by several harnesses whose built-in prompts do not
+  agree on what they already cover — guidance like "run the formatter", "never
+  weaken a test to make it pass" or "read the installed dependency, don't recall
+  it" has to stay in the file for the agents that do not ship it, while adding
+  nothing but bloat to hrdr's prompt, which does. Put what hrdr already knows
+  below the marker and it serves both.
+
+  It applies to the project file and to the global one, matches a whole line (so
+  indentation and a CRLF ending are fine, and a sentence that merely mentions
+  the marker does not truncate anything), and takes the marker line itself out
+  too. A typo'd marker does nothing and the whole file is read: the failure
+  direction is hrdr seeing instructions it did not need, never the user's
+  instructions vanishing. The size cap is unchanged and still measured on the
+  file's length on disk, so a file over it is skipped whole even if the marker
+  would have brought it under.
+
+- **A search hit is treated as a location, not as the implementation.** The
+  always-on prompt now says so directly: a grep match arrives stripped of the
+  things that decide its meaning — the guard above it, the negation in the
+  condition, the early return, the `cfg` that makes it dead, a later definition
+  that shadows it — so every match is a coordinate to `read` with
+  `offset`/`limit` around, wide enough to take in the function it sits in.
+  Answering or editing from the match line is how a turn produces a confident
+  and precisely wrong account of the code.
+
 ## [0.11.0] - 2026-08-03
 
 ### Added
