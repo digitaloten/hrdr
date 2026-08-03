@@ -511,7 +511,22 @@ impl Agent {
         );
         let mut messages = Vec::with_capacity(2 + tail.len());
         messages.push(system);
-        messages.push(ChatMessage::user(continuation));
+        // Tagged, not a plain user message. Nothing but the prose opening used
+        // to mark it apart from something the user typed, and the code that
+        // asks "is this a turn?" asked `role == User` — so once the summary was
+        // old enough to fall in the head, the next compaction summarized it
+        // again, degrading a summary of a summary with nothing erroring.
+        //
+        // The tag also makes the one-summary invariant hold by construction:
+        // the tail always begins at a real user turn, which is always after
+        // index 1, so an existing summary is always in the head. The summarizer
+        // therefore sees it as context and folds it into the new summary, and
+        // this line replaces it. Exactly one summary is in history at any time,
+        // always covering the session start through the tail.
+        messages.push(ChatMessage {
+            origin: MessageOrigin::Summary,
+            ..ChatMessage::user(continuation)
+        });
         messages.extend(tail);
         self.messages = messages;
         // Most file contents the model had read live only in the summary now;

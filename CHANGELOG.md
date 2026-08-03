@@ -38,6 +38,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A second compaction no longer summarizes the first summary.** The summary
+  went into history as a plain user message, marked apart only by its prose
+  opening, so once it was old enough to fall in the head the next compaction
+  summarized it again — a summary of a summary, degrading a little more each
+  time with nothing erroring. It is now tagged as what it is, which also makes
+  the invariant hold by construction: exactly one summary is in history at any
+  time, always covering the session start through the verbatim tail.
+
 - **Compaction no longer spends the verbatim tail on messages the user never
   sent.** The tail-window walk kept the last `compaction_tail_turns` turns and
   called any `role:"user"` message a turn — but hrdr writes user-role messages

@@ -11176,6 +11176,86 @@ mod tests {
             );
         }
 
+        /// The summary is a distinguished message, and there is never more than
+        /// one of it.
+        ///
+        /// It used to be a plain user message, marked apart only by its prose
+        /// opening — so the code that asks "is this a turn?" counted it, and a
+        /// second compaction summarized the first summary. A summary of a
+        /// summary degrades silently: nothing errors, the text just gets vaguer
+        /// every time. Tagging it fixes both halves — it is not a turn
+        /// boundary, so the tail keeps real turns, and it always lands in the
+        /// head of the next compaction, which folds it in and replaces it.
+        #[tokio::test]
+        async fn a_second_compaction_replaces_the_summary_rather_than_nesting_it() {
+            let server = MockServer::start(vec![
+                MockResp::Sse(vec![
+                    text_chunk("s1", "FIRST_SUMMARY"),
+                    stop_chunk("s1"),
+                    "[DONE]".to_string(),
+                ]),
+                MockResp::Sse(vec![
+                    text_chunk("s2", "SECOND_SUMMARY"),
+                    stop_chunk("s2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            let turns = |agent: &mut Agent, tag: &str| {
+                for i in 0..8 {
+                    agent.messages.push(ChatMessage::user(format!("{tag} {i}")));
+                    agent
+                        .messages
+                        .push(ChatMessage::assistant(format!("reply {i}")));
+                }
+            };
+            let summaries = |agent: &Agent| -> Vec<String> {
+                agent
+                    .messages
+                    .iter()
+                    .filter(|m| m.origin == crate::MessageOrigin::Summary)
+                    .map(|m| m.content.clone().unwrap_or_default())
+                    .collect()
+            };
+
+            turns(&mut agent, "first round");
+            agent
+                .compact(None)
+                .await
+                .expect("first compaction succeeds");
+
+            let after_first = summaries(&agent);
+            assert_eq!(after_first.len(), 1, "exactly one summary: {after_first:?}");
+            assert!(after_first[0].contains("FIRST_SUMMARY"));
+            assert_eq!(
+                agent.messages[1].origin,
+                crate::MessageOrigin::Summary,
+                "the summary sits directly after the system prompt"
+            );
+
+            // A second compaction, with real turns since the first.
+            turns(&mut agent, "second round");
+            agent
+                .compact(None)
+                .await
+                .expect("second compaction succeeds");
+
+            let after_second = summaries(&agent);
+            assert_eq!(
+                after_second.len(),
+                1,
+                "the new summary REPLACES the old one: {after_second:?}"
+            );
+            assert!(after_second[0].contains("SECOND_SUMMARY"));
+            assert!(
+                !after_second[0].contains("FIRST_SUMMARY"),
+                "the old summary is folded into the new one, not carried verbatim"
+            );
+        }
+
         // ── overflow recovery for a single oversized turn (Part A) ────────────
 
         /// REGRESSION: a sub-agent-shaped history — exactly one `role:"user"`
