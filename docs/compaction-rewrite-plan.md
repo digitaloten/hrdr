@@ -268,6 +268,57 @@ so it does not pay for doomed uploads. That stays too.
 
 ---
 
+## Live defect, independent of the rewrite
+
+**Turn-boundary selection is blind to `MessageOrigin`, so synthetic messages eat
+the verbatim tail.** `compaction_tail_start` picks boundaries with
+`.filter(|&i| msgs[i].role == Role::User)` and nothing else. But hrdr creates
+`Role::User` messages with FOUR origins, all through one `push_user_message`:
+
+| origin             | what it is                                            | a turn? |
+| ------------------ | ----------------------------------------------------- | ------- |
+| `User`             | the user opening a turn                               | yes     |
+| `Steering`         | the user (or the main agent on their behalf) mid-turn | yes     |
+| `Nudge`            | synthetic TODO prompt the harness injects             | **no**  |
+| `BackgroundResult` | a detached sub-agent's report — tool product          | **no**  |
+| `Summary`          | harness-generated (see above)                         | **no**  |
+
+With `compaction_tail_turns = 2` the tail starts at the second-newest boundary,
+so every synthetic boundary pulls that start point LATER and shortens the
+verbatim tail. The turn count and `preserve_recent_tokens` are both caps and
+whichever binds first wins; synthetic boundaries make the count bind far earlier
+than intended. The sessions worst hit are the busiest — a sub-agent that took
+two steers, or a main agent that collected two background results, spends its
+whole tail budget on messages that are not turns.
+
+It also undermines `mega_turn_tail_start`, which exists for a history with no
+second `role:"user"` message: a steered sub-agent HAS boundaries, so the
+fallback never fires and the tail is chosen from steering messages instead.
+
+**One predicate fixes all of it** — count a boundary only where the content came
+from the user. `MessageOrigin` already carries that, and already survives
+session serialization. This is the same defect the summary case turned out to
+be: the code asks _"is this `Role::User`?"_ when it means _"is this a real user
+turn?"_.
+
+**Decided 2026-08-04 by the owner: `Steering` counts as a real turn.** A steer
+is the user speaking, just mid-turn — and a steer arriving from the MAIN AGENT
+is no different, because the main agent is acting on the user's behalf. A
+sub-agent treats both identically and nothing should distinguish them. `Nudge`,
+`BackgroundResult` and `Summary` are the harness talking to itself and are not
+turns.
+
+**Also decided: main and sub-agent compaction stay ONE code path.** They must
+not be allowed to drift. Note this is already true — `mega_turn_tail_start` is a
+fallback keyed on the SHAPE of the history (one long turn), not on whether the
+agent is delegated, and no agent-type branch exists in the compaction path. The
+constraint is to keep it that way, matching the standing rule that every agent,
+main or sub, runs the same code.
+
+**Shippable on its own**, ahead of the rewrite: it costs verbatim tail on every
+compacted session today, and more the more you steer or delegate. It supersedes
+the narrower "stolen tail slot" note under the summary decision.
+
 ## Work items, in the order worth doing
 
 1. **Compact in place, against the live prefix.** Where the money is. Requires
