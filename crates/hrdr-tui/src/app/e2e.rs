@@ -1609,6 +1609,86 @@ async fn a_restored_steer_lands_above_what_is_being_typed() {
     assert_eq!(h.app.editor.content(), "queued thought\nhalf-typed");
 }
 
+/// Up on an empty box takes a queued message back for editing — and TAKES it,
+/// rather than copying it.
+#[tokio::test]
+async fn up_on_an_empty_box_takes_back_the_queued_message() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    h.type_str("half a thought");
+    h.press(KeyCode::Enter);
+    assert_eq!(h.app.pending(), ["half a thought"], "queued while running");
+    assert_eq!(h.app.editor.content(), "", "and the box was cleared");
+
+    h.press(KeyCode::Up);
+    assert_eq!(
+        h.app.editor.content(),
+        "half a thought",
+        "Up brings the queued message back to be edited"
+    );
+    assert!(
+        h.app.pending().is_empty(),
+        "and takes it OFF the queue — a copy would be delivered as well as the edit"
+    );
+}
+
+/// The whole point of taking it off the queue: the edited message is sent once.
+///
+/// If Up merely copied the text, the queue would still drain the original and the
+/// user would see their message twice — once as they first wrote it, once as they
+/// meant it.
+#[tokio::test]
+async fn an_edited_message_is_queued_once_not_twice() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    h.type_str("use the blue one");
+    h.press(KeyCode::Enter);
+
+    // Take it back, change it, send it again — still mid-turn, so it re-queues.
+    h.press(KeyCode::Up);
+    h.app.editor.set_content("use the red one");
+    h.press(KeyCode::Enter);
+
+    assert_eq!(
+        h.app.pending(),
+        ["use the red one"],
+        "one message on the queue, and it is the edited one"
+    );
+}
+
+/// With nothing queued, Up on an empty box is history, exactly as before.
+#[tokio::test]
+async fn up_on_an_empty_box_with_nothing_queued_still_recalls_history() {
+    let mut h = Harness::new(vec![MockReply::Text("answer".to_string())]).await;
+    h.submit("an older message").await;
+    assert!(h.app.pending().is_empty(), "nothing is queued");
+
+    h.press(KeyCode::Up);
+    assert_eq!(
+        h.app.editor.content(),
+        "an older message",
+        "history still answers Up when the queue is empty"
+    );
+}
+
+/// A half-typed draft in the box is not an invitation to raid the queue: Up with
+/// text in it browses history, and what is queued stays queued.
+#[tokio::test]
+async fn up_with_a_draft_in_the_box_leaves_the_queue_alone() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    h.type_str("queued thought");
+    h.press(KeyCode::Enter);
+    h.type_str("half-typed");
+
+    h.press(KeyCode::Up);
+    assert_eq!(
+        h.app.pending(),
+        ["queued thought"],
+        "the queue is untouched while the box holds a draft"
+    );
+}
+
 /// Several mid-turn submits queue up and are merged into a single message —
 /// each line the user types while waiting is one thought, not separate turns.
 #[tokio::test]

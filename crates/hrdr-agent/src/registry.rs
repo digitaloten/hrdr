@@ -622,6 +622,21 @@ impl AgentRegistry {
         })
     }
 
+    /// Take the message at the TAIL of agent `key`'s queue — the newest thing the
+    /// user said to it, and the one they are most likely to want back.
+    ///
+    /// The counterpart to [`Self::take_pending`], which takes the head because the
+    /// agent delivers in order. This end is for a frontend handing a queued message
+    /// back to the user to edit: taking it off the queue is what stops the edited
+    /// copy from being sent twice.
+    pub fn take_newest_pending(&self, key: u64) -> Option<crate::Steer> {
+        self.with(|v| {
+            v.iter()
+                .find(|e| e.key == key)
+                .and_then(|e| e.steering.lock().ok().and_then(|mut q| q.pop_back()))
+        })
+    }
+
     /// Drop everything queued for agent `key`, returning how many were discarded
     /// (a cancelled turn must not leak them into the next one).
     pub fn clear_pending(&self, key: u64) -> usize {

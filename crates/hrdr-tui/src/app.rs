@@ -662,7 +662,8 @@ impl App {
             "hrdr ready. Type a message; Enter sends, Alt+Enter or \\+Enter for a newline \
              (Shift+Enter too on supporting terminals), Ctrl+G opens $EDITOR. Type @path to \
              attach a file. /help for commands; /exit (Ctrl+C twice, or Ctrl+D on an empty line) \
-             to quit. Submit while a reply runs to queue follow-ups."
+             to quit. Submit while a reply runs to queue follow-ups; Up on an empty box \
+             takes the last one back to edit."
         };
         // The banner opens every new session; the welcome text follows it.
         // Both are chrome: a resumed session gets a fresh pair, not the saved one.
@@ -1153,6 +1154,15 @@ impl App {
                 }
                 KeyCode::Home if self.scroll_offset < self.max_scroll => {
                     self.scroll_offset = self.max_scroll; // jump to the top of the session
+                    return Action::None;
+                }
+                // Up on an EMPTY box takes back a message still waiting to be
+                // said, before it falls through to history — see
+                // [`Self::take_queued_into_input`].
+                KeyCode::Up if self.editor.content().trim().is_empty() => {
+                    if !self.take_queued_into_input() {
+                        self.history_prev();
+                    }
                     return Action::None;
                 }
                 // Up/Down recall previous submissions (readline-style), but only
@@ -2369,6 +2379,43 @@ impl App {
         if let Some(text) = self.history.recall_prev(&current) {
             self.editor.set_content(&text);
         }
+    }
+
+    /// Take the newest message still queued for the pane on screen back into the
+    /// input box, so it can be edited before it is said. `false` when there was
+    /// nothing queued and the caller should fall through to history.
+    ///
+    /// Up already means "the last thing I typed". While a turn runs, that is not
+    /// the newest history entry — it is the message sitting in the queue, which is
+    /// both more recent and the only one still changeable: history has already
+    /// been delivered, and this has not. So an empty box gives the queue first.
+    ///
+    /// **Taking it off the queue is the point, not a side effect.** Leaving it
+    /// there and merely copying the text would send it twice — once when the queue
+    /// drains and again when the edit is submitted — which is exactly the bug the
+    /// user would then have to notice. Cancelling a turn already hands queued
+    /// messages back this way (`cancel_turn`), so the input box is the established
+    /// place for a message that has left the queue but not yet been said.
+    ///
+    /// Keyed to the ACTIVE pane, because the queue is the agent's: typing at a
+    /// sub-agent's pane queues on that sub-agent, and Up there must take back what
+    /// was said to it rather than something waiting for the main agent.
+    fn take_queued_into_input(&mut self) -> bool {
+        let key = self.panes.active_pane().id.key();
+        let Some(steer) = self.registry.take_newest_pending(key) else {
+            return false;
+        };
+        // The recalled text is a draft again, so keep the completion popup dormant
+        // over it — the same reason `history_prev` does.
+        self.suppress_completions = true;
+        // `display`, not `sent`: what the user typed, before `@file` mentions were
+        // expanded into it. They get to edit their sentence, not a file dump — and
+        // submitting expands it again.
+        self.editor.set_content(&steer.display);
+        // Drop the pending block right away rather than at the next frame's sync,
+        // so the message is never on screen in two places at once.
+        self.sync_panes();
+        true
     }
 
     /// Move toward newer submissions; past the newest, restore the draft.

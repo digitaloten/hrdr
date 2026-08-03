@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Up on an empty input takes a queued message back to edit.** Submitting while
+  a reply is running queues the message, and until now the only way to change
+  one was to cancel the whole turn. Press Up with the box empty and the newest
+  queued message returns to it, ready to be rewritten and sent again. With
+  nothing queued, Up still recalls history as before, and a half-typed draft in
+  the box browses history rather than raiding the queue.
+
+  The message is **taken off** the queue, not copied off it — otherwise the
+  original would still be delivered when the queue drained and the user would
+  see their message twice, once as first written and once as they meant it. It
+  is keyed to the pane on screen, because the queue belongs to the agent: at a
+  sub-agent's pane, Up takes back what was said to that sub-agent. What comes
+  back is what was typed, before any `@file` mention was expanded into it, so
+  the sentence is editable rather than a file dump; submitting expands it again.
+
 ### Changed
 
 - **Dependencies updated.** Every semver-compatible release, plus the major
