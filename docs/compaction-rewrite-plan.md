@@ -38,6 +38,14 @@ On a long conversation with Anthropic pricing, cached input is a small fraction
 of base rate. hrdr currently pays the full rate exactly when the conversation is
 largest.
 
+**What this does NOT buy: a warm cache after compaction.** `Agent::compact`
+calls `refresh_system_prompt_in_place()` on purpose, so a memory note saved
+during the session is in the rebuilt index rather than only in the history being
+summarized away. That changes the system prompt, and the history is replaced
+wholesale, so the turn AFTER a compaction starts cold whatever we do. The saving
+here is on the compaction request itself — which is a full-history upload,
+repeated per shrink stage — not on the turn that follows it.
+
 ---
 
 ## Settled decisions
@@ -80,6 +88,47 @@ call. Two layers handle it:
    attempt, retried through the existing `RetryBudget`. Executing one would run
    a side effect the user never asked for, at the worst possible moment in a
    session. This behaviour must be documented at the call site, not just here.
+
+### The summary is a distinguished message, not a user turn
+
+**Verified 2026-08-04:** compaction rebuilds history as
+`[system, ChatMessage::user(continuation), ...tail]`, and that continuation is a
+PLAIN user message. Nothing marks it apart from something the user typed — only
+the prose opening _"This session is being continued from an earlier
+conversation…"_. Two consequences, both live today:
+
+- **The lossy chain.** `compaction_tail_start` treats every `Role::User` message
+  as a turn boundary, so once the summary is old enough to fall in the head, the
+  next compaction summarizes it again — a summary of a summary, degrading
+  silently with nothing erroring.
+- **It steals a tail slot.** Counting as a turn boundary means that with
+  `compaction_tail_turns = 2`, the summary itself occupies one of the two turns
+  kept verbatim. Immediately after a compaction the "recent tail" is the summary
+  plus ONE real turn — halving the working state that was the whole reason for
+  preferring whole turns over codex's user-messages-only rebuild.
+
+The fix uses a seam hrdr already has: `MessageOrigin` distinguishes `User` from
+`Steering` from `BackgroundResult` — the same shape of problem, a message that
+is structurally a user turn without being the user speaking. Add a `Summary`
+variant, then:
+
+1. **Never a turn boundary.** `compaction_tail_start` skips it when counting
+   turns, so the tail keeps two REAL turns.
+2. **Replace, never re-summarize.** Pull any existing summary out of the head
+   and hand its text to the summarizer as prior context — fold it into the new
+   one — then emit a single summary that supersedes it. **Invariant: exactly one
+   summary in history at any time, always covering the session start through the
+   tail.** Stronger than codex, which keeps user messages verbatim but has no
+   equivalent guarantee against summary-of-summary.
+3. **It carries the reason.** Work item 2 lands here naturally: the tagged
+   message holds the `CompactionReason`, so provenance survives into the
+   transcript and across a resume.
+
+**Prerequisite to verify before building this:** that `MessageOrigin`
+round-trips through session serialization. If it does not, a resumed session
+loses the tag, the summary reverts to an ordinary user message, and the chain
+returns — silently, and only on resumed sessions, which is the worst way to find
+out.
 
 ### Keep hrdr's whole-turn tail
 
@@ -145,30 +194,23 @@ so it does not pay for doomed uploads. That stays too.
 
 ## Open questions
 
-Ranked. (1) is the only one that can change the design's shape.
+Ranked. Question 1 (what a second compaction does to an existing summary) was
+**answered on 2026-08-04** — see
+[The summary is a distinguished message](#the-summary-is-a-distinguished-message-not-a-user-turn)
+above. It is now a design decision rather than an unknown, and it turned out to
+have a second consequence nobody had predicted (the stolen tail slot).
 
-1. **What does the SECOND compaction do to an existing summary?** — the blocker.
-   Codex has `is_summary_message()` and
-   `insert_initial_context_before_last_real_user_or_summary()`, so it clearly
-   distinguishes an existing summary from ordinary history. hrdr's behaviour is
-   **unverified**: after compaction the history is `[system, summary, tail…]`,
-   and if the next compaction folds that summary back into the head, a long
-   session degrades silently — a summary of a summary of a summary, with nothing
-   erroring. This decides whether the summary is an ordinary message or a
-   distinguished one that later compactions must preserve or replace. Cheap to
-   answer on our side: read what `Agent::compact` leaves behind and what the
-   next call does with it.
-2. **`InitialContextInjection`.** Codex re-injects something after a history
+1. **`InitialContextInjection`.** Codex re-injects something after a history
    wipe and suppresses it on the model-switch paths (`DoNotInject`), via
    `build_compaction_initial_context()`. hrdr rebuilds its system sections on
    every request so it may get this for free — **that is an assumption, not a
    finding.**
-3. **Nothing can measure the win.** The entire case for item 1 is cache
+2. **Nothing can measure the win.** The entire case for item 1 is cache
    economics, and hrdr has no prompt-size introspection (a standing backlog
    gap), so it would ship on argument alone. This is the "change of MECHANISM"
    case: the code compiles and passes identically whether the cache hits or not.
    Wants a cached-vs-uncached input token figure before and after.
-4. **Sub-agents and `/compact`.** A delegated agent's history is one long turn
+3. **Sub-agents and `/compact`.** A delegated agent's history is one long turn
    with no second `role:"user"` message — `mega_turn_tail_start` exists for
    exactly that shape — and must keep working. `/compact`'s optional steering
    instructions need a home in the new in-place request.
