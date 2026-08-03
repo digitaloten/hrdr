@@ -268,6 +268,42 @@ so it does not pay for doomed uploads. That stays too.
 
 ---
 
+## Item 0 — rename `MessageOrigin::BackgroundResult` to `Tool`
+
+**Do this first, before anything else in this plan.** Decided 2026-08-04 by the
+owner. Every other item in here touches `MessageOrigin`; renaming afterwards
+would mean rewriting code and tests written against the old name, so it goes
+ahead of them.
+
+Two reasons, both good: the variant only ever describes a message that came back
+from a **tool call**, so `Tool` is what it actually means — "background" was
+describing how the task ran, which is irrelevant to what the message IS; and it
+keeps the enum single-word throughout (`User`, `Steering`, `Nudge`, `Tool`, and
+the `Summary` this plan adds).
+
+**Note the adjacency, and that it is correct rather than confusing:** hrdr also
+has `Role::Tool`. A tool RESULT is `Role::Tool`; a delegated agent's report
+delivered back into the conversation is `Role::User` carrying
+`MessageOrigin::Tool` — a user-role message whose content is tool product. That
+pairing is exactly the distinction the origin marker exists to express, and the
+turn-boundary rule below reads correctly with it: `Role::User` +
+`MessageOrigin::Tool` is not a turn.
+
+**Decide before doing it: the serialized name changes.** `persisted_messages`
+writes `origin` into session files whenever it differs from `User`, so sessions
+that already contain one of these carry the OLD variant name on disk. After the
+rename, deserializing one is an unknown-variant error — which fails the whole
+session load, not just that message.
+
+The standing rule is **no migration or back-compat fallback before 1.0** — clean
+breaks, delete old-format code when found — so the default answer is to accept
+it. But note the blast radius is different from a config key: these are session
+files the owner may be actively resuming, and the failure is a load error rather
+than a warning. The one-line alternative, if that is judged too sharp, is a
+serde alias on the variant; that is a back-compat affordance and the rule points
+away from it. **Owner's call, and worth making deliberately rather than
+discovering on the next resume.**
+
 ## Live defect, independent of the rewrite
 
 **Turn-boundary selection is blind to `MessageOrigin`, so synthetic messages eat
@@ -305,8 +341,7 @@ turn?"_.
 is the user speaking, just mid-turn — and a steer arriving from the MAIN AGENT
 is no different, because the main agent is acting on the user's behalf. A
 sub-agent treats both identically and nothing should distinguish them. `Nudge`,
-`BackgroundResult` and `Summary` are the harness talking to itself and are not
-turns.
+`Tool` and `Summary` are the harness talking to itself and are not turns.
 
 **Also decided: main and sub-agent compaction stay ONE code path.** They must
 not be allowed to drift. Note this is already true — `mega_turn_tail_start` is a
