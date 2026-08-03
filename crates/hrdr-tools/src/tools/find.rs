@@ -46,8 +46,8 @@ impl Tool for FindTool {
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Glob pattern, e.g. 'src/**/*.rs'."},
-                "hidden": {"type": "boolean", "description": "Also match hidden files/dirs (dotfiles). Skipped by default (default false)."},
-                "no_ignore": {"type": "boolean", "description": "Also match .gitignore'd files. Skipped by default (default false)."}
+                "hidden": {"type": "boolean", "default": false, "description": "Also match hidden files/dirs (dotfiles). Skipped by default (default false)."},
+                "no_ignore": {"type": "boolean", "default": false, "description": "Also match .gitignore'd files. Skipped by default (default false)."}
             },
             "required": ["pattern"]
         })

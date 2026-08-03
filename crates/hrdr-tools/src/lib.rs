@@ -1339,6 +1339,72 @@ pub trait Tool: Send + Sync {
     /// result, not propagated as a hard failure — the agent keeps going.
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String>;
 
+    /// Defaults this tool can only know at RUN time, as `{name: value}`.
+    ///
+    /// Most defaults are constants and belong in the schema as `"default"`, where
+    /// [`Self::recorded_args`] picks them up and the model sees them too. This is
+    /// for the ones that depend on the call: `task`'s `cwd` is the delegating
+    /// agent's directory, its `model` is whatever the named profile resolves to.
+    /// A value returned here wins over a schema default for the same key.
+    ///
+    /// `{}` is the honest answer for a tool whose optional arguments are all
+    /// constants — and `every_optional_argument_records_its_default` fails if a
+    /// tool leaves an optional argument covered by neither route.
+    fn dynamic_arg_defaults(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> serde_json::Value {
+        serde_json::json!({})
+    }
+
+    /// `args` as the transcript should RECORD them: every optional value this
+    /// call will actually use, filled in.
+    ///
+    /// A tool call is stored, and read back months later out of a session file.
+    /// Recording only what the model typed means the reader has to know what the
+    /// defaults were *at the time* to know what ran — and the moment a default
+    /// changes, every old session silently starts describing itself with the new
+    /// value. Freezing the values into the record is what makes an old session
+    /// still true.
+    ///
+    /// A key already present is never overwritten — except when it is `null` or a
+    /// blank string, which is how models spell "I am not passing this" and which
+    /// every optional argument here already treats as absent.
+    fn recorded_args(&self, args: &serde_json::Value, ctx: &ToolContext) -> serde_json::Value {
+        let mut out = match args {
+            serde_json::Value::Object(m) => m.clone(),
+            // A non-object argument has no named parameters to fill.
+            _ => return args.clone(),
+        };
+        let unset = |m: &serde_json::Map<String, serde_json::Value>, k: &str| match m.get(k) {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::String(s)) => s.trim().is_empty(),
+            Some(_) => false,
+        };
+        if let Some(props) = self
+            .timed_parameters()
+            .get("properties")
+            .and_then(|p| p.as_object())
+        {
+            for (key, prop) in props {
+                if let Some(default) = prop.get("default")
+                    && unset(&out, key)
+                {
+                    out.insert(key.clone(), default.clone());
+                }
+            }
+        }
+        if let Some(dynamic) = self.dynamic_arg_defaults(args, ctx).as_object() {
+            for (key, value) in dynamic {
+                if unset(&out, key) {
+                    out.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        serde_json::Value::Object(out)
+    }
+
     fn to_def(&self) -> ToolDef {
         ToolDef::function(self.name(), self.description(), self.timed_parameters())
     }
@@ -1365,6 +1431,10 @@ pub trait Tool: Send + Sync {
             "timeout_secs".to_string(),
             serde_json::json!({
                 "type": "integer",
+                // Declared, not just described: `recorded_args` freezes it into the
+                // transcript so a session read back after the default moves still
+                // says which deadline the call actually ran under.
+                "default": secs,
                 "description": format!(
                     "Seconds to let this call run before it is cut off (default {secs}). \
                      Raise it for something you expect to be slow — a search across a huge \
@@ -1515,6 +1585,20 @@ impl ToolRegistry {
         if self.tools.insert(name, tool).is_none() {
             self.order.push(name);
         }
+    }
+
+    /// The registered tool called `name`, if there is one.
+    pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+        self.tools.get(name)
+    }
+
+    /// Every registered tool, in registration order.
+    pub fn all_tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.order
+            .iter()
+            .filter_map(|n| self.tools.get(n))
+            .cloned()
+            .collect()
     }
 
     /// Tool definitions for the request `tools[]`, in registration order.
@@ -3438,6 +3522,83 @@ b:2:y"
         assert!(
             err.to_string().contains("not a regular file"),
             "expected not-a-file error, got: {err}"
+        );
+    }
+
+    /// Every optional argument of every registered tool declares the value it
+    /// falls back to — so a recorded call says what it ran with, and a session
+    /// read back after a default moves is still true about itself.
+    ///
+    /// The check is over the SCHEMA rather than over any list written here, so
+    /// adding an optional parameter fails this test until its default is declared
+    /// (as `"default"` in the schema, or from [`Tool::dynamic_arg_defaults`] when
+    /// only the call knows it). That is the whole point: an opt-in convention
+    /// nothing enforces is one every new tool silently skips.
+    #[test]
+    fn every_optional_argument_records_its_default() {
+        let ctx = ToolContext::new(PathBuf::from("."));
+        let mut missing: Vec<String> = Vec::new();
+        let registry = ToolRegistry::with_defaults();
+        for tool in registry.all_tools() {
+            let schema = tool.timed_parameters();
+            let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+                continue;
+            };
+            let required: Vec<&str> = schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
+                .unwrap_or_default();
+            // What a call with NO arguments records is exactly the set of
+            // defaults — asserted through the same path production uses, so a
+            // schema default the filler ignores counts as missing.
+            let recorded = tool.recorded_args(&serde_json::json!({}), &ctx);
+            for name in props.keys() {
+                if required.contains(&name.as_str()) {
+                    continue;
+                }
+                if recorded.get(name).is_none() {
+                    missing.push(format!("{}.{name}", tool.name()));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these optional arguments record no default, so a transcript cannot say \
+             what the call ran with: {missing:?}\nDeclare `\"default\"` on the property, \
+             or return it from `dynamic_arg_defaults` when only the call knows it."
+        );
+    }
+
+    /// A value the caller DID pass is never replaced by a default, and the blank
+    /// forms models use for "not passing this" are.
+    #[test]
+    fn recorded_args_fills_only_what_was_left_out() {
+        let ctx = ToolContext::new(PathBuf::from("."));
+        let tool = LsTool;
+
+        let given = tool.recorded_args(&serde_json::json!({"path": "src"}), &ctx);
+        assert_eq!(given.get("path").unwrap(), "src", "a given value stands");
+
+        for blank in [
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::json!(null),
+        ] {
+            let filled = tool.recorded_args(&serde_json::json!({"path": blank}), &ctx);
+            assert_eq!(
+                filled.get("path").unwrap(),
+                ".",
+                "a blank argument is not a value: it is how a model says it passed none"
+            );
+        }
+
+        // The universal one is filled like any other.
+        let filled = tool.recorded_args(&serde_json::json!({}), &ctx);
+        assert_eq!(
+            filled.get("timeout_secs").unwrap(),
+            &serde_json::json!(DEFAULT_TOOL_TIMEOUT_SECS),
+            "the deadline the call actually ran under is part of the record"
         );
     }
 }

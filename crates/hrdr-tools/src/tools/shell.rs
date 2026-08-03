@@ -264,6 +264,7 @@ fn shell_parameters(command_desc: &str) -> serde_json::Value {
             "command": {"type": "string", "description": command_desc},
             "timeout_secs": {
                 "type": "integer",
+                "default": crate::DEFAULT_TOOL_TIMEOUT_SECS,
                 "description": "How long to let the command run, in seconds. \
                                 Default 300 (5 minutes). Raise it for something you \
                                 expect to be slow — a cold build, a full test suite, a \
@@ -272,6 +273,7 @@ fn shell_parameters(command_desc: &str) -> serde_json::Value {
             },
             "keep_ansi": {
                 "type": "boolean",
+                "default": false,
                 "description": "Keep ANSI escape sequences (colour, cursor moves) in \
                                 the output instead of stripping them. Default false: \
                                 output normally reaches you as a terminal would show \

@@ -121,7 +121,7 @@ impl Tool for EditTool {
                 "path": {"type": "string", "description": "File to edit, absolute or relative to cwd."},
                 "old_string": {"type": "string", "description": "Exact text to replace (include surrounding context to make it unique)."},
                 "new_string": {"type": "string", "description": "Replacement text."},
-                "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)."}
+                "replace_all": {"type": "boolean", "default": false, "description": "Replace every occurrence (default false)."}
             },
             "required": ["path", "old_string", "new_string"]
         })

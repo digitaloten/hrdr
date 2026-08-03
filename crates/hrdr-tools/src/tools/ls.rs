@@ -39,7 +39,7 @@ impl Tool for LsTool {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Directory to list (default: cwd)."}
+                "path": {"type": "string", "default": ".", "description": "Directory to list (default: cwd)."}
             }
         })
     }

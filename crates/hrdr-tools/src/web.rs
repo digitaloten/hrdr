@@ -192,6 +192,17 @@ impl Tool for WebFetchTool {
         true
     }
 
+    /// `max_chars` falls back to this call's output cap, which is a property of
+    /// the context rather than a constant — so it cannot be declared in the
+    /// schema, and this is the route that exists for exactly that.
+    fn dynamic_arg_defaults(
+        &self,
+        _args: &serde_json::Value,
+        ctx: &ToolContext,
+    ) -> serde_json::Value {
+        serde_json::json!({ "max_chars": ctx.max_output })
+    }
+
     fn read_only(&self) -> bool {
         true
     }
@@ -287,6 +298,13 @@ struct SearchArgs {
     max_results: Option<usize>,
 }
 
+/// Results `search` returns when the call does not say — named so the schema
+/// default and the code that applies it are one value, not two that can drift.
+const DEFAULT_SEARCH_RESULTS: usize = 5;
+
+/// Ceiling on `max_results`, whatever the call asks for.
+const MAX_SEARCH_RESULTS: usize = 10;
+
 #[async_trait]
 impl Tool for WebSearchTool {
     /// Already wrapped by `execute` — see [`Tool::wraps_own_output`] for why this
@@ -313,6 +331,7 @@ impl Tool for WebSearchTool {
                 "query": { "type": "string", "description": "Search query." },
                 "max_results": {
                     "type": "integer",
+                    "default": DEFAULT_SEARCH_RESULTS,
                     "description": "Number of results to return (default 5, max 10)."
                 }
             },
@@ -326,7 +345,10 @@ impl Tool for WebSearchTool {
         if query.is_empty() {
             bail!("query must not be empty");
         }
-        let n = args.max_results.unwrap_or(5).clamp(1, 10);
+        let n = args
+            .max_results
+            .unwrap_or(DEFAULT_SEARCH_RESULTS)
+            .clamp(1, MAX_SEARCH_RESULTS);
 
         let results = if let Ok(base) = std::env::var("SEARXNG_URL") {
             searxng_search(&base, query, n).await?

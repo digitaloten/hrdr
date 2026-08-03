@@ -122,14 +122,14 @@ impl Tool for GrepTool {
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Pattern to search for — a regex by default, or a fixed string when `literal` is set."},
-                "path": {"type": "string", "description": "File or directory to search (default cwd)."},
-                "glob": {"type": "string", "description": "Glob to filter files, e.g. '*.rs'."},
-                "context": {"type": "integer", "description": "Lines of surrounding context per match, 0-10 (default 0; 2-3 is usually enough)."},
-                "multiline": {"type": "boolean", "description": "Allow regex matches to span line boundaries (default false)."},
-                "hidden": {"type": "boolean", "description": "Also search hidden files/dirs (dotfiles). Skipped by default (default false)."},
-                "no_ignore": {"type": "boolean", "description": "Also search .gitignore'd files. Skipped by default (default false)."},
-                "literal": {"type": "boolean", "description": "Treat `pattern` as a fixed string, not a regex — use for patterns like 'foo(bar)', 'a.b', '$var' (default false)."},
-                "case_insensitive": {"type": "boolean", "description": "Case-insensitive match (default false)."}
+                "path": {"type": "string", "default": ".", "description": "File or directory to search (default cwd)."},
+                "glob": {"type": "string", "default": null, "description": "Glob to filter files, e.g. '*.rs'."},
+                "context": {"type": "integer", "default": 0, "description": "Lines of surrounding context per match, 0-10 (default 0; 2-3 is usually enough)."},
+                "multiline": {"type": "boolean", "default": false, "description": "Allow regex matches to span line boundaries (default false)."},
+                "hidden": {"type": "boolean", "default": false, "description": "Also search hidden files/dirs (dotfiles). Skipped by default (default false)."},
+                "no_ignore": {"type": "boolean", "default": false, "description": "Also search .gitignore'd files. Skipped by default (default false)."},
+                "literal": {"type": "boolean", "default": false, "description": "Treat `pattern` as a fixed string, not a regex — use for patterns like 'foo(bar)', 'a.b', '$var' (default false)."},
+                "case_insensitive": {"type": "boolean", "default": false, "description": "Case-insensitive match (default false)."}
             },
             "required": ["pattern"]
         })

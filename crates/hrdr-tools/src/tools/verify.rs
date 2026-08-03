@@ -87,6 +87,7 @@ impl Tool for VerifyTool {
             "properties": {
                 "timeout_secs": {
                     "type": "integer",
+                    "default": DEFAULT_VERIFY_TIMEOUT_SECS,
                     "description": format!(
                         "Optional deadline in seconds for EACH gate command (default {DEFAULT_VERIFY_TIMEOUT_SECS}). \
                          Raise it for a slow suite. A value below the default is raised back to it — \

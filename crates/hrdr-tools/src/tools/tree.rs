@@ -71,18 +71,22 @@ impl Tool for TreeTool {
             "properties": {
                 "path": {
                     "type": "string",
+                    "default": ".",
                     "description": "Directory to tree (default: cwd)."
                 },
                 "max_depth": {
                     "type": "integer",
+                    "default": default_max_depth(),
                     "description": "Max directory depth (default 3, max 10)."
                 },
                 "max_entries": {
                     "type": "integer",
+                    "default": default_max_entries(),
                     "description": "Max entries shown per directory before summarizing the rest (default 200)."
                 },
                 "hidden": {
                     "type": "boolean",
+                    "default": false,
                     "description": "Also show hidden files/dirs (dotfiles). Skipped by default (default false)."
                 }
             }

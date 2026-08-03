@@ -104,10 +104,10 @@ impl Tool for ReplaceTool {
             "properties": {
                 "pattern": {"type": "string", "description": "Text to match — same matching shape as `grep`: a regex unless `literal` is true. Set `literal` for exact text containing `.` `(` `*` etc."},
                 "replace": {"type": "string", "description": "Replacement text. May use $1/$2 capture groups unless `literal` is true; brace them (${1}) when a letter, digit or underscore follows, or the group name swallows it. With `literal`, it is inserted verbatim ($1 stays $1)."},
-                "glob": {"type": "string", "description": "Only files matching this glob, e.g. \"src/**/*.rs\"."},
-                "path": {"type": "string", "description": "Directory to search under. Defaults to the working directory."},
-                "literal": {"type": "boolean", "description": "Treat `pattern` as a fixed string, not a regex — use for exact text like 'foo(bar)', 'a.b', '$var'. Also disables $1 expansion in `replace`. Default false."},
-                "dry_run": {"type": "boolean", "description": "Report the diff without writing. Default false."}
+                "glob": {"type": "string", "default": null, "description": "Only files matching this glob, e.g. \"src/**/*.rs\"."},
+                "path": {"type": "string", "default": ".", "description": "Directory to search under. Defaults to the working directory."},
+                "literal": {"type": "boolean", "default": false, "description": "Treat `pattern` as a fixed string, not a regex — use for exact text like 'foo(bar)', 'a.b', '$var'. Also disables $1 expansion in `replace`. Default false."},
+                "dry_run": {"type": "boolean", "default": false, "description": "Report the diff without writing. Default false."}
             },
             "required": ["pattern", "replace"]
         })

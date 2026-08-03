@@ -1138,10 +1138,57 @@ impl SubagentTool {
     }
 }
 
+impl SubagentTool {
+    /// The model a call naming `profile` (or naming none) will actually run on,
+    /// as the spec a reader can look up.
+    ///
+    /// Same precedence the call itself applies: the named profile's model, then
+    /// the configured sub-agent model, then the agent's own.
+    fn resolved_model_for(&self, profile: Option<&str>) -> String {
+        let named = profile.filter(|p| !p.is_empty()).and_then(|p| {
+            self.profiles
+                .iter()
+                .find(|candidate| candidate.name == p)
+                .and_then(|candidate| candidate.model.as_ref())
+        });
+        named
+            .or(self.base.subagent_model.as_ref())
+            .map(|spec| spec.to_string())
+            .unwrap_or_else(|| self.base.model.to_string())
+    }
+}
+
 #[async_trait::async_trait]
 impl hrdr_tools::Tool for SubagentTool {
     fn name(&self) -> &'static str {
         "task"
+    }
+
+    /// `cwd` and `model` are the reason this route exists: neither is a constant,
+    /// so neither can be declared in the schema.
+    ///
+    /// `cwd` defaults to the delegating agent's own directory, which is a property
+    /// of the call. `model` resolves through the named profile, then the
+    /// configured sub-agent model, then the parent's — a chain whose answer is
+    /// only known once the call names its profile, which is why this takes `args`.
+    /// Recording the resolved value is what lets a session read back next year say
+    /// which model actually ran, rather than which model that name means today.
+    fn dynamic_arg_defaults(
+        &self,
+        args: &serde_json::Value,
+        ctx: &hrdr_tools::ToolContext,
+    ) -> serde_json::Value {
+        let mut out = serde_json::Map::new();
+        out.insert(
+            "cwd".to_string(),
+            serde_json::json!(ctx.cwd.display().to_string()),
+        );
+        let profile = args.get("agent").and_then(|v| v.as_str()).map(str::trim);
+        out.insert(
+            "model".to_string(),
+            serde_json::json!(self.resolved_model_for(profile)),
+        );
+        serde_json::Value::Object(out)
     }
 
     fn description(&self) -> &'static str {
@@ -2244,5 +2291,84 @@ mod scoped_cwd_tests {
             .to_string();
         assert!(err.contains("does not exist"), "{err}");
         assert!(err.contains("your own working directory"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod recorded_default_tests {
+    use super::*;
+
+    /// A `task` tool whose agent runs on `model`, built the way the agent builds
+    /// one — no defaults invented here that production would not use.
+    fn task_tool(model: &str) -> SubagentTool {
+        let base = crate::config::AgentConfig {
+            model: model.parse().expect("a model ref"),
+            ..Default::default()
+        };
+        let runtime =
+            crate::new_delegation_runtime(&base, &crate::ResolvedModel::from_config(&base));
+        SubagentTool::new(
+            base,
+            runtime,
+            Vec::new(),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(std::sync::Mutex::new(0.0f64)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+            None,
+            AgentRegistry::new(),
+        )
+    }
+
+    /// A `task` call that names neither `cwd` nor `model` records both — the
+    /// directory it ran in and the model it resolved to.
+    ///
+    /// The reason it is recorded rather than resolved at display time: a session
+    /// file read back next year must say which model actually answered, not which
+    /// model that profile name happens to mean by then.
+    #[test]
+    fn a_task_call_records_the_cwd_and_model_it_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = task_tool("openai://gpt-main");
+        let ctx = hrdr_tools::ToolContext::new(dir.path().to_path_buf());
+
+        let recorded = hrdr_tools::Tool::recorded_args(
+            &tool,
+            &serde_json::json!({"prompt": "do the thing"}),
+            &ctx,
+        );
+
+        assert_eq!(
+            recorded.get("cwd").and_then(|v| v.as_str()),
+            Some(dir.path().display().to_string().as_str()),
+            "the directory the sub-agent actually ran in: {recorded}"
+        );
+        assert_eq!(
+            recorded.get("model").and_then(|v| v.as_str()),
+            Some("openai://gpt-main"),
+            "the model the chain actually resolved to: {recorded}"
+        );
+        assert_eq!(
+            recorded.get("prompt").and_then(|v| v.as_str()),
+            Some("do the thing"),
+            "and what the caller did pass is untouched"
+        );
+    }
+
+    /// A value the caller gave is recorded as given — this freezes defaults, it
+    /// does not overwrite arguments.
+    #[test]
+    fn a_given_cwd_and_model_are_recorded_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = task_tool("openai://gpt-main");
+        let ctx = hrdr_tools::ToolContext::new(dir.path().to_path_buf());
+
+        let recorded = hrdr_tools::Tool::recorded_args(
+            &tool,
+            &serde_json::json!({"prompt": "x", "cwd": "vendor/dep", "model": "local://tiny"}),
+            &ctx,
+        );
+        assert_eq!(recorded.get("cwd").unwrap(), "vendor/dep");
+        assert_eq!(recorded.get("model").unwrap(), "local://tiny");
     }
 }

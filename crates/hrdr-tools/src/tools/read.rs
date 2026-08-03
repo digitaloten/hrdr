@@ -81,9 +81,9 @@ impl Tool for ReadTool {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path, absolute or relative to cwd."},
-                "offset": {"type": "integer", "description": "1-based line to start at (default 1)."},
-                "limit": {"type": "integer", "description": "Max lines to return (default 2000)."},
-                "full": {"type": "boolean", "description": "Read the entire file with NO line clipping and NO output-size cap (ignores offset/limit); returns the whole file, bounded only by the 50 MB load cap. Use it to fully read a file — large, or with a very long line — so a subsequent `write` rewrite is accepted. Costs more tokens. Default false."}
+                "offset": {"type": "integer", "default": 1, "description": "1-based line to start at (default 1)."},
+                "limit": {"type": "integer", "default": DEFAULT_READ_LIMIT, "description": "Max lines to return (default 2000)."},
+                "full": {"type": "boolean", "default": false, "description": "Read the entire file with NO line clipping and NO output-size cap (ignores offset/limit); returns the whole file, bounded only by the 50 MB load cap. Use it to fully read a file — large, or with a very long line — so a subsequent `write` rewrite is accepted. Costs more tokens. Default false."}
             },
             "required": ["path"]
         })

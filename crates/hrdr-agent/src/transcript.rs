@@ -364,11 +364,7 @@ pub fn tool_display(name: &str, args: &str) -> ToolDisplay {
             };
             plain(format!("{sub}{args_str}"))
         }
-        "task" => ToolDisplay {
-            headline: String::new(),
-            body: ToolBody::Details(task_arg_details(&v)),
-        },
-        // Every MCP tool: its arguments, one per row.
+        // `task` and every MCP tool: their arguments, one per row.
         _ => ToolDisplay {
             headline: String::new(),
             body: ToolBody::Details(arg_details(&v)),
@@ -402,43 +398,6 @@ fn arg_details(v: &serde_json::Value) -> Vec<(String, String)> {
             .collect(),
         serde_json::Value::Null => Vec::new(),
         other => vec![(String::new(), detail_value(other))],
-    }
-}
-
-/// `task`'s optional arguments — the ones a blank value means "use the default"
-/// for, rather than "set this to nothing".
-const TASK_DEFAULTED_ARGS: [&str; 2] = ["cwd", "model"];
-
-/// `task`'s arguments as rows, minus the optional ones left to their defaults.
-///
-/// Models routinely send `""` (or `null`) for an optional parameter they do not
-/// want, and `task` reads both exactly as absent: `cwd` falls back to the
-/// delegating agent's directory, `model` to the configured sub-agent model. The
-/// generic renderer showed those as a key with nothing beside it, which reads as
-/// a bug — an argument that was set, to nothing — when the truth is that the call
-/// did not set them at all. The model it actually ran on is on the
-/// `↳ delegated to …` line under the block.
-///
-/// Deliberately scoped to `task` and to these two keys rather than dropping every
-/// empty argument everywhere. `replace` renders through the generic path, and an
-/// empty `new_string` there is the entire point of the call — it deletes what it
-/// matched — so a blanket rule would hide a real edit.
-fn task_arg_details(v: &serde_json::Value) -> Vec<(String, String)> {
-    let defaulted = |k: &str, val: &serde_json::Value| {
-        TASK_DEFAULTED_ARGS.contains(&k)
-            && match val {
-                serde_json::Value::Null => true,
-                serde_json::Value::String(s) => s.trim().is_empty(),
-                _ => false,
-            }
-    };
-    match v {
-        serde_json::Value::Object(map) => map
-            .iter()
-            .filter(|(k, val)| !defaulted(k, val))
-            .map(|(k, val)| (k.clone(), detail_value(val)))
-            .collect(),
-        other => arg_details(other),
     }
 }
 
@@ -859,66 +818,6 @@ mod tool_display_tests {
         // offset 1 is the default — not worth the noise.
         let d = tool_display("read", r#"{"path":"x.rs","offset":1}"#);
         assert_eq!(d.headline, "x.rs");
-    }
-
-    /// A `task` call that leaves `cwd`/`model` to their defaults shows neither.
-    ///
-    /// Models send `""` for an optional parameter they do not want, and `task`
-    /// reads that as absent. Rendering the key with nothing beside it reads as a
-    /// bug — an argument set to nothing — rather than as a default in force.
-    #[test]
-    fn task_omits_optional_args_left_to_their_defaults() {
-        let d = tool_display(
-            "task",
-            r#"{"agent":"review","cwd":"","description":"Review it","model":"","prompt":"go","timeout_secs":300}"#,
-        );
-        assert_eq!(
-            d.body,
-            ToolBody::Details(vec![
-                ("agent".into(), "review".into()),
-                ("description".into(), "Review it".into()),
-                ("prompt".into(), "go".into()),
-                ("timeout_secs".into(), "300".into()),
-            ]),
-            "no empty cwd/model rows, and everything actually passed still shows"
-        );
-
-        // `null` is the same statement as `""`, and whitespace is not a directory.
-        let d = tool_display("task", r#"{"cwd":null,"model":"   ","prompt":"go"}"#);
-        assert_eq!(
-            d.body,
-            ToolBody::Details(vec![("prompt".into(), "go".into())])
-        );
-
-        // Given values are still shown — this hides defaults, not arguments.
-        let d = tool_display("task", r#"{"cwd":"vendor/dep","model":"openai://gpt-5.6"}"#);
-        assert_eq!(
-            d.body,
-            ToolBody::Details(vec![
-                ("cwd".into(), "vendor/dep".into()),
-                ("model".into(), "openai://gpt-5.6".into()),
-            ])
-        );
-    }
-
-    /// The omission is `task`'s alone. `replace` renders through the generic path,
-    /// where an empty `new_string` is the whole point of the call — it deletes what
-    /// it matched — so that row must survive.
-    #[test]
-    fn an_empty_replacement_still_shows_on_replace() {
-        let d = tool_display(
-            "replace",
-            r#"{"pattern":"old","new_string":"","path":"a.rs"}"#,
-        );
-        assert_eq!(
-            d.body,
-            ToolBody::Details(vec![
-                ("new_string".into(), String::new()),
-                ("path".into(), "a.rs".into()),
-                ("pattern".into(), "old".into()),
-            ]),
-            "an empty replacement is a deletion, not an unset argument"
-        );
     }
 
     #[test]

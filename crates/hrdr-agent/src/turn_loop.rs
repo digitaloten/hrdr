@@ -1067,10 +1067,23 @@ impl Agent {
             tokio::sync::mpsc::channel::<(String, String)>(UI_STREAM_CAP);
         let mut futs = Vec::with_capacity(batch.len());
         for call in batch {
+            // Record the arguments the call will RUN with, not the ones it was
+            // typed with: every optional value the tool falls back to is frozen in
+            // here, so a session read back after a default changes still describes
+            // what actually happened. Unparseable arguments are passed through —
+            // the tool is about to reject them, and the record should show what it
+            // was given.
+            let recorded = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                .ok()
+                .and_then(|parsed| {
+                    let tool = self.tools.get(&call.function.name)?;
+                    serde_json::to_string(&tool.recorded_args(&parsed, &self.ctx)).ok()
+                })
+                .unwrap_or_else(|| call.function.arguments.clone());
             on_event(AgentEvent::ToolStart {
                 id: call.id.clone(),
                 name: call.function.name.clone(),
-                args: call.function.arguments.clone(),
+                args: recorded,
             });
             let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(UI_STREAM_CAP);
             let fwd_tx = shared_tx.clone();
