@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependencies updated.** Every semver-compatible release, plus the major
+  bumps that carried no behaviour change: `base64` 0.23, `sha2` 0.11, `similar`
+  3, `toml` 1, `toml_edit` 0.25 and `which` 8. Four majors were held back on
+  purpose — `hjkl` 0.40 (an engine/view architecture change), `reqwest` 0.13
+  (moves TLS roots from bundled to the system trust store, which static musl
+  builds cannot rely on), `ctor` 1.0 (needs the separate `dtor` crate) and
+  `windows-sys` 0.61 (`HANDLE` became a pointer, and none of it compiles off
+  Windows). `docs/backlog.md` records what each attempt showed.
+
 ## [0.11.1] - 2026-08-03
 
 ### Added

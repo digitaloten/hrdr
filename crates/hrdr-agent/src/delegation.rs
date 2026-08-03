@@ -1516,7 +1516,9 @@ pub(crate) fn workspace_map(root: &std::path::Path) -> Option<String> {
 /// is no root manifest or no `[workspace]` in it.
 fn workspace_members(root: &std::path::Path) -> Option<Vec<String>> {
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
-    let doc: toml::Value = manifest.parse().ok()?;
+    // `Table`, not `Value` — a `Value`'s `FromStr` parses one value since toml 1.0,
+    // so a manifest fails to parse and the sub-agent silently loses its crate paths.
+    let doc: toml::Table = manifest.parse().ok()?;
     let members = doc.get("workspace")?.get("members")?.as_array()?;
     let mut out: Vec<String> = Vec::new();
     for pattern in members.iter().filter_map(|m| m.as_str()) {

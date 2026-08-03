@@ -20,7 +20,7 @@ similar.workspace = true
 reqwest.workspace = true
 async-trait = "0.1"
 futures-util = { workspace = true }
-which = "7"
+which = "8"
 # Randomizes the per-session scratch-dir name (src/sandbox.rs) so a recycled
 # pid cannot land on a directory another local user created first.
 rand.workspace = true

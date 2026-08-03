@@ -80,6 +80,58 @@ Conventions:
 
 ---
 
+## Dependency upgrades held back, 2026-08-03
+
+A `cargo update` sweep took every compatible release and the major bumps that
+were safe (`base64` 0.23, `sha2` 0.11, `similar` 3, `toml` 1, `toml_edit` 0.25,
+`which` 8). Four majors were deliberately NOT taken. Each was tried, and the
+reason below is what the attempt showed — not a guess about what it might do.
+
+- **`hjkl` 0.33 → 0.40 is an architecture migration, not a bump.** 23 compile
+  errors in `hrdr-editor` alone, all cascading from one root cause:
+  `hjkl_buffer::Buffer` no longer implements `hjkl_engine::View`, and that trait
+  is now sealed (`View: Cursor + Query + BufferEdit + Search + sealed::Sealed`),
+  so nothing outside the engine can implement it. hjkl-buffer 0.40 has its own
+  separate `View` type (`buffer.rs`), with the viewport moved onto the engine
+  `Host` adapter — so `Editor<Buffer, HrdrHost>` is the wrong shape now, not a
+  renamed one. `BufferView` also gained `background`, `cursor_column` and
+  `search_ranges`. Doing this properly means understanding the new
+  engine/host/view split and re-verifying the whole TUI input and rendering
+  surface; it is its own task, and `hrdr-tui` was never reached because
+  `hrdr-editor` failed first.
+- **`reqwest` 0.12 → 0.13 changes where TLS roots come from.** It compiles once
+  `rustls-tls` is renamed to `rustls`, and that is the trap: 0.12's `rustls-tls`
+  resolves to `webpki-roots` (CA roots compiled INTO the binary), while 0.13's
+  `rustls` pulls `rustls-platform-verifier` → `rustls-native-certs` (the system
+  trust store). Verified both ways with `cargo tree`. hrdr ships static musl
+  tarballs and an Alpine `.apk`; in a scratch or distroless container there is
+  no system cert store, so every provider request would fail TLS while the build
+  stayed green. Take this only with a decided answer on root certs, and test it
+  in a container with no `/etc/ssl/certs`.
+- **`ctor` 0.6 → 1.0 needs a new dependency.** 1.0 removed `#[ctor::dtor]` — it
+  lives in a separate `dtor` crate now — and requires `#[ctor(unsafe)]` at every
+  `#[ctor]` site. `hrdr-test-support`'s `remove_sandbox` dtor is what keeps the
+  suite from leaving a sandbox dir per test binary in `/tmp`, so it cannot just
+  be dropped. Adding `dtor` is a manifest decision for the owner, which is why
+  this stopped here rather than proceeding.
+- **`windows-sys` 0.52 → 0.61 cannot be verified locally.** The crate is
+  `cfg(windows)`-only, so a local build compiles none of it and CI is the only
+  verdict, one full round trip per attempt. At least one break is already
+  visible by reading: `HANDLE` became a pointer in 0.59, so `sandbox.rs`'s
+  `let mut token: HANDLE = 0;` and any `!= 0` comparison have to become
+  `null_mut()`/`is_null()`. That code lowers the process integrity level, so it
+  is the wrong place to write blind and confirm later. Worth doing as its own
+  change, with the CI round trips budgeted.
+
+**What the sweep did catch, worth remembering:** `toml` 1.0 changed `Value`'s
+`FromStr` to parse a single VALUE rather than a document, so
+`text.parse::<toml::Value>()` now fails on any real config with
+`unexpected content, expected nothing`. Both call sites swallowed it with
+`.ok()?` — one of them `provider_alias_collision_error`, a startup refusal that
+would have gone on refusing nothing at all. Parse a `toml::Table` for a
+document. Three existing tests went red and are the only reason this was not
+shipped silently.
+
 ## Owed right now
 
 - **v0.11.0 is not on the AUR.** Every other channel published on 2026-08-03 —

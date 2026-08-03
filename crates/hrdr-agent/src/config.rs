@@ -1193,9 +1193,12 @@ pub fn canonical_providers(
 /// handed it. Now they are the same key — so the config is asking for two different
 /// endpoints under one identity, and the only honest answer is to stop and say so.
 pub fn provider_alias_collision_error(text: &str, path: &std::path::Path) -> Option<String> {
-    let toml::Value::Table(root) = text.parse::<toml::Value>().ok()? else {
-        return None;
-    };
+    // `toml::Table`, not `toml::Value`: since toml 1.0 a `Value`'s `FromStr`
+    // parses a single VALUE, so a whole document fails at the first table header
+    // ("unexpected content, expected nothing"). That failure is silent here — the
+    // `.ok()?` would turn it into "no collision found" and this refusal would stop
+    // refusing anything.
+    let root = text.parse::<toml::Table>().ok()?;
     let providers = root.get("providers")?.as_table()?;
     let mut seen: HashMap<String, String> = HashMap::new();
     let mut names: Vec<&String> = providers.keys().collect();
