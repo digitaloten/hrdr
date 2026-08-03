@@ -124,11 +124,31 @@ variant, then:
    message holds the `CompactionReason`, so provenance survives into the
    transcript and across a resume.
 
-**Prerequisite to verify before building this:** that `MessageOrigin`
-round-trips through session serialization. If it does not, a resumed session
-loses the tag, the summary reverts to an ordinary user message, and the chain
-returns — silently, and only on resumed sessions, which is the worst way to find
-out.
+**Prerequisite — CHECKED 2026-08-04, it passes.** `MessageOrigin` round-trips
+through session serialization, by deliberate mechanism rather than by luck. The
+field carries `#[serde(default, skip_serializing)]`, so the ordinary `Serialize`
+impl never emits it — that is what keeps it off the provider wire, where it is
+not a real field. The session file instead uses
+`#[serde(with = "persisted_messages")]` (`hrdr-agent/src/session.rs`), whose
+serializer re-inserts the internal fields the wire impl drops:
+`reasoning_content`, `anthropic_thinking_blocks`, `responses_reasoning_items`
+and `origin`, commented _"Preserve internal origin marker so real user turns
+stay distinguishable from injected context after a session resume."_
+Deserialization is the plain derive, and `#[serde(default)]` means an older file
+with no `origin` key loads as `User`.
+
+Two things the `Summary` variant must respect:
+
+- **The serializer writes `origin` only when it differs from `User`** — a size
+  optimisation that round-trips correctly precisely because `User` is also the
+  `#[default]`. `Summary != User`, so it is written and read back. But this
+  makes the default load-bearing: **`User` must stay `#[default]`**, or every
+  omitted message silently mislabels on load.
+- **A round-trip test ships with the feature.** Save a session holding a
+  `Summary`-tagged message, load it, assert the tag survived — and prove the
+  test fails when the tag is dropped. Without it, a later change to
+  `persisted_messages` could quietly stop emitting `origin` and nothing would
+  notice until a resumed session began chaining summaries again.
 
 ### Initial context needs nothing from us — but the ORDER might
 
