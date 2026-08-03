@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::capped_read::{MAX_DIAGNOSTIC_BYTES, MAX_LOG_FILE_BYTES, MAX_STRUCTURED_JSON_BYTES};
 use crate::sse::SseDecoder;
-use crate::types::{CacheMode, ChatChunk, ChatMessage, ChatRequest, ToolDef};
+use crate::types::{CacheMode, ChatChunk, ChatMessage, ChatRequest, Role, ToolDef};
 
 /// Wire-level debug log, enabled by `HRDR_LOG_REQUESTS=<path>`: every chat
 /// request body, every raw SSE data line, and every non-2xx response body is
@@ -561,6 +561,13 @@ pub fn url_host(base_url: &str) -> &str {
         .unwrap_or(authority)
 }
 
+/// Whether `base_url` is DeepSeek's own API host — the one endpoint that
+/// requires the assistant's `reasoning_content` to be passed back on
+/// subsequent requests when `tools` is present (400 without it).
+fn is_deepseek(base_url: &str) -> bool {
+    url_host(base_url) == "api.deepseek.com"
+}
+
 /// Detect the wire protocol from `base_url`:
 /// - `api.anthropic.com` → native Anthropic Messages API (unlocks caching).
 /// - `chatgpt.com` with a `/codex/` path → the OpenAI Responses API (the
@@ -656,7 +663,8 @@ pub(crate) fn apply_extra_headers(
 }
 
 impl Client {
-    /// `base_url` should include the `/v1` suffix, e.g. `http://localhost:8080/v1`.
+    /// `base_url` should include the `/v1` suffix where the provider uses one,
+    /// e.g. `http://localhost:8080/v1`.
     pub fn new(
         base_url: impl Into<String>,
         api_key: Option<String>,
@@ -871,7 +879,8 @@ impl Client {
         }
     }
 
-    /// The current endpoint base URL (including the `/v1` suffix).
+    /// The current endpoint base URL (including the `/v1` suffix where the
+    /// provider uses one).
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -1079,6 +1088,33 @@ impl Client {
             && let Some(obj) = json.as_object_mut()
         {
             obj.insert("prompt_cache_key".to_string(), serde_json::json!(key));
+        }
+        // DeepSeek's thinking mode returns chain-of-thought as
+        // `reasoning_content`, and for requests carrying `tools` — always, in
+        // hrdr's agent loop — the API requires each assistant turn's
+        // `reasoning_content` to be passed back on every subsequent request;
+        // omitting it is a 400. `ChatMessage.reasoning_content` is
+        // `skip_serializing` for every other backend, so the graft is the only
+        // route, and it happens here keyed by index off the ORIGINAL messages
+        // (which still hold the field) — DeepSeek's host only, so an
+        // OpenAI-compatible server that rejects unknown message fields sees
+        // the unchanged body.
+        if is_deepseek(&self.base_url)
+            && let Some(messages) = json
+                .get_mut("messages")
+                .and_then(serde_json::Value::as_array_mut)
+        {
+            for (msg, original) in messages.iter_mut().zip(&body.messages) {
+                if original.role == Role::Assistant
+                    && let Some(reasoning) = &original.reasoning_content
+                    && let Some(obj) = msg.as_object_mut()
+                {
+                    obj.insert(
+                        "reasoning_content".to_string(),
+                        serde_json::json!(reasoning),
+                    );
+                }
+            }
         }
         json
     }
@@ -1602,6 +1638,81 @@ mod tests {
         client.set_prompt_cache_key(None);
         let cleared = client.body_json(&client.request(Some(client.model.clone()), &[], &[], true));
         assert!(cleared.get("prompt_cache_key").is_none());
+    }
+
+    /// DeepSeek's thinking mode requires an assistant turn's
+    /// `reasoning_content` back on every subsequent request when `tools` is
+    /// present (hrdr's agent loop always sends tools) — omitting it is a 400.
+    /// The field must be grafted onto assistant messages in a body built for
+    /// `api.deepseek.com` only: `ChatMessage.reasoning_content` is
+    /// `skip_serializing` for exactly that reason, and any other
+    /// OpenAI-compatible server rejecting unknown message fields is the
+    /// failure the pass-back must not reintroduce.
+    #[test]
+    fn reasoning_content_is_grafted_only_for_the_deepseek_host() {
+        // A reasoning assistant turn, an assistant turn with no reasoning, and
+        // a user turn — only the first may grow the field.
+        fn assistant_with_reasoning(content: &str, reasoning: &str) -> ChatMessage {
+            ChatMessage {
+                role: Role::Assistant,
+                content: Some(content.to_string()),
+                reasoning_content: Some(reasoning.to_string()),
+                anthropic_thinking_blocks: vec![],
+                responses_reasoning_items: vec![],
+                origin: Default::default(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }
+        }
+        let messages = vec![
+            assistant_with_reasoning("Let me check that.", "I should verify the docs first."),
+            ChatMessage::assistant("No reasoning here."),
+            ChatMessage::user("ok"),
+        ];
+
+        let deepseek = Client::new("https://api.deepseek.com", None, "deepseek-v4-pro");
+        assert!(is_deepseek(&deepseek.base_url));
+        let body = deepseek.body_json(&deepseek.request(
+            Some(deepseek.model.clone()),
+            &messages,
+            &[],
+            true,
+        ));
+        let msgs = body["messages"].as_array().expect("messages array");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(
+            msgs[0]["reasoning_content"],
+            "I should verify the docs first."
+        );
+        // The graft is additive — the serialized message is otherwise intact.
+        assert_eq!(msgs[0]["content"], "Let me check that.");
+        // No reasoning on the field-less assistant turn or the user turn.
+        assert!(
+            msgs[1].get("reasoning_content").is_none(),
+            "an assistant message with no reasoning must stay bare: {body}"
+        );
+        assert!(
+            msgs[2].get("reasoning_content").is_none(),
+            "a user message must never carry reasoning_content: {body}"
+        );
+
+        // The same request through any other host omits the field entirely.
+        for url in [
+            "https://api.openai.com",
+            "https://openrouter.ai/api/v1",
+            "http://localhost:8080/v1",
+        ] {
+            let other = Client::new(url, None, "deepseek-v4-pro");
+            assert!(!is_deepseek(&other.base_url));
+            let body =
+                other.body_json(&other.request(Some(other.model.clone()), &messages, &[], true));
+            assert!(
+                !body.to_string().contains("reasoning_content"),
+                "{url} must not receive reasoning_content: {body}"
+            );
+        }
     }
 
     /// Every [`UnsupportedParam`](crate::UnsupportedParam) variant actually

@@ -1263,6 +1263,33 @@ mod tests {
         );
         assert!(json.contains("Hello!"));
 
+        // The same holds through the serialized request body, for every host:
+        // `ChatRequest` serializes its messages straight, so no endpoint can
+        // see the field from the struct alone. (DeepSeek is the one exception
+        // to that, and it is grafted later, host-gated, in `Client::body_json`
+        // — client.rs — never here.)
+        let request = ChatRequest {
+            model: Some("deepseek-v4-pro".to_string()),
+            messages: vec![msg.clone(), ChatMessage::user("continue")],
+            tools: vec![],
+            temperature: None,
+            reasoning_effort: Some("high".to_string()),
+            max_tokens: None,
+            max_completion_tokens: None,
+            top_p: None,
+            seed: None,
+            stop: vec![],
+            stream: true,
+            stream_options: None,
+        };
+        let body = serde_json::to_value(&request).unwrap();
+        assert!(
+            !body.to_string().contains("reasoning_content"),
+            "reasoning_content leaked into the request body: {body}"
+        );
+        assert_eq!(body["messages"][0]["role"], "assistant");
+        assert_eq!(body["messages"][0]["content"], "Hello!");
+
         // Deserialization still accepts it (non-streaming / compact responses).
         let parsed: ChatMessage =
             serde_json::from_str(r#"{"role":"assistant","content":"hi","reasoning_content":"x"}"#)
