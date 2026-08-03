@@ -91,6 +91,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   compaction starts cold regardless, since the history is replaced and the
   system prompt rebuilt.
 
+- **The reinjected summary now tells the model what it is reading.** It states
+  the real trigger for the compaction, that the summary is a record of work
+  already done rather than a plan, that work it describes as finished must not
+  be redone, and — where the verbatim tail and the summary describe the same
+  events — that the verbatim messages are authoritative. Previously it opened
+  with "ran out of context" regardless, which is untrue of a `/compact`, and
+  said nothing about precedence.
+
 - **The summary carries its own provenance across a resume.** The trigger
   (`/compact`, filling context, or overflow rescue) is recorded on the summary
   message itself, so a resumed session can still tell a compaction the user

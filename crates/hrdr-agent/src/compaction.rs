@@ -12,9 +12,7 @@
 //! One cache invalidation that summarizes beats several that only defer.
 
 use anyhow::{Result, bail};
-use hrdr_llm::ToolDef;
-
-use hrdr_llm::CompactionReason;
+use hrdr_llm::{CompactionReason, ToolDef};
 
 use crate::{
     Agent, AgentEvent, AgentRegistry, ChatMessage, MessageOrigin, RetryBudget, Role, drain_stream,
@@ -195,6 +193,49 @@ struct CompactionSpend {
     cached_prompt_tokens: Option<u32>,
     output_tokens: u32,
     cost_usd: Option<f64>,
+}
+
+/// The prose that introduces a reinjected summary.
+///
+/// Framing matters more than it looks. The model reading this has no memory of
+/// the conversation the summary describes, so without being told what the text
+/// IS it treats the contents as a plan rather than as a record — and redoes work
+/// that is already finished, which is the characteristic failure of a compacted
+/// agent. Two things it therefore has to say: the summary is a record of work
+/// ALREADY DONE, and where the summary and the verbatim tail disagree the tail
+/// wins.
+///
+/// That last point is load-bearing since the summarization request covers the
+/// whole history rather than just the head: the tail is described by the summary
+/// AND present verbatim, so the model sees the same events twice, at different
+/// levels of detail and possibly with the summary's own inaccuracies.
+///
+/// `reason` opens it honestly — "ran out of context" is simply untrue of a
+/// `/compact` the user chose to run.
+fn continuation_framing(reason: CompactionReason, has_tail: bool) -> String {
+    let opening = match reason {
+        CompactionReason::UserRequested => "This conversation was compacted at the user's request.",
+        CompactionReason::ContextFilling => {
+            "This conversation was compacted because it was filling the context window."
+        }
+        CompactionReason::ContextOverflow => {
+            "This conversation was compacted because it exceeded the context window."
+        }
+    };
+    let tail = if has_tail {
+        " The most recent messages follow it verbatim: where they and the summary describe the \
+         same events, the verbatim messages are authoritative and the summary is the condensed \
+         account."
+    } else {
+        ""
+    };
+    format!(
+        "{opening} The summary below was written by a model reading the full history, and it \
+         REPLACES that history — it is a record of what has already happened, not a plan.{tail} \
+         Work the summary describes as done IS done: continue from where it leaves off, and do \
+         not repeat it. If you need a detail the summary does not carry, read it from the \
+         source rather than assuming."
+    )
 }
 
 /// Max bytes of a tool-result body kept when shrinking a compaction request.
@@ -676,10 +717,8 @@ impl Agent {
         let system = self.messages[0].clone();
         let tail: Vec<ChatMessage> = self.messages[tail_start..].to_vec();
         let continuation = format!(
-            "This session is being continued from an earlier conversation that ran out of \
-             context. The summary below captures the older part of the conversation; the most \
-             recent messages follow it verbatim. Continue from where they leave off without \
-             losing any detail.\n\n{summary}"
+            "{}\n\n{summary}",
+            continuation_framing(reason, !tail.is_empty())
         );
         let mut messages = Vec::with_capacity(2 + tail.len());
         messages.push(system);
@@ -997,6 +1036,42 @@ mod tests {
         let stage3 = compact_stage_history(3, &full, &mut elided);
         assert!(stage2.len() <= stage1.len());
         assert!(stage3.len() <= stage2.len());
+    }
+
+    /// The reinjected summary is framed as a RECORD, and says which of the two
+    /// accounts of the overlapping messages wins.
+    ///
+    /// Without framing, a model with no memory of the conversation reads the
+    /// summary as a plan and redoes finished work — the characteristic failure
+    /// of a compacted agent. And since the summarization request now covers the
+    /// whole history rather than just the head, the tail is described by the
+    /// summary AND present verbatim; the model has to be told which to trust.
+    #[test]
+    fn the_reinjected_summary_is_framed_for_the_model_that_reads_it() {
+        let framed = continuation_framing(CompactionReason::UserRequested, true);
+        assert!(framed.contains("at the user's request"), "{framed}");
+        assert!(
+            framed.contains("record of what has already happened, not a plan"),
+            "{framed}"
+        );
+        assert!(framed.contains("do not repeat it"), "{framed}");
+        assert!(
+            framed.contains("verbatim messages are authoritative"),
+            "the tail wins where the two overlap: {framed}"
+        );
+
+        // No tail kept: there is nothing for the summary to disagree with, so
+        // the precedence sentence would be describing messages that aren't there.
+        let no_tail = continuation_framing(CompactionReason::ContextOverflow, false);
+        assert!(no_tail.contains("exceeded the context window"), "{no_tail}");
+        assert!(!no_tail.contains("verbatim"), "{no_tail}");
+
+        // The opening states the real trigger — "ran out of context" is simply
+        // untrue of a compaction the user chose to run.
+        assert!(
+            continuation_framing(CompactionReason::ContextFilling, true)
+                .contains("filling the context window")
+        );
     }
 
     /// Pre-sizing skips the stages that cannot fit, so a doomed request is never
