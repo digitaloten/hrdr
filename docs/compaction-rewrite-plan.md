@@ -193,6 +193,60 @@ Not revisited without evidence that a provider we care about behaves worse with
 summary-first — and note that adopting codex's order would mean betting the
 layout on one vendor's post-training.
 
+### Compaction reports its own cache saving — resolved 2026-08-04
+
+The original worry was that item 1's entire case is cache economics and nothing
+could prove it worked. Owner's answer, and it is better than a manual benchmark:
+**read the cache figures off the provider response and put them in a `::Notice`
+in the transcript after every compaction**, so the mechanism reports on itself
+in normal use.
+
+**The data already exists.** `hrdr-llm/src/catalog.rs` prices cached tokens
+today — `cache_read` and `cache_write` rates, a `cache_creation` input, and a
+cost function discounting reads at roughly 0.1x input, with a documented mapping
+between provider field names and the catalog's. The counts are parsed and priced
+already; they are simply never surfaced.
+
+**The one structural obstacle:** `Agent::compact` cannot emit events. Its own
+comment says so — _"`compact` has no event sink (it is called from overflow
+recovery and from `/compact` alike) … the caller's own notice covers the
+outcome."_ So the notice cannot come from inside it. It fits the existing shape
+instead: `compact()` already returns `(before, after)` message counts and each
+caller emits its own notice from them. Widen that return to a small struct
+carrying the cache figures, and each caller folds them into the notice it
+already writes — which also means an overflow rescue and a `/compact` can report
+differently, and that is exactly where work item 2's `CompactionReason` belongs.
+One change, both purposes.
+
+**What to report:** tokens served from cache versus tokens charged at full rate
+for the compaction request, the summarization's own output tokens (unchanged by
+this work, and the honest denominator for "what did this cost"), and the
+estimated cost. The number that proves the mechanism is the **cache-read
+fraction** — near zero today, and it should jump to most of the prompt once the
+request shape matches an ordinary turn. If it does not move, the change did not
+work, and that is visible on the first compaction rather than at the end of a
+billing period.
+
+**Two caveats it must respect:**
+
+- **Cache reporting is provider-specific.** Anthropic reports it directly,
+  OpenAI-compatible endpoints report `cached_tokens` under a details object, and
+  many local or gateway endpoints report nothing. The notice must degrade
+  honestly — "not reported" rather than a zero, because absent and zero mean
+  opposite things and one of them looks like the change failed.
+- **It measures the compaction request only.** Compaction rewrites history and
+  refreshes the system prompt, so the turn AFTER it starts cold regardless. The
+  wording must not imply otherwise.
+
+**Paired with a CI check, because a notice is not a test.** You cannot unit-test
+a cache hit — it needs a real provider and two sequential requests — but you CAN
+test the property that causes it: build a normal request and a compaction
+request from the same agent state and assert the system prompt and `tools[]` are
+equal, and that the messages differ only by the appended instruction. That goes
+red the moment anyone reintroduces a separate summarizer prompt or strips the
+tools, which is the regression that would silently restore today's cost. The
+notice then confirms real behaviour in use; the test stops it regressing.
+
 ### Keep hrdr's whole-turn tail
 
 Codex rebuilds post-compaction history as three parts: the initial context, then
@@ -263,15 +317,30 @@ Ranked. Question 1 (what a second compaction does to an existing summary) was
 above. It is now a design decision rather than an unknown, and it turned out to
 have a second consequence nobody had predicted (the stolen tail slot).
 
-1. **Nothing can measure the win.** The entire case for item 1 is cache
-   economics, and hrdr has no prompt-size introspection (a standing backlog
-   gap), so it would ship on argument alone. This is the "change of MECHANISM"
-   case: the code compiles and passes identically whether the cache hits or not.
-   Wants a cached-vs-uncached input token figure before and after.
-2. **Sub-agents and `/compact`.** A delegated agent's history is one long turn
-   with no second `role:"user"` message — `mega_turn_tail_start` exists for
-   exactly that shape — and must keep working. `/compact`'s optional steering
-   instructions need a home in the new in-place request.
+1. **Sub-agents and `/compact` — two traps in the in-place design.**
+
+   **The appended instruction creates a turn boundary that did not exist.** A
+   delegated agent's history is one long turn with no second `role:"user"`
+   message — `mega_turn_tail_start` exists for exactly that shape. But item 1
+   appends the compaction instruction AS a user message, so the very shape that
+   function was written for changes at the moment compaction runs, and tail
+   selection may take a different path than it does today. That might make the
+   mega-turn split unnecessary during compaction, or it might land the boundary
+   somewhere useless. **Decide it while building item 1, not after** — finding
+   it late means reworking the tail logic. The test is concrete: a delegated
+   agent's history, compacted, asserting the tail is what was intended.
+
+   **The instruction must not survive into the rebuilt history.** Once the
+   summary comes back, the appended message has to be dropped explicitly, or
+   every compacted session carries a fake user turn reading "summarize the
+   conversation so far" — which the model will take as something the user asked
+   for. Today's implementation cannot have this bug because the request is built
+   separately; the in-place design introduces the possibility.
+
+   `/compact`'s optional steering instructions are the easy half: append them to
+   the same user message as the compaction instruction, which keeps the request
+   shape unchanged and needs no new plumbing (they already arrive as
+   `Option<&str>`).
 
 ---
 
