@@ -17,26 +17,41 @@ pub enum Role {
 }
 
 /// Internal origin of a message — distinguishes a real user turn from synthetic
-/// user-role context injected by the agent (steering, background results,
-/// turn-end nudges, …).
+/// user-role context the agent injected (tool products, turn-end nudges,
+/// compaction summaries).
 ///
-/// Lets the agent tell a real user turn apart from synthetic `Role::User`
-/// context it injected. Defaults to [`User`](MessageOrigin::User) so that
-/// existing serialized data (session files) correctly treats all messages as
-/// real user turns.
+/// One variant per genuine kind of `Role::User` message. Only [`User`] is the
+/// user speaking; the rest are the harness talking to itself, and compaction
+/// counts turn boundaries on that distinction.
+///
+/// [`User`] must stay `#[default]`: the session file writes `origin` only when
+/// it differs from the default (see `persisted_messages` in `hrdr-agent`), so a
+/// message with the field omitted loads back as `User`.
 ///
 /// **Never serialized onto the provider wire** — only the session file preserves
-/// it (see `persisted_messages` in `hrdr-app`).
+/// it.
+///
+/// [`User`]: MessageOrigin::User
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum MessageOrigin {
+    /// The user speaking — opening a turn or steering mid-turn. A steer is the
+    /// user talking either way, so both are real turns; and a steer arriving
+    /// from a main agent to its sub-agent is no different, because the main
+    /// agent acts on the user's behalf.
     #[default]
     User,
-    Steering,
-    BackgroundResult,
     /// A synthetic prompt the harness injects when the model ends its turn
     /// with no tool calls while the shared TODO list still has unfinished
     /// items — never a real user turn. See `Agent::run`'s turn loop.
     Nudge,
+    /// The product of a tool call, delivered as a `Role::User` message because
+    /// it arrives after the round that requested it closed — a detached
+    /// sub-agent's report. Never a real user turn.
+    Tool,
+    /// A compaction summary standing in for the history it replaced. Never a
+    /// real user turn, and never re-summarized: the next compaction folds its
+    /// text into the new summary and emits one that supersedes it.
+    Summary,
 }
 
 /// A single chat message. Used for both request and response — `content` is
@@ -83,9 +98,9 @@ pub struct ChatMessage {
     #[serde(default, skip_serializing)]
     pub responses_reasoning_items: Vec<serde_json::Value>,
     /// Internal origin marker — distinguishes real user turns from synthetic
-    /// user-role context injected by the agent (steering, background results).
-    /// Defaults to [`MessageOrigin::User`] (a real user turn) for backward
-    /// compatibility with existing session files.
+    /// user-role context injected by the agent (tool products, nudges,
+    /// compaction summaries). Defaults to [`MessageOrigin::User`], a real user
+    /// turn.
     ///
     /// Never written onto the provider wire (`skip_serializing`); the session
     /// file preserves it via `persisted_messages`.

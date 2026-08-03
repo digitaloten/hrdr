@@ -6596,14 +6596,15 @@ mod tests {
 
         // Both messages are appended as user turns — stamped with an entry-time
         // timestamp like every user-role turn (they go through the same
-        // `push_user_message` chokepoint), tagged as steering…
+        // `push_user_message` chokepoint), and tagged `User`: a steer is the
+        // user speaking, so it counts as a real turn boundary…
         let msgs = agent.messages();
         let second_last = msgs[msgs.len() - 2].content.as_deref().unwrap();
         assert!(second_last.starts_with('[') && second_last.ends_with("] use ripgrep instead"));
         let last = msgs[msgs.len() - 1].content.as_deref().unwrap();
         assert!(last.starts_with('[') && last.ends_with("] and skip the tests"));
         assert!(msgs[msgs.len() - 1].role == Role::User);
-        assert_eq!(msgs[msgs.len() - 1].origin, MessageOrigin::Steering);
+        assert_eq!(msgs[msgs.len() - 1].origin, MessageOrigin::User);
         // …a Steered event fires for each carrying the raw (unstamped) text the
         // frontend displays…
         let steered: Vec<_> = events
@@ -9156,7 +9157,6 @@ mod tests {
             assert_eq!(nudges[0].role, Role::User);
             // Not a genuine user turn.
             assert_ne!(nudges[0].origin, MessageOrigin::User);
-            assert_ne!(nudges[0].origin, MessageOrigin::Steering);
 
             assert!(
                 events

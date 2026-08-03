@@ -930,16 +930,11 @@ impl Agent {
             sent.push_str(&block);
         }
         // The model reads the expanded (`sent`) form; the transcript shows what was
-        // typed (`display`). A real opener is a `User` turn; a mid-turn correction
-        // is tagged `Steering` so session serialization can still tell them apart
-        // (both count as turn boundaries).
+        // typed (`display`). Opener or mid-turn correction, this is the user
+        // speaking, so both are plain `User` turns: the origin marker records WHO
+        // sent a message, not when it arrived.
         on_event(AgentEvent::Steered(msg.display));
-        let origin = if opening {
-            MessageOrigin::User
-        } else {
-            MessageOrigin::Steering
-        };
-        self.push_user_message(sent, origin);
+        self.push_user_message(sent, MessageOrigin::User);
         Ok(())
     }
 

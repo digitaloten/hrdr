@@ -2825,38 +2825,46 @@ mod roundtrip_audit {
             .to_string_lossy()
             .to_string();
 
-        let steer = Message {
-            origin: crate::MessageOrigin::Steering,
-            ..Message::user("steer")
+        let nudge = Message {
+            origin: crate::MessageOrigin::Nudge,
+            ..Message::user("nudge")
         };
-        let bg = Message {
-            origin: crate::MessageOrigin::BackgroundResult,
+        let tool = Message {
+            origin: crate::MessageOrigin::Tool,
             ..Message::user("bg result")
+        };
+        // A resumed session must still know its summary is a summary, or the
+        // next compaction summarizes it again and the tail loses a real turn.
+        let summary = Message {
+            origin: crate::MessageOrigin::Summary,
+            ..Message::user("summary of earlier conversation")
         };
 
         let st = SessionState {
             cwd: cwd.clone(),
-            messages: vec![Message::user("real"), steer.clone(), bg.clone()],
+            messages: vec![
+                Message::user("real"),
+                nudge.clone(),
+                tool.clone(),
+                summary.clone(),
+            ],
             ..Default::default()
         };
 
         // — Wire form (Message's own Serialize) drops origin —
-        let wire = serde_json::to_string(&steer).unwrap();
-        assert!(
-            !wire.contains("origin"),
-            "origin must not appear on the wire: {wire}"
-        );
-        let wire = serde_json::to_string(&bg).unwrap();
-        assert!(
-            !wire.contains("origin"),
-            "origin must not appear on the wire: {wire}"
-        );
+        for m in [&nudge, &tool, &summary] {
+            let wire = serde_json::to_string(m).unwrap();
+            assert!(
+                !wire.contains("origin"),
+                "origin must not appear on the wire: {wire}"
+            );
+        }
 
         // — Session file round-trip preserves origin —
         let json = serde_json::to_string(&Session::new(st)).unwrap();
         let back = serde_json::from_str::<Session>(&json).unwrap().state;
 
-        assert_eq!(back.messages.len(), 3);
+        assert_eq!(back.messages.len(), 4);
         assert_eq!(
             back.messages[0].origin,
             crate::MessageOrigin::User,
@@ -2864,13 +2872,18 @@ mod roundtrip_audit {
         );
         assert_eq!(
             back.messages[1].origin,
-            crate::MessageOrigin::Steering,
-            "Steering origin survives session file"
+            crate::MessageOrigin::Nudge,
+            "Nudge origin survives session file"
         );
         assert_eq!(
             back.messages[2].origin,
-            crate::MessageOrigin::BackgroundResult,
-            "BackgroundResult origin survives session file"
+            crate::MessageOrigin::Tool,
+            "Tool origin survives session file"
+        );
+        assert_eq!(
+            back.messages[3].origin,
+            crate::MessageOrigin::Summary,
+            "Summary origin survives session file"
         );
 
         // — Old session files (no origin field) default to User on read —

@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- **A session file holding a `Steering` or `BackgroundResult` message no longer
+  loads.** The internal `MessageOrigin` marker — which tells a real user turn
+  apart from user-role context the harness injected — now has one variant per
+  genuine kind: `User`, `Nudge`, `Tool`, `Summary`. `BackgroundResult` is
+  renamed `Tool` (it is only ever a message that came back from a tool call),
+  `Steering` is folded into `User` (a steer is the user speaking, just mid-turn,
+  and nothing read the distinction), and `Summary` is new, for the compaction
+  summary. Those names are written into session files, so an affected session
+  fails to load rather than resuming; per the pre-1.0 rule no alias is kept.
+  Start a new session.
+
 - **Tool-output pruning is removed; compaction is the only answer to a filling
   context.** The `auto_prune` config key, `$HRDR_AUTO_PRUNE` and
   `--auto-prune on|off` are gone, and a `config.toml` still setting `auto_prune`

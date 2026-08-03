@@ -128,7 +128,7 @@ impl Agent {
             let body =
                 format!("[Background task #{id} ({label}) finished — its result:]\n{result}");
             let body = format!("{body}{}", Self::BACKGROUND_ARRIVAL_REMINDER);
-            self.push_user_message(body, MessageOrigin::BackgroundResult);
+            self.push_user_message(body, MessageOrigin::Tool);
         }
     }
 }
