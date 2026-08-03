@@ -11282,6 +11282,63 @@ mod tests {
             );
         }
 
+        /// A tool round the user cancelled mid-flight is repaired BEFORE the
+        /// tail is chosen, not after.
+        ///
+        /// The repair inserts `[interrupted]` results into the history. An index
+        /// computed before it slides backwards underneath it — so the verbatim
+        /// tail would begin one message early, on a tool result torn from the
+        /// assistant `tool_calls` message that is now in the summarized head.
+        /// Strict servers reject exactly that shape, which makes it a failure on
+        /// the NEXT request rather than this one.
+        #[tokio::test]
+        async fn a_cancelled_tool_round_is_repaired_before_the_tail_is_chosen() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("s1", "A summary."),
+                stop_chunk("s1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            // One turn keeps the tail short enough that the repaired message
+            // sits before it.
+            agent.compaction_tail_turns = 1;
+            agent.messages.push(ChatMessage::user("first turn"));
+            // Esc mid-tool-call: the results never arrived.
+            let mut calls = ChatMessage::assistant("working on it");
+            calls.tool_calls = Some(vec![hrdr_llm::ToolCall {
+                id: "call-abandoned".into(),
+                kind: "function".into(),
+                function: hrdr_llm::FunctionCall {
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            }]);
+            agent.messages.push(calls);
+            agent.messages.push(ChatMessage::user("second turn"));
+            agent.messages.push(ChatMessage::assistant("done"));
+
+            agent.compact(None).await.expect("compaction succeeds");
+
+            // [system, summary, …tail]. The tail must start where the user
+            // spoke, not on the stub result the repair inserted.
+            assert_eq!(agent.messages[1].origin, crate::MessageOrigin::Summary);
+            assert_eq!(agent.messages[2].role, Role::User);
+            assert_eq!(
+                agent.messages[2].content.as_deref(),
+                Some("second turn"),
+                "the tail begins at the real turn boundary: {:?}",
+                agent.messages
+            );
+            assert!(
+                agent.messages[2..].iter().all(|m| m.role != Role::Tool),
+                "no tool result is orphaned from its call: {:?}",
+                agent.messages
+            );
+        }
+
         /// The summary is a distinguished message, and there is never more than
         /// one of it.
         ///

@@ -385,6 +385,18 @@ impl Agent {
         // decided to on its own, which no frontend is told about. The guard clears
         // the flag on every exit, error and cancellation included.
         let _compacting = CompactingGuard::new(self.live_home.clone());
+        // A `/compact` landing right after an Esc-cancelled tool round leaves an
+        // assistant `tool_calls` message with no results, which strict servers
+        // reject. Backfill the stubs the same way the turn loop does at turn
+        // start, rather than flattening the tool protocol out of the request:
+        // flattening rewrote every message and so guaranteed a cache miss, and
+        // with the session's `tools[]` now in the request there is nothing to
+        // flatten it for.
+        //
+        // BEFORE the tail is chosen, not after: the repair inserts messages, so
+        // an index taken first would slide backwards underneath it and could
+        // land the tail on an orphaned tool result.
+        crate::turn_loop::repair_dangling_tool_calls(&mut self.messages);
         // Keep the most recent messages verbatim — compaction usually fires
         // mid-task, and the summary alone loses exactly the detail the model
         // is working with. Only the head (everything older) is summarized.
@@ -446,15 +458,6 @@ impl Agent {
         // tail being summarized as well as kept verbatim is redundant, not
         // wrong: the summary covers the session and the tail follows it in
         // full.
-        //
-        // A `/compact` landing right after an Esc-cancelled tool round leaves
-        // an assistant `tool_calls` message with no results, which strict
-        // servers reject. Backfill the stubs the same way the turn loop does at
-        // turn start, rather than flattening the tool protocol out of the
-        // request: flattening rewrote every message and so guaranteed a cache
-        // miss, and with the session's `tools[]` now present there is nothing
-        // to flatten it for.
-        crate::turn_loop::repair_dangling_tool_calls(&mut self.messages);
         let defs = self.tools.defs();
         // When compaction is overflow-triggered, the summarization request is
         // itself over the limit. If it overflows, shrink what the summarizer
