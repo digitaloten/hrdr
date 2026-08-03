@@ -130,6 +130,41 @@ loses the tag, the summary reverts to an ordinary user message, and the chain
 returns — silently, and only on resumed sessions, which is the worst way to find
 out.
 
+### Initial context needs nothing from us — but the ORDER might
+
+**Investigated 2026-08-04, closing the open question.** Codex's "initial
+context" is the repo/environment state (`WorldState`), and it lives **inside the
+history**, so a compaction that replaces history destroys it and it has to be
+put back. Hence the enum. Its doc comment states both cases:
+
+- Pre-turn and manual compaction use `DoNotInject` — _"they replace history with
+  a summary and clear `reference_context_item`, so the next regular turn will
+  fully reinject initial context after compaction."_
+- Mid-turn compaction MUST use `BeforeLastUserMessage`, _"because the model is
+  trained to see the compaction summary as the last item in history after
+  mid-turn compaction; we therefore inject initial context into the replacement
+  history just above the last real user message."_
+
+**hrdr needs none of this, and that is architectural rather than lucky.** The
+equivalent state lives in hrdr's SYSTEM PROMPT — environment, memory, AGENTS.md,
+skills — as ordered named sections rebuilt per request, and `Agent::compact`
+already calls `refresh_system_prompt_in_place()` precisely so a note saved this
+session is in the rebuilt index. Codex has to re-inject because its context is
+history-resident; ours cannot be destroyed by a history rewrite. Codex's other
+half of the same hygiene — clearing `reference_context_item` — hrdr already has
+as `reset_read_files()`, on the same line of reasoning: file contents the model
+read now live only in the summary, so require fresh reads before further edits.
+
+**What IS worth deciding, and is currently an accident: summary ordering.** hrdr
+builds `[system, summary, ...tail]` — summary first, then the verbatim tail,
+chronological, and the continuation prose says so (_"the most recent messages
+follow it verbatim"_). Codex's mid-turn shape is the opposite: the summary is
+the LAST item, because their models are **trained** on that layout. That is a
+post-training artifact specific to their models, and hrdr targets many
+providers, so chronological order is the right default and it stays — but it
+should be a recorded decision rather than something nobody chose. Revisit only
+with evidence that a provider we care about behaves worse with summary-first.
+
 ### Keep hrdr's whole-turn tail
 
 Codex rebuilds post-compaction history as three parts: the initial context, then
@@ -200,17 +235,12 @@ Ranked. Question 1 (what a second compaction does to an existing summary) was
 above. It is now a design decision rather than an unknown, and it turned out to
 have a second consequence nobody had predicted (the stolen tail slot).
 
-1. **`InitialContextInjection`.** Codex re-injects something after a history
-   wipe and suppresses it on the model-switch paths (`DoNotInject`), via
-   `build_compaction_initial_context()`. hrdr rebuilds its system sections on
-   every request so it may get this for free — **that is an assumption, not a
-   finding.**
-2. **Nothing can measure the win.** The entire case for item 1 is cache
+1. **Nothing can measure the win.** The entire case for item 1 is cache
    economics, and hrdr has no prompt-size introspection (a standing backlog
    gap), so it would ship on argument alone. This is the "change of MECHANISM"
    case: the code compiles and passes identically whether the cache hits or not.
    Wants a cached-vs-uncached input token figure before and after.
-3. **Sub-agents and `/compact`.** A delegated agent's history is one long turn
+2. **Sub-agents and `/compact`.** A delegated agent's history is one long turn
    with no second `role:"user"` message — `mega_turn_tail_start` exists for
    exactly that shape — and must keep working. `/compact`'s optional steering
    instructions need a home in the new in-place request.
