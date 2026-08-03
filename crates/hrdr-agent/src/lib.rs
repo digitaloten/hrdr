@@ -11441,6 +11441,14 @@ mod tests {
             );
             assert!(notice.contains("90% from cache"), "{notice}");
             assert!(notice.contains("40 output"), "{notice}");
+            // Scoped to the summarization request. Unqualified, those figures
+            // read as a claim about the session — and the turn after this one
+            // starts cold, because compaction rewrites the history and
+            // refreshes the system prompt.
+            assert!(
+                notice.contains("summary call: 1000 prompt tokens, 90% from cache, 40 output"),
+                "the figures must be scoped to the call they describe: {notice}"
+            );
 
             // A provider that reports no cache figure at all must not be
             // rendered as one reporting zero: absent and zero mean opposite

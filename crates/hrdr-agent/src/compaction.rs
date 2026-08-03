@@ -162,24 +162,31 @@ impl CompactionReport {
             self.before,
             self.after
         );
+        // Everything past here describes the summarization request and nothing
+        // else, so it says so. Unscoped, "90% from cache" reads as a claim about
+        // the session — while in fact the turn AFTER a compaction starts cold,
+        // because compaction rewrites the history and refreshes the system
+        // prompt. The figures are joined by commas rather than the `·` used
+        // above, so the scope covers all of them rather than only the first.
+        line.push_str(" · summary call: ");
         match self.cached_prompt_tokens {
             Some(cached) if self.prompt_tokens > 0 => {
                 let percent = f64::from(cached) / f64::from(self.prompt_tokens) * 100.0;
                 line.push_str(&format!(
-                    " · {} prompt tokens, {percent:.0}% from cache",
+                    "{} prompt tokens, {percent:.0}% from cache",
                     self.prompt_tokens
                 ));
             }
             // Absent and zero mean opposite things, and one of them looks like
             // this whole mechanism failed. Say which it is.
             _ => line.push_str(&format!(
-                " · {} prompt tokens, cache not reported",
+                "{} prompt tokens, cache not reported",
                 self.prompt_tokens
             )),
         }
-        line.push_str(&format!(" · {} output", self.output_tokens));
+        line.push_str(&format!(", {} output", self.output_tokens));
         if let Some(cost) = self.cost_usd {
-            line.push_str(&format!(" · ${cost:.4}"));
+            line.push_str(&format!(", ${cost:.4}"));
         }
         line
     }
