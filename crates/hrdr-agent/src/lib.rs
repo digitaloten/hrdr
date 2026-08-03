@@ -4373,7 +4373,7 @@ mod tests {
         // Nothing to summarise (system prompt only), so this is a no-op compaction
         // — but it must still retire the reading.
         let _ = agent
-            .compact(crate::CompactionReason::UserRequested, None)
+            .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
             .await;
         assert_eq!(
             agent.last_prompt_tokens, None,
@@ -10539,7 +10539,7 @@ mod tests {
             }
 
             agent
-                .compact(crate::CompactionReason::UserRequested, None)
+                .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
                 .await
                 .expect("the unsupported cap gets one uncapped retry");
 
@@ -10614,7 +10614,7 @@ mod tests {
             }
 
             agent
-                .compact(crate::CompactionReason::UserRequested, None)
+                .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
                 .await
                 .expect("uncapped transient retries eventually succeed");
 
@@ -10911,7 +10911,7 @@ mod tests {
 
             // Compaction takes no sink, so nothing is reported during it.
             agent
-                .compact(crate::CompactionReason::UserRequested, None)
+                .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
                 .await
                 .expect("the uncapped retry works");
             assert!(
@@ -11066,7 +11066,7 @@ mod tests {
             crate::oauth::with_test_oauth_access(
                 "test-oauth-bearer".to_string(),
                 Some("acct-test".to_string()),
-                agent.compact(crate::CompactionReason::UserRequested, None),
+                agent.compact(crate::CompactionReason::UserRequested, None, &mut |_| {}),
             )
             .await
             .expect("compaction succeeds with injected OAuth");
@@ -11119,7 +11119,7 @@ mod tests {
             let before = agent.message_count();
 
             let report = agent
-                .compact(crate::CompactionReason::UserRequested, None)
+                .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
                 .await
                 .expect("compaction must survive a transient error on the summarization call");
             let after = report.after;
@@ -11178,7 +11178,7 @@ mod tests {
             .unwrap();
 
             agent
-                .compact(crate::CompactionReason::UserRequested, None)
+                .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
                 .await
                 .expect("compaction succeeds");
 
@@ -11241,7 +11241,7 @@ mod tests {
             }
             agent.run_input("do the thing", |_| {}).await.unwrap();
             agent
-                .compact(crate::CompactionReason::UserRequested, None)
+                .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
                 .await
                 .expect("compaction succeeds");
 
@@ -11361,7 +11361,7 @@ mod tests {
             agent.messages.push(ChatMessage::assistant("done"));
 
             agent
-                .compact(crate::CompactionReason::UserRequested, None)
+                .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
                 .await
                 .expect("compaction succeeds");
 
@@ -11430,7 +11430,7 @@ mod tests {
                         .push(ChatMessage::assistant(format!("reply {i}")));
                 }
                 agent
-                    .compact(crate::CompactionReason::ContextFilling, None)
+                    .compact(crate::CompactionReason::ContextFilling, None, &mut |_| {})
                     .await
                     .expect("compaction succeeds")
             };
@@ -11463,6 +11463,105 @@ mod tests {
             let notice = report.notice();
             assert!(notice.contains("cache not reported"), "{notice}");
             assert!(!notice.contains("0% from cache"), "{notice}");
+        }
+
+        /// A compaction's model calls are accounted like any other call.
+        ///
+        /// They were not. `plain_completion_inner` called `account_usage` — so
+        /// the money reached `cost_total` — and then emitted nothing, and
+        /// `AgentUsage` only ever counts what it is handed as an event. So every
+        /// compaction's tokens were missing from the counters `/cost` and
+        /// `/status` read, and a summarization request carries the whole
+        /// history: the gap was made of a session's LARGEST calls, and grew
+        /// with each one.
+        ///
+        /// One event per attempt, not one per compaction — a tool-call retry is
+        /// a billed call too.
+        #[tokio::test]
+        async fn a_compaction_reports_its_own_model_calls() {
+            let summary = |id: &str, text: &str, prompt: u32| {
+                MockResp::Sse(vec![
+                    text_chunk(id, text),
+                    stop_chunk(id),
+                    serde_json::to_string(&serde_json::json!({
+                        "id": id, "choices": [], "usage": {
+                            "prompt_tokens": prompt,
+                            "completion_tokens": 25,
+                            "prompt_tokens_details": {"cached_tokens": prompt / 2},
+                        }
+                    }))
+                    .unwrap(),
+                    "[DONE]".to_string(),
+                ])
+            };
+            // A refused tool call, then the summary: two billed calls, and the
+            // counters must see both.
+            let server = MockServer::start(vec![
+                MockResp::Sse(vec![
+                    tool_start_chunk("s1", "call-1", "read"),
+                    tool_args_chunk("s1", r#"{"path":"README.md"}"#),
+                    tool_calls_stop_chunk("s1"),
+                    serde_json::to_string(&serde_json::json!({
+                        "id": "s1", "choices": [], "usage": {
+                            "prompt_tokens": 1_000, "completion_tokens": 25,
+                            "prompt_tokens_details": {"cached_tokens": 500},
+                        }
+                    }))
+                    .unwrap(),
+                    "[DONE]".to_string(),
+                ]),
+                summary("s2", "A summary.", 1_000),
+            ])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+
+            let mut events: Vec<AgentEvent> = Vec::new();
+            let report = agent
+                .compact(crate::CompactionReason::UserRequested, None, &mut |ev| {
+                    events.push(ev)
+                })
+                .await
+                .expect("compaction succeeds");
+
+            let usage: Vec<&AgentEvent> = events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::Usage { .. }))
+                .collect();
+            assert_eq!(
+                usage.len(),
+                2,
+                "one Usage per attempt, refused tool call included: {events:?}"
+            );
+            // Nothing else escapes: the summary's text is not the user's to
+            // read, and compaction stays silent about it.
+            assert_eq!(
+                events.len(),
+                usage.len(),
+                "compaction emits accounting and nothing else: {events:?}"
+            );
+
+            // The counters an agent keeps for itself see both calls, with the
+            // cache halves intact.
+            let mut counters = crate::AgentUsage::default();
+            for ev in &events {
+                counters.record_event(ev);
+            }
+            assert_eq!(counters.tokens_in, 2_000);
+            assert_eq!(counters.tokens_out, 50);
+            assert_eq!(counters.cache_hit_rate(), Some(0.5));
+
+            // …and the report still describes only the attempt that produced
+            // the summary, which is a different question from what was spent.
+            assert_eq!(report.prompt_tokens, 1_000);
+            assert_eq!(report.output_tokens, 25);
         }
 
         /// The summary is a distinguished message, and there is never more than
@@ -11512,7 +11611,7 @@ mod tests {
 
             turns(&mut agent, "first round");
             agent
-                .compact(crate::CompactionReason::UserRequested, None)
+                .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
                 .await
                 .expect("first compaction succeeds");
 
@@ -11530,7 +11629,7 @@ mod tests {
             // whatever the first compaction left behind.
             turns(&mut agent, "second round");
             agent
-                .compact(crate::CompactionReason::ContextOverflow, None)
+                .compact(crate::CompactionReason::ContextOverflow, None, &mut |_| {})
                 .await
                 .expect("second compaction succeeds");
 
@@ -11596,7 +11695,7 @@ mod tests {
             }
 
             agent
-                .compact(crate::CompactionReason::UserRequested, None)
+                .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
                 .await
                 .expect("the retry after the tool call produces the summary");
 
@@ -11664,7 +11763,7 @@ mod tests {
             let before = history(&agent);
 
             let err = agent
-                .compact(crate::CompactionReason::UserRequested, None)
+                .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
                 .await
                 .expect_err("a summarizer that only calls tools must fail, not loop");
             assert!(
@@ -11728,7 +11827,7 @@ mod tests {
             );
 
             let report = agent
-                .compact(crate::CompactionReason::UserRequested, None)
+                .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
                 .await
                 .expect("compacting a single oversized turn must succeed");
             let after = report.after;
@@ -11795,7 +11894,7 @@ mod tests {
                 .collect();
 
             agent
-                .compact(crate::CompactionReason::ContextOverflow, None)
+                .compact(crate::CompactionReason::ContextOverflow, None, &mut |_| {})
                 .await
                 .expect("compacting a delegated agent's history must succeed");
 
@@ -11853,7 +11952,7 @@ mod tests {
                         .push(ChatMessage::assistant(format!("reply {i}")));
                 }
                 agent
-                    .compact(crate::CompactionReason::ContextFilling, None)
+                    .compact(crate::CompactionReason::ContextFilling, None, &mut |_| {})
                     .await
                     .expect("compaction succeeds");
                 // Everything compaction WROTE — the summary and the tail. The
@@ -11949,7 +12048,7 @@ mod tests {
             agent.self_compact_failed_at = Some(100_000);
 
             agent
-                .compact(crate::CompactionReason::UserRequested, None)
+                .compact(crate::CompactionReason::UserRequested, None, &mut |_| {})
                 .await
                 .expect("this compaction succeeds");
             assert_eq!(

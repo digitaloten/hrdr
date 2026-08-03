@@ -540,10 +540,18 @@ impl Agent {
     /// `instructions` optionally steers the summary's focus. A no-op report
     /// (`before == after`) means there was nothing beyond the system prompt and
     /// one message to summarize.
-    pub async fn compact(
+    ///
+    /// `on_event` receives an [`AgentEvent::Usage`] per summarization attempt
+    /// and nothing else — compaction stays silent about the summary's content,
+    /// which is not the user's to read, but its model calls are accounted like
+    /// any other. They were not: the tokens went into the session's cost total
+    /// while its token counters never saw them, so `/cost` under-reported by
+    /// exactly the largest calls a session makes.
+    pub async fn compact<F: FnMut(AgentEvent)>(
         &mut self,
         reason: CompactionReason,
         instructions: Option<&str>,
+        on_event: &mut F,
     ) -> Result<CompactionReport> {
         // Whatever the outcome, the last prompt reading describes the history as it
         // was *before* this call. Clearing it here (rather than in one caller) stops
@@ -689,7 +697,7 @@ impl Agent {
             // read as something the user asked for.
             req.push(ChatMessage::user(trigger.clone()));
             self.budget_preflight().await?;
-            match self.plain_completion(req, &defs).await {
+            match self.plain_completion(req, &defs, on_event).await {
                 Ok((msg, spend)) => {
                     // A tool call returned during compaction is NEVER executed.
                     // The tools are in the request for the prefix cache, not
@@ -846,10 +854,11 @@ impl Agent {
     /// The loop terminates because each rejection can be honoured once: a
     /// parameter already dropped makes the helper return `false` and the error
     /// propagate. No other 400 is retried here.
-    async fn plain_completion(
+    async fn plain_completion<F: FnMut(AgentEvent)>(
         &mut self,
         req: Vec<ChatMessage>,
         defs: &[ToolDef],
+        on_event: &mut F,
     ) -> Result<(ChatMessage, crate::usage::CallSpend)> {
         // Compaction can run before any normal turn (notably `/compact` after
         // resuming a process), so it cannot rely on `connect_stream` having
@@ -879,7 +888,7 @@ impl Agent {
             let client = self.client.clone();
             let output_cap = client.params().max_tokens;
             match self
-                .plain_completion_inner(&client, &req, defs, output_cap)
+                .plain_completion_inner(&client, &req, defs, output_cap, on_event)
                 .await
             {
                 Err(error) if self.drop_unsupported_param(&error) => continue,
@@ -888,24 +897,42 @@ impl Agent {
         }
     }
 
-    async fn plain_completion_inner(
+    async fn plain_completion_inner<F: FnMut(AgentEvent)>(
         &mut self,
         client: &hrdr_llm::Client,
         req: &[ChatMessage],
         defs: &[ToolDef],
         output_cap: Option<u32>,
+        on_event: &mut F,
     ) -> Result<(ChatMessage, crate::usage::CallSpend)> {
         let mut stream = client.chat_stream(req, defs).await?;
-        // The round's generation time is dropped on purpose: a compaction call
-        // emits no `Usage` event, so its tokens never reach the turn's
-        // throughput either. Counting one without the other would skew it.
-        let acc = drain_stream(&mut stream, &mut |_| {}).await?.acc;
+        // The stream's own sink is a no-op — the summary's text is not the
+        // user's to read — but the round is TIMED like any other, because its
+        // tokens are reported below and throughput measured over tokens with
+        // no time against them is not throughput.
+        let drained = drain_stream(&mut stream, &mut |_| {}).await?;
+        let acc = drained.acc;
         // The compaction request carries the session's own `tools[]` — the same
         // surface a normal round pays for, and the same estimate when the server
         // reports no usage.
         let spend = self
             .account_usage(&acc, estimate_tokens_in_tools(defs))
             .await;
+        // Emitted per ATTEMPT, not once per compaction. A retry after the model
+        // answered with a tool call is a billed call like any other, and the
+        // counters have to see it or they under-report exactly when compaction
+        // cost most.
+        on_event(AgentEvent::Usage {
+            prompt_tokens: spend.prompt_tokens,
+            completion_tokens: spend.completion_tokens,
+            decode_ms: drained.decode.as_millis().min(u32::MAX as u128) as u32,
+            cached_prompt_tokens: spend.cached_prompt_tokens,
+            cache_creation_tokens: spend.cache_creation_tokens,
+            reasoning_tokens: acc.usage.as_ref().and_then(|u| u.reasoning_tokens()),
+            cost_usd: spend.cost_usd,
+            session_cost_usd: spend.session_cost_usd,
+            cost_partial: self.session_cost_partial(),
+        });
         // A summary cut off at the output cap is the one truncation that must
         // never be accepted quietly: this text REPLACES the conversation, so
         // half of it is not a degraded answer but a permanently missing half of
@@ -963,7 +990,10 @@ impl Agent {
         // — read it afterwards and it is always `None`, the suppression never
         // engages, and a failing summarizer is retried on every single round.
         let attempted_at = self.last_prompt_tokens;
-        match self.compact(CompactionReason::ContextFilling, None).await {
+        match self
+            .compact(CompactionReason::ContextFilling, None, on_event)
+            .await
+        {
             // `compact` clears `last_prompt_tokens` itself: the reading described
             // the history we just replaced, and leaving it set would re-trigger on
             // the next round against a history that is already small.

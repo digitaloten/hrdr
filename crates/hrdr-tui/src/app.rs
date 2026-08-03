@@ -2363,8 +2363,18 @@ impl App {
         self.registry.begin_turn(pane.key());
         let agent = self.agent_for(pane);
         let tx = self.tx.clone();
+        // Compaction's model calls are recorded on the agent's own registry
+        // entry, exactly as a turn's are (see `AgentRegistry::start_turn`) —
+        // that entry is what every pane is rebuilt from each frame, so the
+        // counters pick them up without this task touching pane state. Before
+        // this they were recorded nowhere: their cost reached the session total
+        // and their tokens reached nothing.
+        let live = self.registry.clone();
         let handle = tokio::spawn(async move {
-            let res = hrdr_app::run_compaction(agent, instructions).await;
+            let res = hrdr_app::run_compaction(agent, instructions, &mut |ev| {
+                live.record(pane.key(), &ev);
+            })
+            .await;
             let _ = tx.send(TurnMsg::Compacted(pane, res)).await;
         });
         self.turn_handle = Some(handle);

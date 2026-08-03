@@ -1185,7 +1185,7 @@ impl Agent {
             "context window exceeded — compacting and retrying".to_string(),
         ));
         let report = self
-            .compact(hrdr_llm::CompactionReason::ContextOverflow, None)
+            .compact(hrdr_llm::CompactionReason::ContextOverflow, None, on_event)
             .await?;
         *overflow_compacted = true;
         if !report.shrank() {
