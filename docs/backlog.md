@@ -134,10 +134,86 @@ shipped silently.
 
 ## Compaction rewrite
 
-Designed 2026-08-04, not built — the plan lives in
-`docs/compaction-rewrite-plan.md`, including the settled decisions and the four
-open questions. Delete that file when the work ships and keep only what still
-binds future work.
+The plan lives in `docs/compaction-rewrite-plan.md`. Item 0, the origin-blind
+turn-boundary defect, and work items 1–3 shipped 2026-08-04; items 4 and 5 are
+below, both blocked on a decision rather than on effort. Delete the plan file
+when they close, keeping only what still binds future work.
+
+### Item 4 — trigger on the body, not the total (BLOCKED, needs a decision)
+
+The plan says hrdr measures total prompt tokens against the window while the
+prefix (system prompt, `tools[]`, memory) is exactly what compaction cannot
+reclaim, and cites codex's
+`AutoCompactTokenLimitScope::{Total, BodyAfterPrefix}` as the shape to copy.
+
+**Not built, because the arithmetic does not transfer.** hrdr's trigger is
+DERIVED (`compaction_trigger` = `window − min(reserved, window/4)`), not
+configured. Restating it against the body — fire when
+`total − prefix ≥ window − reserved − prefix` — is the identical inequality, so
+a literal port changes nothing. Codex's knob only means something because its
+limit is a configured absolute number that the user sets against one scope or
+the other.
+
+The real defect the item is pointing at is narrower and worth fixing on its own
+terms: **on a small window a compaction can reclaim nothing and still fire every
+round.** Worked example — a 32k window with the reserve clamped to `window/4`
+gives a 24k trigger; a 15k prefix leaves a 9k body, and `preserve_recent_tokens`
+alone can exceed that, so `compact()` replaces the history with a summary plus a
+tail that is no smaller, the trigger is still met on the next round, and each
+round buys another summarization call. `compact()` only no-ops on the STRUCTURE
+of the history (`before == after`), never on how many tokens a compaction would
+actually free.
+
+Options, needing the owner's call:
+
+- **Gate on the reclaim.** Before summarizing, estimate
+  `body − (tail + a summary allowance)` and no-op when it is below some floor.
+  Cheap, local to `compact()`, and does not touch the trigger. Risk: an agent
+  that genuinely cannot fit its next request now no-ops instead of trying, so
+  overflow recovery has to be the thing that reports it clearly.
+- **Subtract the prefix from the trigger's meaning** and expose the scope as
+  config, closest to codex. Costs a config key, and the key is hard to explain
+  precisely because the limit it scopes is derived.
+- **Leave it.** The churn case needs a small window AND a large prefix; hrdr's
+  prefix is large, so this is really a "small local model" defect.
+
+Not measured on a real session — the example above is arithmetic from the
+constants, not an observed run.
+
+### Item 5 — compact with the outgoing model on a model switch (BLOCKED on shape)
+
+Verified as described in the plan: `set_model_ref` → `adopt_resolved`
+invalidates the cached window and the next `maybe_self_compact` fires against
+the new, smaller trigger. So a downshift IS handled — but the summarizing is
+then done by the INCOMING model, on a history that may not fit its window, with
+a cold cache.
+
+**The blocker is architectural, not conceptual.** `Agent::set_model_ref` and
+`adopt_resolved` are synchronous, and compacting is an `async` model call. Doing
+this properly means either making the switch path async (it is called from the
+`/model` command flow in `hrdr-app` and `hrdr-tui`, so the change is not local)
+or adding an explicit "compact before switching" step ahead of the switch in
+those callers, which leaves the agent's own API able to perform an unsafe
+switch. Neither is a detail to pick while implementing.
+
+The plan's second half is separable and worth doing regardless: codex's
+`should_retry_with_current_model` taxonomy (`InvalidRequest`,
+`UnexpectedStatus`, `ContextWindowExceeded`, `UsageLimitReached`,
+`ServerOverloaded`, `InternalServerError`, `RetryLimit`) separates
+"model-specific, a different model might work" from "transient, retry the same
+request". hrdr's `is_transient` only has the second class, so several
+permanently-failing cases are retried. That can land without any of the
+model-switch machinery.
+
+### Noticed while working, not fixed
+
+`session_name_from` (`hrdr-agent/src/session.rs`) takes the first `Role::User`
+message, which after a compaction is the summary — so a session first NAMED
+after a compaction gets "This conversation was compacted…" as its name. Now
+trivially fixable with the `MessageOrigin` predicate that compaction uses
+(`compaction::is_user_turn`), but out of scope for the plan and rare in
+practice: names are set on the first save, which normally precedes any
+compaction.
 
 ## Owed right now
 
