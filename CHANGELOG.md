@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Copying a mouse selection no longer picks up the scrollbar column.** A
+  selection dragged to the right-hand edge copied each line with the scrollbar's
+  `│` on the end, and every space in front of it: the transcript published its
+  selectable rect from the full area while drawing text into one column less, so
+  a drag could reach a column nothing ever wrote text into. Because a
+  box-drawing character is not whitespace, it also defeated the trailing-blank
+  trim that would otherwise have cleaned the line up. The selectable rect is now
+  derived from the text area rather than computed a second time, so the two
+  cannot drift apart again; pressing on the scrollbar column starts no
+  selection, and the rightmost text column still does.
+
 - **A `task` block no longer shows blank `cwd` and `model` rows.** Models
   routinely send `""` for an optional parameter they do not want, and `task`
   already reads `""` and `null` exactly as absent — `cwd` falls back to the

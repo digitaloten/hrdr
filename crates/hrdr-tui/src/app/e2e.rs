@@ -2891,6 +2891,100 @@ async fn a_toast_paints_over_the_screen() {
     );
 }
 
+/// A selection that runs to the right-hand edge copies the TEXT and stops: no
+/// scrollbar column, and no run of padding behind it.
+///
+/// The regression: `draw_transcript` published the selectable rect from `area`
+/// while drawing the text into `area.width - 1`, so a drag could reach one column
+/// further right than anything was ever painted. Every copied line ended in the
+/// scrollbar's `│`, and because a box-drawing character is not whitespace, the
+/// trailing-blank trim stopped at it and kept the padding in front of it too.
+#[tokio::test]
+async fn a_selection_to_the_edge_copies_no_scrollbar_and_no_padding() {
+    const WIDTH: u16 = 40;
+
+    let mut h = Harness::new(vec![]).await;
+    h.app
+        .transcript_mut()
+        .retain(|e| !matches!(e.kind, EntryKind::Notice(_) | EntryKind::Header));
+    h.app.push_entry(Entry::assistant("PICKME"));
+
+    let mut term = Terminal::new(TestBackend::new(WIDTH, 20)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+
+    let rect = h.app.transcript_rect;
+    assert_eq!(
+        rect.x + rect.w,
+        WIDTH - 1,
+        "the selectable rect stops one column short of the frame — that column is \
+         the scrollbar's, and nothing writes text into it"
+    );
+
+    // Find the row the reply landed on, then select that whole row edge to edge.
+    let row = (rect.y..rect.y + rect.h)
+        .find(|&row| {
+            (rect.x..rect.x + rect.w).any(|col| {
+                term.backend()
+                    .buffer()
+                    .cell(ratatui::layout::Position::new(col, row))
+                    .is_some_and(|c| c.symbol() == "P")
+            })
+        })
+        .expect("the reply is on screen");
+
+    let mut buf = term.backend().buffer().clone();
+    let last = rect.x + rect.w - 1;
+    let text = ui::paint_selection(&mut buf, rect, ((rect.x, row), (last, row)));
+
+    assert!(
+        text.contains("PICKME"),
+        "the reply's text is copied: {text:?}"
+    );
+    assert!(
+        !text.contains('│'),
+        "no scrollbar column in the copied text: {text:?}"
+    );
+    assert_eq!(
+        text,
+        text.trim_end(),
+        "and nothing trailing behind it: {text:?}"
+    );
+}
+
+/// The scrollbar column is not text, so pressing on it starts no selection.
+#[tokio::test]
+async fn a_press_on_the_scrollbar_column_starts_no_selection() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    const WIDTH: u16 = 40;
+
+    let mut h = Harness::new(vec![]).await;
+    h.app.push_entry(Entry::assistant("something to look at"));
+    let mut term = Terminal::new(TestBackend::new(WIDTH, 20)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+
+    let rect = h.app.transcript_rect;
+    let press = |column| MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row: rect.y + 1,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    };
+
+    h.app.on_mouse(press(WIDTH - 1));
+    assert!(
+        h.app.selection.is_none(),
+        "the scrollbar column holds no text, so a press there is not a drag"
+    );
+
+    // The last TEXT column still starts one, so the rect was not simply shrunk
+    // out of usefulness.
+    h.app.on_mouse(press(WIDTH - 2));
+    assert!(
+        h.app.selection.is_some(),
+        "the rightmost text column is still selectable"
+    );
+}
+
 /// Dragging across the transcript selects the cells under the pointer and, when
 /// the button comes up, copies what they say — the drag never reaches the tool
 /// block it started on, so selecting text can't toggle a block open.

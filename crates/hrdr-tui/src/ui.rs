@@ -189,7 +189,7 @@ fn draw_selection(f: &mut Frame, app: &mut App) {
 /// Reverse-video the cells the selection covers and return their text, one row
 /// per line with trailing blanks trimmed. Split out from [`draw_selection`] so
 /// the geometry can be tested against a rendered buffer.
-fn paint_selection(buf: &mut Buffer, rect: HitRect, span: SelectionSpan) -> String {
+pub(crate) fn paint_selection(buf: &mut Buffer, rect: HitRect, span: SelectionSpan) -> String {
     let ((from_col, from_row), (to_col, to_row)) = span;
     let last_col = (rect.x + rect.w).saturating_sub(1);
     let mut text = String::new();
@@ -818,22 +818,25 @@ fn clamp_u16(n: usize) -> u16 {
 }
 
 fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
-    // Publish the height so key handlers can compute half-page offsets, and the
-    // whole rect so a mouse drag knows what it may select.
-    app.transcript_height = area.height;
-    app.transcript_rect = crate::app::HitRect {
-        x: area.x,
-        y: area.y,
-        w: area.width,
-        h: area.height,
-    };
-
     // Reserve the rightmost column for the scrollbar. Left padding is applied
     // per-block via pad_line's leading bg-coloured space.
     let text_area = Rect {
         width: area.width.saturating_sub(1),
         ..area
     };
+
+    // Publish the height so key handlers can compute half-page offsets, and the
+    // TEXT rect — not `area` — so a mouse drag can only select cells that hold
+    // text.
+    //
+    // Derived from `text_area` rather than recomputed, because the two used to be
+    // worked out separately and drifted by exactly the scrollbar column: a
+    // selection harvested one column further right than anything was ever drawn,
+    // so every copied line ended in the scrollbar's `│`. That also defeated
+    // `paint_selection`'s trailing-blank trim — a box-drawing character is not
+    // whitespace, so the trim stopped at it and kept every space behind it.
+    app.transcript_height = area.height;
+    app.transcript_rect = crate::app::HitRect::from(text_area);
 
     // A block is laid out against `app` (the header reads live session state), so
     // the frame *reads* everything it needs here and hands the writes back below —
