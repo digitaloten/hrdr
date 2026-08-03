@@ -11741,6 +11741,138 @@ mod tests {
             }
         }
 
+        /// A delegated agent's compaction keeps EXACTLY the tail
+        /// [`super::mega_turn_tail_start`] chose — not merely *a* smaller
+        /// history.
+        ///
+        /// Every sub-agent's history is one user turn followed by tool
+        /// round-trips, so the mega-turn split is the only thing that can
+        /// choose its tail, and "it shrank" is satisfied by a tail that is one
+        /// message or the whole turn alike. What matters to the sub-agent that
+        /// resumes is which messages survived: the boundary the split picked,
+        /// with nothing before it and nothing after it dropped.
+        #[tokio::test]
+        async fn a_delegated_agents_compaction_keeps_exactly_the_intended_tail() {
+            let server = MockServer::start(vec![MockResp::Sse(vec![
+                text_chunk("s1", "Summary of the tool work so far."),
+                stop_chunk("s1"),
+                "[DONE]".to_string(),
+            ])])
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(AgentConfig {
+                delegated: true,
+                ..test_cfg(server.base_url(), dir.path())
+            })
+            .unwrap();
+            agent.messages.push(ChatMessage::user("do the big task"));
+            let big = "x".repeat(20_000); // ~5000 tokens each (len/4)
+            for i in 0..6 {
+                let id = format!("call{i}");
+                agent.messages.push(super::assistant_with_calls(&[&id]));
+                agent
+                    .messages
+                    .push(ChatMessage::tool_result(&id, big.clone()));
+            }
+
+            // The tail the split picks, computed against the same history the
+            // compaction is about to read.
+            let tail_start =
+                super::mega_turn_tail_start(agent.messages(), 1, agent.preserve_recent_tokens);
+            assert!(
+                tail_start > 1 && tail_start < agent.messages.len(),
+                "precondition: the split found a boundary inside the turn, got {tail_start}"
+            );
+            let expected: Vec<Option<String>> = agent.messages[tail_start..]
+                .iter()
+                .map(|m| m.content.clone())
+                .collect();
+
+            agent
+                .compact(crate::CompactionReason::ContextOverflow, None)
+                .await
+                .expect("compacting a delegated agent's history must succeed");
+
+            // [system, summary, …exactly that tail].
+            assert_eq!(agent.messages[0].role, Role::System);
+            assert_eq!(
+                agent.messages[1].origin,
+                crate::MessageOrigin::Summary(crate::CompactionReason::ContextOverflow)
+            );
+            let kept: Vec<Option<String>> = agent.messages[2..]
+                .iter()
+                .map(|m| m.content.clone())
+                .collect();
+            assert_eq!(
+                kept, expected,
+                "the tail must be the one the split chose, message for message"
+            );
+            assert_ne!(
+                agent.messages[2].role,
+                Role::Tool,
+                "the tail must not open on a result torn from its call"
+            );
+        }
+
+        /// A delegated agent compacts through the SAME code path as the main
+        /// agent.
+        ///
+        /// Context management is the agent's own business, not a feature of
+        /// whatever is watching it, and the whole sub-agent design rests on a
+        /// sub-agent being an agent. Nothing structural stops someone adding a
+        /// `if self.delegated` branch to `compact` — this is what would go red
+        /// if they did: identical histories through identical responses have to
+        /// come out identical.
+        #[tokio::test]
+        async fn a_delegated_agent_and_a_main_agent_compact_identically() {
+            let responses = || {
+                vec![MockResp::Sse(vec![
+                    text_chunk("s1", "A summary."),
+                    stop_chunk("s1"),
+                    "[DONE]".to_string(),
+                ])]
+            };
+            let compacted = async |delegated: bool| -> Vec<(Role, Option<String>)> {
+                let server = MockServer::start(responses()).await;
+                let dir = tempfile::tempdir().unwrap();
+                let mut agent = Agent::new(AgentConfig {
+                    delegated,
+                    ..test_cfg(server.base_url(), dir.path())
+                })
+                .unwrap();
+                for i in 0..8 {
+                    agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                    agent
+                        .messages
+                        .push(ChatMessage::assistant(format!("reply {i}")));
+                }
+                agent
+                    .compact(crate::CompactionReason::ContextFilling, None)
+                    .await
+                    .expect("compaction succeeds");
+                // Everything compaction WROTE — the summary and the tail. The
+                // system prompt is excluded because it legitimately differs:
+                // a delegated agent is told it is one. What must not differ is
+                // what compaction does with the history.
+                agent.messages[1..]
+                    .iter()
+                    .map(|m| (m.role, m.content.clone()))
+                    .collect()
+            };
+
+            let main = compacted(false).await;
+            let sub = compacted(true).await;
+            assert!(
+                main.len() > 1,
+                "precondition: a tail was kept, not just a summary"
+            );
+            assert_eq!(
+                main, sub,
+                "a sub-agent must compact exactly as the main agent does"
+            );
+        }
+
         // ── overflow retry fails clearly instead of looping (Part B) ──────────
 
         /// REGRESSION: when compaction cannot shrink the history at all (nothing
