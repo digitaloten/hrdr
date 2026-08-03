@@ -19,22 +19,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cannot drift apart again; pressing on the scrollbar column starts no
   selection, and the rightmost text column still does.
 
-- **A `task` block no longer shows blank `cwd` and `model` rows.** Models
-  routinely send `""` for an optional parameter they do not want, and `task`
-  already reads `""` and `null` exactly as absent — `cwd` falls back to the
-  delegating agent's directory, `model` to the configured sub-agent model. The
-  block rendered them anyway, as a key with nothing beside it, which reads as an
-  argument that was set to nothing rather than a default in force. Both rows are
-  now omitted when left to their defaults, and still shown whenever a value was
-  actually passed. The model the run went to is on the `↳ delegated to …` line
-  under the block, as before.
-
-  Scoped to `task` and to those two keys on purpose: `replace` renders through
-  the same generic path, and an empty `new_string` there is the entire point of
-  the call — it deletes what it matched — so a blanket rule would have hidden a
-  real edit.
-
 ### Added
+
+- **A tool call records the defaults it actually ran with.** A call is stored
+  and read back out of a session file months later, and recording only what the
+  model typed meant the reader had to know what the defaults were at the time —
+  so the moment a default changed, every old session quietly started describing
+  itself with the new value. Every optional argument a call falls back on is now
+  frozen into the record as the call is made. A `task` block that names neither
+  shows the directory it ran in and the model it resolved to, rather than two
+  blank rows; blocks whose display picks named fields (`read`, `grep`, `shell`
+  and the rest) look exactly as before.
+
+  Constants are declared as `"default"` in each tool's schema, so the model sees
+  them too, and values only the call can know — `task`'s cwd and resolved model,
+  `fetch`'s output cap — come from a `dynamic_arg_defaults` hook. The check that
+  keeps this honest is derived from each schema rather than from a list, so a
+  new optional parameter fails the build until its default is declared; adding
+  it found 28 arguments across eleven tools that recorded nothing. `search`'s
+  result count and cap became named constants in the same pass, so its schema
+  and the code applying them are one value rather than two that can drift.
 
 - **Up on an empty input takes a queued message back to edit.** Submitting while
   a reply is running queues the message, and until now the only way to change
