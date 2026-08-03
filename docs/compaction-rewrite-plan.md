@@ -311,21 +311,27 @@ mid-turn rather than opening one (`turn_loop.rs`:
   timing problem. That is an operational guarantee, not a property of the
   message, so it does not belong in an origin marker.
 
-### Decide before doing it: the serialized names change
+### The serialized names change — CLEAN BREAK, decided 2026-08-04 by the owner
 
 `persisted_messages` writes `origin` into session files whenever it differs from
 `User`, so sessions already on disk carry the OLD variant names. After this
-change, deserializing one is an unknown-variant error — which fails the whole
-session load, not just that message.
+change, deserializing one is an unknown-variant error, which fails the whole
+session load rather than that one message.
 
-The standing rule is **no migration or back-compat fallback before 1.0** — clean
-breaks, delete old-format code when found — so the default answer is to accept
-it. Note the blast radius differs from a config key (as `auto_prune` was): these
-are session files the owner may be actively resuming, and the failure is a load
-error rather than a warning. The one-line alternative is a serde alias per
-variant, which is a back-compat affordance the rule points away from. **Owner's
-call — but doing all three changes in ONE commit makes it a single break instead
-of three, which is the main reason to sequence it here.**
+**Accepted, with no serde alias.** This follows the standing pre-1.0 rule —
+clean breaks, no migration or back-compat fallback, and no bespoke "old form"
+error either. An alias was considered and declined: it is precisely the
+compatibility shim the rule exists to keep out, and carrying one for a variant
+nothing reads would outlive the reason for it.
+
+Two consequences to accept knowingly, since this is sharper than the
+`auto_prune` break shipped the same day (a config key, with an obvious fix):
+
+- Sessions containing a `Steering` or `BackgroundResult` message will not
+  resume. The failure is a load error, not a warning.
+- **This is the reason all three enum changes go in ONE commit.** Done
+  separately they would be three separate breaks against the same files; done
+  together they are one.
 
 ## Live defect, independent of the rewrite
 
