@@ -1479,6 +1479,7 @@ mod tests {
         assert_eq!(builtin_catalog_key("zen"), Some("opencode"));
         assert_eq!(builtin_catalog_key("go"), Some("opencode-go"));
         assert_eq!(builtin_catalog_key("claude"), Some("anthropic"));
+        assert_eq!(builtin_catalog_key("deepseek"), Some("deepseek"));
         assert_eq!(builtin_catalog_key("OpenAI"), Some("openai")); // case-insensitive
         assert_eq!(builtin_catalog_key("local"), None);
         assert_eq!(builtin_catalog_key("mycustom"), None);

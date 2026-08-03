@@ -2258,6 +2258,13 @@ mod cache_mode_tests {
         );
         assert!(!is_anthropic_native("https://api.together.xyz/v1"));
 
+        // DeepSeek caches automatically with no `cache_control` support — the
+        // marker buys nothing, so the deliberate answer is `Off`: nothing sent.
+        assert_eq!(
+            resolve_cache_mode(None, "https://api.deepseek.com"),
+            CacheMode::Off
+        );
+
         // A lookalike host must not satisfy the `.anthropic.com` suffix check.
         assert_eq!(
             resolve_cache_mode(None, "https://notanthropic.com/v1"),

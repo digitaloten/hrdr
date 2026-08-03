@@ -2805,6 +2805,10 @@ mod tests {
             wire_protocol("http://localhost:1234/v1"),
         );
         assert_eq!(wire_protocol("http://localhost:1234/v1"), "OpenAI");
+        // DeepSeek's OpenAI-compatible API is spoken over the generic
+        // chat-completions wire — never the native Anthropic Messages API.
+        assert_eq!(wire_protocol("https://api.deepseek.com"), "OpenAI");
+        assert!(!is_anthropic_backend("https://api.deepseek.com"));
     }
 
     // ── Log hardening ───────────────────────────────────────────────────
