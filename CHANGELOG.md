@@ -66,6 +66,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the invariant hold by construction: exactly one summary is in history at any
   time, always covering the session start through the verbatim tail.
 
+- **An overflow-driven compaction no longer drops the previous summary.** When
+  the summarization request is itself too big, compaction shrinks what the
+  summarizer sees — first eliding bulky tool results, then keeping only the most
+  recent half, quarter or eighth of the conversation. Those windows cut the
+  front of the history, which is exactly where the last compaction's summary
+  sits, and the new summary replaces it regardless. So a session compacted twice
+  under pressure silently lost everything before the first compaction's tail:
+  nothing errored, the history just started later than it had. The summary is
+  now carried into every shrunk window, and is charged against the same size
+  estimate that picks the stage.
+
 - **Compaction no longer spends the verbatim tail on messages the user never
   sent.** The tail-window walk kept the last `compaction_tail_turns` turns and
   called any `role:"user"` message a turn — but hrdr writes user-role messages

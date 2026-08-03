@@ -272,8 +272,42 @@ fn compact_stage_history(
     let elided = elided.get_or_insert_with(|| elide_tool_results(full));
     match stage {
         1 => elided.clone(),
-        n => tail_window(elided, 1 << (n - 1)),
+        n => carry_prior_summary(elided, tail_window(elided, 1 << (n - 1))),
     }
+}
+
+/// Put the previous compaction's summary back at the front of a `window` that
+/// dropped it.
+///
+/// The shrink stages keep the most recent slice of the history, so they drop
+/// its front — and that is exactly where the last compaction's summary sits (it
+/// is always the message straight after the system prompt, so always `full[0]`
+/// here). Dropping it does not shrink anything, because [`Agent::compact`]
+/// replaces that message unconditionally: the summarizer would write a new
+/// summary having never seen the old one, and everything before the previous
+/// compaction's tail would be gone from the session for good. That is a silent
+/// loss — nothing errors, the history simply starts later than it did.
+///
+/// Carrying it costs one message on a request that is being shrunk precisely
+/// because it is too big; the summary is bounded by the summarizer's own output
+/// and is the only record of the older half of the session, which makes it the
+/// last thing worth dropping rather than the first.
+fn carry_prior_summary(full: &[ChatMessage], window: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    // `tail_window` returns a suffix, so an equal length means nothing was cut
+    // and the summary is already in there.
+    if window.len() >= full.len() {
+        return window;
+    }
+    let Some(summary) = full
+        .first()
+        .filter(|m| matches!(m.origin, MessageOrigin::Summary(_)))
+    else {
+        return window;
+    };
+    let mut carried = Vec::with_capacity(window.len() + 1);
+    carried.push(summary.clone());
+    carried.extend(window);
+    carried
 }
 
 /// Whether `msg` begins a real user turn.
@@ -1053,6 +1087,71 @@ mod tests {
         let stage3 = compact_stage_history(3, &full, &mut elided);
         assert!(stage2.len() <= stage1.len());
         assert!(stage3.len() <= stage2.len());
+    }
+
+    /// A shrink stage drops the front of the history — but never the previous
+    /// compaction's summary.
+    ///
+    /// That summary is the only record of everything before the last
+    /// compaction, and `compact` replaces it whatever the summarizer saw. Let a
+    /// shrink window drop it and the older half of the session is gone with
+    /// nothing erroring: the history simply starts later than it used to.
+    #[test]
+    fn a_shrink_stage_carries_the_previous_summary_it_would_otherwise_drop() {
+        let mut full = vec![ChatMessage {
+            origin: MessageOrigin::Summary(CompactionReason::ContextOverflow),
+            ..ChatMessage::user("EVERYTHING BEFORE THE LAST COMPACTION")
+        }];
+        full.extend((0..16).map(|i| {
+            if i % 2 == 0 {
+                sized(Role::User, 100)
+            } else {
+                sized(Role::Tool, 1_000)
+            }
+        }));
+
+        let carried = |stage: usize| -> Vec<ChatMessage> {
+            let mut elided = None;
+            compact_stage_history(stage, &full, &mut elided)
+        };
+        // Stages 0 and 1 send every message, so the summary is already there.
+        for stage in 0..=1 {
+            assert_eq!(carried(stage).len(), full.len(), "stage {stage}");
+        }
+        // The windowing stages cut the front. Each must still open with the
+        // summary, and must not have grown a second copy of it.
+        for stage in 2..=MAX_COMPACT_STAGE {
+            let history = carried(stage);
+            assert!(
+                history.len() < full.len(),
+                "precondition: stage {stage} shrinks the history"
+            );
+            assert_eq!(
+                history[0].origin,
+                MessageOrigin::Summary(CompactionReason::ContextOverflow),
+                "stage {stage} dropped the only record of the older session"
+            );
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|m| matches!(m.origin, MessageOrigin::Summary(_)))
+                    .count(),
+                1,
+                "stage {stage} carried it twice"
+            );
+        }
+
+        // A history with no prior summary is untouched: nothing is prepended to
+        // the window just because it was cut.
+        let plain: Vec<ChatMessage> = full[1..].to_vec();
+        let mut elided = None;
+        let history = compact_stage_history(MAX_COMPACT_STAGE, &plain, &mut elided);
+        assert!(
+            history
+                .iter()
+                .all(|m| !matches!(m.origin, MessageOrigin::Summary(_))),
+            "nothing to carry, nothing carried"
+        );
     }
 
     /// The reinjected summary is framed as a RECORD, and says which of the two
