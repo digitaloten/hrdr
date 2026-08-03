@@ -133,6 +133,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`deepseek` is now a built-in provider** — `deepseek://model` talks to
+  DeepSeek's own API (`https://api.deepseek.com`) with `DEEPSEEK_API_KEY` over
+  Bearer. `/login deepseek` takes a plain API key (DeepSeek has no OAuth;
+  browser-login users keep the OpenRouter path). Context caching is automatic
+  and `reasoning_effort` is supported via `/effort`; on tool-call turns the
+  assistant's `reasoning_content` is passed back, which DeepSeek requires (400
+  without it). Model context windows, prices and effort levels come from the
+  models.dev catalog (`deepseek` key).
+
 - **Every compaction now says what triggered it and what the prompt cache
   saved.** The transcript line names the trigger (`/compact`, a filling context,
   or an overflow rescue), the message counts, the summarization request's prompt

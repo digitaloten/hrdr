@@ -249,7 +249,7 @@ pub(crate) fn unreachable_guidance(base_url: &str, err: &str) -> String {
          hrdr talks to a running OpenAI-compatible server. Start one listening at \
          {base_url} — e.g. `infr serve <model> --addr 127.0.0.1:8080` or `llama-server \
          -hf <ref> --jinja --port 8080` — and it connects on your next message. Or run \
-         `/login` to set up a hosted provider (zen/openai/openrouter/claude) and its API key."
+         `/login` to set up a hosted provider (zen/openai/openrouter/claude/deepseek) and its API key."
     )
 }
 

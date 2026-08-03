@@ -340,6 +340,7 @@ Built-in presets:
 | `openai`               | `https://api.openai.com/v1`    | `OPENAI_API_KEY`     |
 | `openrouter`           | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
 | `claude` / `anthropic` | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY`  |
+| `deepseek`             | `https://api.deepseek.com`     | `DEEPSEEK_API_KEY`   |
 | `local` / `infr`       | `http://localhost:8080/v1`     | `HRDR_API_KEY`       |
 
 (`claude` / `anthropic` talks to Anthropic's **native Messages API**
@@ -350,6 +351,13 @@ selection is automatic from the endpoint host, so a `[providers.*]` pointed at
 `thinking` budget (scaled from `max_tokens`; streamed to the reasoning pane),
 and `max_tokens` (config / `$HRDR_MAX_TOKENS`, default 8192) caps output — raise
 it for longer replies and deeper thinking. `local` needs no key.)
+
+(`deepseek` talks to DeepSeek's own API, OpenAI-compatible. Context caching is
+automatic — cache hits are billed at the reduced rate with nothing to configure
+— and thinking mode is on by default, with effort selectable via `/effort`
+(`reasoning_effort`). `/login deepseek` takes a plain API key
+(`DEEPSEEK_API_KEY`); there is no browser login. Prefer `deepseek://model` for
+DeepSeek's own API; `openrouter://deepseek/...` still works via OpenRouter.)
 
 ```bash
 export OPENCODE_API_KEY=sk-...
