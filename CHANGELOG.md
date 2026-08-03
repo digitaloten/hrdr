@@ -36,7 +36,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replaces it: `auto_compact`, `compaction_reserved`, `compaction_tail_turns`
   and `preserve_recent_tokens` are unchanged and now carry the whole job.
 
+### Added
+
+- **`/cost` and `/status` report what the prompt cache did this session.**
+  `prompt cache: 78% read (120.0k), 30.0k written` — the fraction of measured
+  prompt tokens served from cache, plus the tokens written into it. The rate
+  divides by the prompt tokens of the calls that actually reported cache use,
+  not by every token sent: an endpoint that publishes no cache figures is not an
+  endpoint whose cache is missing, and both commands omit the clause entirely
+  rather than showing a misleading 0%. `/status` appends it to its existing
+  `prompt cache: on|off` line, which said only that the breakpoints were sent.
+
+  `AgentUsage` carries the counters (`cache_read_tokens`, `cache_write_tokens`,
+  `cache_measured_tokens`, and `cache_hit_rate()`), so they exist per agent with
+  no UI attached and a sub-agent's are its own.
+
 ### Fixed
+
+- **A compaction's model calls are counted.** `account_usage` ran for them — so
+  their cost reached the session total and the `max_cost` cap — but no `Usage`
+  event was emitted, and hrdr's token counters only ever count what they are
+  handed as an event. So every compaction's tokens were missing from `/cost` and
+  `/status`, and a summarization request carries the whole history: the gap was
+  made of a session's largest calls and grew with each one. Compaction now emits
+  one `Usage` per attempt (a retry after the model answered with a tool call is
+  a billed call too). The summary's text is still never surfaced.
+
+- **A compaction's cache fraction can be read.** The notice printed a percentage
+  with nothing to interpret it by, and the same number meant opposite things:
+  below the full-history stage the request rewrites message bodies, so a
+  near-zero reading is the shrink ladder working as designed, while after a
+  retry a near-total reading may be the identical previous request warming the
+  cache rather than the session's prefix matching. The line now names the shrink
+  stage and the attempt count when they are not the trivial values —
+  `context window exceeded — compacted 61 → 8 messages · 2 attempts, quarter-history stage · summary call: …`.
 
 - **Compaction stops paying full price for the whole conversation.** The
   summarization call used to be a one-off request: a dedicated summarizer system
