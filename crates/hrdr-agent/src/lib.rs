@@ -11176,6 +11176,112 @@ mod tests {
             );
         }
 
+        /// The compaction request IS an ordinary turn, so the provider's prefix
+        /// cache still matches it.
+        ///
+        /// This is the whole economic case for compacting in place, and a cache
+        /// hit is not unit-testable — it needs a real provider and two
+        /// sequential requests. What IS testable is the property that causes
+        /// one: same system prompt, same `tools[]`, and a messages array that
+        /// extends the previous request's rather than replacing it. This goes
+        /// red the moment anyone reintroduces a separate summarizer prompt or
+        /// strips the tools, which is the regression that would silently put
+        /// the old full-rate upload back.
+        #[tokio::test]
+        async fn the_compaction_request_keeps_the_live_prefix_byte_for_byte() {
+            let bodies: Arc<std::sync::Mutex<Vec<String>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = bodies.clone();
+            let server = MockServer::start_with_body_hook(
+                vec![
+                    MockResp::Sse(vec![
+                        text_chunk("s1", "done"),
+                        stop_chunk("s1"),
+                        "[DONE]".to_string(),
+                    ]),
+                    MockResp::Sse(vec![
+                        text_chunk("s2", "A summary."),
+                        stop_chunk("s2"),
+                        "[DONE]".to_string(),
+                    ]),
+                ],
+                move |_idx, body| seen.lock().unwrap().push(body.to_string()),
+            )
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+            agent.run_input("do the thing", |_| {}).await.unwrap();
+            agent.compact(None).await.expect("compaction succeeds");
+
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 2, "one normal turn, then one compaction");
+            let turn: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+            let compaction: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+
+            assert!(
+                turn["tools"].as_array().is_some_and(|t| !t.is_empty()),
+                "precondition: the normal turn advertises tools"
+            );
+            assert_eq!(
+                compaction["tools"], turn["tools"],
+                "the compaction request carries the session's own tools[]"
+            );
+
+            let turn_msgs = turn["messages"].as_array().unwrap();
+            let compaction_msgs = compaction["messages"].as_array().unwrap();
+            assert_eq!(
+                compaction_msgs[0], turn_msgs[0],
+                "the session's own system prompt, not a summarizer one"
+            );
+            // The turn's whole request is a PREFIX of the compaction request:
+            // the cache matches up to where they diverge, so anything short of
+            // this is paid for at full rate.
+            assert!(
+                compaction_msgs.len() > turn_msgs.len(),
+                "compaction extends the history, it does not replace it"
+            );
+            assert_eq!(
+                &compaction_msgs[..turn_msgs.len()],
+                &turn_msgs[..],
+                "the compaction request must extend the previous request byte for byte"
+            );
+            // …and what it adds is the instruction, and nothing else.
+            let added = &compaction_msgs[turn_msgs.len()..];
+            let (last, appended) = added.split_last().unwrap();
+            assert_eq!(
+                appended.len(),
+                1,
+                "only the assistant's reply and the instruction were added: {added:?}"
+            );
+            assert_eq!(appended[0]["role"], "assistant");
+            assert_eq!(last["role"], "user");
+            assert!(
+                last["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Summarize the conversation so far"),
+                "the appended message is the compaction instruction: {last}"
+            );
+
+            // The instruction exists only in the request — a fake user turn
+            // asking for a summary must never end up in the session.
+            assert!(
+                !agent.messages.iter().any(|m| m
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("Summarize the conversation so far")),
+                "the appended instruction must not survive into the rebuilt history"
+            );
+        }
+
         /// The summary is a distinguished message, and there is never more than
         /// one of it.
         ///

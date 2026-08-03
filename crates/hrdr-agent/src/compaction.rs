@@ -16,7 +16,7 @@ use hrdr_llm::ToolDef;
 
 use crate::{
     Agent, AgentEvent, AgentRegistry, ChatMessage, MessageOrigin, RetryBudget, Role, drain_stream,
-    flatten_tool_protocol, is_context_overflow,
+    is_context_overflow,
 };
 
 /// The context-usage token count at which proactive compaction fires:
@@ -70,16 +70,17 @@ impl Drop for CompactingGuard {
     }
 }
 
-/// System prompt for the one-off compaction (summarization) call.
-const COMPACT_SYSTEM: &str = "\
-You are summarizing a software-engineering conversation between a user and an AI \
-coding agent so it can continue in a fresh context with nothing important lost. \
-Be precise, technical, and exhaustive about concrete details — vague summaries are \
-useless here.";
+/// How many times the model may answer the compaction request with a tool call
+/// before compaction gives up. The request carries the session's `tools[]` (see
+/// [`Agent::compact`]), so a tool call is possible even though the instruction
+/// forbids it; it is never executed, only asked again.
+const COMPACT_TOOL_CALL_ATTEMPTS: usize = 2;
 
 /// User-turn instruction that triggers the structured summary.
 const COMPACT_TRIGGER: &str = "\
-Summarize the conversation so far. The summary REPLACES the full history, so it must \
+Summarize the conversation so far. Write the summary as your reply: return prose only, \
+and do not call a tool — a tool call cannot be a summary and will not be run. \
+The summary REPLACES the full history, so it must \
 let the agent continue seamlessly. Use these sections:
 
 1. **Intent & requirements** — what the user asked for, in their own terms, including \
@@ -115,8 +116,9 @@ const MAX_COMPACT_STAGE: usize = 4;
 const COMPACT_MAX_OUTPUT_TOKENS: u32 = 32_768;
 
 /// Tokens held back from the window when sizing the summarization request: the
-/// output cap above, plus slack for the summarizer's own system prompt, the
-/// trigger, and the estimator's own error.
+/// output cap above, plus slack for the trigger and the estimator's own error.
+/// The system prompt and `tools[]` are charged separately — see
+/// [`Agent::first_viable_compact_stage`]'s `prefix_tokens`.
 const COMPACT_INPUT_HEADROOM: u32 = COMPACT_MAX_OUTPUT_TOKENS + 8_192;
 
 /// The history a given shrink stage sends: the whole head, the head with bulky
@@ -414,20 +416,54 @@ impl Agent {
             }
         }
 
-        // Build a one-off summarization request: a dedicated summarizer system
-        // prompt + the conversation so far (minus its own system prompt) + the
-        // trigger instruction. No tools — we only want prose back.
+        // The request is an ORDINARY turn: the session's own system prompt, its
+        // own `tools[]`, its own history, with the instruction appended as one
+        // more user message. Nothing about its shape differs from the request
+        // sent a moment ago, so the provider's prefix cache still matches and
+        // compaction pays cached rates on the history instead of full rate on
+        // all of it — at the most expensive moment in a session, and again on
+        // each shrink stage.
+        //
+        // It used to be a one-off: a dedicated summarizer system prompt, the
+        // head only, and no `tools[]` at all. Four independent reasons the
+        // cached prefix could not match.
+        //
+        // `tool_choice` is deliberately NOT used to forbid a tool call.
+        // Anthropic's cache hierarchy is tools → system → messages, and their
+        // documentation has `tool_choice` invalidating message blocks — it
+        // would keep the cheap half valid and throw away the expensive half,
+        // exactly backwards for a long conversation. The instruction plus the
+        // guard on the response below cover it, and cost nothing anywhere.
         let mut trigger = COMPACT_TRIGGER.to_string();
         if let Some(extra) = instructions.map(str::trim).filter(|s| !s.is_empty()) {
             trigger.push_str("\n\nAdditional instructions for the summary, follow them closely:\n");
             trigger.push_str(extra);
         }
+        // The whole history, not just the head. Truncating at `tail_start`
+        // would end the request in the middle of the conversation, where no
+        // earlier request ended and so no cached prefix reaches — the point of
+        // this call is that its prefix is the one that was just cached. The
+        // tail being summarized as well as kept verbatim is redundant, not
+        // wrong: the summary covers the session and the tail follows it in
+        // full.
+        //
+        // A `/compact` landing right after an Esc-cancelled tool round leaves
+        // an assistant `tool_calls` message with no results, which strict
+        // servers reject. Backfill the stubs the same way the turn loop does at
+        // turn start, rather than flattening the tool protocol out of the
+        // request: flattening rewrote every message and so guaranteed a cache
+        // miss, and with the session's `tools[]` now present there is nothing
+        // to flatten it for.
+        crate::turn_loop::repair_dangling_tool_calls(&mut self.messages);
+        let defs = self.tools.defs();
         // When compaction is overflow-triggered, the summarization request is
-        // itself near the limit (versus the failed request it only drops the
-        // `tools[]` block). If it overflows too, shrink what the summarizer
+        // itself over the limit. If it overflows, shrink what the summarizer
         // sees and retry: first elide bulky tool results, then keep only the
-        // most recent half/quarter/eighth of the conversation.
-        let full: Vec<ChatMessage> = self.messages[1..tail_start].to_vec();
+        // most recent half/quarter/eighth of the conversation. Every stage
+        // above 0 rewrites message bodies and so gives the cache up — which is
+        // the cost of a rescue, and the reason proactive compaction (which
+        // fires while stage 0 still fits) is where the saving lands.
+        let full: Vec<ChatMessage> = self.messages[1..].to_vec();
         // Elision is O(history) and allocates a copy of it; the stages above 0
         // all start from the same elided copy, so build it at most once instead
         // of once per attempt (stage 3 used to rebuild it, then window it).
@@ -440,7 +476,11 @@ impl Agent {
         // under-counts (~4 bytes/token, and code is denser than that), so a
         // wrong guess errs toward starting too early, which the escalation
         // below still handles: this only skips stages that plainly cannot fit.
-        let mut stage = self.first_viable_compact_stage(&full, &mut elided);
+        // The prefix rides on every stage and cannot be shrunk by any of them,
+        // so it comes off the budget rather than being sized against it.
+        let prefix_tokens = estimate_tokens_in_messages(&self.messages[..1])
+            .saturating_add(estimate_tokens_in_tools(&defs));
+        let mut stage = self.first_viable_compact_stage(&full, &mut elided, prefix_tokens);
         // Bounded retry (with the same backoff the main turn loop uses) for a
         // transient 429/503 hitting the summarization request itself — without
         // this, compaction (often triggered *because* the model is under
@@ -454,24 +494,43 @@ impl Agent {
         // none. The budgets that must not stack are the ones retrying the SAME
         // request (connect and drain) — see `connect_and_drain`.
         let mut budget = RetryBudget::new(self.retry_policy);
+        // Attempts spent on a model that answered with a tool call instead of
+        // the summary. Counted apart from `budget`, which only retries
+        // transient network and server failures — this is neither.
+        let mut tool_call_attempts = 0usize;
         let summary = loop {
             let history = compact_stage_history(stage, &full, &mut elided);
-            // The summarizer is sent no `tools` (it must answer in prose), but
-            // `history` still carries tool_use/tool_result blocks from the
-            // conversation being summarized — including, if a `/compact` lands
-            // right after an Esc-cancelled tool round, a dangling `tool_calls`
-            // message with no matching result. The native Anthropic backend
-            // 400s on either shape unless `tools` is defined, so flatten the
-            // protocol out of the request entirely rather than repairing it.
-            let history = flatten_tool_protocol(&history);
             let mut req = Vec::with_capacity(history.len() + 2);
-            req.push(ChatMessage::system(COMPACT_SYSTEM.to_string()));
+            req.push(self.messages[0].clone());
             req.extend(history);
+            // The instruction exists only in this request. The rebuilt history
+            // below is assembled from the system prompt, the summary and the
+            // tail — so a fake "summarize the conversation so far" user turn
+            // cannot survive into the session, which the model would otherwise
+            // read as something the user asked for.
             req.push(ChatMessage::user(trigger.clone()));
             self.budget_preflight().await?;
-            match self.plain_completion(req).await {
-                Ok(s) => break s,
-                Err(e) if is_context_overflow(&e) && stage < 4 => stage += 1,
+            match self.plain_completion(req, &defs).await {
+                Ok(msg) => {
+                    // A tool call returned during compaction is NEVER executed.
+                    // The tools are in the request for the prefix cache, not
+                    // for use: running one here would be a side effect the user
+                    // never asked for, at the worst possible moment in a
+                    // session. Treat it as a failed attempt and ask again.
+                    if msg.tool_calls.is_some_and(|calls| !calls.is_empty()) {
+                        tool_call_attempts += 1;
+                        if tool_call_attempts > COMPACT_TOOL_CALL_ATTEMPTS {
+                            bail!(
+                                "the model answered the compaction request with a tool call \
+                                 {tool_call_attempts} times instead of writing the summary — \
+                                 refusing to replace the conversation"
+                            );
+                        }
+                        continue;
+                    }
+                    break msg.content.unwrap_or_default();
+                }
+                Err(e) if is_context_overflow(&e) && stage < MAX_COMPACT_STAGE => stage += 1,
                 Err(e) => {
                     // Silent: `compact` has no event sink (it is called from
                     // overflow recovery and from `/compact` alike), so the retry
@@ -547,15 +606,23 @@ impl Agent {
     /// `None` window (an endpoint that never said, and no configured value)
     /// means there is nothing to size against: start at 0 and let the escalation
     /// discover the limit the slow way, exactly as before.
+    ///
+    /// `prefix_tokens` is what the request carries no matter which stage it
+    /// sends — the session's system prompt and its `tools[]`. No stage can
+    /// shrink either, so they come off the budget rather than being sized
+    /// against it.
     fn first_viable_compact_stage(
         &self,
         full: &[ChatMessage],
         elided: &mut Option<Vec<ChatMessage>>,
+        prefix_tokens: u32,
     ) -> usize {
         let Some(window) = self.context_window else {
             return 0;
         };
-        let budget = window.saturating_sub(COMPACT_INPUT_HEADROOM);
+        let budget = window
+            .saturating_sub(COMPACT_INPUT_HEADROOM)
+            .saturating_sub(prefix_tokens);
         if budget == 0 {
             // A window smaller than the headroom: nothing can be sized, and
             // guessing the smallest stage would throw away the history for a
@@ -569,8 +636,13 @@ impl Agent {
             .unwrap_or(MAX_COMPACT_STAGE)
     }
 
-    /// Run one no-tools request to completion, returning the streamed text.
-    /// Silent: the shared [`drain_stream`] gets a no-op event sink.
+    /// Run one request to completion, returning the assistant message the model
+    /// streamed back. Silent: the shared [`drain_stream`] gets a no-op event
+    /// sink.
+    ///
+    /// The whole message, not just its text, because the caller has to see
+    /// whether the model called a tool — [`Agent::compact`] sends the session's
+    /// `tools[]` for the prefix cache and must never execute what comes back.
     ///
     /// The output cap is applied to a clone of the live client, so the session's
     /// own parameters remain untouched on success, error, or cancellation.
@@ -582,7 +654,11 @@ impl Agent {
     /// loop terminates because each rejection can be honoured once: a parameter
     /// already dropped makes the helper return `false` and the error propagate.
     /// No other 400 is retried here.
-    async fn plain_completion(&mut self, req: Vec<ChatMessage>) -> Result<String> {
+    async fn plain_completion(
+        &mut self,
+        req: Vec<ChatMessage>,
+        defs: &[ToolDef],
+    ) -> Result<ChatMessage> {
         // Compaction can run before any normal turn (notably `/compact` after
         // resuming a process), so it cannot rely on `connect_stream` having
         // refreshed and injected ChatGPT OAuth. Do it at the actual request
@@ -600,7 +676,7 @@ impl Agent {
                 max_tokens: cap,
                 ..self.client.params().clone()
             });
-            match self.plain_completion_inner(&client, &req, cap).await {
+            match self.plain_completion_inner(&client, &req, defs, cap).await {
                 Err(error) if self.drop_unsupported_param(&error) => continue,
                 result => return result,
             }
@@ -611,16 +687,19 @@ impl Agent {
         &mut self,
         client: &hrdr_llm::Client,
         req: &[ChatMessage],
+        defs: &[ToolDef],
         output_cap: Option<u32>,
-    ) -> Result<String> {
-        let mut stream = client.chat_stream(req, &[]).await?;
+    ) -> Result<ChatMessage> {
+        let mut stream = client.chat_stream(req, defs).await?;
         // The round's generation time is dropped on purpose: a compaction call
         // emits no `Usage` event, so its tokens never reach the turn's
         // throughput either. Counting one without the other would skew it.
         let acc = drain_stream(&mut stream, &mut |_| {}).await?.acc;
-        // A summarization request carries no `tools[]` (see the `&[]` above), so
-        // there is no tool surface in its prompt to estimate.
-        self.account_usage(&acc, 0).await;
+        // The compaction request carries the session's own `tools[]` — the same
+        // surface a normal round pays for, and the same estimate when the server
+        // reports no usage.
+        self.account_usage(&acc, estimate_tokens_in_tools(defs))
+            .await;
         // A summary cut off at the output cap is the one truncation that must
         // never be accepted quietly: this text REPLACES the conversation, so
         // half of it is not a degraded answer but a permanently missing half of
@@ -638,7 +717,7 @@ impl Agent {
                  the conversation with a partial summary"
             );
         }
-        Ok(acc.into_message().content.unwrap_or_default())
+        Ok(acc.into_message())
     }
 
     /// Compact this agent's own history when it is close to filling its context
@@ -795,7 +874,7 @@ mod tests {
     #[test]
     fn first_viable_stage_skips_what_cannot_fit() {
         let mut agent = crate::Agent::new(crate::AgentConfig::default()).unwrap();
-        // ~40k estimated tokens of tool output in the head.
+        // ~40k estimated tokens of tool output in the history.
         let full: Vec<ChatMessage> = (0..10)
             .map(|i| {
                 if i % 2 == 0 {
@@ -809,24 +888,36 @@ mod tests {
         // No window: nothing to size against, so behaviour is unchanged.
         agent.set_context_window(None);
         let mut elided = None;
-        assert_eq!(agent.first_viable_compact_stage(&full, &mut elided), 0);
+        assert_eq!(agent.first_viable_compact_stage(&full, &mut elided, 0), 0);
 
-        // A window with ample room for the whole head still starts at 0.
+        // A window with ample room for the whole history still starts at 0.
         agent.set_context_window(Some(400_000));
         let mut elided = None;
-        assert_eq!(agent.first_viable_compact_stage(&full, &mut elided), 0);
+        assert_eq!(agent.first_viable_compact_stage(&full, &mut elided, 0), 0);
 
-        // A window that the full head cannot fit skips straight past stage 0.
+        // A window that the full history cannot fit skips straight past stage 0.
         agent.set_context_window(Some(COMPACT_INPUT_HEADROOM + 20_000));
         let mut elided = None;
-        let stage = agent.first_viable_compact_stage(&full, &mut elided);
+        let stage = agent.first_viable_compact_stage(&full, &mut elided, 0);
         assert!(stage > 0, "a doomed stage 0 must be skipped, got {stage}");
         assert!(stage <= MAX_COMPACT_STAGE);
+
+        // The prefix — system prompt and tools — rides on every stage, so it
+        // comes off the budget: a window that fits the history alone does not
+        // fit it once the prefix is charged.
+        agent.set_context_window(Some(COMPACT_INPUT_HEADROOM + 60_000));
+        let mut elided = None;
+        assert_eq!(agent.first_viable_compact_stage(&full, &mut elided, 0), 0);
+        let mut elided = None;
+        assert!(
+            agent.first_viable_compact_stage(&full, &mut elided, 40_000) > 0,
+            "the prefix must be charged against the same budget"
+        );
 
         // A window smaller than the headroom has nothing to size against and
         // must not throw the history away on a guess.
         agent.set_context_window(Some(1_000));
         let mut elided = None;
-        assert_eq!(agent.first_viable_compact_stage(&full, &mut elided), 0);
+        assert_eq!(agent.first_viable_compact_stage(&full, &mut elided, 0), 0);
     }
 }

@@ -38,6 +38,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Compaction stops paying full price for the whole conversation.** The
+  summarization call used to be a one-off request: a dedicated summarizer system
+  prompt instead of the session's, only the head of the history, and no
+  `tools[]` at all — four independent reasons the provider's prompt cache could
+  not match it. So compaction uploaded the entire history at full rate, at the
+  most expensive moment in a session, and again on each shrink stage. It is now
+  an ordinary turn: the session's own system prompt, its own `tools[]`, its own
+  history, with the summarization instruction appended as one more user message.
+  The prefix is the one that was just cached. A tool call coming back from that
+  request is never executed — it is a failed attempt, and compaction asks again.
+
 - **A second compaction no longer summarizes the first summary.** The summary
   went into history as a plain user message, marked apart only by its prose
   opening, so once it was old enough to fall in the head the next compaction
