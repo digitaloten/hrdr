@@ -139,6 +139,14 @@ turn-boundary defect, and work items 1–3 shipped 2026-08-04; items 4 and 5 are
 below, both blocked on a decision rather than on effort. Delete the plan file
 when they close, keeping only what still binds future work.
 
+An audit of the shipped work against the plan, same day, raised ten gaps. Eight
+are closed: the removed `max_tokens` override (see the standing constraint
+below), the untested never-execute guard, the previous summary dropped by the
+shrink stages, the missing sub-agent tail assertion, the unscoped cache figure
+in the notice, the unenforced one-code-path claim, and the two below that were
+considered and declined. The remaining two need a decision and are recorded
+under _Audit items needing a decision_.
+
 ### Item 4 — trigger on the body, not the total (BLOCKED, needs a decision)
 
 The plan says hrdr measures total prompt tokens against the window while the
@@ -238,6 +246,53 @@ reintroducing a compaction-only cap.
 Guarded by `the_compaction_request_keeps_the_live_prefix_byte_for_byte`, which
 asserts the two requests' `max_tokens` match, and by the comment in
 `Agent::plain_completion`.
+
+### Audit items needing a decision
+
+**The notice reports only the attempt that succeeded.** `CompactionSpend` is
+overwritten by each attempt in `Agent::plain_completion_inner`, so after an
+overflow escalation `CompactionReport` carries the last stage's figures and the
+earlier stages' vanish from the notice — understating the cost exactly when
+compaction was most expensive. Nothing is unbilled: `Agent::account_usage` adds
+every attempt to `cost_total`, so the session ledger and the `max_cost` ceiling
+already see them. Only the transcript line is short. Options: accumulate prompt,
+output and cost across attempts while keeping the cache fraction from the
+successful attempt alone (the failed stages' cache readings describe requests
+that were rejected, so averaging them in would be meaningless); or say how many
+attempts it took and leave the figures as they are; or leave it, on the grounds
+that the ledger is the number that matters and the notice is about whether the
+cache is working.
+
+**The summarization request sends the whole history, not just the head.** So the
+verbatim tail is summarized AND kept, and the model that resumes sees the same
+events at two levels of detail — mitigated, not removed, by
+`continuation_framing` telling it the verbatim tail is authoritative. The reason
+recorded in `Agent::compact` is that truncating at `tail_start` would end the
+request where no earlier request ended and so reach no cached prefix. **That
+reasoning is worth re-checking before acting on it either way**: a head-only
+request is still a byte-prefix of the request that was just cached, so whether
+it hits depends on where the provider's cache breakpoints sit, not on where the
+request ends. Nobody has measured it. Deciding needs the breakpoint behaviour
+confirmed against Anthropic's docs and then a real two-request comparison —
+which is the same setup the cache-fraction notice was built to make visible.
+
+### Audit items considered and declined
+
+**The tool-call retry does not go through `RetryBudget`.** The plan's letter
+says it should; `compact` counts its own `tool_call_attempts` instead.
+Deliberate — `RetryBudget::retry` only retries transient network and server
+failures and refuses everything else, so a model answering with a tool call
+would fall straight through it and abort the compaction on the first offence.
+The separate counter is bounded by `COMPACT_TOOL_CALL_ATTEMPTS` and is now
+covered by `compaction_gives_up_on_a_model_that_only_ever_calls_tools`.
+
+**"Logged AND persisted" has no log to write to.** `hrdr-agent` takes no
+`tracing` or `log` dependency at all, and adding one for a single line is not
+worth a dependency the project has otherwise done without. The transcript is the
+log: every compaction emits `AgentEvent::Notice(report.notice())`, and the
+trigger is persisted with the summary itself as
+`MessageOrigin::Summary(reason)`, so a resumed session still knows why its
+history was replaced.
 
 ### Noticed while working, not fixed
 

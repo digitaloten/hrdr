@@ -102,9 +102,8 @@ impl Agent {
     /// is part of the prompt on every call, so the no-usage fallback below is
     /// short by thousands of tokens without it. Callers compute it once per turn
     /// from the defs they already hold, and pass `0` for a round that sends no
-    /// tools at all (the wrap-up round, the summarizer call). It is ignored
-    /// entirely when the server reports usage: that number already counts the
-    /// tools.
+    /// tools at all (the wrap-up round). It is ignored entirely when the server
+    /// reports usage: that number already counts the tools.
     pub(crate) async fn account_usage(
         &mut self,
         acc: &Accumulator,
