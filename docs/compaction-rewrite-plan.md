@@ -108,9 +108,9 @@ conversation…"_. Two consequences, both live today:
   preferring whole turns over codex's user-messages-only rebuild.
 
 The fix uses a seam hrdr already has: `MessageOrigin` distinguishes `User` from
-`Steering` from `BackgroundResult` — the same shape of problem, a message that
-is structurally a user turn without being the user speaking. Add a `Summary`
-variant, then:
+`Nudge` from `Tool` (post-item-0 names) — the same shape of problem, a message
+that is structurally a user turn without being the user speaking. Add a
+`Summary` variant, then:
 
 1. **Never a turn boundary.** `compaction_tail_start` skips it when counting
    turns, so the tail keeps two REAL turns.
@@ -268,41 +268,64 @@ so it does not pay for doomed uploads. That stays too.
 
 ---
 
-## Item 0 — rename `MessageOrigin::BackgroundResult` to `Tool`
+## Item 0 — settle `MessageOrigin` first
 
-**Do this first, before anything else in this plan.** Decided 2026-08-04 by the
-owner. Every other item in here touches `MessageOrigin`; renaming afterwards
-would mean rewriting code and tests written against the old name, so it goes
-ahead of them.
+**Do this before anything else in this plan.** Every other item touches
+`MessageOrigin`; changing it afterwards means rewriting code and tests written
+against the old shape. One commit, three changes, decided 2026-08-04 by the
+owner:
 
-Two reasons, both good: the variant only ever describes a message that came back
-from a **tool call**, so `Tool` is what it actually means — "background" was
-describing how the task ran, which is irrelevant to what the message IS; and it
-keeps the enum single-word throughout (`User`, `Steering`, `Nudge`, `Tool`, and
-the `Summary` this plan adds).
+| before             | after     | why                                                                                                                                                     |
+| ------------------ | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BackgroundResult` | `Tool`    | only ever a message that came back from a TOOL CALL — "background" described how the task ran, not what the message is; also keeps the enum single-word |
+| `Steering`         | _(gone)_  | folded into `User` — see below                                                                                                                          |
+| —                  | `Summary` | new, see the distinguished-message decision                                                                                                             |
 
-**Note the adjacency, and that it is correct rather than confusing:** hrdr also
-has `Role::Tool`. A tool RESULT is `Role::Tool`; a delegated agent's report
-delivered back into the conversation is `Role::User` carrying
-`MessageOrigin::Tool` — a user-role message whose content is tool product. That
-pairing is exactly the distinction the origin marker exists to express, and the
-turn-boundary rule below reads correctly with it: `Role::User` +
-`MessageOrigin::Tool` is not a turn.
+Leaving four variants, one per genuine kind: **`User`, `Nudge`, `Tool`,
+`Summary`.**
 
-**Decide before doing it: the serialized name changes.** `persisted_messages`
-writes `origin` into session files whenever it differs from `User`, so sessions
-that already contain one of these carry the OLD variant name on disk. After the
-rename, deserializing one is an unknown-variant error — which fails the whole
+### Why `Steering` folds into `User`
+
+`Steering` was never about WHO sent a message — it recorded only that it arrived
+mid-turn rather than opening one (`turn_loop.rs`:
+`if opening { User } else { Steering }`). Three things retire it:
+
+- **Nothing reads it.** Written once, persisted, and asserted in two tests — no
+  production code branches on it. Pruning used to; pruning was deleted
+  (`10c88e8`).
+- **hrdr already discards the distinction.** A steer still pending when the
+  model answers without calling a tool _"is not delivered: that turn is over,
+  and the frontend re-sends it as a turn of its own"_ — an undelivered steer
+  becomes a plain `User` opener. Cancelling hands queued messages back to the
+  input box to be resent the same way. The two paths are designed to converge.
+- **It produces identical history.** At the round boundary — the moment tool
+  results are recorded — the model has just completed an assistant message and
+  nothing is mid-generation. Cancelling there and resending yields
+  `[…, assistant(tool_calls), tool results, user message]`, which is exactly
+  what steering yields. Same array, same next request, same model behaviour.
+
+  **What steering actually buys is determinism, not different behaviour.** By
+  hand you would have to hit Esc inside the window between "results recorded"
+  and "next request sent", and missing it — cancelling mid-generation — really
+  does lose the partial output and the tokens paid for it. Steering removes the
+  timing problem. That is an operational guarantee, not a property of the
+  message, so it does not belong in an origin marker.
+
+### Decide before doing it: the serialized names change
+
+`persisted_messages` writes `origin` into session files whenever it differs from
+`User`, so sessions already on disk carry the OLD variant names. After this
+change, deserializing one is an unknown-variant error — which fails the whole
 session load, not just that message.
 
 The standing rule is **no migration or back-compat fallback before 1.0** — clean
 breaks, delete old-format code when found — so the default answer is to accept
-it. But note the blast radius is different from a config key: these are session
-files the owner may be actively resuming, and the failure is a load error rather
-than a warning. The one-line alternative, if that is judged too sharp, is a
-serde alias on the variant; that is a back-compat affordance and the rule points
-away from it. **Owner's call, and worth making deliberately rather than
-discovering on the next resume.**
+it. Note the blast radius differs from a config key (as `auto_prune` was): these
+are session files the owner may be actively resuming, and the failure is a load
+error rather than a warning. The one-line alternative is a serde alias per
+variant, which is a back-compat affordance the rule points away from. **Owner's
+call — but doing all three changes in ONE commit makes it a single break instead
+of three, which is the main reason to sequence it here.**
 
 ## Live defect, independent of the rewrite
 
@@ -311,13 +334,12 @@ the verbatim tail.** `compaction_tail_start` picks boundaries with
 `.filter(|&i| msgs[i].role == Role::User)` and nothing else. But hrdr creates
 `Role::User` messages with FOUR origins, all through one `push_user_message`:
 
-| origin             | what it is                                            | a turn? |
-| ------------------ | ----------------------------------------------------- | ------- |
-| `User`             | the user opening a turn                               | yes     |
-| `Steering`         | the user (or the main agent on their behalf) mid-turn | yes     |
-| `Nudge`            | synthetic TODO prompt the harness injects             | **no**  |
-| `BackgroundResult` | a detached sub-agent's report — tool product          | **no**  |
-| `Summary`          | harness-generated (see above)                         | **no**  |
+| origin             | what it is                                   | a turn? |
+| ------------------ | -------------------------------------------- | ------- |
+| `User`             | the user opening a turn                      | yes     |
+| `Nudge`            | synthetic TODO prompt the harness injects    | **no**  |
+| `BackgroundResult` | a detached sub-agent's report — tool product | **no**  |
+| `Summary`          | harness-generated (see above)                | **no**  |
 
 With `compaction_tail_turns = 2` the tail starts at the second-newest boundary,
 so every synthetic boundary pulls that start point LATER and shortens the
