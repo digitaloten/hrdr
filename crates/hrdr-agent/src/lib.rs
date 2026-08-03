@@ -7608,6 +7608,51 @@ mod tests {
         assert_eq!(msgs[start].role, Role::User);
     }
 
+    /// Only a real user turn is a turn boundary. A nudge, a background task's
+    /// report and a compaction summary are all `Role::User` messages the
+    /// HARNESS wrote, and counting them shortens the verbatim tail to almost
+    /// nothing on exactly the busiest sessions — the ones that compact.
+    #[test]
+    fn compaction_tail_start_ignores_synthetic_user_messages() {
+        let big = "x".repeat(20_000); // ~5000 tokens each (len/4)
+        let synthetic = |origin: crate::MessageOrigin, text: &str| ChatMessage {
+            origin,
+            ..ChatMessage::user(text)
+        };
+        let msgs = vec![
+            ChatMessage::system("sys"),                                      // 0
+            ChatMessage::user("u1"),                                         // 1
+            ChatMessage::assistant(big.clone()),                             // 2
+            ChatMessage::user("u2"),                                         // 3
+            ChatMessage::assistant(big.clone()),                             // 4
+            synthetic(crate::MessageOrigin::Tool, "background #1 finished"), // 5
+            ChatMessage::assistant(big.clone()),                             // 6
+            synthetic(crate::MessageOrigin::Nudge, "unfinished TODOs"),      // 7
+            ChatMessage::assistant(big.clone()),                             // 8
+        ];
+        // Two turns back from the newest REAL turn is u1 (1), not the nudge at
+        // 7 and the background result at 5 — which is what a role-only filter
+        // would have picked, leaving one real turn's worth of tail.
+        assert_eq!(compaction_tail_start(&msgs, 2, 1_000_000), 1);
+        assert_eq!(compaction_tail_start(&msgs, 1, 1_000_000), 3);
+        let start = compaction_tail_start(&msgs, 2, 1_000_000);
+        assert_eq!(msgs[start].origin, crate::MessageOrigin::User);
+
+        // A summary does not open a turn either: the message right after a
+        // compaction is the summary, and treating it as a turn is what let the
+        // NEXT compaction summarize it again.
+        let after_compaction = vec![
+            ChatMessage::system("sys"),
+            synthetic(
+                crate::MessageOrigin::Summary,
+                "summary of the earlier session",
+            ),
+            ChatMessage::user("u1"),
+            ChatMessage::assistant(big.clone()),
+        ];
+        assert_eq!(compaction_tail_start(&after_compaction, 2, 1_000_000), 2);
+    }
+
     #[test]
     fn mega_turn_tail_start_shrinks_a_single_oversized_turn() {
         // Sub-agent-shaped history: exactly one `role:"user"` message overall

@@ -15,7 +15,7 @@ use anyhow::{Result, bail};
 use hrdr_llm::ToolDef;
 
 use crate::{
-    Agent, AgentEvent, AgentRegistry, ChatMessage, RetryBudget, Role, drain_stream,
+    Agent, AgentEvent, AgentRegistry, ChatMessage, MessageOrigin, RetryBudget, Role, drain_stream,
     flatten_tool_protocol, is_context_overflow,
 };
 
@@ -139,13 +139,32 @@ fn compact_stage_history(
     }
 }
 
+/// Whether `msg` begins a real user turn.
+///
+/// `Role::User` alone is not the question. hrdr pushes FOUR kinds of user-role
+/// message through the one `push_user_message` chokepoint, and only one of them
+/// is the user speaking: a [`MessageOrigin::Nudge`] is the harness prompting
+/// itself about unfinished TODOs, a [`MessageOrigin::Tool`] is a detached
+/// sub-agent's report arriving after its round closed, and a
+/// [`MessageOrigin::Summary`] is compaction's own output. Counting those as
+/// turns spends the verbatim tail budget on messages the user never sent —
+/// worst on the busiest sessions, which are the ones compacting.
+///
+/// A steer is [`MessageOrigin::User`] and so does count: it is the user
+/// speaking, only mid-turn. A steer relayed from a main agent to a sub-agent
+/// is the same thing, because the main agent acts on the user's behalf.
+pub(crate) fn is_user_turn(msg: &ChatMessage) -> bool {
+    msg.role == Role::User && msg.origin == MessageOrigin::User
+}
+
 /// Index where the kept-verbatim tail begins for compaction. Keeps the last
-/// `tail_turns` turns (a turn begins at a `role:"user"` message), but no more
-/// than `preserve_tokens` estimated tokens — walking newest → oldest, adding
-/// whole turns until the budget is hit, always keeping at least the newest
-/// turn. Never returns 0 (the system prompt stays); the tail always begins on a
-/// user message, so no tool result is orphaned. Everything in `1..start` gets
-/// summarized. Mirrors opencode's compaction tail selection.
+/// `tail_turns` turns (a turn begins at a real user message — see
+/// [`is_user_turn`]), but no more than `preserve_tokens` estimated tokens —
+/// walking newest → oldest, adding whole turns until the budget is hit, always
+/// keeping at least the newest turn. Never returns 0 (the system prompt stays);
+/// the tail always begins on a user message, so no tool result is orphaned.
+/// Everything in `1..start` gets summarized. Mirrors opencode's compaction tail
+/// selection.
 pub(crate) fn compaction_tail_start(
     msgs: &[ChatMessage],
     tail_turns: usize,
@@ -154,9 +173,9 @@ pub(crate) fn compaction_tail_start(
     if tail_turns == 0 {
         return msgs.len();
     }
-    // Turn boundaries: user messages after the system prompt.
+    // Turn boundaries: real user messages after the system prompt.
     let starts: Vec<usize> = (1..msgs.len())
-        .filter(|&i| msgs[i].role == Role::User)
+        .filter(|&i| is_user_turn(&msgs[i]))
         .collect();
     let Some(&newest) = starts.last() else {
         return msgs.len().max(1);

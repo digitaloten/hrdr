@@ -38,6 +38,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Compaction no longer spends the verbatim tail on messages the user never
+  sent.** The tail-window walk kept the last `compaction_tail_turns` turns and
+  called any `role:"user"` message a turn — but hrdr writes user-role messages
+  itself: the unfinished-TODO nudge, a detached background task's report, and
+  the compaction summary. Each of those pulled the tail start later, so the
+  sessions worst hit were the busiest ones: a main agent that collected two
+  background results kept a "tail" made entirely of them and summarized the
+  actual work. Boundaries are now counted on the message's origin, so only the
+  user speaking — including a steer — opens a turn.
+
 - **Copying a mouse selection no longer picks up the scrollbar column.** A
   selection dragged to the right-hand edge copied each line with the scrollbar's
   `│` on the end, and every space in front of it: the transcript published its
