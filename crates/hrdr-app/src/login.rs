@@ -58,6 +58,7 @@ fn provider_label(name: &str) -> &'static str {
         "openai" => "OpenAI",
         "openrouter" => "OpenRouter",
         "claude" => "Anthropic (Claude)",
+        "deepseek" => "DeepSeek",
         "chatgpt" | "codex" | "openai-oauth" => "ChatGPT subscription",
         "local" => "self-hosted, no key",
         _ => "",
@@ -830,6 +831,7 @@ mod tests {
         for (provider, route) in [
             ("zen", LoginRoute::Key),
             ("claude", LoginRoute::Key),
+            ("deepseek", LoginRoute::Key),
             ("local", LoginRoute::Keyless),
         ] {
             let rows: Vec<&LoginProviderChoice> =
@@ -837,6 +839,10 @@ mod tests {
             assert_eq!(rows.len(), 1, "{provider} offers exactly one row");
             assert_eq!(rows[0].route, route, "{provider} route");
         }
+        // DeepSeek is remote and key-based: its one row is an API-key row,
+        // labelled by its friendly name, with no browser flow.
+        let deepseek = choices.iter().find(|c| c.name == "deepseek").unwrap();
+        assert_eq!(deepseek.label, "DeepSeek");
         // `go` shares OpenCode's key with `zen`, so it emits no login row of its
         // own; the single `zen` row is labelled for both.
         assert!(
@@ -861,7 +867,7 @@ mod tests {
             );
         }
         assert_eq!(browser_login_provider("openrouter"), Some("openrouter"));
-        for keyed in ["zen", "go", "claude", "local"] {
+        for keyed in ["zen", "go", "claude", "deepseek", "local"] {
             assert_eq!(
                 browser_login_provider(keyed),
                 None,
