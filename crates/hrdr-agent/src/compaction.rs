@@ -74,7 +74,7 @@ impl Drop for CompactingGuard {
 /// before compaction gives up. The request carries the session's `tools[]` (see
 /// [`Agent::compact`]), so a tool call is possible even though the instruction
 /// forbids it; it is never executed, only asked again.
-const COMPACT_TOOL_CALL_ATTEMPTS: usize = 2;
+pub(crate) const COMPACT_TOOL_CALL_ATTEMPTS: usize = 2;
 
 /// User-turn instruction that triggers the structured summary.
 const COMPACT_TRIGGER: &str = "\

@@ -11539,6 +11539,132 @@ mod tests {
             );
         }
 
+        /// A tool call returned to the compaction request is NEVER executed.
+        ///
+        /// The request carries the session's own `tools[]` — for the prefix
+        /// cache, not for use — so the model *can* answer with a call even
+        /// though the instruction forbids it. Running one would be a side effect
+        /// the user never asked for, at the worst moment in a session: the
+        /// history is about to be replaced, so nothing about it is recoverable.
+        /// Ask again instead.
+        #[tokio::test]
+        async fn a_tool_call_answering_the_compaction_request_is_never_executed() {
+            let dir = tempfile::tempdir().unwrap();
+            let victim = dir.path().join("written-by-the-summarizer.txt");
+            let call = MockResp::Sse(vec![
+                tool_start_chunk("s1", "call-1", "write"),
+                tool_args_chunk(
+                    "s1",
+                    &serde_json::to_string(&json!({
+                        "path": victim.to_string_lossy(),
+                        "content": "the tool ran",
+                    }))
+                    .unwrap(),
+                ),
+                tool_calls_stop_chunk("s1"),
+                "[DONE]".to_string(),
+            ]);
+            let server = MockServer::start(vec![
+                call,
+                MockResp::Sse(vec![
+                    text_chunk("s2", "A summary."),
+                    stop_chunk("s2"),
+                    "[DONE]".to_string(),
+                ]),
+            ])
+            .await;
+
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+
+            agent
+                .compact(crate::CompactionReason::UserRequested, None)
+                .await
+                .expect("the retry after the tool call produces the summary");
+
+            assert!(
+                !victim.exists(),
+                "the summarizer's tool call must never run: {victim:?}"
+            );
+            assert!(
+                agent.messages[1]
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("A summary."),
+                "the retry's summary is what replaces the history: {:?}",
+                agent.messages[1]
+            );
+            // The refused call left nothing behind — no `tool_calls` message and
+            // no stub result in the rebuilt history.
+            assert!(
+                agent.messages.iter().all(|m| m.tool_calls.is_none()),
+                "the refused call must not survive into the session: {:?}",
+                agent.messages
+            );
+        }
+
+        /// A model that answers with a tool call every time gives up rather than
+        /// replacing the conversation with nothing.
+        ///
+        /// [`super::COMPACT_TOOL_CALL_ATTEMPTS`] bounds it. Without the bound
+        /// this loop is unbounded and free of network errors, so it never exits
+        /// — and taking the empty content instead would replace the whole
+        /// history with an empty summary.
+        #[tokio::test]
+        async fn compaction_gives_up_on_a_model_that_only_ever_calls_tools() {
+            let call = || {
+                MockResp::Sse(vec![
+                    tool_start_chunk("s1", "call-1", "read"),
+                    tool_args_chunk("s1", r#"{"path":"README.md"}"#),
+                    tool_calls_stop_chunk("s1"),
+                    "[DONE]".to_string(),
+                ])
+            };
+            // One more than the guard allows: the attempts it permits, then the
+            // one it refuses. A further response would mean the bound never
+            // engaged — the mock has none to give, so the loop would fail on a
+            // dry queue instead of on the guard.
+            let server = MockServer::start(
+                (0..crate::compaction::COMPACT_TOOL_CALL_ATTEMPTS + 1)
+                    .map(|_| call())
+                    .collect(),
+            )
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            for i in 0..8 {
+                agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                agent
+                    .messages
+                    .push(ChatMessage::assistant(format!("reply {i}")));
+            }
+            let history = |agent: &Agent| -> Vec<Option<String>> {
+                agent.messages.iter().map(|m| m.content.clone()).collect()
+            };
+            let before = history(&agent);
+
+            let err = agent
+                .compact(crate::CompactionReason::UserRequested, None)
+                .await
+                .expect_err("a summarizer that only calls tools must fail, not loop");
+            assert!(
+                err.to_string().contains("instead of writing the summary"),
+                "the error says what actually happened: {err}"
+            );
+            assert_eq!(
+                history(&agent),
+                before,
+                "a failed compaction leaves the real history in place"
+            );
+        }
+
         // ── overflow recovery for a single oversized turn (Part A) ────────────
 
         /// REGRESSION: a sub-agent-shaped history — exactly one `role:"user"`
