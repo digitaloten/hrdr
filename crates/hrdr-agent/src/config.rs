@@ -309,35 +309,6 @@ pub struct AgentConfig {
     /// `--max-write-subagents`). Lower than the read-only cap: they share the
     /// main agent's working tree.
     pub max_write_subagents: usize,
-    /// Prune old non-conversation content — tool-call *output* and background
-    /// sub-agent delivery reports — from the model history when context is
-    /// under pressure and it's worth it: bodies older than the recent
-    /// protected window are replaced with a short pointer at a file holding
-    /// the original (the tool call + args stay). Only the model-facing
-    /// history is touched; the UI transcript keeps the full output.
-    ///
-    /// **Default `true`.** Rewriting history still invalidates the prompt
-    /// cache from the first changed message onward — that caveat is real and
-    /// doesn't go away — but the gating below changes the economics enough
-    /// that it's worth eating on by default: pruning is only even *attempted*
-    /// once compaction is imminent, and only *applied* when the reclaim buys
-    /// real runway, so a triggered prune is competing against compaction, not
-    /// against a warm cache that would otherwise have lasted. And a
-    /// ROI-met prune is strictly cheaper than the compaction it defers —
-    /// compaction invalidates the whole cache too, *plus* pays for a
-    /// summarizer model call, *plus* loses information permanently (pruned
-    /// content is at least still on disk, one `read`/`grep` away). Set to
-    /// `false` to keep history verbatim and rely on compaction alone for
-    /// overflow relief — the right call if cache hits matter more to you than
-    /// context headroom, since a stale prefix that's never rewritten is what
-    /// keeps the cache hitting.
-    ///
-    /// When on, pruning is gated, not continuous: it's only even attempted once
-    /// usage nears the compaction trigger, and only applied when the reclaim
-    /// buys enough runway to be worth the invalidation — otherwise compaction
-    /// (the costlier but bounded fallback) handles it instead. See
-    /// `PRUNE_PRESSURE_TOKENS` / `PRUNE_ROI_TOKENS`.
-    pub auto_prune: bool,
     /// User-defined providers from `[providers.<name>]` in config, keyed by name.
     pub providers: HashMap<String, ProviderConfig>,
     /// Extra shell guardrails from `[[guardrails]]` in config, applied on top
@@ -815,7 +786,6 @@ pub(crate) struct FileConfig {
     pub(crate) compaction_reserved: Option<u32>,
     pub(crate) max_readonly_subagents: Option<usize>,
     pub(crate) max_write_subagents: Option<usize>,
-    pub(crate) auto_prune: Option<bool>,
     /// `sandbox = "write" | "read" | "none"`. A misspelling is a hard TOML parse
     /// error (the enum's serde derive), matching the file-values-are-errors rule.
     pub(crate) sandbox: Option<SandboxMode>,
@@ -1036,7 +1006,6 @@ impl Default for AgentConfig {
             compaction_reserved: DEFAULT_COMPACTION_RESERVED,
             max_readonly_subagents: DEFAULT_MAX_READONLY_SUBAGENTS,
             max_write_subagents: DEFAULT_MAX_WRITE_SUBAGENTS,
-            auto_prune: true,
             providers: HashMap::new(),
             guardrails: Vec::new(),
             hooks: Vec::new(),
@@ -1697,9 +1666,6 @@ impl AgentConfig {
         if let Some(v) = fc.max_write_subagents {
             self.max_write_subagents = v;
         }
-        if let Some(v) = fc.auto_prune {
-            self.auto_prune = v;
-        }
         if let Some(v) = fc.sandbox {
             self.sandbox = v;
         }
@@ -1934,10 +1900,6 @@ pub(crate) const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     }),
     ("HRDR_COMPACTION_RESERVED", |c, v| {
         c.compaction_reserved = env_parse(v, "a whole number of tokens")?;
-        Ok(())
-    }),
-    ("HRDR_AUTO_PRUNE", |c, v| {
-        c.auto_prune = env_bool(v)?;
         Ok(())
     }),
     ("HRDR_SANDBOX", |c, v| {

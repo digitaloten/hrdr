@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- **Tool-output pruning is removed; compaction is the only answer to a filling
+  context.** The `auto_prune` config key, `$HRDR_AUTO_PRUNE` and
+  `--auto-prune on|off` are gone, and a `config.toml` still setting `auto_prune`
+  fails at startup rather than being ignored — an unknown key is an error, and
+  silently accepting a setting that no longer does anything would be worse.
+  Delete the line.
+
+  Pruning replaced old tool-output bodies with a pointer at a file, gated on
+  pressure and on the reclaim being worth it. The economics did not hold up:
+  every prune rewrote history deep in the prompt prefix and so invalidated the
+  provider's cache for nearly the whole conversation, it could fire repeatedly
+  across a long session, and the conversation still ended in a compaction
+  anyway. One cache invalidation that summarizes beats several that only defer —
+  and unlike compaction, a prune dropped information permanently. Nothing
+  replaces it: `auto_compact`, `compaction_reserved`, `compaction_tail_turns`
+  and `preserve_recent_tokens` are unchanged and now carry the whole job.
+
 ### Fixed
 
 - **Copying a mouse selection no longer picks up the scrollbar column.** A

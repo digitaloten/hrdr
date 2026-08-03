@@ -85,16 +85,12 @@ mod compaction;
 mod turn_state;
 #[cfg(test)]
 pub(crate) use compaction::{
-    ELIDE_TOOL_RESULT_BYTES, PRUNE_PLACEHOLDER, PRUNE_TASK_PLACEHOLDER_PREFIX,
-    PRUNE_TOOL_PLACEHOLDER_PREFIX, apply_prune_in, compaction_tail_start, elide_tool_results,
-    mega_turn_tail_start, tail_window,
+    ELIDE_TOOL_RESULT_BYTES, compaction_tail_start, elide_tool_results, mega_turn_tail_start,
+    tail_window,
 };
+pub use compaction::{compaction_trigger, should_auto_compact};
 pub(crate) use compaction::{
-    PRUNE_KEEP_TURNS, PRUNE_PROTECT_TOKENS, apply_prune, estimate_tokens,
-    estimate_tokens_in_messages, estimate_tokens_in_tools, plan_prune,
-};
-pub use compaction::{
-    compaction_trigger, prune_meets_roi, prune_under_pressure, should_auto_compact,
+    estimate_tokens, estimate_tokens_in_messages, estimate_tokens_in_tools,
 };
 mod delegation;
 #[cfg(test)]
@@ -1040,9 +1036,6 @@ pub struct Agent {
     /// ([`AgentConfig::retry`]). One [`RetryBudget`] is minted from it per
     /// logical operation — see [`Agent::connect_and_drain`].
     retry_policy: RetryPolicy,
-    /// Prune stale tool output from the history when pressure and ROI justify
-    /// it (see [`AgentConfig::auto_prune`]).
-    auto_prune: bool,
     /// Compact proactively when the context fills ([`AgentConfig::auto_compact`]).
     auto_compact: bool,
     /// Headroom left below the window when deciding to compact
@@ -1938,7 +1931,6 @@ impl Agent {
             messages: vec![ChatMessage::system(system)],
             max_steps: config.max_steps,
             retry_policy: config.retry,
-            auto_prune: config.auto_prune,
             auto_compact: config.auto_compact,
             compaction_reserved: config.compaction_reserved,
             context_window,
@@ -2997,15 +2989,13 @@ mod tests {
         Agent, AgentConfig, AgentEvent, ConfigDiagnostics, DEFAULT_BASE_URL,
         DEFAULT_MAX_READONLY_SUBAGENTS, DEFAULT_MAX_WRITE_SUBAGENTS,
         DEFAULT_PRESERVE_RECENT_TOKENS, DEFAULT_TAIL_TURNS, ELIDE_TOOL_RESULT_BYTES, ENV_SETTERS,
-        FileConfig, LspFileConfig, LspServerEntry, PRUNE_PLACEHOLDER,
-        PRUNE_TASK_PLACEHOLDER_PREFIX, PRUNE_TOOL_PLACEHOLDER_PREFIX, ProviderConfig,
-        SubagentSlots, ToolOutputConfig, builtin_provider, child_transcript_id,
-        compaction_tail_start, elide_tool_results, ensure_assistant_has_content, estimate_tokens,
-        estimate_tokens_in_messages, estimate_tokens_in_tools, flatten_tool_protocol,
-        format_duration, in_git_repo, mega_turn_tail_start, parse_env_bool,
-        provider_alias_collision_error, repair_dangling_tool_calls, resolve, resolve_child_dir,
-        steering_queue, strip_user_timestamp, subagent_base_config, tail_window,
-        timestamped_user_message,
+        FileConfig, LspFileConfig, LspServerEntry, ProviderConfig, SubagentSlots, ToolOutputConfig,
+        builtin_provider, child_transcript_id, compaction_tail_start, elide_tool_results,
+        ensure_assistant_has_content, estimate_tokens, estimate_tokens_in_messages,
+        estimate_tokens_in_tools, flatten_tool_protocol, format_duration, in_git_repo,
+        mega_turn_tail_start, parse_env_bool, provider_alias_collision_error,
+        repair_dangling_tool_calls, resolve, resolve_child_dir, steering_queue,
+        strip_user_timestamp, subagent_base_config, tail_window, timestamped_user_message,
     };
     use crate::cwd_slug;
     use crate::registry;
@@ -4141,7 +4131,6 @@ mod tests {
         let parent = AgentConfig {
             memory: true,
             auto_compact: true,
-            auto_prune: true,
             max_cost: Some(5.0),
             ..Default::default()
         };
@@ -4157,10 +4146,6 @@ mod tests {
 
         // Safety-scoped: comes along.
         assert_eq!(sub.max_cost, Some(5.0), "the cost ceiling still applies");
-        assert!(
-            sub.auto_prune,
-            "cheap tool-output pruning is not compaction"
-        );
         // And so does context management: compaction is a *window* concern, not a
         // session one. A sub-agent reading a codebase on a 64k local model fills
         // its window like anything else, and nothing is watching it.
@@ -7258,7 +7243,6 @@ mod tests {
             compaction_reserved: Some(12_345),
             // Differs from the default (`true`) so this proves the field is
             // actually applied, not just left at its default.
-            auto_prune: Some(false),
             sandbox: Some(hrdr_tools::SandboxMode::Read),
             sandbox_writable_roots: vec!["/opt/cache".to_string()],
             providers: HashMap::new(),
@@ -7324,7 +7308,6 @@ mod tests {
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         assert!(cfg.auto_compact);
         assert_eq!(cfg.compaction_reserved, 12_345);
-        assert!(!cfg.auto_prune);
         assert_eq!(cfg.sandbox, hrdr_tools::SandboxMode::Read);
         assert_eq!(
             cfg.sandbox_writable_roots,
@@ -7596,317 +7579,6 @@ mod tests {
         let out = tail_window(&msgs, 2);
         assert!(out[0].role != Role::Tool, "window starts on a tool result");
         assert!(!out.is_empty() && out.len() < msgs.len());
-    }
-
-    /// Pull the saved-file path out of a file-linked prune placeholder body
-    /// (`"... saved to <path>; \`read\` ..."`).
-    fn placeholder_path(body: &str) -> &str {
-        let (_, after) = body
-            .rsplit_once("saved to ")
-            .expect("file-linked placeholder should name a saved-to path");
-        after.split(';').next().expect("path is terminated by `;`")
-    }
-
-    #[test]
-    fn plan_prune_targets_old_tool_output_beyond_protected_window() {
-        use super::{apply_prune_in, plan_prune};
-        // Four turns, each with one big tool result (~10k tokens: len/4).
-        let big = "x".repeat(40_000);
-        assert_eq!(estimate_tokens(&big), 10_000);
-        let mut msgs = vec![
-            ChatMessage::user("u1"),
-            assistant_with_calls(&["a"]),
-            ChatMessage::tool_result("a", big.clone()), // 2 — oldest → pruned
-            ChatMessage::user("u2"),
-            assistant_with_calls(&["b"]),
-            ChatMessage::tool_result("b", big.clone()), // 5 — inside protect window
-            ChatMessage::user("u3"),
-            assistant_with_calls(&["c"]),
-            ChatMessage::tool_result("c", big.clone()), // 8 — last-2-turns protected
-            ChatMessage::user("u4"),
-            assistant_with_calls(&["d"]),
-            ChatMessage::tool_result("d", big.clone()), // 11 — current turn protected
-        ];
-        // Protect window 16k tokens, keep 2 turns: turn-3/4 output is shielded
-        // by the last-2-turns rule, turn-2's 10k fills the window, so only
-        // turn-1's 10k (the oldest) is a prune target.
-        let (victims, reclaimable) = plan_prune(&msgs, 16_000, 2);
-        assert_eq!(victims, vec![2]);
-        assert_eq!(reclaimable, estimate_tokens(&big));
-        // Planning is pure — nothing changes until `apply_prune` runs.
-        assert_eq!(msgs[2].content.as_deref(), Some(big.as_str()));
-
-        let dir = tempfile::tempdir().unwrap();
-        apply_prune_in(&mut msgs, &victims, dir.path());
-        let body = msgs[2].content.clone().unwrap();
-        assert!(
-            body.starts_with(PRUNE_TOOL_PLACEHOLDER_PREFIX),
-            "placeholder should be the file-linked tool-output variant: {body}"
-        );
-        // The file the placeholder points at holds the original body,
-        // byte-for-byte — one file per victim.
-        let saved = std::fs::read_to_string(placeholder_path(&body)).unwrap();
-        assert_eq!(saved, big);
-        assert_eq!(
-            std::fs::read_dir(dir.path()).unwrap().count(),
-            1,
-            "one file for the one victim"
-        );
-        for kept in [5, 8, 11] {
-            assert_eq!(msgs[kept].content.as_deref(), Some(big.as_str()));
-        }
-        // The assistant tool_calls metadata is never touched.
-        assert!(msgs[1].tool_calls.is_some());
-
-        // Idempotent: a second plan finds only the placeholder + kept window,
-        // and applying that (empty) plan writes no new files — double-prune
-        // safety.
-        let (victims2, reclaimable2) = plan_prune(&msgs, 16_000, 2);
-        assert!(victims2.is_empty());
-        assert_eq!(reclaimable2, 0);
-        apply_prune_in(&mut msgs, &victims2, dir.path());
-        assert_eq!(
-            std::fs::read_dir(dir.path()).unwrap().count(),
-            1,
-            "re-planning + applying after an apply writes no new files"
-        );
-    }
-
-    /// A background sub-agent's delivery report (`Role::User` on the wire,
-    /// `MessageOrigin::BackgroundResult`) is tool product, not the user
-    /// speaking — Change C targets it for pruning just like a tool result,
-    /// with its own label/wording, while a genuine user message old enough to
-    /// be past the protect window is never touched.
-    #[test]
-    fn background_result_deliveries_are_prunable_genuine_user_messages_are_not() {
-        use super::{apply_prune_in, plan_prune};
-        fn background_result(text: &str) -> ChatMessage {
-            ChatMessage {
-                origin: MessageOrigin::BackgroundResult,
-                ..ChatMessage::user(text)
-            }
-        }
-        let old_bg = "x".repeat(400_000); // 100k tokens — well past any window
-        let recent_bg = "x".repeat(400_000);
-        let msgs = vec![
-            ChatMessage::user("real user turn, ancient — must survive"), // 0
-            background_result(&old_bg), // 1 — old background delivery → prunable
-            ChatMessage::user("u2"),    // 2 — turn boundary
-            assistant_with_calls(&["a"]),
-            ChatMessage::tool_result("a", "recent tool output"), // 4
-            ChatMessage::user("u3"), // 5 — turn boundary (keep_turns=2 stops here)
-            background_result(&recent_bg), // 6 — inside the protect window
-            ChatMessage::user("u4"), // 7 — turn boundary
-        ];
-        let (victims, reclaimable) = plan_prune(&msgs, 16_000, 2);
-        assert_eq!(victims, vec![1], "only the old background delivery");
-        assert_eq!(reclaimable, estimate_tokens(&old_bg));
-        // The genuine, ancient user message is never a candidate no matter how
-        // far back it sits.
-        assert!(!victims.contains(&0));
-
-        let mut msgs = msgs;
-        let dir = tempfile::tempdir().unwrap();
-        apply_prune_in(&mut msgs, &victims, dir.path());
-        let body = msgs[1].content.clone().unwrap();
-        assert!(
-            body.starts_with(PRUNE_TASK_PLACEHOLDER_PREFIX),
-            "background delivery gets the task-report placeholder: {body}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(placeholder_path(&body)).unwrap(),
-            old_bg
-        );
-        // Untouched: the genuine user message and the recent (in-window)
-        // background delivery.
-        assert_eq!(
-            msgs[0].content.as_deref(),
-            Some("real user turn, ancient — must survive")
-        );
-        assert_eq!(msgs[6].content.as_deref(), Some(recent_bg.as_str()));
-    }
-
-    /// `keep_turns` counts genuine turns (`origin` `User`/`Steering`) only —
-    /// a `BackgroundResult` delivery folded in between two real turns must
-    /// not itself count as one. Otherwise a burst of task deliveries would
-    /// let `turns` rack up on wire-level `Role::User` count alone, either
-    /// exposing old content for pruning before the intended number of *real*
-    /// turns has actually passed, or (symmetrically) prematurely stripping
-    /// protection from tool output genuinely tied to a recent turn.
-    #[test]
-    fn background_deliveries_between_turns_do_not_count_as_turns() {
-        use super::plan_prune;
-        fn background_result(text: &str) -> ChatMessage {
-            ChatMessage {
-                origin: MessageOrigin::BackgroundResult,
-                ..ChatMessage::user(text)
-            }
-        }
-        let old = "x".repeat(40_000); // 10k tokens
-        let msgs = vec![
-            ChatMessage::user("u_old"),                 // 0 — genuine turn (older)
-            assistant_with_calls(&["a"]),               // 1
-            ChatMessage::tool_result("a", old.clone()), // 2 — old tool output
-            ChatMessage::user("u_new"),                 // 3 — genuine turn (recent)
-            background_result("bg report 1"),           // 4 — NOT a turn
-            background_result("bg report 2"),           // 5 — NOT a turn
-            background_result("bg report 3"),           // 6 — NOT a turn
-        ];
-        // keep_turns=2 needs two GENUINE turns scanned before anything past
-        // them is even a prune candidate. Only one genuine turn (`u_new`)
-        // follows the old tool result — the three background deliveries
-        // trailing it correctly don't count — so the gate is never
-        // satisfied and the old result stays protected no matter how many
-        // background deliveries pile up after it.
-        let (victims, _) = plan_prune(&msgs, 0, 2);
-        assert!(
-            victims.is_empty(),
-            "only one genuine turn follows — old tool output stays protected"
-        );
-        // Relax to one genuine turn: `u_new` alone now satisfies the gate,
-        // and the old tool result becomes the sole target — proving the
-        // previous assertion wasn't vacuous (e.g. from a bug that protects
-        // everything unconditionally), and that the three background
-        // deliveries themselves were never miscounted as *additional* real
-        // turns that would have satisfied `keep_turns=2` on their own.
-        let (victims, reclaimable) = plan_prune(&msgs, 0, 1);
-        assert_eq!(victims, vec![2]);
-        assert_eq!(reclaimable, estimate_tokens(&old));
-    }
-
-    /// Saving a victim's body to a file can fail (unwritable dir, disk full,
-    /// ...) — the prune must still proceed rather than fail the turn: the
-    /// body still leaves history, just via the constant fallback placeholder
-    /// instead of a pointer.
-    #[test]
-    fn save_failure_falls_back_to_the_constant_placeholder_without_panicking() {
-        use super::{apply_prune_in, plan_prune};
-        let big = "x".repeat(40_000);
-        let mut msgs = vec![
-            ChatMessage::user("u1"),
-            assistant_with_calls(&["a"]),
-            ChatMessage::tool_result("a", big),
-            ChatMessage::user("u2"),
-        ];
-        let (victims, _) = plan_prune(&msgs, 0, 1);
-        assert_eq!(victims, vec![2]);
-
-        // A file (not a directory) as the "dir" seam: `save_overflow`'s
-        // `create_dir_all` fails on it, so every save attempt errors out.
-        let dir = tempfile::tempdir().unwrap();
-        let unwritable = dir.path().join("not-a-dir");
-        std::fs::write(&unwritable, b"blocker").unwrap();
-
-        apply_prune_in(&mut msgs, &victims, &unwritable);
-        assert_eq!(msgs[2].content.as_deref(), Some(PRUNE_PLACEHOLDER));
-    }
-
-    /// Below `PRUNE_PRESSURE_TOKENS` of the compaction trigger, pruning isn't
-    /// even attempted — a stale prefix is fine as long as the cache is still
-    /// worth keeping warm. This holds regardless of how much stale tool output
-    /// is sitting there to reclaim: `plan_prune` never even gets called by the
-    /// run loop in this zone.
-    #[test]
-    fn below_pressure_nothing_is_pruned() {
-        use super::{plan_prune, prune_under_pressure};
-        let window = 100_000;
-        let reserved = 16_384;
-        // A conversation with plenty of stale, prunable tool output — one big
-        // old result, old enough to be past both the protect window and the
-        // last-2-turns rule.
-        let big = "x".repeat(400_000); // 100k tokens of it
-        let msgs = vec![
-            ChatMessage::user("u1"),
-            assistant_with_calls(&["a"]),
-            ChatMessage::tool_result("a", big), // old → prunable
-            ChatMessage::user("u2"),
-            assistant_with_calls(&["b"]),
-            ChatMessage::tool_result("b", "recent".to_string()), // protected
-            ChatMessage::user("u3"),
-            assistant_with_calls(&["c"]),
-            ChatMessage::tool_result("c", "recent".to_string()), // protected
-            ChatMessage::user("u4"),
-        ];
-        let (victims, reclaimable) = plan_prune(&msgs, 16_000, 2);
-        assert!(!victims.is_empty() && reclaimable > 0, "plenty to reclaim");
-
-        // But usage is far below the trigger, so the gate says don't bother.
-        let usage = 50_000;
-        assert!(usage < super::compaction_trigger(window, reserved));
-        assert!(!prune_under_pressure(usage, window, reserved));
-    }
-
-    /// At pressure with a big reclaim, the plan clears the ROI bar and gets
-    /// applied — and critically, the usage estimate the run loop adjusts
-    /// afterward no longer trips `should_auto_compact` on the very same round.
-    /// Without that adjustment, `maybe_self_compact` would read the stale
-    /// pre-prune figure and compact anyway, making the prune pure loss.
-    #[test]
-    fn at_pressure_big_reclaim_meets_roi_and_defers_compaction() {
-        use super::{prune_meets_roi, prune_under_pressure, should_auto_compact};
-        let window = 100_000;
-        let reserved = 16_384;
-        let trigger = super::compaction_trigger(window, reserved);
-        // Usage is already past the trigger — `should_auto_compact` would fire
-        // on this reading.
-        let usage = trigger + 1_384;
-        assert!(should_auto_compact(
-            Some(usage),
-            Some(window),
-            reserved,
-            true
-        ));
-        assert!(prune_under_pressure(usage, window, reserved));
-
-        // A plan that reclaims well over `PRUNE_ROI_TOKENS`.
-        let reclaimable = 40_000;
-        assert!(prune_meets_roi(usage, window, reserved, reclaimable));
-
-        // The run loop's adjustment: subtract the reclaim from the usage
-        // estimate before `maybe_self_compact` runs this same round.
-        let adjusted = usage.saturating_sub(reclaimable);
-        assert!(
-            !should_auto_compact(Some(adjusted), Some(window), reserved, true),
-            "the prune bought enough runway to defer compaction this round"
-        );
-    }
-
-    /// At pressure but with only a small reclaim, the ROI bar isn't cleared —
-    /// the plan exists (this is not the below-pressure case) but is left
-    /// unapplied, so history stays byte-identical and compaction stays
-    /// responsible for relieving the pressure.
-    #[test]
-    fn at_pressure_small_reclaim_is_left_unapplied() {
-        use super::{plan_prune, prune_meets_roi, prune_under_pressure};
-        let window = 100_000;
-        let reserved = 16_384;
-        // Protect window (16k) is filled by one 14k result; the only prune
-        // target is 3k tokens.
-        let within = "x".repeat(56_000); // 14k tokens
-        let tiny = "x".repeat(12_000); // 3k tokens
-        let msgs = vec![
-            ChatMessage::user("u1"),
-            assistant_with_calls(&["a"]),
-            ChatMessage::tool_result("a", tiny.clone()), // 2 — 3k prune target
-            ChatMessage::user("u2"),
-            assistant_with_calls(&["b"]),
-            ChatMessage::tool_result("b", within), // 5 — fills the window
-            ChatMessage::user("u3"),
-            assistant_with_calls(&["c"]),
-            ChatMessage::tool_result("c", "recent".to_string()), // 8 — protected
-            ChatMessage::user("u4"),
-        ];
-        let (victims, reclaimable) = plan_prune(&msgs, 16_000, 2);
-        assert_eq!(reclaimable, estimate_tokens(&tiny));
-        assert!(!victims.is_empty());
-
-        // Usage sits right at the trigger — under pressure — but 3k of reclaim
-        // doesn't land it `PRUNE_ROI_TOKENS` below it.
-        let usage = super::compaction_trigger(window, reserved);
-        assert!(prune_under_pressure(usage, window, reserved));
-        assert!(!prune_meets_roi(usage, window, reserved, reclaimable));
-        // So the run loop never calls `apply_prune` — history is untouched.
-        assert_eq!(msgs[2].content.as_deref(), Some(tiny.as_str()));
     }
 
     #[test]
@@ -8886,7 +8558,6 @@ mod tests {
                 cwd: cwd.to_path_buf(),
                 subagents: false,
                 memory: false,
-                auto_prune: false,
                 retry: instant_retries(),
                 ..Default::default()
             }

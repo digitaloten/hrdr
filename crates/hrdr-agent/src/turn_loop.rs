@@ -515,59 +515,12 @@ impl Agent {
             self.drain_steering(&steering, &mut on_event).await;
             // Fold in any detached background sub-agent results that have landed.
             self.drain_background(&mut on_event);
-            // Reclaim stale tool output before compacting or building the next
-            // request — the cheap, no-model-call first line of defence against
-            // context ballooning (compaction below is the expensive fallback).
-            // Pressure-gated and ROI-checked, not continuous: rewriting old
-            // messages invalidates the provider's prompt cache for nearly the
-            // whole conversation, so this is only even attempted once usage
-            // nears the compaction trigger, and only applied when the reclaim
-            // buys real runway (see the doc comment above `PRUNE_PROTECT_TOKENS`
-            // for the full reasoning).
-            if self.auto_prune
-                && let Some(usage) = self.last_prompt_tokens
-            {
-                // Same inputs `maybe_self_compact` uses below — one trigger, so
-                // the two decisions can't drift apart.
-                self.ensure_context_window();
-                if let Some(window) = self.context_window
-                    && prune_under_pressure(usage, window, self.compaction_reserved)
-                {
-                    let (victims, reclaimable) =
-                        plan_prune(&self.messages, PRUNE_PROTECT_TOKENS, PRUNE_KEEP_TURNS);
-                    if !victims.is_empty()
-                        && prune_meets_roi(usage, window, self.compaction_reserved, reclaimable)
-                    {
-                        apply_prune(&mut self.messages, &victims);
-                        on_event(AgentEvent::Notice(format!(
-                            "context filling — pruned ~{reclaimable} tokens of old tool \
-                             output, deferring compaction"
-                        )));
-                        // `last_prompt_tokens` describes the *previous* request — it
-                        // doesn't know about the prune we just applied. Left as-is,
-                        // `maybe_self_compact` right below would read that stale,
-                        // pre-prune figure and compact anyway on this very round,
-                        // making the prune pure loss (cache invalidated for nothing).
-                        // Both numbers are estimates (`estimate_tokens` here vs
-                        // whatever tokenizer produced the original reading), which is
-                        // fine for a threshold heuristic — this only needs to be
-                        // roughly right.
-                        self.last_prompt_tokens = Some(usage.saturating_sub(reclaimable));
-                    }
-                    // Else: the plan doesn't clear the ROI bar — no mutation, and
-                    // deliberately no notice. Pressure builds gradually, so this
-                    // branch would otherwise fire (silently) every round while
-                    // pressure is on but ROI isn't met; compaction is left to
-                    // handle it once usage actually reaches the trigger.
-                }
-            }
             // Compact before the next request if this agent manages its own
             // context and is close to filling it (a small local model reading a
-            // lot of files gets there fast). Pruning above gets first shot at
-            // relieving pressure — cheap, no model call — so this expensive
-            // fallback (a summarizer call plus a full cache nuke) only fires
-            // when pruning couldn't buy enough runway, or usage is already past
-            // what pruning alone can save.
+            // lot of files gets there fast). The only answer to a filling context:
+            // tool-output pruning used to get first shot at it and was removed,
+            // because it invalidated the prompt cache each time it fired, could
+            // fire repeatedly, and still ended here.
             self.maybe_self_compact(&mut on_event).await;
             // Cost budget: stop before issuing another model call once the
             // session's estimated spend (incl. sub-agents) reaches the cap.
@@ -978,8 +931,8 @@ impl Agent {
         }
         // The model reads the expanded (`sent`) form; the transcript shows what was
         // typed (`display`). A real opener is a `User` turn; a mid-turn correction
-        // is tagged `Steering` so pruning/session serialization can still tell them
-        // apart (both count as turn boundaries — see `plan_prune`).
+        // is tagged `Steering` so session serialization can still tell them apart
+        // (both count as turn boundaries).
         on_event(AgentEvent::Steered(msg.display));
         let origin = if opening {
             MessageOrigin::User

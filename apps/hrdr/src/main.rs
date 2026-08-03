@@ -163,11 +163,6 @@ struct Cli {
     #[arg(long, global = true, value_name = "N")]
     max_write_subagents: Option<usize>,
 
-    /// Prune old tool output from the model context when nearing the
-    /// compaction trigger and it's worth it (on|off; default on).
-    #[arg(long = "auto-prune", global = true, value_name = "on|off")]
-    auto_prune: Option<String>,
-
     /// Filesystem confinement for this session: `write` (the default — reads
     /// unrestricted, writes confined to the working directory, temp/scratch,
     /// tool output and the package-manager caches), `read` (what read-only
@@ -674,13 +669,6 @@ async fn main() -> Result<()> {
     }
     if let Some(n) = cli.max_write_subagents {
         config.max_write_subagents = n;
-    }
-    if let Some(v) = cli
-        .auto_prune
-        .as_deref()
-        .and_then(hrdr_agent::parse_env_bool)
-    {
-        config.auto_prune = v;
     }
     // Unlike the neighbours above, a mistyped sandbox mode is never dropped
     // silently: quietly running unconfined is the failure this flag exists to
