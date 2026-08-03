@@ -173,6 +173,16 @@ pub trait CommandHost {
     fn session_tokens(&self) -> (usize, usize) {
         (0, 0)
     }
+    /// Session-cumulative prompt-cache figures — `(hit_rate, read, written)`,
+    /// where the rate is over the prompt tokens of the calls that actually
+    /// reported cache use.
+    ///
+    /// `None` when nothing reported any: an endpoint that does not publish
+    /// these is not an endpoint whose cache is missing, and displaying it as a
+    /// 0% rate would say it was.
+    fn session_cache(&self) -> Option<(f64, usize, usize)> {
+        None
+    }
     /// Session-cumulative estimated cost in USD (0 when nothing was priced).
     fn session_cost(&self) -> f64 {
         0.0

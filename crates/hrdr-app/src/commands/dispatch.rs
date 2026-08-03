@@ -100,6 +100,21 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 String::new()
             };
             let effort = host.effort().unwrap_or_else(|| "—".to_string());
+            // What the cache actually DID this session, appended to whether it
+            // is switched on — the two belong on one line, because "on" alone
+            // says the breakpoints were sent, not that anything was served from
+            // them. Absent when the endpoint publishes no figures.
+            let observed = host
+                .session_cache()
+                .map(|(rate, read, written)| {
+                    format!(
+                        " · {:.0}% read ({}), {} written",
+                        rate * 100.0,
+                        crate::fmt_count(read),
+                        crate::fmt_count(written)
+                    )
+                })
+                .unwrap_or_default();
             host.spawn_line(Box::pin(async move {
                 let (temp, messages, cache) = {
                     let a = agent.lock().await;
@@ -110,7 +125,8 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 format!(
                     "session: {session}\nmodel: {model}\nendpoint: {base_url}\ncwd: {dir} \
                      ({branch})\ncontext: {ctx}\ntokens: ↑{tokens_in} ↓{tokens_out}{cost_line}\n\
-                     temperature: {}\neffort: {effort}\nprompt cache: {}\nmessages: {messages}",
+                     temperature: {}\neffort: {effort}\nprompt cache: {}{observed}\n\
+                     messages: {messages}",
                     temp.map(|t| t.to_string())
                         .unwrap_or_else(|| "default".to_string()),
                     if cache { "on" } else { "off" }
@@ -514,6 +530,18 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         "cost" => {
             let (tokens_in, tokens_out) = host.session_tokens();
             let mut line = format!("session tokens: ↑{tokens_in} input · ↓{tokens_out} output");
+            // The one figure that says whether the prompt cache is working
+            // across the session, rather than on whichever call was last.
+            // Omitted entirely — not shown as 0% — when the endpoint publishes
+            // no cache figures at all.
+            if let Some((rate, read, written)) = host.session_cache() {
+                line.push_str(&format!(
+                    " · prompt cache: {:.0}% read ({}), {} written",
+                    rate * 100.0,
+                    crate::fmt_count(read),
+                    crate::fmt_count(written)
+                ));
+            }
             let cost = host.session_cost();
             if cost > 0.0 {
                 let s = crate::fmt_cost_maybe_partial(cost, host.session_cost_partial());
@@ -695,6 +723,8 @@ mod tests {
         nth_calls: std::cell::Cell<usize>,
         /// What the last `copy_to_clipboard` call was asked to copy.
         clipboard: Option<String>,
+        /// Session prompt-cache figures, as `session_cache` reports them.
+        cache: Option<(f64, usize, usize)>,
     }
 
     impl TestHost {
@@ -718,6 +748,7 @@ mod tests {
                 messages: Vec::new(),
                 nth_calls: std::cell::Cell::new(0),
                 clipboard: None,
+                cache: None,
             }
         }
     }
@@ -725,6 +756,9 @@ mod tests {
     impl CommandHost for TestHost {
         fn info(&mut self, line: String) {
             self.info_log.push(line);
+        }
+        fn session_cache(&self) -> Option<(f64, usize, usize)> {
+            self.cache
         }
         fn agent(&self) -> Arc<Mutex<Agent>> {
             self.agent.clone()
@@ -1018,5 +1052,36 @@ mod tests {
     fn windows_cmd_start_leaves_url_without_ampersand_untouched() {
         let url = "https://example.com/callback?code=abc123";
         assert_eq!(windows_escape_for_cmd_start(url), url);
+    }
+
+    /// `/cost` reports what the prompt cache did across the session — the
+    /// figure that says whether caching is working, as opposed to a single
+    /// call's fraction, which moves for reasons that have nothing to do with
+    /// the cache (a compaction shrink stage rewrites the prompt; a retry warms
+    /// it).
+    ///
+    /// And it says nothing at all when the endpoint reported nothing. A 0%
+    /// there would read as "the cache stopped working", which is the one
+    /// conclusion the line exists to support and would be wrong.
+    #[test]
+    fn cost_reports_the_sessions_prompt_cache_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+
+        assert!(dispatch(&mut host, "/cost"));
+        let silent = host.info_log.last().cloned().unwrap_or_default();
+        assert!(silent.contains("session tokens:"), "{silent}");
+        assert!(
+            !silent.contains("prompt cache"),
+            "an endpoint that reported nothing must not read as a rate: {silent}"
+        );
+
+        host.cache = Some((0.78, 120_000, 30_000));
+        assert!(dispatch(&mut host, "/cost"));
+        let measured = host.info_log.last().cloned().unwrap_or_default();
+        assert!(
+            measured.contains("prompt cache: 78% read (120.0k), 30.0k written"),
+            "{measured}"
+        );
     }
 }

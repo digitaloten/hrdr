@@ -477,6 +477,14 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         let u = &self.app.panes.active_pane().state.usage;
         (u.tokens_in, u.tokens_out)
     }
+    fn session_cache(&self) -> Option<(f64, usize, usize)> {
+        let u = &self.app.panes.active_pane().state.usage;
+        Some((
+            u.cache_hit_rate()?,
+            u.cache_read_tokens,
+            u.cache_write_tokens,
+        ))
+    }
     fn session_cost(&self) -> f64 {
         self.app.panes.active_pane().state.usage.cost_usd
     }
