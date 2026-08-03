@@ -155,15 +155,23 @@ half of the same hygiene — clearing `reference_context_item` — hrdr already 
 as `reset_read_files()`, on the same line of reasoning: file contents the model
 read now live only in the summary, so require fresh reads before further edits.
 
-**What IS worth deciding, and is currently an accident: summary ordering.** hrdr
-builds `[system, summary, ...tail]` — summary first, then the verbatim tail,
-chronological, and the continuation prose says so (_"the most recent messages
-follow it verbatim"_). Codex's mid-turn shape is the opposite: the summary is
-the LAST item, because their models are **trained** on that layout. That is a
-post-training artifact specific to their models, and hrdr targets many
-providers, so chronological order is the right default and it stays — but it
-should be a recorded decision rather than something nobody chose. Revisit only
-with evidence that a provider we care about behaves worse with summary-first.
+**Summary ordering — decided 2026-08-04 by the owner: chronological, summary
+first.** hrdr builds `[system, summary, ...tail]`, and the continuation prose
+says so (_"the most recent messages follow it verbatim"_). Codex's mid-turn
+shape is the opposite — summary LAST — because their models are trained on that
+layout.
+
+The owner's reasoning, and it is the stronger one: **the position should be
+temporally true.** The summary covers what happened BEFORE the last few full
+turns, so placing it before them is simply where it belongs in the conversation;
+the tail then reads forward from it in order. That shape needs no special
+training to be understood, which is why it works across providers. Codex's
+layout is probably better on GPT models specifically, and hrdr is not a GPT-only
+harness.
+
+Not revisited without evidence that a provider we care about behaves worse with
+summary-first — and note that adopting codex's order would mean betting the
+layout on one vendor's post-training.
 
 ### Keep hrdr's whole-turn tail
 
