@@ -1,7 +1,7 @@
 # DeepSeek as a built-in provider — plan of record
 
-Status: **being planned.** Written 2026-08-04. No open decisions. All slices
-outstanding — the checklist at the end tracks it. Independently reviewed
+Status: **shipped.** Written 2026-08-04. No open decisions. All slices
+implemented, reviewed, and pushed (see checklist). Independently reviewed
 2026-08-04: one blocking finding (`reasoning_content` pass-back on tool-call
 turns — DeepSeek 400s without it) folded in as slice 4; the effort claim was
 corrected (models.dev declares `high`/`max`; see Accepted losses).
@@ -449,10 +449,11 @@ verified with `git ls-remote origin hrdr-temp`.
 
 ## Checklist
 
-- [ ] Slice 1 — config.rs provider entry (BUILTIN_PROVIDERS, builtin_provider)
-- [ ] Slice 2 — model_ref.rs canonical name (is_builtin, catalog_key)
-- [ ] Slice 3 — login.rs label + row
-- [ ] Slice 4 — reasoning_content pass-back (body_json + is_deepseek, hrdr-llm)
-- [ ] Slice 5 — transport pins (wire_protocol, cache mode, catalog key tests)
-- [ ] Slice 6 — README table + model.rs hint + CHANGELOG [Unreleased] entry
-- [ ] Slice 7 — manual smoke (single-turn + agentic tool-call turn)
+- [x] Slice 1 — config.rs provider entry (BUILTIN_PROVIDERS, builtin_provider)
+- [x] Slice 2 — model_ref.rs canonical name (is_builtin, catalog_key)
+- [x] Slice 3 — login.rs label + row
+- [x] Slice 4 — reasoning_content pass-back (body_json + is_deepseek, hrdr-llm)
+- [x] Slice 5 — transport pins (wire_protocol, cache mode, catalog key tests)
+- [x] Slice 6 — README table + model.rs hint + CHANGELOG [Unreleased] entry
+- [ ] Slice 7 — manual smoke (single-turn + agentic tool-call turn) — needs a
+      real `DEEPSEEK_API_KEY`; not runnable in the automated suite
