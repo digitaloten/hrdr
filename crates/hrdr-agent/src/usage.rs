@@ -14,6 +14,28 @@
 
 use serde::{Deserialize, Serialize};
 
+/// What one model call was billed — the figures
+/// [`Agent::account_usage`](crate::Agent::account_usage) extracts from a
+/// finished stream, prices, and folds into the session total.
+///
+/// Named rather than a tuple because three call sites read it and one of them
+/// used to keep a hand-rolled copy of the same five values under different
+/// field names. One type, so a caller cannot silently pair the wrong figure
+/// with the wrong label.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CallSpend {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    /// Prompt tokens the provider served from its cache. `None` means it
+    /// reported no figure at all — which is not the same as zero, and must
+    /// never be rendered as one.
+    pub cached_prompt_tokens: Option<u32>,
+    /// Estimated USD for this call, and for the session so far. `None` when the
+    /// catalog does not price the model.
+    pub cost_usd: Option<f64>,
+    pub session_cost_usd: Option<f64>,
+}
+
 /// One agent's token and cost counters.
 ///
 /// `tokens_in`/`tokens_out` accumulate over every model call the agent makes.

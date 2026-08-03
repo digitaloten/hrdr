@@ -559,22 +559,16 @@ impl Agent {
             // estimate so the context bar and compaction still work — an estimate
             // beats a stale/zero reading, and the overflow-retry path covers any
             // under-estimate.
-            let (
-                prompt_tokens,
-                completion_tokens,
-                cached_prompt_tokens,
-                cost_usd,
-                session_cost_usd,
-            ) = self.account_usage(&acc, tool_tokens).await;
-            self.last_prompt_tokens = Some(prompt_tokens);
+            let spend = self.account_usage(&acc, tool_tokens).await;
+            self.last_prompt_tokens = Some(spend.prompt_tokens);
             on_event(AgentEvent::Usage {
-                prompt_tokens,
-                completion_tokens,
+                prompt_tokens: spend.prompt_tokens,
+                completion_tokens: spend.completion_tokens,
                 decode_ms: decode.as_millis().min(u32::MAX as u128) as u32,
-                cached_prompt_tokens,
+                cached_prompt_tokens: spend.cached_prompt_tokens,
                 reasoning_tokens: acc.usage.as_ref().and_then(|u| u.reasoning_tokens()),
-                cost_usd,
-                session_cost_usd,
+                cost_usd: spend.cost_usd,
+                session_cost_usd: spend.session_cost_usd,
                 cost_partial: self.session_cost_partial(),
             });
 
@@ -828,19 +822,18 @@ impl Agent {
             .await?;
         // No `tools` went out on this round (see above), so none are in the
         // prompt to account for.
-        let (prompt_tokens, completion_tokens, cached_prompt_tokens, cost_usd, session_cost_usd) =
-            self.account_usage(&acc, 0).await;
+        let spend = self.account_usage(&acc, 0).await;
         on_event(AgentEvent::Usage {
-            prompt_tokens,
-            completion_tokens,
+            prompt_tokens: spend.prompt_tokens,
+            completion_tokens: spend.completion_tokens,
             decode_ms: decode.as_millis().min(u32::MAX as u128) as u32,
-            cached_prompt_tokens,
+            cached_prompt_tokens: spend.cached_prompt_tokens,
             reasoning_tokens: acc
                 .usage
                 .as_ref()
                 .and_then(|usage| usage.reasoning_tokens()),
-            cost_usd,
-            session_cost_usd,
+            cost_usd: spend.cost_usd,
+            session_cost_usd: spend.session_cost_usd,
             cost_partial: self.session_cost_partial(),
         });
         let mut wrap_up_reply = acc.into_message();

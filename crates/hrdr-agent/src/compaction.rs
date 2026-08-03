@@ -192,16 +192,6 @@ impl CompactionReport {
     }
 }
 
-/// What the summarization call itself was billed. Written by the attempt that
-/// produced the summary and folded into the [`CompactionReport`].
-#[derive(Debug, Clone, Copy, Default)]
-struct CompactionSpend {
-    prompt_tokens: u32,
-    cached_prompt_tokens: Option<u32>,
-    output_tokens: u32,
-    cost_usd: Option<f64>,
-}
-
 /// The prose that introduces a reinjected summary.
 ///
 /// Framing matters more than it looks. The model reading this has no memory of
@@ -684,11 +674,10 @@ impl Agent {
         // the summary. Counted apart from `budget`, which only retries
         // transient network and server failures — this is neither.
         let mut tool_call_attempts = 0usize;
-        // The billing figures of the attempt that actually produced the summary
-        // — the earlier, failed ones cost real tokens but say nothing about
-        // whether the prefix cache is working.
-        let mut spend = CompactionSpend::default();
-        let summary = loop {
+        // The summary and what the attempt that produced it was billed, bound
+        // together: a spend exists only where a request succeeded, so there is
+        // no zeroed placeholder to mistake for a real reading.
+        let (summary, spend) = loop {
             let history = compact_stage_history(stage, &full, &mut elided);
             let mut req = Vec::with_capacity(history.len() + 2);
             req.push(self.messages[0].clone());
@@ -700,8 +689,8 @@ impl Agent {
             // read as something the user asked for.
             req.push(ChatMessage::user(trigger.clone()));
             self.budget_preflight().await?;
-            match self.plain_completion(req, &defs, &mut spend).await {
-                Ok(msg) => {
+            match self.plain_completion(req, &defs).await {
+                Ok((msg, spend)) => {
                     // A tool call returned during compaction is NEVER executed.
                     // The tools are in the request for the prefix cache, not
                     // for use: running one here would be a side effect the user
@@ -718,7 +707,7 @@ impl Agent {
                         }
                         continue;
                     }
-                    break msg.content.unwrap_or_default();
+                    break (msg.content.unwrap_or_default(), spend);
                 }
                 Err(e) if is_context_overflow(&e) && stage < MAX_COMPACT_STAGE => stage += 1,
                 Err(e) => {
@@ -791,7 +780,7 @@ impl Agent {
             after: self.messages.len(),
             prompt_tokens: spend.prompt_tokens,
             cached_prompt_tokens: spend.cached_prompt_tokens,
-            output_tokens: spend.output_tokens,
+            output_tokens: spend.completion_tokens,
             cost_usd: spend.cost_usd,
         })
     }
@@ -845,29 +834,23 @@ impl Agent {
     }
 
     /// Run one request to completion, returning the assistant message the model
-    /// streamed back. Silent: the shared [`drain_stream`] gets a no-op event
-    /// sink.
+    /// streamed back and what the call was billed. Silent: the shared
+    /// [`drain_stream`] gets a no-op event sink.
     ///
     /// The whole message, not just its text, because the caller has to see
     /// whether the model called a tool — [`Agent::compact`] sends the session's
     /// `tools[]` for the prefix cache and must never execute what comes back.
     ///
-    /// The output cap is applied to a clone of the live client, so the session's
-    /// own parameters remain untouched on success, error, or cancellation.
-    ///
     /// A parameter this endpoint rejects is dropped and the request retried,
-    /// through the same [`Agent::drop_unsupported_param`] the turn path uses —
-    /// including the summarizer's own cap, which is why the cap below is applied
-    /// only while `max_tokens` is still on speaking terms with the endpoint. The
-    /// loop terminates because each rejection can be honoured once: a parameter
-    /// already dropped makes the helper return `false` and the error propagate.
-    /// No other 400 is retried here.
+    /// through the same [`Agent::drop_unsupported_param`] the turn path uses.
+    /// The loop terminates because each rejection can be honoured once: a
+    /// parameter already dropped makes the helper return `false` and the error
+    /// propagate. No other 400 is retried here.
     async fn plain_completion(
         &mut self,
         req: Vec<ChatMessage>,
         defs: &[ToolDef],
-        spend: &mut CompactionSpend,
-    ) -> Result<ChatMessage> {
+    ) -> Result<(ChatMessage, crate::usage::CallSpend)> {
         // Compaction can run before any normal turn (notably `/compact` after
         // resuming a process), so it cannot rely on `connect_stream` having
         // refreshed and injected ChatGPT OAuth. Do it at the actual request
@@ -896,7 +879,7 @@ impl Agent {
             let client = self.client.clone();
             let output_cap = client.params().max_tokens;
             match self
-                .plain_completion_inner(&client, &req, defs, output_cap, spend)
+                .plain_completion_inner(&client, &req, defs, output_cap)
                 .await
             {
                 Err(error) if self.drop_unsupported_param(&error) => continue,
@@ -911,8 +894,7 @@ impl Agent {
         req: &[ChatMessage],
         defs: &[ToolDef],
         output_cap: Option<u32>,
-        spend: &mut CompactionSpend,
-    ) -> Result<ChatMessage> {
+    ) -> Result<(ChatMessage, crate::usage::CallSpend)> {
         let mut stream = client.chat_stream(req, defs).await?;
         // The round's generation time is dropped on purpose: a compaction call
         // emits no `Usage` event, so its tokens never reach the turn's
@@ -921,15 +903,9 @@ impl Agent {
         // The compaction request carries the session's own `tools[]` — the same
         // surface a normal round pays for, and the same estimate when the server
         // reports no usage.
-        let (prompt_tokens, output_tokens, cached_prompt_tokens, cost_usd, _) = self
+        let spend = self
             .account_usage(&acc, estimate_tokens_in_tools(defs))
             .await;
-        *spend = CompactionSpend {
-            prompt_tokens,
-            cached_prompt_tokens,
-            output_tokens,
-            cost_usd,
-        };
         // A summary cut off at the output cap is the one truncation that must
         // never be accepted quietly: this text REPLACES the conversation, so
         // half of it is not a degraded answer but a permanently missing half of
@@ -947,7 +923,7 @@ impl Agent {
                  the conversation with a partial summary"
             );
         }
-        Ok(acc.into_message())
+        Ok((acc.into_message(), spend))
     }
 
     /// Compact this agent's own history when it is close to filling its context

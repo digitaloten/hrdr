@@ -94,8 +94,6 @@ impl Agent {
     /// accumulator, price the call via the catalog, and accumulate into the
     /// session total.
     ///
-    /// Returns `(prompt_tokens, completion_tokens, cached_prompt_tokens,
-    /// cost_usd, session_cost_usd)`.
     ///
     /// `tool_tokens` is the caller's estimate of the `tools[]` block it sent with
     /// this request (see [`crate::estimate_tokens_in_tools`]) — the tool surface
@@ -108,7 +106,7 @@ impl Agent {
         &mut self,
         acc: &Accumulator,
         tool_tokens: u32,
-    ) -> (u32, u32, Option<u32>, Option<f64>, Option<f64>) {
+    ) -> crate::usage::CallSpend {
         let (prompt_tokens, completion_tokens) = match &acc.usage {
             Some(usage) => (usage.prompt_tokens, usage.completion_tokens),
             // A server that reports nothing: estimate every channel the model
@@ -168,13 +166,13 @@ impl Agent {
             *total += cost_usd.unwrap_or(0.0);
             (*total > 0.0).then_some(*total)
         };
-        (
+        crate::usage::CallSpend {
             prompt_tokens,
             completion_tokens,
             cached_prompt_tokens,
             cost_usd,
             session_cost_usd,
-        )
+        }
     }
 }
 
@@ -220,8 +218,14 @@ mod tests {
         );
 
         let acc = Accumulator::new();
-        let without = agent_with_history().account_usage(&acc, 0).await.0;
-        let with = agent_with_history().account_usage(&acc, expected).await.0;
+        let without = agent_with_history()
+            .account_usage(&acc, 0)
+            .await
+            .prompt_tokens;
+        let with = agent_with_history()
+            .account_usage(&acc, expected)
+            .await
+            .prompt_tokens;
         assert_eq!(
             with,
             without + expected,
@@ -240,11 +244,14 @@ mod tests {
             ..Default::default()
         });
 
-        let (prompt, completion, ..) = agent_with_history()
+        let spend = agent_with_history()
             .account_usage(&acc, crate::estimate_tokens_in_tools(&[fat_tool()]))
             .await;
-        assert_eq!(prompt, 4321, "the server's prompt count is used verbatim");
-        assert_eq!(completion, 77);
+        assert_eq!(
+            spend.prompt_tokens, 4321,
+            "the server's prompt count is used verbatim"
+        );
+        assert_eq!(spend.completion_tokens, 77);
     }
 
     /// The cache-write premium is priced, not swallowed. `account_usage` has no
