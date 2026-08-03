@@ -349,6 +349,7 @@ mod tests {
         assert_eq!(url("openai"), "https://api.openai.com/v1");
         assert_eq!(url("openrouter"), "https://openrouter.ai/api/v1");
         assert_eq!(url("claude"), "https://api.anthropic.com/v1");
+        assert_eq!(url("deepseek"), "https://api.deepseek.com");
         // `chatgpt`/`codex` fold onto the merged `openai` provider, which — with
         // no OAuth credential in scope — resolves to the STANDARD OpenAI endpoint.
         assert_eq!(url("chatgpt"), "https://api.openai.com/v1");
@@ -611,6 +612,7 @@ mod tests {
             ("claude", Some("anthropic")),
             ("openai", Some("openai")),
             ("openrouter", Some("openrouter")),
+            ("deepseek", Some("deepseek")),
             ("local", None),
         ] {
             assert_eq!(

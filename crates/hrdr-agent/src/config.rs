@@ -133,7 +133,15 @@ pub const CHATGPT_DEFAULT_CONTEXT_WINDOW: u32 = 272_000;
 /// `openai` is one provider: an API key talks to `api.openai.com`, an OpenAI
 /// OAuth credential talks to the Codex endpoint (see the auth-derived switch in
 /// [`resolve::oauth_derived`](crate::oauth_derived)).
-pub const BUILTIN_PROVIDERS: &[&str] = &["zen", "go", "openai", "openrouter", "claude", "local"];
+pub const BUILTIN_PROVIDERS: &[&str] = &[
+    "zen",
+    "go",
+    "openai",
+    "openrouter",
+    "claude",
+    "deepseek",
+    "local",
+];
 
 /// The spellings that fold onto the built-in `openai` provider's OAuth/Codex
 /// login. Sole owner of the alias set: the `/login` route and the `/model`
@@ -1394,6 +1402,7 @@ pub fn builtin_provider(name: &str) -> Option<ResolvedProvider> {
         // Anthropic's own host → hrdr uses the native Messages API (`x-api-key`),
         // which unlocks prompt caching (the OpenAI-compat endpoint can't cache).
         "claude" | "anthropic" => ("https://api.anthropic.com/v1", "ANTHROPIC_API_KEY", true),
+        "deepseek" => ("https://api.deepseek.com", "DEEPSEEK_API_KEY", true),
         "local" | "infr" => ("http://localhost:8080/v1", "HRDR_API_KEY", false),
         _ => return None,
     };
