@@ -1620,6 +1620,7 @@ mod tests {
                 last_prompt_tokens: Some(10),
                 last_completion_tokens: Some(5),
                 context_window: Some(1000),
+                ..Default::default()
             };
             Session::new(st.clone()).save("round-trip").unwrap();
 
@@ -2531,6 +2532,7 @@ mod roundtrip_audit {
                 last_prompt_tokens: Some(10),
                 last_completion_tokens: Some(5),
                 context_window: Some(1000),
+                ..Default::default()
             },
         };
 

@@ -786,6 +786,11 @@ pub enum AgentEvent {
         decode_ms: u32,
         /// Prompt tokens served from the prompt cache (a cache hit), if reported.
         cached_prompt_tokens: Option<u32>,
+        /// Prompt tokens *written* into the cache on this call, if reported.
+        /// Travels alongside the read count because the counters need both: a
+        /// turn that writes the cache and reads nothing is the first turn of a
+        /// session, not a broken cache.
+        cache_creation_tokens: Option<u32>,
         /// Completion tokens spent on reasoning/thinking, if reported.
         reasoning_tokens: Option<u32>,
         /// Estimated USD for this call, when the models.dev catalog prices the

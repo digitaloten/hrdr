@@ -1443,6 +1443,7 @@ mod tests {
                 completion_tokens: 30,
                 decode_ms: 0,
                 cached_prompt_tokens: None,
+                cache_creation_tokens: None,
                 reasoning_tokens: None,
                 cost_usd: None,
                 session_cost_usd: Some(0.02),

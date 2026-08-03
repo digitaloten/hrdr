@@ -170,6 +170,7 @@ impl Agent {
             prompt_tokens,
             completion_tokens,
             cached_prompt_tokens,
+            cache_creation_tokens,
             cost_usd,
             session_cost_usd,
         }

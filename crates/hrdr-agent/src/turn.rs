@@ -342,6 +342,7 @@ mod tests {
             completion_tokens,
             decode_ms,
             cached_prompt_tokens: None,
+            cache_creation_tokens: None,
             reasoning_tokens: None,
             cost_usd: None,
             session_cost_usd: None,

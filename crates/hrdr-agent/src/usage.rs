@@ -26,10 +26,11 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct CallSpend {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
-    /// Prompt tokens the provider served from its cache. `None` means it
-    /// reported no figure at all — which is not the same as zero, and must
-    /// never be rendered as one.
+    /// Prompt tokens the provider served from its cache, and wrote into it.
+    /// `None` means it reported no figure at all — which is not the same as
+    /// zero, and must never be rendered as one.
     pub cached_prompt_tokens: Option<u32>,
+    pub cache_creation_tokens: Option<u32>,
     /// Estimated USD for this call, and for the session so far. `None` when the
     /// catalog does not price the model.
     pub cost_usd: Option<f64>,
@@ -58,6 +59,23 @@ pub struct AgentUsage {
     /// A cost display must then be flagged (`≥ $X`), never shown bare.
     #[serde(default)]
     pub cost_partial: bool,
+    /// Prompt tokens this agent's calls were served from the provider's cache,
+    /// and wrote into it.
+    #[serde(default)]
+    pub cache_read_tokens: usize,
+    #[serde(default)]
+    pub cache_write_tokens: usize,
+    /// Prompt tokens from the calls whose cache use the provider actually
+    /// reported — the denominator [`cache_hit_rate`](Self::cache_hit_rate)
+    /// divides by.
+    ///
+    /// Separate from `tokens_in` on purpose. A provider that reports no cache
+    /// figures at all is not a provider whose cache is missing; folding its
+    /// prompt tokens into the denominator would drive the rate toward zero and
+    /// read as "prefix caching broke", which is the one conclusion the number
+    /// exists to support. So a call counts here only if it said something.
+    #[serde(default)]
+    pub cache_measured_tokens: usize,
     #[serde(default)]
     pub last_prompt_tokens: Option<u32>,
     #[serde(default)]
@@ -87,6 +105,33 @@ impl AgentUsage {
         self.set_last(Some((prompt, completion)));
     }
 
+    /// Accumulate one call's prompt-cache figures.
+    ///
+    /// `prompt` is that call's whole prompt — inclusive of the cached and
+    /// written halves, which is what the backends normalize it to (see
+    /// `hrdr-llm`'s Anthropic usage mapping, where `prompt_tokens` stays the
+    /// inclusive total while the two cache fields break it down). Both figures
+    /// absent means the provider said nothing, and the call is left out of the
+    /// measured denominator entirely.
+    pub fn record_cache(&mut self, prompt: u32, read: Option<u32>, written: Option<u32>) {
+        if read.is_none() && written.is_none() {
+            return;
+        }
+        self.cache_read_tokens += read.unwrap_or(0) as usize;
+        self.cache_write_tokens += written.unwrap_or(0) as usize;
+        self.cache_measured_tokens += prompt as usize;
+    }
+
+    /// Fraction of measured prompt tokens this agent had served from the
+    /// prompt cache, in `0.0..=1.0`.
+    ///
+    /// `None` when no call this session reported any cache figure — an endpoint
+    /// that does not publish them, which must not render as a rate of zero.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        (self.cache_measured_tokens > 0)
+            .then(|| self.cache_read_tokens as f64 / self.cache_measured_tokens as f64)
+    }
+
     /// Fold one [`crate::AgentEvent::Usage`] into these counters. The single
     /// place an event becomes a number, so an agent's counters read the same
     /// whoever is watching it — or when nobody is.
@@ -94,12 +139,19 @@ impl AgentUsage {
         if let crate::AgentEvent::Usage {
             prompt_tokens,
             completion_tokens,
+            cached_prompt_tokens,
+            cache_creation_tokens,
             session_cost_usd,
             cost_partial,
             ..
         } = ev
         {
             self.record_call(*prompt_tokens, *completion_tokens);
+            self.record_cache(
+                *prompt_tokens,
+                *cached_prompt_tokens,
+                *cache_creation_tokens,
+            );
             if let Some(total) = session_cost_usd {
                 self.cost_usd = *total;
             }
@@ -133,6 +185,49 @@ mod tests {
         assert_eq!(u.ctx_used(), 0, "cleared after a /clear or a compaction");
     }
 
+    /// The session cache rate divides by what was actually MEASURED, not by
+    /// every prompt token the agent sent.
+    ///
+    /// An endpoint that publishes no cache figures is not an endpoint whose
+    /// cache stopped working, and those are the two things the rate has to tell
+    /// apart — it exists to answer "did prefix caching keep working this
+    /// session", and a silent provider dragging it toward zero would answer
+    /// "no" for every session that touched one.
+    #[test]
+    fn the_cache_rate_divides_by_what_was_measured() {
+        let mut u = AgentUsage::default();
+        // Nothing reported yet: absent, not zero.
+        assert_eq!(u.cache_hit_rate(), None);
+        u.record_cache(1_000, None, None);
+        assert_eq!(
+            u.cache_hit_rate(),
+            None,
+            "a provider that says nothing must not read as a 0% hit rate"
+        );
+        assert_eq!(u.cache_measured_tokens, 0);
+
+        // A reporting call: 900 of its 1000 prompt tokens came from cache.
+        u.record_cache(1_000, Some(900), Some(50));
+        assert_eq!(u.cache_read_tokens, 900);
+        assert_eq!(u.cache_write_tokens, 50);
+        assert_eq!(u.cache_hit_rate(), Some(0.9));
+
+        // A second silent call must not move it — that is the whole point of
+        // the separate denominator.
+        u.record_cache(9_000, None, None);
+        assert_eq!(
+            u.cache_hit_rate(),
+            Some(0.9),
+            "an unreported call must not dilute a measured rate"
+        );
+
+        // A first turn writes the cache and reads nothing. That IS a 0% rate,
+        // and it is measured, so it counts.
+        let mut fresh = AgentUsage::default();
+        fresh.record_cache(2_000, None, Some(2_000));
+        assert_eq!(fresh.cache_hit_rate(), Some(0.0));
+    }
+
     /// The event is folded into the counters here, so an agent's usage is the
     /// same whether a UI is watching it or not.
     #[test]
@@ -142,7 +237,8 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 4,
             decode_ms: 0,
-            cached_prompt_tokens: None,
+            cached_prompt_tokens: Some(6),
+            cache_creation_tokens: Some(2),
             reasoning_tokens: None,
             cost_usd: None,
             session_cost_usd: Some(0.5),
@@ -151,6 +247,11 @@ mod tests {
         assert_eq!(u.tokens_in, 10);
         assert_eq!(u.tokens_out, 4);
         assert_eq!(u.cost_usd, 0.5);
+        // The cache halves ride the same event and land in the same fold —
+        // they used to be carried past these counters and dropped.
+        assert_eq!(u.cache_read_tokens, 6);
+        assert_eq!(u.cache_write_tokens, 2);
+        assert_eq!(u.cache_hit_rate(), Some(0.6));
         assert!(!u.cost_partial, "a fully-priced total is complete");
         // Anything else leaves them alone.
         u.record_event(&crate::AgentEvent::TurnDone);
@@ -168,6 +269,7 @@ mod tests {
             completion_tokens: 4,
             decode_ms: 0,
             cached_prompt_tokens: None,
+            cache_creation_tokens: None,
             reasoning_tokens: None,
             cost_usd: Some(0.25),
             session_cost_usd: Some(0.25),
@@ -181,6 +283,7 @@ mod tests {
             completion_tokens: 2,
             decode_ms: 0,
             cached_prompt_tokens: None,
+            cache_creation_tokens: None,
             reasoning_tokens: None,
             cost_usd: Some(0.1),
             session_cost_usd: Some(0.35),

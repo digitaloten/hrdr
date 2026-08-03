@@ -566,6 +566,7 @@ impl Agent {
                 completion_tokens: spend.completion_tokens,
                 decode_ms: decode.as_millis().min(u32::MAX as u128) as u32,
                 cached_prompt_tokens: spend.cached_prompt_tokens,
+                cache_creation_tokens: spend.cache_creation_tokens,
                 reasoning_tokens: acc.usage.as_ref().and_then(|u| u.reasoning_tokens()),
                 cost_usd: spend.cost_usd,
                 session_cost_usd: spend.session_cost_usd,
@@ -828,6 +829,7 @@ impl Agent {
             completion_tokens: spend.completion_tokens,
             decode_ms: decode.as_millis().min(u32::MAX as u128) as u32,
             cached_prompt_tokens: spend.cached_prompt_tokens,
+            cache_creation_tokens: spend.cache_creation_tokens,
             reasoning_tokens: acc
                 .usage
                 .as_ref()
