@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
-use hrdr_agent::Agent;
+use hrdr_agent::{Agent, CompactionReason, CompactionReport};
 use tokio::sync::Mutex;
 
-/// The shared compaction core (`/compact` and threshold auto-compaction):
-/// lock the agent and summarize. `Ok((before, after))` with `before == after`
-/// means there was nothing to compact.
+/// The shared compaction core for `/compact`: lock the agent and summarize. A
+/// report whose `before == after` means there was nothing to compact.
 ///
 /// Works on any agent, main or delegated. Compaction is a *context-window*
 /// concern, not a session one: a sub-agent reading its way through a codebase on
@@ -15,20 +14,22 @@ use tokio::sync::Mutex;
 pub async fn run_compaction(
     agent: Arc<Mutex<Agent>>,
     instructions: Option<String>,
-) -> Result<(usize, usize), String> {
+) -> Result<CompactionReport, String> {
     let mut a = agent.lock().await;
-    a.compact(instructions.as_deref())
+    a.compact(CompactionReason::UserRequested, instructions.as_deref())
         .await
         .map_err(|e| e.to_string())
 }
 
-/// The system line a finished compaction shows.
-pub fn compaction_message(res: &Result<(usize, usize), String>) -> String {
+/// The system line a finished compaction shows. The counts and the cache
+/// figures come from the report's own renderer, so this line and the agent's
+/// self-compaction notices cannot describe the same numbers differently.
+pub fn compaction_message(res: &Result<CompactionReport, String>) -> String {
     match res {
-        Ok((before, after)) if before == after => "nothing to compact yet".to_string(),
-        Ok((before, after)) => format!(
-            "compacted: {before} → {after} messages (summary kept; scrollback above is \
-             preserved for you)"
+        Ok(report) if !report.shrank() => report.notice(),
+        Ok(report) => format!(
+            "{} (summary kept; scrollback above is preserved for you)",
+            report.notice()
         ),
         Err(e) => format!("[compact failed] {e}"),
     }

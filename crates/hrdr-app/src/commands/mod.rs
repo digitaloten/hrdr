@@ -60,8 +60,27 @@ mod tests {
         assert!(should_auto_compact(Some(750), Some(1000), 5000, true));
         assert!(!should_auto_compact(Some(749), Some(1000), 5000, true));
         // Message formatting covers the three outcomes.
-        assert_eq!(compaction_message(&Ok((2, 2))), "nothing to compact yet");
-        assert!(compaction_message(&Ok((10, 2))).contains("compacted: 10 → 2"));
+        let report = |before, after| hrdr_agent::CompactionReport {
+            reason: hrdr_agent::CompactionReason::UserRequested,
+            before,
+            after,
+            prompt_tokens: 1_000,
+            cached_prompt_tokens: Some(900),
+            output_tokens: 42,
+            cost_usd: None,
+        };
+        assert_eq!(
+            compaction_message(&Ok(report(2, 2))),
+            "nothing to compact yet"
+        );
+        let line = compaction_message(&Ok(report(10, 2)));
+        assert!(
+            line.contains("compacted on request 10 → 2 messages"),
+            "{line}"
+        );
+        // The cache-read fraction is the number that shows the compaction
+        // request still matched the session's cached prefix.
+        assert!(line.contains("90% from cache"), "{line}");
         assert!(compaction_message(&Err("boom".into())).contains("[compact failed] boom"));
     }
 

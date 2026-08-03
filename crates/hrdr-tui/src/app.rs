@@ -193,7 +193,10 @@ pub(crate) enum TurnMsg {
     /// Carries the pane whose agent was summarized — `/compact` acts on the
     /// conversation being viewed, so its clock and its stale context reading are
     /// that agent's, not the session's.
-    Compacted(hrdr_app::PaneId, Result<(usize, usize), String>),
+    Compacted(
+        hrdr_app::PaneId,
+        Result<hrdr_agent::CompactionReport, String>,
+    ),
     /// A model/provider switch re-probed the endpoint's advertised context window.
     /// Carries the pane whose agent was switched: `/model` acts on the agent being
     /// viewed, so its probe result belongs to that agent and not to the session's.
@@ -2834,7 +2837,18 @@ mod tests {
         );
 
         // What the compaction task reports back when it lands.
-        app.on_turn_msg(TurnMsg::Compacted(PaneId(key), Ok((1, 1))));
+        app.on_turn_msg(TurnMsg::Compacted(
+            PaneId(key),
+            Ok(hrdr_agent::CompactionReport {
+                reason: hrdr_agent::CompactionReason::UserRequested,
+                before: 10,
+                after: 3,
+                prompt_tokens: 0,
+                cached_prompt_tokens: None,
+                output_tokens: 0,
+                cost_usd: None,
+            }),
+        ));
         assert!(
             !live.is_running(key),
             "the clock stops on the pane it started on"

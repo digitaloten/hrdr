@@ -14,6 +14,8 @@
 use anyhow::{Result, bail};
 use hrdr_llm::ToolDef;
 
+use hrdr_llm::CompactionReason;
+
 use crate::{
     Agent, AgentEvent, AgentRegistry, ChatMessage, MessageOrigin, RetryBudget, Role, drain_stream,
     is_context_overflow,
@@ -97,6 +99,103 @@ let the agent continue seamlessly. Use these sections:
 
 Be specific: prefer exact names, paths, and values over paraphrase. Output only the \
 summary.";
+
+/// What one compaction did, and what it cost.
+///
+/// The cache figures are the whole point of compacting against the live prefix
+/// (see [`Agent::compact`]) and a cache hit cannot be unit-tested — it needs a
+/// real provider and two sequential requests. So the mechanism reports on
+/// itself: every compaction puts its cache-read fraction in the transcript, and
+/// a run where that stays near zero says the change stopped working on the first
+/// compaction rather than at the end of a billing period.
+#[derive(Debug, Clone, Copy)]
+pub struct CompactionReport {
+    /// What triggered this compaction.
+    pub reason: CompactionReason,
+    /// History length before and after. Equal means nothing was compacted.
+    pub before: usize,
+    pub after: usize,
+    /// Prompt tokens the summarization request was billed for, and how many of
+    /// them the provider served from its cache. `None` means the provider
+    /// reported no cache figure at all — which is not the same as zero, and
+    /// must not be rendered as one.
+    pub prompt_tokens: u32,
+    pub cached_prompt_tokens: Option<u32>,
+    /// The summary's own output tokens — unchanged by prefix caching, and the
+    /// honest denominator for "what did this cost".
+    pub output_tokens: u32,
+    /// Estimated cost of the summarization call, when the model is priced.
+    pub cost_usd: Option<f64>,
+}
+
+impl CompactionReport {
+    /// The report for a compaction that had nothing to summarize.
+    fn nothing_to_do(reason: CompactionReason, messages: usize) -> Self {
+        Self {
+            reason,
+            before: messages,
+            after: messages,
+            prompt_tokens: 0,
+            cached_prompt_tokens: None,
+            output_tokens: 0,
+            cost_usd: None,
+        }
+    }
+
+    /// Whether this compaction actually shrank the history.
+    pub fn shrank(&self) -> bool {
+        self.after < self.before
+    }
+
+    /// The transcript line for this compaction — one renderer for every caller,
+    /// so a `/compact`, a proactive pass and an overflow rescue cannot describe
+    /// the same numbers in three drifting ways.
+    ///
+    /// The cost figures describe the summarization request ONLY. Compaction
+    /// rewrites the history and refreshes the system prompt, so the turn after
+    /// it starts cold no matter what this says.
+    pub fn notice(&self) -> String {
+        if !self.shrank() {
+            return "nothing to compact yet".to_string();
+        }
+        let mut line = format!(
+            "{} {} → {} messages",
+            self.reason.as_str(),
+            self.before,
+            self.after
+        );
+        match self.cached_prompt_tokens {
+            Some(cached) if self.prompt_tokens > 0 => {
+                let percent = f64::from(cached) / f64::from(self.prompt_tokens) * 100.0;
+                line.push_str(&format!(
+                    " · {} prompt tokens, {percent:.0}% from cache",
+                    self.prompt_tokens
+                ));
+            }
+            // Absent and zero mean opposite things, and one of them looks like
+            // this whole mechanism failed. Say which it is.
+            _ => line.push_str(&format!(
+                " · {} prompt tokens, cache not reported",
+                self.prompt_tokens
+            )),
+        }
+        line.push_str(&format!(" · {} output", self.output_tokens));
+        if let Some(cost) = self.cost_usd {
+            line.push_str(&format!(" · ${cost:.4}"));
+        }
+        line
+    }
+}
+
+/// What the summarization call itself was billed. Written by the attempt that
+/// produced the summary and folded into the [`CompactionReport`].
+#[derive(Debug, Clone, Copy, Default)]
+struct CompactionSpend {
+    prompt_tokens: u32,
+    cached_prompt_tokens: Option<u32>,
+    output_tokens: u32,
+    cost_usd: Option<f64>,
+}
 
 /// Max bytes of a tool-result body kept when shrinking a compaction request.
 pub(crate) const ELIDE_TOOL_RESULT_BYTES: usize = 400;
@@ -365,13 +464,20 @@ impl Agent {
     }
 
     /// Compact the conversation: ask the model for a structured summary and
-    /// replace the history with `[system prompt, summary]`, so the context
-    /// shrinks while continuity is preserved (Claude Code / opencode style).
+    /// replace the history with `[system prompt, summary, …recent tail]`, so the
+    /// context shrinks while continuity is preserved.
     ///
-    /// `instructions` optionally steers the summary's focus. Returns
-    /// `(messages_before, messages_after)`; a no-op when there's nothing beyond
-    /// the system prompt and one message.
-    pub async fn compact(&mut self, instructions: Option<&str>) -> Result<(usize, usize)> {
+    /// `reason` is what triggered this; it rides on the summary message and on
+    /// the returned [`CompactionReport`], so a caller's notice and a resumed
+    /// session both know whether this was a `/compact` or a rescue.
+    /// `instructions` optionally steers the summary's focus. A no-op report
+    /// (`before == after`) means there was nothing beyond the system prompt and
+    /// one message to summarize.
+    pub async fn compact(
+        &mut self,
+        reason: CompactionReason,
+        instructions: Option<&str>,
+    ) -> Result<CompactionReport> {
         // Whatever the outcome, the last prompt reading describes the history as it
         // was *before* this call. Clearing it here (rather than in one caller) stops
         // a frontend-driven `/compact` from leaving a stale, over-the-trigger figure
@@ -379,7 +485,7 @@ impl Agent {
         self.last_prompt_tokens = None;
         let before = self.messages.len();
         if before <= 2 {
-            return Ok((before, before));
+            return Ok(CompactionReport::nothing_to_do(reason, before));
         }
         // The agent is the one that knows it is summarizing — including when it
         // decided to on its own, which no frontend is told about. The guard clears
@@ -424,7 +530,7 @@ impl Agent {
                 // Splitting bought nothing — the lone turn already fits the
                 // tail budget, or there's truly nothing beyond the system
                 // prompt to summarize.
-                return Ok((before, before));
+                return Ok(CompactionReport::nothing_to_do(reason, before));
             }
         }
 
@@ -501,6 +607,10 @@ impl Agent {
         // the summary. Counted apart from `budget`, which only retries
         // transient network and server failures — this is neither.
         let mut tool_call_attempts = 0usize;
+        // The billing figures of the attempt that actually produced the summary
+        // — the earlier, failed ones cost real tokens but say nothing about
+        // whether the prefix cache is working.
+        let mut spend = CompactionSpend::default();
         let summary = loop {
             let history = compact_stage_history(stage, &full, &mut elided);
             let mut req = Vec::with_capacity(history.len() + 2);
@@ -513,7 +623,7 @@ impl Agent {
             // read as something the user asked for.
             req.push(ChatMessage::user(trigger.clone()));
             self.budget_preflight().await?;
-            match self.plain_completion(req, &defs).await {
+            match self.plain_completion(req, &defs, &mut spend).await {
                 Ok(msg) => {
                     // A tool call returned during compaction is NEVER executed.
                     // The tools are in the request for the prefix cache, not
@@ -586,7 +696,7 @@ impl Agent {
         // this line replaces it. Exactly one summary is in history at any time,
         // always covering the session start through the tail.
         messages.push(ChatMessage {
-            origin: MessageOrigin::Summary,
+            origin: MessageOrigin::Summary(reason),
             ..ChatMessage::user(continuation)
         });
         messages.extend(tail);
@@ -600,7 +710,15 @@ impl Agent {
         // for the rest of the session (only `invalidate_context_window`, on a
         // model switch, used to clear this).
         self.self_compact_failed_at = None;
-        Ok((before, self.messages.len()))
+        Ok(CompactionReport {
+            reason,
+            before,
+            after: self.messages.len(),
+            prompt_tokens: spend.prompt_tokens,
+            cached_prompt_tokens: spend.cached_prompt_tokens,
+            output_tokens: spend.output_tokens,
+            cost_usd: spend.cost_usd,
+        })
     }
 
     /// The first shrink stage whose request plausibly fits the context window,
@@ -661,6 +779,7 @@ impl Agent {
         &mut self,
         req: Vec<ChatMessage>,
         defs: &[ToolDef],
+        spend: &mut CompactionSpend,
     ) -> Result<ChatMessage> {
         // Compaction can run before any normal turn (notably `/compact` after
         // resuming a process), so it cannot rely on `connect_stream` having
@@ -679,7 +798,10 @@ impl Agent {
                 max_tokens: cap,
                 ..self.client.params().clone()
             });
-            match self.plain_completion_inner(&client, &req, defs, cap).await {
+            match self
+                .plain_completion_inner(&client, &req, defs, cap, spend)
+                .await
+            {
                 Err(error) if self.drop_unsupported_param(&error) => continue,
                 result => return result,
             }
@@ -692,6 +814,7 @@ impl Agent {
         req: &[ChatMessage],
         defs: &[ToolDef],
         output_cap: Option<u32>,
+        spend: &mut CompactionSpend,
     ) -> Result<ChatMessage> {
         let mut stream = client.chat_stream(req, defs).await?;
         // The round's generation time is dropped on purpose: a compaction call
@@ -701,8 +824,15 @@ impl Agent {
         // The compaction request carries the session's own `tools[]` — the same
         // surface a normal round pays for, and the same estimate when the server
         // reports no usage.
-        self.account_usage(&acc, estimate_tokens_in_tools(defs))
+        let (prompt_tokens, output_tokens, cached_prompt_tokens, cost_usd, _) = self
+            .account_usage(&acc, estimate_tokens_in_tools(defs))
             .await;
+        *spend = CompactionSpend {
+            prompt_tokens,
+            cached_prompt_tokens,
+            output_tokens,
+            cost_usd,
+        };
         // A summary cut off at the output cap is the one truncation that must
         // never be accepted quietly: this text REPLACES the conversation, so
         // half of it is not a degraded answer but a permanently missing half of
@@ -760,14 +890,12 @@ impl Agent {
         // — read it afterwards and it is always `None`, the suppression never
         // engages, and a failing summarizer is retried on every single round.
         let attempted_at = self.last_prompt_tokens;
-        match self.compact(None).await {
+        match self.compact(CompactionReason::ContextFilling, None).await {
             // `compact` clears `last_prompt_tokens` itself: the reading described
             // the history we just replaced, and leaving it set would re-trigger on
             // the next round against a history that is already small.
-            Ok((before, after)) if before != after => {
-                on_event(AgentEvent::Notice(format!(
-                    "context was filling up — compacted {before} → {after} messages"
-                )));
+            Ok(report) if report.shrank() => {
+                on_event(AgentEvent::Notice(report.notice()));
             }
             Ok(_) => {}
             Err(e) => {

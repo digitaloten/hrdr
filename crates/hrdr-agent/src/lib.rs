@@ -83,12 +83,12 @@ pub(crate) use turn_loop::{
 pub(crate) use turn_loop::{drain_stream, is_context_overflow};
 mod compaction;
 mod turn_state;
+pub use compaction::{CompactionReport, compaction_trigger, should_auto_compact};
 #[cfg(test)]
 pub(crate) use compaction::{
     ELIDE_TOOL_RESULT_BYTES, compaction_tail_start, elide_tool_results, mega_turn_tail_start,
     tail_window,
 };
-pub use compaction::{compaction_trigger, should_auto_compact};
 pub(crate) use compaction::{
     estimate_tokens, estimate_tokens_in_messages, estimate_tokens_in_tools,
 };
@@ -2656,7 +2656,6 @@ impl Agent {
 
 // Re-exports consumers need without reaching into sub-crates.
 pub use hrdr_llm::ChatMessage as Message;
-pub use hrdr_llm::MessageOrigin;
 /// The type of [`AgentConfig::retry`] — re-exported so a frontend can name it
 /// (a test pointing an agent at a dead endpoint wants `max_attempts: 1`)
 /// without a direct `hrdr-llm` dependency.
@@ -2668,6 +2667,7 @@ pub use hrdr_llm::catalog;
 /// Whether a reasoning-effort label is a level actually sent as `reasoning_effort`
 /// (`minimal`/`low`/`medium`/`high`) rather than a display-only label.
 pub use hrdr_llm::normalize_effort;
+pub use hrdr_llm::{CompactionReason, MessageOrigin};
 pub use hrdr_tools::TodoItem as Todo;
 
 /// Downgrade `messages` out of the tool-call protocol entirely — no
@@ -4367,7 +4367,9 @@ mod tests {
 
         // Nothing to summarise (system prompt only), so this is a no-op compaction
         // — but it must still retire the reading.
-        let _ = agent.compact(None).await;
+        let _ = agent
+            .compact(crate::CompactionReason::UserRequested, None)
+            .await;
         assert_eq!(
             agent.last_prompt_tokens, None,
             "the reading described a history that no longer exists"
@@ -7644,7 +7646,7 @@ mod tests {
         let after_compaction = vec![
             ChatMessage::system("sys"),
             synthetic(
-                crate::MessageOrigin::Summary,
+                crate::MessageOrigin::Summary(crate::CompactionReason::UserRequested),
                 "summary of the earlier session",
             ),
             ChatMessage::user("u1"),
@@ -10532,7 +10534,7 @@ mod tests {
             }
 
             agent
-                .compact(None)
+                .compact(crate::CompactionReason::UserRequested, None)
                 .await
                 .expect("the unsupported cap gets one uncapped retry");
 
@@ -10605,7 +10607,7 @@ mod tests {
             }
 
             agent
-                .compact(None)
+                .compact(crate::CompactionReason::UserRequested, None)
                 .await
                 .expect("uncapped transient retries eventually succeed");
 
@@ -10901,7 +10903,10 @@ mod tests {
             }
 
             // Compaction takes no sink, so nothing is reported during it.
-            agent.compact(None).await.expect("the uncapped retry works");
+            agent
+                .compact(crate::CompactionReason::UserRequested, None)
+                .await
+                .expect("the uncapped retry works");
             assert!(
                 agent
                     .unsupported_params
@@ -11054,7 +11059,7 @@ mod tests {
             crate::oauth::with_test_oauth_access(
                 "test-oauth-bearer".to_string(),
                 Some("acct-test".to_string()),
-                agent.compact(None),
+                agent.compact(crate::CompactionReason::UserRequested, None),
             )
             .await
             .expect("compaction succeeds with injected OAuth");
@@ -11106,11 +11111,12 @@ mod tests {
             }
             let before = agent.message_count();
 
-            let (b, after) = agent
-                .compact(None)
+            let report = agent
+                .compact(crate::CompactionReason::UserRequested, None)
                 .await
                 .expect("compaction must survive a transient error on the summarization call");
-            assert_eq!(b, before);
+            let after = report.after;
+            assert_eq!(report.before, before);
             assert!(after < before, "history should shrink after compaction");
         }
 
@@ -11164,7 +11170,10 @@ mod tests {
             )
             .unwrap();
 
-            agent.compact(None).await.expect("compaction succeeds");
+            agent
+                .compact(crate::CompactionReason::UserRequested, None)
+                .await
+                .expect("compaction succeeds");
 
             assert!(
                 agent.messages[0]
@@ -11218,7 +11227,10 @@ mod tests {
                     .push(ChatMessage::assistant(format!("reply {i}")));
             }
             agent.run_input("do the thing", |_| {}).await.unwrap();
-            agent.compact(None).await.expect("compaction succeeds");
+            agent
+                .compact(crate::CompactionReason::UserRequested, None)
+                .await
+                .expect("compaction succeeds");
 
             let bodies = bodies.lock().unwrap();
             assert_eq!(bodies.len(), 2, "one normal turn, then one compaction");
@@ -11320,11 +11332,17 @@ mod tests {
             agent.messages.push(ChatMessage::user("second turn"));
             agent.messages.push(ChatMessage::assistant("done"));
 
-            agent.compact(None).await.expect("compaction succeeds");
+            agent
+                .compact(crate::CompactionReason::UserRequested, None)
+                .await
+                .expect("compaction succeeds");
 
             // [system, summary, …tail]. The tail must start where the user
             // spoke, not on the stub result the repair inserted.
-            assert_eq!(agent.messages[1].origin, crate::MessageOrigin::Summary);
+            assert_eq!(
+                agent.messages[1].origin,
+                crate::MessageOrigin::Summary(crate::CompactionReason::UserRequested)
+            );
             assert_eq!(agent.messages[2].role, Role::User);
             assert_eq!(
                 agent.messages[2].content.as_deref(),
@@ -11337,6 +11355,78 @@ mod tests {
                 "no tool result is orphaned from its call: {:?}",
                 agent.messages
             );
+        }
+
+        /// Compaction reports its own cache saving.
+        ///
+        /// A cache hit cannot be asserted in a unit test, so the mechanism
+        /// reports on itself in normal use instead: every compaction puts its
+        /// cache-read fraction in the transcript. A run where that stays near
+        /// zero says compacting against the live prefix stopped working — on the
+        /// first compaction, rather than at the end of a billing period.
+        ///
+        /// The figures describe the summarization request only. The turn AFTER a
+        /// compaction starts cold whatever this says, because compaction
+        /// rewrites the history and refreshes the system prompt.
+        #[tokio::test]
+        async fn a_compaction_reports_what_the_prompt_cache_saved() {
+            let summarize = |cached: Option<u32>| {
+                let mut usage = serde_json::json!({
+                    "prompt_tokens": 1_000,
+                    "completion_tokens": 40,
+                });
+                if let Some(cached) = cached {
+                    usage["prompt_tokens_details"] = serde_json::json!({
+                        "cached_tokens": cached
+                    });
+                }
+                MockResp::Sse(vec![
+                    text_chunk("s1", "A summary."),
+                    stop_chunk("s1"),
+                    serde_json::to_string(&serde_json::json!({
+                        "id": "s1", "choices": [], "usage": usage
+                    }))
+                    .unwrap(),
+                    "[DONE]".to_string(),
+                ])
+            };
+
+            let compact_once = async |resp: MockResp| {
+                let server = MockServer::start(vec![resp]).await;
+                let dir = tempfile::tempdir().unwrap();
+                let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+                for i in 0..8 {
+                    agent.messages.push(ChatMessage::user(format!("turn {i}")));
+                    agent
+                        .messages
+                        .push(ChatMessage::assistant(format!("reply {i}")));
+                }
+                agent
+                    .compact(crate::CompactionReason::ContextFilling, None)
+                    .await
+                    .expect("compaction succeeds")
+            };
+
+            let report = compact_once(summarize(Some(900))).await;
+            assert_eq!(report.prompt_tokens, 1_000);
+            assert_eq!(report.cached_prompt_tokens, Some(900));
+            assert_eq!(report.output_tokens, 40);
+            let notice = report.notice();
+            assert!(
+                notice.starts_with("context was filling up — compacted"),
+                "{notice}"
+            );
+            assert!(notice.contains("90% from cache"), "{notice}");
+            assert!(notice.contains("40 output"), "{notice}");
+
+            // A provider that reports no cache figure at all must not be
+            // rendered as one reporting zero: absent and zero mean opposite
+            // things, and one of them reads as "the change failed".
+            let report = compact_once(summarize(None)).await;
+            assert_eq!(report.cached_prompt_tokens, None);
+            let notice = report.notice();
+            assert!(notice.contains("cache not reported"), "{notice}");
+            assert!(!notice.contains("0% from cache"), "{notice}");
         }
 
         /// The summary is a distinguished message, and there is never more than
@@ -11379,14 +11469,14 @@ mod tests {
                 agent
                     .messages
                     .iter()
-                    .filter(|m| m.origin == crate::MessageOrigin::Summary)
+                    .filter(|m| matches!(m.origin, crate::MessageOrigin::Summary(_)))
                     .map(|m| m.content.clone().unwrap_or_default())
                     .collect()
             };
 
             turns(&mut agent, "first round");
             agent
-                .compact(None)
+                .compact(crate::CompactionReason::UserRequested, None)
                 .await
                 .expect("first compaction succeeds");
 
@@ -11395,14 +11485,16 @@ mod tests {
             assert!(after_first[0].contains("FIRST_SUMMARY"));
             assert_eq!(
                 agent.messages[1].origin,
-                crate::MessageOrigin::Summary,
+                crate::MessageOrigin::Summary(crate::CompactionReason::UserRequested),
                 "the summary sits directly after the system prompt"
             );
 
-            // A second compaction, with real turns since the first.
+            // A second compaction, with real turns since the first — and a
+            // different trigger, so the tag has to carry THIS one rather than
+            // whatever the first compaction left behind.
             turns(&mut agent, "second round");
             agent
-                .compact(None)
+                .compact(crate::CompactionReason::ContextOverflow, None)
                 .await
                 .expect("second compaction succeeds");
 
@@ -11416,6 +11508,11 @@ mod tests {
             assert!(
                 !after_second[0].contains("FIRST_SUMMARY"),
                 "the old summary is folded into the new one, not carried verbatim"
+            );
+            assert_eq!(
+                agent.messages[1].origin,
+                crate::MessageOrigin::Summary(crate::CompactionReason::ContextOverflow),
+                "the summary records what triggered the compaction that wrote it"
             );
         }
 
@@ -11468,11 +11565,12 @@ mod tests {
                 1
             );
 
-            let (b, after) = agent
-                .compact(None)
+            let report = agent
+                .compact(crate::CompactionReason::UserRequested, None)
                 .await
                 .expect("compacting a single oversized turn must succeed");
-            assert_eq!(b, before);
+            let after = report.after;
+            assert_eq!(report.before, before);
             assert!(
                 after < before,
                 "a single oversized turn must actually shrink, not no-op \
@@ -11556,7 +11654,10 @@ mod tests {
             // Simulate an earlier self-compaction failure that was recorded.
             agent.self_compact_failed_at = Some(100_000);
 
-            agent.compact(None).await.expect("this compaction succeeds");
+            agent
+                .compact(crate::CompactionReason::UserRequested, None)
+                .await
+                .expect("this compaction succeeds");
             assert_eq!(
                 agent.self_compact_failed_at, None,
                 "a successful compact() must clear the recorded failure"

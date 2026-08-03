@@ -1189,14 +1189,20 @@ impl Agent {
         on_event(AgentEvent::Notice(
             "context window exceeded — compacting and retrying".to_string(),
         ));
-        let (before, after) = self.compact(None).await?;
+        let report = self
+            .compact(hrdr_llm::CompactionReason::ContextOverflow, None)
+            .await?;
         *overflow_compacted = true;
-        if after >= before {
+        if !report.shrank() {
             bail!(
                 "context window exceeded and the current turn is too large to compact \
-                 ({after} messages, nothing left to shrink) — {error}"
+                 ({} messages, nothing left to shrink) — {error}",
+                report.after
             );
         }
+        // What the rescue itself cost, and how much of it the prefix cache
+        // absorbed — the notice above fired before the call and could not know.
+        on_event(AgentEvent::Notice(report.notice()));
         Ok(true)
     }
 

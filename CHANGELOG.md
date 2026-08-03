@@ -80,6 +80,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Every compaction now says what triggered it and what the prompt cache
+  saved.** The transcript line names the trigger (`/compact`, a filling context,
+  or an overflow rescue), the message counts, the summarization request's prompt
+  tokens and what fraction of them came from cache, its output tokens, and the
+  estimated cost. The cache-read fraction is what shows compacting against the
+  live prefix is still working; a provider that reports no cache figure prints
+  "cache not reported" rather than a zero, because absent and zero mean opposite
+  things. The figures describe the summarization request only — the turn after a
+  compaction starts cold regardless, since the history is replaced and the
+  system prompt rebuilt.
+
+- **The summary carries its own provenance across a resume.** The trigger
+  (`/compact`, filling context, or overflow rescue) is recorded on the summary
+  message itself, so a resumed session can still tell a compaction the user
+  asked for from one the harness performed.
+
 - **A tool call records the defaults it actually ran with.** A call is stored
   and read back out of a session file months later, and recording only what the
   model typed meant the reader had to know what the defaults were at the time —

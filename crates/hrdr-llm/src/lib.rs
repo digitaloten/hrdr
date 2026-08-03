@@ -33,7 +33,7 @@ pub use retry::{
 };
 pub use sse::{SseDecoder, SseEvent, SseOverflow};
 pub use types::{
-    Accumulator, CacheMode, ChatChunk, ChatMessage, ChatRequest, ChunkChoice, Delta, FunctionCall,
-    FunctionDef, FunctionDelta, MessageOrigin, RequestParams, Role, ToolCall, ToolCallDelta,
-    ToolDef, Usage, apply_cache_breakpoints, normalize_effort,
+    Accumulator, CacheMode, ChatChunk, ChatMessage, ChatRequest, ChunkChoice, CompactionReason,
+    Delta, FunctionCall, FunctionDef, FunctionDelta, MessageOrigin, RequestParams, Role, ToolCall,
+    ToolCallDelta, ToolDef, Usage, apply_cache_breakpoints, normalize_effort,
 };

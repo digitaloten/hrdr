@@ -48,10 +48,42 @@ pub enum MessageOrigin {
     /// it arrives after the round that requested it closed — a detached
     /// sub-agent's report. Never a real user turn.
     Tool,
-    /// A compaction summary standing in for the history it replaced. Never a
-    /// real user turn, and never re-summarized: the next compaction folds its
-    /// text into the new summary and emits one that supersedes it.
-    Summary,
+    /// A compaction summary standing in for the history it replaced, carrying
+    /// what triggered the compaction that produced it. Never a real user turn,
+    /// and never re-summarized: the next compaction folds its text into the new
+    /// summary and emits one that supersedes it.
+    ///
+    /// The reason rides on the message rather than on a log line so provenance
+    /// survives into the transcript and across a session resume — nothing else
+    /// can tell a `/compact` the user asked for from an overflow rescue.
+    Summary(CompactionReason),
+}
+
+/// What triggered a compaction.
+///
+/// Lives here because [`MessageOrigin::Summary`] carries it onto the summary
+/// message and therefore through session serialization; the compaction path
+/// that produces it lives in `hrdr-agent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactionReason {
+    /// The user ran `/compact`.
+    UserRequested,
+    /// Context usage crossed the proactive trigger, before any request failed.
+    ContextFilling,
+    /// A request was rejected for exceeding the context window, and compaction
+    /// is the rescue.
+    ContextOverflow,
+}
+
+impl CompactionReason {
+    /// How the reason reads at the head of a transcript notice.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserRequested => "compacted on request",
+            Self::ContextFilling => "context was filling up — compacted",
+            Self::ContextOverflow => "context window exceeded — compacted",
+        }
+    }
 }
 
 /// A single chat message. Used for both request and response — `content` is

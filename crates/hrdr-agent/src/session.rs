@@ -2836,7 +2836,7 @@ mod roundtrip_audit {
         // A resumed session must still know its summary is a summary, or the
         // next compaction summarizes it again and the tail loses a real turn.
         let summary = Message {
-            origin: crate::MessageOrigin::Summary,
+            origin: crate::MessageOrigin::Summary(crate::CompactionReason::ContextOverflow),
             ..Message::user("summary of earlier conversation")
         };
 
@@ -2882,8 +2882,8 @@ mod roundtrip_audit {
         );
         assert_eq!(
             back.messages[3].origin,
-            crate::MessageOrigin::Summary,
-            "Summary origin survives session file"
+            crate::MessageOrigin::Summary(crate::CompactionReason::ContextOverflow),
+            "the Summary tag AND the reason it carries survive a session file"
         );
 
         // — Old session files (no origin field) default to User on read —
