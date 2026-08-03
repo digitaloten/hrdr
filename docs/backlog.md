@@ -249,19 +249,40 @@ asserts the two requests' `max_tokens` match, and by the comment in
 
 ### Audit items needing a decision
 
-**The notice reports only the attempt that succeeded.** `CompactionSpend` is
-overwritten by each attempt in `Agent::plain_completion_inner`, so after an
-overflow escalation `CompactionReport` carries the last stage's figures and the
-earlier stages' vanish from the notice — understating the cost exactly when
-compaction was most expensive. Nothing is unbilled: `Agent::account_usage` adds
-every attempt to `cost_total`, so the session ledger and the `max_cost` ceiling
-already see them. Only the transcript line is short. Options: accumulate prompt,
-output and cost across attempts while keeping the cache fraction from the
-successful attempt alone (the failed stages' cache readings describe requests
-that were rejected, so averaging them in would be meaningless); or say how many
-attempts it took and leave the figures as they are; or leave it, on the grounds
-that the ledger is the number that matters and the notice is about whether the
-cache is working.
+**The notice reports only the attempt that succeeded, and does not say what it
+took to get there.** `CompactionSpend` is overwritten per attempt in
+`Agent::plain_completion_inner`, so `CompactionReport` describes the last one.
+
+The under-reported spend is smaller than it first looks.
+`plain_completion_inner` calls `Agent::account_usage` only after `chat_stream`
+and `drain_stream` have both succeeded, so a shrink escalation and a transient
+retry are never billed _or_ accounted — the provider rejected the request before
+generating anything. The one path that spends and vanishes is the tool-call
+retry: that request succeeded, `account_usage` added it to `cost_total`, and the
+next iteration overwrote `spend`. Bounded by `COMPACT_TOOL_CALL_ATTEMPTS`, and
+each retry sends a byte-identical request, so its prompt is almost entirely
+cache reads. The `acc.truncated()` bail is the other one — billed, accounted,
+and no report at all, because `compact` returns `Err` and the caller reports the
+error instead.
+
+**The interpretation problem is the real one**, because reporting the cache
+fraction is what the notice is _for_ (a run where it stays near zero says
+in-place compaction stopped working). Both directions are currently unreadable:
+
+- After a tool-call retry the reported fraction is near 100% because the
+  identical previous attempt just warmed it — not because the live session
+  prefix matched. A false pass on the health signal.
+- At any stage above 0 the fraction is near zero _by construction_: every shrink
+  stage rewrites message bodies and gives the cache up. That is expected, not a
+  regression, and the notice gives the reader no way to tell.
+
+Options: carry `attempts` and the shrink `stage` on `CompactionReport` and print
+them when they are not the trivial values (both already live in `compact` as
+locals, so it is one field each and a line in `notice`) — that makes the
+fraction readable in both directions; or accumulate prompt/output/cost across
+attempts as well, which is honest about billing but reads oddly as "the request
+was N tokens" when the attempts shared a cached prefix; or leave it, on the
+grounds that `cost_total` is the number that matters.
 
 **The summarization request sends the whole history, not just the head.** So the
 verbatim tail is summarized AND kept, and the model that resumes sees the same
