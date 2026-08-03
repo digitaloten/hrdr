@@ -245,21 +245,16 @@ pub(crate) const ELIDE_TOOL_RESULT_BYTES: usize = 400;
 /// elided tool results, then the most recent 1/2, 1/4 and 1/8 of it.
 const MAX_COMPACT_STAGE: usize = 4;
 
-/// Output cap for the summarization call.
-///
-/// Bounded rather than inherited: the session's `max_tokens` is now the model's
-/// real ceiling (128k on the current Claude and GPT models), and a summarizer
-/// left to run against that can spend minutes and a fortune producing prose
-/// nobody asked for. 32k is far more than the structured summary needs — it is
-/// a backstop against a runaway, not a target — while leaving ample room for a
-/// thinking model to reason before it writes.
-const COMPACT_MAX_OUTPUT_TOKENS: u32 = 32_768;
+/// The output allowance assumed when the endpoint reports no `max_tokens` at
+/// all, so the shrink ladder still has a figure to reserve against. Only ever a
+/// sizing estimate — nothing caps the response at this.
+const COMPACT_ASSUMED_OUTPUT_TOKENS: u32 = 32_768;
 
-/// Tokens held back from the window when sizing the summarization request: the
-/// output cap above, plus slack for the trigger and the estimator's own error.
-/// The system prompt and `tools[]` are charged separately — see
+/// Slack held back on top of the output allowance when sizing the summarization
+/// request: the trigger message, and the estimator's own error. The system
+/// prompt and `tools[]` are charged separately — see
 /// [`Agent::first_viable_compact_stage`]'s `prefix_tokens`.
-const COMPACT_INPUT_HEADROOM: u32 = COMPACT_MAX_OUTPUT_TOKENS + 8_192;
+const COMPACT_INPUT_SLACK: u32 = 8_192;
 
 /// The history a given shrink stage sends: the whole head, the head with bulky
 /// tool results elided, then the most recent 1/2, 1/4, 1/8 of the elided head.
@@ -771,6 +766,12 @@ impl Agent {
     /// sends — the session's system prompt and its `tools[]`. No stage can
     /// shrink either, so they come off the budget rather than being sized
     /// against it.
+    ///
+    /// The output allowance comes off it too, and is the session's own
+    /// `max_tokens` because [`Agent::plain_completion`] no longer overrides it.
+    /// A model whose endpoint reports none is sized against
+    /// [`COMPACT_ASSUMED_OUTPUT_TOKENS`] instead — a guess for the ladder, not a
+    /// limit on the response.
     fn first_viable_compact_stage(
         &self,
         full: &[ChatMessage],
@@ -780,8 +781,14 @@ impl Agent {
         let Some(window) = self.context_window else {
             return 0;
         };
+        let headroom = self
+            .client
+            .params()
+            .max_tokens
+            .unwrap_or(COMPACT_ASSUMED_OUTPUT_TOKENS)
+            .saturating_add(COMPACT_INPUT_SLACK);
         let budget = window
-            .saturating_sub(COMPACT_INPUT_HEADROOM)
+            .saturating_sub(headroom)
             .saturating_sub(prefix_tokens);
         if budget == 0 {
             // A window smaller than the headroom: nothing can be sized, and
@@ -828,17 +835,27 @@ impl Agent {
         // account-header cleanup semantics.
         self.refresh_oauth_if_needed().await;
         loop {
-            let cap = (!self
-                .unsupported_params
-                .contains(&hrdr_llm::UnsupportedParam::MaxTokens))
-            .then_some(COMPACT_MAX_OUTPUT_TOKENS);
-            let mut client = self.client.clone();
-            client.set_params(hrdr_llm::RequestParams {
-                max_tokens: cap,
-                ..self.client.params().clone()
-            });
+            // NOTHING about the request parameters is overridden, and that is
+            // the point: the compaction call has to be byte-identical to an
+            // ordinary turn or the prefix cache [`Agent::compact`] exists to hit
+            // is gone. Anthropic's invalidation table puts `output_config.effort`
+            // and the `thinking` config in the same class as `tool_choice` —
+            // each "always invalidates message blocks", and on models that
+            // render the config ahead of them, `tools` and `system` too.
+            //
+            // `max_tokens` is not on that table itself, and this call used to cap
+            // it as a runaway-summarizer guard. That guard was removed because on
+            // the MANUAL thinking dialect the cap was not neutral: `thinking_budget`
+            // in `hrdr-llm`'s Anthropic backend derives `thinking.budget_tokens`
+            // from `max_tokens`, so capping the output rewrote the thinking block
+            // and cost the cache on every one of those models. The summarizer now
+            // runs with the session's own allowance, which is what makes the
+            // request identical; a summary that runs to that limit is still
+            // refused rather than accepted truncated, below.
+            let client = self.client.clone();
+            let output_cap = client.params().max_tokens;
             match self
-                .plain_completion_inner(&client, &req, defs, cap, spend)
+                .plain_completion_inner(&client, &req, defs, output_cap, spend)
                 .await
             {
                 Err(error) if self.drop_unsupported_param(&error) => continue,
@@ -1101,8 +1118,20 @@ mod tests {
         let mut elided = None;
         assert_eq!(agent.first_viable_compact_stage(&full, &mut elided, 0), 0);
 
+        // Headroom tracks the session's own output allowance rather than a
+        // fixed cap, so read it off the agent instead of restating it here.
+        let headroom = |agent: &crate::Agent| {
+            agent
+                .client
+                .params()
+                .max_tokens
+                .unwrap_or(COMPACT_ASSUMED_OUTPUT_TOKENS)
+                .saturating_add(COMPACT_INPUT_SLACK)
+        };
+
         // A window that the full history cannot fit skips straight past stage 0.
-        agent.set_context_window(Some(COMPACT_INPUT_HEADROOM + 20_000));
+        let window = headroom(&agent) + 20_000;
+        agent.set_context_window(Some(window));
         let mut elided = None;
         let stage = agent.first_viable_compact_stage(&full, &mut elided, 0);
         assert!(stage > 0, "a doomed stage 0 must be skipped, got {stage}");
@@ -1111,13 +1140,29 @@ mod tests {
         // The prefix — system prompt and tools — rides on every stage, so it
         // comes off the budget: a window that fits the history alone does not
         // fit it once the prefix is charged.
-        agent.set_context_window(Some(COMPACT_INPUT_HEADROOM + 60_000));
+        let window = headroom(&agent) + 60_000;
+        agent.set_context_window(Some(window));
         let mut elided = None;
         assert_eq!(agent.first_viable_compact_stage(&full, &mut elided, 0), 0);
         let mut elided = None;
         assert!(
             agent.first_viable_compact_stage(&full, &mut elided, 40_000) > 0,
             "the prefix must be charged against the same budget"
+        );
+
+        // The summarizer runs with the session's own `max_tokens` (nothing caps
+        // it any more), so the allowance it reserves has to move with it: the
+        // window that just fit at the smaller allowance stops fitting once the
+        // session asks for more output.
+        let params = hrdr_llm::RequestParams {
+            max_tokens: Some(headroom(&agent) + 40_000),
+            ..agent.client.params().clone()
+        };
+        agent.client.set_params(params);
+        let mut elided = None;
+        assert!(
+            agent.first_viable_compact_stage(&full, &mut elided, 0) > 0,
+            "the output allowance must be charged against the same budget"
         );
 
         // A window smaller than the headroom has nothing to size against and

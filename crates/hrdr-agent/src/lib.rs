@@ -10542,16 +10542,18 @@ mod tests {
             assert_eq!(bodies.len(), 2, "exactly capped then uncapped: {bodies:#?}");
             // The local mock speaks Chat Completions (`max_tokens`); Codex maps
             // the same RequestParams field to `max_output_tokens`.
-            assert_eq!(bodies[0]["max_tokens"], 32_768);
+            //
+            // The SESSION's cap, not one of compaction's own: overriding it
+            // would rewrite `thinking.budget_tokens` on the manual thinking
+            // dialect and cost the prefix cache compacting in place exists for.
+            assert_eq!(bodies[0]["max_tokens"], 1_234);
             assert!(
                 bodies[1].get("max_tokens").is_none(),
                 "fallback omits the rejected cap: {bodies:#?}"
             );
             // The endpoint refused the cap, so the session stops sending it —
             // ordinary turns would otherwise keep offering the configured 1234
-            // and be rejected exactly as the summarizer was. What must never
-            // happen is the summarizer's own 32768 being left behind on the
-            // live client, which would silently truncate the model's replies.
+            // and be rejected exactly as the summarizer was.
             assert_eq!(
                 agent.client.params().max_tokens,
                 None,
@@ -10617,7 +10619,7 @@ mod tests {
                 4,
                 "all queued attempts were made: {bodies:#?}"
             );
-            assert_eq!(bodies[0]["max_tokens"], 32_768);
+            assert_eq!(bodies[0]["max_tokens"], 1_234, "the session's own cap");
             assert!(
                 bodies[1..]
                     .iter()
@@ -11220,6 +11222,12 @@ mod tests {
 
             let dir = tempfile::tempdir().unwrap();
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+            // A session that actually caps its output, so the parameter check
+            // below compares two real values rather than two absent ones.
+            agent.client.set_params(hrdr_llm::RequestParams {
+                max_tokens: Some(4_096),
+                ..Default::default()
+            });
             for i in 0..8 {
                 agent.messages.push(ChatMessage::user(format!("turn {i}")));
                 agent
@@ -11244,6 +11252,21 @@ mod tests {
             assert_eq!(
                 compaction["tools"], turn["tools"],
                 "the compaction request carries the session's own tools[]"
+            );
+
+            // Request PARAMETERS have to match too, not just the prompt. On the
+            // manual thinking dialect `thinking.budget_tokens` is derived from
+            // `max_tokens`, so a compaction-only output cap rewrites the
+            // thinking block — and Anthropic documents a changed thinking config
+            // as always invalidating message blocks. Compaction therefore
+            // overrides nothing.
+            assert!(
+                turn["max_tokens"].is_number(),
+                "precondition: the normal turn sends a cap: {turn}"
+            );
+            assert_eq!(
+                compaction["max_tokens"], turn["max_tokens"],
+                "the compaction request must not cap output differently"
             );
 
             let turn_msgs = turn["messages"].as_array().unwrap();

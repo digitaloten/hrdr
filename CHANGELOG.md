@@ -49,6 +49,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The prefix is the one that was just cached. A tool call coming back from that
   request is never executed — it is a failed attempt, and compaction asks again.
 
+  The summarizer also no longer caps its own output at 32k. That cap looked free
+  — `max_tokens` does not invalidate a prompt cache by itself — but on Anthropic
+  models using manual extended thinking the thinking budget is derived from
+  `max_tokens`, so capping it rewrote the thinking block and invalidated the
+  cache anyway. Compaction now overrides no request parameter at all, and runs
+  with whatever thinking budget the session is already using. A summary cut off
+  at the limit is still refused rather than silently replacing the conversation
+  with half of one.
+
 - **A second compaction no longer summarizes the first summary.** The summary
   went into history as a plain user message, marked apart only by its prose
   opening, so once it was old enough to fall in the head the next compaction

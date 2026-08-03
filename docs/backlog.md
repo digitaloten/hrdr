@@ -205,6 +205,40 @@ request". hrdr's `is_transient` only has the second class, so several
 permanently-failing cases are retried. That can land without any of the
 model-switch machinery.
 
+### Standing constraint: compaction overrides NO request parameter
+
+**From Anthropic's prompt-caching docs, read 2026-08-04.** The summarization
+call must be byte-identical to an ordinary turn in its parameters as well as its
+prompt, or the prefix cache that compacting in place exists to hit is gone.
+
+- `output_config.effort` and the `thinking` config sit in the same invalidation
+  class as `tool_choice`: each _"always invalidates message blocks"_, and on
+  models that render the config ahead of them, `tools` and `system` too. An
+  effort or thinking override on the compaction path would undo the whole
+  in-place-compaction win on **every** model.
+- `max_tokens` is not on that table itself, but it is not neutral either.
+  `thinking_budget` in `hrdr-llm/src/anthropic.rs` derives
+  `thinking.budget_tokens` from it, so on the MANUAL thinking dialect — per
+  `classify`, Claude 3.x and Claude 4 below 4.6, with an effort configured —
+  capping the output rewrites the thinking block and costs the cache. (4.6 and
+  later send an adaptive block with no budget, as does every model `classify`
+  does not recognize; with no effort set the shape is `Off` and no thinking
+  block is sent.)
+
+The compaction-only output cap that used to exist was **removed** for that
+reason: the summarizer now runs with the session's own `max_tokens`. Two things
+replaced what it guarded — `first_viable_compact_stage` sizes its headroom off
+the session's real allowance (falling back to `COMPACT_ASSUMED_OUTPUT_TOKENS`
+only when the endpoint reports none), and a summary that runs to the limit is
+still refused rather than accepted truncated. What is gone is the spend ceiling:
+a pathological summarizer can now produce up to the session's full output
+allowance. Revisit only if that is observed in practice, and not by
+reintroducing a compaction-only cap.
+
+Guarded by `the_compaction_request_keeps_the_live_prefix_byte_for_byte`, which
+asserts the two requests' `max_tokens` match, and by the comment in
+`Agent::plain_completion`.
+
 ### Noticed while working, not fixed
 
 `session_name_from` (`hrdr-agent/src/session.rs`) takes the first `Role::User`
