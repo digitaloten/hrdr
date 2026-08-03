@@ -93,7 +93,7 @@ impl ProviderName {
     pub fn is_builtin(&self) -> bool {
         matches!(
             self.0.as_str(),
-            "zen" | "go" | "openai" | "openrouter" | "claude" | "local"
+            "zen" | "go" | "openai" | "openrouter" | "claude" | "deepseek" | "local"
         )
     }
 
@@ -114,6 +114,7 @@ impl ProviderName {
             "openai" => "openai",
             "openrouter" => "openrouter",
             "claude" => "anthropic",
+            "deepseek" => "deepseek",
             _ => return None,
         })
     }
@@ -427,6 +428,8 @@ mod tests {
         assert_eq!(n("local"), "local");
         assert_eq!(n("infr"), "local");
         assert_eq!(n("openrouter"), "openrouter");
+        assert_eq!(n("deepseek"), "deepseek");
+        assert!(ProviderName::new("deepseek").is_builtin());
         // Case- and whitespace-insensitive, like `builtin_provider`.
         assert_eq!(n("  OpenCode-GO \n"), "go");
         assert_eq!(ProviderName::new("ZEN"), ProviderName::new("opencode"));
@@ -451,6 +454,7 @@ mod tests {
         assert_eq!(p("chatgpt").catalog_key(), Some("openai"));
         assert_eq!(p("codex").catalog_key(), Some("openai"));
         assert_eq!(p("openrouter").catalog_key(), Some("openrouter"));
+        assert_eq!(p("deepseek").catalog_key(), Some("deepseek"));
         // No catalog presence.
         assert_eq!(p("local").catalog_key(), None);
         assert_eq!(p("mycustom").catalog_key(), None);
@@ -465,6 +469,7 @@ mod tests {
         assert_eq!(p("chatgpt").auth_key(), "openai");
         assert_eq!(p("codex").auth_key(), "openai");
         assert_eq!(p("mycustom").auth_key(), "mycustom");
+        assert_eq!(p("deepseek").auth_key(), "deepseek");
     }
 
     /// What a catalog call site must pass: the built-in mapping, else the custom
