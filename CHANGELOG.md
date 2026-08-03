@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `task` block no longer shows blank `cwd` and `model` rows.** Models
+  routinely send `""` for an optional parameter they do not want, and `task`
+  already reads `""` and `null` exactly as absent — `cwd` falls back to the
+  delegating agent's directory, `model` to the configured sub-agent model. The
+  block rendered them anyway, as a key with nothing beside it, which reads as an
+  argument that was set to nothing rather than a default in force. Both rows are
+  now omitted when left to their defaults, and still shown whenever a value was
+  actually passed. The model the run went to is on the `↳ delegated to …` line
+  under the block, as before.
+
+  Scoped to `task` and to those two keys on purpose: `replace` renders through
+  the same generic path, and an empty `new_string` there is the entire point of
+  the call — it deletes what it matched — so a blanket rule would have hidden a
+  real edit.
+
 ### Added
 
 - **Up on an empty input takes a queued message back to edit.** Submitting while
