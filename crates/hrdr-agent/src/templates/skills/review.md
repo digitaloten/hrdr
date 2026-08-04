@@ -102,10 +102,13 @@ findings clearly marked as such).
      never true either; saying where you stopped is what lets the user judge the
      report.
 7. Route the findings by where you're working:
-   - **Inside a git repo with a `docs/` directory** → write the full report to
-     `docs/code-review.md`.
-   - **Inside a git repo with no `docs/` directory** → write it to
-     `code-review.md` at the repo root.
+   - **Inside a git repo with a `docs/backlog.md`** → append the full report to
+     `docs/backlog.md` under a dated `## <area> review YYYY-MM-DD` heading
+     (backlog.md is the single work-item file; a review's open findings belong
+     in it, its closed ones in the Record section — do not create a sibling
+     file).
+   - **Inside a git repo without `docs/backlog.md`** → append it to
+     `backlog.md` at the repo root (creating the file if needed).
    - **Not inside a git repo** (working on something git doesn't track) → do NOT
      write to disk.
 

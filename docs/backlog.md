@@ -4,19 +4,31 @@
 (the four-harness comparison) and `security-audit.md`, which are deleted — read
 `git log` for what they said before this.
 
-**Threading pass 2026-08-04** (`docs/threading-plan.md`, slices 1/2/3/5 shipped
-in `1145ccd`/`b21bec8`/`5130f26`/`6549c7b`): blocking tool fs now runs on
-`spawn_blocking`, each tool call in a batch runs as its own task (with the
-panic-resume and cancel-abort mechanisms), session saves write off the UI thread
-behind a latest-wins coalescer, and sub-agent construction runs on the blocking
-pool. **Slice 4 (attach reads off the UI thread) is deferred**: the `@file`
-reads are bounded (~100 KB per file) and one-shot at submit, while the change
-would convert the whole input path (`on_key` → `submit_input` →
-`spawn_turn`/`send_to_subagent`) to async — a disproportionate ripple for a
-stall that is imperceptible next to the per-round save Slice 3 removed. If the
-submit-time stall ever shows up, the reads in
-`crates/hrdr-app/src/util.rs:130-213` (`read_attach_file`/`read_attach_dir`/
-`discover_skills`) are the site.
+**Threading pass 2026-08-04** (slices 1/2/3/5 shipped in
+`1145ccd`/`b21bec8`/`5130f26`/`6549c7b`; the plan document
+`docs/threading-plan.md` was archived into this file same day): blocking tool fs
+now runs on `spawn_blocking`, each tool call in a batch runs as its own task
+(with the panic-resume and cancel-abort mechanisms), session saves write off the
+UI thread behind a latest-wins coalescer, and sub-agent construction runs on the
+blocking pool. Binding decisions carried forward: the TUI stays the root task on
+the main thread, blocking tool work belongs on `spawn_blocking`, and the
+whole-turn agent mutex stays (the UI works around it with `try_lock`). **Slice 4
+(attach reads off the UI thread) is deferred**: the `@file` reads are bounded
+(~100 KB per file) and one-shot at submit, while the change would convert the
+whole input path (`on_key` → `submit_input` → `spawn_turn`/`send_to_subagent`)
+to async — a disproportionate ripple for a stall that is imperceptible next to
+the per-round save Slice 3 removed. If the submit-time stall ever shows up, the
+reads in `crates/hrdr-app/src/util.rs:130-213`
+(`read_attach_file`/`read_attach_dir`/ `discover_skills`) are the site.
+
+**Docs consolidation 2026-08-04.** Every other work-item file in `docs/` is
+folded into this one and deleted — `git log` has what they said: the 2026-08-04
+code review (`docs/code-review.md`, 6 findings, all fixed), the performance
+review (see [Performance review — 2026-08-04](#performance-review-2026-08-04)),
+the threading plan, the compaction rewrite plan (binding decisions kept in
+[Compaction rewrite](#compaction-rewrite)), the DeepSeek provider plan (shipped,
+one manual-smoke item below), and the sandbox redesign decision record (its open
+items live in [Sandbox follow-ups](#sandbox-follow-ups)).
 
 **Every claim below was re-verified against the tree at `8c76cdb`** before it
 was carried over. What did not survive verification is either corrected in place
@@ -94,6 +106,50 @@ Conventions:
 
 ---
 
+## Performance review 2026-08-04
+
+From `docs/performance-review.md`, archived into this file. Findings ranked by
+impact; the threading slices (above) closed #1's save half and #1d, and moved
+the tool-blocking fs off tokio workers. What remains open:
+
+1. **Per-round full-history clone ×3 in the event pipeline.** The turn loop
+   clones the whole message list per round (`turn_loop.rs:759`), the registry
+   log re-clones it (`registry.rs:415`; the reducer ignores the payload, the
+   headless runner reads only its `len`), and the frontend re-clones it in
+   `persist_mid_turn`. Slice 3 moved the save off the UI thread; the three
+   clones remain — log a lightweight marker, hand the `History` payload by
+   value, and drop `Session::save`'s double state clone
+   (`session.rs:341`/`:778`).
+2. **Request body deep-copied into a `serde_json::Value` per request.**
+   `client.rs:1062-1120` (`to_value` + grafts) then reqwest serializes the tree;
+   under no graft (default cache mode, no prompt-cache key, not DeepSeek) the
+   Value is pure waste — serialize `ChatRequest` straight to bytes.
+3. **`list_sessions()` rescanned per frame and per keystroke** while a `/resume`
+   popup is live (`hrdr-app/completion.rs:201` ← `ui.rs:148`, `app.rs:994`;
+   read_dir + stat + sort every call). Memoize by editor content / sessions-dir
+   mtime.
+4. **`rank_file_matches` over the 20k-file index per frame and per keystroke**
+   (`hrdr-tui/app/completion.rs:160-166`, `WALK_MAX_FILES = 20_000`), with a
+   `to_ascii_lowercase` per path per call. Precompute a lowercase path table.
+5. **Full-history token re-estimate every round** on endpoints reporting no
+   usage (`budget.rs:122-123`). Keep a running `messages_tokens` counter.
+6. **Per-line `canonicalize_nearest` in the shell secret filter.**
+   `grep_line_is_secret` (`lib.rs:1233`) realpath-chains the same path token
+   once per match line; memoize the verdict per token for one command's run.
+   (The grep-walk per-file canonicalize is closed: Slice 1 moved the whole walk
+   to `spawn_blocking`.)
+7. **Compaction tail-window selection re-sums overlapping suffixes**
+   (`compaction.rs:451-460`) plus a per-stage history clone in the ladder
+   sizing. One newest→oldest accumulating pass.
+8. **`/resume` picker rebuilds every row per frame** (`ui.rs:600-663`):
+   `relative_time` + `display_dir` + three width passes, unchanged between
+   frames. Cache rendered rows and widths.
+9. **Picker refilter allocates per candidate per keystroke**
+   (`selector.rs:43-46`, `models.rs:786-791` `format!`+`to_lowercase`).
+   Precompute a lowercase haystack per choice.
+10. **fstat per transcript record** (`transcript_log.rs:434`), used only to roll
+    back a partial write. Track the appended length instead.
+
 ## Dependency upgrades held back, 2026-08-03
 
 A `cargo update` sweep took every compatible release and the major bumps that
@@ -148,10 +204,11 @@ shipped silently.
 
 ## Compaction rewrite
 
-The plan lives in `docs/compaction-rewrite-plan.md`. Item 0, the origin-blind
-turn-boundary defect, and work items 1–3 shipped 2026-08-04; items 4 and 5 are
-below, both blocked on a decision rather than on effort. Delete the plan file
-when they close, keeping only what still binds future work.
+The plan (`docs/compaction-rewrite-plan.md`) is archived into this section — its
+open items are below, and the binding decisions it left are listed at the end of
+this section. Item 0, the origin-blind turn-boundary defect, and work items 1–3
+shipped 2026-08-04; items 4 and 5 are below, both blocked on a decision rather
+than on effort.
 
 An audit of the shipped work against the plan, same day, raised ten gaps. Nine
 are closed: the removed `max_tokens` override (see the standing constraint
@@ -324,6 +381,23 @@ trivially fixable with the `MessageOrigin` predicate that compaction uses
 (`compaction::is_user_turn`), but out of scope for the plan and rare in
 practice: names are set on the first save, which normally precedes any
 compaction.
+
+### Binding decisions from the archived plan
+
+These constrain any future compaction work; the plan file is deleted, so they
+live here:
+
+- Compact **in place**, request shape unchanged (no separate summarization
+  endpoint, no `tool_choice` — rejected 2026-08-04).
+- The reinjected summary is a **distinguished message** (a `MessageOrigin` of
+  its own), never a user turn; prose framing is guaranteed by instruction plus a
+  hard guard.
+- Keep hrdr's **whole-turn tail** and the **local shrink ladder** (the staged
+  fallback when the full history won't fit the window).
+- The `MessageOrigin` serialized names changed — a **clean break** on session
+  files, decided 2026-08-04.
+- Compaction **overrides no request parameter** (see the standing constraint
+  above).
 
 ## Owed right now
 
@@ -846,6 +920,11 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
 ---
 
 ## Test coverage gaps
+
+- **DeepSeek built-in provider: manual smoke slice never ran.** The provider
+  plan's slice 7 (single-turn + agentic tool-call turn against the real API)
+  needs a live `DEEPSEEK_API_KEY` and was not runnable in the automated suite;
+  every other slice shipped. Run it before trusting a real DeepSeek session.
 
 - **Wire log on the native backends — unblocked, still unwritten.**
   `error_response` and `sse` records are emitted by `anthropic.rs`/`codex.rs`
@@ -1836,6 +1915,25 @@ frontend renders only), the agent-logic migration (main and sub-agents on one
 codepath), session retention/compression, the memory tool's design, the DRY and
 seam audits (their survivors are under Considered and declined), and the
 tool-robustness audit (13 items: 11 shipped, 2 dropped in re-triage).
+
+**Code review 2026-08-04** (full codebase, low depth). Six findings, all fixed
+and pushed the same day: the dangling-symlink write sandbox escape (fixed in
+`canonicalize_nearest`), the compressed-session open-lock id divergence, the
+`max_tokens`/`max_completion_tokens` routing on the sentinel path, the shell
+spool dropping the cap-crossing line, the phantom `!command` tool block, and the
+`@agent` mention splice targeting the wrong offset. The report itself was folded
+into this file on the same day's docs consolidation and deleted;
+`docs/code-review.md` is gone — `git log` has the detail.
+
+**Docs consolidation 2026-08-04.** `docs/` is down to this file alone. The
+performance review (findings carried into
+[Performance review 2026-08-04](#performance-review-2026-08-04)), the threading
+plan (carried into the threading-pass note at the top), the compaction rewrite
+plan (carried into [Compaction rewrite](#compaction-rewrite)), the DeepSeek
+provider plan (shipped; the one open slice is under Test coverage gaps), and the
+sandbox redesign decision record (its open items were already under
+[Sandbox follow-ups](#sandbox-follow-ups)) were archived into this file and
+deleted. Read `git log` for what they said before this.
 
 **Tracked elsewhere:** the Codex catalog compatibility pin is GitHub issue #2.
 Issue #13 (sandbox) is shipped and should be closed.

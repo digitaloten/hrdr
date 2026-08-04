@@ -52,10 +52,12 @@ named in arguments if given: $ARGUMENTS
    concrete fix. Then add a short **Coverage** section: which paths you actually
    traced and which you did not, and anything whose cost you could not settle
    without profiling. Then route it by where you're working:
-   - **Inside a git repo with a `docs/` directory** → write the full report to
-     `docs/performance-review.md`.
-   - **Inside a git repo with no `docs/` directory** → write it to
-     `performance-review.md` at the repo root.
+   - **Inside a git repo with a `docs/backlog.md`** → append the full report to
+     `docs/backlog.md` under a dated `## <area> review YYYY-MM-DD` heading
+     (backlog.md is the single work-item file; open findings belong in it, and
+     do not create a sibling file).
+   - **Inside a git repo without `docs/backlog.md`** → append it to
+     `backlog.md` at the repo root (creating the file if needed).
    - **Not inside a git repo** (working on something git doesn't track) → do NOT
      write to disk.
 
