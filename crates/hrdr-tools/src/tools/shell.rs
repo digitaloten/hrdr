@@ -532,9 +532,12 @@ pub(crate) async fn run_streamed_command(
     // line lives verbatim in `head` (it only starts spilling into the `tail`
     // ring once `head` reaches `head_budget`, which is sized to exactly
     // `ctx.max_output` — the same threshold that trips the byte cap below), so
-    // the moment we first cross a cap, `head` already holds the complete
-    // output so far and can be dumped in one write with nothing missing.
-    // Every line after that point is appended as it arrives, same as before.
+    // when we first cross a cap, `head` holds everything except possibly the
+    // line that just tripped it: a line that fills `head` to exactly
+    // `head_budget` is routed to the `tail` ring (it does not fit in `head`),
+    // and its `total_bytes` addition is what makes `over_cap` fire. The seed
+    // write below appends that one line explicitly. Every line after that
+    // point is appended as it arrives, same as before.
     let overflow_dir = crate::tool_output_dir();
     let mut overflow_path: Option<std::path::PathBuf> = None;
     let mut overflow_file: Option<std::fs::File> = None;
@@ -583,6 +586,10 @@ pub(crate) async fn run_streamed_command(
                 total_bytes += line.len() + 1; // +1 for the newline
 
                 // Accumulate in-memory head + tail.
+                // The routing decision, captured up front: the line that trips
+                // the byte cap is exactly the one that does not fit in `head`,
+                // and the seed write below needs to know whether to append it.
+                let went_to_tail = head.len() >= head_budget;
                 if head.len() < head_budget {
                     head.push_str(line);
                     head.push('\n');
@@ -607,6 +614,10 @@ pub(crate) async fn run_streamed_command(
                         // everything ingested so far (verbatim in `head`) in one
                         // write, rather than having written every line from the
                         // start regardless of whether it would ever be needed.
+                        // The line that just tripped the cap is the one `head`
+                        // lacks when it filled `head` to exactly `head_budget`
+                        // (it went to the `tail` ring instead) — append it so
+                        // the spool misses nothing.
                         let _ = std::fs::create_dir_all(&overflow_dir);
                         let stamp = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -623,6 +634,10 @@ pub(crate) async fn run_streamed_command(
                         {
                             use std::io::Write as _;
                             let _ = f.write_all(head.as_bytes());
+                            if went_to_tail {
+                                let _ = f.write_all(line.as_bytes());
+                                let _ = f.write_all(b"\n");
+                            }
                             overflow_path = Some(p);
                             overflow_file = Some(f);
                         }
@@ -966,6 +981,42 @@ mod tests {
         // The shape the bug produced, on either platform's wording.
         assert!(!out.contains("exit code:"), "{out}");
         assert!(!out.contains("exit status: exit"), "{out}");
+    }
+
+    /// The overflow spool keeps the one line that crosses the byte cap.
+    ///
+    /// `max_output = 100` and 52 lines of `x` (104 bytes): lines 1-50 fill
+    /// `head` to exactly 100 bytes, line 51 is the first one that does not fit
+    /// (it goes to the `tail` ring) and its arrival is what trips `over_cap` —
+    /// so when the spool file is seeded with `head`, that line is not in it.
+    /// The seed must append it, or a grep of the spool cannot find it while the
+    /// hint says "52 lines, 104 bytes".
+    #[tokio::test]
+    async fn the_overflow_spool_keeps_the_line_that_crosses_the_byte_cap() {
+        let Some(shell) = Shell::detect() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ToolContext::new(dir.path());
+        ctx.max_output = 100;
+        ctx.max_output_lines = 10_000;
+        // 52 lines of "x" = 104 bytes: line 51 is the one that crosses the cap,
+        // and it is exactly the line the spool used to drop.
+        let command = "printf 'x\\n%.0s' {1..52}";
+        let out = ShellTool::new(shell)
+            .execute(serde_json::json!({"command": command}), &ctx)
+            .await
+            .expect("a command that overflows is still a result");
+        let spool = ctx
+            .spooled_output_for(command)
+            .expect("the run spilled to a spool file");
+        let contents = std::fs::read_to_string(&spool).expect("spool readable");
+        assert_eq!(
+            contents.lines().count(),
+            52,
+            "spool holds every line: {out}"
+        );
+        assert!(out.contains("52 lines"), "{out}");
     }
 
     /// **A shell that is present but cannot run anything is not a shell.**
