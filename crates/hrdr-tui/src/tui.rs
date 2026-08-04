@@ -58,7 +58,7 @@ pub(crate) async fn run_loop(
     let mut events = EventStream::new();
     let mut rx = app.rx.take().expect("run_loop called once");
     // Periodic wake so the inference spinner animates between tokens.
-    let mut ticker = tokio::time::interval(Duration::from_millis(120));
+    let mut ticker = tokio::time::interval(Duration::from_millis(ui::SPINNER_FRAME_MS));
     // Shared config watch (OS watcher with polling fallback); pings arrive as
     // TurnMsg::ConfigChanged. Kept alive for the loop.
     let _config_watch = app.start_config_watch();

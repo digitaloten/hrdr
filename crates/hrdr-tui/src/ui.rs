@@ -1095,7 +1095,7 @@ fn todo_lines(app: &App) -> Option<(Vec<Line<'static>>, Option<usize>)> {
     }
 
     let bg = app.theme.user_bg;
-    let frame = SPINNER[(app.header_anchor.elapsed().as_millis() / 120) as usize % SPINNER.len()];
+    let frame = spinner_frame(app.header_anchor.elapsed());
     let mut lines: Vec<Line<'static>> = todos
         .iter()
         .take(TODO_PANEL_MAX_ITEMS as usize)
@@ -1184,7 +1184,7 @@ fn subagent_lines(app: &App, width: usize) -> Option<(Vec<Line<'static>>, Vec<hr
     let (accent, success, bg) = (app.theme.accent, app.theme.success, app.theme.user_bg);
     // A running row leads with the same animated spinner as the inference loader
     // (driven off the free-running header clock so it ticks even while idle).
-    let frame = SPINNER[(app.header_anchor.elapsed().as_millis() / 120) as usize % SPINNER.len()];
+    let frame = spinner_frame(app.header_anchor.elapsed());
     let inner = inner_width(width) as usize;
     let (lines, ids) = items
         .iter()
@@ -1212,6 +1212,15 @@ fn subagent_lines(app: &App, width: usize) -> Option<(Vec<Line<'static>>, Vec<hr
 }
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Spinner frame period in milliseconds. The redraw ticker in [`tui`] uses the
+/// same value so the animation and the draw loop stay in sync.
+pub(crate) const SPINNER_FRAME_MS: u64 = 120;
+
+/// The spinner frame for `elapsed`: one step per [`SPINNER_FRAME_MS`], wrapping
+/// around [`SPINNER`]'s length.
+pub(crate) fn spinner_frame(elapsed: std::time::Duration) -> &'static str {
+    SPINNER[(elapsed.as_millis() / SPINNER_FRAME_MS as u128) as usize % SPINNER.len()]
+}
 
 /// The inference loader: spinner + live stats (context size, in/out ratio,
 /// token throughput), closing the transcript while a turn runs. `None` when the
@@ -1235,7 +1244,7 @@ fn loader_line(app: &App) -> Option<Line<'static>> {
     // The model's own working time: the tool calls it waited on don't count, so
     // the clock freezes while they run rather than inflating the turn.
     let elapsed = turn.infer_elapsed();
-    let frame = SPINNER[(elapsed.as_millis() / 120) as usize % SPINNER.len()];
+    let frame = spinner_frame(elapsed);
     let speed = turn.tok_per_sec();
 
     let ctx = match pane.state.usage.last() {
@@ -2619,7 +2628,7 @@ fn transcript_chunks<'a>(app: &'a App, width: u16) -> (Vec<Chunk<'a>>, Vec<usize
         // longer model name wrapping) has to be measured again.
         // For unfinished tool entries the current spinner frame is mixed into the
         // hash so the cached block invalidates on each tick, animating the marker.
-        let frame_idx = (app.header_anchor.elapsed().as_millis() / 120) as u64;
+        let frame_idx = (app.header_anchor.elapsed().as_millis() / SPINNER_FRAME_MS as u128) as u64;
         let frame = SPINNER[frame_idx as usize % SPINNER.len()];
         let base_hash = match entry.kind {
             EntryKind::Header => header_hash(app),
