@@ -194,7 +194,11 @@ impl CompactionReport {
         // because compaction rewrites the history and refreshes the system
         // prompt. The figures are joined by commas rather than the `·` used
         // above, so the scope covers all of them rather than only the first.
-        line.push_str(" · summary call: ");
+        // The scoped block goes on its own line: the clause above can already
+        // carry " · 2 attempts · full-history stage", and one long line wraps
+        // awkwardly in the transcript.
+        line.push('\n');
+        line.push_str("summary call: ");
         match self.cached_prompt_tokens {
             Some(cached) if self.prompt_tokens > 0 => {
                 let percent = f64::from(cached) / f64::from(self.prompt_tokens) * 100.0;

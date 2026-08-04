@@ -83,6 +83,16 @@ mod tests {
         // The cache-read fraction is the number that shows the compaction
         // request still matched the session's cached prefix.
         assert!(line.contains("90% from cache"), "{line}");
+        // The message is multi-line: the summary-call figures and the suffix
+        // each sit on their own line rather than one wrapped string.
+        assert!(
+            line.ends_with("\n(summary kept; scrollback above is preserved for you)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("\nsummary call: 1000 prompt tokens, 90% from cache, 42 output"),
+            "{line}"
+        );
         assert!(compaction_message(&Err("boom".into())).contains("[compact failed] boom"));
     }
 

@@ -36,7 +36,7 @@ pub fn compaction_message(res: &Result<CompactionReport, String>) -> String {
     match res {
         Ok(report) if !report.shrank() => report.notice(),
         Ok(report) => format!(
-            "{} (summary kept; scrollback above is preserved for you)",
+            "{}\n(summary kept; scrollback above is preserved for you)",
             report.notice()
         ),
         Err(e) => format!("[compact failed] {e}"),
