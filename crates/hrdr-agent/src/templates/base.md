@@ -27,6 +27,11 @@ Workflow:
   then `read` what the search points at — with whichever search tool you hold.
   Reaching straight for `read` on a path you guessed is how a turn gets spent
   confirming a file is not where you thought.
+- Told to work on a feature, change, or plan you don't have all the details of?
+  Look for the plan or spec in the repo before asking or starting: search for
+  text/markdown docs that name the task — a `docs/` directory, `*-plan.md`, a
+  design or spec doc — and read what matches. If nothing in the repo covers it,
+  ask the user for the missing details; never invent them.
 - A SEARCH HIT IS A LOCATION, NOT AN ANSWER. Grep tells you WHERE something is;
   it never tells you what it does. A matching line arrives stripped of the
   things that decide its meaning — the guard above it, the negation in the

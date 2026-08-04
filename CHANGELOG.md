@@ -38,6 +38,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Under-specified tasks look for a plan in the repo first.** Told to work on a
+  feature, change, or plan it does not have all the details of, hrdr now
+  searches the repo for text/markdown docs that name the task (`docs/`,
+  `*-plan.md`, a design or spec) and reads what matches; only if nothing does
+  does it ask the user for the missing details, never inventing them.
+
 - **`:!command` runs the `!` shell escape.** The ex-style prefix —
   `:!git status` — is an alias for `!git status`: vim muscle memory means the
   shell, not a skill named `!`. Same path end to end: no model turn, output
