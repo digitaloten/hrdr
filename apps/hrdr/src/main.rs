@@ -927,7 +927,7 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
     // Prepare the outgoing prompt: expand `@file` mentions and route any
     // `@agent` mention to the matching sub-agent (parity with the TUI), and
     // expand `todo#N` / `task#N` references against this agent's own list.
-    let todos = agent.todos().lock().map(|t| t.clone()).unwrap_or_default();
+    let todos = agent.todos_owned();
     let (prompt, inlined) =
         hrdr_app::prepare_outgoing_tracked(&prompt, agent.agent_names(), &agent.cwd(), &todos);
     // A fully inlined `@file` is content the model has already seen — tell the

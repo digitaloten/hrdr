@@ -2243,6 +2243,11 @@ impl Agent {
         self.messages.clone()
     }
 
+    /// A clone of the current TODO list.
+    pub fn todos_owned(&self) -> Vec<TodoItem> {
+        self.todos().lock().map(|t| t.clone()).unwrap_or_default()
+    }
+
     /// Replace the message history (for resuming a session). Resets the
     /// read-before-edit gate: this conversation didn't read those files.
     ///

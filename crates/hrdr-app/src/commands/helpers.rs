@@ -224,7 +224,7 @@ pub fn agent_names(agent: &Arc<Mutex<Agent>>) -> Vec<String> {
 pub fn agent_todos(agent: &Arc<Mutex<Agent>>) -> Vec<hrdr_tools::TodoItem> {
     agent
         .try_lock()
-        .map(|a| a.todos().lock().map(|t| t.clone()).unwrap_or_default())
+        .map(|a| a.todos_owned())
         .unwrap_or_default()
 }
 

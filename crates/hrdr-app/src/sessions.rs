@@ -16,7 +16,7 @@ pub async fn save_agent_session(
 ) -> anyhow::Result<Option<SaveOutcome>> {
     let (msgs, cwd, todos) = {
         let a = agent.lock().await;
-        let todos = a.todos().lock().map(|t| t.clone()).unwrap_or_default();
+        let todos = a.todos_owned();
         (a.messages_owned(), a.cwd().display().to_string(), todos)
     };
     state.sync_from(msgs, todos, cwd);
