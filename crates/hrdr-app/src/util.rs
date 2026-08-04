@@ -19,7 +19,24 @@ use std::path::{Path, PathBuf};
 /// `@`-tokens that don't match an agent are left alone (they may be `@file`
 /// mentions). Only the first match is honored.
 pub fn extract_agent_mention(input: &str, names: &[String]) -> Option<(String, String)> {
+    // Track each token's byte offset through the iteration instead of
+    // re-searching the input: the first occurrence of a token's bytes can live
+    // inside an earlier word (`foo@explore` contains `@explore`), which a
+    // `find` would splice out of the wrong place.
+    let mut offset = 0;
     for raw in input.split_whitespace() {
+        // split_whitespace skips the whitespace runs between tokens; mirror
+        // that here (advancing by full chars) so `offset` lands on the start
+        // of the current token.
+        while offset < input.len() {
+            let c = input[offset..].chars().next().unwrap();
+            if !c.is_whitespace() {
+                break;
+            }
+            offset += c.len_utf8();
+        }
+        let start = offset;
+        offset += raw.len();
         let Some(tok) = raw.strip_prefix('@') else {
             continue;
         };
@@ -28,16 +45,13 @@ pub fn extract_agent_mention(input: &str, names: &[String]) -> Option<(String, S
             continue;
         }
         if let Some(canon) = names.iter().find(|n| n.eq_ignore_ascii_case(tok)) {
-            // Drop the first occurrence of the whole `@name` token, then tidy
-            // only the doubled/edge horizontal whitespace it leaves behind at
-            // the splice point. Collapsing whitespace over the *whole* body
-            // (as a blanket `split_whitespace().join(" ")` would) flattens
-            // every newline and fenced code block in the message, not just
-            // the token's own spacing — so only the splice site is touched,
-            // and only spaces/tabs there, leaving newlines elsewhere intact.
-            let Some(start) = input.find(raw) else {
-                return Some((canon.clone(), input.to_string()));
-            };
+            // Drop the matched `@name` token, then tidy only the doubled/edge
+            // horizontal whitespace it leaves behind at the splice point.
+            // Collapsing whitespace over the *whole* body (as a blanket
+            // `split_whitespace().join(" ")` would) flattens every newline and
+            // fenced code block in the message, not just the token's own
+            // spacing — so only the splice site is touched, and only
+            // spaces/tabs there, leaving newlines elsewhere intact.
             let end = start + raw.len();
             let before = &input[..start];
             let after = &input[end..];
@@ -711,6 +725,19 @@ mod tests {
         // The directive names the agent and carries the body.
         let msg = agent_mention_message("explore", "find X");
         assert!(msg.contains("`explore`") && msg.ends_with("find X"));
+    }
+
+    #[test]
+    fn extract_agent_mention_splices_the_matched_token_not_the_first_occurrence() {
+        let names = vec!["explore".to_string()];
+        // `foo@explore` contains the token's bytes but is not a mention; the real
+        // mention is the last token. The old code spliced `input.find("@explore")`
+        // — the occurrence inside the email — gutting it, keeping the mention, and
+        // jamming the words ("contact foothen @explore run audit").
+        let input = "contact foo@explore then @explore run audit";
+        let (a, body) = extract_agent_mention(input, &names).unwrap();
+        assert_eq!(a, "explore");
+        assert_eq!(body, "contact foo@explore then run audit");
     }
 
     /// Stripping the `@name` token must only tidy the whitespace it leaves
