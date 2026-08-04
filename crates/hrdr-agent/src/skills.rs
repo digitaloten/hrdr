@@ -96,11 +96,7 @@ fn skill_dirs(cwd: &Path, project: crate::prompt::ProjectInstructions) -> Vec<Pa
     if let Some(d) = crate::config_dir() {
         dirs.push(d.join("skills")); // ~/.config/hrdr/skills
     }
-    if let Some(home) = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-    {
+    if let Some(home) = crate::agents_dir::home_dir() {
         dirs.push(home.join(".claude").join("commands"));
     }
     if let Ok(d) = hjkl_xdg::config_dir("opencode") {
