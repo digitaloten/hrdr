@@ -151,6 +151,10 @@ impl super::App {
     /// holds the agent lock, so [`Self::autosave`]'s try_lock read would skip —
     /// adopt the snapshot it sent and persist that instead. With this, a crash
     /// mid-turn loses at most the round in flight.
+    ///
+    /// The state mutation stays on the UI thread; the serialize + atomic write
+    /// move to a spawned task once the session has an id (the mint — id +
+    /// open-lock — is synchronous and only ever runs here on the UI thread).
     pub(super) fn persist_mid_turn(&mut self, messages: Vec<hrdr_agent::Message>) {
         let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
         // `state.cwd` is only synced by the turn-end autosave; on the very
@@ -161,6 +165,15 @@ impl super::App {
         state.messages = messages;
         state.todos = todos;
         state.cwd = cwd;
+        if self.state().id.is_some() {
+            // The id (and its open-lock) was minted synchronously — at turn
+            // start by `reserve_session_id`, or by the first sync save below.
+            // Only the write goes off-thread.
+            self.enqueue_save();
+            return;
+        }
+        // No id yet (near-unreachable — `reserve_session_id` runs at turn
+        // start): mint + write synchronously, exactly as before.
         let saved = hrdr_app::save_session(self.state());
         if let Some(mut o) = self.record_session_save(saved) {
             // On the first save this session's id is minted and its open-lock is
@@ -248,6 +261,19 @@ impl super::App {
         let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
         self.state_mut().sync_from(msgs, todos, cwd);
 
+        if self.state().id.is_some() {
+            // The mint happened synchronously (at turn start, or on the very
+            // first save); only the write goes off-thread. Hand the notice the
+            // mint deferred over at the same point as always — here, turn end —
+            // so it lands once the first save of the session succeeds.
+            if std::mem::take(&mut self.session_notice_pending) {
+                let id = self.state().id.clone().unwrap_or_default();
+                self.push_entry(Entry::notice(hrdr_app::session_saved_notice(&id)));
+            }
+            self.enqueue_save();
+            return;
+        }
+        // No id yet: mint + write synchronously, unchanged.
         let saved = hrdr_app::save_session(self.state());
         if let Some(mut o) = self.record_session_save(saved) {
             // Hold the freshly-minted session's open-lock, if this was the mint.
@@ -262,6 +288,99 @@ impl super::App {
             }
             self.state_mut().id = Some(o.id);
             self.refresh_subagent_dir();
+        }
+    }
+
+    /// Queue a save of the current session state. Called only once the session
+    /// has an id — the mint stays synchronous, only the write is off-thread.
+    ///
+    /// The snapshot is captured HERE on the UI thread, so a `/rename` or
+    /// `/clear` after this point cannot corrupt an in-flight write; the next
+    /// enqueue supersedes it (latest-wins: at most one save task runs, and a
+    /// newer snapshot is always what it writes next).
+    fn enqueue_save(&mut self) {
+        let snapshot = self.state().clone();
+        if self.save_in_flight {
+            self.pending_save = Some(snapshot);
+            return;
+        }
+        self.spawn_save(snapshot);
+    }
+
+    /// Spawn the serialize + atomic-write for `snapshot`. The id is captured
+    /// from the CURRENT state at spawn time — the pending snapshot belongs to
+    /// whatever session is current, and `/clear` or `/resume` since it was
+    /// captured leaves the pipeline stale (see the guard in
+    /// [`Self::promote_pending_save`]).
+    fn spawn_save(&mut self, snapshot: hrdr_app::SessionState) {
+        let id = self
+            .state()
+            .id
+            .clone()
+            .expect("a save is only spawned after the id exists");
+        self.save_in_flight = true;
+        let tx = self.tx.clone();
+        let save_done = self.save_done.clone();
+        tokio::spawn(async move {
+            let res = hrdr_app::Session::new(snapshot.persisted()).save(&id);
+            let _ = tx
+                .send(TurnMsg::SaveDone(
+                    res.map(|p| p.display().to_string())
+                        .map_err(|e| e.to_string()),
+                ))
+                .await;
+            save_done.notify_one();
+        });
+    }
+
+    /// An off-thread save finished: clear the in-flight flag, surface a failure
+    /// exactly as the sync path does, and write the newest pending snapshot
+    /// next. The snapshot captured at enqueue time is what was written, so a
+    /// `/rename`/`/clear` that landed since cannot have interleaved with it.
+    pub(super) fn on_save_done(&mut self, result: Result<String, String>) {
+        self.save_in_flight = false;
+        match result {
+            Ok(_) => self.session_save_error = None,
+            Err(error) => {
+                if self.session_save_error.as_deref() != Some(&error) {
+                    self.push_entry(Entry::notice(format!(
+                        "session autosave failed — conversation is not safely stored: {error}"
+                    )));
+                    self.session_save_error = Some(error);
+                }
+            }
+        }
+        self.promote_pending_save();
+    }
+
+    /// Write the pending snapshot (if any) next. The snapshot must belong to
+    /// the CURRENT session: `/clear` or `/resume` since it was captured resets
+    /// the id, and the old session's snapshot must never be written under the
+    /// new one's filename — drop it instead (the session it belonged to was
+    /// deliberately discarded).
+    fn promote_pending_save(&mut self) {
+        if let Some(next) = self.pending_save.take()
+            && next.id.as_deref() == self.state().id.as_deref()
+        {
+            self.spawn_save(next);
+        }
+    }
+
+    /// Wait for every save the coalescer has queued (in-flight or pending) to
+    /// land. The quit path calls this after its final `autosave`: the process
+    /// must not exit before the last snapshot reaches disk.
+    ///
+    /// Each save posts its `SaveDone` to the channel and then notifies; on the
+    /// quit path the channel is never drained (the loop has already stopped
+    /// selecting on it), so `on_save_done` never runs — reflect each
+    /// completion here instead: clear the in-flight flag and promote the
+    /// pending snapshot, exactly as `on_save_done` would. The write lands
+    /// BEFORE the notification, so waking is the durability signal.
+    pub(crate) async fn await_saves(&mut self) {
+        while self.save_in_flight || self.pending_save.is_some() {
+            self.save_done.notified().await;
+            self.save_in_flight = false;
+            self.promote_pending_save();
         }
     }
 

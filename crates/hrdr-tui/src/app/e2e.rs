@@ -424,6 +424,22 @@ impl Harness {
         }
     }
 
+    /// Wait for the session save the last turn/tool round enqueued to land.
+    ///
+    /// Saves serialize + write on a spawned task, so the session file may not be
+    /// current (or, before its first write, may not exist) when a turn settles —
+    /// a test that reads it must drain until the coalescer's `SaveDone` clears
+    /// the in-flight flag. Processes every message it drains, exactly as the
+    /// real loop would.
+    async fn save_drain(&mut self) {
+        while self.app.save_in_flight || self.app.pending_save.is_some() {
+            match self.rx.recv().await {
+                Some(msg) => self.app.on_turn_msg(msg),
+                None => break,
+            }
+        }
+    }
+
     /// Render the whole UI to a [`TestBackend`] and flatten it to text.
     fn render(&mut self) -> String {
         let mut term = Terminal::new(TestBackend::new(90, 30)).unwrap();
@@ -2020,6 +2036,9 @@ async fn autosave_writes_the_state_and_it_loads_back_identically() {
     }])
     .await;
     h.submit("run it").await;
+    // The save is written off-thread; wait for its SaveDone so the load below
+    // reads the turn's state, not the first (mint) write.
+    h.save_drain().await;
 
     // The turn-end autosave assigned an id and wrote the file.
     let id = h
@@ -2068,6 +2087,57 @@ async fn autosave_writes_the_state_and_it_loads_back_identically() {
         "id from the file name"
     );
     assert_eq!(loaded.state.messages.len(), 3, "system + user + assistant");
+}
+
+/// The session save runs off the UI thread: a turn's end-of-turn handling
+/// returns BEFORE its save lands, and the file catches up once the save
+/// task's `SaveDone` is drained.
+///
+/// Regression against Slice 3: `persist_mid_turn`/`autosave` used to
+/// `serde_json::to_string` + atomically write the whole session on the UI
+/// thread, so by the time a turn settled the file was already current. The
+/// write now runs on a spawned task behind a latest-wins coalescer — the
+/// turn-end code must not wait for it (that is the stall being removed), and
+/// the snapshot reaches disk via the `SaveDone` the task posts.
+#[tokio::test]
+async fn session_save_lands_off_thread_after_the_turn() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![MockReply::Text("done".into())]).await;
+    h.submit("do the thing").await;
+
+    let id = h.app.state().id.clone().expect("the turn minted an id");
+    let cwd = h.app.current_cwd();
+
+    // The turn-end handling (submit's pump) returned without waiting for the
+    // save: the last snapshot is still queued on the coalescer, not on disk.
+    assert!(
+        h.app.save_in_flight || h.app.pending_save.is_some(),
+        "the turn settled before its save landed"
+    );
+
+    // Drain until the save's SaveDone is processed — the file is written by
+    // then.
+    h.save_drain().await;
+    assert!(
+        !h.app.save_in_flight && h.app.pending_save.is_none(),
+        "the coalescer drained every queued save"
+    );
+    let loaded = hrdr_app::Session::load(&cwd, &id).expect("the save landed");
+    assert!(
+        loaded.state.messages.iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|c| c.contains("do the thing"))),
+        "the user message reached disk"
+    );
+    assert!(
+        loaded
+            .state
+            .messages
+            .iter()
+            .any(|m| m.content.as_deref().is_some_and(|c| c.contains("done"))),
+        "the assistant reply reached disk"
+    );
 }
 
 /// The shared sub-agent transcript cell starts empty (no id yet) and is
@@ -2577,6 +2647,9 @@ async fn resume_notices_do_not_accumulate() {
 
     let mut h = Harness::new(vec![MockReply::Text("ok".into())]).await;
     h.submit("hi").await;
+    // The save is written off-thread; the first load below must see the
+    // turn's save (the mint alone filed the session under the pre-sync cwd).
+    h.save_drain().await;
     let id = h.app.state().id.clone().expect("session saved");
     let cwd = h.app.current_cwd();
 
@@ -2602,6 +2675,9 @@ async fn resume_notices_do_not_accumulate() {
         let session = hrdr_app::Session::load(&cwd, &id).unwrap();
         h.app.apply_session(id.clone(), session);
         h.app.autosave();
+        // The resume's autosave is written off-thread; wait for it before
+        // reading the file back.
+        h.save_drain().await;
 
         assert_eq!(
             saved_notices(&id, &cwd),
@@ -5018,6 +5094,9 @@ async fn cancelling_a_turn_autosaves_the_in_progress_transcript() {
     // a later checkpoint performs.
     h.app.reap_cancelled_turn().await;
     h.app.autosave();
+    // The save is written off-thread; wait for its SaveDone before reading
+    // the file.
+    h.save_drain().await;
 
     let id = h
         .app
@@ -5072,11 +5151,13 @@ async fn quitting_mid_turn_autosaves_the_in_progress_transcript() {
     assert!(!h.app.running(), "the in-flight turn was cancelled first");
 
     // Finish the quit the way the run loop does: await the aborted turn (which
-    // releases the agent lock) then run the final autosave. Without this, the
-    // reap-then-save the loop performs on `should_quit` never happens, and the
-    // best-effort save in `cancel_turn` skips while the lock is still held.
+    // releases the agent lock), run the final autosave, then flush the
+    // off-thread save before the process exits. Without the reap-then-save the
+    // loop performs on `should_quit`, the best-effort save in `cancel_turn`
+    // skips while the lock is still held.
     h.app.reap_cancelled_turn().await;
     h.app.autosave();
+    h.app.await_saves().await;
 
     let id = h
         .app
@@ -5543,15 +5624,21 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
     assert!(noted, "the history note landed with ToolEnd");
 
     // …and autosaved: the session file already carries the note and the
-    // closed tool block, not "whenever the next turn saves".
+    // closed tool block, not "whenever the next turn saves". The write is
+    // off-thread; wait for its SaveDone first.
+    h.save_drain().await;
+    // The ToolEnd autosave filed the session under the session's own cwd (the
+    // state mirror it wrote); `current_cwd()` would fall back to the process
+    // cwd while the follow-up turn still holds the agent lock, so load where
+    // the save actually went.
+    let cwd = h.app.state().cwd.clone();
     let id = h
         .app
         .state()
         .id
         .clone()
         .expect("the !command's autosave assigned a session id");
-    let loaded = hrdr_app::Session::load(&h.app.current_cwd(), &id)
-        .expect("session file written on ToolEnd");
+    let loaded = hrdr_app::Session::load(&cwd, &id).expect("session file written on ToolEnd");
     assert!(
         loaded.state.messages.iter().any(|m| {
             m.content

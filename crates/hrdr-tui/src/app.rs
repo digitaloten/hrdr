@@ -182,6 +182,10 @@ pub(crate) enum TurnMsg {
     UserShell(AgentEvent, Option<String>),
     /// Turn finished; `Some` carries an error string.
     Done(Option<String>),
+    /// An off-thread session save finished: `Ok(path)` once the snapshot is
+    /// atomically on disk, or the error. Sent by the save task spawned by
+    /// [`App::enqueue_save`]; the coalescer's in-flight flag clears here.
+    SaveDone(Result<String, String>),
     /// An event from a sub-agent being driven directly from its pane. Carried per
     /// pane key so it lands in that agent's transcript and nowhere else.
     SubAgent(u64, AgentEvent),
@@ -385,6 +389,19 @@ pub(crate) struct App {
     /// Last autosave error shown in the transcript. Identical failures stay
     /// silent until a save succeeds, preventing every checkpoint from spamming.
     session_save_error: Option<String>,
+    /// The coalescer's waiting snapshot: a save is in flight, and this newer
+    /// state is what the next save task writes (latest-wins — a later save
+    /// always supersedes an in-flight one). Captured on the UI thread at
+    /// enqueue time, so a `/rename` or `/clear` after that point cannot
+    /// interleave with a stale write. `Some` implies [`Self::save_in_flight`].
+    pending_save: Option<hrdr_app::SessionState>,
+    /// Whether a session-save task is currently writing (serialize + atomic
+    /// fs write, both off the UI thread).
+    save_in_flight: bool,
+    /// Wakes the quit flush ([`Self::await_saves`]) when a save task posts its
+    /// `SaveDone`. The save writes the file BEFORE notifying, so waking is the
+    /// durability signal.
+    save_done: Arc<tokio::sync::Notify>,
     /// The open-lock for the session currently loaded, if any. Held for the whole
     /// time this session is active so a second hrdr instance can't resume the same
     /// session and silently clobber our turns (last-writer-wins). Set when a
@@ -710,6 +727,9 @@ impl App {
             },
             session_notice_pending: false,
             session_save_error: None,
+            pending_save: None,
+            save_in_flight: false,
+            save_done: Arc::new(tokio::sync::Notify::new()),
             active_lock: None,
             editor,
             theme,
@@ -2532,6 +2552,7 @@ impl App {
                 self.file_index_cwd = Some(cwd);
                 self.file_index_building = false;
             }
+            TurnMsg::SaveDone(result) => self.on_save_done(result),
             TurnMsg::Identity(id, reference, base_url, window) => {
                 // The agent has taken it; the chrome may now say so.
                 self.update_chrome(id, |s| s.model = reference);

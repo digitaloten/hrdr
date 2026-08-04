@@ -112,6 +112,10 @@ pub(crate) async fn run_loop(
             // nothing new, so it never double-writes.
             app.reap_cancelled_turn().await;
             app.autosave();
+            // The final save landed off-thread; don't exit before it does.
+            // `await_saves` waits for the in-flight save (and any newer
+            // snapshot coalesced behind it) to reach disk.
+            app.await_saves().await;
             // `session_end` hooks run after the final save, awaited (each
             // hook's timeout bounds the wait) — a spawned task would be
             // killed when the process exits right after.
