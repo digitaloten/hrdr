@@ -168,7 +168,7 @@ impl RunSnapshot {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_background(
+async fn spawn_background(
     cfg: AgentConfig,
     prompt: String,
     label: String,
@@ -217,7 +217,11 @@ fn spawn_background(
     };
     // Build and register synchronously so `task_steer` can address the id as soon as
     // `task` returns; registration inside the spawned future races the caller.
-    let mut sub = Agent::new(cfg)?;
+    // Construction is synchronous fs/config work (profile resolution, skills
+    // discovery, gate detection), so it runs on the blocking pool rather than
+    // occupying a tokio worker. The parent waits for the ack either way — the
+    // registration below still happens before the id is returned.
+    let mut sub = tokio::task::spawn_blocking(move || Agent::new(cfg)).await??;
     sub.cost_total = cost_total;
     sub.cost_partial = cost_partial;
     sub.ctx.lsp = lsp;
@@ -1452,7 +1456,8 @@ impl hrdr_tools::Tool for SubagentTool {
             self.lsp.clone(),
             self.transcript_dir.clone(),
             self.live.clone(),
-        )?;
+        )
+        .await?;
         Ok(ack)
     }
 }
