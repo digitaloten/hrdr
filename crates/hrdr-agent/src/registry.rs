@@ -420,33 +420,38 @@ impl AgentRegistry {
     /// the agent did and what it spent are recorded in one place, by the agent,
     /// with nothing required to be watching.
     pub fn record(&self, key: u64, ev: &crate::AgentEvent) {
-        self.update(key, |e| {
-            e.usage.record_event(ev);
-            e.turn.record(ev);
-            if let Ok(mut log) = e.events.lock() {
-                log.push(ev.clone());
-            }
-            // Append to the agent's durable transcript, if it has one. This is
-            // what makes the on-disk jsonl complete across BOTH a sub-agent's
-            // delegated run and any later steered turn: every event travels
-            // through here, so it is written exactly once, in order, regardless
-            // of which task drove it. Best-effort — a poisoned lock or a failed
-            // write must never break recording.
-            //
-            // An event with no record of its own still marks a moment worth
-            // landing the writer's buffered deltas at: `Usage` ends a stream,
-            // `History` commits a round, `TurnDone` ends the turn. So the
-            // no-record case flushes rather than doing nothing — durability at
-            // every round boundary, without a list of event kinds to keep in
-            // sync here.
-            if let Some(ts) = &e.transcript {
-                let mut w = ts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                match crate::transcript_log::Record::from_event(ev) {
-                    Some(rec) => w.write(&rec),
-                    None => w.flush(),
+        // Record usage/turn/events under the registry lock; the transcript
+        // writer is cloned out so the file I/O below runs outside it.
+        let transcript = self.with(|v| {
+            v.iter_mut().find(|e| e.key == key).and_then(|e| {
+                e.usage.record_event(ev);
+                e.turn.record(ev);
+                if let Ok(mut log) = e.events.lock() {
+                    log.push(ev.clone());
                 }
-            }
+                e.transcript.clone()
+            })
         });
+        // Append to the agent's durable transcript, if it has one. This is
+        // what makes the on-disk jsonl complete across BOTH a sub-agent's
+        // delegated run and any later steered turn: every event travels
+        // through here, so it is written exactly once, in order, regardless
+        // of which task drove it. Best-effort — a poisoned lock or a failed
+        // write must never break recording.
+        //
+        // An event with no record of its own still marks a moment worth
+        // landing the writer's buffered deltas at: `Usage` ends a stream,
+        // `History` commits a round, `TurnDone` ends the turn. So the
+        // no-record case flushes rather than doing nothing — durability at
+        // every round boundary, without a list of event kinds to keep in
+        // sync here.
+        if let Some(ts) = transcript {
+            let mut w = ts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match crate::transcript_log::Record::from_event(ev) {
+                Some(rec) => w.write(&rec),
+                None => w.flush(),
+            }
+        }
     }
 
     /// The failed `ToolEnd` every tool call still open on agent `key` never got,
