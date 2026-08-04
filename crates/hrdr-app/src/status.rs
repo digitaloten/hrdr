@@ -30,6 +30,8 @@ pub enum StatusRole {
     Effort,
     /// Time-to-first-token of the latest turn (dim).
     Ttft,
+    /// The sandbox-confinement badge (inverted on the accent2 slot).
+    Sandbox,
     /// Session name, right-aligned (dim).
     Session,
 }
@@ -91,6 +93,13 @@ pub fn status_role_style(role: StatusRole) -> RoleStyle {
         StatusRole::Model => RoleStyle::fg(ThemeSlot::Assistant),
         StatusRole::Effort => RoleStyle::fg(ThemeSlot::Warn),
         StatusRole::Ttft => RoleStyle::fg(ThemeSlot::Dim),
+        // A badge: inverted (black) text on a filled accent background — same
+        // treatment as the session badge.
+        StatusRole::Sandbox => RoleStyle {
+            fg: None,
+            bg: Some(ThemeSlot::Accent2),
+            bold: false,
+        },
         // A badge: inverted (black) text on a filled accent background.
         StatusRole::Session => RoleStyle {
             fg: None,
@@ -197,11 +206,27 @@ pub struct StatusInputs<'a> {
     pub model: &'a str,
     /// Session name, right-aligned on the status bar (empty/None → no right side).
     pub session: Option<&'a str>,
+    /// The sandbox-confinement badge label (`yolo` / `write` / `read only` /
+    /// `jail`), shown next to the context gauge when set.
+    pub sandbox: Option<&'a str>,
     pub effort: Option<&'a str>,
     /// Time-to-first-token of the latest turn, seconds.
     pub ttft: Option<f64>,
     /// Whether Nerd-font glyphs (folder/branch icons) may be used.
     pub nerd_icons: bool,
+}
+
+/// The status-bar badge label for a sandbox mode — the user-facing name of what
+/// the agent's tools are confined to. Distinct from [`hrdr_tools::SandboxMode::as_str`]
+/// (the canonical config spelling) on purpose: `none` reads as nothing on a bar,
+/// and `read` is ambiguous next to a read-only *session*.
+pub fn sandbox_label(mode: hrdr_tools::SandboxMode) -> &'static str {
+    match mode {
+        hrdr_tools::SandboxMode::None => "Yolo",
+        hrdr_tools::SandboxMode::Write => "Write",
+        hrdr_tools::SandboxMode::Read => "Read Only",
+        hrdr_tools::SandboxMode::Jail => "Jail",
+    }
 }
 
 /// Build the status sections in display order. Priorities (drop order under
@@ -289,6 +314,11 @@ pub fn status_sections(i: &StatusInputs) -> Vec<StatusSeg> {
             StatusRole::CtxPlain,
         )),
     }
+    // The sandbox-confinement badge rides next to the context gauge, at the
+    // same drop priority so the two leave the bar together under truncation.
+    if let Some(label) = i.sandbox {
+        sections.push(StatusSeg::one(1, format!(" {label} "), StatusRole::Sandbox));
+    }
     // Provider + model share one section so they never split across a wrap or
     // get dropped independently under truncation.
     let mut model_runs = Vec::new();
@@ -357,6 +387,7 @@ mod tests {
             provider: Some("zen"),
             model: "qwen3",
             session: Some("my-session"),
+            sandbox: Some("Write"),
             effort: None,
             ttft: Some(1.5),
             nerd_icons: false,
@@ -450,8 +481,8 @@ mod tests {
     #[test]
     fn sections_cover_roles_and_levels() {
         let segs = status_sections(&inputs());
-        // dir, branch, in, out, ctx, model, ttft (no effort).
-        assert_eq!(segs.len(), 7);
+        // dir, branch, in, out, ctx, sandbox, model, ttft (no effort).
+        assert_eq!(segs.len(), 8);
         assert!(segs[0].runs[0].text.contains("proj"));
         // 90% of a 1000-token window with an 0.85 trigger → critical fill.
         let ctx = &segs[4];
@@ -461,6 +492,11 @@ mod tests {
         assert!((gauge.frac - 0.9).abs() < 1e-9);
         assert_eq!(gauge.level, CtxLevel::Critical);
         assert!(gauge.label.contains("of"));
+        // The sandbox badge sits right after the context gauge, same priority.
+        let sb = &segs[5];
+        assert_eq!(sb.priority, 1);
+        assert_eq!(sb.runs[0].text, " Write ");
+        assert_eq!(sb.runs[0].role, StatusRole::Sandbox);
         // Unknown window → plain count.
         let mut i2 = inputs();
         i2.context_window = None;

@@ -97,6 +97,10 @@ pub struct Pane {
     /// 64k local model has a different threshold from a main agent on 200k.
     pub auto_compact: bool,
     pub compaction_reserved: u32,
+    /// The sandbox confinement this agent's tools enforce — the badge the status
+    /// bar shows next to the context gauge. Per agent: a jailed delegation has
+    /// its own.
+    pub sandbox: hrdr_tools::SandboxMode,
     /// This agent's live TODO list — the one its own `todo` tool writes.
     pub todos: std::sync::Arc<std::sync::Mutex<Vec<hrdr_tools::TodoItem>>>,
     /// Where the reader is in this conversation, and what they had half-typed to
@@ -195,6 +199,7 @@ impl Default for PaneSet {
                 effort: None,
                 auto_compact: true,
                 compaction_reserved: 0,
+                sandbox: hrdr_tools::SandboxMode::None,
                 todos: Default::default(),
                 consumed: 0,
                 view: PaneView::default(),
@@ -312,6 +317,7 @@ impl PaneSet {
                     effort: e.effort.clone(),
                     auto_compact: e.auto_compact,
                     compaction_reserved: e.compaction_reserved,
+                    sandbox: e.sandbox,
                     todos: std::sync::Arc::clone(&e.todos),
                     usage: e.usage,
                     turn: e.turn,
@@ -359,6 +365,7 @@ impl PaneSet {
                         effort: None,
                         auto_compact: true,
                         compaction_reserved: 0,
+                        sandbox: s.sandbox,
                         todos: Default::default(),
                         consumed: 0,
                         view: PaneView::default(),
@@ -431,6 +438,7 @@ struct LiveSnapshot {
     effort: Option<String>,
     auto_compact: bool,
     compaction_reserved: u32,
+    sandbox: hrdr_tools::SandboxMode,
     todos: std::sync::Arc<std::sync::Mutex<Vec<hrdr_tools::TodoItem>>>,
     usage: crate::SessionUsage,
     turn: crate::TurnStats,
@@ -818,6 +826,7 @@ mod tests {
                 effort: None,
                 auto_compact: true,
                 compaction_reserved: 0,
+                sandbox: hrdr_tools::SandboxMode::None,
                 todos: Default::default(),
                 usage: crate::AgentUsage::default(),
                 events: crate::event_log(),

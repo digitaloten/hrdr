@@ -246,6 +246,12 @@ fn spawn_background(
         effort: None,
         auto_compact: true,
         compaction_reserved: 0,
+        // The sub-agent's own confinement — a jailed delegation is confined,
+        // and the badge must say so rather than mirror the parent's mode.
+        sandbox: sub
+            .try_lock()
+            .map(|s| s.sandbox_policy().mode)
+            .unwrap_or(hrdr_tools::SandboxMode::None),
         todos: Default::default(),
         usage: usage_for_live,
         events: registry::event_log(),

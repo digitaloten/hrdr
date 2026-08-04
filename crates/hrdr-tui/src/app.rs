@@ -2797,6 +2797,7 @@ mod tests {
             effort: None,
             auto_compact: true,
             compaction_reserved: 0,
+            sandbox: hrdr_tools::SandboxMode::None,
             todos: Default::default(),
             usage: Default::default(),
             events: hrdr_agent::event_log(),

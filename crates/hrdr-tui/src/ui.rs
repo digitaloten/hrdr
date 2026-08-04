@@ -1479,6 +1479,7 @@ fn build_status_sections(app: &App) -> (Vec<StatusSection>, Vec<StatusSection>) 
         provider: Some(pane.provider()),
         model: pane.model(),
         session: Some(session.as_str()),
+        sandbox: Some(hrdr_app::sandbox_label(pane.sandbox)),
         effort: pane.effort.as_deref(),
         ttft,
         nerd_icons: app.icon_mode == hjkl_icons::IconMode::Nerd,

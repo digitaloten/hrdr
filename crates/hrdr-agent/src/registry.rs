@@ -220,6 +220,10 @@ pub struct AgentEntry {
     /// model has its own — and they set where its context gauge turns red.
     pub auto_compact: bool,
     pub compaction_reserved: u32,
+    /// The filesystem confinement this agent's tools enforce — what a frontend
+    /// shows as the sandbox badge on the status bar. Set once from the agent's
+    /// policy at registration; it is fixed for the agent's lifetime.
+    pub sandbox: hrdr_tools::SandboxMode,
     /// This agent's TODO list — the live one its `todo` tool writes. Every agent has
     /// its own; a frontend showing this agent shows *its* list.
     pub todos: Arc<Mutex<Vec<hrdr_tools::TodoItem>>>,
@@ -350,6 +354,13 @@ impl AgentRegistry {
         base_url: String,
         usage: crate::AgentUsage,
     ) {
+        // The sandbox policy is fixed for the agent's lifetime, so capture the
+        // mode once here; a busy lock (impossible at registration time) falls
+        // back to the unconfined default rather than failing the call.
+        let sandbox = agent
+            .try_lock()
+            .map(|a| a.sandbox_policy().mode)
+            .unwrap_or(hrdr_tools::SandboxMode::None);
         self.with(|v| {
             if v.iter().any(|e| e.key == MAIN_KEY) {
                 return;
@@ -367,6 +378,7 @@ impl AgentRegistry {
                 effort: None,
                 auto_compact: true,
                 compaction_reserved: 0,
+                sandbox,
                 todos: Default::default(),
                 usage,
                 events: event_log(),
@@ -1032,6 +1044,7 @@ mod tests {
             effort: None,
             auto_compact: true,
             compaction_reserved: 0,
+            sandbox: hrdr_tools::SandboxMode::None,
             todos: Default::default(),
             usage: crate::AgentUsage::default(),
             events: event_log(),
