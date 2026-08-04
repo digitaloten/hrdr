@@ -70,18 +70,25 @@ impl TerminalGuard {
     }
 }
 
+/// Restore the terminal to its normal state: the cursor style, keyboard
+/// enhancement flags, mouse capture, alternate screen and bracketed paste
+/// hrdr switched on. Idempotent; errors are the caller's to handle.
+fn restore_terminal_state(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    execute!(
+        out,
+        // Hand the cursor back the way we found it.
+        SetCursorStyle::DefaultUserShape,
+        PopKeyboardEnhancementFlags,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+    )
+}
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut out = stdout();
-        let _ = execute!(
-            out,
-            // Hand the cursor back the way we found it.
-            SetCursorStyle::DefaultUserShape,
-            PopKeyboardEnhancementFlags,
-            DisableMouseCapture,
-            LeaveAlternateScreen,
-            DisableBracketedPaste,
-        );
+        let _ = restore_terminal_state(&mut out);
         let _ = disable_raw_mode();
     }
 }
@@ -92,14 +99,7 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 /// terminal: drop raw mode, the alt screen, and the keyboard enhancements.
 pub(crate) fn suspend_terminal(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        SetCursorStyle::DefaultUserShape,
-        PopKeyboardEnhancementFlags,
-        DisableMouseCapture,
-        LeaveAlternateScreen,
-        DisableBracketedPaste,
-    )?;
+    restore_terminal_state(terminal.backend_mut())?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -145,15 +145,7 @@ pub async fn run(
         // Best-effort restore; errors are intentionally swallowed so we never
         // mask the real panic message with a secondary I/O failure.
         let mut out = stdout();
-        let _ = execute!(
-            out,
-            // Hand the cursor back the way we found it.
-            SetCursorStyle::DefaultUserShape,
-            PopKeyboardEnhancementFlags,
-            DisableMouseCapture,
-            LeaveAlternateScreen,
-            DisableBracketedPaste,
-        );
+        let _ = restore_terminal_state(&mut out);
         let _ = disable_raw_mode();
         prev_hook(info);
     }));
