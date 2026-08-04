@@ -32,7 +32,10 @@
 //! `type: reference`, with `description` inferred from its first non-empty line,
 //! so it still lists and searches.
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -112,6 +115,7 @@ impl MemType {
 }
 
 /// A parsed memory: its frontmatter fields plus the Markdown body.
+#[derive(Clone)]
 struct Memory {
     name: String,
     description: String,
@@ -429,6 +433,23 @@ fn emit_memory(mem: &Memory) -> String {
     out
 }
 
+/// Per-root parsed-memory cache: scope root → file stem → (mtime, memory).
+type MemoryCache = HashMap<PathBuf, HashMap<String, (SystemTime, Memory)>>;
+
+/// In-process cache of parsed memories, keyed by scope root and then file stem,
+/// and guarded by each file's mtime. [`load_memories`] runs on every recall,
+/// search and listing, so an unchanged memory file must not be re-read and
+/// re-parsed on every call — checking a file's mtime is a cheap stat.
+///
+/// Keying on the FILE's mtime (not the directory's) is required: a content edit
+/// to an existing file does not change its directory's mtime. Two edits within
+/// the same mtime tick could be missed; acceptable on Linux ns-granularity
+/// filesystems.
+fn memory_cache() -> &'static Mutex<MemoryCache> {
+    static CACHE: OnceLock<Mutex<MemoryCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Load every memory in the scope (stem + parsed frontmatter), skipping the
 /// generated index files.
 fn load_memories(root: &Path) -> Vec<(String, Memory)> {
@@ -436,6 +457,9 @@ fn load_memories(root: &Path) -> Vec<(String, Memory)> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return mems;
     };
+    // The names present in this enumeration, so cache entries for files deleted
+    // since the last load don't linger (pruned after the loop).
+    let mut present: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|x| x.to_str()) != Some("md") {
@@ -452,9 +476,45 @@ fn load_memories(root: &Path) -> Vec<(String, Memory)> {
             .and_then(|s| s.to_str())
             .unwrap_or(fname)
             .to_string();
+        present.push(stem.clone());
+        // A file whose mtime matches the cached one is served a clone — no
+        // read, no parse. A failed stat falls through to a fresh read, matching
+        // the pre-cache error tolerance.
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let cached = mtime.and_then(|m| {
+            memory_cache()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(root)
+                .and_then(|files| files.get(&stem).cloned())
+                .filter(|(cached_mtime, _)| *cached_mtime == m)
+        });
+        if let Some((_, mem)) = cached {
+            mems.push((stem, mem));
+            continue;
+        }
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         let mem = parse_memory(&content, &stem);
+        if let Some(mtime) = mtime {
+            memory_cache()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(root.to_path_buf())
+                .or_default()
+                .insert(stem.clone(), (mtime, mem.clone()));
+        }
         mems.push((stem, mem));
+    }
+    // Drop cached entries whose file no longer exists, so deletions don't leak
+    // stale entries.
+    let mut cache = memory_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(files) = cache.get_mut(root) {
+        files.retain(|stem, _| present.contains(stem));
+        if files.is_empty() {
+            cache.remove(root);
+        }
     }
     mems
 }
@@ -1083,5 +1143,29 @@ mod tests {
         let from_project = recall(Some(&proj), Some(&glob), "widget configuration", 4096).unwrap();
         assert!(from_project.contains("in project scope"), "{from_project}");
         assert!(!from_project.contains("in global scope"), "{from_project}");
+    }
+
+    #[test]
+    fn load_memories_refreshes_after_write_and_reuses_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("project");
+        seed(&proj, "deploy", "how to deploy", "step one");
+
+        let first = load_memories(&proj);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, "deploy");
+        assert_eq!(first[0].1.body.trim(), "step one");
+
+        // An unchanged second load is served from the cache (same content).
+        let second = load_memories(&proj);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].1.body.trim(), "step one");
+
+        // A content edit bumps the file's mtime → cache miss → fresh parse, so
+        // the cache never serves stale data after a write.
+        seed(&proj, "deploy", "how to deploy", "step two");
+        let third = load_memories(&proj);
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].1.body.trim(), "step two");
     }
 }
