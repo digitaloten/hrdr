@@ -172,14 +172,18 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 /// block). Selecting flows through the ends of the rows it crosses, like a
 /// terminal's own selection, rather than cutting a rectangular block.
 fn draw_selection(f: &mut Frame, app: &mut App) {
-    let Some(span) = app.selection_span() else {
+    let Some(sel) = app.selection else {
         // The selection went away before its frame (a key, a scroll): there is
         // nothing to read the text out of, so the copy goes with it rather than
         // firing against whatever is selected next.
         app.pending_copy = false;
         return;
     };
-    let text = paint_selection(f.buffer_mut(), app.transcript_rect, span);
+    let Some(span) = app.selection_span() else {
+        app.pending_copy = false;
+        return;
+    };
+    let text = paint_selection(f.buffer_mut(), app.area_rect(sel.area()), span);
     // The copy waits for this frame because only a painted frame has the text.
     if std::mem::take(&mut app.pending_copy) {
         app.copy_selection(&text);
@@ -1385,6 +1389,9 @@ fn draw_pane(f: &mut Frame, theme: &Theme, area: Rect, bar: Color) -> Rect {
 }
 
 fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
+    // Publish the pane rect so a mouse press here starts a select-to-copy drag
+    // instead of doing nothing.
+    app.input_rect = crate::app::HitRect::from(area);
     let inner = draw_pane(f, &app.theme, area, app.theme.prompt_border);
     app.editor.render(f, inner);
 
@@ -1606,11 +1613,14 @@ fn status_wrap_rows(sections: &[StatusSection], width: usize) -> u16 {
 /// against the right edge.
 fn draw_statusbar(
     f: &mut Frame,
-    app: &App,
+    app: &mut App,
     area: Rect,
     left: &[StatusSection],
     right: &[StatusSection],
 ) {
+    // Publish the block rect so a mouse press here starts a select-to-copy
+    // drag; everything else this function does with the app is a read.
+    app.status_rect = crate::app::HitRect::from(area);
     let t = &app.theme;
     let width = area.width as usize;
     let inner = inner_width(width) as usize;

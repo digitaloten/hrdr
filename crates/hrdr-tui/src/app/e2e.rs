@@ -3148,6 +3148,135 @@ async fn dragging_the_transcript_selects_and_copies_instead_of_clicking() {
     assert!(h.app.selection.is_none(), "a keypress clears the selection");
 }
 
+/// Select-to-copy works over the input pane too: a drag that starts and ends
+/// inside the input box copies the text it crosses, exactly like a drag over
+/// the transcript.
+#[tokio::test]
+async fn dragging_the_input_box_selects_and_copies() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let mut h = Harness::new(vec![]).await;
+    h.type_str("hello");
+    let mut term = Terminal::new(TestBackend::new(40, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let rect = h.app.input_rect;
+    assert!(rect.h > 0, "the input pane was drawn");
+
+    // The pane pads one row top and BLOCK_PAD_X columns left; find the `h` the
+    // editor rendered — the typed word runs from there.
+    let text_row = rect.y + 1;
+    let start = (rect.x..rect.x + rect.w)
+        .find(|&col| {
+            term.backend()
+                .buffer()
+                .cell(ratatui::layout::Position::new(col, text_row))
+                .is_some_and(|c| c.symbol() == "h")
+        })
+        .expect("the typed text renders in the input pane");
+    let end = start + 4; // the five cells of "hello" are start..=end
+    let mut buf = term.backend().buffer().clone();
+    assert_eq!(
+        ui::paint_selection(&mut buf, rect, ((start, text_row), (end, text_row))),
+        "hello",
+        "the cells under the drag hold the typed text"
+    );
+
+    let mouse = |kind, column, row| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    };
+    h.app.on_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        start,
+        text_row,
+    ));
+    h.app.on_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        end,
+        text_row,
+    ));
+    assert!(
+        h.app.selection.is_some(),
+        "a press in the input box starts a selection"
+    );
+    h.app
+        .on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), end, text_row));
+    assert!(h.app.pending_copy, "releasing the drag queues the copy");
+
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(!h.app.pending_copy, "the copy ran on the next frame");
+    assert!(
+        h.app.toasts.last_body().is_some(),
+        "the copy says how it went in a toast"
+    );
+}
+
+/// Select-to-copy works over the status bar too: dragging across its text
+/// copies it, like the bottom line of any terminal.
+#[tokio::test]
+async fn dragging_the_status_bar_selects_and_copies() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let mut h = Harness::new(vec![]).await;
+    h.app.statusbar_mode = hrdr_app::StatusBarMode::Truncate;
+    let mut term = Terminal::new(TestBackend::new(40, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let rect = h.app.status_rect;
+    assert!(rect.h > 0, "the status bar was drawn");
+
+    // The block pads one row top; find the first text cell on its content row
+    // (skipping the padding blanks and the left border) and select a short run.
+    let text_row = rect.y + 1;
+    let start = (rect.x..rect.x + rect.w)
+        .find(|&col| {
+            term.backend()
+                .buffer()
+                .cell(ratatui::layout::Position::new(col, text_row))
+                .is_some_and(|c| !c.symbol().trim().is_empty() && c.symbol() != "│")
+        })
+        .expect("the status bar has text to select");
+    let end = start + 2;
+    let mut buf = term.backend().buffer().clone();
+    let expected = ui::paint_selection(&mut buf, rect, ((start, text_row), (end, text_row)));
+    assert!(
+        !expected.trim().is_empty(),
+        "the cells under the status drag hold real text"
+    );
+
+    let mouse = |kind, column, row| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    };
+    h.app.on_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        start,
+        text_row,
+    ));
+    h.app.on_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        end,
+        text_row,
+    ));
+    assert!(
+        h.app.selection.is_some(),
+        "a press in the status bar starts a selection"
+    );
+    h.app
+        .on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), end, text_row));
+    assert!(h.app.pending_copy, "releasing the drag queues the copy");
+
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(!h.app.pending_copy, "the copy ran on the next frame");
+    assert!(
+        h.app.toasts.last_body().is_some(),
+        "the copy says how it went in a toast"
+    );
+}
+
 /// The per-turn stats line closes the turn's block instead of opening one of its
 /// own: same background as the reply, above the `#N assistant` label.
 #[tokio::test]

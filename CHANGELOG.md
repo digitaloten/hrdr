@@ -38,6 +38,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Mouse select-to-copy works on the input box and status bar.** Drag-selecting
+  text had only worked over the transcript; a press inside the input pane or the
+  status bar block now starts a selection too, and releasing it copies the text
+  under the drag to the clipboard. Each area bounds its own drag, and a click
+  there still starts no other action.
+
 - **Under-specified tasks look for a plan in the repo first.** Told to work on a
   feature, change, or plan it does not have all the details of, hrdr now
   searches the repo for text/markdown docs that name the task (`docs/`,

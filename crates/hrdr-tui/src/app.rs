@@ -160,11 +160,32 @@ pub(crate) struct MouseSelection {
     /// the earlier of the two on screen — [`App::selection_span`] orders them.
     anchor: (u16, u16),
     head: (u16, u16),
+    /// The pane the drag started in: its rect decides where the head clamps and
+    /// which horizontal band [`paint_selection`](crate::ui::paint_selection)
+    /// reads interior rows over.
+    area: SelectionArea,
     /// The button is still down: the head still follows the pointer.
     dragging: bool,
     /// The pointer left the anchor cell, which is what tells a selection from a
     /// plain click (the click the transcript's blocks answer to).
     moved: bool,
+}
+
+impl MouseSelection {
+    /// The pane this selection is anchored in.
+    pub(crate) fn area(&self) -> SelectionArea {
+        self.area
+    }
+}
+
+/// Which pane a mouse selection is anchored in. Select-to-copy works over the
+/// transcript, the input pane and the status bar alike; each area's rect bounds
+/// the drag and is the band its copied rows are read over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectionArea {
+    Transcript,
+    Input,
+    Status,
 }
 
 // The transcript item model + its representation-independent queries
@@ -586,7 +607,12 @@ pub(crate) struct App {
     /// Screen rect of the transcript, set during draw: the region a drag may
     /// select from, and the frame the selected text is read back out of.
     pub(crate) transcript_rect: HitRect,
-    /// The live mouse selection over the transcript, if any.
+    /// Screen rect of the input pane, set during draw: mouse select-to-copy
+    /// works there too, not just over the transcript.
+    pub(crate) input_rect: HitRect,
+    /// Screen rect of the status bar block, set during draw: likewise selectable.
+    pub(crate) status_rect: HitRect,
+    /// The live mouse selection, if any.
     pub(crate) selection: Option<MouseSelection>,
     /// Set when the button comes up on a real drag: the next frame — the one
     /// that has the rendered cells — harvests the selected text and copies it.
@@ -804,6 +830,18 @@ impl App {
             end_button: None,
             tool_hits: Vec::new(),
             transcript_rect: HitRect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
+            input_rect: HitRect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
+            status_rect: HitRect {
                 x: 0,
                 y: 0,
                 w: 0,
@@ -1641,40 +1679,61 @@ impl App {
                     self.scroll_offset = self.max_scroll; // jump to the top
                     return;
                 }
-                // Inside the transcript the button going down is the start of a
-                // drag, not yet a click: what it turns out to be is settled on
-                // the way up, once we know whether the pointer moved.
-                if self.transcript_rect.contains(m.column, m.row) {
-                    self.selection = Some(MouseSelection {
-                        anchor: (m.column, m.row),
-                        head: (m.column, m.row),
-                        dragging: true,
-                        moved: false,
-                    });
-                }
+                // A button going down is the start of a drag, not yet a click:
+                // what it turns out to be is settled on the way up, once we know
+                // whether the pointer moved. Select-to-copy works over the
+                // transcript, the input pane and the status bar alike; whichever
+                // area the press lands in bounds the drag.
+                let area = if self.transcript_rect.contains(m.column, m.row) {
+                    SelectionArea::Transcript
+                } else if self.input_rect.contains(m.column, m.row) {
+                    SelectionArea::Input
+                } else if self.status_rect.contains(m.column, m.row) {
+                    SelectionArea::Status
+                } else {
+                    return;
+                };
+                self.selection = Some(MouseSelection {
+                    anchor: (m.column, m.row),
+                    head: (m.column, m.row),
+                    area,
+                    dragging: true,
+                    moved: false,
+                });
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(sel) = &mut self.selection
-                    && sel.dragging
-                {
-                    let head = self.transcript_rect.clamp(m.column, m.row);
-                    sel.moved |= head != sel.anchor;
-                    sel.head = head;
+                // `MouseSelection` is `Copy`: take it out, move the head, put it
+                // back — `area_rect` borrows `self` while the selection's own
+                // borrow is live, so the two cannot overlap.
+                let Some(mut sel) = self.selection else {
+                    return;
+                };
+                if !sel.dragging {
+                    return;
                 }
+                let head = self.area_rect(sel.area).clamp(m.column, m.row);
+                sel.moved |= head != sel.anchor;
+                sel.head = head;
+                self.selection = Some(sel);
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 let Some(sel) = &mut self.selection else {
                     return;
                 };
+                let (moved, area) = (sel.moved, sel.area);
                 sel.dragging = false;
-                if sel.moved {
+                if moved {
                     // A real drag: the next frame reads the cells under it back
                     // out and copies them.
                     self.pending_copy = true;
                 } else {
-                    // A click after all — the transcript's own hit targets get it.
+                    // A click after all — the transcript's own hit targets get
+                    // it. Elsewhere a click just clears the selection: pressing
+                    // the input pane or status bar starts no other action.
                     self.selection = None;
-                    self.click_transcript(m.column, m.row);
+                    if area == SelectionArea::Transcript {
+                        self.click_transcript(m.column, m.row);
+                    }
                 }
             }
             _ => {}
@@ -1724,6 +1783,17 @@ impl App {
             // The block's height just changed; keep its top where the reader is
             // looking instead of letting it slide.
             self.pending_scroll_entry = Some(idx);
+        }
+    }
+
+    /// The screen rect of the pane a mouse selection is anchored in — the band
+    /// its drag head clamps to and its copied rows are read over. Published
+    /// during draw, exactly like the rects themselves.
+    pub(crate) fn area_rect(&self, area: SelectionArea) -> HitRect {
+        match area {
+            SelectionArea::Transcript => self.transcript_rect,
+            SelectionArea::Input => self.input_rect,
+            SelectionArea::Status => self.status_rect,
         }
     }
 
