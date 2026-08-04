@@ -278,14 +278,9 @@ impl TranscriptLog {
     /// file with two `Start`s and two `End`s, and makes an orphan check report a
     /// genuinely orphaned run as complete — defeating the whole point of the log.
     pub fn create(dir: &Path, id: &str) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
         // The transcript holds the sub-agent's full prompt and output. Keep the
         // directory owner-only; the file inherits protection from it.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-        }
+        crate::auth::create_dir_owner_only(dir)?;
         // Owner-only too, not just the directory: a transcript is a verbatim
         // prompt/output log ([`hrdr_llm::owner_only_options`] documents what that
         // buys on each platform).
@@ -314,14 +309,9 @@ impl TranscriptLog {
     /// and a later [`read_transcript`] folds old and new together in order.
     pub fn append(path: &Path) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
             // The transcript holds the agent's full prompt and output; keep its
             // directory owner-only (the file inherits from the mode below).
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
+            crate::auth::create_dir_owner_only(parent)?;
         }
         // Same owner-only policy as [`create`](Self::create) — see
         // [`hrdr_llm::owner_only_options`].
