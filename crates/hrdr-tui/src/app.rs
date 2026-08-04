@@ -1305,6 +1305,19 @@ impl App {
             );
             return;
         }
+        // Reject a second `!command` before anything is minted or recorded: a
+        // refused command must leave no id, no session reservation, and no
+        // tool block in the transcript.
+        if self
+            .user_shell
+            .as_ref()
+            .is_some_and(|u| !u.handle.is_finished())
+        {
+            self.system(
+                "a !command is already running — wait for it (or cancel with Esc Esc)".to_string(),
+            );
+            return;
+        }
         let Some(shell) = hrdr_tools::Shell::detect() else {
             self.system(
                 "no shell found — !commands need bash or a POSIX shell on PATH (on Windows, \
@@ -1334,16 +1347,6 @@ impl App {
             args: serde_json::json!({"command": command}).to_string(),
         });
         let task_id = id.clone();
-        if self
-            .user_shell
-            .as_ref()
-            .is_some_and(|u| !u.handle.is_finished())
-        {
-            self.system(
-                "a !command is already running — wait for it (or cancel with Esc Esc)".to_string(),
-            );
-            return;
-        }
         let cwd = hrdr_app::agent_cwd(&self.agent);
         let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<String>(256);
         let mut ctx = hrdr_tools::ToolContext::new(&cwd);

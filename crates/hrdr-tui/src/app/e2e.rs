@@ -5564,6 +5564,81 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
     );
 }
 
+/// A second `!command` typed while one is already running is refused before
+/// anything is minted or recorded: no tool id, no session reservation, no
+/// ToolStart. On the pre-fix code the refused submission opened a second
+/// `done: false` block that nothing ever closed, and it resurfaced as a
+/// settled-failed block on resume.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_second_bang_command_while_one_runs_leaves_no_phantom_block() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    // A command that stays alive long enough for a second submission.
+    h.type_str("!sleep 2");
+    h.press(KeyCode::Enter);
+    assert!(
+        h.app
+            .transcript()
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::Tool { done: false, .. })),
+        "the first !command's block opened"
+    );
+    // The second !command is refused, with no transcript artifact.
+    h.type_str("!echo hi");
+    h.press(KeyCode::Enter);
+    let open = h
+        .app
+        .transcript()
+        .iter()
+        .filter(|e| matches!(&e.kind, EntryKind::Tool { done: false, .. }))
+        .count();
+    assert_eq!(open, 1, "the rejected command must not open a second block");
+    assert!(
+        h.app.transcript().iter().any(|e| matches!(
+            &e.kind,
+            EntryKind::Notice(t) | EntryKind::System(t)
+                if t.contains("already running")
+        )),
+        "the refusal message is shown"
+    );
+    // Drain until the first block closes; there must still be exactly one
+    // tool block total — the rejected command never appears.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !h
+        .app
+        .transcript()
+        .iter()
+        .any(|e| matches!(&e.kind, EntryKind::Tool { done: true, .. }))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "shell events never arrived"
+        );
+        match tokio::time::timeout(std::time::Duration::from_secs(5), h.rx.recv()).await {
+            Ok(Some(msg)) => h.app.on_turn_msg(msg),
+            Ok(None) => panic!("channel closed before the shell finished"),
+            Err(_) => panic!("timed out waiting for shell events"),
+        }
+    }
+    let total = h
+        .app
+        .transcript()
+        .iter()
+        .filter(|e| matches!(&e.kind, EntryKind::Tool { .. }))
+        .count();
+    assert_eq!(
+        total,
+        1,
+        "only the first command's block exists: {:?}",
+        h.app
+            .transcript()
+            .iter()
+            .map(|e| &e.kind)
+            .collect::<Vec<_>>()
+    );
+}
+
 /// **`!command` runs as the user, with no OS confinement — and nothing else does.**
 ///
 /// The relief valve the whole design now leans on. With escalation removed this is
