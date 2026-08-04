@@ -985,8 +985,11 @@ impl Client {
         stream: bool,
     ) -> ChatRequest {
         // OpenAI reasoning models want `max_completion_tokens`, not `max_tokens`.
+        // Route on the resolved wire model, not `self.model`: the configured id
+        // (possibly the `UNNAMED_MODEL` sentinel) is not what `wire_model`
+        // resolved and put on the wire.
         let (max_tokens, max_completion_tokens) = match self.params.max_tokens {
-            Some(n) if uses_max_completion_tokens(&self.model) => (None, Some(n)),
+            Some(n) if model.as_deref().is_some_and(uses_max_completion_tokens) => (None, Some(n)),
             other => (other, None),
         };
         ChatRequest {
@@ -1925,6 +1928,24 @@ mod tests {
             ..Default::default()
         });
         let r = c.request(Some(c.model.clone()), &[], &[], false);
+        assert_eq!(r.max_tokens, Some(1000));
+        assert_eq!(r.max_completion_tokens, None);
+
+        // The sentinel path: the configured id is `UNNAMED_MODEL`, but the
+        // resolved wire model names the reasoning model, so the cap still
+        // routes to `max_completion_tokens`.
+        let mut c = Client::new("https://example.com/v1", None, UNNAMED_MODEL);
+        c.set_params(crate::RequestParams {
+            max_tokens: Some(1000),
+            ..Default::default()
+        });
+        let r = c.request(Some("o3-mini".to_string()), &[], &[], false);
+        assert_eq!(r.max_tokens, None);
+        assert_eq!(r.max_completion_tokens, Some(1000));
+
+        // With no wire model the field is omitted and the fallback keeps
+        // `max_tokens`.
+        let r = c.request(None, &[], &[], false);
         assert_eq!(r.max_tokens, Some(1000));
         assert_eq!(r.max_completion_tokens, None);
     }
