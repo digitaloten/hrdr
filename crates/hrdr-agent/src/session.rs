@@ -946,11 +946,8 @@ impl Session {
     /// stays lock-free for listing, preview and tests.
     pub fn open_path(path: &Path) -> Result<(Session, SessionLock), OpenError> {
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("session");
-        let lock = acquire_open_lock(dir, id)
+        let id = session_id_from_path(path).unwrap_or_else(|| "session".to_string());
+        let lock = acquire_open_lock(dir, &id)
             .map_err(|SessionBusy { pid, started }| OpenError::Busy { pid, started })?;
         match Self::load_path(path) {
             Ok(session) => Ok((session, lock)),
@@ -2011,6 +2008,34 @@ mod tests {
                 !json.with_extension("json.zst").exists(),
                 "stale compressed copy dropped"
             );
+        });
+    }
+
+    #[test]
+    fn open_path_locks_a_compressed_session_under_its_real_id() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let mut st = state("Chat", &cwd);
+            st.named_by_user = true;
+            Session::new(st).save("resume").unwrap();
+            let json = session_file_path(&cwd, "resume");
+            compress_session_file(&json).unwrap();
+            let zst = json.with_extension("json.zst");
+            let dir = session_dir(&cwd);
+            let (_, lock) = Session::open_path(&zst).unwrap();
+            // The lock is keyed on the real id — the name every other actor uses —
+            // not the file_stem of the compressed path.
+            assert!(dir.join(".resume.open.lock").exists());
+            assert!(!dir.join(".resume-json.open.lock").exists());
+            // A second open of the same session now contends on the same name.
+            assert!(matches!(
+                Session::open_path(&zst),
+                Err(OpenError::Busy { .. })
+            ));
+            drop(lock);
         });
     }
 
