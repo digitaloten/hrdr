@@ -150,6 +150,257 @@ the tool-blocking fs off tokio workers. What remains open:
 10. **fstat per transcript record** (`transcript_log.rs:434`), used only to roll
     back a partial write. Track the appended length instead.
 
+## Performance review — second pass 2026-08-04
+
+A fresh `:perf` run over the whole tree (working tree clean at the time). The
+archived first review above is the canonical record where both cover the same
+ground — items 1 and 6 re-found that review's still-open #1 and #5 and add
+specifics. Every finding was re-verified at its cited lines before recording;
+one candidate from the run was dropped (item 7).
+
+1. **Per-round full-history save with two fsyncs — still the dominant cost of a
+   long session.** `turn_loop.rs:785` clones the whole `messages` on every tool
+   round and emits `AgentEvent::History`; the frontend clones again
+   (`hrdr-tui/src/app.rs:2748`) into `persist_mid_turn`, which clones the whole
+   `SessionState` (`app/session.rs:302`), `Session::new(snapshot.persisted())`
+   (`:325`) clones once more (`session.rs:341`), `Session::save` clones again
+   and re-serializes everything (`session.rs:778`/`:785`), and `write_atomic`
+   does two fsyncs (`auth.rs:116`, dir fsync `:135-138`) — per round, on the
+   save task. O(N) per round over a history that grows every round → O(N²) bytes
+   written per session. The transcript already got the append-only jsonl fix
+   (`session.rs:115-123` names the O(n²) it removed); `messages` has the same
+   problem remaining. Sub-agents pay the same synchronously on their turn task
+   (`delegation.rs:374-379` → `RunSnapshot::save` `:149-166`). Fix: write the
+   round's appended messages to the append-only jsonl and keep full `.json`
+   serialization for turn end; move (don't clone) the messages into the save
+   path. Tradeoff: mid-turn crash durability drops from "at most one round lost"
+   to "at most one turn lost" unless the jsonl also records messages.
+2. **Registry `entries` lock held across per-event transcript I/O.** `record`
+   (`registry.rs:422-449`, called per streamed event via the closure at
+   `:880-883`) runs under the single `entries` mutex (`update` → `with`,
+   `:326-329`) while locking the events log and performing the transcript write
+   — `serde_json::to_string` + `append_all` + `metadata()` + `flush` syscalls at
+   every coalesce boundary (`transcript_log.rs:423-448`). The UI thread takes
+   the same lock every frame (`pane.rs:304`) and on every
+   `events_since`/`compact` (`registry.rs:710`/`:723`), so a streaming agent
+   makes each frame contend with per-token recording, and multiple agents
+   serialize on it. Fix: the writer already has its own `Mutex`
+   (`registry.rs:278`) — clone the `Arc` out from under the entries lock and
+   write outside it.
+3. **`Entry::refresh_hash` re-hashes the whole accumulated text per streamed
+   chunk — O(L²) per reply/tool output.** `transcript.rs:146-148` recomputes
+   `kind_hash` (`:114-142`) over the entire accumulated string; the reducers
+   call it on every delta (`:593-599` Text, `:605-615` Reasoning, `:643-649`
+   ToolOutput) and the TUI replays every delta
+   (`hrdr-tui/src/app.rs:2494-2504`). A reply of L chars streamed in ~L/4 chunks
+   costs ~L²/4 hashing; a multi-MB build log costs hundreds of MB of hashing per
+   call. Fix: hash only the appended chunk (the hash feeds the render-cache key
+   at `hrdr-tui/src/ ui.rs:2622-2623`), or hash once at block close.
+4. **`memory::recall` reads and parses every memory file on every user turn.**
+   `recall` (`hrdr-tools/src/memory.rs:635-693`) calls `load_memories`
+   (`:434-460`: `read_dir` + `read_to_string` + frontmatter parse per file, in
+   both scopes) per turn opener (`turn_loop.rs:943`); `search` (`:534-553`) and
+   the list fallback (`:499-511`) do the same per tool call. Fix: cache the
+   parsed lists keyed on directory mtime, invalidated in `rebuild_index`
+   (`:464`).
+5. **~3-4 heap allocations per streamed token.** Per chunk: `Accumulator::push`
+   clones the delta (`hrdr-llm/src/types.rs:820`), the reasoning path clones
+   (`turn_loop.rs:223`), `record` clones the whole event into the log
+   (`registry.rs:427`), `Record::from_event` clones every string field again
+   (`transcript_log.rs:111-143`), and the pane drain clones once more
+   (`registry.rs:103`). Fix: `Record::from_event` takes the event by value (the
+   closure at `registry.rs:880-883` owns it and drops it immediately), moving
+   the strings — cuts ~2 allocations per token.
+6. **No-usage fallback re-estimates the whole history every round.**
+   `budget.rs:122-127`: when the endpoint reports no usage,
+   `estimate_tokens_in_messages(&self.messages)` is O(N) per round. Fix: keep a
+   running prompt-token estimate, add only messages appended since the last
+   call. Same as the archived review's #5, still open.
+7. **Dropped: compaction "overlapping suffixes".** The run claimed
+   `compaction.rs:451-452` re-sums a growing slice per candidate turn — the
+   archived first review's #7 made the same claim. It does not reproduce: the
+   loop walks candidates newest→oldest with `tail_start` set to each `start`, so
+   every `estimate_tokens_in_messages(&msgs[start..tail_start])` covers one
+   disjoint turn; total work is O(tail), which the budget check needs.
+   `mega_turn_tail_start` (`:505-506`) estimates single messages — fine. The
+   archived #7's "per-stage history clone in the ladder sizing" was not examined
+   here.
+
+**Coverage** — traced: turn_loop, transcript, session, registry, transcript_log,
+usage, budget, compaction, delegation, prompt, pane, hrdr-tools memory/sandbox/
+lsp, hrdr-llm types/sse, hrdr-tui app/app-session/ui, hrdr-app util/completion/
+format, apps/hrdr main, hrdr-editor. Good news confirmed along the way: the
+jsonl coalescing is sound, the prompt is built once per agent, tool `defs()` is
+once per turn, and the TUI has per-entry render caches. Corrections to the
+hints: `lsp.rs` runs per edit, not per keystroke; `prompt.rs` is not on a
+per-token path. Not settled without profiling: whether the per-round save
+(item 1) actually dominates wall time (the fsyncs are the suspect, not the
+serialize), the per-frame transcript layout loop (`ui.rs:880-916`) at very long
+transcripts, and item 2's real lock-contention timing.
+
+## Tidy review 2026-08-04
+
+Quality pass over the whole tree (clean at the time); every candidate re-read at
+its cited lines, behavior-preserving only, ranked by confidence.
+
+1. **`now_ms()` — three byte-identical epoch-millis helpers.**
+   `oauth.rs:834-839` and `chatgpt_models.rs:105-109` (same crate, same body)
+   plus `hrdr-app/src/login.rs:75-79` (same result via `map`/`unwrap_or(0)`;
+   hrdr-app already depends on hrdr-agent, see `login.rs:71`). Action: promote
+   one to a shared `pub(crate)`/`pub` helper in hrdr-agent and call it from all
+   three.
+2. **`create_dir_owner_only` re-implemented inline in the same crate.**
+   `auth.rs:150-158` defines the helper (used once, `auth_store.rs:132`);
+   `transcript_log.rs:281-288` (`create`) and `:316-324` (`append`) spell out
+   the same `create_dir_all` + `set_permissions(0o700)`. Action: call
+   `crate::auth::create_dir_owner_only` at both sites.
+3. **`home_dir()` re-implemented inline.** `skills.rs:99-104` repeats the
+   `$HOME`/`%USERPROFILE%` chain that `agents_dir.rs:90-95` already exposes as
+   `pub(crate) fn home_dir()`. Action: use `crate::agents_dir::home_dir()`.
+4. **TUI terminal-restore sequence — three copies of the same 5-op crossterm
+   `execute!`.** `hrdr-tui/src/lib.rs:73-87` (`TerminalGuard::drop`), `:93-105`
+   (`suspend_terminal`), `:144-159` (panic hook). One asymmetry:
+   `suspend_terminal` propagates errors (`?`), targets `terminal.backend_mut()`
+   and adds `show_cursor`; the other two swallow with `let _` on `stdout()`.
+   Action: one `fn restore_terminal_state(out: &mut Stdout) -> io::Result<()>`;
+   Drop and the panic hook swallow it, `suspend_terminal` keeps `?` +
+   `show_cursor`.
+5. **Todo-list clone idiom — three sites, `messages_owned()` precedent.**
+   `todos().lock().map(|t| t.clone()).unwrap_or_default()` at
+   `hrdr-app/src/sessions.rs:19`, `commands/helpers.rs:227`,
+   `apps/hrdr/src/ main.rs:930`; `Agent::messages_owned()`
+   (`hrdr-agent/src/lib.rs:2233`) is the established shape. Action: add
+   `Agent::todos_owned()`; all three collapse to it. (The TUI's own copies in
+   `app/session.rs` are a different type — out of scope.)
+6. **Spinner-frame expression repeated four times, magic `120` untied.**
+   `SPINNER[(…as_millis() / 120) as usize % SPINNER.len()]` at
+   `hrdr-tui/src/ui.rs:1098`, `:1187`, `:1238`, `:2623`, while the ticker
+   interval `Duration::from_millis(120)` sits at `tui.rs:61` — nothing ties the
+   two, so the animation and redraw rates drift apart if one changes. Action: a
+   `spinner_frame(elapsed)` helper plus one named `SPINNER_FRAME_MS` const both
+   files use.
+7. **Needless clone: `bounded.clone()` in the user-shell result path.**
+   `hrdr-tui/src/app.rs:1450-1459` clones the truncate result because `bounded`
+   is still borrowed by the `note` format at `:1458`. Action: build `note`
+   first, then move `bounded` into `result` — identical output, clone gone.
+8. **Low: `md_theme`/`md_theme_dim` — the same 10-arg `MdTheme::new` twice.**
+   `hrdr-tui/src/theme.rs:75-88` and `:92-106`; the second passes every color
+   through `dim_color(c, REASONING_DIM)`. The two arms do change together
+   (adding a color should dim it too). Action: one
+   `md_theme_with(&self, map: impl Fn(Color) -> Color)`.
+9. **Low: unused re-export `apply_cache_breakpoints`.** `hrdr-llm/src/lib.rs:38`
+   re-exports it; the only production caller uses
+   `crate::types:: apply_cache_breakpoints` (`client.rs:1068`) and no workspace
+   crate imports the re-export. Action: drop it — but hrdr-llm is a published
+   crate, so removing a `pub use` is a public-API break for external consumers;
+   safe only if nothing outside the repo pins it (pre-1.0 → minor bump if so).
+
+**Coverage** — examined closely: hrdr-editor, hrdr-test-support, hrdr-llm export
+surface, hrdr-app (sessions/history/format/transcript/effort/login/pane/
+commands), hrdr-tools (lib, ls/read/shell/tree/mutation/mcp/hooks/lsp head),
+hrdr-tui (lib/tui/theme/trust_prompt/app, app/session, app/selector, app/
+completion, ui spinner area), hrdr-agent (paths/agents_dir/skills/auth/
+auth_store/config/session/usage/transcript/turn_loop head/delegation head/
+transcript_log), apps/hrdr main. Skimmed: sandbox/lsp/memory/verification/web,
+ui.rs body, app/e2e.rs. Dropped as not-tidy: `agent_dirs`/`skill_dirs` and
+`read_dir_profiles`/`discover_skills` shape differences (change for different
+reasons); the `sandbox.rs:545` home_dir copy (wrong dependency direction); the
+`split_whitespace().join(" ")` idiom; `sandbox.rs:1255`'s `#[allow(dead_code)]`
+is a Windows-only backend in real use.
+
+## Correctness review 2026-08-04
+
+`:review` (low depth) over the whole tree, split across two passes (hrd-agent +
+hrd-llm; hrdr-tools + hrdr-tui + hrdr-app + hrdr-editor + apps/hrdr). Both
+findings below were re-traced at the cited lines; everything else the passes
+suspected was disproved (Cleared) or is hardening.
+
+1. **`memory` descriptions containing a newline are silently truncated, and the
+   truncation becomes permanent on the first edit.** (low)
+   `hrdr-tools/src/memory.rs`: `emit_memory` (`:416-429`) writes
+   `description: {value}` unquoted, one line; `parse_memory` (`:365-397`) reads
+   per line via `split_once(':')`, so a value whose second line has no colon is
+   dropped; `parse_scalar` (`:350-360`) additionally strips literal edge quotes
+   that `emit` never adds. The index (`rebuild_index` at `:464` via
+   `load_memories`) and `search`/`recall` then see only the first line, and
+   `edit` (`:256-272`) re-emits the parsed (truncated) value when no new
+   description is given.
+
+   ```
+   Repro: memory write {name:"x", description:"Build it\nThen deploy"} then memory edit {name:"x", body:"…"}
+   Expect: description "Build it\nThen deploy" survives write → edit → index.
+   Actual: index/search/recall show "Build it"; the edit rewrites the file with
+           "Build it", deleting "Then deploy" permanently.
+   ```
+
+   Fix: quote and escape the description in `emit_memory` (and parse
+   accordingly), or reject control newlines in descriptions at write time.
+
+2. **`Session::fork` copies `messages` but drops the display transcript — the
+   fork's pane renders an empty conversation.** (low-mid)
+   `hrdr-agent/src/session.rs:986-1018`: `fork` loads the source (transcript
+   folded from its sibling jsonl, `:922-927`), sets `id = None`, and saves via
+   the ordinary path (`:1008`), which writes only the `.json` (`save_session`
+   `:1378` → `Session::save`; `transcript` is `#[serde(skip_serializing)]`,
+   `:123-124`). No `<newid>.jsonl` is written or copied, so the reload at
+   `:1015` finds no jsonl and leaves `transcript == []`. The TUI swap
+   (`hrdr-tui/src/app/session.rs:124-130`) then shows the fork as an empty
+   conversation; the fork's test (`session.rs:2383-2427`) asserts
+   messages/name/id/locks but never the transcript — and its source has no
+   jsonl, so it cannot catch this.
+
+   ```
+   Repro: live session with messages + a non-empty <id>.jsonl, held open
+          elsewhere; Session::fork(cwd, path)
+   Expect: the fork carries the source's conversation — at minimum its
+          transcript, like a resume does.
+   Actual: forked session has state.transcript == [], pane renders empty.
+   ```
+
+   Fix: copy the source's jsonl to the fork's id (or fold the source transcript
+   into the fork's state and seed its jsonl), and assert the transcript in the
+   fork test.
+
+**Cleared** (suspected, traced, safe): SSE decoder overlong-line/UTF-8/EOF
+handling; jsonl torn-line rollback and offsets; token/cost arithmetic clamps;
+cache-breakpoint offsets (char-boundary guarded); retry budgets; the OAuth
+single-flight coordinator; registry turn generations vs cancelled runs; TUI
+completion `items.len() - 1` underflow (guarded by non-empty lists); save
+pipeline lost-wakeup (`Notify` permit semantics); `truncate`/`middle_bounds`/
+`collect_lines` boundary math; `truncate_inline`; history dedup/cursor math;
+guardrail regex escapes (`--force-with-lease`, `git checkout .`); shell-arg
+recursion bounds; sandbox canonicalization/write-escape/linked-worktree grants/
+Landlock/Seatbelt; memory slug/traversal and index skips; completion-offset char
+boundaries; login/OAuth state checks; `mega_turn_tail_start` reachability (it is
+reachable — the sub-agent opener is a real user turn).
+
+**Hardening** (correct today, fragile): PID-reuse vs stale session/store locks
+(`session.rs:456`, `store_lock.rs:172`) — a recycled PID keeps a lock "alive"
+forever, giving a spurious permanent busy error; `openai_refresh` requires
+`refresh_token` in the response (`oauth.rs:361`) — a spec-minimal server forces
+a re-login; the wrap-up round shares `overflow_compacted`
+(`turn_loop.rs:524, 842`) — a second overflow on the forced wrap-up errors the
+turn; `cost_partial` is a process-lifetime latch (`budget.rs:44`) that
+`reset_session_cost` doesn't clear; `memory` `safe_stem` allows Windows-reserved
+device names (`con`, `aux`, `nul`) — a confusing Windows-only write failure;
+`parse_scalar` quote-stripping loses legitimately edge-quoted values (cosmetic
+until finding 1's edit truncates).
+
+**Coverage** — walked in full: hrdr-llm sse/retry/capped_read/catalog/types/
+client; hrdr-agent session/transcript_log/transcript/compaction/budget/usage/
+oauth/auth_store/registry/turn_loop/turn_state/turn/store_lock/model_ref/
+resolve/auth/delegation/paths; hrdr-tools sandbox/memory/guardrails/shell/todo/
+write/secret_diff/test_nudge/hooks/mcp-client/truncate core; hrdr-tui app.rs,
+app/session, app/commands, app/completion, tui.rs; hrdr-app lib/util/history/
+completion/effort/sessions/login/format/commands-dispatch; hrdr-editor. GAPs —
+skimmed, not line-walked: `config.rs` (rest), `prompt.rs` (rest), `lib.rs`
+(13.6k lines), `agents_dir.rs`, `skills.rs`, `hooks.rs`, `trust.rs`, `pane.rs`
+(rest), `hrdr-tui/ui.rs` (4253 lines), `hrdr-app` status/highlight/subagents/
+themes/palette/config and the rest of commands/, `hrdr-tools` lsp/web/gate/
+ansi/proc/verification/mcp-transport and tools/{edit,read,replace,grep,tree,
+verify,mutation,find,ls}, `apps/hrdr/src/main.rs`, hrdr-llm anthropic/codex/fs,
+`app/e2e.rs`. Defects confined to those files are unreviewed.
+
 ## Dependency upgrades held back, 2026-08-03
 
 A `cargo update` sweep took every compatible release and the major bumps that
