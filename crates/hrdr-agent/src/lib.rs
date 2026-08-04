@@ -183,6 +183,7 @@ use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use futures_util::FutureExt;
@@ -876,6 +877,14 @@ impl Steer {
             display: display.into(),
         }
     }
+}
+
+/// Current time in epoch milliseconds.
+pub fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Create an empty [`SteeringQueue`].

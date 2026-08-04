@@ -73,10 +73,7 @@ fn is_oauth_login(name: &str) -> bool {
 
 /// Milliseconds since the Unix epoch, for OAuth token expiry.
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    hrdr_agent::unix_millis()
 }
 
 /// One login ROUTE the flow offers (one modal picker row). A provider can expose

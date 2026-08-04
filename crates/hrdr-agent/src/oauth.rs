@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
@@ -832,10 +832,7 @@ fn access_expired(expires_ms: u64, now_ms: u64) -> bool {
 
 /// Current time in epoch milliseconds.
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::unix_millis()
 }
 
 // ── URL encoding helpers ────────────────────────────────────────────────────

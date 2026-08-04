@@ -15,7 +15,7 @@
 //! (which run against local fixtures, no network).
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use futures_util::{Stream, StreamExt};
@@ -103,10 +103,7 @@ fn account_digest(account_id: &str) -> String {
 
 /// Current time in epoch milliseconds.
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::unix_millis()
 }
 
 /// The per-account catalog cache path, `<XDG cache>/hrdr/chatgpt_models.json`.
