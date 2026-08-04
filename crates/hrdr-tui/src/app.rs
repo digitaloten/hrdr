@@ -1246,13 +1246,14 @@ impl App {
                     }
                     return Action::None;
                 }
-                // Up/Down recall previous submissions (readline-style), but only
-                // for single-line input so multi-line editing keeps cursor moves.
-                KeyCode::Up if !self.editor.content().contains('\n') => {
+                // Up/Down recall previous submissions (readline-style), always —
+                // even for multi-line entries, so the arrows never get stuck
+                // moving the cursor inside a recalled multi-line item.
+                KeyCode::Up => {
                     self.history_prev();
                     return Action::None;
                 }
-                KeyCode::Down if !self.editor.content().contains('\n') => {
+                KeyCode::Down => {
                     self.history_next();
                     return Action::None;
                 }
@@ -2554,7 +2555,8 @@ impl App {
     /// Move toward newer submissions; past the newest, restore the draft.
     fn history_next(&mut self) {
         self.suppress_completions = true;
-        if let Some(text) = self.history.recall_next() {
+        let current = self.editor.content();
+        if let Some(text) = self.history.recall_next(&current) {
             self.editor.set_content(&text);
         }
     }

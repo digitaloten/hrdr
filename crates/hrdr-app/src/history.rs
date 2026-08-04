@@ -80,7 +80,9 @@ impl HistoryBrowser {
     }
 
     /// Step to the previous (older) entry, stashing `current` as the draft on
-    /// the first step. `None` when there's no history to recall.
+    /// the first step — and again on any later step where the loaded entry was
+    /// edited before stepping on, so a modified recall is never lost. `None`
+    /// when there's no history to recall.
     pub fn recall_prev(&mut self, current: &str) -> Option<String> {
         if self.entries.is_empty() {
             return None;
@@ -90,16 +92,25 @@ impl HistoryBrowser {
                 self.draft = current.to_string();
                 self.entries.len() - 1
             }
-            Some(p) => p.saturating_sub(1),
+            Some(p) => {
+                if current != self.entries[p] {
+                    self.draft = current.to_string();
+                }
+                p.saturating_sub(1)
+            }
         };
         self.pos = Some(pos);
         Some(self.entries[pos].clone())
     }
 
     /// Step toward newer entries; past the newest, restore the stashed draft.
+    /// An edited recall is stashed first, exactly like [`Self::recall_prev`].
     /// `None` when not currently browsing.
-    pub fn recall_next(&mut self) -> Option<String> {
+    pub fn recall_next(&mut self, current: &str) -> Option<String> {
         let pos = self.pos?;
+        if current != self.entries[pos] {
+            self.draft = current.to_string();
+        }
         if pos + 1 < self.entries.len() {
             self.pos = Some(pos + 1);
             Some(self.entries[pos + 1].clone())
@@ -148,17 +159,66 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(b.recall_prev("draft").as_deref(), Some("two"));
-        assert_eq!(b.recall_prev("ignored").as_deref(), Some("one"));
+        // An unmodified recall passes the loaded entry back — the draft stays.
+        assert_eq!(b.recall_prev("two").as_deref(), Some("one"));
         // Clamped at the oldest entry.
-        assert_eq!(b.recall_prev("ignored").as_deref(), Some("one"));
-        assert_eq!(b.recall_next().as_deref(), Some("two"));
+        assert_eq!(b.recall_prev("one").as_deref(), Some("one"));
+        assert_eq!(b.recall_next("one").as_deref(), Some("two"));
         // Past the newest, the stashed draft comes back.
-        assert_eq!(b.recall_next().as_deref(), Some("draft"));
+        assert_eq!(b.recall_next("two").as_deref(), Some("draft"));
         // Not browsing anymore.
-        assert_eq!(b.recall_next(), None);
+        assert_eq!(b.recall_next("draft"), None);
         // Empty history: Up does nothing.
         let mut empty = HistoryBrowser::default();
         assert_eq!(empty.recall_prev("draft"), None);
+    }
+
+    /// Editing a recalled entry before stepping on keeps the edit as the draft:
+    /// walking back down returns it, not the original pre-browsing text. This is
+    /// what lets Up/Down keep navigating multi-line entries without eating edits.
+    #[test]
+    fn editing_a_recalled_entry_stashes_the_edit() {
+        let mut b = HistoryBrowser {
+            entries: vec!["one".into(), "two".into()],
+            ..Default::default()
+        };
+        assert_eq!(b.recall_prev("draft").as_deref(), Some("two"));
+        assert_eq!(b.recall_prev("two").as_deref(), Some("one"));
+        // Edit "one" to "one-edited", then press Up (clamped at the oldest).
+        assert_eq!(b.recall_prev("one-edited").as_deref(), Some("one"));
+        // Down through the entries; the edited draft comes back past the newest.
+        assert_eq!(b.recall_next("one").as_deref(), Some("two"));
+        assert_eq!(b.recall_next("two").as_deref(), Some("one-edited"));
+        // Down also stashes an edit made on the newest entry.
+        assert_eq!(b.recall_prev("one-edited").as_deref(), Some("two"));
+        assert_eq!(b.recall_prev("two-edited").as_deref(), Some("one"));
+        assert_eq!(b.recall_next("one").as_deref(), Some("two"));
+        assert_eq!(b.recall_next("two").as_deref(), Some("two-edited"));
+    }
+
+    /// Multi-line entries browse exactly like single-line ones: the arrows walk
+    /// history, never the cursor lines.
+    #[test]
+    fn multi_line_entries_browse_like_single_line() {
+        let mut b = HistoryBrowser {
+            entries: vec!["line one\nline two".into(), "one\n\ntwo\n".into()],
+            ..Default::default()
+        };
+        assert_eq!(b.recall_prev("draft").as_deref(), Some("one\n\ntwo\n"));
+        assert_eq!(
+            b.recall_prev("one\n\ntwo\n").as_deref(),
+            Some("line one\nline two")
+        );
+        // Clamped; then back down and the draft returns.
+        assert_eq!(
+            b.recall_prev("line one\nline two").as_deref(),
+            Some("line one\nline two")
+        );
+        assert_eq!(
+            b.recall_next("line one\nline two").as_deref(),
+            Some("one\n\ntwo\n")
+        );
+        assert_eq!(b.recall_next("one\n\ntwo\n").as_deref(), Some("draft"));
     }
 
     #[cfg(unix)]

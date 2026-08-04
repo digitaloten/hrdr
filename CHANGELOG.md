@@ -156,6 +156,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cannot drift apart again; pressing on the scrollbar column starts no
   selection, and the rightmost text column still does.
 
+- **Arrow Up/Down walk input history even on multi-line entries.** The history
+  recall keys only fired for single-line input, so a recalled multi-line item
+  trapped the arrows — Up/Down moved the cursor a line inside it instead of
+  stepping through history. The arrows are history keys unconditionally now, and
+  editing a recalled entry before stepping on stashes the edit, so Down past the
+  newest entry returns what you changed rather than losing it.
+
 - **Forking a busy session keeps its conversation.** The `f` fork escape hatch
   copied the session's messages but dropped its display transcript, so the copy
   opened as an empty conversation; it now copies the source's transcript jsonl

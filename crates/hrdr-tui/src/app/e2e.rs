@@ -1724,6 +1724,44 @@ async fn up_with_a_draft_in_the_box_leaves_the_queue_alone() {
     );
 }
 
+/// A recalled multi-line entry does not trap the arrows: Up/Down keep walking
+/// history while a multi-line item is loaded, instead of moving the cursor a
+/// line inside it (the old `!contains('\n')` gate stranded the user on the
+/// item).
+#[tokio::test]
+async fn arrows_walk_history_across_multi_line_entries() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.history.record("entry-a");
+    h.app.history.record("multi\nline");
+
+    h.press(KeyCode::Up); // empty box → newest: the multi-line entry
+    assert_eq!(h.app.editor.content(), "multi\nline");
+    h.press(KeyCode::Up); // ← previously got stuck moving the cursor instead
+    assert_eq!(h.app.editor.content(), "entry-a");
+    h.press(KeyCode::Down);
+    assert_eq!(h.app.editor.content(), "multi\nline");
+    h.press(KeyCode::Down); // past the newest → the stashed (empty) draft
+    assert_eq!(h.app.editor.content(), "");
+}
+
+/// Editing a recalled multi-line entry before stepping on keeps the edit: Down
+/// past the newest returns the edited text, not the pre-browsing draft.
+#[tokio::test]
+async fn editing_a_recalled_multi_line_entry_returns_the_edit() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.history.record("entry-a");
+    h.app.history.record("multi\nline");
+
+    h.press(KeyCode::Up); // → "multi\nline"
+    assert_eq!(h.app.editor.content(), "multi\nline");
+    h.press(KeyCode::Up); // → "entry-a"
+    h.type_str(" + edited");
+    h.press(KeyCode::Down); // back to "multi\nline"
+    assert_eq!(h.app.editor.content(), "multi\nline");
+    h.press(KeyCode::Down); // past the newest → the edited text comes back
+    assert_eq!(h.app.editor.content(), "entry-a + edited");
+}
+
 /// Several mid-turn submits queue up and are merged into a single message —
 /// each line the user types while waiting is one thought, not separate turns.
 #[tokio::test]
