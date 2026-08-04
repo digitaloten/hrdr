@@ -147,6 +147,26 @@ impl Entry {
         self.content_hash = Self::kind_hash(&self.kind);
     }
 
+    /// Fold a streamed delta into `content_hash` without rehashing the whole
+    /// accumulated string. `kind_hash` is O(accumulated length), so recomputing
+    /// it per chunk makes a reply streamed in ~L/4 deltas O(L²); this combines
+    /// the previous hash with just the new chunk. The fold is order-sensitive:
+    /// the previous hash is hashed *before* the chunk bytes, so `fold("a")`
+    /// then `fold("b")` differs from `fold("b")` then `fold("a")`, and from a
+    /// single `fold("ab")`. That matters because `content_hash` is a
+    /// render-cache key — equal final content must hash equal, different
+    /// content different, and the value must keep changing while text streams
+    /// in — and a chunk-order collision (e.g. XORing per-chunk hashes) would
+    /// serve a stale rendered block. The final value is not `kind_hash`'s; a
+    /// caller that needs the canonical hash of the finished state calls
+    /// [`Self::refresh_hash`].
+    pub fn fold_content_hash(&mut self, chunk: &str) {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write_u64(self.content_hash);
+        h.write(chunk.as_bytes());
+        self.content_hash = h.finish();
+    }
+
     pub fn user(text: impl Into<String>) -> Self {
         Self::now(EntryKind::User(text.into()))
     }
@@ -595,7 +615,7 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
                 && let EntryKind::Assistant(s) = &mut last.kind
             {
                 s.push_str(t);
-                last.refresh_hash();
+                last.fold_content_hash(t);
                 mutated = true;
             }
             if !mutated && !t.is_empty() {
@@ -611,7 +631,7 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
                 } = &mut last.kind
             {
                 text.push_str(t);
-                last.refresh_hash();
+                last.fold_content_hash(t);
                 mutated = true;
             }
             // Same `!is_empty` guard the `Text` arm above uses, and for a
@@ -645,7 +665,7 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) {
                 && let EntryKind::Tool { result, .. } = &mut entry.kind
             {
                 result.push_str(chunk);
-                entry.refresh_hash();
+                entry.fold_content_hash(chunk);
             }
         }
         AgentEvent::ToolEnd {
@@ -768,6 +788,73 @@ mod tests {
         assert!(txt.contains("[welcome]"));
         assert!(!txt.contains("thinking")); // reasoning dropped
         assert!(!txt.ends_with('\n')); // trailing whitespace trimmed
+    }
+
+    #[test]
+    fn fold_content_hash_is_deterministic() {
+        let mut a = Entry::assistant("");
+        let mut b = Entry::assistant("");
+        for chunk in ["Hello, ", "world", "!", "\n"] {
+            a.fold_content_hash(chunk);
+            b.fold_content_hash(chunk);
+        }
+        assert_eq!(a.content_hash, b.content_hash);
+    }
+
+    #[test]
+    fn fold_content_hash_is_order_and_chunking_sensitive() {
+        let mut one = Entry::assistant("");
+        one.fold_content_hash("ab");
+
+        let mut two = Entry::assistant("");
+        two.fold_content_hash("a");
+        two.fold_content_hash("b");
+
+        let mut swapped = Entry::assistant("");
+        swapped.fold_content_hash("b");
+        swapped.fold_content_hash("a");
+
+        assert_ne!(one.content_hash, two.content_hash, "chunking differs");
+        assert_ne!(
+            two.content_hash, swapped.content_hash,
+            "chunk order differs"
+        );
+    }
+
+    /// The render cache keys on `content_hash`; once a tool block is closed its
+    /// hash must be the canonical full recompute, not the streaming fold.
+    #[test]
+    fn tool_end_recomputes_the_full_kind_hash() {
+        let mut transcript = Vec::new();
+        apply_event(
+            &mut transcript,
+            &AgentEvent::ToolStart {
+                id: "t1".into(),
+                name: "shell".into(),
+                args: r#"{"command":"ls"}"#.into(),
+            },
+        );
+        for chunk in ["line 1\n", "line 2\n", "line 3"] {
+            apply_event(
+                &mut transcript,
+                &AgentEvent::ToolOutput {
+                    id: "t1".into(),
+                    chunk: chunk.into(),
+                },
+            );
+        }
+        apply_event(
+            &mut transcript,
+            &AgentEvent::ToolEnd {
+                id: "t1".into(),
+                name: "shell".into(),
+                result: "line 1\nline 2\nline 3\n".into(),
+                ok: true,
+            },
+        );
+        let e = transcript.last().unwrap();
+        assert!(matches!(&e.kind, EntryKind::Tool { done: true, .. }));
+        assert_eq!(e.content_hash, Entry::kind_hash(&e.kind));
     }
 }
 
