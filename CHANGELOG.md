@@ -38,6 +38,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`:!command` runs the `!` shell escape.** The ex-style prefix —
+  `:!git status` — is an alias for `!git status`: vim muscle memory means the
+  shell, not a skill named `!`. Same path end to end: no model turn, output
+  streams into a transcript tool block, command + output committed to history on
+  finish.
+
 - **`/cost` and `/status` report what the prompt cache did this session.**
   `prompt cache: 78% read (120.0k), 30.0k written` — the fraction of measured
   prompt tokens served from cache, plus the tokens written into it. The rate

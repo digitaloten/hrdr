@@ -1261,7 +1261,13 @@ impl App {
             // `!command` — the user-initiated shell escape: run it directly
             // (bash/PowerShell), stream the output into a transcript tool
             // block, and record command + output into the model's history.
-            if let Some(cmd) = input.trim().strip_prefix('!') {
+            // `:!command` is the same escape under the ex-style prefix —
+            // vim muscle memory means the shell, never a skill named `!`.
+            let trimmed = input.trim();
+            if let Some(cmd) = trimmed
+                .strip_prefix('!')
+                .or_else(|| trimmed.strip_prefix(":!"))
+            {
                 let cmd = cmd.trim().to_string();
                 self.editor.set_content("");
                 self.scroll_offset = 0;

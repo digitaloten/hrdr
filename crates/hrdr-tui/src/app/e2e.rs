@@ -5687,6 +5687,59 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
     );
 }
 
+/// `:!command` is the `!` shell escape under the ex-style prefix — vim
+/// muscle memory types `:!git status` and means the shell, not a skill
+/// named `!`. It takes the exact `!` path: no model turn spawns, the
+/// output streams into a tool block, and ToolEnd commits the note.
+#[cfg(unix)]
+#[tokio::test]
+async fn colon_bang_runs_the_same_user_shell_command() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.type_str(":!echo hello-from-colon-bang");
+    h.press(KeyCode::Enter);
+    assert!(!h.app.running(), "no model turn spawns for a :!command");
+    assert!(
+        h.app
+            .transcript()
+            .iter()
+            .any(|e| matches!(&e.kind, EntryKind::Tool { .. })),
+        "the tool block opened synchronously"
+    );
+
+    // Drain the events the spawned shell task sends until the block closes.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !h
+        .app
+        .transcript()
+        .iter()
+        .any(|e| matches!(&e.kind, EntryKind::Tool { done: true, .. }))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "shell events never arrived"
+        );
+        match tokio::time::timeout(std::time::Duration::from_secs(5), h.rx.recv()).await {
+            Ok(Some(msg)) => h.app.on_turn_msg(msg),
+            Ok(None) => panic!("channel closed before the shell finished"),
+            Err(_) => panic!("timed out waiting for shell events"),
+        }
+    }
+    let screen = h.render();
+    assert!(
+        screen.contains("hello-from-colon-bang"),
+        "output in the transcript:\n{screen}"
+    );
+    let noted = h.app.agent.try_lock().is_ok_and(|a| {
+        a.messages_owned().iter().any(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|c| c.contains("hello-from-colon-bang") && c.contains("I ran"))
+        })
+    });
+    assert!(noted, "the history note landed with ToolEnd");
+}
+
 /// A second `!command` typed while one is already running is refused before
 /// anything is minted or recorded: no tool id, no session reservation, no
 /// ToolStart. On the pre-fix code the refused submission opened a second
