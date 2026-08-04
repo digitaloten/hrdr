@@ -96,11 +96,20 @@ impl Tool for TreeTool {
         let a: TreeArgs = crate::tool_args("tree", args)?;
         let depth = a.max_depth.min(10);
         let max_entries = a.max_entries;
+        let hidden = a.hidden;
 
         let root = ctx.resolve_read(a.path.as_deref().unwrap_or("."))?;
 
-        // Collect entries from the ignore walker.
-        let entries = collect_entries(&root, depth, max_entries, a.hidden)?;
+        // The ignore-walker walk runs on the blocking pool — a `tree` over a big
+        // directory is `std::fs` work that must not occupy a tokio worker. The
+        // closure takes an owned copy of `root` (no borrow of `ctx` across the
+        // `spawn_blocking` boundary); `render_tree` below is CPU-only and stays
+        // on the async side.
+        let root_for_walk = root.clone();
+        let entries = tokio::task::spawn_blocking(move || {
+            collect_entries(&root_for_walk, depth, max_entries, hidden)
+        })
+        .await??;
 
         // Render to a string.
         let root_label = if a.path.as_deref().is_none_or(|p| p == ".") {

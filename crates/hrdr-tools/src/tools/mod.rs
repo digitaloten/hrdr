@@ -530,8 +530,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn grep_builtin_skips_secret_files() {
+    #[tokio::test]
+    async fn grep_builtin_skips_secret_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("code.rs"), "let token = 1;\n").unwrap();
         // A non-hidden private key (the walker already skips dotfiles, so use a
@@ -552,6 +552,7 @@ mod tests {
             },
             &c,
         )
+        .await
         .unwrap();
         assert!(out.contains("code.rs"), "{out}");
         assert!(
@@ -562,8 +563,8 @@ mod tests {
 
     // ---- grep (built-in fallback) ----
 
-    #[test]
-    fn grep_builtin_matches_and_filters() {
+    #[tokio::test]
+    async fn grep_builtin_matches_and_filters() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn foo() {}\nlet x = 1;\n").unwrap();
         std::fs::write(dir.path().join("b.txt"), "foo in text\n").unwrap();
@@ -584,6 +585,7 @@ mod tests {
             },
             &c,
         )
+        .await
         .unwrap();
         assert!(out.contains("a.rs:1:fn foo() {}"), "{out}");
         assert!(out.contains("b.txt:1:foo in text"), "{out}");
@@ -603,6 +605,7 @@ mod tests {
             },
             &c,
         )
+        .await
         .unwrap();
         assert!(out.contains("a.rs"), "{out}");
         assert!(!out.contains("b.txt"), "glob should exclude b.txt: {out}");
@@ -622,6 +625,7 @@ mod tests {
             },
             &c,
         )
+        .await
         .unwrap();
         assert_eq!(out, "(no matches)");
     }
@@ -649,6 +653,7 @@ mod tests {
             },
             &c,
         )
+        .await
         .unwrap();
         // Matches use `:`; context lines use `-`; disjoint groups separated
         // by `--`. Lines 3 and 8 don't overlap at ±1 → two groups; 13 makes
@@ -675,6 +680,7 @@ mod tests {
             },
             &c,
         )
+        .await
         .unwrap();
         assert_eq!(out.matches("--\n").count(), 0, "{out}");
         // No duplicate lines from the merge.

@@ -155,7 +155,7 @@ impl Tool for GrepTool {
                  look-around and filter the hits yourself)"
             );
         }
-        grep_builtin(&a, ctx)
+        grep_builtin(&a, ctx).await
     }
 }
 
@@ -192,9 +192,9 @@ fn compile_pattern(a: &GrepArgs) -> Result<regex::Regex> {
 
 /// Pure-Rust search fallback: walk the tree (honoring `.gitignore`) and match
 /// each line with a regex. Used when neither ripgrep nor grep is installed.
-pub(crate) fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
+pub(crate) async fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     if a.multiline {
-        return grep_builtin_multiline(a, ctx);
+        return grep_builtin_multiline(a, ctx).await;
     }
     let re = compile_pattern(a)?;
     let root = match a.path.as_ref() {
@@ -208,91 +208,105 @@ pub(crate) fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
         .transpose()
         .context("invalid glob")?;
 
-    let mut out = String::new();
-    let mut matches = 0usize;
-    let walker = super::ignore_walker(&root, a.hidden, a.no_ignore);
-    'walk: for entry in walker.flatten() {
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        if crate::secret_file_reason(&crate::canonicalize_nearest(path)).is_some() {
-            continue; // never read credential/secret files (see deny-list)
-        }
-        if let Some(gp) = &glob_pat {
-            let name = path.file_name().map(|n| n.to_string_lossy());
-            let rel = path.strip_prefix(&root).unwrap_or(path);
-            let hit = name.as_deref().is_some_and(|n| gp.matches(n)) || gp.matches_path(rel);
-            if !hit {
+    // The WHOLE walk — walker, per-file `read_to_string`, regex/glob matching —
+    // runs in one `spawn_blocking` closure: a grep across a large tree is exactly
+    // the `std::fs` work that must not occupy a tokio worker. Not one closure per
+    // file (that would serialize on the blocking pool's queue). The closure owns
+    // every value it touches (root, cwd, the parsed glob/regex, the limits), so
+    // nothing borrows `ctx` or `a` across the boundary.
+    let cwd = ctx.cwd.clone();
+    let max_output = ctx.max_output;
+    let max_output_lines = ctx.max_output_lines;
+    let hidden = a.hidden;
+    let no_ignore = a.no_ignore;
+    let n_ctx = a.context();
+    let max_matches = a.max_matches();
+    tokio::task::spawn_blocking(move || {
+        let mut out = String::new();
+        let mut matches = 0usize;
+        let walker = super::ignore_walker(&root, hidden, no_ignore);
+        'walk: for entry in walker.flatten() {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
-        }
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue; // skip binary / non-UTF-8 files
-        };
-        let disp = path.strip_prefix(&ctx.cwd).unwrap_or(path);
-        let n_ctx = a.context();
-        let max_matches = a.max_matches();
-        if n_ctx == 0 {
-            for (i, line) in text.lines().enumerate() {
+            let path = entry.path();
+            if crate::secret_file_reason(&crate::canonicalize_nearest(path)).is_some() {
+                continue; // never read credential/secret files (see deny-list)
+            }
+            if let Some(gp) = &glob_pat {
+                let name = path.file_name().map(|n| n.to_string_lossy());
+                let rel = path.strip_prefix(&root).unwrap_or(path);
+                let hit = name.as_deref().is_some_and(|n| gp.matches(n)) || gp.matches_path(rel);
+                if !hit {
+                    continue;
+                }
+            }
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue; // skip binary / non-UTF-8 files
+            };
+            let disp = path.strip_prefix(&cwd).unwrap_or(path);
+            if n_ctx == 0 {
+                for (i, line) in text.lines().enumerate() {
+                    if re.is_match(line) {
+                        matches += 1;
+                        if matches > max_matches {
+                            out.push_str(
+                                "… [match limit reached — narrow the pattern or scope with path/glob]",
+                            );
+                            break 'walk;
+                        }
+                        out.push_str(&format!("{}:{}:{}\n", disp.display(), i + 1, line));
+                        if out.len() > max_output {
+                            break 'walk;
+                        }
+                    }
+                }
+                continue;
+            }
+            // Context mode: collect this file's hits (bounded by the match cap),
+            // then emit merged ±n windows — matches as `path:NN:line`, context as
+            // `path-NN-line`, `--` between disjoint groups (grep/rg -C format).
+            let lines: Vec<&str> = text.lines().collect();
+            let mut hits: Vec<usize> = Vec::new();
+            let mut capped = false;
+            for (i, line) in lines.iter().enumerate() {
                 if re.is_match(line) {
+                    if matches >= max_matches {
+                        capped = true;
+                        break;
+                    }
                     matches += 1;
-                    if matches > max_matches {
-                        out.push_str(
-                            "… [match limit reached — narrow the pattern or scope with path/glob]",
-                        );
-                        break 'walk;
-                    }
-                    out.push_str(&format!("{}:{}:{}\n", disp.display(), i + 1, line));
-                    if out.len() > ctx.max_output {
-                        break 'walk;
-                    }
+                    hits.push(i);
                 }
             }
-            continue;
-        }
-        // Context mode: collect this file's hits (bounded by the match cap),
-        // then emit merged ±n windows — matches as `path:NN:line`, context as
-        // `path-NN-line`, `--` between disjoint groups (grep/rg -C format).
-        let lines: Vec<&str> = text.lines().collect();
-        let mut hits: Vec<usize> = Vec::new();
-        let mut capped = false;
-        for (i, line) in lines.iter().enumerate() {
-            if re.is_match(line) {
-                if matches >= max_matches {
-                    capped = true;
-                    break;
-                }
-                matches += 1;
-                hits.push(i);
+            emit_context_windows(&mut out, &disp.display().to_string(), &lines, &hits, n_ctx);
+            if capped {
+                out.push_str("… [match limit reached — narrow the pattern or scope with path/glob]");
+                break 'walk;
+            }
+            if out.len() > max_output {
+                break 'walk;
             }
         }
-        emit_context_windows(&mut out, &disp.display().to_string(), &lines, &hits, n_ctx);
-        if capped {
-            out.push_str("… [match limit reached — narrow the pattern or scope with path/glob]");
-            break 'walk;
+        if out.is_empty() {
+            Ok(super::NO_MATCHES.to_string())
+        } else {
+            Ok(truncate_saved(
+                out.trim_end(),
+                max_output,
+                max_output_lines,
+                TruncateSide::Head,
+                "grep",
+            ))
         }
-        if out.len() > ctx.max_output {
-            break 'walk;
-        }
-    }
-    if out.is_empty() {
-        Ok(super::NO_MATCHES.to_string())
-    } else {
-        Ok(truncate_saved(
-            out.trim_end(),
-            ctx.max_output,
-            ctx.max_output_lines,
-            TruncateSide::Head,
-            "grep",
-        ))
-    }
+    })
+    .await?
 }
 
 /// Cross-line variant of the built-in walker. Every line touched by a match is
 /// emitted as a match line. POSIX grep uses this path too because its executable
 /// has no portable cross-record matching mode.
-fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
+async fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
     let re = compile_pattern(a)?;
     let root = match a.path.as_ref() {
         Some(p) => ctx.resolve_read(p)?,
@@ -304,90 +318,104 @@ fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<String> {
         .map(|g| glob::Pattern::new(g))
         .transpose()
         .context("invalid glob")?;
-    let mut out = String::new();
-    let mut matches = 0usize;
 
-    'walk: for entry in super::ignore_walker(&root, a.hidden, a.no_ignore).flatten() {
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        if crate::secret_file_reason(&crate::canonicalize_nearest(path)).is_some() {
-            continue;
-        }
-        if let Some(gp) = &glob_pat {
-            let name = path.file_name().map(|n| n.to_string_lossy());
-            let rel = path.strip_prefix(&root).unwrap_or(path);
-            if !name.as_deref().is_some_and(|n| gp.matches(n)) && !gp.matches_path(rel) {
+    // Same one-closure-per-walk structure as `grep_builtin` — see there for why.
+    let cwd = ctx.cwd.clone();
+    let max_output = ctx.max_output;
+    let max_output_lines = ctx.max_output_lines;
+    let hidden = a.hidden;
+    let no_ignore = a.no_ignore;
+    let n_ctx = a.context();
+    let max_matches = a.max_matches();
+    tokio::task::spawn_blocking(move || {
+        let mut out = String::new();
+        let mut matches = 0usize;
+
+        'walk: for entry in super::ignore_walker(&root, hidden, no_ignore).flatten() {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
-        }
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let lines: Vec<&str> = text.lines().collect();
-        if lines.is_empty() {
-            continue;
-        }
-        let mut matched_lines = HashSet::new();
-        let mut capped = false;
-        for hit in re.find_iter(&text) {
-            if matches >= a.max_matches() {
-                capped = true;
-                break;
+            let path = entry.path();
+            if crate::secret_file_reason(&crate::canonicalize_nearest(path)).is_some() {
+                continue;
             }
-            matches += 1;
-            let start = text[..hit.start()].bytes().filter(|b| *b == b'\n').count();
-            let last_byte = hit.end().saturating_sub(1).max(hit.start());
-            let end = text[..last_byte].bytes().filter(|b| *b == b'\n').count();
-            for line in start..=end.min(lines.len().saturating_sub(1)) {
-                matched_lines.insert(line);
-                if matched_lines.len() >= ctx.max_output_lines {
+            if let Some(gp) = &glob_pat {
+                let name = path.file_name().map(|n| n.to_string_lossy());
+                let rel = path.strip_prefix(&root).unwrap_or(path);
+                if !name.as_deref().is_some_and(|n| gp.matches(n)) && !gp.matches_path(rel) {
+                    continue;
+                }
+            }
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            if lines.is_empty() {
+                continue;
+            }
+            let mut matched_lines = HashSet::new();
+            let mut capped = false;
+            for hit in re.find_iter(&text) {
+                if matches >= max_matches {
                     capped = true;
                     break;
                 }
+                matches += 1;
+                let start = text[..hit.start()].bytes().filter(|b| *b == b'\n').count();
+                let last_byte = hit.end().saturating_sub(1).max(hit.start());
+                let end = text[..last_byte].bytes().filter(|b| *b == b'\n').count();
+                for line in start..=end.min(lines.len().saturating_sub(1)) {
+                    matched_lines.insert(line);
+                    if matched_lines.len() >= max_output_lines {
+                        capped = true;
+                        break;
+                    }
+                }
+                if capped {
+                    break;
+                }
+            }
+            if !matched_lines.is_empty() {
+                let mut hits: Vec<usize> = matched_lines.into_iter().collect();
+                hits.sort_unstable();
+                let disp = path.strip_prefix(&cwd).unwrap_or(path);
+                if n_ctx == 0 {
+                    for i in hits {
+                        out.push_str(&format!("{}:{}:{}\n", disp.display(), i + 1, lines[i]));
+                    }
+                } else {
+                    emit_context_windows(
+                        &mut out,
+                        &disp.display().to_string(),
+                        &lines,
+                        &hits,
+                        n_ctx,
+                    );
+                }
             }
             if capped {
-                break;
-            }
-        }
-        if !matched_lines.is_empty() {
-            let mut hits: Vec<usize> = matched_lines.into_iter().collect();
-            hits.sort_unstable();
-            let disp = path.strip_prefix(&ctx.cwd).unwrap_or(path);
-            if a.context() == 0 {
-                for i in hits {
-                    out.push_str(&format!("{}:{}:{}\n", disp.display(), i + 1, lines[i]));
-                }
-            } else {
-                emit_context_windows(
-                    &mut out,
-                    &disp.display().to_string(),
-                    &lines,
-                    &hits,
-                    a.context(),
+                out.push_str(
+                    "… [match limit reached — narrow the pattern or scope with path/glob]",
                 );
+                break 'walk;
+            }
+            if out.len() > max_output {
+                break 'walk;
             }
         }
-        if capped {
-            out.push_str("… [match limit reached — narrow the pattern or scope with path/glob]");
-            break 'walk;
+        if out.is_empty() {
+            Ok(super::NO_MATCHES.to_string())
+        } else {
+            Ok(truncate_saved(
+                out.trim_end(),
+                max_output,
+                max_output_lines,
+                TruncateSide::Head,
+                "grep",
+            ))
         }
-        if out.len() > ctx.max_output {
-            break 'walk;
-        }
-    }
-    if out.is_empty() {
-        Ok(super::NO_MATCHES.to_string())
-    } else {
-        Ok(truncate_saved(
-            out.trim_end(),
-            ctx.max_output,
-            ctx.max_output_lines,
-            TruncateSide::Head,
-            "grep",
-        ))
-    }
+    })
+    .await?
 }
 
 /// Append merged ±`n_ctx` windows around `hits` (0-based line indexes) in
@@ -488,51 +516,53 @@ mod tests {
         assert!(has_lookaround("a\\\\(?!b)"));
     }
 
-    #[test]
-    fn builtin_multiline_matches_across_line_boundary() {
+    #[tokio::test]
+    async fn builtin_multiline_matches_across_line_boundary() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("sample.txt"), "before\nfoo\nbar\nafter\n").unwrap();
         let ctx = ToolContext::new(dir.path());
-        let out = grep_builtin(&multiline_args("foo\\nbar"), &ctx).unwrap();
+        let out = grep_builtin(&multiline_args("foo\\nbar"), &ctx)
+            .await
+            .unwrap();
         assert!(out.contains("sample.txt:2:foo"), "{out}");
         assert!(out.contains("sample.txt:3:bar"), "{out}");
     }
 
-    #[test]
-    fn builtin_without_multiline_does_not_cross_lines() {
+    #[tokio::test]
+    async fn builtin_without_multiline_does_not_cross_lines() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("sample.txt"), "foo\nbar\n").unwrap();
         let ctx = ToolContext::new(dir.path());
         let mut args = multiline_args("foo\\nbar");
         args.multiline = false;
-        assert_eq!(grep_builtin(&args, &ctx).unwrap(), "(no matches)");
+        assert_eq!(grep_builtin(&args, &ctx).await.unwrap(), "(no matches)");
     }
 
-    #[test]
-    fn builtin_multiline_zero_width_match_on_empty_file_does_not_panic() {
+    #[tokio::test]
+    async fn builtin_multiline_zero_width_match_on_empty_file_does_not_panic() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("sample.txt"), "").unwrap();
         let ctx = ToolContext::new(dir.path());
         assert_eq!(
-            grep_builtin(&multiline_args("^"), &ctx).unwrap(),
+            grep_builtin(&multiline_args("^"), &ctx).await.unwrap(),
             "(no matches)"
         );
     }
 
-    #[test]
-    fn builtin_multiline_spanning_match_respects_line_cap() {
+    #[tokio::test]
+    async fn builtin_multiline_spanning_match_respects_line_cap() {
         let dir = tempfile::tempdir().unwrap();
         let text = (0..100).map(|i| format!("line{i}\n")).collect::<String>();
         std::fs::write(dir.path().join("sample.txt"), text).unwrap();
         let mut ctx = ToolContext::new(dir.path());
         ctx.max_output_lines = 5;
-        let out = grep_builtin(&multiline_args("(?s).*"), &ctx).unwrap();
+        let out = grep_builtin(&multiline_args("(?s).*"), &ctx).await.unwrap();
         assert!(out.lines().count() <= 7, "{out}");
         assert!(out.contains("full output"), "{out}");
     }
 
-    #[test]
-    fn builtin_multiline_preserves_context_and_glob_filtering() {
+    #[tokio::test]
+    async fn builtin_multiline_preserves_context_and_glob_filtering() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("sample.txt"), "before\nfoo\nbar\nafter\n").unwrap();
         std::fs::write(dir.path().join("sample.rs"), "foo\nbar\n").unwrap();
@@ -540,7 +570,7 @@ mod tests {
         let mut args = multiline_args("foo\\nbar");
         args.glob = Some("*.txt".into());
         args.context = Some(1);
-        let out = grep_builtin(&args, &ctx).unwrap();
+        let out = grep_builtin(&args, &ctx).await.unwrap();
         assert!(out.contains("sample.txt-1-before"), "{out}");
         assert!(out.contains("sample.txt-4-after"), "{out}");
         assert!(!out.contains("sample.rs"), "{out}");
@@ -573,8 +603,8 @@ mod tests {
     /// Same guarantee for the pure-Rust builtin fallback (used when neither
     /// `rg` nor `grep` is installed): it already skips secret files at the
     /// walk level, but pin it here too so a refactor can't silently regress.
-    #[test]
-    fn context_lines_do_not_leak_env_secrets_via_builtin() {
+    #[tokio::test]
+    async fn context_lines_do_not_leak_env_secrets_via_builtin() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".env"),
@@ -593,7 +623,7 @@ mod tests {
             literal: false,
             case_insensitive: false,
         };
-        let out = grep_builtin(&a, &ctx).unwrap();
+        let out = grep_builtin(&a, &ctx).await.unwrap();
         assert!(!out.contains("supersecret"), "{out}");
         assert_eq!(out, "(no matches)");
     }
@@ -601,20 +631,23 @@ mod tests {
     /// Hidden files/dirs (dotfiles) are skipped by default and only searched
     /// when `hidden: true` is set — the undocumented behavior this change
     /// documents and makes overridable.
-    #[test]
-    fn builtin_hidden_files_skipped_by_default_and_found_with_hidden_flag() {
+    #[tokio::test]
+    async fn builtin_hidden_files_skipped_by_default_and_found_with_hidden_flag() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".hidden-dir")).unwrap();
         std::fs::write(dir.path().join(".hidden-dir/file.txt"), "needle here\n").unwrap();
         let ctx = ToolContext::new(dir.path());
 
         let args = plain_args("needle");
-        assert_eq!(grep_builtin(&args, &ctx).unwrap(), "(no matches)");
+        assert_eq!(grep_builtin(&args, &ctx).await.unwrap(), "(no matches)");
 
         let mut hidden_args = plain_args("needle");
         hidden_args.hidden = true;
         // Windows paths print with `\` — normalize before asserting.
-        let out = grep_builtin(&hidden_args, &ctx).unwrap().replace('\\', "/");
+        let out = grep_builtin(&hidden_args, &ctx)
+            .await
+            .unwrap()
+            .replace('\\', "/");
         assert!(out.contains(".hidden-dir/file.txt:1:needle"), "{out}");
     }
 
@@ -623,8 +656,8 @@ mod tests {
     /// `ignore` crate only applies git-related ignore rules (including
     /// `.gitignore`) inside a discovered git repository by default — same
     /// setup `tree_respects_gitignore` uses.
-    #[test]
-    fn builtin_gitignored_files_skipped_by_default_and_found_with_no_ignore_flag() {
+    #[tokio::test]
+    async fn builtin_gitignored_files_skipped_by_default_and_found_with_no_ignore_flag() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
@@ -632,11 +665,11 @@ mod tests {
         let ctx = ToolContext::new(dir.path());
 
         let args = plain_args("needle");
-        assert_eq!(grep_builtin(&args, &ctx).unwrap(), "(no matches)");
+        assert_eq!(grep_builtin(&args, &ctx).await.unwrap(), "(no matches)");
 
         let mut no_ignore_args = plain_args("needle");
         no_ignore_args.no_ignore = true;
-        let out = grep_builtin(&no_ignore_args, &ctx).unwrap();
+        let out = grep_builtin(&no_ignore_args, &ctx).await.unwrap();
         assert!(out.contains("ignored.txt:1:needle"), "{out}");
     }
 
@@ -646,34 +679,37 @@ mod tests {
     /// parens themselves aren't part of the match. Only `literal: true`
     /// (which escapes the pattern) finds the verbatim text, and it must not
     /// error doing so.
-    #[test]
-    fn builtin_literal_matches_fixed_string_verbatim() {
+    #[tokio::test]
+    async fn builtin_literal_matches_fixed_string_verbatim() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("sample.txt"), "call foo(bar) here\n").unwrap();
         let ctx = ToolContext::new(dir.path());
 
         let regex_args = plain_args("foo(bar)");
-        assert_eq!(grep_builtin(&regex_args, &ctx).unwrap(), "(no matches)");
+        assert_eq!(
+            grep_builtin(&regex_args, &ctx).await.unwrap(),
+            "(no matches)"
+        );
 
         let mut literal_args = plain_args("foo(bar)");
         literal_args.literal = true;
-        let out = grep_builtin(&literal_args, &ctx).unwrap();
+        let out = grep_builtin(&literal_args, &ctx).await.unwrap();
         assert!(out.contains("sample.txt:1:call foo(bar) here"), "{out}");
     }
 
     /// `case_insensitive: true` matches regardless of case.
-    #[test]
-    fn builtin_case_insensitive_matches_across_case() {
+    #[tokio::test]
+    async fn builtin_case_insensitive_matches_across_case() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("sample.txt"), "NEEDLE here\n").unwrap();
         let ctx = ToolContext::new(dir.path());
 
         let args = plain_args("needle");
-        assert_eq!(grep_builtin(&args, &ctx).unwrap(), "(no matches)");
+        assert_eq!(grep_builtin(&args, &ctx).await.unwrap(), "(no matches)");
 
         let mut ci_args = plain_args("needle");
         ci_args.case_insensitive = true;
-        let out = grep_builtin(&ci_args, &ctx).unwrap();
+        let out = grep_builtin(&ci_args, &ctx).await.unwrap();
         assert!(out.contains("sample.txt:1:NEEDLE here"), "{out}");
     }
 
@@ -704,7 +740,7 @@ mod tests {
         // the multiline variant it delegates to.
         for mut a in [plain_args("needle"), multiline_args("needle")] {
             a.path = Some(outside.path().to_string_lossy().to_string());
-            let err = grep_builtin(&a, &ctx).unwrap_err().to_string();
+            let err = grep_builtin(&a, &ctx).await.unwrap_err().to_string();
             assert!(err.contains("sandbox: refusing to read"), "{err}");
         }
     }

@@ -100,50 +100,60 @@ impl Tool for ReadTool {
         })?;
         let path = ctx.resolve_read(&a.path)?;
 
-        // Open the file first so the handle is fixed before any path resolution —
-        // this closes the TOCTOU window between secret-file validation and reading.
-        let mut file =
-            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        // Whole-file open + guards + read on the blocking pool: this is `std::fs`
+        // on a handle that can be a multi-MB read, so it must not occupy a tokio
+        // worker. The closure takes an owned copy of the resolved path (no borrow
+        // of `ctx` or `path` across the `spawn_blocking` boundary) and returns the
+        // content; the guards and the size cap run inside it, with the same errors.
+        let resolved = path.clone();
+        let text = tokio::task::spawn_blocking(move || -> Result<String> {
+            // Open the file first so the handle is fixed before any path resolution —
+            // this closes the TOCTOU window between secret-file validation and reading.
+            let mut file = std::fs::File::open(&resolved)
+                .with_context(|| format!("opening {}", resolved.display()))?;
 
-        // Validate the path is not a secret file.
-        crate::guard_secret_read(&path)?;
+            // Validate the path is not a secret file.
+            crate::guard_secret_read(&resolved)?;
 
-        // Prove the handle we opened is still the object this path names — if any
-        // component was swapped between the open and the guard above, reject it.
-        // Enforced on every platform (unix via dev/ino, Windows via the file
-        // index), so the guard is not quietly weaker on one of them.
-        crate::guard_not_swapped(&file, &path)?;
+            // Prove the handle we opened is still the object this path names — if any
+            // component was swapped between the open and the guard above, reject it.
+            // Enforced on every platform (unix via dev/ino, Windows via the file
+            // index), so the guard is not quietly weaker on one of them.
+            crate::guard_not_swapped(&file, &resolved)?;
 
-        // Check file size from the open handle (not a separate stat).
-        let file_len = file
-            .metadata()
-            .with_context(|| format!("statting {}", path.display()))?
-            .len();
-        if file_len > MAX_READ_BYTES {
-            bail!(
-                "{} is {} bytes, over this tool's {MAX_READ_BYTES}-byte cap — it's too large to \
-                 load whole; use `grep` to search it or `bash` (`sed`/`head`/`tail`) to slice out \
-                 the range you need",
-                path.display(),
-                file_len
-            );
-        }
-
-        // Read from the already-opened handle.
-        let mut text = String::new();
-        match file.read_to_string(&mut text) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            // Check file size from the open handle (not a separate stat).
+            let file_len = file
+                .metadata()
+                .with_context(|| format!("statting {}", resolved.display()))?
+                .len();
+            if file_len > MAX_READ_BYTES {
                 bail!(
-                    "{} is not a text file (invalid UTF-8) — this tool only reads text; \
-                     inspect binaries via bash (`file`, `hexdump -C`, `strings`) if needed",
-                    path.display()
+                    "{} is {} bytes, over this tool's {MAX_READ_BYTES}-byte cap — it's too large to \
+                     load whole; use `grep` to search it or `bash` (`sed`/`head`/`tail`) to slice out \
+                     the range you need",
+                    resolved.display(),
+                    file_len
                 );
             }
-            Err(e) => {
-                return Err(e).with_context(|| format!("reading {}", path.display()));
+
+            // Read from the already-opened handle.
+            let mut text = String::new();
+            match file.read_to_string(&mut text) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    bail!(
+                        "{} is not a text file (invalid UTF-8) — this tool only reads text; \
+                         inspect binaries via bash (`file`, `hexdump -C`, `strings`) if needed",
+                        resolved.display()
+                    );
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("reading {}", resolved.display()));
+                }
             }
-        }
+            Ok(text)
+        })
+        .await??;
         let total_lines = text.lines().count();
         // `full` reads the whole file with no per-line clip and no output budget
         // (ignoring offset/limit), so a file with a line over `MAX_LINE` or one
@@ -480,5 +490,33 @@ mod tests {
             .await
             .expect("reads under the cwd root are allowed");
         assert!(out.contains("data"), "got: {out}");
+    }
+
+    /// The file-open + read path runs on the blocking pool (`spawn_blocking`): a
+    /// big file's whole-file `read_to_string` must not occupy a tokio worker.
+    /// Whether the work actually landed on a blocking thread is not portably
+    /// assertable (the blocking pool is a tokio implementation detail, and a
+    /// single-threaded test runtime offers no observable difference), so pin the
+    /// observable instead: a read of a large file completes and returns the
+    /// right content through the spawned path.
+    #[tokio::test]
+    async fn read_large_file_completes_via_the_blocking_pool() {
+        let cwd = tempfile::tempdir().unwrap();
+        let path = cwd.path().join("big.txt");
+        // Enough lines that the whole-file read is non-trivial; the first lines
+        // would only survive if the closure actually returned the content.
+        let body: String = (0..200_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+        let ctx = ToolContext::new(cwd.path().to_path_buf());
+
+        let out = ReadTool
+            .execute(
+                serde_json::json!({"path": "big.txt", "offset": 1, "limit": 3}),
+                &ctx,
+            )
+            .await
+            .expect("a large read completes");
+        assert!(out.contains("line 0"), "{out}");
+        assert!(out.contains("line 2"), "{out}");
     }
 }

@@ -1426,7 +1426,15 @@ impl hrdr_tools::Tool for SubagentTool {
         // It rides in the volatile task payload on purpose: the system prompt's
         // sections are ordered least-volatile-first for cache reuse, and per-task
         // text there would break the prefix.
-        if let Some(map) = workspace_map(&ctx.cwd) {
+        //
+        // Both walks inside `workspace_map` (the directory walk and the
+        // `workspace_members` Cargo.toml read + glob) are blocking fs, so they
+        // run on the blocking pool — a big repo should not stall a tokio worker
+        // for the whole walk. The closure owns the cloned cwd, so nothing borrows
+        // `ctx` across the `spawn_blocking` boundary.
+        let cwd = ctx.cwd.clone();
+        let map = tokio::task::spawn_blocking(move || workspace_map(&cwd)).await?;
+        if let Some(map) = map {
             prompt.push_str("\n\n");
             prompt.push_str(&map);
         }

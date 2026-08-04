@@ -63,23 +63,34 @@ impl Tool for FindTool {
         // `node_modules/`, …) are skipped automatically — same as hidden `.git/`
         // and other dotfiles. Both are overridable via `hidden` / `no_ignore` —
         // the same flags `grep` exposes on the same walker.
-        let mut paths: Vec<String> = Vec::new();
-        let walker = super::ignore_walker(&ctx.cwd, a.hidden, a.no_ignore);
-        for entry in walker.flatten() {
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
+        // The whole walk runs on the blocking pool — a `find` across a big tree
+        // is `std::fs` work that must not occupy a tokio worker. The closure
+        // owns everything it touches (the cwd, the flags, the parsed glob), so
+        // nothing borrows `ctx` across the `spawn_blocking` boundary.
+        let cwd = ctx.cwd.clone();
+        let hidden = a.hidden;
+        let no_ignore = a.no_ignore;
+        let mut paths = tokio::task::spawn_blocking(move || {
+            let mut paths: Vec<String> = Vec::new();
+            let walker = super::ignore_walker(&cwd, hidden, no_ignore);
+            for entry in walker.flatten() {
+                if !entry.file_type().is_some_and(|t| t.is_file()) {
+                    continue;
+                }
+                let path = entry.path();
+                let rel = path.strip_prefix(&cwd).unwrap_or(path);
+                // Match both the bare filename and the full relative path so that
+                // simple patterns like `*.rs` work without a leading `**/`, while
+                // patterns like `src/**/*.rs` still match across directory depth.
+                let name = path.file_name().map(|n| n.to_string_lossy());
+                let hit = name.as_deref().is_some_and(|n| pat.matches(n)) || pat.matches_path(rel);
+                if hit {
+                    paths.push(rel.to_string_lossy().to_string());
+                }
             }
-            let path = entry.path();
-            let rel = path.strip_prefix(&ctx.cwd).unwrap_or(path);
-            // Match both the bare filename and the full relative path so that
-            // simple patterns like `*.rs` work without a leading `**/`, while
-            // patterns like `src/**/*.rs` still match across directory depth.
-            let name = path.file_name().map(|n| n.to_string_lossy());
-            let hit = name.as_deref().is_some_and(|n| pat.matches(n)) || pat.matches_path(rel);
-            if hit {
-                paths.push(rel.to_string_lossy().to_string());
-            }
-        }
+            paths
+        })
+        .await?;
         paths.sort();
         if paths.is_empty() {
             return Ok(super::NO_MATCHES.to_string());
