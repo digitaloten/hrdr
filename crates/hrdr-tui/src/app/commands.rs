@@ -502,6 +502,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         self.app.dir = hrdr_app::display_dir(new);
         self.app.branch = hrdr_app::git_branch(new);
         self.app.file_index_cwd = None; // rebuild @-completion for the new dir
+        self.app.arm_file_watcher(new);
         self.app.skills = hrdr_app::discover_skills(new, hrdr_agent::ProjectInstructions::Load);
     }
     fn timestamp_style(&self) -> hrdr_app::TimestampStyle {

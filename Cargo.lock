@@ -1415,6 +1415,7 @@ dependencies = [
  "hrdr-editor",
  "hrdr-test-support",
  "hrdr-tools",
+ "notify",
  "ratatui",
  "serde_json",
  "tempfile",

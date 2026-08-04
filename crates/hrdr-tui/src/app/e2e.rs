@@ -440,6 +440,25 @@ impl Harness {
         }
     }
 
+    /// Drain turn messages until one matches `pred`, applying each as it goes
+    /// (the real loop's order). Bounded so a watcher event or off-thread walk
+    /// that never arrives fails the test instead of hanging it.
+    async fn wait_for(&mut self, what: &str, pred: impl Fn(&TurnMsg) -> bool) {
+        let wait = async {
+            loop {
+                let msg = self.rx.recv().await.expect("turn channel closed");
+                let done = pred(&msg);
+                self.app.on_turn_msg(msg);
+                if done {
+                    return;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
     /// Render the whole UI to a [`TestBackend`] and flatten it to text.
     fn render(&mut self) -> String {
         let mut term = Terminal::new(TestBackend::new(90, 30)).unwrap();
@@ -6683,6 +6702,74 @@ async fn up_after_recalling_a_slash_command_keeps_walking_history() {
         comp.items.iter().any(|(name, _)| name == "/help"),
         "the popup offers the command: {:?}",
         comp.items
+    );
+}
+
+/// `@file` completion sees files that appear *after* its index was built. A
+/// recursive watcher on the cwd invalidates the cache on create/rename/remove,
+/// so a file added by a `git pull`, another shell, or the agent's own write
+/// tool shows up on the next `@` keystroke. (Regression: the index was a
+/// one-shot snapshot per cwd — new files were invisible until the cwd changed
+/// or hrdr restarted.)
+#[tokio::test]
+async fn at_mention_completion_picks_up_files_created_after_the_index() {
+    let mut h = Harness::new(vec![]).await;
+    let cwd = std::path::PathBuf::from(h.app.current_cwd());
+    std::fs::write(cwd.join("alpha.txt"), "x").unwrap();
+
+    // The first `@` builds the index off-thread. The keystroke itself sees the
+    // empty content (the char is inserted *after* the completion branch), so
+    // the build is triggered by the next draw — do here what the frame's draw
+    // does — then the popup appears once the FileIndex result lands.
+    h.type_str("@");
+    let _ = h.app.active_completions();
+    h.wait_for("file index", |m| matches!(m, TurnMsg::FileIndex(..)))
+        .await;
+    let items = h
+        .app
+        .active_completions()
+        .map(|c| c.items)
+        .unwrap_or_default();
+    assert!(
+        items.iter().any(|(name, _)| name == "alpha.txt"),
+        "indexed file offered: {items:?}"
+    );
+
+    // A new file appears in the watched tree — a `git pull` or another shell.
+    std::fs::write(cwd.join("beta.rs"), "fn main() {}").unwrap();
+
+    // The next keystroke starts the rebuild once the watcher's dirty ping has
+    // been applied (it may already have been drained — the alpha.txt write
+    // pinged too). Wait until the rebuilt index actually contains the file
+    // rather than betting on which ping is still in the channel.
+    h.type_str("b");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        while let Ok(msg) = h.rx.try_recv() {
+            h.app.on_turn_msg(msg);
+        }
+        // A keystroke or draw would call this; do it here so the rebuild starts
+        // once the dirty ping has been applied.
+        let _ = h.app.active_completions();
+        if h.app.file_index.iter().any(|p| p == "beta.rs") {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "rebuilt index never included beta.rs: {:?}",
+                h.app.file_index
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let items = h
+        .app
+        .active_completions()
+        .map(|c| c.items)
+        .unwrap_or_default();
+    assert!(
+        items.iter().any(|(name, _)| name == "beta.rs"),
+        "the newly created file is offered: {items:?}"
     );
 }
 

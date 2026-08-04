@@ -231,6 +231,10 @@ pub(crate) enum TurnMsg {
     },
     /// `@file` completion index built off-thread for `cwd`.
     FileIndex(std::path::PathBuf, Vec<String>),
+    /// The watched cwd changed on disk (entries created/renamed/removed —
+    /// external edits, a `git pull`, the agent's own writes). The `@file`
+    /// index is stale; the frontend invalidates it.
+    FileIndexDirty,
     /// The config file changed on disk (from the shared watcher).
     ConfigChanged,
 }
@@ -444,10 +448,20 @@ pub(crate) struct App {
     history: hrdr_app::HistoryBrowser,
     /// Cached relative file paths under the cwd, for `@file` completion.
     file_index: Vec<String>,
-    /// The cwd `file_index` was built for; rebuilt when the cwd changes.
+    /// The cwd `file_index` was built for; rebuilt when the cwd changes or a
+    /// filesystem change lands in the watched tree.
     file_index_cwd: Option<std::path::PathBuf>,
     /// An off-thread index build is in flight (don't spawn another).
     file_index_building: bool,
+    /// A filesystem change landed while a build was in flight, so the build
+    /// result about to land is already stale. Keeps the cache invalidated
+    /// until the next build starts (which clears it).
+    file_index_dirty: bool,
+    /// Recursive watcher on the cwd; its events (create/rename/remove —
+    /// anything but a read) arrive as [`TurnMsg::FileIndexDirty`] and
+    /// invalidate the `@file` index. `None` when no watcher could be
+    /// established — completion then refreshes only on cwd changes.
+    file_watcher: Option<notify::RecommendedWatcher>,
     /// Whether to render the model's reasoning (`<think>`) blocks (`/reasoning`).
     pub(crate) show_reasoning: bool,
     /// Show every tool result in full (`/expand all`); per-entry `expanded`
@@ -749,6 +763,8 @@ impl App {
             file_index: Vec::new(),
             file_index_cwd: None,
             file_index_building: false,
+            file_index_dirty: false,
+            file_watcher: None,
             show_reasoning: show_thinking,
             expand_tools: false,
             pending_edit: None,
@@ -811,6 +827,10 @@ impl App {
         // The session's agent joins the registry alongside every delegated one, so
         // the frontend can build its view the same way for all of them.
         app.publish_main_agent();
+        // Watch the working tree so a change to it (a new file, a `git pull`)
+        // invalidates the `@file` completion index instead of leaving the cached
+        // snapshot stale forever. Re-armed on every cwd change.
+        app.arm_file_watcher(&cwd_for_skills);
         if auto_resume {
             app.auto_resume_latest();
         }
@@ -2086,6 +2106,7 @@ impl App {
         self.dir = display_dir(&new);
         self.branch = git_branch(&new);
         self.file_index_cwd = None; // force a rebuild for the new directory
+        self.arm_file_watcher(&new);
         self.skills = hrdr_app::discover_skills(&new, hrdr_agent::ProjectInstructions::Load);
     }
 
@@ -2549,9 +2570,18 @@ impl App {
             }
             TurnMsg::FileIndex(cwd, files) => {
                 self.file_index = files;
-                self.file_index_cwd = Some(cwd);
                 self.file_index_building = false;
+                if self.file_index_dirty {
+                    // A filesystem change landed while the walk was running —
+                    // this freshly built list is already stale. Keep the cache
+                    // invalidated; the next `@` keystroke builds again.
+                    self.file_index_dirty = false;
+                    self.file_index_cwd = None;
+                } else {
+                    self.file_index_cwd = Some(cwd);
+                }
             }
+            TurnMsg::FileIndexDirty => self.on_file_index_dirty(),
             TurnMsg::SaveDone(result) => self.on_save_done(result),
             TurnMsg::Identity(id, reference, base_url, window) => {
                 // The agent has taken it; the chrome may now say so.

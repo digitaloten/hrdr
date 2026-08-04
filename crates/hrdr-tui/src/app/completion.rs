@@ -176,6 +176,10 @@ impl super::App {
             return;
         }
         self.file_index_building = true;
+        // This walk runs after whatever invalidated the index, so it captures
+        // the new state; a dirty marker set by a mid-build event is now moot
+        // (the `FileIndex` handler re-invalidates if a *further* event lands).
+        self.file_index_dirty = false;
         let tx = self.tx.clone();
         let sent_cwd = cwd.clone();
         hrdr_app::spawn_file_index(cwd, move |files| {
@@ -183,6 +187,42 @@ impl super::App {
             // into an idle channel, so `try_send` suffices.
             let _ = tx.try_send(super::TurnMsg::FileIndex(sent_cwd, files));
         });
+    }
+
+    /// A filesystem change landed in the watched tree (create/rename/remove —
+    /// external edits, a `git pull`, the agent's own writes). Invalidate the
+    /// cached index; the next `@` keystroke rebuilds it. If a rebuild is
+    /// already in flight, mark it so the `FileIndex` handler discards its
+    /// result — the snapshot it walked predates this change.
+    pub(super) fn on_file_index_dirty(&mut self) {
+        self.file_index_dirty = true;
+        self.file_index_cwd = None;
+    }
+
+    /// (Re)start the recursive watcher on `dir` that feeds
+    /// [`TurnMsg::FileIndexDirty`]. Any change that can alter the completion
+    /// listing — creates, renames, removals, and modifies (some backends, e.g.
+    /// FSEvents, surface a directory change that way) — invalidates the index;
+    /// a pure read (`Access`) cannot. Invalidation is lazy (one walk on the
+    /// next `@`), so a false positive is free. Dropping the previous watcher
+    /// stops it; `None` when no watcher could be established.
+    pub(super) fn arm_file_watcher(&mut self, dir: &std::path::Path) {
+        use notify::{RecursiveMode, Watcher};
+        let tx = self.tx.clone();
+        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let dirty = match res {
+                Ok(ev) => !matches!(ev.kind, notify::EventKind::Access(_)),
+                // A watcher error (e.g. a watch-limit hit) means events may be
+                // missed — err towards invalidating.
+                Err(_) => true,
+            };
+            if dirty {
+                let _ = tx.try_send(super::TurnMsg::FileIndexDirty);
+            }
+        })
+        .ok()
+        .and_then(|mut w| w.watch(dir, RecursiveMode::Recursive).ok().map(|()| w));
+        self.file_watcher = watcher;
     }
 }
 

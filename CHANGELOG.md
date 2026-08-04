@@ -53,6 +53,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`@file` completion refreshes when the working tree changes.** The completion
+  index was a one-shot snapshot per cwd: a file created after the first `@` — by
+  a `git pull`, another shell, or the agent's own write tool — never appeared
+  until the cwd changed or hrdr restarted. A recursive watcher on the cwd now
+  invalidates the cache on create/rename/remove (anything but a read), so the
+  next `@` keystroke rebuilds and offers the new file.
+
 - **A compaction's model calls are counted.** `account_usage` ran for them — so
   their cost reached the session total and the `max_cost` cap — but no `Usage`
   event was emitted, and hrdr's token counters only ever count what they are
