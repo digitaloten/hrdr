@@ -144,6 +144,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cannot drift apart again; pressing on the scrollbar column starts no
   selection, and the rightmost text column still does.
 
+- **Forking a busy session keeps its conversation.** The `f` fork escape hatch
+  copied the session's messages but dropped its display transcript, so the copy
+  opened as an empty conversation; it now copies the source's transcript jsonl
+  as well.
+
 ### Added
 
 - **`deepseek` is now a built-in provider** — `deepseek://model` talks to

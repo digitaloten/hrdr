@@ -982,6 +982,9 @@ impl Session {
     /// [`SessionLock`] is exactly the guard a first save mints; the caller holds it
     /// for as long as the fork stays active.
     ///
+    /// The source's display transcript (its sibling `<id>.jsonl`) is copied to the
+    /// fork's jsonl too, so the copy opens with the same conversation on screen.
+    ///
     /// Returns `(new_id, forked_session, fork_lock)`.
     pub fn fork(cwd: &str, source_path: &Path) -> Result<(String, Session, SessionLock)> {
         // Read the source's current on-disk snapshot WITHOUT taking its lock.
@@ -1010,6 +1013,18 @@ impl Session {
         let lock = outcome
             .open_lock
             .context("could not acquire the forked session's open-lock")?;
+        // Carry the source's display transcript over: the fork keeps the
+        // conversation's display fold, without which the copy opens with an
+        // empty pane. Best-effort — a failed copy must not fail the fork, and a
+        // source with no jsonl keeps an empty fork transcript as before.
+        if let Some(source_id) = session_id_from_path(source_path) {
+            let source_jsonl = source_path.with_file_name(format!("{source_id}.jsonl"));
+            let fork_jsonl =
+                session_file_path(cwd, &outcome.id).with_file_name(format!("{}.jsonl", outcome.id));
+            if source_jsonl.exists() {
+                let _ = std::fs::copy(&source_jsonl, &fork_jsonl);
+            }
+        }
         // Reload so the returned session reflects exactly what was written
         // (persisted transcript, id stamped from the filename).
         let session = Self::load_path(&session_file_path(cwd, &outcome.id))
@@ -2392,6 +2407,17 @@ mod tests {
             src.messages = vec![Message::user("keep me"), Message::assistant("sure")];
             Session::new(src).save("orig").unwrap();
             let source_path = session_file_path(&cwd, "orig");
+            // Give the source a real display transcript too, as a busy live
+            // session would have: a sibling `orig.jsonl` the fork must carry.
+            let mut log = crate::transcript_log::TranscriptLog::create(&sdir, "orig").unwrap();
+            log.write(
+                &crate::transcript_log::Record::from_event(&crate::AgentEvent::Text(
+                    "the conversation so far".into(),
+                ))
+                .unwrap(),
+            );
+            log.flush();
+            assert!(sdir.join("orig.jsonl").exists());
 
             // The other instance holds the source's open-lock.
             let _source_held = acquire_open_lock(&sdir, "orig").unwrap();
@@ -2412,6 +2438,20 @@ mod tests {
                 forked.state.messages.len(),
                 2,
                 "conversation copied from the source"
+            );
+            // The fork's display transcript came along with the jsonl: the same
+            // fold the source's pane renders, not an empty conversation.
+            assert!(
+                !forked.state.transcript.is_empty(),
+                "fork carries the source's display transcript"
+            );
+            assert!(
+                forked.state.transcript.iter().any(|e| matches!(
+                    &e.kind,
+                    EntryKind::Assistant(s) if s == "the conversation so far"
+                )),
+                "forked transcript folds the source's records: {:?}",
+                forked.state.transcript
             );
             assert_eq!(forked.state.id.as_deref(), Some(new_id.as_str()));
 
