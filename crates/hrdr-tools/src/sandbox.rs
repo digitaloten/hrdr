@@ -1937,6 +1937,54 @@ mod tests {
         }
     }
 
+    /// A dangling symlink inside a writable root must not smuggle a write out:
+    /// the write tool follows the link and creates the file at the target, so
+    /// the guard has to resolve the link *before* the root check. Regression
+    /// for the escape where `canonicalize_nearest` kept the lexical link path
+    /// (inside the root) and the write landed outside it. Unix-only — creating
+    /// symlinks on Windows needs privileges.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_cannot_escape_the_writable_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        // Canonical root so the symlink target compares against the same
+        // resolved ancestor `canonicalize_nearest` produces on macOS and
+        // Windows. No-op on Linux.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Write,
+            writable_roots: vec![root.clone()],
+            readable_roots: vec![root.clone()],
+            cache_roots: Vec::new(),
+            wrap_tool_results: false,
+        };
+
+        // `root/link -> ../outside.txt`: parent exists, target file does not —
+        // the dangling case the guard used to wave through. A write through it
+        // creates the file outside the root.
+        let link = root.join("link");
+        std::os::unix::fs::symlink("../outside.txt", &link).unwrap();
+        assert!(
+            policy
+                .check_write(&canonicalize_nearest(&link), &link)
+                .is_err(),
+            "a dangling symlink must not write outside the root"
+        );
+
+        // The benign case: a dangling link pointing at a not-yet-existing file
+        // inside the root stays writable.
+        let inner = root.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let benign = inner.join("link");
+        std::os::unix::fs::symlink("new.txt", &benign).unwrap();
+        assert!(
+            policy
+                .check_write(&canonicalize_nearest(&benign), &benign)
+                .is_ok(),
+            "a dangling symlink inside the root must stay writable"
+        );
+    }
+
     /// A real repo with one commit at `<root>/repo` plus a linked worktree at
     /// `<root>/wt` on branch `hrdr/task-1` — the exact shape a write
     /// sub-agent runs in, and the one the metadata roots exist for.

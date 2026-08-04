@@ -683,7 +683,34 @@ pub fn resolve_under(base: &std::path::Path, path: &str) -> PathBuf {
 /// prevents a confinement bypass where a path like
 /// `cwd/nonexistent/../../etc/passwd` would pass a `starts_with(cwd)` check
 /// despite escaping the working directory.
+///
+/// How many symlink hops [`canonicalize_nearest`] follows when resolving a
+/// dangling final-component symlink by hand. Matches Linux's MAXSYMLINKS.
+const MAX_CANON_SYMLINKS: usize = 40;
+
 pub fn canonicalize_nearest(path: &std::path::Path) -> PathBuf {
+    canonicalize_nearest_bounded(path, MAX_CANON_SYMLINKS)
+}
+
+fn canonicalize_nearest_bounded(path: &std::path::Path, budget: usize) -> PathBuf {
+    // A dangling symlink can't be canonicalized, but the guard needs to know
+    // where it points: a write through it lands at the target. Resolve the
+    // final component by hand; the budget stops a symlink loop (which a write
+    // couldn't go through anyway) from recursing forever.
+    if budget > 0
+        && let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+        && let Ok(target) = std::fs::read_link(path)
+    {
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            path.parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(&target)
+        };
+        return canonicalize_nearest_bounded(&resolved, budget - 1);
+    }
     let mut existing = path;
     let mut rest = Vec::new();
     loop {
@@ -3450,6 +3477,51 @@ b:2:y"
             !canon.starts_with(&cwd),
             "symlink-escaped path {canon:?} must not start with cwd {cwd:?}"
         );
+    }
+
+    /// A dangling symlink must resolve to its target: a write through it lands
+    /// at the target, so the confinement guard has to see the target, not the
+    /// lexical link path inside the root. A relative target with `..` (the
+    /// classic escape) is resolved against the link's parent. Unix-only —
+    /// creating symlinks on Windows needs privileges.
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_nearest_resolves_a_dangling_symlink_to_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        // Canonical root so the expected path matches `canonicalize_nearest`'s
+        // resolved ancestor on macOS (`/private`) and Windows (`\\?\`). No-op
+        // on Linux.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tmp = root.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // `tmp/link -> tmp/../outside.txt`: parent exists, target does not.
+        let link = tmp.join("link");
+        std::os::unix::fs::symlink("../outside.txt", &link).unwrap();
+
+        let canon = canonicalize_nearest(&link);
+        assert!(
+            canon.ends_with("outside.txt"),
+            "resolved path {canon:?} must end in the target's name"
+        );
+        assert!(
+            !canon.starts_with(&tmp),
+            "resolved path {canon:?} must not stay under tmp {tmp:?}"
+        );
+    }
+
+    /// A symlink loop must terminate — the hop budget caps the recursion —
+    /// rather than hang forever. A write through the loop would fail with
+    /// ELOOP anyway, so falling back to the lexical path is safe.
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_nearest_terminates_on_a_symlink_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("a");
+        std::os::unix::fs::symlink("a", &link).unwrap();
+
+        // Returns *some* path — the point is it doesn't hang.
+        let canon = canonicalize_nearest(&link);
+        assert!(!canon.as_os_str().is_empty());
     }
 
     // ---- validate_attach_path ----
