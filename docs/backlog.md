@@ -158,16 +158,21 @@ ground — items 1 and 6 re-found that review's still-open #1 and #5 and add
 specifics. Every finding was re-verified at its cited lines before recording;
 one candidate from the run was dropped (item 7).
 
+**Actionable without direction: items 2-6** (behavior-preserving fixes, no
+tradeoff — perf value only). **Needs direction: item 1** (the crash-durability
+tradeoff is a product decision). Each item carries its own tag below.
+
 1. **Per-round full-history save with two fsyncs — still the dominant cost of a
-   long session.** `turn_loop.rs:785` clones the whole `messages` on every tool
-   round and emits `AgentEvent::History`; the frontend clones again
-   (`hrdr-tui/src/app.rs:2748`) into `persist_mid_turn`, which clones the whole
-   `SessionState` (`app/session.rs:302`), `Session::new(snapshot.persisted())`
-   (`:325`) clones once more (`session.rs:341`), `Session::save` clones again
-   and re-serializes everything (`session.rs:778`/`:785`), and `write_atomic`
-   does two fsyncs (`auth.rs:116`, dir fsync `:135-138`) — per round, on the
-   save task. O(N) per round over a history that grows every round → O(N²) bytes
-   written per session. The transcript already got the append-only jsonl fix
+   long session.** **[needs direction — pick the crash-durability tradeoff]**
+   `turn_loop.rs:785` clones the whole `messages` on every tool round and emits
+   `AgentEvent::History`; the frontend clones again (`hrdr-tui/src/app.rs:2748`)
+   into `persist_mid_turn`, which clones the whole `SessionState`
+   (`app/session.rs:302`), `Session::new(snapshot.persisted())` (`:325`) clones
+   once more (`session.rs:341`), `Session::save` clones again and re-serializes
+   everything (`session.rs:778`/`:785`), and `write_atomic` does two fsyncs
+   (`auth.rs:116`, dir fsync `:135-138`) — per round, on the save task. O(N) per
+   round over a history that grows every round → O(N²) bytes written per
+   session. The transcript already got the append-only jsonl fix
    (`session.rs:115-123` names the O(n²) it removed); `messages` has the same
    problem remaining. Sub-agents pay the same synchronously on their turn task
    (`delegation.rs:374-379` → `RunSnapshot::save` `:149-166`). Fix: write the
@@ -175,47 +180,50 @@ one candidate from the run was dropped (item 7).
    serialization for turn end; move (don't clone) the messages into the save
    path. Tradeoff: mid-turn crash durability drops from "at most one round lost"
    to "at most one turn lost" unless the jsonl also records messages.
-2. **Registry `entries` lock held across per-event transcript I/O.** `record`
-   (`registry.rs:422-449`, called per streamed event via the closure at
-   `:880-883`) runs under the single `entries` mutex (`update` → `with`,
-   `:326-329`) while locking the events log and performing the transcript write
-   — `serde_json::to_string` + `append_all` + `metadata()` + `flush` syscalls at
-   every coalesce boundary (`transcript_log.rs:423-448`). The UI thread takes
-   the same lock every frame (`pane.rs:304`) and on every
-   `events_since`/`compact` (`registry.rs:710`/`:723`), so a streaming agent
-   makes each frame contend with per-token recording, and multiple agents
-   serialize on it. Fix: the writer already has its own `Mutex`
-   (`registry.rs:278`) — clone the `Arc` out from under the entries lock and
-   write outside it.
+2. **Registry `entries` lock held across per-event transcript I/O.**
+   **[actionable]** `record` (`registry.rs:422-449`, called per streamed event
+   via the closure at `:880-883`) runs under the single `entries` mutex
+   (`update` → `with`, `:326-329`) while locking the events log and performing
+   the transcript write — `serde_json::to_string` + `append_all` +
+   `metadata()` + `flush` syscalls at every coalesce boundary
+   (`transcript_log.rs:423-448`). The UI thread takes the same lock every frame
+   (`pane.rs:304`) and on every `events_since`/`compact`
+   (`registry.rs:710`/`:723`), so a streaming agent makes each frame contend
+   with per-token recording, and multiple agents serialize on it. Fix: the
+   writer already has its own `Mutex` (`registry.rs:278`) — clone the `Arc` out
+   from under the entries lock and write outside it.
 3. **`Entry::refresh_hash` re-hashes the whole accumulated text per streamed
-   chunk — O(L²) per reply/tool output.** `transcript.rs:146-148` recomputes
-   `kind_hash` (`:114-142`) over the entire accumulated string; the reducers
-   call it on every delta (`:593-599` Text, `:605-615` Reasoning, `:643-649`
-   ToolOutput) and the TUI replays every delta
+   chunk — O(L²) per reply/tool output.** **[actionable — use a running hash of
+   appended chunks, not a hash-at-close; the hash feeds the live render cache]**
+   `transcript.rs:146-148` recomputes `kind_hash` (`:114-142`) over the entire
+   accumulated string; the reducers call it on every delta (`:593-599` Text,
+   `:605-615` Reasoning, `:643-649` ToolOutput) and the TUI replays every delta
    (`hrdr-tui/src/app.rs:2494-2504`). A reply of L chars streamed in ~L/4 chunks
    costs ~L²/4 hashing; a multi-MB build log costs hundreds of MB of hashing per
    call. Fix: hash only the appended chunk (the hash feeds the render-cache key
-   at `hrdr-tui/src/ ui.rs:2622-2623`), or hash once at block close.
+   at `hrdr-tui/src/ ui.rs:2622-2623`); hashing once at block close would freeze
+   the streaming render, so it is not an option.
 4. **`memory::recall` reads and parses every memory file on every user turn.**
-   `recall` (`hrdr-tools/src/memory.rs:635-693`) calls `load_memories`
-   (`:434-460`: `read_dir` + `read_to_string` + frontmatter parse per file, in
-   both scopes) per turn opener (`turn_loop.rs:943`); `search` (`:534-553`) and
-   the list fallback (`:499-511`) do the same per tool call. Fix: cache the
-   parsed lists keyed on directory mtime, invalidated in `rebuild_index`
-   (`:464`).
-5. **~3-4 heap allocations per streamed token.** Per chunk: `Accumulator::push`
-   clones the delta (`hrdr-llm/src/types.rs:820`), the reasoning path clones
-   (`turn_loop.rs:223`), `record` clones the whole event into the log
-   (`registry.rs:427`), `Record::from_event` clones every string field again
-   (`transcript_log.rs:111-143`), and the pane drain clones once more
-   (`registry.rs:103`). Fix: `Record::from_event` takes the event by value (the
-   closure at `registry.rs:880-883` owns it and drops it immediately), moving
-   the strings — cuts ~2 allocations per token.
+   **[actionable]** `recall` (`hrdr-tools/src/memory.rs:635-693`) calls
+   `load_memories` (`:434-460`: `read_dir` + `read_to_string` + frontmatter
+   parse per file, in both scopes) per turn opener (`turn_loop.rs:943`);
+   `search` (`:534-553`) and the list fallback (`:499-511`) do the same per tool
+   call. Fix: cache the parsed lists keyed on directory mtime, invalidated in
+   `rebuild_index` (`:464`).
+5. **~3-4 heap allocations per streamed token.** **[actionable]** Per chunk:
+   `Accumulator::push` clones the delta (`hrdr-llm/src/types.rs:820`), the
+   reasoning path clones (`turn_loop.rs:223`), `record` clones the whole event
+   into the log (`registry.rs:427`), `Record::from_event` clones every string
+   field again (`transcript_log.rs:111-143`), and the pane drain clones once
+   more (`registry.rs:103`). Fix: `Record::from_event` takes the event by value
+   (the closure at `registry.rs:880-883` owns it and drops it immediately),
+   moving the strings — cuts ~2 allocations per token.
 6. **No-usage fallback re-estimates the whole history every round.**
-   `budget.rs:122-127`: when the endpoint reports no usage,
-   `estimate_tokens_in_messages(&self.messages)` is O(N) per round. Fix: keep a
-   running prompt-token estimate, add only messages appended since the last
-   call. Same as the archived review's #5, still open.
+   **[actionable — keep a running estimate, recomputed when compaction or a
+   resume replaces `messages` wholesale]** `budget.rs:122-127`: when the
+   endpoint reports no usage, `estimate_tokens_in_messages(&self.messages)` is
+   O(N) per round. Fix: keep a running prompt-token estimate, add only messages
+   appended since the last call. Same as the archived review's #5, still open.
 7. **Dropped: compaction "overlapping suffixes".** The run claimed
    `compaction.rs:451-452` re-sums a growing slice per candidate turn — the
    archived first review's #7 made the same claim. It does not reproduce: the
@@ -243,53 +251,60 @@ transcripts, and item 2's real lock-contention timing.
 Quality pass over the whole tree (clean at the time); every candidate re-read at
 its cited lines, behavior-preserving only, ranked by confidence.
 
-1. **`now_ms()` — three byte-identical epoch-millis helpers.**
+**Actionable without direction: items 1-8** (all behavior-preserving by
+construction). **Needs direction: item 9** (external-API removal). Each item
+carries its own tag below.
+
+1. **`now_ms()` — three byte-identical epoch-millis helpers.** **[actionable]**
    `oauth.rs:834-839` and `chatgpt_models.rs:105-109` (same crate, same body)
    plus `hrdr-app/src/login.rs:75-79` (same result via `map`/`unwrap_or(0)`;
    hrdr-app already depends on hrdr-agent, see `login.rs:71`). Action: promote
    one to a shared `pub(crate)`/`pub` helper in hrdr-agent and call it from all
    three.
 2. **`create_dir_owner_only` re-implemented inline in the same crate.**
-   `auth.rs:150-158` defines the helper (used once, `auth_store.rs:132`);
-   `transcript_log.rs:281-288` (`create`) and `:316-324` (`append`) spell out
-   the same `create_dir_all` + `set_permissions(0o700)`. Action: call
-   `crate::auth::create_dir_owner_only` at both sites.
-3. **`home_dir()` re-implemented inline.** `skills.rs:99-104` repeats the
-   `$HOME`/`%USERPROFILE%` chain that `agents_dir.rs:90-95` already exposes as
-   `pub(crate) fn home_dir()`. Action: use `crate::agents_dir::home_dir()`.
+   **[actionable]** `auth.rs:150-158` defines the helper (used once,
+   `auth_store.rs:132`); `transcript_log.rs:281-288` (`create`) and `:316-324`
+   (`append`) spell out the same `create_dir_all` + `set_permissions(0o700)`.
+   Action: call `crate::auth::create_dir_owner_only` at both sites.
+3. **`home_dir()` re-implemented inline.** **[actionable]** `skills.rs:99-104`
+   repeats the `$HOME`/`%USERPROFILE%` chain that `agents_dir.rs:90-95` already
+   exposes as `pub(crate) fn home_dir()`. Action: use
+   `crate::agents_dir::home_dir()`.
 4. **TUI terminal-restore sequence — three copies of the same 5-op crossterm
-   `execute!`.** `hrdr-tui/src/lib.rs:73-87` (`TerminalGuard::drop`), `:93-105`
-   (`suspend_terminal`), `:144-159` (panic hook). One asymmetry:
-   `suspend_terminal` propagates errors (`?`), targets `terminal.backend_mut()`
-   and adds `show_cursor`; the other two swallow with `let _` on `stdout()`.
-   Action: one `fn restore_terminal_state(out: &mut Stdout) -> io::Result<()>`;
-   Drop and the panic hook swallow it, `suspend_terminal` keeps `?` +
-   `show_cursor`.
+   `execute!`.** **[actionable]** `hrdr-tui/src/lib.rs:73-87`
+   (`TerminalGuard::drop`), `:93-105` (`suspend_terminal`), `:144-159` (panic
+   hook). One asymmetry: `suspend_terminal` propagates errors (`?`), targets
+   `terminal.backend_mut()` and adds `show_cursor`; the other two swallow with
+   `let _` on `stdout()`. Action: one
+   `fn restore_terminal_state(out: &mut Stdout) -> io::Result<()>`; Drop and the
+   panic hook swallow it, `suspend_terminal` keeps `?` + `show_cursor`.
 5. **Todo-list clone idiom — three sites, `messages_owned()` precedent.**
-   `todos().lock().map(|t| t.clone()).unwrap_or_default()` at
+   **[actionable]** `todos().lock().map(|t| t.clone()).unwrap_or_default()` at
    `hrdr-app/src/sessions.rs:19`, `commands/helpers.rs:227`,
    `apps/hrdr/src/ main.rs:930`; `Agent::messages_owned()`
    (`hrdr-agent/src/lib.rs:2233`) is the established shape. Action: add
    `Agent::todos_owned()`; all three collapse to it. (The TUI's own copies in
    `app/session.rs` are a different type — out of scope.)
 6. **Spinner-frame expression repeated four times, magic `120` untied.**
-   `SPINNER[(…as_millis() / 120) as usize % SPINNER.len()]` at
+   **[actionable]** `SPINNER[(…as_millis() / 120) as usize % SPINNER.len()]` at
    `hrdr-tui/src/ui.rs:1098`, `:1187`, `:1238`, `:2623`, while the ticker
    interval `Duration::from_millis(120)` sits at `tui.rs:61` — nothing ties the
    two, so the animation and redraw rates drift apart if one changes. Action: a
    `spinner_frame(elapsed)` helper plus one named `SPINNER_FRAME_MS` const both
    files use.
 7. **Needless clone: `bounded.clone()` in the user-shell result path.**
-   `hrdr-tui/src/app.rs:1450-1459` clones the truncate result because `bounded`
-   is still borrowed by the `note` format at `:1458`. Action: build `note`
-   first, then move `bounded` into `result` — identical output, clone gone.
+   **[actionable]** `hrdr-tui/src/app.rs:1450-1459` clones the truncate result
+   because `bounded` is still borrowed by the `note` format at `:1458`. Action:
+   build `note` first, then move `bounded` into `result` — identical output,
+   clone gone.
 8. **Low: `md_theme`/`md_theme_dim` — the same 10-arg `MdTheme::new` twice.**
-   `hrdr-tui/src/theme.rs:75-88` and `:92-106`; the second passes every color
-   through `dim_color(c, REASONING_DIM)`. The two arms do change together
-   (adding a color should dim it too). Action: one
+   **[actionable]** `hrdr-tui/src/theme.rs:75-88` and `:92-106`; the second
+   passes every color through `dim_color(c, REASONING_DIM)`. The two arms do
+   change together (adding a color should dim it too). Action: one
    `md_theme_with(&self, map: impl Fn(Color) -> Color)`.
-9. **Low: unused re-export `apply_cache_breakpoints`.** `hrdr-llm/src/lib.rs:38`
-   re-exports it; the only production caller uses
+9. **Low: unused re-export `apply_cache_breakpoints`.** **[needs direction —
+   removing a `pub use` from a published crate is an external-API decision]**
+   `hrdr-llm/src/lib.rs:38` re-exports it; the only production caller uses
    `crate::types:: apply_cache_breakpoints` (`client.rs:1068`) and no workspace
    crate imports the re-export. Action: drop it — but hrdr-llm is a published
    crate, so removing a `pub use` is a public-API break for external consumers;
@@ -315,8 +330,15 @@ hrd-llm; hrdr-tools + hrdr-tui + hrdr-app + hrdr-editor + apps/hrdr). Both
 findings below were re-traced at the cited lines; everything else the passes
 suspected was disproved (Cleared) or is hardening.
 
+**Actionable without direction: finding 2** (copy the source jsonl into the fork
+— the expected behavior is unambiguous). **Needs direction: finding 1** (the fix
+changes the on-disk frontmatter format / accepted input). Each finding carries
+its own tag below.
+
 1. **`memory` descriptions containing a newline are silently truncated, and the
-   truncation becomes permanent on the first edit.** (low)
+   truncation becomes permanent on the first edit.** (low) **[needs direction —
+   pick the fix: quote+escape in `emit_memory` (format change, existing files
+   must keep parsing) vs reject newlines in descriptions]**
    `hrdr-tools/src/memory.rs`: `emit_memory` (`:416-429`) writes
    `description: {value}` unquoted, one line; `parse_memory` (`:365-397`) reads
    per line via `split_once(':')`, so a value whose second line has no colon is
@@ -337,7 +359,9 @@ suspected was disproved (Cleared) or is hardening.
    accordingly), or reject control newlines in descriptions at write time.
 
 2. **`Session::fork` copies `messages` but drops the display transcript — the
-   fork's pane renders an empty conversation.** (low-mid)
+   fork's pane renders an empty conversation.** (low-mid) **[actionable — copy
+   the source's `<id>.jsonl` to the fork's id (the writer reattaches via
+   `TranscriptLog::append`), and assert the transcript in the fork test]**
    `hrdr-agent/src/session.rs:986-1018`: `fork` loads the source (transcript
    folded from its sibling jsonl, `:922-927`), sets `id = None`, and saves via
    the ordinary path (`:1008`), which writes only the `.json` (`save_session`
