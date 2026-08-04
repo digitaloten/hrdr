@@ -9,8 +9,8 @@
 //! takes the whole remainder (see [`expand_skill`]). Discovery mirrors the
 //! sub-agent files: project dirs first, then user dirs, hrdr → Claude Code →
 //! opencode conventions, then hrdr's own built-in skills (`:commit`,
-//! `:consolidate`, `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`,
-//! `:plan`, `:tidy`, `:perf`) last — deduped by name (first source wins), so a
+//! `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`, `:plan`,
+//! `:tidy`, `:perf`) last — deduped by name (first source wins), so a
 //! user or project file always overrides a built-in of the same name.
 //!
 //! This lives in `hrdr-agent` rather than in a frontend because the model can
@@ -24,13 +24,12 @@ use std::sync::{Arc, Mutex};
 
 // The skills hrdr ships with, baked into the binary via `include_str!` — the
 // same convention the prompt fragments use — so a fresh install has a working
-// `:commit`, `:consolidate`, `:release`, `:review`, `:audit`, `:fix`, `:todo`,
-// `:test`, `:plan`, `:tidy`, `:perf` with no setup. Content lives in
+// `:commit`, `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`,
+// `:plan`, `:tidy`, `:perf` with no setup. Content lives in
 // `templates/skills/*.md`, not here: keep the prompt text in Markdown
 // (reviewable, diffable, editable without touching Rust) and this file to
 // parsing/wiring only.
 const BUILTIN_COMMIT: &str = include_str!("templates/skills/commit.md");
-const BUILTIN_CONSOLIDATE: &str = include_str!("templates/skills/consolidate.md");
 const BUILTIN_RELEASE: &str = include_str!("templates/skills/release.md");
 const BUILTIN_REVIEW: &str = include_str!("templates/skills/review.md");
 const BUILTIN_AUDIT: &str = include_str!("templates/skills/audit.md");
@@ -178,8 +177,8 @@ pub fn discover_skills(cwd: &Path, project: crate::prompt::ProjectInstructions) 
     out
 }
 
-/// hrdr's built-in skills — `:commit`, `:consolidate`, `:release`, `:review`,
-/// `:audit`, `:fix`, `:todo`, `:test`, `:plan`, `:tidy`, `:perf` — parsed from
+/// hrdr's built-in skills — `:commit`, `:release`, `:review`, `:audit`,
+/// `:fix`, `:todo`, `:test`, `:plan`, `:tidy`, `:perf` — parsed from
 /// the Markdown templates baked into the binary at compile time. Always one
 /// entry per template (each is a checked-in, non-empty file, so parsing cannot
 /// fail); sorted by name like a scanned directory's entries are, so their
@@ -188,7 +187,6 @@ pub fn discover_skills(cwd: &Path, project: crate::prompt::ProjectInstructions) 
 pub fn builtin_skills() -> Vec<Skill> {
     let mut skills: Vec<Skill> = [
         (BUILTIN_COMMIT, "commit"),
-        (BUILTIN_CONSOLIDATE, "consolidate"),
         (BUILTIN_RELEASE, "release"),
         (BUILTIN_REVIEW, "review"),
         (BUILTIN_AUDIT, "audit"),
@@ -817,22 +815,12 @@ mod tests {
         let skills = builtin_skills();
         assert_eq!(
             skills.len(),
-            11,
-            "audit, commit, consolidate, fix, perf, plan, release, review, test, tidy, todo"
+            10,
+            "audit, commit, fix, perf, plan, release, review, test, tidy, todo"
         );
 
         for name in [
-            "audit",
-            "commit",
-            "consolidate",
-            "fix",
-            "perf",
-            "plan",
-            "release",
-            "review",
-            "test",
-            "tidy",
-            "todo",
+            "audit", "commit", "fix", "perf", "plan", "release", "review", "test", "tidy", "todo",
         ] {
             let s = skills
                 .iter()
@@ -864,7 +852,7 @@ mod tests {
             skills.iter().find(|s| s.name == "audit").unwrap().args,
             vec!["low", "high"]
         );
-        for name in ["fix", "test", "todo", "plan", "tidy", "perf", "consolidate"] {
+        for name in ["fix", "test", "todo", "plan", "tidy", "perf"] {
             assert!(
                 skills
                     .iter()
@@ -879,7 +867,7 @@ mod tests {
 
     /// `discover_skills` on a cwd with no skill directories at all still
     /// returns the built-ins — the whole point of shipping them is that
-    /// `:commit`/`:consolidate`/`:release`/`:review`/`:audit`/`:fix`/`:todo`/`:test`/`:plan`/`:tidy`/`:perf` work with zero setup.
+    /// `:commit`/`:release`/`:review`/`:audit`/`:fix`/`:todo`/`:test`/`:plan`/`:tidy`/`:perf` work with zero setup.
     #[test]
     fn discover_skills_on_empty_cwd_returns_only_builtins() {
         let dir = tempfile::tempdir().unwrap();
@@ -889,16 +877,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "audit",
-                "commit",
-                "consolidate",
-                "fix",
-                "perf",
-                "plan",
-                "release",
-                "review",
-                "test",
-                "tidy",
+                "audit", "commit", "fix", "perf", "plan", "release", "review", "test", "tidy",
                 "todo"
             ]
         );
