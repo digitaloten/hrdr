@@ -463,7 +463,7 @@ pub fn environment_section(cwd: &Path, tools: &ToolRegistry, limits: SubagentLim
 
 /// Max bytes the skill listing may spend. Names are never dropped (a name the
 /// model cannot see is a skill it cannot load); descriptions are what gives, tail
-/// first, once the budget is gone. Generous next to a real setup — the ten
+/// first, once the budget is gone. Generous next to a real setup — the
 /// built-ins list in well under 1 KiB — so this only bites on a directory full of
 /// skills, where names-only is exactly the right degradation.
 const SKILLS_SECTION_MAX_BYTES: usize = 4 * 1024;
@@ -3700,7 +3700,7 @@ mod tests {
         assert!(skills_section(&tools_with_skill(), &[only]).is_empty());
     }
 
-    /// What the ten built-ins actually cost every agent that has the `skill`
+    /// What the built-ins actually cost every agent that has the `skill`
     /// tool. Pinned because this section sits in the cached prefix of every
     /// prompt: a built-in whose `description:` grows into a paragraph should
     /// fail here, not quietly tax every session.
@@ -3709,11 +3709,20 @@ mod tests {
         let s = skills_section(&tools_with_skill(), &crate::builtin_skills());
         assert!(
             s.len() < 1600,
-            "the ten built-in skills list in {} bytes:\n{s}",
+            "the built-in skills list in {} bytes:\n{s}",
             s.len()
         );
         for name in [
-            "audit", "commit", "fix", "perf", "plan", "review", "test", "tidy", "todo",
+            "audit",
+            "commit",
+            "consolidate",
+            "fix",
+            "perf",
+            "plan",
+            "review",
+            "test",
+            "tidy",
+            "todo",
         ] {
             assert!(s.contains(&format!("\n- {name} — ")), "{name} is listed");
         }

@@ -38,6 +38,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`:consolidate` folds `docs/` work-item files into the backlog.** Reads the
+  review-style files the other skills leave behind (`:audit` →
+  `docs/security-review.md`, `:tidy` → `docs/tidy-review.md`, `:plan` →
+  `docs/<task>-plan.md`), verifies each item against the current tree, folds
+  open items into `docs/backlog.md` (closed ones into its Record section,
+  binding decisions into Standing constraints), and purges the file — but only
+  when it is more than half done. A plan that is barely started stays in its
+  original file untouched.
+
 - **`:!command` runs the `!` shell escape.** The ex-style prefix —
   `:!git status` — is an alias for `!git status`: vim muscle memory means the
   shell, not a skill named `!`. Same path end to end: no model turn, output

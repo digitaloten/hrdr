@@ -9,9 +9,9 @@
 //! takes the whole remainder (see [`expand_skill`]). Discovery mirrors the
 //! sub-agent files: project dirs first, then user dirs, hrdr → Claude Code →
 //! opencode conventions, then hrdr's own built-in skills (`:commit`,
-//! `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`, `:plan`,
-//! `:tidy`, `:perf`) last — deduped by name (first source wins), so a user or
-//! project file always overrides a built-in of the same name.
+//! `:consolidate`, `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`,
+//! `:plan`, `:tidy`, `:perf`) last — deduped by name (first source wins), so a
+//! user or project file always overrides a built-in of the same name.
 //!
 //! This lives in `hrdr-agent` rather than in a frontend because the model can
 //! invoke a skill: the agent lists what is available in its system prompt
@@ -24,12 +24,13 @@ use std::sync::{Arc, Mutex};
 
 // The skills hrdr ships with, baked into the binary via `include_str!` — the
 // same convention the prompt fragments use — so a fresh install has a working
-// `:commit`, `:release`, `:review`, `:audit`, `:fix`, `:todo`, `:test`,
-// `:plan`, `:tidy`, `:perf` with no setup. Content lives in
+// `:commit`, `:consolidate`, `:release`, `:review`, `:audit`, `:fix`, `:todo`,
+// `:test`, `:plan`, `:tidy`, `:perf` with no setup. Content lives in
 // `templates/skills/*.md`, not here: keep the prompt text in Markdown
 // (reviewable, diffable, editable without touching Rust) and this file to
 // parsing/wiring only.
 const BUILTIN_COMMIT: &str = include_str!("templates/skills/commit.md");
+const BUILTIN_CONSOLIDATE: &str = include_str!("templates/skills/consolidate.md");
 const BUILTIN_RELEASE: &str = include_str!("templates/skills/release.md");
 const BUILTIN_REVIEW: &str = include_str!("templates/skills/review.md");
 const BUILTIN_AUDIT: &str = include_str!("templates/skills/audit.md");
@@ -177,16 +178,17 @@ pub fn discover_skills(cwd: &Path, project: crate::prompt::ProjectInstructions) 
     out
 }
 
-/// hrdr's built-in skills — `:commit`, `:release`, `:review`, `:audit`,
-/// `:fix`, `:todo`, `:test`, `:plan`, `:tidy`, `:perf` — parsed from the
-/// Markdown templates baked into the binary at compile time. Always ten
-/// entries (each template is a checked-in, non-empty file, so parsing cannot
+/// hrdr's built-in skills — `:commit`, `:consolidate`, `:release`, `:review`,
+/// `:audit`, `:fix`, `:todo`, `:test`, `:plan`, `:tidy`, `:perf` — parsed from
+/// the Markdown templates baked into the binary at compile time. Always one
+/// entry per template (each is a checked-in, non-empty file, so parsing cannot
 /// fail); sorted by name like a scanned directory's entries are, so their
 /// relative order matches wherever they'd sit if they were plain files on
 /// disk.
 pub fn builtin_skills() -> Vec<Skill> {
     let mut skills: Vec<Skill> = [
         (BUILTIN_COMMIT, "commit"),
+        (BUILTIN_CONSOLIDATE, "consolidate"),
         (BUILTIN_RELEASE, "release"),
         (BUILTIN_REVIEW, "review"),
         (BUILTIN_AUDIT, "audit"),
@@ -806,21 +808,31 @@ mod tests {
         assert!(!skills.iter().any(|s| s.name == "notes"));
     }
 
-    /// The ten built-in templates each parse into a usable skill: a name,
+    /// The built-in templates each parse into a usable skill: a name,
     /// a non-empty description and body, and — for `release`/`review`/`audit`, whose
     /// templates declare `args:` — the completion candidates the popup should
-    /// offer after `:name `. `commit`, `fix`, `test`, `todo`, `plan`, `tidy`, and `perf` declare none, so their lists are empty.
+    /// offer after `:name `. The rest declare none, so their lists are empty.
     #[test]
     fn builtins_parse_with_names_descriptions_bodies_and_args() {
         let skills = builtin_skills();
         assert_eq!(
             skills.len(),
-            10,
-            "audit, commit, fix, perf, plan, release, review, test, tidy, todo"
+            11,
+            "audit, commit, consolidate, fix, perf, plan, release, review, test, tidy, todo"
         );
 
         for name in [
-            "audit", "commit", "fix", "perf", "plan", "release", "review", "test", "tidy", "todo",
+            "audit",
+            "commit",
+            "consolidate",
+            "fix",
+            "perf",
+            "plan",
+            "release",
+            "review",
+            "test",
+            "tidy",
+            "todo",
         ] {
             let s = skills
                 .iter()
@@ -852,7 +864,7 @@ mod tests {
             skills.iter().find(|s| s.name == "audit").unwrap().args,
             vec!["low", "high"]
         );
-        for name in ["fix", "test", "todo", "plan", "tidy", "perf"] {
+        for name in ["fix", "test", "todo", "plan", "tidy", "perf", "consolidate"] {
             assert!(
                 skills
                     .iter()
@@ -866,8 +878,8 @@ mod tests {
     }
 
     /// `discover_skills` on a cwd with no skill directories at all still
-    /// returns the ten built-ins — the whole point of shipping them is that
-    /// `:commit`/`:release`/`:review`/`:audit`/`:fix`/`:todo`/`:test`/`:plan`/`:tidy` work with zero setup.
+    /// returns the built-ins — the whole point of shipping them is that
+    /// `:commit`/`:consolidate`/`:release`/`:review`/`:audit`/`:fix`/`:todo`/`:test`/`:plan`/`:tidy`/`:perf` work with zero setup.
     #[test]
     fn discover_skills_on_empty_cwd_returns_only_builtins() {
         let dir = tempfile::tempdir().unwrap();
@@ -877,7 +889,16 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "audit", "commit", "fix", "perf", "plan", "release", "review", "test", "tidy",
+                "audit",
+                "commit",
+                "consolidate",
+                "fix",
+                "perf",
+                "plan",
+                "release",
+                "review",
+                "test",
+                "tidy",
                 "todo"
             ]
         );
@@ -898,7 +919,7 @@ mod tests {
         let commit = skills.iter().find(|s| s.name == "commit").unwrap();
         assert_eq!(commit.body, "project commit wins");
         assert_ne!(commit.source, "built-in");
-        // The other eight built-ins are still present, unshadowed.
+        // The other built-ins are still present, unshadowed.
         assert!(
             skills
                 .iter()
