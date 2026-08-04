@@ -1081,6 +1081,18 @@ opened, so nobody records it as reviewed:
 
 Not bugs; things whose surprise is worth having written down.
 
+- **A panicking tool now waits for its batch siblings before the turn ends.**
+  Since the tool-batch dispatch change (2026-08-04, `run_tool_batch` spawns each
+  call as its own task and resumes the panic after `join_all`), a panicking
+  tool's `panicked` outcome is delivered only once every other call in the same
+  batch has finished — an inline panic used to abort the siblings immediately.
+  All tested observables (immediate panics, ordering, streaming, timeouts,
+  cancel) are unchanged; the only surprise is the delay when a panicking call
+  runs beside a long sibling (e.g. a shell at its five-minute timeout). A
+  `FuturesUnordered` join that aborts siblings on the first panic would restore
+  the old immediacy; deferred as a rework of the riskiest slice for an edge
+  case.
+
 - **A profile can allow-list itself into having no search tool.** `read_only`
   keeps a shell on purpose, and `jail` keeps `grep`/`find`/`ls`/`tree`; but an
   `allowed_tools` list naming neither leaves an agent that can only `read` by

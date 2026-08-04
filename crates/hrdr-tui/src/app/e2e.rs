@@ -5875,6 +5875,80 @@ async fn esc_cancels_a_running_user_shell_command() {
     assert!(h.app.user_shell.is_some(), "a new command is accepted");
 }
 
+/// Esc-Esc cancels a turn whose *model-driven* tool is mid-flight: the batch
+/// guard aborts the spawned tool task (a dropped `JoinHandle` alone would just
+/// detach it), the shell tool's future drops, and `kill_on_drop` kills the
+/// child — so the `touch` behind a `sleep 3` never fires. Without the abort
+/// the spawned task would keep running to its own five-minute timeout and the
+/// marker would appear ~3s after the tool started; the assert below waits past
+/// that deadline, so a detached task fails it.
+#[cfg(unix)]
+#[tokio::test]
+async fn esc_esc_cancels_a_turn_mid_tool_call_and_aborts_the_tool_task() {
+    let mut h = Harness::new(vec![
+        MockReply::ToolCall {
+            name: "shell".to_string(),
+            args: r#"{"command":"sleep 3; touch batch-cancel-marker"}"#.to_string(),
+        },
+        // Consumed only if the turn survived the cancel: the follow-up round's
+        // request for another completion.
+        MockReply::Text("the cancel should have prevented this".to_string()),
+    ])
+    .await;
+    let marker = h._tmp.path().join("batch-cancel-marker");
+
+    // Start the turn, but do NOT pump to idle — the tool runs for 3s.
+    h.type_str("run the sleep");
+    h.press(KeyCode::Enter);
+
+    // Wait until the shell tool is actually in flight: its `ToolStart` has
+    // landed and been applied to the app's transcript (open, not done).
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            while let Ok(msg) = h.rx.try_recv() {
+                h.app.on_turn_msg(msg);
+            }
+            let started = h.app.transcript().iter().any(|e| {
+                matches!(&e.kind, EntryKind::Tool { name, done, .. }
+                    if name == "shell" && !done)
+            });
+            if started {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the shell tool started within 10s");
+    // Let the child actually spawn before cancelling.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    h.press(KeyCode::Esc);
+    h.press(KeyCode::Esc);
+    assert!(!h.app.running(), "the turn was cancelled");
+    // Await the aborted turn task so its future — and with it the batch guard
+    // — is dropped before we check the marker.
+    h.app.reap_cancelled_turn().await;
+
+    // Well past the `sleep 3` deadline: if the tool task had been detached
+    // instead of aborted, its `touch` would have landed by now.
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    assert!(
+        !marker.exists(),
+        "the tool task was aborted, not detached — the child must not survive \
+         the cancel: {} exists",
+        marker.display()
+    );
+
+    // The open tool block settles as a failed call (the same repair a resumed
+    // session gets), not a live spinner.
+    let settled = h.app.transcript().iter().any(|e| {
+        matches!(&e.kind, EntryKind::Tool { name, done, ok, .. }
+            if name == "shell" && *done && !*ok)
+    });
+    assert!(settled, "the cancelled tool block settled as failed");
+}
+
 /// `/skills` opens a picker of the discovered skills; Enter inserts the
 /// `:name ` invocation into the input and hands the cursor back.
 #[tokio::test]

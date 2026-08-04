@@ -443,6 +443,32 @@ struct TodoShrinkWatch {
     len: usize,
 }
 
+/// One tool call's measured outcome: its wall-clock duration and result.
+type TimedResult = (std::time::Duration, Result<String>);
+
+/// Aborts every in-flight tool task when the batch scope unwinds.
+///
+/// Each tool call in a batch runs as its own spawned task (see
+/// `run_tool_batch`), and dropping a [`tokio::task::JoinHandle`] merely
+/// detaches the task — the tool would keep running to its own timeout. This
+/// guard is the explicit abort: on a cancelled turn (Esc-Esc aborts the turn
+/// task, dropping `join_all`) or a panicking sibling (`resume_unwind` in
+/// `run_tool_batch`), the guard's `Drop` aborts every handle still in flight,
+/// the tool futures drop, and a shell tool's `kill_on_drop` kills the child.
+/// On the normal completion path every handle has already finished, and
+/// aborting a completed handle is a no-op.
+struct ToolBatchGuard {
+    handles: Vec<tokio::task::JoinHandle<TimedResult>>,
+}
+
+impl Drop for ToolBatchGuard {
+    fn drop(&mut self) {
+        for h in &mut self.handles {
+            h.abort();
+        }
+    }
+}
+
 impl Agent {
     /// The current TODO list's item contents and length, for [`TodoShrinkWatch`].
     fn todo_snapshot(&self) -> (Vec<String>, usize) {
@@ -989,6 +1015,18 @@ impl Agent {
     /// `ToolOutput` events (attributed by call id) while they run. A read-only
     /// run executes concurrently; a lone mutating call is a one-element batch.
     /// Results are emitted and recorded in call order.
+    ///
+    /// Each call runs as its own spawned task — so CPU-bound tools run in
+    /// parallel across workers instead of serializing inside this turn task —
+    /// and is joined through a [`ToolBatchGuard`], which owns two behaviors:
+    ///
+    /// - **Panic containment**: a panicking tool no longer unwinds this task,
+    ///   because `spawn` captures the panic into the handle. It is resumed
+    ///   after the join (see the body) so the turn task's `catch_unwind` still
+    ///   records the `panicked` outcome and closes the open tool calls.
+    /// - **Cancellation**: on a cancelled turn the guard's `Drop` aborts every
+    ///   in-flight handle, dropping the tool futures (and killing shell
+    ///   children via `kill_on_drop`) instead of silently detaching them.
     async fn run_tool_batch<F: FnMut(AgentEvent)>(
         &mut self,
         batch: &[hrdr_llm::ToolCall],
@@ -1049,7 +1087,6 @@ impl Agent {
             let hooks = Arc::clone(&self.event_hooks);
             // A refused call (repeat breaker) resolves immediately instead of
             // executing; boxing keeps the join order == call order.
-            type TimedResult = (std::time::Duration, Result<String>);
             let fut: std::pin::Pin<Box<dyn std::future::Future<Output = TimedResult> + Send>> =
                 match repeat.refusal(&name, &raw_args) {
                     // A refused call never ran, so its cost is zero.
@@ -1145,13 +1182,23 @@ impl Agent {
                         (start.elapsed(), res)
                     }),
                 };
-            futs.push(fut);
+            // Each call runs as its own task, so a CPU-bound tool executes on a
+            // worker thread of its own instead of blocking this turn task's
+            // turn. The handle keeps join order == call order.
+            futs.push(tokio::spawn(fut));
         }
         drop(shared_tx); // forwarders hold the remaining senders
 
-        let joined = futures_util::future::join_all(futs);
+        // The spawned tasks are awaited through `&mut` handles, so `joined`
+        // borrows the guard's vec: on unwind — the `resume_unwind` below or the
+        // whole turn task being aborted (Esc-Esc) — `joined` drops first,
+        // releasing the borrow, and the guard's `Drop` then aborts every
+        // in-flight handle. That abort drops the tool futures, and a shell
+        // tool's `kill_on_drop` kills the child.
+        let mut guard = ToolBatchGuard { handles: futs };
+        let joined = futures_util::future::join_all(guard.handles.iter_mut());
         tokio::pin!(joined);
-        let results = loop {
+        let joined_results = loop {
             tokio::select! {
                 r = &mut joined => break r,
                 Some((id, chunk)) = shared_rx.recv() => {
@@ -1163,6 +1210,24 @@ impl Agent {
         while let Ok((id, chunk)) = shared_rx.try_recv() {
             on_event(AgentEvent::ToolOutput { id, chunk });
         }
+        // A panicking tool no longer unwinds the turn task directly: `spawn`
+        // captures the panic into the handle, and `join_all` hands it back as a
+        // `JoinError`. Resume it here so it propagates exactly as before —
+        // through `Agent::run` to the turn task's `catch_unwind`, which records
+        // `TurnOutcome { panicked: true }` and closes the open tool calls. A
+        // cancelled handle is defensive only (nothing in this scope aborts an
+        // individual task): surface it as a normal tool error.
+        let results: Vec<TimedResult> = joined_results
+            .into_iter()
+            .map(|r| match r {
+                Ok(r) => r,
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(e) => (
+                    std::time::Duration::ZERO,
+                    Err(anyhow::anyhow!("tool task cancelled: {e}")),
+                ),
+            })
+            .collect();
         for (call, (elapsed, result)) in batch.iter().zip(results) {
             self.finish_tool_call(call, elapsed, result, repeat, on_event);
         }
