@@ -73,35 +73,30 @@ impl Theme {
     /// Markdown render theme derived from these chat colors, so assistant
     /// markdown follows the active hjkl theme.
     pub fn md_theme(&self) -> MdTheme {
-        MdTheme::new(
-            self.assistant, // text
-            self.user,      // heading1
-            self.warn,      // heading 2-6
-            self.success,   // inline code span
-            self.success,   // code block
-            self.user,      // link
-            self.warn,      // list bullet
-            self.assistant, // bold
-            self.assistant, // italic
-            self.dim,       // rule
-        )
+        self.md_theme_with(std::convert::identity)
     }
 
     /// [`Self::md_theme`] with every role dimmed: reasoning renders with the
     /// same structure and colors as output, only quieter.
     pub fn md_theme_dim(&self) -> MdTheme {
-        let d = |c: Color| dim_color(c, REASONING_DIM);
+        self.md_theme_with(|c| dim_color(c, REASONING_DIM))
+    }
+
+    /// [`MdTheme::new`] with every role passed through `map`, so adding a
+    /// color to the render theme adds it to both [`Self::md_theme`] and
+    /// [`Self::md_theme_dim`] at once.
+    fn md_theme_with(&self, map: impl Fn(Color) -> Color) -> MdTheme {
         MdTheme::new(
-            d(self.assistant),
-            d(self.user),
-            d(self.warn),
-            d(self.success),
-            d(self.success),
-            d(self.user),
-            d(self.warn),
-            d(self.assistant),
-            d(self.assistant),
-            d(self.dim),
+            map(self.assistant), // text
+            map(self.user),      // heading1
+            map(self.warn),      // heading 2-6
+            map(self.success),   // inline code span
+            map(self.success),   // code block
+            map(self.user),      // link
+            map(self.warn),      // list bullet
+            map(self.assistant), // bold
+            map(self.assistant), // italic
+            map(self.dim),       // rule
         )
     }
 }
