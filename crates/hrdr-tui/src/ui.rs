@@ -1053,6 +1053,13 @@ fn draw_scrollbar(f: &mut Frame, app: &App, area: Rect, max_scroll: usize, offse
     f.render_stateful_widget(scrollbar, sb_area, &mut sb_state);
 }
 
+/// One TODO panel row: `#id mark content`. The leading `#N` is the same stable
+/// reference the `todo` tool's render shows, so a row the user sees here can be
+/// pointed at from the input box (`todo#N` / `task#N`).
+fn todo_row(t: &hrdr_tools::TodoItem, mark: &str) -> String {
+    format!("#{} {mark} {}", t.id, t.content)
+}
+
 /// The TODO panel's rows — one per task still to do, marked by status — and the
 /// index of the "finished" row, when there is one. `None` when the panel has
 /// nothing to show at all.
@@ -1100,7 +1107,7 @@ fn todo_lines(app: &App) -> Option<(Vec<Line<'static>>, Option<usize>)> {
                 _ => (" ", app.theme.dim),
             };
             Line::from(Span::styled(
-                format!("{mark} {}", t.content),
+                todo_row(t, mark),
                 Style::default().fg(color).bg(bg),
             ))
         })
@@ -1124,6 +1131,34 @@ fn todo_lines(app: &App) -> Option<(Vec<Line<'static>>, Option<usize>)> {
         return None;
     }
     Some((lines, toggle))
+}
+
+#[cfg(test)]
+mod todo_panel_tests {
+    use super::todo_row;
+
+    /// The panel row leads with the stable `#N` reference — the same shape the
+    /// `todo` tool's render shows, so what the user sees and what the input box
+    /// can point at (`todo#N`) agree.
+    #[test]
+    fn a_todo_row_leads_with_the_stable_id() {
+        let t = hrdr_tools::TodoItem {
+            content: "fix it".to_string(),
+            id: 7,
+            status: "in_progress".to_string(),
+            evidence: None,
+        };
+        assert_eq!(todo_row(&t, "⠋"), "#7 ⠋ fix it");
+        // The status mark still follows the id, and an id-less (legacy) item
+        // renders as `#0` — unassigned, but the shape is unchanged.
+        let t = hrdr_tools::TodoItem {
+            content: "legacy".to_string(),
+            id: 0,
+            status: "completed".to_string(),
+            evidence: None,
+        };
+        assert_eq!(todo_row(&t, "✓"), "#0 ✓ legacy");
+    }
 }
 
 /// The agent switcher's rows — one per agent, and the id each row switches to

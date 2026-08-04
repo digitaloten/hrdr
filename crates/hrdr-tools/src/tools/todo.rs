@@ -58,7 +58,7 @@ impl Tool for TodoTool {
         false
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
-        let items = parse_todos(args).context("invalid todo args")?;
+        let mut items = parse_todos(args).context("invalid todo args")?;
         // Reject *before* the list is replaced, so a refused call leaves the
         // previous list exactly as it was and the retry is a straight re-send.
         {
@@ -69,6 +69,7 @@ impl Tool for TodoTool {
             if let Some(err) = unevidenced_completions(&prior, &items) {
                 bail!(err);
             }
+            assign_ids(&prior, &mut items);
         }
         let rendered = render_todos(&items);
         // A poisoned lock must not silently report success with a stale list.
@@ -134,6 +135,7 @@ fn parse_item(v: serde_json::Value) -> Result<TodoItem> {
         .or_else(|| m.remove("state"))
         .and_then(|s| s.as_str().map(normalize_status))
         .unwrap_or_else(|| "pending".to_string());
+    let id = m.remove("id").and_then(|v| v.as_u64()).unwrap_or(0);
     let evidence = m
         .remove("evidence")
         .or_else(|| m.remove("verified_by"))
@@ -149,6 +151,7 @@ fn parse_item(v: serde_json::Value) -> Result<TodoItem> {
         .filter(|s| !s.is_empty());
     Ok(TodoItem {
         content,
+        id,
         status,
         evidence,
     })
@@ -193,6 +196,41 @@ fn unevidenced_completions(prior: &[TodoItem], next: &[TodoItem]) -> Option<Stri
     ))
 }
 
+/// Give every incoming item with `id == 0` a stable reference id.
+///
+/// The model replaces the whole list on every call and rarely echoes the ids
+/// back, so the prior list is the source of truth: an item whose content
+/// already carried a nonzero id reuses it (ids survive a full-list
+/// replacement), and everything else — new items and legacy id-0 items from
+/// sessions saved before the field existed — gets a freshly minted id, starting
+/// one past the largest id seen across prior ∪ incoming so an echoed new id
+/// never collides with a minted one.
+fn assign_ids(prior: &[TodoItem], items: &mut [TodoItem]) {
+    let mut next = prior
+        .iter()
+        .chain(items.iter())
+        .filter(|t| t.id != 0)
+        .map(|t| t.id)
+        .max()
+        .unwrap_or(0)
+        .max(1)
+        + 1;
+    for t in items.iter_mut() {
+        if t.id != 0 {
+            continue;
+        }
+        t.id = prior
+            .iter()
+            .find(|p| p.content == t.content && p.id != 0)
+            .map(|p| p.id)
+            .unwrap_or_else(|| {
+                let id = next;
+                next += 1;
+                id
+            });
+    }
+}
+
 /// Map a free-form status string onto one of `pending | in_progress | completed | cancelled`.
 /// Unknown values fall back to `pending`, so a bad status never fails the call.
 fn normalize_status(s: &str) -> String {
@@ -224,7 +262,7 @@ fn render_todos(todos: &[TodoItem]) -> String {
             "in_progress" => "⠋",
             _ => " ",
         };
-        out.push_str(&format!("{mark} {}\n", t.content));
+        out.push_str(&format!("#{} {mark} {}\n", t.id, t.content));
         // Echo the evidence back under its item. It is the model's own claim,
         // and putting it where the user reads the list is what makes an empty
         // one visible to somebody other than the model that wrote it.
@@ -242,6 +280,16 @@ mod tests {
     fn item(content: &str, status: &str, evidence: Option<&str>) -> TodoItem {
         TodoItem {
             content: content.to_string(),
+            id: 0,
+            status: status.to_string(),
+            evidence: evidence.map(str::to_string),
+        }
+    }
+
+    fn item_with_id(content: &str, status: &str, evidence: Option<&str>, id: u64) -> TodoItem {
+        TodoItem {
+            content: content.to_string(),
+            id,
             status: status.to_string(),
             evidence: evidence.map(str::to_string),
         }
@@ -330,5 +378,53 @@ mod tests {
         // "evidence" is a claim about work that is not finished.
         let out = render_todos(&[item("fix it", "in_progress", Some("half a run"))]);
         assert!(!out.contains("↳"), "{out}");
+    }
+
+    #[test]
+    fn rendered_rows_lead_with_the_stable_id() {
+        let out = render_todos(&[item_with_id("fix it", "in_progress", None, 3)]);
+        assert!(out.contains("#3 ⠋ fix it"), "{out}");
+    }
+
+    #[test]
+    fn an_echoed_id_is_kept() {
+        let prior: [TodoItem; 0] = [];
+        let mut next = vec![item_with_id("fix it", "pending", None, 42)];
+        assign_ids(&prior, &mut next);
+        assert_eq!(next[0].id, 42, "a model that echoes an id keeps it");
+    }
+
+    #[test]
+    fn ids_survive_a_full_list_replacement_and_legacy_items_get_minted() {
+        // The model replaces the whole list on every call and rarely echoes
+        // ids: an item whose content already had an id reuses it, a brand-new
+        // item is minted, and a legacy id-0 item (saved before the field
+        // existed) is minted on the first call after upgrade.
+        let prior = [
+            item_with_id("keep me", "pending", None, 7),
+            item_with_id("legacy", "pending", None, 0),
+        ];
+        let mut next = vec![
+            item("keep me", "in_progress", None),
+            item("brand new", "pending", None),
+            item("legacy", "completed", Some("ran it")),
+        ];
+        assign_ids(&prior, &mut next);
+        assert_eq!(next[0].id, 7, "same content reuses the prior id");
+        assert_eq!(next[1].id, 8, "a new item gets the next minted id");
+        assert_eq!(next[2].id, 9, "a legacy id-0 item is minted too");
+        // Minting stays clear of an echoed nonzero id, whatever the order.
+        let mut next = vec![
+            item("new a", "pending", None),
+            item_with_id("echoed", "pending", None, 100),
+            item("new b", "pending", None),
+        ];
+        assign_ids(&prior, &mut next);
+        assert_eq!(next[1].id, 100, "the echoed id is untouched");
+        assert_eq!(
+            next[0].id, 101,
+            "minting starts past the largest id seen, echoed ones included"
+        );
+        assert_eq!(next[2].id, 102, "minting continues in order");
     }
 }

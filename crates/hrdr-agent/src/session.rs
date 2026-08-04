@@ -2519,6 +2519,7 @@ mod roundtrip_audit {
             messages: vec![Message::user("hi"), assistant],
             todos: vec![hrdr_tools::TodoItem {
                 content: "task".into(),
+                id: 0,
                 status: "completed".into(),
                 evidence: None,
             }],

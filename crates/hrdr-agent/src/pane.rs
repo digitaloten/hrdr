@@ -724,6 +724,7 @@ mod tests {
         let live = live_with(&[1]);
         let todos = std::sync::Arc::new(std::sync::Mutex::new(vec![hrdr_tools::TodoItem {
             content: "the sub-agent's own task".to_string(),
+            id: 0,
             status: "in_progress".to_string(),
             evidence: None,
         }]));

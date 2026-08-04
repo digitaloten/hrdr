@@ -174,17 +174,19 @@ pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> (String, Vec<PathBuf>
 /// "input → sent" transform shared by the TUI and the headless runner; the
 /// display copy keeps the raw input.
 pub fn prepare_outgoing(input: &str, names: &[String], cwd: &Path) -> String {
-    prepare_outgoing_tracked(input, names, cwd).0
+    prepare_outgoing_tracked(input, names, cwd, &[]).0
 }
 
 /// [`prepare_outgoing`], plus the paths whose whole content the sent message now
 /// carries (see [`expand_mentions_tracked`]) — for the caller to hand to
 /// [`hrdr_agent::Agent::mark_files_read`] so the read-before-edit guard knows the
-/// model has already seen them.
+/// model has already seen them. `todos` is the agent's TODO list, used to expand
+/// `todo#N` / `task#N` references (see [`expand_todo_refs`]).
 pub fn prepare_outgoing_tracked(
     input: &str,
     names: &[String],
     cwd: &Path,
+    todos: &[hrdr_tools::TodoItem],
 ) -> (String, Vec<PathBuf>) {
     // A `:skill` template may itself carry `@file` / `@agent` mentions — they
     // get the same expansion below.
@@ -206,10 +208,59 @@ pub fn prepare_outgoing_tracked(
     match extract_agent_mention(input, names) {
         Some((agent, body)) => {
             let (body, inlined) = expand_mentions_tracked(&body, cwd);
-            (agent_mention_message(&agent, &body), inlined)
+            (
+                agent_mention_message(&agent, &expand_todo_refs(&body, todos)),
+                inlined,
+            )
         }
-        None => expand_mentions_tracked(input, cwd),
+        None => {
+            let (body, inlined) = expand_mentions_tracked(input, cwd);
+            (expand_todo_refs(&body, todos), inlined)
+        }
     }
+}
+
+/// Expand `todo#N` / `task#N` mentions in `input` by appending each distinct
+/// referenced item's content under a "Referenced todos" section, mirroring the
+/// `@file` section style. A token is resolved against the item with `id == N`;
+/// tokens that match no item (or reference an id-0, unassigned legacy item) are
+/// left alone, like an unresolved `@path`. Returns `input` unchanged when
+/// nothing matches.
+pub fn expand_todo_refs(input: &str, todos: &[hrdr_tools::TodoItem]) -> String {
+    let mut matched: Vec<&hrdr_tools::TodoItem> = Vec::new();
+    for raw in input.split_whitespace() {
+        let Some(num) = raw
+            .strip_prefix("todo#")
+            .or_else(|| raw.strip_prefix("task#"))
+        else {
+            continue;
+        };
+        let num = num.trim_end_matches([',', '.', ';', ':', ')', ']', '}']);
+        let Ok(id) = num.parse::<u64>() else {
+            continue;
+        };
+        if id == 0 {
+            continue; // unassigned — nothing to reference
+        }
+        let Some(t) = todos.iter().find(|t| t.id == id) else {
+            continue; // unknown id: leave the token alone
+        };
+        if !matched.iter().any(|m| m.id == id) {
+            matched.push(t);
+        }
+    }
+    if matched.is_empty() {
+        return input.to_string();
+    }
+    let mut out = String::from(input);
+    out.push_str("\n\n--- Referenced todos ---\n");
+    for t in matched {
+        out.push_str(&format!(
+            "\n=== #{}: {} ===\n{}\n",
+            t.id, t.status, t.content
+        ));
+    }
+    out
 }
 
 /// Largest byte index `<= index` that lands on a UTF-8 char boundary of `s`.
@@ -699,14 +750,91 @@ mod tests {
         std::fs::write(root.join("note.txt"), "the note").unwrap();
         let names = vec!["explore".to_string()];
 
-        let (sent, inlined) = prepare_outgoing_tracked("read @note.txt", &names, root);
+        let (sent, inlined) = prepare_outgoing_tracked("read @note.txt", &names, root, &[]);
         assert!(sent.contains("the note"));
         assert_eq!(inlined, vec![root.join("note.txt")]);
 
         // Routed at a sub-agent: same expansion, same report.
-        let (sent, inlined) = prepare_outgoing_tracked("@explore read @note.txt", &names, root);
+        let (sent, inlined) =
+            prepare_outgoing_tracked("@explore read @note.txt", &names, root, &[]);
         assert!(sent.contains("`explore`") && sent.contains("the note"));
         assert_eq!(inlined, vec![root.join("note.txt")]);
+    }
+
+    #[test]
+    fn expand_todo_refs_appends_referenced_items() {
+        let todos = vec![
+            hrdr_tools::TodoItem {
+                content: "fix the bug".to_string(),
+                id: 1,
+                status: "pending".to_string(),
+                evidence: None,
+            },
+            hrdr_tools::TodoItem {
+                content: "add a test".to_string(),
+                id: 2,
+                status: "in_progress".to_string(),
+                evidence: None,
+            },
+        ];
+
+        // A `todo#N` / `task#N` mix, each resolved against its item.
+        let out = expand_todo_refs("do task#1 then todo#2", &todos);
+        assert!(out.starts_with("do task#1 then todo#2"), "{out}");
+        assert!(out.contains("--- Referenced todos ---"), "{out}");
+        assert!(out.contains("=== #1: pending ==="), "{out}");
+        assert!(out.contains("fix the bug"), "{out}");
+        assert!(out.contains("=== #2: in_progress ==="), "{out}");
+        assert!(out.contains("add a test"), "{out}");
+
+        // Trailing punctuation on the token is tolerated.
+        let out = expand_todo_refs("see todo#2.", &todos);
+        assert!(out.contains("=== #2: in_progress ==="), "{out}");
+
+        // Duplicate references append the item once.
+        let out = expand_todo_refs("todo#2 and again todo#2", &todos);
+        assert_eq!(out.matches("=== #2: in_progress ===").count(), 1, "{out}");
+
+        // An unknown number is left alone, like an unresolved `@path`.
+        assert_eq!(expand_todo_refs("see todo#99", &todos), "see todo#99");
+        // A non-numeric suffix too.
+        assert_eq!(expand_todo_refs("see todo#x", &todos), "see todo#x");
+        // id 0 is unassigned — nothing to reference.
+        assert_eq!(expand_todo_refs("see todo#0", &todos), "see todo#0");
+        // A plain message without tokens is unchanged.
+        assert_eq!(expand_todo_refs("just some text", &todos), "just some text");
+    }
+
+    /// `prepare_outgoing_tracked` expands `todo#N` after `@file`, in both its
+    /// shapes — a plain message and one routed at an `@agent`.
+    #[test]
+    fn prepare_outgoing_tracked_expands_todo_refs_after_file_mentions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("note.txt"), "the note").unwrap();
+        let names = vec!["explore".to_string()];
+        let todos = vec![hrdr_tools::TodoItem {
+            content: "add a test".to_string(),
+            id: 2,
+            status: "in_progress".to_string(),
+            evidence: None,
+        }];
+
+        let (sent, _) =
+            prepare_outgoing_tracked("read @note.txt then todo#2", &names, root, &todos);
+        // The todo section comes after the @file section.
+        let file_at = sent.find("--- Referenced paths (via @) ---").unwrap();
+        let todo_at = sent.find("--- Referenced todos ---").unwrap();
+        assert!(todo_at > file_at, "{sent}");
+        assert!(sent.contains("add a test"), "{sent}");
+
+        // Routed at a sub-agent: same expansion, wrapped in the directive.
+        let (sent, _) = prepare_outgoing_tracked("@explore do todo#2", &names, root, &todos);
+        assert!(
+            sent.contains("`explore`") && sent.contains("add a test"),
+            "{sent}"
+        );
+        assert!(sent.contains("--- Referenced todos ---"), "{sent}");
     }
 
     #[test]

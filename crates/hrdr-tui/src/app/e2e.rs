@@ -4206,21 +4206,25 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
     *h.app.todos.lock().unwrap() = vec![
         hrdr_agent::Todo {
             content: "ship it".to_string(),
+            id: 0,
             status: "in_progress".to_string(),
             evidence: None,
         },
         hrdr_agent::Todo {
             content: "wait here".to_string(),
+            id: 0,
             status: "pending".to_string(),
             evidence: None,
         },
         hrdr_agent::Todo {
             content: "landed".to_string(),
+            id: 0,
             status: "completed".to_string(),
             evidence: None,
         },
         hrdr_agent::Todo {
             content: "skip it".to_string(),
+            id: 0,
             status: "cancelled".to_string(),
             evidence: None,
         },
@@ -4277,11 +4281,15 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
         "bottom padding:\n{screen}"
     );
 
-    // The rule, then the rest of the left padding, then the content.
-    // The in_progress marker is a braille SPINNER frame (first frame at t≈0).
+    // The rule, then the rest of the left padding, then the content, which
+    // leads with the item's stable `#N` reference. The in_progress marker is a
+    // braille SPINNER frame (first frame at t≈0).
     let first_frame = "⠋";
     assert!(
-        row(text_y).starts_with(&format!("{} {first_frame} ship it", crate::ui::BORDER_BAR)),
+        row(text_y).starts_with(&format!(
+            "{} #0 {first_frame} ship it",
+            crate::ui::BORDER_BAR
+        )),
         "{screen}"
     );
     assert!(screen.contains("  wait here"), "pending marker: {screen}");
@@ -4316,11 +4324,13 @@ async fn clicking_the_finished_row_unfolds_the_done_todos() {
     *h.app.todos.lock().unwrap() = vec![
         hrdr_agent::Todo {
             content: "ship it".to_string(),
+            id: 0,
             status: "in_progress".to_string(),
             evidence: None,
         },
         hrdr_agent::Todo {
             content: "landed".to_string(),
+            id: 0,
             status: "completed".to_string(),
             evidence: None,
         },
@@ -4406,6 +4416,7 @@ async fn each_panel_owns_a_blank_row_above_it() {
     // With todos, the panel's first row is preceded by a blank, untinted row.
     *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
         content: "ship it".to_string(),
+        id: 0,
         status: "in_progress".to_string(),
         evidence: None,
     }];
@@ -4756,6 +4767,7 @@ async fn the_generating_line_closes_the_transcript() {
     // A panel between the loader and the input, so "top-most" is a real claim.
     *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
         content: "ship it".to_string(),
+        id: 0,
         status: "in_progress".to_string(),
         evidence: None,
     }];
@@ -6686,6 +6698,7 @@ async fn the_todo_panel_shows_the_active_agents_list() {
     // Give the main agent a TODO.
     *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
         content: "main task".to_string(),
+        id: 0,
         status: "in_progress".to_string(),
         evidence: None,
     }];
@@ -6694,6 +6707,7 @@ async fn the_todo_panel_shows_the_active_agents_list() {
     let sub_key = 1u64;
     let sub_todos = std::sync::Arc::new(std::sync::Mutex::new(vec![hrdr_agent::Todo {
         content: "sub task".to_string(),
+        id: 0,
         status: "pending".to_string(),
         evidence: None,
     }]));
@@ -6760,6 +6774,7 @@ async fn the_todo_panel_stays_up_while_a_sub_agent_runs() {
     // Give the main agent a TODO.
     *h.app.todos.lock().unwrap() = vec![hrdr_agent::Todo {
         content: "main task".to_string(),
+        id: 0,
         status: "in_progress".to_string(),
         evidence: None,
     }];
@@ -6768,6 +6783,7 @@ async fn the_todo_panel_stays_up_while_a_sub_agent_runs() {
     let sub_key = 1u64;
     let sub_todos = std::sync::Arc::new(std::sync::Mutex::new(vec![hrdr_agent::Todo {
         content: "sub task".to_string(),
+        id: 0,
         status: "in_progress".to_string(),
         evidence: None,
     }]));

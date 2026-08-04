@@ -86,6 +86,11 @@ pub const SPOOL_MEMORY: usize = 8;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
     pub content: String,
+    /// Stable per-item reference id, minted by the `todo` tool and shown in the
+    /// panel as `#N`. `0` = unassigned (legacy items saved before this field
+    /// existed); the tool assigns real ids on its next call.
+    #[serde(default)]
+    pub id: u64,
     /// `pending` | `in_progress` | `completed` | `cancelled`.
     #[serde(default = "default_status")]
     pub status: String,

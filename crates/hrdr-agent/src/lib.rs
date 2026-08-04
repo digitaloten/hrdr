@@ -9158,11 +9158,13 @@ mod tests {
             *agent.todos().lock().unwrap() = vec![
                 TodoItem {
                     content: "write the fix".to_string(),
+                    id: 0,
                     status: "in_progress".to_string(),
                     evidence: None,
                 },
                 TodoItem {
                     content: "add a test".to_string(),
+                    id: 0,
                     status: "pending".to_string(),
                     evidence: None,
                 },
@@ -9250,6 +9252,7 @@ mod tests {
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             *agent.todos().lock().unwrap() = vec![TodoItem {
                 content: "write the fix".to_string(),
+                id: 0,
                 status: "completed".to_string(),
                 evidence: None,
             }];
@@ -9291,11 +9294,13 @@ mod tests {
             *agent.todos().lock().unwrap() = vec![
                 TodoItem {
                     content: "write the fix".to_string(),
+                    id: 0,
                     status: "completed".to_string(),
                     evidence: None,
                 },
                 TodoItem {
                     content: "skip the other".to_string(),
+                    id: 0,
                     status: "cancelled".to_string(),
                     evidence: None,
                 },
@@ -9339,6 +9344,7 @@ mod tests {
             let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
             *agent.todos().lock().unwrap() = vec![TodoItem {
                 content: "review the change".to_string(),
+                id: 0,
                 status: "in_progress".to_string(),
                 evidence: None,
             }];
@@ -9404,6 +9410,7 @@ mod tests {
             let mut agent = Agent::new(cfg).unwrap();
             *agent.todos().lock().unwrap() = vec![TodoItem {
                 content: "unfinished work".to_string(),
+                id: 0,
                 status: "pending".to_string(),
                 evidence: None,
             }];
@@ -9781,11 +9788,13 @@ mod tests {
             *agent.todos().lock().unwrap() = vec![
                 TodoItem {
                     content: "write the fix".to_string(),
+                    id: 0,
                     status: "in_progress".to_string(),
                     evidence: None,
                 },
                 TodoItem {
                     content: "add a test".to_string(),
+                    id: 0,
                     status: "pending".to_string(),
                     evidence: None,
                 },
@@ -9867,11 +9876,13 @@ mod tests {
             *agent.todos().lock().unwrap() = vec![
                 TodoItem {
                     content: "write the fix".to_string(),
+                    id: 0,
                     status: "in_progress".to_string(),
                     evidence: None,
                 },
                 TodoItem {
                     content: "add a test".to_string(),
+                    id: 0,
                     status: "pending".to_string(),
                     evidence: None,
                 },

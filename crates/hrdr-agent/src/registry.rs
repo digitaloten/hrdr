@@ -1115,6 +1115,7 @@ mod tests {
         use hrdr_tools::TodoItem;
         let todo = |content: &str, status: &str| TodoItem {
             content: content.to_string(),
+            id: 0,
             status: status.to_string(),
             evidence: None,
         };

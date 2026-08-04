@@ -218,6 +218,16 @@ pub fn agent_names(agent: &Arc<Mutex<Agent>>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The live agent's TODO list, for `todo#N` / `task#N` expansion in the send
+/// path. Empty when the lock is held (a turn is running) or the list's own lock
+/// is poisoned.
+pub fn agent_todos(agent: &Arc<Mutex<Agent>>) -> Vec<hrdr_tools::TodoItem> {
+    agent
+        .try_lock()
+        .map(|a| a.todos().lock().map(|t| t.clone()).unwrap_or_default())
+        .unwrap_or_default()
+}
+
 /// [`crate::prepare_outgoing`] for frontends holding the shared agent handle:
 /// fetches the sub-agent names ([`agent_names`]) and cwd ([`agent_cwd`]) itself.
 ///
@@ -229,8 +239,12 @@ pub fn agent_names(agent: &Arc<Mutex<Agent>>) -> Vec<String> {
 /// elsewhere, use [`prepare_outgoing_relayed`] so a file the agent never sees
 /// doesn't disarm its guard.
 pub fn prepare_outgoing_via(agent: &Arc<Mutex<Agent>>, input: &str) -> String {
-    let (sent, inlined) =
-        crate::prepare_outgoing_tracked(input, &agent_names(agent), &agent_cwd(agent));
+    let (sent, inlined) = crate::prepare_outgoing_tracked(
+        input,
+        &agent_names(agent),
+        &agent_cwd(agent),
+        &agent_todos(agent),
+    );
     // Best-effort, and deliberately not blocking: a turn in flight holds the
     // lock, and the same `try_lock` gate already decides whether `@agent`
     // routing resolves at all (see `agent_names`). Missing the mark costs one

@@ -925,9 +925,11 @@ fn ask_to_trust(cwd: &std::path::Path, theme: Option<&str>) -> hrdr_agent::trust
 async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bool) -> Result<()> {
     let mut agent = Agent::new(config)?;
     // Prepare the outgoing prompt: expand `@file` mentions and route any
-    // `@agent` mention to the matching sub-agent (parity with the TUI).
+    // `@agent` mention to the matching sub-agent (parity with the TUI), and
+    // expand `todo#N` / `task#N` references against this agent's own list.
+    let todos = agent.todos().lock().map(|t| t.clone()).unwrap_or_default();
     let (prompt, inlined) =
-        hrdr_app::prepare_outgoing_tracked(&prompt, agent.agent_names(), &agent.cwd());
+        hrdr_app::prepare_outgoing_tracked(&prompt, agent.agent_names(), &agent.cwd(), &todos);
     // A fully inlined `@file` is content the model has already seen — tell the
     // read-before-edit guard so it doesn't demand a redundant re-read.
     agent.mark_files_read(&inlined);
