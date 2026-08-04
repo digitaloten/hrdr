@@ -4,6 +4,20 @@
 (the four-harness comparison) and `security-audit.md`, which are deleted — read
 `git log` for what they said before this.
 
+**Threading pass 2026-08-04** (`docs/threading-plan.md`, slices 1/2/3/5 shipped
+in `1145ccd`/`b21bec8`/`5130f26`/`6549c7b`): blocking tool fs now runs on
+`spawn_blocking`, each tool call in a batch runs as its own task (with the
+panic-resume and cancel-abort mechanisms), session saves write off the UI thread
+behind a latest-wins coalescer, and sub-agent construction runs on the blocking
+pool. **Slice 4 (attach reads off the UI thread) is deferred**: the `@file`
+reads are bounded (~100 KB per file) and one-shot at submit, while the change
+would convert the whole input path (`on_key` → `submit_input` →
+`spawn_turn`/`send_to_subagent`) to async — a disproportionate ripple for a
+stall that is imperceptible next to the per-round save Slice 3 removed. If the
+submit-time stall ever shows up, the reads in
+`crates/hrdr-app/src/util.rs:130-213` (`read_attach_file`/`read_attach_dir`/
+`discover_skills`) are the site.
+
 **Every claim below was re-verified against the tree at `8c76cdb`** before it
 was carried over. What did not survive verification is either corrected in place
 or listed under
