@@ -1448,15 +1448,15 @@ impl App {
                     // single wrapped line in the settled block — and handed the
                     // model the same flattened blob inside a fence.
                     let bounded = hrdr_tools::truncate(&run.output, 50_000);
-                    let result = if bounded.trim().is_empty() {
-                        format!("(no output — exit {exit})")
-                    } else {
-                        bounded.clone()
-                    };
                     let note = format!(
                         "I ran `{task_command}` in the shell (exit {exit}). Output:\n\n```\n{}\n```",
                         bounded.trim_end()
                     );
+                    let result = if bounded.trim().is_empty() {
+                        format!("(no output — exit {exit})")
+                    } else {
+                        bounded
+                    };
                     let _ = tx
                         .send(TurnMsg::UserShell(
                             AgentEvent::ToolEnd {
