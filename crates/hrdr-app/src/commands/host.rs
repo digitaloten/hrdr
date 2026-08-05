@@ -193,8 +193,9 @@ pub trait CommandHost {
     fn session_cost_partial(&self) -> bool {
         false
     }
-    /// Update the effort label (persistence is dispatch's job).
-    fn set_effort(&mut self, label: String) {
+    /// Update the effort label (`None` clears to the model/provider default;
+    /// persistence is dispatch's job).
+    fn set_effort(&mut self, label: Option<String>) {
         let _ = label;
     }
 

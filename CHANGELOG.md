@@ -192,6 +192,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   opened as an empty conversation; it now copies the source's transcript jsonl
   as well.
 
+- **Slash commands stop accepting garbage they silently persisted.** `/temp`
+  accepted any float — `nan`, `inf`, negatives, `1e40` — and wrote it to
+  `config.toml` with no way to clear it; it now accepts only finite values in
+  `0.0..=2.0`, and `default`/`reset` clears the override back to the provider
+  default. `/effort high` applies the level directly (validated against the
+  current model's accepted levels, matching by value or label) where the
+  argument used to be silently discarded, and `/login`/`/skills` say arguments
+  are unused instead of dropping them. `/export notes.json` now writes JSON —
+  the extension names the format — refuses a second filename and refuses to
+  overwrite an existing file, and its blocking write runs off the async worker.
+  `/doctor` no longer runs the git and auth-file filesystem probes on the UI
+  thread; they moved into the spawned report.
+
 ### Added
 
 - **`deepseek` is now a built-in provider** — `deepseek://model` talks to

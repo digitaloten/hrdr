@@ -185,11 +185,16 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             let arg = arg.clone();
             host.spawn_line(Box::pin(async move {
                 let msgs = agent.lock().await.messages_owned();
-                match export_conversation(&msgs, &cwd, &arg) {
-                    Ok((path, lines)) => {
+                // The serialization and the fs write are blocking work; run
+                // them off the async worker.
+                match tokio::task::spawn_blocking(move || export_conversation(&msgs, &cwd, &arg))
+                    .await
+                {
+                    Ok(Ok((path, lines))) => {
                         format!("exported transcript to {} ({lines} lines)", path.display())
                     }
-                    Err(e) => format!("export failed: {e}"),
+                    Ok(Err(e)) => format!("export failed: {e}"),
+                    Err(e) => format!("export task failed: {e}"),
                 }
             }));
         }
@@ -241,9 +246,17 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                         t.map(|t| t.to_string()).unwrap_or_else(|| "default".into())
                     )
                 }));
+            } else if matches!(arg.to_ascii_lowercase().as_str(), "default" | "reset") {
+                let agent = host.agent();
+                host.spawn_line(Box::pin(async move {
+                    agent.lock().await.set_temperature(None);
+                    String::new()
+                }));
+                host.unpersist_setting("temperature");
+                host.info("temperature → default".to_string());
             } else {
                 match arg.parse::<f32>() {
-                    Ok(t) => {
+                    Ok(t) if t.is_finite() && (0.0..=2.0).contains(&t) => {
                         let agent = host.agent();
                         host.spawn_line(Box::pin(async move {
                             agent.lock().await.set_temperature(Some(t));
@@ -255,15 +268,58 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                         );
                         host.info(format!("temperature → {t}"));
                     }
-                    Err(_) => host.info("usage: /temp <number>".to_string()),
+                    _ => host.info("usage: /temp <0-2> | default".to_string()),
                 }
             }
         }
         "effort" => {
-            // Always the interactive picker (a frontend that supports it; the
-            // default lists the model's levels as text). It offers the levels
-            // the current model actually accepts, per the models.dev catalog.
-            host.begin_effort_selector();
+            if arg.is_empty() {
+                // Always the interactive picker (a frontend that supports it;
+                // the default lists the model's levels as text). It offers the
+                // levels the current model actually accepts, per the models.dev
+                // catalog.
+                host.begin_effort_selector();
+            } else {
+                // `/effort <name>` applies a level directly, mirroring the
+                // picker's apply-selected path: match by value or label
+                // (case-insensitive), or the Default row for default/reset.
+                let reference = host.model_ref();
+                let choices =
+                    crate::effort_choices(Some(reference.provider().as_str()), reference.model());
+                let arg_lower = arg.to_ascii_lowercase();
+                let choice = if matches!(arg_lower.as_str(), "default" | "reset") {
+                    choices.iter().find(|c| c.value.is_none())
+                } else {
+                    choices.iter().find(|c| {
+                        c.value
+                            .as_deref()
+                            .is_some_and(|v| v.eq_ignore_ascii_case(&arg))
+                            || c.label.eq_ignore_ascii_case(&arg)
+                    })
+                };
+                match choice {
+                    Some(c) => {
+                        match &c.value {
+                            Some(v) => {
+                                host.persist_setting("effort", hrdr_agent::ConfigValue::Str(v))
+                            }
+                            None => host.unpersist_setting("effort"),
+                        }
+                        host.set_effort(c.value.clone());
+                        host.info(match &c.value {
+                            Some(v) => format!("effort → {} ({v})", c.label),
+                            None => "effort → default (the model/provider default)".to_string(),
+                        });
+                    }
+                    None => {
+                        let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
+                        host.info(format!(
+                            "unknown effort '{arg}' — available: {}",
+                            labels.join(", ")
+                        ));
+                    }
+                }
+            }
         }
         "cwd" => {
             let cur = host.cwd();
@@ -506,11 +562,19 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
         }
         "reload" => host.reload_config(),
         "skills" => {
+            if !arg.is_empty() {
+                host.info("/skills takes no argument — skills run via `:name`".to_string());
+            }
             // Interactive picker where supported; the default host lists the
             // skills as text (see CommandHost::begin_skill_selector).
             host.begin_skill_selector();
         }
-        "login" => host.begin_login(),
+        "login" => {
+            if !arg.is_empty() {
+                host.info("/login takes no argument".to_string());
+            }
+            host.begin_login();
+        }
         "resume" | "load" => {
             if arg.is_empty() {
                 // No argument: open the interactive session picker (a frontend
@@ -555,35 +619,44 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             let base_url = host.base_url();
             let cwd = host.cwd();
             let ctx_win = host.context_window();
-            let in_git = hrdr_agent::in_git_repo(&cwd);
-            let branch = crate::git_branch(&cwd).unwrap_or_else(|| "—".to_string());
             let config_path = hrdr_agent::config_file_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "—".to_string());
-            let auth_path = hrdr_agent::auth_file_path()
-                .map(|p| {
-                    let exists = p.exists();
-                    format!(
-                        "{} ({})",
-                        p.display(),
-                        if exists { "found" } else { "not found" }
-                    )
-                })
-                .unwrap_or_else(|| "—".to_string());
             let ctx_win_str = ctx_win.map_or_else(|| "—".to_string(), |w| w.to_string());
+            // Only pure computations here: every filesystem probe (git
+            // discovery, the auth-file check) runs in the spawned task below,
+            // not on the UI thread.
             host.info(format!(
                 "model: {model}\nendpoint: {base_url}\ncontext window: {ctx_win_str}\n\
-                 cwd: {} ({in_git})\nbranch: {branch}\nconfig: {config_path}\n\
-                 auth: {auth_path}\nprobing endpoint…",
+                 cwd: {}\nconfig: {config_path}\nprobing endpoint…",
                 crate::display_dir(&cwd),
-                in_git = if in_git { "git repo" } else { "not a git repo" },
             ));
             host.spawn_line(Box::pin(async move {
+                // `in_git_repo` walks ancestors calling `.exists()` and
+                // `git_branch` reads `.git/HEAD` up the tree — both belong
+                // here, off the UI thread, along with the auth-file check.
+                let git_line = if hrdr_agent::in_git_repo(&cwd) {
+                    let branch = crate::git_branch(&cwd).unwrap_or_else(|| "—".to_string());
+                    format!("git: on branch {branch}")
+                } else {
+                    "git: not a repo".to_string()
+                };
+                let auth_line = hrdr_agent::auth_file_path()
+                    .map(|p| {
+                        let exists = p.exists();
+                        format!(
+                            "auth: {} ({})",
+                            p.display(),
+                            if exists { "found" } else { "not found" }
+                        )
+                    })
+                    .unwrap_or_else(|| "auth: —".to_string());
                 let ep = endpoint_health_warning(agent.clone(), model, base_url).await;
                 let mut out = match ep {
                     Some(w) => w,
                     None => "✓ endpoint healthy".to_string(),
                 };
+                out = format!("{git_line}\n{auth_line}\n{out}");
                 out.push('\n');
                 out.push_str(&lsp_status_text(&agent).await);
                 // Session health: report any corrupt/unreadable files.
@@ -713,6 +786,9 @@ mod tests {
         cwd: std::path::PathBuf,
         agent: Arc<Mutex<Agent>>,
         info_log: Vec<String>,
+        /// Lines posted by spawned tasks (`line_poster`), captured so async
+        /// command output (export results, /doctor reports) is assertable.
+        async_log: Arc<std::sync::Mutex<Vec<String>>>,
         busy: bool,
         model: hrdr_agent::ModelRef,
         input: String,
@@ -742,6 +818,7 @@ mod tests {
                 cwd,
                 agent: Arc::new(Mutex::new(agent)),
                 info_log: Vec::new(),
+                async_log: Arc::new(std::sync::Mutex::new(Vec::new())),
                 busy: false,
                 model: "local://test-model".parse().unwrap(),
                 input: String::new(),
@@ -804,7 +881,10 @@ mod tests {
             self.messages.get(n - 1).cloned()
         }
         fn line_poster(&self) -> Box<dyn Fn(LineKind, String) + Send> {
-            Box::new(|_, _| {})
+            let log = self.async_log.clone();
+            Box::new(move |_, line| {
+                log.lock().unwrap().push(line);
+            })
         }
         fn is_busy(&self) -> bool {
             self.busy
@@ -1082,6 +1162,397 @@ mod tests {
         assert!(
             measured.contains("prompt cache: 78% read (120.0k), 30.0k written"),
             "{measured}"
+        );
+    }
+
+    // ── /temp, /export, /effort, /doctor, /login, /skills ──────────────────
+
+    /// The tests that read or write the shared sandboxed `config.toml`
+    /// (dispatch's `persist_setting`/`unpersist_setting` target the
+    /// process-wide sandbox root) are serialized against each other: two of
+    /// them mutating `temperature` / `effort` concurrently would race on the
+    /// one file.
+    static CONFIG_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// The sandboxed config file `persist_setting` writes, as text ("" when
+    /// nothing has been written yet).
+    fn config_contents() -> String {
+        let path = hrdr_agent::config_file_path().expect("the sandbox ctor set HOME");
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    /// Yield until `cond` holds or ~1s passes, letting spawned-task effects
+    /// (agent mutations, posted lines, file writes) land before asserting.
+    async fn settle(cond: impl Fn() -> bool) {
+        for _ in 0..100 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Seed the host's agent with a user/assistant exchange so the export
+    /// formats have something to render.
+    async fn seed_messages(host: &TestHost) {
+        let mut a = host.agent.lock().await;
+        a.set_messages(vec![
+            hrdr_agent::Message::user("hello"),
+            hrdr_agent::Message::assistant("hi there"),
+        ]);
+    }
+
+    /// `/temp` accepts only finite values in `0.0..=2.0`. A NaN, an infinity,
+    /// an out-of-range number, or a parse error is refused with the usage line
+    /// — and nothing lands in the agent or the config file.
+    #[tokio::test]
+    async fn temp_rejects_invalid_values_without_persisting() {
+        let _guard = CONFIG_LOCK.lock().await;
+        hrdr_agent::remove_setting("temperature").expect("clean slate");
+        for bad in ["nan", "inf", "5", "-1", "1e40"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut host = TestHost::new(dir.path().to_path_buf());
+            assert!(dispatch(&mut host, &format!("/temp {bad}")), "{bad}");
+            assert!(
+                host.info_log
+                    .iter()
+                    .any(|l| l.contains("usage: /temp <0-2> | default")),
+                "/temp {bad}: {:?}",
+                host.info_log
+            );
+            assert_eq!(
+                host.agent.lock().await.temperature(),
+                None,
+                "/temp {bad} must not set the temperature"
+            );
+        }
+        assert!(
+            !config_contents().contains("temperature"),
+            "no temperature key may land in the config: {:?}",
+            config_contents()
+        );
+    }
+
+    /// `/temp 0.7` applies the value to the agent (in the spawned task — yield
+    /// first) and persists it to the config file.
+    #[tokio::test]
+    async fn temp_valid_value_persists_and_applies() {
+        let _guard = CONFIG_LOCK.lock().await;
+        hrdr_agent::remove_setting("temperature").expect("clean slate");
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+
+        assert!(dispatch(&mut host, "/temp 0.7"));
+        settle(|| {
+            host.agent
+                .try_lock()
+                .is_ok_and(|a| a.temperature() == Some(0.7))
+        })
+        .await;
+        assert_eq!(host.agent.lock().await.temperature(), Some(0.7));
+        // `persist_setting` stores `t as f64` for an `f32` input, so the value
+        // on disk is the widened f32 representation, not the decimal literal.
+        let cfg = toml::from_str::<toml::Value>(&config_contents()).expect("valid TOML");
+        assert_eq!(
+            cfg.get("temperature").and_then(|v| v.as_float()),
+            Some(0.7f32 as f64),
+            "{:?}",
+            config_contents()
+        );
+        hrdr_agent::remove_setting("temperature").expect("cleanup");
+    }
+
+    /// `/temp default` clears a set value: the agent goes back to `None` and
+    /// the `temperature` key leaves the config file.
+    #[tokio::test]
+    async fn temp_default_clears_the_override() {
+        let _guard = CONFIG_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+
+        // Set a value first so the clear has something to undo.
+        assert!(dispatch(&mut host, "/temp 0.5"));
+        settle(|| {
+            host.agent
+                .try_lock()
+                .is_ok_and(|a| a.temperature() == Some(0.5))
+        })
+        .await;
+
+        assert!(dispatch(&mut host, "/temp default"));
+        settle(|| {
+            host.agent
+                .try_lock()
+                .is_ok_and(|a| a.temperature().is_none())
+        })
+        .await;
+        assert!(
+            !config_contents().contains("temperature"),
+            "the key must be removed: {:?}",
+            config_contents()
+        );
+    }
+
+    /// A file named `*.json` is exported as JSON even without the flag.
+    #[tokio::test]
+    async fn export_writes_json_when_the_file_is_named_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+        seed_messages(&host).await;
+
+        assert!(dispatch(&mut host, "/export out.json"));
+        settle(|| dir.path().join("out.json").exists()).await;
+        let text = std::fs::read_to_string(dir.path().join("out.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert!(v.is_array(), "expected a JSON array, got: {text}");
+    }
+
+    /// A plain name is exported as Markdown.
+    #[tokio::test]
+    async fn export_writes_markdown_without_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+        seed_messages(&host).await;
+
+        assert!(dispatch(&mut host, "/export out.md"));
+        settle(|| dir.path().join("out.md").exists()).await;
+        let text = std::fs::read_to_string(dir.path().join("out.md")).unwrap();
+        assert!(
+            text.starts_with("## User"),
+            "expected markdown, got: {text}"
+        );
+    }
+
+    /// `--json` forces JSON even for a file with no extension.
+    #[tokio::test]
+    async fn export_flag_forces_json_even_without_an_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+        seed_messages(&host).await;
+
+        assert!(dispatch(&mut host, "/export --json out"));
+        settle(|| dir.path().join("out").exists()).await;
+        let text = std::fs::read_to_string(dir.path().join("out")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert!(v.is_array(), "expected a JSON array, got: {text}");
+    }
+
+    /// An existing file is refused, never overwritten, and the error names it.
+    #[tokio::test]
+    async fn export_refuses_to_overwrite_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+        seed_messages(&host).await;
+        std::fs::write(dir.path().join("out.md"), "original").unwrap();
+
+        assert!(dispatch(&mut host, "/export out.md"));
+        settle(|| !host.async_log.lock().unwrap().is_empty()).await;
+        assert!(
+            host.async_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("refusing to overwrite existing file")),
+            "{:?}",
+            host.async_log.lock().unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out.md")).unwrap(),
+            "original",
+            "the existing file must be left untouched"
+        );
+    }
+
+    /// A second filename is refused with the usage line, and nothing is
+    /// written.
+    #[tokio::test]
+    async fn export_rejects_extra_tokens_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+        seed_messages(&host).await;
+
+        assert!(dispatch(&mut host, "/export a.md b.md"));
+        settle(|| !host.async_log.lock().unwrap().is_empty()).await;
+        assert!(
+            host.async_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("usage: /export [--json] <file>")),
+            "{:?}",
+            host.async_log.lock().unwrap()
+        );
+        assert!(!dir.path().join("a.md").exists(), "nothing may be written");
+    }
+
+    /// `/effort high` applies the level by value (the picker's own match rule)
+    /// and persists it as the config default.
+    #[tokio::test]
+    async fn effort_applies_a_valid_value() {
+        let _guard = CONFIG_LOCK.lock().await;
+        hrdr_agent::remove_setting("effort").expect("clean slate");
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+
+        assert!(dispatch(&mut host, "/effort high"));
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("effort → High (high)")),
+            "{:?}",
+            host.info_log
+        );
+        assert!(
+            config_contents().contains("effort = \"high\""),
+            "{:?}",
+            config_contents()
+        );
+        hrdr_agent::remove_setting("effort").expect("cleanup");
+    }
+
+    /// `/effort default` clears the override: the `effort` key leaves the
+    /// config file.
+    #[tokio::test]
+    async fn effort_default_clears_the_override() {
+        let _guard = CONFIG_LOCK.lock().await;
+        hrdr_agent::remove_setting("effort").expect("clean slate");
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+
+        assert!(dispatch(&mut host, "/effort default"));
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("effort → default (the model/provider default)")),
+            "{:?}",
+            host.info_log
+        );
+        assert!(
+            !config_contents().contains("effort"),
+            "{:?}",
+            config_contents()
+        );
+    }
+
+    /// An unknown level is refused with a list of what IS available (the
+    /// FALLBACK ladder for the local test model), and nothing is persisted.
+    #[tokio::test]
+    async fn effort_unknown_value_lists_the_available_levels() {
+        let _guard = CONFIG_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+
+        assert!(dispatch(&mut host, "/effort zzz"));
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("unknown effort 'zzz'")),
+            "{:?}",
+            host.info_log
+        );
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("available: Default, High, Medium, Low, Minimal")),
+            "{:?}",
+            host.info_log
+        );
+        assert!(
+            !config_contents().contains("effort"),
+            "{:?}",
+            config_contents()
+        );
+    }
+
+    /// `/doctor` keeps the filesystem probes (git, auth file) off the UI
+    /// thread: the synchronous header is pure, and the spawned report carries
+    /// the git/auth lines.
+    #[tokio::test]
+    async fn doctor_reports_not_a_repo_from_the_spawned_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+
+        assert!(dispatch(&mut host, "/doctor"));
+        // The synchronous header must not do the git walk itself.
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("probing endpoint…")),
+            "{:?}",
+            host.info_log
+        );
+        assert!(
+            !host.info_log.iter().any(|l| l.contains("branch:")),
+            "the branch belongs to the spawned report, not the header: {:?}",
+            host.info_log
+        );
+        settle(|| !host.async_log.lock().unwrap().is_empty()).await;
+        let joined = host.async_log.lock().unwrap().join("\n");
+        assert!(joined.contains("git: not a repo"), "{joined}");
+        assert!(joined.contains("auth:"), "{joined}");
+    }
+
+    /// Inside a real git repo the spawned report names the branch.
+    #[tokio::test]
+    async fn doctor_reports_the_branch_inside_a_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git must be available to run this test");
+        assert!(out.status.success(), "{out:?}");
+        let mut host = TestHost::new(dir.path().to_path_buf());
+
+        assert!(dispatch(&mut host, "/doctor"));
+        settle(|| !host.async_log.lock().unwrap().is_empty()).await;
+        let joined = host.async_log.lock().unwrap().join("\n");
+        assert!(joined.contains("git: on branch"), "{joined}");
+    }
+
+    /// `/login <arg>` says the argument is unused but still opens the wizard.
+    #[tokio::test]
+    async fn login_with_an_argument_still_opens_the_wizard() {
+        let mut host = TestHost::new(std::env::temp_dir());
+        assert!(dispatch(&mut host, "/login foo"));
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("/login takes no argument")),
+            "{:?}",
+            host.info_log
+        );
+        // The wizard still opened (the default host reports it unavailable).
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("/login isn't available")),
+            "{:?}",
+            host.info_log
+        );
+    }
+
+    /// `/skills <arg>` says the argument is unused but still opens the picker.
+    #[tokio::test]
+    async fn skills_with_an_argument_still_opens_the_picker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(dir.path().to_path_buf());
+        assert!(dispatch(&mut host, "/skills foo"));
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("/skills takes no argument")),
+            "{:?}",
+            host.info_log
+        );
+        // The picker still opened (the default host lists the skills as text).
+        assert!(
+            host.info_log
+                .iter()
+                .any(|l| l.contains("skills (invoke with :name")),
+            "{:?}",
+            host.info_log
         );
     }
 }

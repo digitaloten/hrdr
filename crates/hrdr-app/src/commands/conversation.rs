@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 use hrdr_agent::{Message, MessageRole};
 
 /// Write the conversation to a file per a `/export [--json] [file]` argument,
-/// returning the path written and its line count. With no file, a timestamped
-/// `hrdr-transcript-<date>.{md,json}` in `cwd` is used.
+/// returning the path written and its line count. JSON when `--json` is passed
+/// or the named file's extension is `.json` (case-insensitive); otherwise
+/// Markdown. With no file, a timestamped `hrdr-transcript-<date>.{md,json}` in
+/// `cwd` is used. An existing file is refused, never overwritten.
 pub fn export_conversation(
     msgs: &[Message],
     cwd: &Path,
@@ -17,6 +19,10 @@ pub fn export_conversation(
             json = true;
         } else if file.is_none() {
             file = Some(tok);
+        } else {
+            // A second filename (or an unknown token) used to be dropped
+            // silently; refuse instead.
+            return Err("usage: /export [--json] <file>".to_string());
         }
     }
     let path = match file {
@@ -27,6 +33,21 @@ pub fn export_conversation(
             cwd.join(format!("hrdr-transcript-{stamp}.{ext}"))
         }
     };
+    // The extension names the format even without the flag (`out.json` is JSON);
+    // the flag itself forces JSON for any other name.
+    if file.is_some_and(|f| {
+        Path::new(f)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+    }) {
+        json = true;
+    }
+    if path.exists() {
+        return Err(format!(
+            "refusing to overwrite existing file: {}",
+            path.display()
+        ));
+    }
     let content = if json {
         conversation_to_json(msgs)
     } else {

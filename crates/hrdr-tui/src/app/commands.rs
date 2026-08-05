@@ -496,11 +496,11 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     fn session_cost_partial(&self) -> bool {
         self.app.panes.active_pane().state.usage.cost_partial
     }
-    fn set_effort(&mut self, label: String) {
+    fn set_effort(&mut self, label: Option<String>) {
         // Effort is the agent's; it publishes the change back into the chrome.
         let agent = self.app.active_agent();
         tokio::spawn(async move {
-            agent.lock().await.set_effort(Some(label));
+            agent.lock().await.set_effort(label);
         });
     }
     fn cwd_changed(&mut self, new: &std::path::Path) {
