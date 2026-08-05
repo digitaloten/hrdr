@@ -958,19 +958,21 @@ directory's files may then do:
   answer** — the memory half of it already shipped. If the honest list is
   "memory changed, AGENTS.md changed", one appended `# Context update` developer
   message gets most of the value. Do the cheap version first.
-- **Memory: usage tracking and an external-drift guard.** Two halves, both open.
-  Codex tracks whether memories are _used_ (citation blocks, plus parsing the
-  model's shell commands for reads of memory paths) and feeds
-  `usage_count`/`last_usage` into pruning — hrdr's `read`/`grep` calls under the
-  memory dir are directly observable with no parsing needed. _Caveat:_ usage
-  count is a bad proxy for memories whose value is preventing a mistake — hrdr's
-  own `no-migration-pre-1.0` earns its keep by being _injected_, never read, so
-  counting reads would prune the most valuable first. Separately, hermes'
-  `_detect_external_drift` refuses a full-file rewrite when on-disk content
-  wouldn't round-trip through the tool's own parser (manual edit, sibling
-  session), backing up to `.bak.<ts>` instead of clobbering; hrdr has no
-  equivalent (verified: no drift/round-trip/`.bak` logic in `memory.rs`). Both
-  fold into the memory-drift item below.
+- **Memory: usage tracking and an external-drift guard.** Two halves; the drift
+  half shipped, usage tracking is open. Codex tracks whether memories are _used_
+  (citation blocks, plus parsing the model's shell commands for reads of memory
+  paths) and feeds `usage_count`/`last_usage` into pruning — hrdr's
+  `read`/`grep` calls under the memory dir are directly observable with no
+  parsing needed. _Caveat:_ usage count is a bad proxy for memories whose value
+  is preventing a mistake — hrdr's own `no-migration-pre-1.0` earns its keep by
+  being _injected_, never read, so counting reads would prune the most valuable
+  first. Separately, hermes' `_detect_external_drift` refuses a full-file
+  rewrite when on-disk content wouldn't round-trip through the tool's own parser
+  (manual edit, sibling session), backing up to `.bak.<ts>` instead of
+  clobbering — **shipped `5bc2e5d`**: `backup_if_drifted` in `memory.rs` copies
+  a drifted file to `<slug>.<ts>.bak` before the write/edit rewrite, refuses the
+  rewrite when the backup cannot be written, and the result line names the
+  backup. Both fold into the memory-drift item below.
 - ~~**Gate LSP tool registration on the project having a matching server.**~~
   **Moot 2026-07-30:** `definition`/`references`/`rename` are deleted (2 calls
   in 9,350 — available and ignored), so there are no LSP tool schemas to gate.
@@ -1120,8 +1122,9 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   versa) and flag/prune stale or contradicted memories. Cheap because
   `rebuild_index` regenerates the pointer index on every mutation (verified), so
   files and index cannot drift **structurally**; what is missing is semantic
-  staleness, plus the external-drift guard and usage-tracking halves recorded
-  above.
+  staleness plus the usage-tracking half recorded above. The external-drift half
+  shipped 2026-08-05 (`5bc2e5d`) — see the memory item in
+  [Permissions, isolation, and state](#permissions-isolation-and-state).
 - **Profile-faithful revive** — the residual the above left. Only _capability_
   is persisted, not the profile: a revived run does not get its original persona
   (`agent_prompt`) or explicit `tools:` allow-list back, because neither was
