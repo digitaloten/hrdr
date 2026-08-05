@@ -243,6 +243,17 @@ pub(crate) fn log_wire(kind: &str, fields: serde_json::Value) {
 /// Classification of a chat-endpoint error for the agent's retry and
 /// compaction logic. Carried in the typed [`ChatError`] so hrdr-agent can
 /// match on the kind directly rather than scanning Display strings.
+///
+/// Four classes, mapping onto codex's `should_retry_with_current_model`
+/// taxonomy (see docs/backlog.md, "Compaction rewrite" item 5):
+/// [`Transient`](ChatErrorKind::Transient) ≈ `UnexpectedStatus` /
+/// `ServerOverloaded` / `InternalServerError` / `RetryLimit`, retry the same
+/// request; [`Overflow`](ChatErrorKind::Overflow) ≈ `ContextWindowExceeded`,
+/// compaction's job; [`Other`](ChatErrorKind::Other) ≈ `InvalidRequest`;
+/// [`UsageLimit`](ChatErrorKind::UsageLimit) ≈ `UsageLimitReached`. The
+/// model-specific half of codex's taxonomy (a different model might work) has
+/// no counterpart here — hrdr has no model-switch machinery, so all four
+/// classes surface rather than switch models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatErrorKind {
     /// The request exceeded the model's context window; compaction may help.
@@ -251,6 +262,10 @@ pub enum ChatErrorKind {
     Transient,
     /// Any other error (bad request, auth failure, unsupported parameter, …).
     Other,
+    /// A usage/quota limit — billing exhausted, a spend cap, or insufficient
+    /// quota. Retrying cannot help until the window resets (billing cycle,
+    /// plan change), so it is terminal; codex's `UsageLimitReached`.
+    UsageLimit,
 }
 
 /// A typed chat-endpoint error, emitted by [`Client::chat_stream`] for HTTP
@@ -312,10 +327,18 @@ pub(crate) async fn error_from_response(resp: reqwest::Response) -> anyhow::Erro
         "error_response",
         serde_json::json!({"status": status_u16, "body": text}),
     );
+    let mut kind = classify_status(status_u16);
+    // A 429 can be a rate limit (retryable) or a spent quota/billing cap
+    // (permanent until the window resets); `classify_status` can only see the
+    // status, so the body decides which. Only the transient set (408/429/5xx)
+    // is even eligible.
+    if kind == ChatErrorKind::Transient && crate::retry::is_usage_limit_text(&text) {
+        kind = ChatErrorKind::UsageLimit;
+    }
     anyhow::Error::new(ChatError {
         status: Some(status_u16),
         retry_after,
-        kind: classify_status(status_u16),
+        kind,
         message: format!(
             "chat endpoint returned {status}: {text}{}",
             retry_after_suffix_from(retry_after)
@@ -1319,7 +1342,12 @@ impl Client {
                             || type_str.contains("rate_limit")
                             || type_str.contains("overloaded")
                             || type_str.contains("server_error");
-                        let kind = if transient {
+                        // A spent quota/billing cap is terminal, whatever the
+                        // embedded code says — `insufficient_quota` or a quota
+                        // message must not ride the `code == 429` transient path.
+                        let kind = if crate::retry::is_usage_limit_text(&format!("{type_str} {msg}")) {
+                            ChatErrorKind::UsageLimit
+                        } else if transient {
                             ChatErrorKind::Transient
                         } else {
                             ChatErrorKind::Other
@@ -2496,13 +2524,43 @@ mod tests {
                  data: {\"type\":\"error\",\"code\":429,\"message\":\"rate limit reached\"}\n\n",
                 ChatErrorKind::Other,
             ),
+            // Spent quota/billing: terminal on all three, whatever the code says
+            // — even `rate_limit_exceeded`/`rate_limit_error`, whose type alone
+            // would have made them retryable.
+            (
+                "usage limit",
+                Backend::OpenAi,
+                "data: {\"error\":{\"type\":\"insufficient_quota\",\"message\":\"You exceeded your current quota\"}}\n\n",
+                ChatErrorKind::UsageLimit,
+            ),
+            (
+                "usage limit",
+                Backend::Anthropic,
+                "event: error\n\
+                 data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Your credit balance is too low to access the API\"}}\n\n",
+                ChatErrorKind::UsageLimit,
+            ),
+            (
+                "usage limit",
+                Backend::Codex,
+                "event: error\n\
+                 data: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"you have reached your usage quota\"}\n\n",
+                ChatErrorKind::UsageLimit,
+            ),
         ] {
             // The server's own message text for this situation; every payload in
-            // the table above carries it verbatim.
-            let needle = match situation {
-                "rate limit" | "rate limit named only by HTTP status" => "rate limit reached",
-                "server overload" => "upstream overloaded",
-                "bad credential" => "Incorrect API key",
+            // the table above carries one of them verbatim. A situation whose
+            // rows carry different messages (the usage-limit rows) lists all of
+            // them and matches any.
+            let needle: &[&str] = match situation {
+                "rate limit" | "rate limit named only by HTTP status" => &["rate limit reached"],
+                "server overload" => &["upstream overloaded"],
+                "bad credential" => &["Incorrect API key"],
+                "usage limit" => &[
+                    "You exceeded your current quota",
+                    "Your credit balance is too low",
+                    "you have reached your usage quota",
+                ],
                 other => panic!("no expected message text for {other:?}"),
             };
             let err = stream_error(backend, body).await;
@@ -2519,7 +2577,7 @@ mod tests {
                 err.message
             );
             assert!(
-                err.message.contains(needle),
+                needle.iter().any(|n| err.message.contains(n)),
                 "{situation} on {backend:?} lost the server's message ({needle:?}): {}",
                 err.message
             );
@@ -3481,6 +3539,16 @@ mod tests {
                 429,
                 ChatErrorKind::Transient,
                 Some(Duration::from_secs(12)),
+            ),
+            // Same status, spent-quota body: the body decides, not the status —
+            // a quota-exhausted 429 must not be retried for six minutes.
+            (
+                "429 Too Many Requests",
+                "",
+                r#"{"error":{"message":"You exceeded your current quota"}}"#,
+                429,
+                ChatErrorKind::UsageLimit,
+                None,
             ),
             (
                 "400 Bad Request",

@@ -950,10 +950,16 @@ fn map_event(
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error");
             let kind = match err_type {
-                // Anthropic's retryable server-side error types. `api_error` is
-                // their internal 500-equivalent and rides alongside
-                // `overloaded_error` (529); classifying it terminal aborts the
-                // turn on a transient hiccup that a retry would ride out.
+                // Anthropic's retryable server-side error types (`api_error` is
+                // their 500-equivalent; `rate_limit_error` is 429). A
+                // rate_limit_error carrying a credit/quota message is a spent
+                // billing cap, not a rate limit — permanent until the user tops
+                // up, so it must not be retried for six minutes.
+                "rate_limit_error" | "overloaded_error" | "api_error"
+                    if crate::retry::is_usage_limit_text(msg) =>
+                {
+                    crate::client::ChatErrorKind::UsageLimit
+                }
                 "rate_limit_error" | "overloaded_error" | "api_error" => {
                     crate::client::ChatErrorKind::Transient
                 }
@@ -2252,6 +2258,39 @@ mod tests {
         );
         assert!(chat_err.message.contains("rate_limit_error"));
         assert!(chat_err.message.contains("Rate limited"));
+    }
+
+    /// A `rate_limit_error` whose message describes a spent billing cap is
+    /// terminal — the user is out of credit, not rate limited, so retrying for
+    /// six minutes is pointless.
+    #[test]
+    fn rate_limit_error_with_a_credit_message_is_terminal() {
+        let mut slot = std::collections::HashMap::new();
+        let mut next = 0usize;
+        let mut thinking: std::collections::HashMap<u64, (String, String)> =
+            std::collections::HashMap::new();
+        let mut redacted: Vec<(u64, Value)> = vec![];
+        let mut stop_seen = false;
+
+        let ev = json!({"type":"error","error":{"type":"rate_limit_error","message":"Your credit balance is too low to access the API"}});
+        let err = map_event(
+            &ev,
+            &mut slot,
+            &mut next,
+            &mut thinking,
+            &mut redacted,
+            &mut stop_seen,
+        )
+        .unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(
+            chat_err.kind,
+            crate::client::ChatErrorKind::UsageLimit,
+            "a rate_limit_error with a credit/quota message is a spent cap"
+        );
+        assert!(!crate::retry::is_transient(&err));
+        assert!(chat_err.message.contains("rate_limit_error"));
+        assert!(chat_err.message.contains("credit balance is too low"));
     }
 
     #[test]

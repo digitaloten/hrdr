@@ -550,7 +550,16 @@ fn map_event(state: &mut StreamState, ev: &Value) -> Result<Option<ChatChunk>> {
             Err(anyhow::Error::new(crate::client::ChatError {
                 status: None,
                 retry_after: None,
-                kind: classify_codex_error(code),
+                kind: {
+                    let k = classify_codex_error(code);
+                    if k == crate::client::ChatErrorKind::Transient
+                        && crate::retry::is_usage_limit_text(&msg)
+                    {
+                        crate::client::ChatErrorKind::UsageLimit
+                    } else {
+                        k
+                    }
+                },
                 message: format!("responses stream failed: {msg}"),
             }))
         }
@@ -587,7 +596,16 @@ fn map_event(state: &mut StreamState, ev: &Value) -> Result<Option<ChatChunk>> {
             Err(anyhow::Error::new(crate::client::ChatError {
                 status: None,
                 retry_after: None,
-                kind: classify_codex_error(code),
+                kind: {
+                    let k = classify_codex_error(code);
+                    if k == crate::client::ChatErrorKind::Transient
+                        && crate::retry::is_usage_limit_text(&msg)
+                    {
+                        crate::client::ChatErrorKind::UsageLimit
+                    } else {
+                        k
+                    }
+                },
                 message: format!("responses stream error: {msg}"),
             }))
         }
@@ -1122,6 +1140,32 @@ mod tests {
         let err = map_event(&mut state, &overloaded).unwrap_err();
         let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
         assert_eq!(chat_err.kind, crate::client::ChatErrorKind::Transient);
+    }
+
+    /// A `rate_limit_exceeded` carrying a quota/usage message is a spent cap,
+    /// not a rate limit — terminal on both error shapes, whatever the code says.
+    #[test]
+    fn rate_limit_with_a_quota_message_is_usage_limit() {
+        let mut state = StreamState::default();
+        let failed = json!({"type": "response.failed", "response": {
+            "error": {"code": "rate_limit_exceeded", "message": "you have reached your usage quota"}
+        }});
+        let err = map_event(&mut state, &failed).unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::UsageLimit);
+        assert!(!crate::retry::is_transient(&err));
+        assert!(
+            chat_err.message.contains("usage quota"),
+            "{}",
+            chat_err.message
+        );
+
+        let top = json!({"type": "error", "code": "rate_limit_exceeded",
+            "message": "you have reached your usage quota"});
+        let err = map_event(&mut state, &top).unwrap_err();
+        let chat_err = err.downcast_ref::<crate::client::ChatError>().unwrap();
+        assert_eq!(chat_err.kind, crate::client::ChatErrorKind::UsageLimit);
+        assert!(!crate::retry::is_transient(&err));
     }
 
     /// An `error` event may nest its payload (`{"type":"error","error":{…}}`),

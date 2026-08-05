@@ -186,6 +186,36 @@ fn err_mentions(e: &anyhow::Error, needles: &[&str]) -> bool {
     needles.iter().any(|n| msg.contains(n))
 }
 
+/// Phrases that mean a USAGE/quota limit rather than a rate limit: retrying
+/// cannot help until the billing window resets. Deliberately disjoint from
+/// rate-limit wording — a false positive here stops a retry that would have
+/// succeeded, so only unambiguous usage/billing words match ("rate limit",
+/// "too many requests", "throttl" match none of these).
+const USAGE_LIMIT_PHRASES: &[&str] = &[
+    "quota",
+    "insufficient_quota",
+    "billing",
+    "credit balance",
+    "spend limit",
+];
+
+/// Whether `text` describes a usage/quota limit rather than a rate limit.
+pub(crate) fn is_usage_limit_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    USAGE_LIMIT_PHRASES.iter().any(|n| lower.contains(n))
+}
+
+/// Whether an error is a usage/quota limit — the [`ChatErrorKind::UsageLimit`]
+/// class, or the phrase scan for errors that never went through the typed
+/// classifier. The third classifier alongside [`is_transient`] and
+/// [`is_context_overflow`]; codex's `UsageLimitReached`.
+pub fn is_usage_limit(e: &anyhow::Error) -> bool {
+    if let Some(ce) = e.downcast_ref::<crate::ChatError>() {
+        return ce.kind == crate::ChatErrorKind::UsageLimit;
+    }
+    is_usage_limit_text(&e.to_string())
+}
+
 /// Whether an error looks like a transient network/server failure worth
 /// retrying (connection issues `request failed`/`timed out`/…, 429, or 5xx).
 ///
@@ -202,6 +232,13 @@ fn err_mentions(e: &anyhow::Error, needles: &[&str]) -> bool {
 pub fn is_transient(e: &anyhow::Error) -> bool {
     if let Some(ce) = e.downcast_ref::<crate::ChatError>() {
         return ce.kind == crate::ChatErrorKind::Transient;
+    }
+    // A quota/usage-limit 429 is permanent until the window resets — never
+    // a rate limit to ride out. Checked before the transient scan so an
+    // untyped "returned 429: quota exceeded" doesn't match `returned 429`.
+    // (`is_usage_limit` falls back to the same phrase scan for untyped errors.)
+    if is_usage_limit(e) {
+        return false;
     }
     err_mentions(
         e,
@@ -236,6 +273,9 @@ pub fn is_context_overflow(e: &anyhow::Error) -> bool {
         match ce.kind {
             crate::ChatErrorKind::Overflow => return true,
             crate::ChatErrorKind::Transient => return false,
+            // A quota limit is not a context overflow: the request itself was
+            // fine, so compaction cannot help it.
+            crate::ChatErrorKind::UsageLimit => return false,
             // `Other` falls through to the body-text scan: many providers
             // signal context overflow with a 400 + descriptive body, which
             // `classify_status` can't distinguish from an ordinary bad request.
@@ -553,7 +593,11 @@ mod tests {
     /// nothing taken out of the budget.
     #[tokio::test]
     async fn a_non_transient_error_is_not_retried() {
-        for kind in [ChatErrorKind::Other, ChatErrorKind::Overflow] {
+        for kind in [
+            ChatErrorKind::Other,
+            ChatErrorKind::Overflow,
+            ChatErrorKind::UsageLimit,
+        ] {
             let mut budget = RetryBudget::new(instant(10));
             let mut reports = 0usize;
             assert!(
@@ -567,6 +611,62 @@ mod tests {
             let left = spend(&mut budget, &chat_err(ChatErrorKind::Transient, None)).await;
             assert_eq!(left.len(), 9, "{kind:?} must not consume the budget");
         }
+    }
+
+    /// A usage/quota limit is its own class: permanent until the billing window
+    /// resets, not a rate limit to ride out — so it must never be transient, and
+    /// it is not a context overflow either (the request itself was fine).
+    #[test]
+    fn usage_limit_is_distinct_from_rate_limit() {
+        for msg in [
+            "you exceeded your current quota, please check your plan and billing details",
+            "insufficient_quota",
+            "Your credit balance is too low",
+            "you have reached your spend limit",
+        ] {
+            assert!(
+                is_usage_limit_text(msg),
+                "expected a usage limit for: {msg}"
+            );
+        }
+        for msg in [
+            "rate limit exceeded, retry after 20s",
+            "too many requests",
+            "throttled: slow down",
+            "chat endpoint returned 429: slow down",
+        ] {
+            assert!(
+                !is_usage_limit_text(msg),
+                "rate-limit wording must not read as a usage limit: {msg}"
+            );
+        }
+
+        // Typed: the kind decides, whatever the status says.
+        let quota = anyhow::Error::new(ChatError {
+            status: Some(429),
+            kind: ChatErrorKind::UsageLimit,
+            retry_after: None,
+            message: "quota exceeded".to_string(),
+        });
+        assert!(!is_transient(&quota));
+        assert!(!is_context_overflow(&quota));
+        assert!(is_usage_limit(&quota));
+
+        let rate = anyhow::Error::new(ChatError {
+            status: Some(429),
+            kind: ChatErrorKind::Transient,
+            retry_after: None,
+            message: "rate limited".to_string(),
+        });
+        assert!(is_transient(&rate));
+
+        // Untyped: the phrase scan decides, before the `returned 429` needle.
+        let quota_untyped = anyhow::anyhow!("chat endpoint returned 429: quota exceeded");
+        assert!(!is_transient(&quota_untyped));
+        assert!(is_usage_limit(&quota_untyped));
+
+        let rate_untyped = anyhow::anyhow!("chat endpoint returned 429: rate limited");
+        assert!(is_transient(&rate_untyped));
     }
 
     /// A server that says when to come back beats the computed backoff — the

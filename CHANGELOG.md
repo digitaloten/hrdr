@@ -214,6 +214,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refused. Files the tool wrote itself are untouched — no backup, no message
   change.
 
+- **A spent-quota error is no longer retried for six minutes.** A 429 whose body
+  names a usage/quota limit — a billing cap, exhausted credit, a spend limit —
+  is permanent until the window resets, but it was classified transient on the
+  HTTP status alone and retried through the whole backoff schedule before
+  failing anyway. hrdr now tells a quota 429 from a rate limit 429 on all three
+  backends (the shared HTTP path and the Anthropic, Codex and OpenAI mid-stream
+  error objects): the new `ChatErrorKind::UsageLimit` class is terminal, and the
+  retry taxonomy is documented against codex's `should_retry_with_current_model`
+  (hrdr has no model-switch machinery, so `UsageLimit` surfaces rather than
+  switching models).
+
 ### Added
 
 - **`deepseek` is now a built-in provider** — `deepseek://model` talks to
