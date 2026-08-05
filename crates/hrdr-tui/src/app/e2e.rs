@@ -4290,6 +4290,39 @@ async fn an_empty_turn_does_not_mint_a_blank_session() {
     assert!(h.app.state().id.is_some(), "a real turn reserves one");
 }
 
+/// `reserve_session_id` claims the session id on the caller's thread — so the
+/// sub-agent transcript dir is named before the turn runs — but writes the
+/// file off-thread, so the first Enter no longer blocks the UI on the disk
+/// (the mint is synchronous; the serialize + two-fsync write is not). The
+/// write still lands, and under the CURRENT cwd's slug, not the empty one a
+/// brand-new state carries.
+#[tokio::test]
+async fn reserve_session_id_defers_the_first_write_off_thread() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+
+    h.app.reserve_session_id("first message");
+    let id = h
+        .app
+        .state()
+        .id
+        .clone()
+        .expect("the id is claimed synchronously");
+    // The write is off-thread; wait for it to land before reading the file.
+    h.app.await_saves().await;
+    let loaded = hrdr_app::Session::load(&h.app.current_cwd(), &id)
+        .expect("session file written after the deferred save");
+    assert_eq!(
+        loaded
+            .state
+            .messages
+            .first()
+            .and_then(|m| m.content.as_deref()),
+        Some("first message"),
+        "the seeded mirror round-trips"
+    );
+}
+
 /// A detached sub-agent that finishes while nothing is running wakes the model:
 /// an empty turn spawns, and `Agent::run` folds the result into the conversation
 /// before its first request. The user never has to type to collect it.

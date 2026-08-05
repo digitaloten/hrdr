@@ -1352,8 +1352,12 @@ fn compress_session_file(json_path: &Path) -> Result<()> {
 
 // ── save_session: persistence shared by the frontends ─────────────────────────
 
-/// The result of an auto-save: the session's file id, and whether this call was
-/// the one that first assigned it (so the frontend can notify once).
+/// The result of a session-id mint: the session's file id, whether this call was
+/// the one that first assigned it (so the frontend can notify once), the
+/// open-lock the frontend must hold for the session's lifetime, and — on a
+/// first mint — the reservation that must stay alive until the first write
+/// lands (its drop removes the `.id.lock` that keeps a second instance from
+/// minting the same id).
 pub struct SaveOutcome {
     pub id: String,
     pub first_save: bool,
@@ -1363,6 +1367,49 @@ pub struct SaveOutcome {
     /// brand-new session and collide. `None` on every subsequent save, and on the
     /// (near-impossible) case that the minted id's open-lock was already held.
     pub open_lock: Option<crate::SessionLock>,
+    /// The id-reservation guard, present only on a first mint. The caller must
+    /// hold it until the first write attempt ends: its drop removes the
+    /// `.id.lock` a failed first write would otherwise leave behind until it
+    /// aged out as stale.
+    pub reservation: Option<crate::Reservation>,
+}
+
+/// Claim a session's file id without writing anything: derive a collision-free
+/// id from the state's cwd+name (see [`crate::unique_session_id`]), take its
+/// open-lock, and reserve it against a second instance minting the same id
+/// before the first write lands. `Ok(None)` when there's nothing worth saving
+/// yet (no user message).
+///
+/// This is the synchronous, cheap half of [`save_session`] — the part a
+/// frontend needs *before* the write can go off-thread: the id, the open-lock
+/// to hold, and the reservation to keep alive until the write completes. The
+/// write itself (`Session::save`) can then run on a background task without the
+/// UI thread waiting on the disk.
+pub fn mint_session(state: &SessionState) -> anyhow::Result<Option<SaveOutcome>> {
+    if !state.is_saveable() {
+        return Ok(None);
+    }
+    if let Some(id) = &state.id {
+        return Ok(Some(SaveOutcome {
+            id: id.clone(),
+            first_save: false,
+            open_lock: None,
+            reservation: None,
+        }));
+    }
+    let (id, reservation) = crate::unique_session_id(&state.cwd, &state.name);
+    // Take the per-session open-lock for the freshly-minted id, keyed by the
+    // same directory the file lands in. `.ok()` degrades gracefully: the
+    // brand-new id is unique, so a live open-lock for it is near-impossible;
+    // if the acquire somehow can't take it we still save (just without the
+    // extra guard) rather than erroring the user's first turn.
+    let lock = crate::acquire_session_lock(&state.cwd, &id).ok();
+    Ok(Some(SaveOutcome {
+        id,
+        first_save: true,
+        open_lock: lock,
+        reservation: Some(reservation),
+    }))
 }
 
 /// Persist a conversation as a session. Returns `Ok(None)` when there's nothing
@@ -1375,32 +1422,19 @@ pub struct SaveOutcome {
 /// collision-free id is derived from its name (see [`crate::unique_session_id`])
 /// and reported back as `first_save`.
 pub fn save_session(state: &SessionState) -> anyhow::Result<Option<SaveOutcome>> {
-    if !state.is_saveable() {
+    let Some(outcome) = mint_session(state)? else {
         return Ok(None);
-    }
-    let (id, first_save, _reservation, open_lock) = if let Some(id) = &state.id {
-        (id.clone(), false, None, None)
-    } else {
-        let (id, res) = crate::unique_session_id(&state.cwd, &state.name);
-        // Take the per-session open-lock for the freshly-minted id, keyed by the
-        // same directory the file lands in. `.ok()` degrades gracefully: the
-        // brand-new id is unique, so a live open-lock for it is near-impossible;
-        // if the acquire somehow can't take it we still save (just without the
-        // extra guard) rather than erroring the user's first turn.
-        let lock = crate::acquire_session_lock(&state.cwd, &id).ok();
-        (id, true, Some(res), lock)
     };
-    Session::new(state.persisted()).save(&id)?;
-    // `_reservation` is dropped here. If `save` failed above, the drop
+    Session::new(state.persisted()).save(&outcome.id)?;
+    // The reservation is dropped here. If `save` failed above, the drop
     // removes the lock file that `unique_session_id` created — no stale
     // lock is left behind. If `save` succeeded, `save()` already removed
     // the reservation lock (`.{id}.lock`, distinct from the open-lock); the
     // second `remove_file` in `Reservation::drop` is benign. `open_lock` is
     // NOT dropped — it is handed to the caller to hold.
     Ok(Some(SaveOutcome {
-        id,
-        first_save,
-        open_lock,
+        reservation: None,
+        ..outcome
     }))
 }
 
@@ -1837,6 +1871,77 @@ mod tests {
             // Save removes the lock.
             Session::new(state("cleanup", &cwd)).save(&id).unwrap();
             assert!(!lock.exists(), "lock file removed after save");
+        });
+    }
+
+    /// `mint_session` claims the id, the open-lock and the reservation WITHOUT
+    /// writing a file — the synchronous half of `save_session` a frontend needs
+    /// on the UI thread before the two-fsync write can go off-thread.
+    #[test]
+    fn mint_session_claims_without_writing() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let st = state("chat", &cwd);
+            let Some(outcome) = mint_session(&st).unwrap() else {
+                panic!("a saveable state mints");
+            };
+            assert_eq!(outcome.id, "chat");
+            assert!(outcome.first_save, "the first mint reports first_save");
+            assert!(
+                outcome.open_lock.is_some(),
+                "the open-lock is taken at mint time"
+            );
+            assert!(
+                outcome.reservation.is_some(),
+                "the id is reserved at mint time"
+            );
+            let dir = session_dir(&cwd);
+            let lock = dir.join(".chat.lock");
+            assert!(lock.exists(), "reservation lock written at mint");
+            assert!(
+                !dir.join("chat.json").exists(),
+                "mint writes no session file"
+            );
+
+            // Holding the reservation blocks a second instance minting the same
+            // id…
+            let (second, _res2) = unique_session_id(&cwd, "chat");
+            assert_eq!(second, "chat-2");
+            // …and the write, once it lands, removes the reservation lock.
+            Session::new(st.persisted()).save(&outcome.id).unwrap();
+            assert!(!lock.exists(), "save removed the reservation lock");
+            // Dropping the outcome (with its reservation) is then benign.
+            drop(outcome);
+            assert!(!lock.exists(), "no lock to clean after a successful save");
+        });
+    }
+
+    /// `mint_session` on a state that already has an id is a no-op write-wise:
+    /// the id comes back as-is, nothing is re-reserved.
+    #[test]
+    fn mint_session_on_an_ided_state_is_not_a_first_save() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let mut st = state("chat", &cwd);
+            st.id = Some("chat".to_string());
+            let Some(outcome) = mint_session(&st).unwrap() else {
+                panic!("a saveable state mints");
+            };
+            assert_eq!(outcome.id, "chat");
+            assert!(!outcome.first_save);
+            assert!(outcome.open_lock.is_none(), "nothing new to lock");
+            assert!(outcome.reservation.is_none(), "nothing new to reserve");
+            let dir = session_dir(&cwd);
+            assert!(
+                !dir.join(".chat.lock").exists(),
+                "no reservation lock created for an already-ided state"
+            );
         });
     }
 

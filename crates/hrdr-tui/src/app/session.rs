@@ -221,24 +221,64 @@ impl super::App {
         if sent.trim().is_empty() {
             return;
         }
+        // `state.cwd` is only synced by the turn-end autosave; on the very first
+        // turn it is still empty, which would mint the id — and file the first
+        // save — under the wrong cwd slug. Set it from the agent before minting.
+        let cwd = self.current_cwd();
+        self.state_mut().cwd = cwd;
         // `save_session` skips a conversation with no user message, and the agent
         // does not push this one until the turn starts — so seed the mirror. The
         // next autosave replaces it with the agent's own history.
         self.state_mut()
             .messages
             .push(hrdr_agent::Message::user(sent));
-        let saved = hrdr_app::save_session(self.state());
-        if let Some(mut o) = self.record_session_save(saved) {
-            // Hold the freshly-minted session's open-lock (see `autosave`).
-            if let Some(lock) = o.open_lock.take() {
-                self.active_lock = Some(lock);
+        // Mint the id + open-lock synchronously — cheap — but defer the serialize
+        // and the two-fsync atomic write to the off-thread save task
+        // (`enqueue_save` below). Running the full `save_session` here put the
+        // whole write on the UI thread, freezing the first Enter for the duration
+        // of the disk I/O. The id must still be claimed now, not merely computed:
+        // [`unique_session_id`] establishes uniqueness by looking for an existing
+        // file, so a second hrdr started in the same cwd would mint the same id
+        // until one of them writes — and the id is what names the sub-agent
+        // transcript dir the turn is about to use.
+        //
+        // [`unique_session_id`]: hrdr_app::unique_session_id
+        match hrdr_app::mint_session(self.state()) {
+            Ok(Some(mut o)) => {
+                // Hold the freshly-minted session's open-lock (see `autosave`).
+                if let Some(lock) = o.open_lock.take() {
+                    self.active_lock = Some(lock);
+                }
+                // Stay silent here: the notice belongs *after* the turn, not ahead of
+                // the reply. Hand it to the first autosave, which would otherwise see
+                // an id already set and conclude this was not a first save.
+                self.session_notice_pending = o.first_save;
+                self.state_mut().id = Some(o.id);
+                self.refresh_subagent_dir();
+                // The reservation must live until the first write lands; the save
+                // task takes it (see `enqueue_save`).
+                self.pending_reservation = o.reservation;
             }
-            // Stay silent here: the notice belongs *after* the turn, not ahead of
-            // the reply. Hand it to the first autosave, which would otherwise see
-            // an id already set and conclude this was not a first save.
-            self.session_notice_pending = o.first_save;
-            self.state_mut().id = Some(o.id);
-            self.refresh_subagent_dir();
+            Ok(None) => {
+                // Not saveable — near-unreachable: we just pushed a user message.
+            }
+            Err(error) => {
+                // Mint failed (a filesystem error): surface it exactly like the
+                // sync path did and leave the id unset — the first autosave
+                // retries the mint + write.
+                let error = format!("{error:#}");
+                if self.session_save_error.as_deref() != Some(&error) {
+                    self.push_entry(Entry::notice(format!(
+                        "session autosave failed — conversation is not safely stored: {error}"
+                    )));
+                    self.session_save_error = Some(error);
+                }
+            }
+        }
+        // The write itself goes off-thread; without a minted id there is nothing
+        // to write yet and the next autosave retries.
+        if self.state().id.is_some() {
+            self.enqueue_save();
         }
     }
 
@@ -304,7 +344,11 @@ impl super::App {
             self.pending_save = Some(snapshot);
             return;
         }
-        self.spawn_save(snapshot);
+        // A pending first-save reservation rides into the task: it must stay
+        // alive until the write attempt ends (its drop removes the `.id.lock`
+        // a failed first write would otherwise leave behind).
+        let reservation = self.pending_reservation.take();
+        self.spawn_save(snapshot, reservation);
     }
 
     /// Spawn the serialize + atomic-write for `snapshot`. The id is captured
@@ -312,7 +356,11 @@ impl super::App {
     /// whatever session is current, and `/clear` or `/resume` since it was
     /// captured leaves the pipeline stale (see the guard in
     /// [`Self::promote_pending_save`]).
-    fn spawn_save(&mut self, snapshot: hrdr_app::SessionState) {
+    fn spawn_save(
+        &mut self,
+        snapshot: hrdr_app::SessionState,
+        reservation: Option<hrdr_agent::Reservation>,
+    ) {
         let id = self
             .state()
             .id
@@ -322,6 +370,10 @@ impl super::App {
         let tx = self.tx.clone();
         let save_done = self.save_done.clone();
         tokio::spawn(async move {
+            // `_reservation` is dropped when the task ends — after the write
+            // attempt, whatever its outcome. On success `Session::save` already
+            // removed the lock; on failure the drop cleans it up.
+            let _reservation = reservation;
             let res = hrdr_app::Session::new(snapshot.persisted()).save(&id);
             let _ = tx
                 .send(TurnMsg::SaveDone(
@@ -362,7 +414,8 @@ impl super::App {
         if let Some(next) = self.pending_save.take()
             && next.id.as_deref() == self.state().id.as_deref()
         {
-            self.spawn_save(next);
+            let reservation = self.pending_reservation.take();
+            self.spawn_save(next, reservation);
         }
     }
 
@@ -450,6 +503,10 @@ impl super::App {
         // The state *is* the main pane's — transcript, counters and all — so
         // adopting a session is one assignment. There is nothing left to hand back.
         *self.state_mut() = state.restored();
+        // A first-save reservation pending for the session we just left is
+        // stale: `promote_pending_save`'s id guard drops that snapshot, so its
+        // `.id.lock` must go too (dropping the reservation removes it).
+        self.pending_reservation = None;
         let state = self.state_mut();
         state.id = id;
         state.base_url = base_url;

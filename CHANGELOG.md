@@ -71,6 +71,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The first Enter of a session no longer blocks the UI on a disk write.** The
+  session id was minted _and_ the file written synchronously on the event loop,
+  so the first message's submit froze the TUI for the duration of the serialize
+  plus the two-fsync atomic write. Minting the id + open-lock is cheap and stays
+  on the UI thread — it is what names the sub-agent transcript dir before the
+  turn runs — while the write now goes through the same off-thread save task
+  every later save uses. A crash in the first moments of a brand-new session can
+  now lose at most the first message, the same tradeoff every other mid-turn
+  save already made.
+
+- **Pressing Enter no longer writes the input-history file on the UI thread.**
+  Each unique submit rewrote `$XDG_DATA_HOME/hrdr/history` through
+  `write_atomic` — two fsyncs — on the event loop, stalling every Enter for the
+  disk. The persist now runs on a detached thread, chained behind any
+  still-running write so two rapid submits can't land out of order; the
+  in-memory list stays the source of truth for Up/Down recall.
+
+- **A brand-new session's first save lands under the right cwd slug.** The id
+  was minted before the state's cwd was synced (that happens at the turn-end
+  autosave), so the first file went to the empty-cwd slug and was orphaned there
+  when the autosave wrote the same id under the real one. The cwd is now synced
+  before the mint, so the deferred first write and the autosave agree on where
+  the session lives.
+
 - **`@file` completion refreshes when the working tree changes.** The completion
   index was a one-shot snapshot per cwd: a file created after the first `@` — by
   a `git pull`, another shell, or the agent's own write tool — never appeared

@@ -103,6 +103,11 @@ impl super::App {
         // Release the current session's open-lock: we no longer own it. The next
         // message mints a fresh session and takes a new open-lock with it.
         self.active_lock = None;
+        // Drop any pending first-save reservation with the session it belonged
+        // to: its write is discarded (`promote_pending_save`'s id guard drops
+        // the pending snapshot), so the `.id.lock` must go too or it lingers
+        // until it ages out as stale.
+        self.pending_reservation = None;
         // Drop any armed fork offer — it referred to the session we're leaving.
         self.pending_fork = None;
         // Detach the sub-agent transcript dir with it — otherwise a `task`

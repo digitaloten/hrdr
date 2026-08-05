@@ -66,6 +66,13 @@ impl HistoryBrowser {
 
     /// Record a submitted input (skips a consecutive duplicate, bounds the
     /// buffer, persists on change) and reset browsing state.
+    ///
+    /// The disk persist is fire-and-forget: it is a best-effort mirror for the
+    /// next launch (the in-memory list stays the source of truth for this
+    /// session), and [`persist_history`] ends in `write_atomic`'s two fsyncs —
+    /// which must not sit on the caller's thread. `record` runs on the TUI's
+    /// event loop at every submit, so a synchronous write there was what made
+    /// each Enter stall for the disk.
     pub fn record(&mut self, input: &str) {
         if self.entries.last().map(String::as_str) != Some(input) {
             self.entries.push(input.to_string());
@@ -123,13 +130,42 @@ impl HistoryBrowser {
 
 /// Persist input history (one entry per line; multi-line entries are skipped to
 /// keep the line-based file well-formed). Best-effort — filesystem errors are
-/// silently ignored.
+/// silently ignored. Runs on a detached thread: the write ends in two fsyncs
+/// (`write_atomic`), and the caller of [`HistoryBrowser::record`] is the TUI's
+/// event loop.
 pub fn persist_history(history: &[String]) {
     let Some(path) = history_path() else {
         return;
     };
-    persist_history_to(&path, history);
+    persist_history_async(path, history.to_vec());
 }
+
+/// Fire-and-forget history write, serialized behind any still-running one so
+/// two rapid submits can't land out of order (each write waits for the previous
+/// to finish before renaming its own file). A write that loses the race with
+/// process exit is dropped — same as a crash, and the in-memory list is
+/// unaffected.
+fn persist_history_async(path: PathBuf, entries: Vec<String>) {
+    let writer = HISTORY_WRITER.get_or_init(|| std::sync::Mutex::new(None));
+    let prev = writer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let handle = std::thread::spawn(move || {
+        if let Some(prev) = prev {
+            let _ = prev.join();
+        }
+        persist_history_to(&path, &entries);
+    });
+    *writer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+}
+
+/// One history-writer slot: the join handle of the most recent persist, chained
+/// by the next one so writes never reorder.
+static HISTORY_WRITER: std::sync::OnceLock<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+    std::sync::OnceLock::new();
 
 /// Persist input history to an explicit path. Best-effort — filesystem errors
 /// are silently ignored. The write goes through [`hrdr_agent::write_atomic`],
@@ -233,5 +269,36 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "history file must be owner-only, got {mode:o}");
+    }
+
+    /// The persist `record` triggers runs on a detached thread and lands in
+    /// order. It must not run synchronously on the caller's thread — that was
+    /// the per-Enter UI stall — so poll for the file rather than reading it
+    /// right after `record`.
+    #[test]
+    fn record_persists_on_a_detached_thread() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history");
+        persist_history_async(path.clone(), vec!["one".into(), "two".into()]);
+        persist_history_async(
+            path.clone(),
+            vec!["one".into(), "two".into(), "three".into()],
+        );
+
+        // The writes are chained, so the file can never regress from the fuller
+        // list to the shorter one — but it may legitimately read the shorter
+        // list while the second write is still in flight, so only the final
+        // state is asserted.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::fs::read_to_string(&path).as_deref().ok() == Some("one\ntwo\nthree") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detached history write never reached disk"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

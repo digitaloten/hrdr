@@ -433,6 +433,12 @@ pub(crate) struct App {
     /// session is minted (first save), resumed (picker / `/resume`), or
     /// auto-resumed; dropped — releasing the lock — on `/new` and on exit.
     active_lock: Option<hrdr_app::SessionLock>,
+    /// The id-reservation of a session minted by [`Self::reserve_session_id`]
+    /// whose first write has not landed yet. Held here (not in the save task)
+    /// so a `/clear`/`/resume` that discards the pending write drops it too —
+    /// its drop removes the `.id.lock` a failed first write would otherwise
+    /// leave behind. Taken into the save task by [`Self::enqueue_save`].
+    pending_reservation: Option<hrdr_agent::Reservation>,
     pub(crate) editor: Box<dyn TuiEditorEngine>,
     /// Resolved chat-UI colors (from an hjkl theme).
     pub(crate) theme: Theme,
@@ -771,6 +777,7 @@ impl App {
             save_in_flight: false,
             save_done: Arc::new(tokio::sync::Notify::new()),
             active_lock: None,
+            pending_reservation: None,
             editor,
             theme,
             logo,
