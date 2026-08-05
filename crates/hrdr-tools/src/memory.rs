@@ -505,28 +505,26 @@ fn memory_cache() -> &'static Mutex<MemoryCache> {
 }
 
 /// Memoized per-root verdicts from [`mtime_granularity_is_fine`], so the probe
-/// (a set→read round-trip on a scratch file) runs once per root per process.
+/// (a few writes to a scratch file) runs once per root per process.
 fn mtime_verdicts() -> &'static Mutex<HashMap<PathBuf, bool>> {
     static VERDICTS: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
     VERDICTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Whether `root`'s filesystem reports sub-tick mtime granularity.
+/// Whether `root`'s filesystem can tell two rapid writes to one file apart by
+/// mtime.
 ///
 /// The parsed-memory cache keys on each file's mtime alone, which is sound only
-/// when two rapid writes to one file are distinguishable. On a
-/// coarse-granularity filesystem (FAT, some Windows setups) both writes land in
-/// the same tick and the cache would serve the first write's content until the
-/// tick advances — a same-tick edit silently not seen. The probe writes a
-/// scratch file, sets its mtime to a reference with sub-second precision, and
-/// reads it back: a round-trip that survives means the storage keeps the value
-/// (cache on); one that rounds means the key cannot tell edits apart (cache
-/// off, [`load_memories`] re-reads every call).
+/// when a content edit changes the file's mtime. Some environments stamp file
+/// writes from a coarse clock (a VM's timer resolution, FAT's multi-second
+/// ticks): two writes within one tick report the same mtime, so a same-tick
+/// edit would be served stale until the tick advances. The probe writes a
+/// scratch file twice in a row and asks whether the mtimes differ — if the
+/// write clock cannot tell the two writes apart, the root is not cached and
+/// [`load_memories`] re-reads every file each call.
 ///
-/// The reference's sub-second nanoseconds are a whole NTFS tick (100 ns), so it
-/// is exactly representable where the filesystem is fine-grained and rounded
-/// away where it is not. The scratch file has no `.md` extension, so even a
-/// leaked probe could never be loaded as a memory.
+/// The scratch file has no `.md` extension, so even a leaked probe could never
+/// be loaded as a memory.
 fn mtime_granularity_is_fine(root: &Path) -> bool {
     let mut verdicts = mtime_verdicts()
         .lock()
@@ -534,14 +532,19 @@ fn mtime_granularity_is_fine(root: &Path) -> bool {
     if let Some(v) = verdicts.get(root) {
         return *v;
     }
-    let reference = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_800);
     let probe = root.join(".hrdr-mtime-probe");
-    let fine = std::fs::File::create(&probe)
-        .and_then(|f| f.set_modified(reference))
-        .and_then(|_| std::fs::metadata(&probe))
-        .and_then(|m| m.modified())
-        .map(|got| got == reference)
-        .unwrap_or(false);
+    // Three rapid writes; fine only if every adjacent pair's mtime differs, so
+    // a single tick-straddling write cannot read as "fine".
+    let mut mtimes: Vec<SystemTime> = Vec::new();
+    for byte in *b"abc" {
+        if std::fs::write(&probe, [byte]).is_err() {
+            break;
+        }
+        if let Ok(m) = std::fs::metadata(&probe).and_then(|m| m.modified()) {
+            mtimes.push(m);
+        }
+    }
+    let fine = mtimes.len() == 3 && mtimes.windows(2).all(|w| w[0] != w[1]);
     let _ = std::fs::remove_file(&probe);
     verdicts.insert(root.to_path_buf(), fine);
     fine
