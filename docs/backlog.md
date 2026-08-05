@@ -562,8 +562,16 @@ The plan's second half is separable and worth doing regardless: codex's
 `ServerOverloaded`, `InternalServerError`, `RetryLimit`) separates
 "model-specific, a different model might work" from "transient, retry the same
 request". hrdr's `is_transient` only has the second class, so several
-permanently-failing cases are retried. That can land without any of the
-model-switch machinery.
+permanently-failing cases are retried. **Shipped `12fb89c`** (2026-08-05): the
+one permanent class hrdr actually retried was the spent-quota 429 — typed
+`Transient` on status alone and retried through the whole ~6-minute backoff. The
+new `ChatErrorKind::UsageLimit` (codex's `UsageLimitReached`) is terminal,
+decided by the body where it is available (`error_from_response` plus the
+Anthropic/Codex/OpenAI mid-stream error objects); `is_transient` and
+`is_context_overflow` treat it as terminal, and the four-class taxonomy is
+documented on `ChatErrorKind` against codex's model. The model-switch half (a
+different model might work) still has no machinery here — all four classes
+surface rather than switch.
 
 ### Standing constraint: compaction overrides NO request parameter
 
