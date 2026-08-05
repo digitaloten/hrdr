@@ -496,12 +496,55 @@ type MemoryCache = HashMap<PathBuf, HashMap<String, (SystemTime, Memory)>>;
 /// re-parsed on every call — checking a file's mtime is a cheap stat.
 ///
 /// Keying on the FILE's mtime (not the directory's) is required: a content edit
-/// to an existing file does not change its directory's mtime. Two edits within
-/// the same mtime tick could be missed; acceptable on Linux ns-granularity
-/// filesystems.
+/// to an existing file does not change its directory's mtime. The key is sound
+/// only where two rapid writes are distinguishable — a root on a coarse-mtime
+/// filesystem is not cached at all (see [`mtime_granularity_is_fine`]).
 fn memory_cache() -> &'static Mutex<MemoryCache> {
     static CACHE: OnceLock<Mutex<MemoryCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Memoized per-root verdicts from [`mtime_granularity_is_fine`], so the probe
+/// (a set→read round-trip on a scratch file) runs once per root per process.
+fn mtime_verdicts() -> &'static Mutex<HashMap<PathBuf, bool>> {
+    static VERDICTS: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    VERDICTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether `root`'s filesystem reports sub-tick mtime granularity.
+///
+/// The parsed-memory cache keys on each file's mtime alone, which is sound only
+/// when two rapid writes to one file are distinguishable. On a
+/// coarse-granularity filesystem (FAT, some Windows setups) both writes land in
+/// the same tick and the cache would serve the first write's content until the
+/// tick advances — a same-tick edit silently not seen. The probe writes a
+/// scratch file, sets its mtime to a reference with sub-second precision, and
+/// reads it back: a round-trip that survives means the storage keeps the value
+/// (cache on); one that rounds means the key cannot tell edits apart (cache
+/// off, [`load_memories`] re-reads every call).
+///
+/// The reference's sub-second nanoseconds are a whole NTFS tick (100 ns), so it
+/// is exactly representable where the filesystem is fine-grained and rounded
+/// away where it is not. The scratch file has no `.md` extension, so even a
+/// leaked probe could never be loaded as a memory.
+fn mtime_granularity_is_fine(root: &Path) -> bool {
+    let mut verdicts = mtime_verdicts()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(v) = verdicts.get(root) {
+        return *v;
+    }
+    let reference = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_800);
+    let probe = root.join(".hrdr-mtime-probe");
+    let fine = std::fs::File::create(&probe)
+        .and_then(|f| f.set_modified(reference))
+        .and_then(|_| std::fs::metadata(&probe))
+        .and_then(|m| m.modified())
+        .map(|got| got == reference)
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&probe);
+    verdicts.insert(root.to_path_buf(), fine);
+    fine
 }
 
 /// Drop the cached memories for one scope root. A caller that just rewrote
@@ -522,6 +565,10 @@ fn load_memories(root: &Path) -> Vec<(String, Memory)> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return mems;
     };
+    // The mtime-only cache key is unsound on a coarse-granularity filesystem
+    // (two same-tick writes are indistinguishable); such a root is not cached,
+    // so a same-tick edit is never served stale (see `mtime_granularity_is_fine`).
+    let cacheable = mtime_granularity_is_fine(root);
     // The names present in this enumeration, so cache entries for files deleted
     // since the last load don't linger (pruned after the loop).
     let mut present: Vec<String> = Vec::new();
@@ -546,21 +593,25 @@ fn load_memories(root: &Path) -> Vec<(String, Memory)> {
         // read, no parse. A failed stat falls through to a fresh read, matching
         // the pre-cache error tolerance.
         let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        let cached = mtime.and_then(|m| {
-            memory_cache()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(root)
-                .and_then(|files| files.get(&stem).cloned())
-                .filter(|(cached_mtime, _)| *cached_mtime == m)
-        });
+        let cached = if cacheable {
+            mtime.and_then(|m| {
+                memory_cache()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(root)
+                    .and_then(|files| files.get(&stem).cloned())
+                    .filter(|(cached_mtime, _)| *cached_mtime == m)
+            })
+        } else {
+            None
+        };
         if let Some((_, mem)) = cached {
             mems.push((stem, mem));
             continue;
         }
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         let mem = parse_memory(&content, &stem);
-        if let Some(mtime) = mtime {
+        if cacheable && let Some(mtime) = mtime {
             memory_cache()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1417,6 +1468,63 @@ mod tests {
         let third = load_memories(&proj);
         assert_eq!(third.len(), 1);
         assert_eq!(third[0].1.body.trim(), "step two");
+    }
+
+    /// A root whose filesystem reports coarse mtime granularity must not be
+    /// cached: the mtime-only key cannot tell two same-tick writes apart, so a
+    /// same-tick content edit would be served stale until the tick advances.
+    /// The verdict is forced by seeding the memoized probe store — the point is
+    /// the bypass, not the local filesystem's (fine-grained) probe answer.
+    #[test]
+    fn a_coarse_mtime_root_is_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+        mtime_verdicts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(proj.clone(), false);
+
+        seed(&proj, "deploy", "how to deploy", "step one");
+        assert_eq!(load_memories(&proj)[0].1.body.trim(), "step one");
+
+        // A same-length edit with the mtime pinned back to the first write's
+        // value — indistinguishable by an mtime-only key, and the exact shape
+        // `rebuild_index_reads_a_same_tick_rewrite` exercises for the index.
+        let file = proj.join("deploy.md");
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        seed(&proj, "deploy", "how to deploy", "step two");
+        filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(mtime)).unwrap();
+
+        assert_eq!(
+            load_memories(&proj)[0].1.body.trim(),
+            "step two",
+            "a coarse-mtime root must re-read every call, never serve the cache"
+        );
+    }
+
+    /// The granularity probe memoizes its verdict per root and removes its
+    /// scratch file, so probing is one write per root per process and never
+    /// leaves a file behind that a later load could mistake for a memory.
+    #[test]
+    fn mtime_probe_is_memoized_and_leaves_no_scratch_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let first = mtime_granularity_is_fine(&proj);
+        let second = mtime_granularity_is_fine(&proj);
+        assert_eq!(first, second, "the verdict must be memoized per root");
+        assert!(
+            !proj.join(".hrdr-mtime-probe").exists(),
+            "the probe must remove its scratch file"
+        );
+        // The scratch name has no `.md` extension, so even a leaked probe could
+        // never be loaded as a memory.
+        assert!(
+            load_memories(&proj).is_empty(),
+            "the probe file must never read as a memory"
+        );
     }
 
     /// A same-tick rewrite — the file's mtime pinned back to the cached value —

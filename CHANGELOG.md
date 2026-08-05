@@ -225,6 +225,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (hrdr has no model-switch machinery, so `UsageLimit` surfaces rather than
   switching models).
 
+- **Memory recall no longer serves a stale entry after a same-tick edit.** The
+  parsed-memory cache keyed on each file's mtime alone, so on a filesystem with
+  coarse mtime granularity (FAT, some Windows setups) two writes landing in the
+  same tick were indistinguishable — a memory edited twice in quick succession
+  kept returning the older content until the tick advanced. Each memory root is
+  now probed once for mtime granularity, and a coarse root bypasses the cache
+  entirely (every load re-reads the files), so a same-tick edit is always seen.
+
 ### Added
 
 - **`deepseek` is now a built-in provider** — `deepseek://model` talks to
