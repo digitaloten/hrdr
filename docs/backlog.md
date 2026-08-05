@@ -2104,6 +2104,23 @@ What survives that would otherwise be relearned:
 No worklist here — read `git log`. Kept only so nobody re-opens a closed
 question.
 
+**2026-08-05 Enter-path lag** (`6793464`). The Enter path blocked the UI thread
+on the disk twice: the first Enter of a session ran the full session save
+(serialize + `write_atomic`'s two fsyncs) synchronously in `reserve_session_id`,
+and every unique Enter rewrote the input-history file (two more fsyncs) via
+`HistoryBrowser::record`. Both are off the event loop now — `save_session` was
+split into a sync `mint_session` (id + open-lock + reservation, still on the UI
+thread because the id names the sub-agent transcript dir before the turn runs)
+plus the deferred write through the existing save task, and the history persist
+runs on a detached thread chained behind the previous write. Also fixed while
+there: `reserve_session_id` mints with `state.cwd` synced, so a brand-new
+session's first save lands under the real cwd slug instead of the empty-cwd one
+the turn-end autosave orphaned. NOT addressed — still open: backlog perf #1
+(per-round full-history save with two fsyncs, the documented dominant cost of a
+long session; needs the crash-durability decision) and the designed
+auto-compaction before the first request of a near-full context, which delays
+the _reply_ (the message itself appears before it).
+
 **2026-08-04 review-batch slices** (`0dce43d`, `1f4a46b`, `2b991c2`, `7d6c3a4`,
 `176de8e`, `820bc5d`, `96517bf`, `0144f93`, `33a4cf8`, `f531de6`, `6b3bf37`,
 `f901485`). The actionable items from the three 2026-08-04 reviews were worked
