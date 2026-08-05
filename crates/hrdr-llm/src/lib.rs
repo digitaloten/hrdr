@@ -22,9 +22,10 @@ mod retry;
 pub mod sse;
 mod types;
 
+#[doc(hidden)]
 pub use client::{
-    ChatError, ChatErrorKind, ChatStream, Client, UNNAMED_MODEL, is_anthropic_backend,
-    is_local_host, take_client_warning, url_host, wire_protocol,
+    Backend, ChatError, ChatErrorKind, ChatStream, Client, UNNAMED_MODEL, is_anthropic_backend,
+    is_local_host, serve_response, take_client_warning, url_host, wire_protocol,
 };
 pub use fs::{owner_only_options, owner_only_options_no_follow, unique_sibling_path};
 pub use retry::{

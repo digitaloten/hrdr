@@ -424,8 +424,9 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
 /// (Anthropic's own host → native Messages API; the ChatGPT/Codex `/codex/`
 /// endpoint → the OpenAI Responses API), else the OpenAI chat-completions shape
 /// every other server uses.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Backend {
+pub enum Backend {
     OpenAi,
     Anthropic,
     /// OpenAI **Responses API** — the ChatGPT/Codex OAuth endpoint
@@ -910,8 +911,14 @@ impl Client {
     /// is why it is not dead code even though nothing in the crate proper calls
     /// it. It mutates one client instance and touches no shared state, so
     /// parallel tests cannot race through it.
-    #[cfg(test)]
-    pub(crate) fn set_backend_for_test(&mut self, backend: Backend) {
+    ///
+    /// Used by the library's unit tests and by the
+    /// `tests/wire_log_native_backends.rs` integration binary — which needs it
+    /// precisely because the wire log's env var forces the tests there, while
+    /// host-keyed detection would otherwise route a `127.0.0.1` mock to
+    /// [`Backend::OpenAi`].
+    #[doc(hidden)]
+    pub fn set_backend_for_test(&mut self, backend: Backend) {
         self.backend = backend;
     }
 
@@ -1514,9 +1521,9 @@ fn json_u32(v: &serde_json::Value) -> Option<u32> {
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
-/// Minimal in-process HTTP server used only to exercise the SSE decoding paths
-/// in the `chat_stream` implementations (mirrors the mock server in hrdr-agent's
-/// test module, trimmed to a single canned response).
+/// Minimal in-process HTTP server used to exercise the SSE decoding and error
+/// paths in the `chat_stream` implementations (mirrors the mock server in
+/// hrdr-agent's test module, trimmed to a single canned response).
 ///
 /// Lives outside `mod tests` because [`crate::anthropic`] and [`crate::codex`]
 /// drive their own streams through it too — the path is ignored, so the same
@@ -1524,8 +1531,18 @@ fn json_u32(v: &serde_json::Value) -> Option<u32> {
 /// The response carries no `Content-Length` and closes the connection, so the
 /// client reads to EOF: a body that stops short of its terminator is exactly a
 /// truncated stream.
-#[cfg(test)]
-pub(crate) async fn serve_once(body: &'static str) -> String {
+///
+/// `status_line` is the raw HTTP status line (`"HTTP/1.1 200 OK"`, or a non-2xx
+/// like `"HTTP/1.1 401 Unauthorized"`), so the same server can serve a healthy
+/// SSE stream or the error body a provider sends for a rejected request. The
+/// `Content-Type` stays `text/event-stream` either way — the native code paths
+/// read the body as text regardless of status.
+///
+/// Public (`#[doc(hidden)]`) for the `tests/wire_log_native_backends.rs`
+/// integration binary, which drives the native backends through a `127.0.0.1`
+/// mock to assert the wire log's `sse` and `error_response` records.
+#[doc(hidden)]
+pub async fn serve_response(status_line: &'static str, body: &'static str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1566,7 +1583,7 @@ pub(crate) async fn serve_once(body: &'static str) -> String {
             let _ = stream.read_exact(&mut body_buf).await;
         }
         let resp = format!(
-            "HTTP/1.1 200 OK\r\n\
+            "{status_line}\r\n\
              Content-Type: text/event-stream\r\n\
              Connection: close\r\n\
              \r\n\
@@ -1575,6 +1592,13 @@ pub(crate) async fn serve_once(body: &'static str) -> String {
         let _ = stream.write_all(resp.as_bytes()).await;
     });
     format!("http://127.0.0.1:{port}/v1")
+}
+
+/// Serve one canned `200 OK` SSE body like [`serve_response`], for the
+/// library's own unit tests.
+#[cfg(test)]
+pub(crate) async fn serve_once(body: &'static str) -> String {
+    serve_response("HTTP/1.1 200 OK", body).await
 }
 
 #[cfg(test)]
