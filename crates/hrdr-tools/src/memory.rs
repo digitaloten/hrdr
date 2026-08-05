@@ -241,12 +241,27 @@ impl Tool for MemoryTool {
                 };
                 let file = resolve(root, &format!("{slug}.md"))?;
                 std::fs::create_dir_all(root)?;
+                // An existing file that a hand-edit or sibling session drifted
+                // from the tool's format is preserved as a backup before the
+                // rewrite clobbers it.
+                let backup = if file.exists() {
+                    let existing = std::fs::read_to_string(&file)?;
+                    backup_if_drifted(&file, &existing, &slug)?
+                } else {
+                    None
+                };
                 std::fs::write(&file, emit_memory(&mem))?;
                 rebuild_index(root)?;
-                Ok(format!(
-                    "saved {scope} memory '{slug}' (type: {})",
-                    mem.mem_type.as_str()
-                ))
+                match backup {
+                    Some(bak) => Ok(format!(
+                        "saved {scope} memory '{slug}' (type: {}) — preserved a hand-edited file as {bak}",
+                        mem.mem_type.as_str()
+                    )),
+                    None => Ok(format!(
+                        "saved {scope} memory '{slug}' (type: {})",
+                        mem.mem_type.as_str()
+                    )),
+                }
             }
             "edit" => {
                 let name = require_field(&a.name, "name")?;
@@ -257,6 +272,7 @@ impl Tool for MemoryTool {
                         "no {scope} memory named '{slug}' to edit — use `write` to create it"
                     )
                 })?;
+                let backup = backup_if_drifted(&file, &existing, &slug)?;
                 let mut mem = parse_memory(&existing, &slug);
                 mem.name = slug.clone();
                 if let Some(d) = a.description.filter(|d| !d.trim().is_empty()) {
@@ -275,7 +291,12 @@ impl Tool for MemoryTool {
                 }
                 std::fs::write(&file, emit_memory(&mem))?;
                 rebuild_index(root)?;
-                Ok(format!("updated {scope} memory '{slug}'"))
+                match backup {
+                    Some(bak) => Ok(format!(
+                        "updated {scope} memory '{slug}' — preserved a hand-edited file as {bak}"
+                    )),
+                    None => Ok(format!("updated {scope} memory '{slug}'")),
+                }
             }
             "delete" => {
                 let name = require_field(&a.name, "name")?;
@@ -431,6 +452,39 @@ fn emit_memory(mem: &Memory) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Detect external drift on a memory file about to be rewritten by the tool,
+/// and preserve the drifted content instead of clobbering it.
+///
+/// A file written by this tool round-trips exactly:
+/// `emit_memory(&parse_memory(content, stem)) == content`. A human hand-edit
+/// or a sibling hrdr session's rewrite breaks that round-trip. When `content`
+/// still round-trips (or the file does not exist — nothing to preserve),
+/// return `Ok(None)`. Otherwise copy the file to a `<stem>.<unix_ts>.bak` name
+/// in the same directory and return `Ok(Some(<backup file name>))`.
+///
+/// The backup name MUST NOT end in `.md`: [`load_memories`] loads every file
+/// whose extension is `md`, so a `.bak.md` name would be loaded as a memory
+/// and appear in the index. `foo.<ts>.bak` has extension `bak` and is skipped.
+///
+/// Known interaction: a memory whose `description` contains a newline does not
+/// round-trip (a separate open bug, deliberately NOT fixed here) and therefore
+/// trips the guard, making a backup on each edit — acceptable, out of scope.
+fn backup_if_drifted(file: &Path, content: &str, stem: &str) -> Result<Option<String>> {
+    if emit_memory(&parse_memory(content, stem)) == content {
+        return Ok(None);
+    }
+    let unix_ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup_name = format!("{stem}.{unix_ts}.bak");
+    let backup = file.with_file_name(&backup_name);
+    if let Err(e) = std::fs::copy(file, &backup) {
+        bail!("refusing to overwrite hand-edited memory '{stem}' — could not back it up: {e}");
+    }
+    Ok(Some(backup_name))
 }
 
 /// Per-root parsed-memory cache: scope root → file stem → (mtime, memory).
@@ -904,6 +958,185 @@ mod tests {
 
         let index = std::fs::read_to_string(dir.path().join("project").join("MEMORY.md")).unwrap();
         assert!(!index.contains("temp.md"), "{index}");
+    }
+
+    /// Paths of the drift-guard backups (`*.bak`) under `root`, sorted. The
+    /// timestamp in the backup name is unknowable in advance, so tests locate
+    /// backups by scanning for the suffix instead.
+    fn backup_paths(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let name = fname.to_str().unwrap_or("");
+                if name.ends_with(".bak") {
+                    out.push(entry.path());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn edit_preserves_a_hand_edited_file_as_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_memory(dir.path());
+        let tool = MemoryTool;
+
+        tool.execute(
+            json!({
+                "action": "write",
+                "name": "deploy",
+                "description": "original description"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // A human appends a marker line directly to the file. The write had no
+        // body, so the marker sits flush against the closing `---`; the tool's
+        // emitter expects a blank line there, so this content no longer
+        // round-trips — exactly the external drift the guard must catch.
+        let file = dir.path().join("project").join("deploy.md");
+        let mut hand_edited = std::fs::read_to_string(&file).unwrap();
+        hand_edited.push_str("# hand edit\n");
+        std::fs::write(&file, &hand_edited).unwrap();
+
+        // A tool edit must not clobber the hand edit: it parses the current
+        // content, so the marker survives, and the drifted original is backed up.
+        let out = tool
+            .execute(
+                json!({"action": "edit", "name": "deploy", "description": "new description"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("preserved a hand-edited file as"), "{out}");
+
+        let rewritten = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            rewritten.contains("description: new description"),
+            "{rewritten}"
+        );
+        assert!(rewritten.contains("# hand edit"), "{rewritten}");
+
+        let backup = backup_paths(&dir.path().join("project"));
+        assert_eq!(backup.len(), 1, "exactly one backup expected");
+        let bak = std::fs::read_to_string(&backup[0]).unwrap();
+        assert!(bak.contains("# hand edit"), "{bak}");
+        assert!(bak.contains("original description"), "{bak}");
+    }
+
+    #[tokio::test]
+    async fn write_preserves_an_existing_hand_edited_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_memory(dir.path());
+        let tool = MemoryTool;
+
+        tool.execute(
+            json!({"action": "write", "name": "deploy", "description": "old"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Append a marker line directly to the file. The write had no body, so
+        // the marker breaks the round-trip the guard checks.
+        let file = dir.path().join("project").join("deploy.md");
+        let mut hand_edited = std::fs::read_to_string(&file).unwrap();
+        hand_edited.push_str("# hand edit\n");
+        std::fs::write(&file, &hand_edited).unwrap();
+
+        // Write has replace semantics: the file is overwritten, but the
+        // hand-edited content is preserved in a backup.
+        let out = tool
+            .execute(
+                json!({"action": "write", "name": "deploy", "description": "brand new", "body": "replaced"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("preserved a hand-edited file as"), "{out}");
+
+        let rewritten = std::fs::read_to_string(&file).unwrap();
+        assert!(rewritten.contains("description: brand new"), "{rewritten}");
+        assert!(!rewritten.contains("# hand edit"), "{rewritten}");
+
+        let backup = backup_paths(&dir.path().join("project"));
+        assert_eq!(backup.len(), 1, "exactly one backup expected");
+        let bak = std::fs::read_to_string(&backup[0]).unwrap();
+        assert!(bak.contains("# hand edit"), "{bak}");
+        assert!(bak.contains("description: old"), "{bak}");
+    }
+
+    #[tokio::test]
+    async fn no_backup_when_the_file_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_memory(dir.path());
+        let tool = MemoryTool;
+
+        tool.execute(
+            json!({"action": "write", "name": "deploy", "description": "old", "body": "step one"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // A plain tool edit (no external change) round-trips through the
+        // parser/emitter — the guard must not fire.
+        let out = tool
+            .execute(
+                json!({"action": "edit", "name": "deploy", "description": "new"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.contains("preserved a hand-edited file"), "{out}");
+        assert!(
+            backup_paths(&dir.path().join("project")).is_empty(),
+            "a round-tripping edit must not create a backup"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_files_are_not_loaded_as_memories() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_memory(dir.path());
+        let tool = MemoryTool;
+
+        tool.execute(
+            json!({"action": "write", "name": "deploy", "description": "original description"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Same hand edit as above: no body on the write, so the appended marker
+        // trips the guard and leaves a backup behind.
+        let file = dir.path().join("project").join("deploy.md");
+        let mut hand_edited = std::fs::read_to_string(&file).unwrap();
+        hand_edited.push_str("# hand edit\n");
+        std::fs::write(&file, &hand_edited).unwrap();
+        tool.execute(
+            json!({"action": "edit", "name": "deploy", "description": "new description"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(backup_paths(&dir.path().join("project")).len(), 1);
+
+        // The backup has extension `bak`, not `md`, so it is not loaded as a
+        // memory and never appears in the rebuilt index.
+        let proj = dir.path().join("project");
+        let mems = load_memories(&proj);
+        assert_eq!(mems.len(), 1, "the backup must not be loaded as a memory");
+        assert_eq!(mems[0].0, "deploy");
+
+        let index = std::fs::read_to_string(proj.join("MEMORY.md")).unwrap();
+        assert!(index.contains("deploy.md"), "{index}");
+        assert!(!index.contains(".bak"), "{index}");
     }
 
     #[tokio::test]

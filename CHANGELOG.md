@@ -205,6 +205,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/doctor` no longer runs the git and auth-file filesystem probes on the UI
   thread; they moved into the spawned report.
 
+- **A hand-edited memory file survives the tool's next rewrite.** The `memory`
+  tool rewrote `<slug>.md` files unconditionally, so a manual edit or a change
+  made by a sibling session was normalized away on the next `write`/`edit` with
+  no record. A file whose content no longer round-trips through the tool's own
+  parser is now copied to `<slug>.<timestamp>.bak` before the rewrite, and the
+  result line names the backup; if the backup cannot be written, the rewrite is
+  refused. Files the tool wrote itself are untouched — no backup, no message
+  change.
+
 ### Added
 
 - **`deepseek` is now a built-in provider** — `deepseek://model` talks to
