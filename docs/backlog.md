@@ -1389,23 +1389,28 @@ lowercases only for its match arms and returns the original on fall-through, so
 "unknown command". Two spellings of one command behave oppositely. Decide which
 way, then pin it — neither side has a test, so any fix could regress silently.
 
-**`/temp` takes any `f32` and cannot be cleared.** No range check: `/temp 5`,
-`-1`, `nan`, `1e40` all parse and are **persisted to `config.toml`**, so every
-future launch carries it. Non-finite values serialize to `"temperature": null`.
-There is no in-UI escape — the empty-argument branch only reads, `Some(t)` is
-the only `set_temperature` call, and `/temp default` is not accepted — so
-recovery means hand-editing the config file.
+**`/temp` takes any `f32` and cannot be cleared.** **[fixed — `be0f340`]** No
+range check: `/temp 5`, `-1`, `nan`, `1e40` all parse and are **persisted to
+`config.toml`**, so every future launch carries it. Non-finite values serialize
+to `"temperature": null`. There is no in-UI escape — the empty-argument branch
+only reads, `Some(t)` is the only `set_temperature` call, and `/temp default` is
+not accepted — so recovery means hand-editing the config file. Now: finite
+`0.0..=2.0` only, and `default`/`reset` clears via `unpersist_setting`.
 
 Smaller, each verified: `/copy msg 1-99999999999999` labels the range it
 _requested_ rather than what it copied (the existing bounded-scan test uses
-exactly that input); `/export notes.json` writes Markdown into it because format
-keys off `--json` alone, drops extra tokens silently, and overwrites without
-confirmation using blocking `fs::write` inside an async task; `/effort`,
-`/login` and `/skills` discard their argument in silence (`/effort high` prints
-a level listing on the default host, so the user reasonably believes it
-applied); `/doctor` runs `git branch` and filesystem probes **before** its
-spawn, on the TUI thread, so a slow `git` stalls the UI. `/status` already does
-this correctly inside the spawn.
+exactly that input; still open, cosmetic). **Fixed in `be0f340`:**
+`/export notes.json` wrote Markdown into it because format keys off `--json`
+alone — the extension now names the format — and dropped extra tokens silently
+and overwrote without confirmation using blocking `fs::write` inside an async
+task (now: usage error on a second token, refusal to overwrite, write on
+`spawn_blocking`); `/effort`, `/login` and `/skills` discarded their argument in
+silence (`/effort high` printed a level listing on the default host, so the user
+reasonably believed it applied — `/effort <name>` now applies a level validated
+against the model's accepted set, and the other two say arguments are unused);
+`/doctor` ran `git branch` and filesystem probes **before** its spawn, on the
+TUI thread, so a slow `git` stalled the UI — the probes now run in the spawned
+report. `/status` already did this correctly inside the spawn.
 
 **Checked and fine, so nobody re-derives it:** the `bool` contract is sound —
 every in-arm return is `true`, only the unknown arm and the non-`/` guard return
