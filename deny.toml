@@ -28,10 +28,11 @@ allow = [
   "BSL-1.0",
 ]
 exceptions = [
-  # webpki-roots bundles the Mozilla CA certificate set under the Community
-  # Data License Agreement (a permissive data license). Pulled by reqwest's
-  # rustls TLS backend.
-  { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+  # webpki-root-certs bundles the Mozilla CA certificate set under the Community
+  # Data License Agreement (a permissive data license). Pulled by reqwest 0.13's
+  # rustls backend (its 0.12-era predecessor, webpki-roots, carried the same
+  # license and the same exception).
+  { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
 ]
 confidence-threshold = 0.8
 
