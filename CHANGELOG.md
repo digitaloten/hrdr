@@ -263,6 +263,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The hjkl editor stack and reqwest were updated.** The 14 `hjkl-*` crates
+  moved `0.33 → 0.41` and `reqwest` `0.12 → 0.13` (`rustls-tls` → `rustls`, with
+  the `query` and `form` methods now behind explicit features). hrdr's editor
+  seam changed with the hjkl API: hjkl 0.41 split the buffer into a shared
+  document (`hjkl_buffer::Buffer`) and a per-window view (`hjkl_buffer::View`),
+  and the engine's `Editor` now takes the `View` — the input box wraps a `View`
+  as before, with no behaviour change. The test sandbox's load-time constructor
+  moved `ctor 0.6 → 1` (the destructor is now the separate `dtor` crate).
+  Lockfile regenerated.
+
 - **`:audit` and `:tidy` write their findings into the backlog.** Both append to
   `docs/backlog.md` under a dated `## <area> audit|tidy YYYY-MM-DD` heading,
   matching `:review` and `:perf`; the `docs/security-review.md` and

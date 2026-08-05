@@ -294,13 +294,13 @@ pub(crate) fn wrapped_row_count(text: &str, width: u16) -> usize {
 
 /// The default discipline: hjkl's vim FSM.
 pub struct VimEngine {
-    editor: Editor<hjkl_buffer::Buffer, HrdrHost>,
+    editor: Editor<hjkl_buffer::View, HrdrHost>,
 }
 
 impl VimEngine {
     pub fn new() -> Self {
         let editor = Editor::new(
-            hjkl_buffer::Buffer::new(),
+            hjkl_buffer::View::new(),
             HrdrHost::new(),
             Options {
                 shiftwidth: 4,
@@ -432,14 +432,17 @@ impl TuiRender for VimEngine {
             fold_line_bg: Style::default(),
             folds_override: None,
             cursor_column_bg: Style::default(),
+            cursor_column: None,
             selection_bg: Style::default().bg(Color::Blue),
             cursor_style: Style::default(),
             gutter: Some(gutter),
             search_bg: Style::default(),
+            search_ranges: None,
             signs: &[],
             conceals: &[],
             spans: editor.buffer_spans(),
             search_pattern: None,
+            background: Style::default(),
             non_text_style: Style::default(),
             show_eob: true,
             diag_overlays: &[],

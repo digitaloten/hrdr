@@ -31,24 +31,24 @@ hrdr-tui = { path = "crates/hrdr-tui", version = "0.11.1" }
 hrdr-test-support = { path = "crates/hrdr-test-support" }
 
 # hjkl — crates.io pins (caret-minor; lockfile holds the exact patch).
-hjkl-engine = "0.33"
-hjkl-vim = "0.33"
-hjkl-buffer = "0.33"
-hjkl-buffer-tui = "0.33"
-hjkl-engine-tui = "0.33"
-hjkl-clipboard = "0.33"
-hjkl-holler = "0.33"
-hjkl-holler-tui = "0.33"
-hjkl-theme = "0.33"
-hjkl-markdown = "0.33"
-hjkl-markdown-tui = "0.33"
-hjkl-xdg = "0.33"
-hjkl-icons = "0.33"
-hjkl-splash = "0.33"
+hjkl-engine = "0.41"
+hjkl-vim = "0.41"
+hjkl-buffer = "0.41"
+hjkl-buffer-tui = "0.41"
+hjkl-engine-tui = "0.41"
+hjkl-clipboard = "0.41"
+hjkl-holler = "0.41"
+hjkl-holler-tui = "0.41"
+hjkl-theme = "0.41"
+hjkl-markdown = "0.41"
+hjkl-markdown-tui = "0.41"
+hjkl-xdg = "0.41"
+hjkl-icons = "0.41"
+hjkl-splash = "0.41"
 
 # third-party
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "query", "form", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10.0"

@@ -11,4 +11,6 @@ publish = false
 [dependencies]
 # Runs the sandbox at test-binary load, before `main` and before the test harness
 # spawns a thread — the only point at which `env::set_var` is sound.
-ctor = "0.6"
+ctor = "1"
+# Removes the sandbox at test-binary exit (ctor 1.x split the dtor into its own crate).
+dtor = "1"

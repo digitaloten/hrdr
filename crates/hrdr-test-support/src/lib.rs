@@ -48,8 +48,10 @@ const REAL_HOME_ENV: &str = "HRDR_TEST_REAL_HOME";
 
 /// Point `$HOME` and every XDG root at a throwaway directory, before `main`.
 ///
-/// Runs once per test binary, at load, single-threaded.
-#[ctor::ctor]
+/// Runs once per test binary, at load, single-threaded. `unsafe` marks the
+/// attribute: the body calls `env::set_var` (unsafe in edition 2024), and ctor
+/// 1.x requires the ctor to declare it.
+#[ctor::ctor(unsafe)]
 fn sandbox_user_state() {
     let root = std::env::temp_dir().join(format!("hrdr-test-sandbox-{}", std::process::id()));
     // A process with this pid is long gone; start from nothing.
@@ -92,7 +94,9 @@ fn sandbox_user_state() {
 
 /// Delete the sandbox when the test binary exits — /tmp does not need one of these per
 /// run. Best-effort: a leaked thread still holding a file is not worth a failure.
-#[ctor::dtor]
+/// `unsafe` marks the attribute: the dtor runs at exit, outside normal Rust
+/// runtime guarantees, so dtor 1.x requires the marker even for safe bodies.
+#[dtor::dtor(unsafe)]
 fn remove_sandbox() {
     if let Some(root) = std::env::var_os(SANDBOX_ENV) {
         let _ = std::fs::remove_dir_all(PathBuf::from(root));
