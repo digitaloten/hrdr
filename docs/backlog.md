@@ -2121,6 +2121,18 @@ long session; needs the crash-durability decision) and the designed
 auto-compaction before the first request of a near-full context, which delays
 the _reply_ (the message itself appears before it).
 
+**2026-08-05 CI fallout after the dep update** (`5e3676e`, `a88e17b`). The
+reqwest 0.13 upgrade pulled webpki-root-certs (same CDLA-Permissive-2.0 as its
+0.12-era webpki-roots), so the deny.toml per-crate exception was repointed. The
+Windows test runner then exposed a real race in the memory mtime cache (perf
+review #4's cache, `6b3bf37`): a rewrite landing within the same mtime tick —
+coarse filesystem granularity, some Windows setups — looked unchanged to the
+mtime-only key, so `rebuild_index` rebuilt the pointer index from the stale
+pre-mutation entry and a memory edit kept its old description on disk.
+`rebuild_index` now drops the root's cache before re-reading; a regression test
+pins a file's mtime back to the cached value and asserts a same-length
+description change still reaches the index.
+
 **2026-08-04 review-batch slices** (`0dce43d`, `1f4a46b`, `2b991c2`, `7d6c3a4`,
 `176de8e`, `820bc5d`, `96517bf`, `0144f93`, `33a4cf8`, `f531de6`, `6b3bf37`,
 `f901485`). The actionable items from the three 2026-08-04 reviews were worked
