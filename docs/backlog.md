@@ -2154,7 +2154,15 @@ mtime-only key, so `rebuild_index` rebuilt the pointer index from the stale
 pre-mutation entry and a memory edit kept its old description on disk.
 `rebuild_index` now drops the root's cache before re-reading; a regression test
 pins a file's mtime back to the cached value and asserts a same-length
-description change still reaches the index.
+description change still reaches the index. **The direct-path half was closed
+2026-08-05 (`7cfaac5`, `c722120`)** — `load_memories`' own mtime-only cache
+served the same stale entry after a same-tick edit, and the Windows runner hit
+it on every CI run (a coarse _write_ clock stamps rapid writes with one mtime
+while still storing an explicitly-set time verbatim, so the first probe — a
+`set_modified` round-trip — said "fine" and changed nothing). Each memory root
+is now probed once by the failure mode itself — three rapid writes, fine only if
+every adjacent pair's mtime differs — and a coarse root bypasses the cache
+entirely, re-reading every call.
 
 **2026-08-04 review-batch slices** (`0dce43d`, `1f4a46b`, `2b991c2`, `7d6c3a4`,
 `176de8e`, `820bc5d`, `96517bf`, `0144f93`, `33a4cf8`, `f531de6`, `6b3bf37`,
