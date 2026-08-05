@@ -1208,13 +1208,20 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   needs a live `DEEPSEEK_API_KEY` and was not runnable in the automated suite;
   every other slice shipped. Run it before trusting a real DeepSeek session.
 
-- **Wire log on the native backends — unblocked, still unwritten.**
-  `error_response` and `sse` records are emitted by `anthropic.rs`/`codex.rs`
-  and nothing asserts them; `wire_log_native_backends.rs` filters on
-  `kind == "request"` only. The reason it was impossible is gone —
-  `Client::set_backend_for_test` (`c5a6019`) makes both native paths reachable
-  from a `127.0.0.1` mock, and tests now drive them. Ordinary work now, not a
-  blocked item.
+- **Wire log on the native backends** — **shipped `2a78ec2`.** `error_response`
+  and `sse` records are emitted by `anthropic.rs`/`codex.rs` and nothing
+  asserted them; `wire_log_native_backends.rs` filtered on `kind == "request"`
+  only. Now driven through a `127.0.0.1` mock with `set_backend_for_test`, the
+  binary asserts every raw SSE data line lands as an `sse` record and a 401
+  lands as an `error_response` with status+body, on both native backends. The
+  bridge cost an API decision, recorded here: `Backend`,
+  `Client::set_backend_for_test` and the mock (generalized from `serve_once`
+  into `serve_response(status_line, body)`) are now `#[doc(hidden)] pub` —
+  additive test hooks on a published pre-1.0 crate, unconditional rather than
+  feature-gated so the tests can never silently skip. The binary now runs three
+  tests off ONE shared leaked log path with per-test marker-scoped assertions
+  (the env var is process-global and the wire log latches on the first write);
+  `futures-util` joined hrdr-llm's dev-dependencies to drain the stream.
 - **No end-to-end test consumes a real `Retry-After`.** hrdr-agent's `MockResp`
   has the variants `Sse`, `HttpError` and `HttpErrorBody`, and none can set a
   response header, so the agent's retry loop honouring a server-named delay is
